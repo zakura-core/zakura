@@ -72,6 +72,8 @@ pub(super) struct SubmitItem {
     pub(super) block: Arc<block::Block>,
     /// The decoded block's attributed size, measured at submission.
     pub(super) decoded_bytes: u64,
+    /// Wire size when this preparation decoded a raw body; absent for decoded reuse.
+    pub(super) newly_decoded_wire_bytes: Option<usize>,
 }
 
 /// One body hash submitted at a height.
@@ -288,11 +290,9 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
-    /// Update the applying-byte total and its gauge together.
+    /// Update the applying-byte total.
     fn set_applying_buffered_bytes(&mut self, bytes: u64) {
         self.applying_buffered_bytes = bytes;
-        // This lossy cast is metrics-only; the sequencer keeps the integer value.
-        metrics::gauge!("sync.block.applying.buffered_bytes").set(bytes as f64);
     }
 
     pub(super) fn applying_decoded_attributed_memory_bytes(&self) -> u64 {
@@ -362,11 +362,9 @@ impl Sequencer {
         self.in_flight_submission_bytes
     }
 
-    /// Update the in-flight submission total and its gauge together.
+    /// Update the in-flight submission total.
     fn set_in_flight_submission_bytes(&mut self, bytes: u64) {
         self.in_flight_submission_bytes = bytes;
-        // This lossy cast is metrics-only; the sequencer keeps the integer value.
-        metrics::gauge!("sync.block.submission.in_flight_bytes").set(bytes as f64);
     }
 
     /// Number of decoded submissions the driver can still retain.
@@ -794,9 +792,18 @@ impl Sequencer {
             block,
             decoded_attributed_memory_size_bytes,
             newly_decoded_attributed_memory_bytes,
+            newly_decoded_wire_bytes,
         ) = {
             let applying = self.applying.get_mut(&height)?;
             let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
+            let newly_decoded_wire_bytes = match &applying.body {
+                BufferedBlockBody::RawFramePayload(payload) => Some(
+                    payload
+                        .len()
+                        .saturating_sub(wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+                ),
+                _ => None,
+            };
             let block = applying.body.decoded_block();
             let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
             applying.token = token;
@@ -809,6 +816,7 @@ impl Sequencer {
                 block,
                 decoded_after,
                 decoded_after.saturating_sub(decoded_before),
+                newly_decoded_wire_bytes,
             )
         };
         self.applying_decoded_attributed_memory_bytes = self
@@ -837,6 +845,7 @@ impl Sequencer {
             token,
             block,
             decoded_bytes: decoded_attributed_memory_size_bytes,
+            newly_decoded_wire_bytes,
         })
     }
 

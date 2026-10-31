@@ -9,8 +9,7 @@ use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_M
 /// The reorder, applying, and in-flight submission gauges, and the view
 /// admission reads, equal sums over the bodies the sequencer holds through
 /// out-of-order acceptance, drain, submission, detachment, completion, commit,
-/// and reset. The gauges are read before the view is published, so each must
-/// follow the sequencer on its own. Each retained body keeps its request's
+/// and reset. IO publishes the gauges at completed transition boundaries. Each retained body keeps its request's
 /// admission estimate and its allocation's identity from reorder to applying.
 /// Once the driver drops its submissions, no other holder keeps a body alive.
 #[tokio::test]
@@ -48,6 +47,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         let reorder: u64 = owners.reorder.iter().map(|body| body.bytes).sum();
         let applying: u64 = owners.applying.iter().map(|body| body.bytes).sum();
         let submissions: u64 = owners.submissions.iter().map(|owner| owner.bytes).sum();
+        task.publish_view();
         assert_eq!(
             (
                 recorder.bytes("sync.block.reorder.buffered_bytes"),
@@ -57,7 +57,6 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             (reorder, applying, submissions),
             "gauges after {label}"
         );
-        task.publish_view();
         let view = *view_rx.borrow();
         assert_eq!(
             view.reorder_buffered_bytes, reorder,

@@ -20,11 +20,9 @@ impl ReorderBuffer {
         self.buffered_bytes
     }
 
-    /// Update the buffered-byte total and its gauge together.
+    /// Update the buffered-byte total.
     fn set_buffered_bytes(&mut self, bytes: u64) {
         self.buffered_bytes = bytes;
-        // This lossy cast is metrics-only; the buffer keeps the integer value.
-        metrics::gauge!("sync.block.reorder.buffered_bytes").set(bytes as f64);
     }
 
     pub(super) fn decoded_attributed_memory_bytes(&self) -> u64 {
@@ -427,20 +425,6 @@ impl BufferedBlockBody {
             BufferedBlockBody::RawFramePayload(payload) => {
                 let block = decode_raw_frame_payload(payload);
                 let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
-                let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
-                // Metrics accepts f64 samples; these lossy conversions are observability-only.
-                metrics::histogram!(
-                    "sync.block.body.decoded.attributed_memory_size_bytes",
-                    "stage" => "reorder"
-                )
-                .record(decoded_attributed_memory_size_bytes as f64);
-                if serialized_bytes > 0 {
-                    metrics::histogram!(
-                        "sync.block.body.decoded.to_serialized_ratio",
-                        "stage" => "reorder"
-                    )
-                    .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
-                }
                 *self = BufferedBlockBody::DecodedWithRawFramePayload {
                     block: block.clone(),
                     raw_frame_payload: payload.clone(),

@@ -1195,3 +1195,76 @@ fn sequencer_evidence_witness_rejects_lost_evidence() {
         state.pending_evidence.clear();
     });
 }
+
+#[test]
+fn state_histories_do_not_publish_metrics() {
+    struct NoMetrics;
+    impl metrics::Recorder for NoMetrics {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            panic!("state published counter {}", key.name());
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            panic!("state published gauge {}", key.name());
+        }
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            panic!("state published histogram {}", key.name());
+        }
+    }
+
+    let block = test_block();
+    let frame = BlockSyncMessage::Block(block.clone())
+        .encode_frame()
+        .unwrap();
+    let (_, Some(raw)) = BlockSyncMessage::decode_frame_with_raw_block_payload(frame).unwrap()
+    else {
+        panic!("the block frame retains its bytes");
+    };
+    let recorder = NoMetrics;
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    replay_sequencer_order_bytes(ORDER_WITNESS);
+    replay_sequencer_reset_bytes(RESET_WITNESS);
+    replay_sequencer_evidence_bytes(EVIDENCE_WITNESS);
+
+    let mut state = new_state(1);
+    let mut body = received(&block, 1, 0);
+    body.body = BufferedBlockBody::RawFramePayload(raw);
+    assert!(matches!(state.accept_body(body), BodyAcceptance::Buffered));
+    let item = state
+        .prepare_submission(block::Height(1))
+        .expect("the body is applying");
+    assert_eq!(item.block, block);
+    assert_eq!(item.decoded_bytes, block.attributed_memory_size_bytes());
+    assert_eq!(
+        item.newly_decoded_wire_bytes,
+        Some(include_bytes!("mainnet-block-1.bin").len())
+    );
+}

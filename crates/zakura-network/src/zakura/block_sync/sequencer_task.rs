@@ -669,6 +669,7 @@ impl SequencerIO {
 
     /// Record one control transition's diagnostics and run its operations.
     async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
+        self.publish_state_metrics();
         if let Some(classified) = outputs.frontier_reset {
             if classified.kind != state::FrontierResetKind::Growth {
                 metrics::counter!("sync.block.reorg.reset").increment(1);
@@ -711,6 +712,7 @@ impl SequencerIO {
                 .defer_received_for_owner(owner, height, hash, bytes, verified_tip);
             metrics::counter!("sync.block.retention.deferred").increment(1);
         }
+        self.publish_state_metrics();
         self.trace_body_accepted(height, queued_elapsed, acceptance.label());
     }
 
@@ -776,6 +778,21 @@ impl SequencerIO {
                 continue;
             };
             let decoded_bytes = item.decoded_bytes;
+            if let Some(wire_bytes) = item.newly_decoded_wire_bytes {
+                // Metrics use f64; admission and collection totals remain integers.
+                metrics::histogram!(
+                    "sync.block.body.decoded.attributed_memory_size_bytes",
+                    "stage" => "reorder"
+                )
+                .record(decoded_bytes as f64);
+                if wire_bytes > 0 {
+                    metrics::histogram!(
+                        "sync.block.body.decoded.to_serialized_ratio",
+                        "stage" => "reorder"
+                    )
+                    .record(decoded_bytes as f64 / wire_bytes as f64);
+                }
+            }
             metrics::counter!("sync.block.submit.sent").increment(1);
             let queue_depth = self
                 .actions
@@ -814,6 +831,7 @@ impl SequencerIO {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
                     self.trace_submission_retry_scheduled(height);
                 }
+                self.publish_state_metrics();
                 return;
             }
             if let Some(started_at) = self.state.submission_accepted(height, hash, decoded_bytes) {
@@ -885,7 +903,20 @@ impl SequencerIO {
         }
     }
 
+    /// Publish gauges after a completed state mutation, before IO can suspend.
+    fn publish_state_metrics(&self) {
+        let sequencer = self.state.sequencer();
+        // Metrics use f64; the sequencer keeps exact integer totals.
+        metrics::gauge!("sync.block.reorder.buffered_bytes")
+            .set(sequencer.reorder_buffered_bytes() as f64);
+        metrics::gauge!("sync.block.applying.buffered_bytes")
+            .set(sequencer.applying_buffered_bytes() as f64);
+        metrics::gauge!("sync.block.submission.in_flight_bytes")
+            .set(sequencer.in_flight_submission_bytes() as f64);
+    }
+
     fn publish_view(&mut self) {
+        self.publish_state_metrics();
         #[cfg(any(test, zakura_sim))]
         {
             self.observe_holders();
@@ -927,6 +958,7 @@ impl SequencerIO {
     /// [`Self::publish_decoded_ownership_view`], with `decoding_bytes` added to
     /// `applying` for a body about to be decoded.
     fn publish_decoded_ownership_view_with(&self, decoding_bytes: u64) {
+        self.publish_state_metrics();
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);

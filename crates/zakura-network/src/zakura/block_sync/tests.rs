@@ -15307,3 +15307,59 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
 }
+
+#[tokio::test]
+async fn sequencer_panic_closes_the_reactor_action_channel() {
+    use super::block_sync_observe::{BlockEvent, BlockSyncObserver, ObserverSlot};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct PanicOnce(AtomicBool);
+    impl BlockSyncObserver for PanicOnce {
+        fn observe(&self, event: BlockEvent) {
+            if matches!(event, BlockEvent::Sequencer(_)) && !self.0.swap(true, Ordering::SeqCst) {
+                panic!("injected sequencer task failure");
+            }
+        }
+    }
+
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32]));
+    let snapshot = committed_snapshot(1, 1, 1, frontier, frontier, frontier);
+    let (snapshots, mut startup) =
+        committed_block_sync_startup(snapshot.clone(), ZakuraBlockSyncConfig::default());
+    let fault = Arc::new(PanicOnce::default());
+    startup.observer = ObserverSlot(Some(fault.clone()));
+    let (mut handle, mut actions, reactor) = spawn_block_sync_reactor(startup).unwrap();
+    // This sender exists only in unit-test wiring. Remove its keepalive for the
+    // real action channel so only the production reactor and sequencer own it.
+    let (fixture_actions, _) = mpsc::channel(1);
+    handle.routine_wiring.as_mut().unwrap().actions = fixture_actions;
+    let mut changed = snapshot;
+    changed.state_version = zakura_header_chain::StateVersion::new(2);
+    snapshots.send_replace(Some(committed_view(changed, 0)));
+
+    tokio::time::timeout(Duration::from_secs(2), reactor)
+        .await
+        .expect("sequencer closure must stop the reactor")
+        .expect("the reactor must exit without panicking");
+    assert!(
+        fault.0.load(Ordering::SeqCst),
+        "the sequencer reached the fault"
+    );
+    assert!(
+        !handle.is_accounting_closed(),
+        "exit must not depend on an accounting fault"
+    );
+    assert!(handle
+        .routine_wiring
+        .as_ref()
+        .unwrap()
+        .sequencer_input
+        .is_closed());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while actions.recv().await.is_some() {}
+    })
+    .await
+    .expect("sequencer and reactor exit must close the driver action channel");
+    drop(handle);
+}

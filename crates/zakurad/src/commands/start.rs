@@ -4607,6 +4607,15 @@ mod zakura_header_sync_driver_tests {
 
     #[tokio::test(start_paused = true)]
     async fn accounting_failure_drains_the_block_driver_before_node_shutdown() {
+        assert_failed_block_driver_drains_before_node_shutdown(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_action_channel_drains_the_block_driver_before_node_shutdown() {
+        assert_failed_block_driver_drains_before_node_shutdown(false).await;
+    }
+
+    async fn assert_failed_block_driver_drains_before_node_shutdown(accounting_failure: bool) {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
         let held_first = Arc::downgrade(&block1);
@@ -4664,7 +4673,11 @@ mod zakura_header_sync_driver_tests {
             })
             .await
             .unwrap();
-        controls.fail_accounting();
+        if accounting_failure {
+            controls.fail_accounting();
+        } else {
+            drop(action_tx);
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             fatal_rx.try_recv().is_err(),
@@ -4694,7 +4707,7 @@ mod zakura_header_sync_driver_tests {
         assert!(StartCmd::handle_block_sync_driver_exit(&shutdown).is_err());
         assert!(
             shutdown.is_cancelled(),
-            "the node starts shutdown rather than reopening accounting"
+            "the node starts shutdown after an unexpected driver exit"
         );
     }
 

@@ -201,6 +201,12 @@ pub use work_queue::{
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{
+    replay_block_query_bytes, replay_block_reactor_bytes, BlockQueryReplaySummary,
+    BlockReactorReplaySummary,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
 pub use peer_registry::{
     replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
     RetryAuthorityReplaySummary,

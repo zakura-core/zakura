@@ -1382,12 +1382,72 @@ where
         )
     }
 
+    /// Processes connection events even when no ordinary request is waiting.
+    /// Registers wakeups but does not demand an idle peer.
+    pub(super) fn maintain(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+        // Update service and peer statuses.
+        //
+        // # Correctness
+        //
+        // All of the futures that receive a context from this method can wake the peer set buffer
+        // task. If there are no ready peers, and no new peers, network requests will pause until:
+        // - an unready peer becomes ready, or
+        // - a new peer arrives.
+
+        // Drain stall events first, so disconnects free up slots that
+        // `poll_discover` can fill in the same poll cycle.
+        self.drain_stall_events(cx);
+
+        // Check for new peers, and register a task wakeup when the next new peers arrive. New peers
+        // can be infrequent if our connection slots are full, or we're connected to all
+        // available/useful peers.
+        let _poll_pending_or_ready: Poll<()> = self.poll_discover(cx)?;
+
+        // These tasks don't provide new peers or newly ready peers.
+        let _poll_pending: Poll<()> = self.poll_background_errors(cx)?;
+        let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
+
+        let _ = self.poll_peers(cx)?;
+        self.prune_block_gossip_peers();
+        self.publish_block_gossip_peers();
+
+        // Peers leave the set through many paths. Pruning here, instead of at each
+        // path, keeps stall counts bounded by the live peers.
+        if !self.find_response_stalls.is_empty() {
+            let (ready_services, cancel_handles) = (&self.ready_services, &self.cancel_handles);
+            self.find_response_stalls.retain(|addr| {
+                ready_services.contains_key(addr) || cancel_handles.contains_key(addr)
+            });
+        }
+
+        // These metrics should run last, to report the most up-to-date information.
+        self.log_peer_set_size();
+        self.update_metrics();
+
+        Ok(())
+    }
+
+    /// Authorization sources watched by the owning driver.
+    pub(super) fn authorization(&self) -> (BannedIps, C)
+    where
+        C: Clone,
+    {
+        (
+            self.bans.clone(),
+            self.minimum_peer_version.chain_tip().clone(),
+        )
+    }
+
     /// Drops the block gossip peers of connections that left the peer set, and marks the
     /// published peer list stale if any were dropped.
     fn prune_block_gossip_peers(&mut self) {
         let before = self.block_gossip_peers.len();
-        self.block_gossip_peers.retain(|key, _| {
-            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
+        let minimum = self.minimum_peer_version.current();
+        self.block_gossip_peers.retain(|key, peer| {
+            (self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key))
+                && !peer.sender.is_closed()
+                && !self.bans.contains(key.ip())
+                && peer.version >= minimum
         });
         self.block_gossip_peers_changed |= self.block_gossip_peers.len() != before;
     }
@@ -1410,6 +1470,8 @@ where
             peers: self.block_gossip_peers_tx.subscribe(),
             slots: self.block_gossip_slots.clone(),
             minimum_peer_version: self.minimum_peer_version.clone(),
+            bans: self.bans.clone(),
+            refresh: None,
         }
     }
 
@@ -1559,46 +1621,8 @@ where
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Update service and peer statuses.
-        //
-        // # Correctness
-        //
-        // All of the futures that receive a context from this method can wake the peer set buffer
-        // task. If there are no ready peers, and no new peers, network requests will pause until:
-        // - an unready peer becomes ready, or
-        // - a new peer arrives.
-
-        // Drain stall events first, so disconnects free up slots that
-        // `poll_discover` can fill in the same poll cycle.
-        self.drain_stall_events(cx);
-
-        // Check for new peers, and register a task wakeup when the next new peers arrive. New peers
-        // can be infrequent if our connection slots are full, or we're connected to all
-        // available/useful peers.
-        let _poll_pending_or_ready: Poll<()> = self.poll_discover(cx)?;
-
-        // These tasks don't provide new peers or newly ready peers.
-        let _poll_pending: Poll<()> = self.poll_background_errors(cx)?;
-        let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
-
-        let ready_peers = self.poll_peers(cx)?;
-        self.prune_block_gossip_peers();
-        self.publish_block_gossip_peers();
-
-        // Peers leave the set through many paths. Pruning here, instead of at each
-        // path, keeps stall counts bounded by the live peers.
-        if !self.find_response_stalls.is_empty() {
-            let (ready_services, cancel_handles) = (&self.ready_services, &self.cancel_handles);
-            self.find_response_stalls.retain(|addr| {
-                ready_services.contains_key(addr) || cancel_handles.contains_key(addr)
-            });
-        }
-
-        // These metrics should run last, to report the most up-to-date information.
-        self.log_peer_set_size();
-        self.update_metrics();
-
-        if ready_peers.is_pending() {
+        self.maintain(cx)?;
+        if self.ready_services.is_empty() {
             // # Correctness
             //
             // If the channel is full, drop the demand signal rather than waiting. If we waited

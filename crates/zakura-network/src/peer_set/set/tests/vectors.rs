@@ -406,6 +406,7 @@ fn block_gossip_skips_busy_outdated_peers() {
             outdated_addr,
             crate::peer::block_gossip::BlockGossipPeer {
                 sender,
+                address: None,
                 uploads: Default::default(),
                 registry: None,
                 version: Version(1),
@@ -1679,4 +1680,114 @@ fn block_advertiser_waits_for_a_connected_peer() {
             "the advertisement waits for a peer"
         );
     });
+}
+
+/// Idle maintenance admits new connections and preserves the accepted generation on duplicates.
+#[tokio::test(start_paused = true)]
+async fn driver_admits_idle_sidecar_and_keeps_original_duplicate() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        let (client, mut original) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        let sender = client.block_advert_tx.clone();
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+        let (duplicate, _duplicate_handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        discovery
+            .unbounded_send(Ok(Change::Insert(address, duplicate.into())))
+            .unwrap();
+        let (done, ready) = tokio::sync::oneshot::channel();
+        adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+        ready.await.unwrap();
+        assert!(adverts.peers.borrow()[0].sender.same_channel(&sender));
+        let hash = block::Hash([51; 32]);
+        let broadcast = tokio::spawn(adverts.clone().oneshot(Request::AdvertiseMinedBlock(hash)));
+        loop {
+            if let Some(received) = recv_advertise_block(&mut original) {
+                assert_eq!(received, hash);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(broadcast.await.unwrap().is_ok());
+        shutdown.cancel();
+        adverts
+            .peers
+            .wait_for(|peers| peers.is_empty())
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("idle discovery, duplicate rejection and shutdown finish");
+}
+
+/// Disconnected generations cannot fill a forwarding queue and hide the next live peer.
+#[tokio::test(start_paused = true)]
+async fn driver_keeps_discovering_after_connection_churn() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        let rounds = peers.peerset_total_connection_limit + 1;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        for _ in 0..rounds {
+            let (client, mut handle) = ClientTestHarness::build()
+                .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+                .finish();
+            discovery
+                .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, client.into())))
+                .unwrap();
+            adverts
+                .peers
+                .wait_for(|peers| peers.len() == 1)
+                .await
+                .unwrap();
+            handle.drop_outbound_client_request_receiver();
+            adverts
+                .peers
+                .wait_for(|peers| peers.is_empty())
+                .await
+                .unwrap();
+        }
+        let (client, _handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .finish();
+        discovery
+            .unbounded_send(Ok(Change::Insert(address, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+        shutdown.cancel();
+    })
+    .await
+    .expect("connection churn never needs ordinary traffic");
 }

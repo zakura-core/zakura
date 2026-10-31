@@ -159,7 +159,7 @@ fn benchmark_fixture(
     }
 
     let prepared = SemanticallyVerifiedBlock {
-        block: block.clone(),
+        block: block.clone().into(),
         hash: block.hash(),
         height: BENCHMARK_HEIGHT,
         new_outputs,

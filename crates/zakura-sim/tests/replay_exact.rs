@@ -1273,3 +1273,139 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
         })
     ));
 }
+
+const FUNDING_INPUT: &[u8] = include_bytes!("fixtures/block-work-funding.bin");
+
+#[test]
+fn work_funding_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_WORK_FUNDING_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(
+            report.end.unwrap().steps,
+            (FUNDING_INPUT.len() / 4 + 1) as u64
+        );
+    }
+}
+
+#[test]
+fn work_funding_records_and_replays_retained_runtime_owners() {
+    use zakura_sim::record::machine::MachineStep;
+    let entry = harness::find("block/work-funding").unwrap();
+    let dir = record(entry, FUNDING_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/work-funding",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), FUNDING_INPUT.len() / 4 + 1);
+    assert_eq!(trace.meta.scenario["input"], json!(FUNDING_INPUT));
+    assert_eq!(trace.meta.generator, 1);
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:block-work-funding:") && step.draws.is_empty()));
+    let Some(MachineStep::WorkFunding(reset)) = trace.steps[7].machine.as_deref() else {
+        panic!("runtime funding view missing");
+    };
+    assert_eq!(reset.actual.reserved, 100);
+    assert_eq!(reset.actual.receipts[0].bytes, 100);
+    assert_eq!(reset.actual.funded, 0);
+    let Some(MachineStep::WorkFunding(drain)) = trace.steps.last().unwrap().machine.as_deref()
+    else {
+        panic!("runtime funding drain missing");
+    };
+    assert!(drain.drain);
+    assert_eq!(drain.actual.reserved, 0);
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    assert!(
+        matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable == u32::try_from(trace.steps.len()).unwrap())
+    );
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "work_funding_replay_child"])
+        .env("ZAKURA_WORK_FUNDING_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 8)["machine"]["step"]["actual"]["receipts"][0]["bytes"] = json!(99);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 8,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn work_funding_preserves_short_inputs_and_observes_drain() {
+    let entry = harness::find("block/work-funding").unwrap();
+    for input in [&[][..], &[0, 0][..], FUNDING_INPUT, &[0; 512][..]] {
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        let mut sink = zakura_sim::MemorySink::default();
+        let explored = (entry.run_bytes)(input, &mut sink, None);
+        assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+        assert_eq!(
+            explored.result.unwrap().end.steps,
+            input.len().div_ceil(4) as u64 + 1
+        );
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+    assert!(matches!(
+        (entry.witness)(
+            &json!({"input": []}),
+            PlanInput::Bytes(Vec::new()),
+            "block/work-funding",
+            zakura_sim::witness::Expect::Holds,
+            &mut zakura_sim::NullSink
+        ),
+        Err(zakura_sim::witness::WitnessError::LostTriggerHistory)
+    ));
+}
+
+#[test]
+fn work_funding_missing_evidence_and_drain_cannot_verify() {
+    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    edit(dir.path(), |lines| {
+        step(lines, 2).as_object_mut().unwrap().remove("machine");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 2,
+            field: "machine"
+        })
+    ));
+    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    edit(dir.path(), |lines| {
+        lines.truncate(lines.len() - 2);
+    });
+    assert!(TraceReader::open(dir.path()).is_err());
+    let prefix = TraceReader::open_prefix(dir.path()).unwrap();
+    let report = replay(
+        &prefix,
+        ReplayOptions {
+            prefix: true,
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.verified());
+    assert!(!report.complete);
+    assert!(report.end.is_none());
+}

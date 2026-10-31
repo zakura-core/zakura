@@ -384,7 +384,7 @@ pub fn shrink_with(
 
 /// The direct machine decoder owns these bytes; scheduler inputs stay separate.
 fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
-    if name != "block/work-ownership" {
+    if !matches!(name, "block/work-ownership" | "block/work-funding") {
         return None;
     }
     serde_json::from_value::<crate::harness::block_work::Scenario>(scenario.clone())

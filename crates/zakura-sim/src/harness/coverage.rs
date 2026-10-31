@@ -211,6 +211,14 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "block/work-funding",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_funding_records_and_replays_retained_runtime_owners",
+        ),
+        bypass: Bypass::Planted("lost-reservation-release"),
+    },
+    Coverage {
         property: "block/work-ownership",
         passing: passes(
             "tests/replay_exact.rs",

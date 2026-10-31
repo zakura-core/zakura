@@ -73,7 +73,7 @@ mod work_queue;
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter,
+    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchReceiptBatch,
     BenchSequencerHandle, BenchSubmissions, BenchSubmit, SequencerProgress, WorkRequestEnd,
 };
 #[cfg(test)]

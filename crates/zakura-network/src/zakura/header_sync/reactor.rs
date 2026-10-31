@@ -4218,6 +4218,7 @@ impl HeaderSyncReactor {
             Ok(()) => call.map_or(StorageDispatch::Recorded, StorageDispatch::Started),
             Err(error) => {
                 tracing::debug!(?error, "header-sync action queue unavailable");
+                #[cfg(any(test, zakura_sim))]
                 if let Some(call) = call {
                     observe!(
                         self,

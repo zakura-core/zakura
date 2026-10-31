@@ -1,8 +1,5 @@
 # Native decoded retention mutations
 
-The planted runner treats every patch under `qa/planted` as a simulator case,
-so a mutation that a native test detects lives here.
-
 `unfunded-state-read.patch` exercises a different boundary. It makes the real
 state reader return a deep copy without carrying decoded ownership. The copy
 preserves the block hash. The native test retires the original state and keeps
@@ -14,10 +11,10 @@ Run this native mutation from a clean checkout:
 ```sh
 cargo +1.97.0 test --locked -p zakura-state --lib \
   retired_state_snapshots_and_read_results_keep_decoded_ownership
-git apply qa/native-mutations/decoded-retention/unfunded-state-read.patch
+git apply qa/native-mutations/block/decoded-retention/unfunded-state-read.patch
 cargo +1.97.0 test --locked -p zakura-state --lib \
   retired_state_snapshots_and_read_results_keep_decoded_ownership
-git apply -R qa/native-mutations/decoded-retention/unfunded-state-read.patch
+git apply -R qa/native-mutations/block/decoded-retention/unfunded-state-read.patch
 cargo +1.97.0 test --locked -p zakura-state --lib \
   retired_state_snapshots_and_read_results_keep_decoded_ownership
 ```

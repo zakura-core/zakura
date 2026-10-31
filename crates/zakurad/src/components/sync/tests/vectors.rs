@@ -4409,3 +4409,102 @@ fn scaled_lookahead_stays_below_the_drop_height() {
         );
     }
 }
+
+/// A restart whose header runtime is already Ready must hand apply ownership from the genesis
+/// bootstrap to native sync, without fetching or verifying genesis again.
+///
+/// Regression for a startup race: the coordinator's initial phase used to depend on whether the
+/// state had published Ready yet. A genesis-only database could publish it first, so the
+/// coordinator started `Native` and this handoff failed with "illegal sync lifecycle transition".
+/// Startup waits for Ready before spawning the syncer on a restart, so Ready is the state this
+/// task sees there.
+#[tokio::test]
+async fn ready_restart_hands_genesis_bootstrap_to_native_sync() {
+    use zakura_network::P2pStack;
+    use zakura_node_services::sync_lifecycle::{ApplyPhase, HeaderRuntimeStatus, LifecycleEpoch};
+
+    for stack in [P2pStack::Zakura, P2pStack::Dual] {
+        let network_config = zakura_network::Config::for_test(stack);
+        let coordinator = crate::commands::start::initial_sync_coordinator(&network_config);
+        assert_eq!(
+            coordinator.apply_phase(),
+            ApplyPhase::LegacyBootstrap {
+                epoch: LifecycleEpoch::INITIAL
+            },
+            "{stack:?}: native applies must wait for the genesis handoff"
+        );
+
+        let (
+            chain_sync,
+            _sync_status,
+            mut block_verifier_router,
+            mut peer_set,
+            mut state_service,
+            _tip,
+        ) = setup_chain_sync();
+        let genesis_hash = Network::Mainnet.genesis_hash();
+        let genesis = zakura_header_chain::Frontier::new(Height(0), genesis_hash);
+        let snapshot = zakura_header_chain::EngineSnapshot {
+            mode: zakura_header_chain::EngineMode::Integrated,
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            frontiers: zakura_header_chain::FrontierSet {
+                finalized: genesis,
+                header_best: genesis,
+                verified_best: genesis,
+            },
+            header_best_score: zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                genesis_hash,
+            ),
+            oldest_retained_height: Height(0),
+            alarms: Default::default(),
+        };
+        let (_snapshot_tx, committed_snapshots) = tokio::sync::watch::channel(Some(snapshot));
+        let (_runtime_tx, header_runtime_status) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            });
+        let read_state: MockService<zs::ReadRequest, zs::ReadResponse, PanicAssertion> =
+            MockService::build().for_unit_tests();
+
+        let bootstrap = tokio::spawn(chain_sync.bootstrap_genesis_then_pause(
+            read_state,
+            committed_snapshots,
+            header_runtime_status,
+            stack == P2pStack::Dual,
+            coordinator.clone(),
+        ));
+
+        state_service
+            .expect_request(zs::Request::KnownBlock(genesis_hash))
+            .await
+            .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::Finalized)));
+        tokio::time::timeout(
+            MAX_SERVICE_REQUEST_DELAY,
+            coordinator.wait_for_zakura_ownership(),
+        )
+        .await
+        .expect("the handoff runs right after the stored genesis lookup");
+
+        assert_eq!(
+            coordinator.apply_phase(),
+            ApplyPhase::Native {
+                epoch: LifecycleEpoch::INITIAL
+                    .checked_next()
+                    .expect("the first native epoch exists")
+            },
+            "{stack:?}: the syncer must move the coordinator out of bootstrap exactly once"
+        );
+        assert!(
+            !bootstrap.is_finished(),
+            "{stack:?}: the syncer must keep watching body sync after a successful handoff"
+        );
+        peer_set.expect_no_requests().await;
+        block_verifier_router.expect_no_requests().await;
+
+        // The watchdog loop never returns, so stop it once the handoff is proven.
+        bootstrap.abort();
+    }
+}

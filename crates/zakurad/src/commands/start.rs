@@ -201,6 +201,24 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
+/// Builds the block-apply coordinator for the sync task that [`use_zakura_block_sync`] selects.
+///
+/// Zakura block sync always runs [`ChainSync::bootstrap_genesis_then_pause`], whose handoff only
+/// succeeds from `LegacyBootstrap`, so that task gets a bootstrap coordinator. This must not
+/// depend on header runtime readiness, because the state can publish Ready before startup gets
+/// here when the durable chain is tiny.
+///
+/// [`ChainSync::bootstrap_genesis_then_pause`]: crate::components::sync::ChainSync::bootstrap_genesis_then_pause
+pub(crate) fn initial_sync_coordinator(
+    config: &zakura_network::Config,
+) -> Arc<zakura::SyncCoordinator> {
+    if use_zakura_block_sync(config) {
+        zakura::SyncCoordinator::new_legacy_bootstrap()
+    } else {
+        zakura::SyncCoordinator::new()
+    }
+}
+
 #[derive(Default)]
 // Keeps track of `JoinHandle`s, and when `Drop`ped, `aborts` all of them.
 struct NodeTasks(Vec<AbortHandle>);
@@ -501,14 +519,7 @@ impl StartCmd {
             .network
             .v2_p2p()
             .then(|| read_only_state_service.subscribe_header_runtime_status());
-        // Zakura block sync always runs `bootstrap_genesis_then_pause`, whose handoff only
-        // succeeds from `LegacyBootstrap`. Don't key this on header runtime readiness, because
-        // the state can publish Ready before this line runs when the durable chain is tiny.
-        let zakura_block_sync_handoff = if use_zakura_block_sync(&config.network) {
-            zakura::SyncCoordinator::new_legacy_bootstrap()
-        } else {
-            zakura::SyncCoordinator::new()
-        };
+        let zakura_block_sync_handoff = initial_sync_coordinator(&config.network);
 
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
@@ -2744,9 +2755,17 @@ mod zakura_header_sync_driver_tests {
         let mut config = zakura_network::Config::for_test(P2pStack::Dual);
 
         assert!(use_zakura_block_sync(&config));
+        assert!(
+            !initial_sync_coordinator(&config).zakura_owns_applies(),
+            "the genesis bootstrap task owns applies until its handoff"
+        );
 
         config.p2p_stack = P2pStack::Legacy;
         assert!(!use_zakura_block_sync(&config));
+        assert!(
+            initial_sync_coordinator(&config).zakura_owns_applies(),
+            "legacy ChainSync never runs the genesis handoff"
+        );
     }
 
     #[test]

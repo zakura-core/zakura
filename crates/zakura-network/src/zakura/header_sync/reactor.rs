@@ -2531,7 +2531,7 @@ impl HeaderSyncReactor {
                                 .expect("the request was just started")
                         )
                     );
-                                        self.state.arm_request_deadline(
+                    self.state.arm_request_deadline(
                         peer.clone(),
                         Instant::now(),
                         self.startup.request_timeout,
@@ -3147,7 +3147,7 @@ impl HeaderSyncReactor {
                         .expect("the repair request was just started")
                 )
             );
-                        self.state.arm_request_deadline(
+            self.state.arm_request_deadline(
                 peer.clone(),
                 Instant::now(),
                 self.startup.request_timeout,
@@ -3773,7 +3773,7 @@ impl HeaderSyncReactor {
             (Some(key), Some(port::LocatorReadPermit::new(permit)))
         } else {
             (None, None)
-            };
+        };
         let capacity = match &action {
             HeaderPortOperation::PrepareHeaderTarget { peer, .. }
             | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
@@ -4870,6 +4870,12 @@ fn ordered_send_error_label(error: &OrderedSendError) -> &'static str {
         OrderedSendError::Encode(_) => "encode",
     }
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+#[path = "reactor/tests/state_machine.rs"]
+mod machine_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use machine_tests::{replay_header_reactor_bytes, HeaderReactorReplaySummary};
 
 #[cfg(test)]
 mod tests;

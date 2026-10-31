@@ -835,7 +835,7 @@ pub(super) struct LocatorQueries {
 
 impl LocatorQueries {
     /// Whether a read for `peer` is pending.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn contains(&self, peer: &ZakuraPeerId) -> bool {
         self.pending.contains_key(peer)
     }

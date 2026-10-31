@@ -9,9 +9,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
 use proptest::prelude::*;
 
-use super::*;
+use super::{state::*, *};
 
 const PEERS: usize = 3;
 
@@ -54,6 +55,7 @@ struct Authority {
 }
 
 impl Authority {
+    #[cfg(test)]
     fn arbitrary() -> impl Strategy<Value = Self> {
         (0..2_u8, 0..2_u8, 0..3_u8).prop_map(|(generation, anchor, tip)| Self {
             generation,
@@ -130,6 +132,7 @@ enum Op {
     RefreshStall,
 }
 
+#[cfg(test)]
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         2 => (0..PEERS).prop_map(|peer| Op::Connect { peer }),
@@ -306,6 +309,7 @@ impl Model {
 /// The machine, the model, the virtual clock, and every started read's key.
 struct Harness {
     state: ReactorState,
+    summary: HeaderReactorReplaySummary,
     model: Model,
     started: Vec<(usize, LocatorKey)>,
     start: Instant,
@@ -319,6 +323,7 @@ impl Harness {
         let start = Instant::now();
         Self {
             state: ReactorState::new(start),
+            summary: HeaderReactorReplaySummary::default(),
             model: Model::new(),
             started: Vec::new(),
             start,
@@ -342,9 +347,11 @@ impl Harness {
         entries
     }
 
-    fn apply(&mut self, op: Op) -> Result<(), TestCaseError> {
+    fn apply(&mut self, op: Op) {
+        self.summary.transitions += 1;
         match op {
             Op::Connect { peer } => {
+                self.summary.admissions += 1;
                 let replaced = self.state.admit_session(&peer_id(peer));
                 if replaced {
                     self.state
@@ -366,7 +373,7 @@ impl Harness {
                 } else {
                     self.model.suppliers.push_back(peer);
                 }
-                prop_assert_eq!(replaced, previous.is_some());
+                assert_eq!(replaced, previous.is_some(), "{PROPERTY}");
             }
             Op::Disconnect { peer } => {
                 self.state.remove_session(&peer_id(peer));
@@ -391,7 +398,7 @@ impl Harness {
             } => {
                 // The reactor requests reads only for admitted sessions.
                 let Some(session) = self.model.sessions.get_mut(&peer) else {
-                    return Ok(());
+                    return;
                 };
                 // Staging spends the offer before dispatch.
                 self.state.spend_status(&peer_id(peer));
@@ -401,14 +408,15 @@ impl Harness {
                     .locators
                     .propose(&peer_id(peer), authority.scope());
                 if self.model.pending.contains_key(&peer) {
-                    prop_assert_eq!(proposal, LocatorProposal::Joined);
-                    return Ok(());
+                    assert_eq!(proposal, LocatorProposal::Joined, "{PROPERTY}");
+                    return;
                 }
                 let LocatorProposal::Start(key) = proposal else {
-                    return Err(TestCaseError::fail("a peer without a read must start one"));
+                    panic!("{PROPERTY}: a peer without a read must start one");
                 };
-                prop_assert_eq!(&key.peer, &peer_id(peer));
+                assert_eq!(&key.peer, &peer_id(peer), "{PROPERTY}");
                 if capacity {
+                    self.summary.reads_started += 1;
                     self.model.pending.insert(
                         peer,
                         ModelRead {
@@ -419,6 +427,7 @@ impl Harness {
                     self.started.push((peer, key));
                 } else {
                     // A refusal for local capacity keeps the offer for a later pass.
+                    self.summary.reads_refused += 1;
                     self.state.refuse_locator(&key);
                     session.spent = false;
                     self.model.revision += 1;
@@ -430,7 +439,7 @@ impl Harness {
                 awaiting,
             } => {
                 let Some((peer, key)) = self.pick(read) else {
-                    return Ok(());
+                    return;
                 };
                 let target = awaiting.map(|authority| authority.target(0));
                 let disposition = self.state.locators.settle(&key, target.as_ref(), found);
@@ -446,11 +455,14 @@ impl Harness {
                     // A late completion for a settled read leaves the current read pending.
                     _ => LocatorDisposition::Stale,
                 };
-                prop_assert_eq!(disposition, expected);
+                self.summary.completions += 1;
+                self.summary.stale_completions +=
+                    usize::from(expected == LocatorDisposition::Stale);
+                assert_eq!(disposition, expected, "{PROPERTY}");
             }
             Op::Panic { read } => {
                 let Some((peer, key)) = self.pick(read) else {
-                    return Ok(());
+                    return;
                 };
                 let removed = self.state.locators.remove_exact(&key);
                 let matches = self
@@ -461,7 +473,7 @@ impl Harness {
                 if matches {
                     self.model.pending.remove(&peer);
                 }
-                prop_assert_eq!(removed.is_some(), matches);
+                assert_eq!(removed.is_some(), matches, "{PROPERTY}");
             }
             Op::Advance { millis } => {
                 self.now += Duration::from_millis(millis);
@@ -469,8 +481,9 @@ impl Harness {
             Op::Close { peer, sent, live } => {
                 // The reactor closes only admitted sessions.
                 let Some(session) = self.model.sessions.get(&peer).map(|session| session.id) else {
-                    return Ok(());
+                    return;
                 };
+                self.summary.close_refusals += usize::from(!sent);
                 let attempt = if sent {
                     CloseAttempt::Sent { live }
                 } else {
@@ -515,14 +528,18 @@ impl Harness {
                 let due = self.indexed(due);
                 let expired = self.state.take_expired_closes(self.now);
                 let expired = self.indexed(expired);
-                prop_assert!(due.len() <= PEERS && expired.len() <= PEERS);
-                prop_assert_eq!(
+                self.summary.close_retries += due.len();
+                self.summary.close_expiries += expired.len();
+                assert!(due.len() <= PEERS && expired.len() <= PEERS, "{PROPERTY}");
+                assert_eq!(
                     due,
-                    Model::take_due(&mut self.model.close_retries, self.now)
+                    Model::take_due(&mut self.model.close_retries, self.now),
+                    "{PROPERTY}"
                 );
-                prop_assert_eq!(
+                assert_eq!(
                     expired,
-                    Model::take_due(&mut self.model.close_outcomes, self.now)
+                    Model::take_due(&mut self.model.close_outcomes, self.now),
+                    "{PROPERTY}"
                 );
             }
             Op::CachedPass { key } => {
@@ -536,7 +553,7 @@ impl Harness {
                 // The reactor's cached-pass gate, in order.
                 let wanted = self.state.cached_pass_wanted(opportunity);
                 self.model.cached_deferred = false;
-                prop_assert_eq!(wanted, self.model.cached_key != Some(key));
+                assert_eq!(wanted, self.model.cached_key != Some(key), "{PROPERTY}");
                 if !wanted {
                     return self.check();
                 }
@@ -547,9 +564,10 @@ impl Harness {
                     .last_cached_grant
                     .is_none_or(|last| self.now >= last + CACHED_PASS_REFILL)
                 {
-                    prop_assert!(taken, "the budget refills between passes");
+                    assert!(taken, "{PROPERTY}: the budget refills between passes");
                 }
                 if taken {
+                    self.summary.cached_passes += 1;
                     self.state.finish_cached_pass(opportunity, self.now);
                     self.model.cached_key = Some(key);
                     self.model.cached_granted += 1;
@@ -559,10 +577,10 @@ impl Harness {
                 }
                 let refills = self.now.saturating_duration_since(self.start).as_nanos()
                     / CACHED_PASS_REFILL.as_nanos();
-                prop_assert!(
+                assert!(
                     u128::from(self.model.cached_granted)
                         <= u128::from(CACHED_PASS_BURST) + refills,
-                    "cached passes stay within the burst plus refills"
+                    "{PROPERTY}: cached passes stay within the burst plus refills"
                 );
             }
             Op::ResourceStall { version } => {
@@ -601,7 +619,7 @@ impl Harness {
             }
             Op::RepairStall { supplier } => {
                 let Some((generation, _)) = self.model.repair else {
-                    return Ok(());
+                    return;
                 };
                 let outcome = if supplier {
                     VctRepairStallOutcome::SupplierFailure
@@ -637,7 +655,7 @@ impl Harness {
                         due.best_peer_tip.map(|(height, _)| height),
                     )
                 });
-                prop_assert_eq!(due, self.model_refresh_stall());
+                assert_eq!(due, self.model_refresh_stall(), "{PROPERTY}");
                 self.last_stall_due = due.map(|(trace, report, _, _)| (trace, report));
             }
         }
@@ -663,10 +681,14 @@ impl Harness {
             stall.last_trace = Some(self.now);
         }
         if report {
+            self.summary.repair_reports += 1;
             stall.reported = true;
             let reports = self.model.reports.entry(stall.generation).or_default();
             *reports += 1;
-            assert_eq!(*reports, 1, "one error report per repair generation");
+            assert_eq!(
+                *reports, 1,
+                "{PROPERTY}: one error report per repair generation"
+            );
         }
         self.model.stall = Some(stall);
         let best_peer_height = self
@@ -688,9 +710,16 @@ impl Harness {
     }
 
     /// Compare every observable fact of the machine with the model.
-    fn check(&self) -> Result<(), TestCaseError> {
-        prop_assert_eq!(self.state.scheduling_revision, self.model.revision);
-        prop_assert_eq!(self.state.peers.len(), self.model.sessions.len());
+    fn check(&self) {
+        assert_eq!(
+            self.state.scheduling_revision, self.model.revision,
+            "{PROPERTY}"
+        );
+        assert_eq!(
+            self.state.peers.len(),
+            self.model.sessions.len(),
+            "{PROPERTY}"
+        );
         for peer in 0..PEERS {
             let id = peer_id(peer);
             let schedule = self.state.peers.get(&id).map(|schedule| {
@@ -710,11 +739,11 @@ impl Harness {
                     0,
                 )
             });
-            prop_assert_eq!(schedule, expected, "peer {} schedule", peer);
-            prop_assert_eq!(
+            assert_eq!(schedule, expected, "{PROPERTY}: peer {} schedule", peer);
+            assert_eq!(
                 self.state.locators.contains(&id),
                 self.model.pending.contains_key(&peer),
-                "peer {} pending read",
+                "{PROPERTY}: peer {} pending read",
                 peer
             );
         }
@@ -724,7 +753,11 @@ impl Harness {
             .iter()
             .map(|peer| self.peer_index(peer))
             .collect();
-        prop_assert_eq!(&suppliers, &Vec::from(self.model.suppliers.clone()));
+        assert_eq!(
+            &suppliers,
+            &Vec::from(self.model.suppliers.clone()),
+            "{PROPERTY}"
+        );
         let committed = self
             .model
             .committed
@@ -734,8 +767,12 @@ impl Harness {
                 .committed
                 .is_none_or(|version| version <= stalled)
         });
-        prop_assert_eq!(self.state.ordinary_discovery_paused(committed), paused);
-        prop_assert_eq!(
+        assert_eq!(
+            self.state.ordinary_discovery_paused(committed),
+            paused,
+            "{PROPERTY}"
+        );
+        assert_eq!(
             self.state
                 .vct_repair
                 .current()
@@ -743,9 +780,10 @@ impl Harness {
             self.model.repair.map(|(generation, height)| (
                 u64::from(generation),
                 block::Height(u32::from(height) + 1)
-            ))
+            )),
+            "{PROPERTY}"
         );
-        prop_assert_eq!(
+        assert_eq!(
             self.state.vct_repair_stall.map(|stall| (
                 stall.generation,
                 stall.since,
@@ -757,7 +795,8 @@ impl Harness {
                 stall.since,
                 stall.last_trace,
                 stall.reported
-            ))
+            )),
+            "{PROPERTY}"
         );
         // Every deadline the model knows, except the cached-pass refill.
         let deadline = self
@@ -772,25 +811,30 @@ impl Harness {
             // A deferred pass wakes the reactor within one refill.
             let refill = self.now + CACHED_PASS_REFILL;
             let next = self.state.next_deadline();
-            prop_assert!(next.is_some_and(|next| next <= refill));
-            prop_assert_eq!(
+            assert!(next.is_some_and(|next| next <= refill), "{PROPERTY}");
+            assert_eq!(
                 next,
-                deadline.map_or(next, |deadline| next.min(Some(deadline)))
+                deadline.map_or(next, |deadline| next.min(Some(deadline))),
+                "{PROPERTY}"
             );
         } else {
-            prop_assert_eq!(self.state.next_deadline(), deadline);
+            assert_eq!(self.state.next_deadline(), deadline, "{PROPERTY}");
         }
-        Ok(())
     }
 }
 
 /// Run `ops` from an empty state, checking the machine after every step.
-fn run(ops: impl IntoIterator<Item = Op>) -> Result<Harness, TestCaseError> {
+fn run_with(
+    ops: impl IntoIterator<Item = Op>,
+    mut after_step: impl FnMut(&mut Harness),
+) -> Harness {
     let mut harness = Harness::new();
     for op in ops {
-        harness.apply(op)?;
+        harness.apply(op);
+        after_step(&mut harness);
+        harness.check();
     }
-    Ok(harness)
+    harness
 }
 
 #[test]
@@ -811,18 +855,15 @@ fn late_locator_after_session_replacement_leaves_the_replacement_unchanged() {
         // The replacement drops the first session's awaiting target.
         Op::Connect { peer: 0 },
         Op::Status { peer: 0, tip: 2 },
-    ])
-    .expect("the scenario follows the model");
+    ]);
     let replacement = harness.state.peers[&peer_id(0)].clone();
     let revision = harness.state.scheduling_revision;
 
-    harness
-        .apply(Op::Complete {
-            read: 0,
-            found: true,
-            awaiting: None,
-        })
-        .expect("the late read settles as the model predicts");
+    harness.apply(Op::Complete {
+        read: 0,
+        found: true,
+        awaiting: None,
+    });
 
     assert!(!harness.state.locators.contains(&peer_id(0)));
     assert_eq!(harness.state.peers[&peer_id(0)], replacement);
@@ -851,8 +892,7 @@ fn locator_requests_for_a_replacement_join_the_first_sessions_read() {
             authority: replacement,
             capacity: true,
         },
-    ])
-    .expect("the scenario follows the model");
+    ]);
     assert_eq!(harness.started.len(), 1);
 
     // The read follows the local selected path, so it serves the replacement's
@@ -872,17 +912,14 @@ fn refused_locator_dispatch_keeps_the_offer() {
         anchor: 0,
         tip: 1,
     };
-    let mut harness = run([Op::Connect { peer: 0 }, Op::Status { peer: 0, tip: 1 }])
-        .expect("the scenario follows the model");
+    let mut harness = run([Op::Connect { peer: 0 }, Op::Status { peer: 0, tip: 1 }]);
     let revision = harness.state.scheduling_revision;
 
-    harness
-        .apply(Op::RequestLocator {
-            peer: 0,
-            authority,
-            capacity: false,
-        })
-        .expect("the refusal follows the model");
+    harness.apply(Op::RequestLocator {
+        peer: 0,
+        authority,
+        capacity: false,
+    });
 
     let schedule = &harness.state.peers[&peer_id(0)];
     assert!(!schedule.status_spent, "a capacity refusal keeps the offer");
@@ -891,13 +928,11 @@ fn refused_locator_dispatch_keeps_the_offer() {
     assert_eq!(harness.state.scheduling_revision, revision + 1);
 
     // The next request starts a fresh read.
-    harness
-        .apply(Op::RequestLocator {
-            peer: 0,
-            authority,
-            capacity: true,
-        })
-        .expect("the retry follows the model");
+    harness.apply(Op::RequestLocator {
+        peer: 0,
+        authority,
+        capacity: true,
+    });
     assert!(harness.state.locators.contains(&peer_id(0)));
     assert!(harness.state.peers[&peer_id(0)].status_spent);
 }
@@ -926,8 +961,7 @@ fn late_completion_keeps_a_newer_read_for_the_same_peer() {
             authority,
             capacity: true,
         },
-    ])
-    .expect("the scenario follows the model");
+    ]);
 
     let (_, settled) = harness.started[0].clone();
     assert_eq!(
@@ -949,22 +983,17 @@ fn refused_closes_under_queue_pressure_keep_their_retry_time() {
             sent: false,
             live: true,
         },
-    ])
-    .expect("the scenario follows the model");
+    ]);
     let first_retry = harness.now + CLOSE_RETRY_INTERVAL;
 
     // Steady refusals for the same session cannot postpone the retry.
     for _ in 0..10 {
-        harness
-            .apply(Op::Advance { millis: 110 })
-            .and_then(|()| {
-                harness.apply(Op::Close {
-                    peer: 0,
-                    sent: false,
-                    live: true,
-                })
-            })
-            .expect("each refusal follows the model");
+        harness.apply(Op::Advance { millis: 110 });
+        harness.apply(Op::Close {
+            peer: 0,
+            sent: false,
+            live: true,
+        });
     }
     assert!(harness.now >= first_retry);
     assert_eq!(
@@ -987,15 +1016,12 @@ fn repair_replacement_ends_the_previous_generations_stall() {
         Op::Repair {
             desired: Some((0, 0)),
         },
-    ])
-    .expect("the scenario follows the model");
+    ]);
     assert!(harness.state.vct_repair_stall.is_some());
 
-    harness
-        .apply(Op::Repair {
-            desired: Some((1, 0)),
-        })
-        .expect("the replacement follows the model");
+    harness.apply(Op::Repair {
+        desired: Some((1, 0)),
+    });
     assert!(harness.state.vct_repair_stall.is_none());
     assert_eq!(
         harness
@@ -1011,22 +1037,19 @@ fn repair_replacement_ends_the_previous_generations_stall() {
 #[test]
 fn resource_stall_holds_until_a_newer_state_version() {
     let version = |version| Some(zakura_header_chain::StateVersion::new(version));
-    let mut harness = run([Op::ResourceStall { version: 2 }]).expect("the stall follows the model");
+    let mut harness = run([Op::ResourceStall { version: 2 }]);
     assert!(harness.state.ordinary_discovery_paused(None));
     assert!(harness.state.ordinary_discovery_paused(version(2)));
     assert!(!harness.state.ordinary_discovery_paused(version(3)));
 
     // An older receipt cannot lower the stall's state version.
-    harness
-        .apply(Op::ResourceStall { version: 1 })
-        .expect("the older receipt follows the model");
+    harness.apply(Op::ResourceStall { version: 1 });
     assert!(harness.state.ordinary_discovery_paused(version(2)));
 }
 
 #[test]
 fn repeated_status_and_deadline_events_stay_bounded() {
-    let mut harness = run([Op::Connect { peer: 0 }, Op::Connect { peer: 1 }])
-        .expect("the scenario follows the model");
+    let mut harness = run([Op::Connect { peer: 0 }, Op::Connect { peer: 1 }]);
     for round in 0..1_000_u32 {
         let key = u8::try_from(round % 3).expect("the key is small");
         for op in [
@@ -1039,7 +1062,7 @@ fn repeated_status_and_deadline_events_stay_bounded() {
             },
             Op::Deadlines,
         ] {
-            harness.apply(op).expect("each event follows the model");
+            harness.apply(op);
         }
     }
     // No time passed, so only the burst ran.
@@ -1048,13 +1071,9 @@ fn repeated_status_and_deadline_events_stay_bounded() {
 
     // Each refill interval then buys one pass, however many keys change.
     for round in 0..100_u8 {
-        harness
-            .apply(Op::Advance { millis: 1 })
-            .expect("the clock advances");
+        harness.apply(Op::Advance { millis: 1 });
         for key in [round % 3, (round + 1) % 3] {
-            harness
-                .apply(Op::CachedPass { key })
-                .expect("each pass follows the model");
+            harness.apply(Op::CachedPass { key });
         }
     }
     assert_eq!(
@@ -1071,13 +1090,10 @@ fn a_stalled_repair_reports_once_and_keeps_tracing() {
         },
         Op::RepairStall { supplier: false },
         Op::RefreshStall,
-    ])
-    .expect("the first trace row follows the model");
+    ]);
     let due = |harness: &mut Harness, millis| {
-        harness
-            .apply(Op::Advance { millis })
-            .and_then(|()| harness.apply(Op::RefreshStall))
-            .expect("the refresh follows the model");
+        harness.apply(Op::Advance { millis });
+        harness.apply(Op::RefreshStall);
         harness.last_stall_due
     };
 
@@ -1109,8 +1125,7 @@ fn supplier_order_is_deterministic() {
         Op::Connect { peer: 0 },
         Op::Connect { peer: 1 },
         Op::Connect { peer: 2 },
-    ])
-    .expect("the scenario follows the model");
+    ]);
     assert_eq!(order(&harness), [0, 1, 2]);
 
     for (op, expected) in [
@@ -1119,20 +1134,209 @@ fn supplier_order_is_deterministic() {
         (Op::Connect { peer: 1 }, [2, 0, 1]),
         (Op::Rotate { peer: 0 }, [2, 1, 0]),
     ] {
-        harness.apply(op).expect("each step follows the model");
+        harness.apply(op);
         assert_eq!(order(&harness), expected);
     }
-    harness
-        .apply(Op::Disconnect { peer: 2 })
-        .expect("the disconnect follows the model");
+    harness.apply(Op::Disconnect { peer: 2 });
     assert_eq!(order(&harness), [1, 0]);
 }
 
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn reactor_state_matches_the_model(ops in prop::collection::vec(op(), 1..64)) {
-        run(ops)?;
+        run(ops);
     }
+}
+
+#[cfg(test)]
+fn run(ops: impl IntoIterator<Item = Op>) -> Harness {
+    run_with(ops, |_| {})
+}
+
+pub(super) fn committed_snapshot(
+    anchor: zakura_header_chain::Frontier,
+) -> zakura_header_chain::EngineSnapshot {
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(3),
+        header_generation: zakura_header_chain::HeaderGeneration::new(4),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(5),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized: anchor,
+            header_best: anchor,
+            verified_best: anchor,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            anchor.hash,
+        ),
+        oldest_retained_height: anchor.height,
+        alarms: Default::default(),
+    }
+}
+
+const PROPERTY: &str = "header/reactor-policy";
+
+/// Applicable transitions in a decoder-v1 header reactor history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct HeaderReactorReplaySummary {
+    /// Operations decoded.
+    pub transitions: usize,
+    /// Session admissions checked.
+    pub admissions: usize,
+    /// Locator reads started.
+    pub reads_started: usize,
+    /// Locator dispatches refused for capacity.
+    pub reads_refused: usize,
+    /// Locator completions checked.
+    pub completions: usize,
+    /// Locator completions rejected as stale.
+    pub stale_completions: usize,
+    /// Close dispatches refused by an admitted session.
+    pub close_refusals: usize,
+    /// Close retries drained at their deadline.
+    pub close_retries: usize,
+    /// Close outcome deadlines expired.
+    pub close_expiries: usize,
+    /// Cached-offer passes granted.
+    pub cached_passes: usize,
+    /// Repair generations reported after a sustained stall.
+    pub repair_reports: usize,
+}
+
+/// Replay decoder-v1 quadruples against the existing header reactor model.
+/// Read at most 512 bytes and keep every deadline relative to one clock origin.
+pub fn replay_header_reactor_bytes(data: &[u8]) -> HeaderReactorReplaySummary {
+    run_with(decode(data), |_| {}).summary
+}
+
+fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let peer = usize::from(b) % PEERS;
+        let authority = Authority {
+            generation: c % 2,
+            anchor: c / 2 % 2,
+            tip: c / 4 % 3,
+        };
+        match a % 16 {
+            0 => Op::Connect { peer },
+            1 => Op::Disconnect { peer },
+            2 => Op::Status { peer, tip: c % 3 },
+            3 => Op::RequestLocator {
+                peer,
+                authority,
+                capacity: d & 1 == 0,
+            },
+            4 => Op::Complete {
+                read: usize::from(b),
+                found: d & 1 == 0,
+                awaiting: (d & 2 == 0).then_some(authority),
+            },
+            5 => Op::Panic {
+                read: usize::from(b),
+            },
+            6 => Op::Advance {
+                millis: u64::from(u16::from_le_bytes([c, d])),
+            },
+            7 => Op::Close {
+                peer,
+                sent: c & 1 != 0,
+                live: d & 1 != 0,
+            },
+            8 => Op::Deadlines,
+            9 => Op::CachedPass { key: b % 3 },
+            10 => Op::ResourceStall { version: b % 4 },
+            11 => Op::Commit { version: b % 4 },
+            12 => Op::Rotate { peer },
+            13 => Op::Repair {
+                desired: (d & 1 == 0).then_some((b % 3, c % 2)),
+            },
+            14 => Op::RepairStall {
+                supplier: b & 1 != 0,
+            },
+            _ => Op::RefreshStall,
+        }
+    })
+}
+
+#[cfg(test)]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn header_reactor_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_header_reactor_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const WITNESS: &[u8] = &[
+    0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 2, 3, 0, 0, 0,
+    4, 0, 0, 0, 4, 1, 0, 0, 7, 0, 0, 1, 6, 0, 232, 3, 8, 0, 0, 0, 7, 0, 1, 1, 6, 0, 136, 19, 8, 0,
+    0, 0, 9, 0, 0, 0, 10, 2, 0, 0, 11, 3, 0, 0, 13, 0, 0, 0, 14, 0, 0, 0, 15, 0, 0, 0, 6, 0, 96,
+    234, 15, 0, 0, 0, 15, 0, 0, 0, 12, 0, 0, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn header_reactor_witness_exercises_locator_deadlines_and_repair() {
+    let summary = replay_header_reactor_bytes(WITNESS);
+    assert_eq!(
+        summary,
+        HeaderReactorReplaySummary {
+            transitions: 26,
+            admissions: 2,
+            reads_started: 2,
+            reads_refused: 1,
+            completions: 3,
+            stale_completions: 2,
+            close_refusals: 1,
+            close_retries: 1,
+            close_expiries: 1,
+            cached_passes: 1,
+            repair_reports: 1,
+        }
+    );
+    assert_eq!(
+        replay_header_reactor_bytes(&[]),
+        HeaderReactorReplaySummary::default()
+    );
+    println!("tier=Machine target=header_reactor decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "header/reactor-policy")]
+fn header_reactor_witness_rejects_lost_locator() {
+    run_with(decode(WITNESS), |harness| {
+        for (_, key) in &harness.started {
+            harness.state.locators.remove_exact(key);
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "header/reactor-policy")]
+fn header_reactor_witness_rejects_wrong_revision() {
+    run_with(decode(WITNESS), |harness| {
+        harness.state.scheduling_revision += 1;
+    });
+}
+
+#[test]
+#[should_panic(expected = "header/reactor-policy")]
+fn header_reactor_witness_rejects_premature_close_retry() {
+    run_with(decode(WITNESS), |harness| {
+        harness
+            .state
+            .take_due_closes(harness.now + Duration::from_secs(100));
+    });
 }

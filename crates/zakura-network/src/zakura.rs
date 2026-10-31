@@ -546,6 +546,8 @@ fn resume_task_panic<T>(
     })
 }
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use header_sync::{replay_header_reactor_bytes, HeaderReactorReplaySummary};
 #[cfg(test)]
 mod tests {
     use super::*;

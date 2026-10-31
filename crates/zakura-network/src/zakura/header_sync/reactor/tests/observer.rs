@@ -510,7 +510,10 @@ async fn handled_follows_the_callbacks_effects() {
     let seeded = active(&reactor, &peer);
     recorder.take();
 
-    assert_eq!(StorageDispatch::Started, reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    assert_eq!(
+        StorageDispatch::Started,
+        reactor.dispatch_action(apply_operation(&reactor, &peer))
+    );
     complete_next(&mut reactor).await;
 
     assert_eq!(
@@ -789,7 +792,10 @@ async fn port_panic_before_and_after_submission() {
         let seeded = active(&reactor, &peer);
         recorder.take();
 
-        assert_eq!(StorageDispatch::Started, reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        assert_eq!(
+            StorageDispatch::Started,
+            reactor.dispatch_action(apply_operation(&reactor, &peer))
+        );
         complete_next(&mut reactor).await;
 
         assert_eq!(
@@ -853,7 +859,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     observer.recorder.take();
 
-    assert_eq!(StorageDispatch::Started, reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    assert_eq!(
+        StorageDispatch::Started,
+        reactor.dispatch_action(apply_operation(&reactor, &peer))
+    );
     let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
         .catch_unwind()
         .await;
@@ -901,7 +910,10 @@ async fn observer_panic_unwinds_with_its_own_payload() {
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
 
-        assert_eq!(StorageDispatch::Started, reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        assert_eq!(
+            StorageDispatch::Started,
+            reactor.dispatch_action(apply_operation(&reactor, &peer))
+        );
         let payload = AssertUnwindSafe(reactor.pending_port_operations.next())
             .catch_unwind()
             .await

@@ -26,13 +26,13 @@ use zakura_network::{
         wire_codec::{decode_frame, encode_frame},
         zakura_protocol_for_alpn, AuxSchema, Credit, FullStateFrontiers, HeaderEntry,
         HeaderSyncService, HeaderSyncStartup, MessageRule, Peer, Service, ServicePeerDirection,
-        ServiceRegistry, StreamPrelude, TransportEvent, TransportObserver, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraEndpoint, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId,
-        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace, CONTROL_ACK_MAGIC,
-        CONTROL_HELLO_MAGIC, CONTROL_VERSION, LOCAL_MAX_MESSAGE_BYTES, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_STREAM_HEADER_SYNC,
+        ServiceRegistry, SessionStep, StreamPrelude, TransportEvent, TransportObserver,
+        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
+        ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
+        CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, LOCAL_MAX_MESSAGE_BYTES,
+        P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
     },
     Config,
 };
@@ -1192,9 +1192,11 @@ fn codec_builds_every_row_from_outside_the_crate() {
     );
 }
 
-/// The handshake, registration, a refused stream and the header stream's
-/// admission are each observed, keyed as the identity rules say: the
-/// handshake by the remote address, the rest by the registered connection.
+/// The handshake, registration, a refused stream, the header stream's
+/// admission and its session's lifecycle are each observed, keyed as the
+/// identity rules say: the handshake by the remote address, the rest by the
+/// registered connection. The peer opened the session, so its generation names
+/// no local attempt.
 #[test]
 fn a_connection_is_observed_from_handshake_to_admission() {
     // Kind 4 is discovery, which this node doesn't register.
@@ -1217,6 +1219,9 @@ fn a_connection_is_observed_from_handshake_to_admission() {
         panic!("the other stream is refused before admission: {events:?}");
     };
     assert_ne!(refused, quic_stream);
+    let TransportEvent::Admitted { session_id, .. } = events[4] else {
+        panic!("the header stream is admitted once its member arrives: {events:?}");
+    };
     assert_eq!(
         events,
         vec![
@@ -1237,18 +1242,31 @@ fn a_connection_is_observed_from_handshake_to_admission() {
                 version: 2,
                 reason: "unknown_kind",
             },
+            TransportEvent::SessionLifecycle {
+                conn_id,
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                step: SessionStep::MemberArrived {
+                    wire_id: 0,
+                    member: ZAKURA_STREAM_HEADER_SYNC,
+                },
+            },
             TransportEvent::Admitted {
                 conn_id,
                 quic_stream,
                 kind: ZAKURA_STREAM_HEADER_SYNC,
                 version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-                session_id: match events[3] {
-                    TransportEvent::Admitted { session_id, .. } => session_id,
-                    _ => panic!("the header stream is admitted last: {events:?}"),
-                },
+                session_id,
                 negotiated_limits: limits.clamp(&limits.initial_limits()),
                 inbound_depth: 4,
                 outbound_depth: usize::from(limits.max_inbound_queue_depth),
+            },
+            TransportEvent::SessionLifecycle {
+                conn_id,
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                step: SessionStep::GenerationInstalled {
+                    generation: session_id,
+                    attempt: None,
+                },
             },
         ]
     );

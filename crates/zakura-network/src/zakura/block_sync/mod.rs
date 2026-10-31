@@ -73,8 +73,9 @@ mod work_queue;
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchReceiptBatch,
-    BenchSequencerHandle, BenchSubmissions, BenchSubmit, SequencerProgress, WorkRequestEnd,
+    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchBudgetReceipts,
+    BenchCommitter, BenchReceiptBatch, BenchSequencerHandle, BenchSubmissions, BenchSubmit,
+    SequencerProgress, WorkRequestEnd,
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;

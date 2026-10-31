@@ -2,7 +2,9 @@
 #![allow(missing_docs)]
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use zakura_network::zakura::{bench_work_request, BenchReceiptBatch, WorkRequestEnd};
+use zakura_network::zakura::{
+    bench_work_request, BenchBudgetReceipts, BenchReceiptBatch, WorkRequestEnd,
+};
 
 fn request_lifetimes(c: &mut Criterion) {
     let mut group = c.benchmark_group("block_work_ownership");
@@ -40,5 +42,25 @@ fn matched_receipts(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, request_lifetimes, matched_receipts);
+fn budget_receipts(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block_budget_receipts");
+    for count in [1, 16, 128] {
+        group.throughput(Throughput::Elements(u64::from(count)));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter_batched_ref(
+                || BenchBudgetReceipts::new(count, 4096),
+                BenchBudgetReceipts::release_all,
+                BatchSize::NumIterations(16),
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    request_lifetimes,
+    matched_receipts,
+    budget_receipts
+);
 criterion_main!(benches);

@@ -6,7 +6,7 @@ use zakura_chain::block;
 use zakura_rt::sync::CancellationToken;
 
 use super::super::{request::BlockSizeEstimate, work_queue::WorkQueue};
-use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
+use crate::zakura::transport::{ByteBudget, ByteReservation, FrameWriteClaim};
 
 /// The endpoint of a benchmark request's lifetime.
 #[derive(Clone, Copy, Debug)]
@@ -168,6 +168,48 @@ impl BenchReceiptBatch {
                 .expect("the request owns the height");
             assert_eq!(ended.charge, u64::from(self.bytes));
             drop(ended);
+        }
+        assert_eq!(self.budget.reserved(), 0);
+    }
+}
+
+/// Funded receipts prepared without queue metadata or locking.
+pub struct BenchBudgetReceipts {
+    budget: ByteBudget,
+    funding: ByteReservation,
+    count: u32,
+    bytes: u32,
+}
+
+impl BenchBudgetReceipts {
+    /// Acquire the same aggregate funding that a published queue owns.
+    pub fn new(count: u32, bytes: u32) -> Self {
+        assert!(count > 0 && bytes > 0);
+        let total = u64::from(count) * u64::from(bytes);
+        let budget = ByteBudget::new(total);
+        let funding = budget
+            .reserve_owned(total)
+            .expect("the budget starts empty");
+        Self {
+            budget,
+            funding,
+            count,
+            bytes,
+        }
+    }
+
+    /// Transfer and release each receipt without entering a queue transition.
+    pub fn release_all(&mut self) {
+        assert_eq!(
+            self.budget.reserved(),
+            u64::from(self.count) * u64::from(self.bytes)
+        );
+        for _ in 0..self.count {
+            let receipt = self
+                .funding
+                .split(u64::from(self.bytes))
+                .expect("each receipt is funded");
+            drop(receipt);
         }
         assert_eq!(self.budget.reserved(), 0);
     }

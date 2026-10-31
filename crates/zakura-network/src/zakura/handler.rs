@@ -3,8 +3,9 @@
 mod service_session;
 mod trace;
 use service_session::{
-    may_open_ordered_stream, spawn_service_session, ConnectionRoles, DemandChange, DemandWait,
-    PendingSessions, PreparedStream, RemoteCompletion, ServiceSessionState, SessionExit, SetupIo,
+    may_open_ordered_stream, spawn_service_session, trace_session_step, ConnectionRoles,
+    DemandChange, DemandWait, PendingSessions, PreparedStream, RemoteCompletion,
+    ServiceSessionState, SessionExit, SetupIo,
 };
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
@@ -76,7 +77,7 @@ use crate::{
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
         FrameRejection, FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncPassthroughService,
         HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRule, Peer, RealClock, Service,
-        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
+        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionStep, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
         StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
         ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
         ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
@@ -2810,6 +2811,16 @@ impl ZakuraProtocolHandler {
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
+                let attempt = service_sessions
+                    .get_mut(&stream.kind)
+                    .expect("selected stream has negotiated session state")
+                    .begin_attempt();
+                trace_session_step(
+                    &conn,
+                    &close_cause,
+                    stream.kind,
+                    SessionStep::AttemptStarted { attempt },
+                );
                 let admitted = match self
                     .open_service_session(
                         &connection,
@@ -2832,6 +2843,12 @@ impl ZakuraProtocolHandler {
                 {
                     Ok(admitted) => admitted,
                     Err(ZakuraHandlerError::SessionFull) => {
+                        trace_session_step(
+                            &conn,
+                            &close_cause,
+                            stream.kind,
+                            SessionStep::AttemptFailed { attempt },
+                        );
                         // Demand is advisory: another connection can reserve the
                         // last slot before this open. Retry only this service.
                         session_io.schedule_transport_backoff(
@@ -2842,6 +2859,12 @@ impl ZakuraProtocolHandler {
                         continue;
                     }
                     Err(error) => {
+                        trace_session_step(
+                            &conn,
+                            &close_cause,
+                            stream.kind,
+                            SessionStep::AttemptFailed { attempt },
+                        );
                         debug!(
                             ?error,
                             stream_kind = stream.kind,
@@ -2861,6 +2884,15 @@ impl ZakuraProtocolHandler {
                     .get_mut(&admitted.kind)
                     .expect("opened ordered stream was selected from negotiated session state")
                     .opened(admitted.session_id);
+                trace_session_step(
+                    &conn,
+                    &close_cause,
+                    admitted.kind,
+                    SessionStep::GenerationInstalled {
+                        generation: admitted.session_id,
+                        attempt: Some(attempt),
+                    },
+                );
                 session_io.cancel(admitted.kind);
                 service_streams.extend(admitted.into_service_streams());
             }
@@ -2924,6 +2956,16 @@ impl ZakuraProtocolHandler {
                     let Some(session) = service_sessions.get_mut(&exited.stream.kind) else {
                         continue;
                     };
+                    trace_session_step(
+                        &conn,
+                        &close_cause,
+                        exited.stream.kind,
+                        SessionStep::GenerationExited {
+                            generation: exited.session_id,
+                            opened_locally: exited.opened_locally,
+                            current: session.records(exited),
+                        },
+                    );
                     if let Some(delay) =
                         session.exited(exited, connection_token.is_cancelled())
                     {
@@ -2963,6 +3005,13 @@ impl ZakuraProtocolHandler {
                         }
                     }
 
+                    let attempt = session.begin_attempt();
+                    trace_session_step(
+                        &conn,
+                        &close_cause,
+                        stream.kind,
+                        SessionStep::AttemptStarted { attempt },
+                    );
                     match self
                         .open_service_session(
                             &connection,
@@ -2988,6 +3037,15 @@ impl ZakuraProtocolHandler {
                                 .get_mut(&admitted.kind)
                                 .expect("opened ordered stream has negotiated session state");
                             session.opened(admitted.session_id);
+                            trace_session_step(
+                                &conn,
+                                &close_cause,
+                                admitted.kind,
+                                SessionStep::GenerationInstalled {
+                                    generation: admitted.session_id,
+                                    attempt: session.local_attempt(),
+                                },
+                            );
                             session_io.cancel(admitted.kind);
                             let service_streams = admitted.into_service_streams();
                             let admitted_capabilities = self.registry.add_escalated_peer(
@@ -3005,6 +3063,12 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
+                            trace_session_step(
+                                &conn,
+                                &close_cause,
+                                stream.kind,
+                                SessionStep::AttemptFailed { attempt },
+                            );
                             let delay = session_io.schedule_transport_backoff(
                                 service_sessions
                                     .get_mut(&stream.kind)
@@ -3075,6 +3139,14 @@ impl ZakuraProtocolHandler {
                                     stream_kind = kind,
                                     "winning ordered-stream collision; parking peer's duplicate"
                                 );
+                                trace_session_step(
+                                    &conn,
+                                    &close_cause,
+                                    kind,
+                                    SessionStep::GenerationParked {
+                                        generation: admitted.session_id,
+                                    },
+                                );
                                 admitted.cancel_token.cancel();
                                 continue;
                             }
@@ -3102,6 +3174,14 @@ impl ZakuraProtocolHandler {
                                 stream_kind = kind,
                                 "locally parking ordered service stream because the service has no demand"
                             );
+                            trace_session_step(
+                                &conn,
+                                &close_cause,
+                                kind,
+                                SessionStep::GenerationParked {
+                                    generation: admitted.session_id,
+                                },
+                            );
                             // We are not adopting it after all, so this kind
                             // is free again -- both for a later re-offer by
                             // the peer and for the demand re-check below.
@@ -3116,6 +3196,15 @@ impl ZakuraProtocolHandler {
 
                         session.remote_adopted();
                         session_io.cancel(kind);
+                        trace_session_step(
+                            &conn,
+                            &close_cause,
+                            kind,
+                            SessionStep::GenerationInstalled {
+                                generation: admitted.session_id,
+                                attempt: None,
+                            },
+                        );
                         let service_streams = admitted.into_service_streams();
                         // We keep the full accepted capability context so
                         // discovery can make cross-service ownership

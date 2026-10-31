@@ -5,7 +5,7 @@
 //! Single-stream sessions retain their existing prelude without a wire identifier.
 
 use super::*;
-use crate::zakura::transport::SessionLayout;
+use crate::zakura::{transport::SessionLayout, SessionStep};
 use zakura_node_services::task::erased;
 use zakura_rt::sync::Barrier;
 
@@ -167,6 +167,17 @@ impl PendingSessions {
 
     /// Expiry releases every arrived member and briefly defers another offer.
     pub(super) fn expire(&mut self, now: Instant) {
+        for (kind, wire_id) in self.state.expiring(now) {
+            let arrived = self.streams.get(&kind).and_then(|arrived| arrived.first());
+            if let Some(member) = arrived {
+                trace_session_step(
+                    &member.context.conn,
+                    &member.context.close_cause,
+                    kind,
+                    SessionStep::OfferExpired { wire_id },
+                );
+            }
+        }
         for kind in self.state.expire(now) {
             self.streams.remove(&kind);
         }
@@ -180,6 +191,15 @@ impl PendingSessions {
         incoming: PreparedStream,
     ) -> Result<Option<Vec<PreparedStream>>, ZakuraHandlerError> {
         let kind = layout.primary().kind;
+        trace_session_step(
+            &incoming.context.conn,
+            &incoming.context.close_cause,
+            kind,
+            SessionStep::MemberArrived {
+                wire_id: id,
+                member: incoming.stream.kind,
+            },
+        );
         // Every outcome except `Waiting` drops the arrived members.
         let mut arrived = self.streams.remove(&kind).unwrap_or_default();
         let arrival = self.state.arrive(
@@ -203,6 +223,31 @@ impl PendingSessions {
             }
         }
     }
+}
+
+/// Record one lifecycle step under the identity that names it.
+pub(super) fn trace_session_step(
+    conn: &ZakuraConnTrace,
+    close_cause: &CloseCause,
+    kind: u16,
+    step: SessionStep,
+) {
+    conn.trace_stream(
+        step.label(),
+        step.identity(),
+        Some(stream_kind_label(kind)),
+    );
+    debug!(stream_kind = kind, ?step, "Zakura service session step");
+    #[cfg(any(test, zakura_sim))]
+    if let Some(tap) = close_cause.tap() {
+        tap.emit(crate::zakura::TransportEvent::SessionLifecycle {
+            conn_id: tap.conn_id(),
+            kind,
+            step,
+        });
+    }
+    #[cfg(not(any(test, zakura_sim)))]
+    let _ = close_cause;
 }
 
 /// Run all members independently and report exit only after every worker finishes.

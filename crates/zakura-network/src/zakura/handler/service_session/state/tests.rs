@@ -692,3 +692,51 @@ fn fixed_seeds_exercise_every_session_rule() {
         assert!(count > 0, "no fixed seed exercised {rule}: {total:?}");
     }
 }
+
+/// A trace names the attempt that opened a generation, and only the exit of
+/// that exact generation clears it.
+#[test]
+fn attempts_name_local_generations_and_stale_exits_keep_them() {
+    let roles = ConnectionRoles {
+        is_initiator: true,
+        i_open_collision_winner: true,
+    };
+    let mut session = ServiceSessionState::new(MEMBER_A, REOPEN, roles);
+    let exit = |session_id, opened_locally| SessionExit {
+        stream: MEMBER_A,
+        session_id,
+        opened_locally,
+    };
+
+    assert_eq!(session.begin_attempt(), 1);
+    assert_eq!(session.begin_attempt(), 2, "a failed open keeps its number");
+    session.opened(40);
+    assert_eq!(session.local_attempt(), Some(2));
+
+    for stale in [exit(39, true), exit(40, false)] {
+        assert!(!session.records(stale));
+        assert_eq!(session.exited(stale, false), None);
+        assert_eq!(session.local_attempt(), Some(2));
+    }
+
+    assert!(session.records(exit(40, true)));
+    assert!(session.exited(exit(40, true), false).is_some());
+    assert_eq!(session.local_attempt(), None);
+    assert_eq!(session.begin_attempt(), 3, "reopens keep counting");
+}
+
+/// `expiring` names exactly the offers `expire` drops, by wire ID.
+#[test]
+fn expiring_offers_keep_their_wire_ids() {
+    let layout = layout();
+    let start = Instant::now();
+    let mut pending = PendingState::default();
+    pending
+        .arrive(&layout, 9, MEMBER_A, SETUP_TIMEOUT, start)
+        .unwrap();
+    assert_eq!(pending.expiring(start), Vec::new());
+    let deadline = start + SETUP_TIMEOUT;
+    assert_eq!(pending.expiring(deadline), vec![(MEMBER_A.kind, 9)]);
+    assert_eq!(pending.expire(deadline), vec![MEMBER_A.kind]);
+    assert_eq!(pending.expiring(deadline), Vec::new());
+}

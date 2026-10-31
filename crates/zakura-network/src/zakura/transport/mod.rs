@@ -58,8 +58,8 @@ pub use service::CloseCauseReader;
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
-    SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream, StreamMode,
-    StreamQueueDepths, StreamWritePolicy,
+    SessionOpening, SessionPolicy, SessionResources, SessionStep, Sink, SinkReject, Source, Stream,
+    StreamMode, StreamQueueDepths, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};
 #[cfg(any(test, zakura_sim))]

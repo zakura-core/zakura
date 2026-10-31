@@ -100,6 +100,16 @@ impl PendingState {
         self.sessions.values().map(|session| session.deadline).min()
     }
 
+    /// The kind and wire ID of every offer that [`Self::expire`] would drop at
+    /// `now`.
+    pub(in crate::zakura::handler) fn expiring(&self, now: Instant) -> Vec<(u16, u64)> {
+        self.sessions
+            .iter()
+            .filter(|(_, session)| session.deadline <= now)
+            .map(|(kind, session)| (*kind, session.id))
+            .collect()
+    }
+
     /// Drop every offer whose deadline has passed and defer another offer of
     /// its service. Returns the kinds of the dropped offers.
     pub(in crate::zakura::handler) fn expire(&mut self, now: Instant) -> Vec<u16> {
@@ -257,6 +267,10 @@ pub(in crate::zakura::handler) struct ServiceSessionState {
     // turn persistent refusal into a base-delay reopen loop.
     reopen_attempts: u32,
     reopen_state: SessionReopenState,
+    /// Local opens started on this connection, which name each attempt in traces.
+    open_attempts: u64,
+    /// The attempt that opened the active local generation.
+    local_attempt: Option<u64>,
 }
 
 impl ServiceSessionState {
@@ -274,7 +288,30 @@ impl ServiceSessionState {
             remote_session_id: None,
             reopen_attempts: 0,
             reopen_state: SessionReopenState::Idle,
+            open_attempts: 0,
+            local_attempt: None,
         }
+    }
+
+    /// Name a new local open. Returns its attempt, counted from 1.
+    pub(in crate::zakura::handler) fn begin_attempt(&mut self) -> u64 {
+        self.open_attempts = self.open_attempts.saturating_add(1);
+        self.open_attempts
+    }
+
+    /// The attempt that opened the active local generation.
+    pub(in crate::zakura::handler) fn local_attempt(&self) -> Option<u64> {
+        self.local_attempt
+    }
+
+    /// Whether `exit` names a generation the state still records.
+    pub(in crate::zakura::handler) fn records(&self, exit: SessionExit) -> bool {
+        let active = if exit.opened_locally {
+            self.local_session_id
+        } else {
+            self.remote_session_id
+        };
+        active == Some(exit.session_id)
     }
 
     /// The service's primary stream.
@@ -313,6 +350,7 @@ impl ServiceSessionState {
     pub(in crate::zakura::handler) fn opened(&mut self, session_id: u64) {
         self.cancel_wait();
         self.local_session_id = Some(session_id);
+        self.local_attempt = Some(self.open_attempts);
     }
 
     /// Record a complete inbound generation, unless this endpoint wins the
@@ -394,6 +432,9 @@ impl ServiceSessionState {
         }
 
         *active_session = None;
+        if opened_locally {
+            self.local_attempt = None;
+        }
         true
     }
 

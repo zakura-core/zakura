@@ -21,7 +21,7 @@ pub(crate) struct SlotBudgetCapacityError {
 /// admitted item makes ordinary drop and cancellation release capacity.
 #[derive(Clone, Debug)]
 pub(crate) struct SlotBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     capacity: usize,
     permits: Arc<Semaphore>,
 }
@@ -37,7 +37,7 @@ impl SlotBudget {
         }
 
         Ok(Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz"))]
             capacity,
             permits: Arc::new(Semaphore::new(capacity)),
         })
@@ -50,7 +50,7 @@ impl SlotBudget {
     }
 
     /// Return the number of currently owned slots.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(crate) fn reserved(&self) -> usize {
         self.capacity
             .saturating_sub(self.permits.available_permits())
@@ -65,7 +65,7 @@ impl SlotBudget {
     /// This does not change capacity or release any reserved slots.
     pub(super) fn downgrade(&self) -> WeakSlotBudget {
         WeakSlotBudget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz"))]
             capacity: self.capacity,
             permits: downgrade(&self.permits),
         }
@@ -220,7 +220,7 @@ pub(crate) struct SlotPermit {
 /// can then remove the stale entry.
 #[derive(Debug)]
 pub(super) struct WeakSlotBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     capacity: usize,
     permits: Weak<Semaphore>,
 }
@@ -236,7 +236,7 @@ impl WeakSlotBudget {
     /// This never creates a new pool or resets its available capacity.
     pub(super) fn upgrade(&self) -> Option<SlotBudget> {
         Some(SlotBudget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz"))]
             capacity: self.capacity,
             permits: self.permits.upgrade()?,
         })

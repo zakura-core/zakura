@@ -1,0 +1,9 @@
+harness = "header/publisher-policy"
+generator = 1
+sha256 = "d873835827624015735be3ddf3be8fef8a25af2e62ffe5532d1297aa7887525b"
+scenario_sha256 = "1a296e95f8a7cbf4098d2a3eb311092960f3c5e3199d169eabe86768dcfffb5e"
+source = "crates/zakura-sim/tests/replay_exact.rs"
+
+[[witness]]
+property = "header/publisher-policy"
+expect = "holds"

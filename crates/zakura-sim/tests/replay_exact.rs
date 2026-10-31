@@ -1210,6 +1210,41 @@ fn reactor_machine_records_and_replays_without_transport() {
     ));
 }
 
+const PUBLISHER_INPUT: &[u8] = include_bytes!("fixtures/header-publisher-policy.bin");
+
+#[test]
+fn publisher_machine_records_and_replays_without_transport() {
+    let name = "header/publisher-policy";
+    let dir = record_named(name, PUBLISHER_INPUT);
+    let trace = open(dir.path());
+    (harness::find(name).unwrap().witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        name,
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), PUBLISHER_INPUT.len().div_ceil(4));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:header-publisher:")));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+
+    edit(dir.path(), |lines| {
+        step(lines, 3)["machine"]["step"]["actual"]["slots"] = json!(999);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 3,
+            field: "machine"
+        })
+    ));
+}
+
 #[test]
 fn reactor_machine_preserves_empty_and_short_inputs() {
     for input in [&[][..], &[0, 0][..], REACTOR_INPUT] {

@@ -438,6 +438,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 /// Every harness, by name.
 pub static HARNESSES: &[HarnessEntry] = &[
     header_work::REACTOR_ENTRY,
+    header_work::PUBLISHER_ENTRY,
     entry::<fixtures::Race<fixtures::LostUpdate>>(),
     entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
     entry::<fixtures::Race<fixtures::MissedNotify>>(),

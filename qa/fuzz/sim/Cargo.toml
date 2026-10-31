@@ -14,6 +14,7 @@ discovery_wait_complete = "discovery/wait-complete"
 header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
 header_reactor_policy = "header/reactor-policy"
+header_publisher_policy = "header/publisher-policy"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -60,6 +61,13 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "header_publisher_policy"
+path = "fuzz_targets/header_publisher_policy.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "header_reactor_policy"

@@ -583,3 +583,27 @@ async fn orphan_flood_with_unavailable_parents_is_bounded() {
         usize::from(ORPHANS) + MAX_PARENT_RECOVERIES
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn dropping_downloads_cancels_child_and_parent_recovery() {
+    let child = block_2();
+    let mut harness = Harness::new([child.clone()]);
+    harness
+        .downloads
+        .download_and_verify(child.hash(), Some(legacy(2)));
+    harness.next_request().await;
+    harness.next_request().await;
+    let Harness {
+        downloads,
+        mut requests,
+        mut commits,
+        ..
+    } = harness;
+    drop(downloads);
+    tokio::time::timeout(EXPECTED_WAIT, async {
+        assert!(requests.recv().await.is_none());
+        assert!(commits.recv().await.is_none());
+    })
+    .await
+    .expect("dropping downloads cancels every task and releases its services");
+}

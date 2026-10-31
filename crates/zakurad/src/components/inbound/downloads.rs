@@ -123,6 +123,9 @@ struct DownloadTask {
 /// What happened when an advertised child revealed that its parent is missing.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ParentRecovery {
+    /// The downloads stream has shut down.
+    Closed,
+
     /// The parent already has an inbound download, which the child now waits on.
     Attached,
 
@@ -142,6 +145,7 @@ enum ParentRecovery {
 impl ParentRecovery {
     fn metric_label(self) -> &'static str {
         match self {
+            Self::Closed => "closed",
             Self::Attached => "attached",
             Self::Requested => "requested",
             Self::TooManyRecoveries => "too_many_recoveries",
@@ -327,6 +331,9 @@ const MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 /// known, and the parent's download must be deduplicated against every other inbound download.
 #[derive(Debug, Default)]
 struct Admission {
+    /// The downloads stream has shut down and accepts no further recoveries.
+    closed: bool,
+
     /// Cancellation handles for admitted tasks, keyed by block hash. The optional source is
     /// recorded so completion can clear [`Self::source_counts`] and [`Self::source_locks`].
     ///
@@ -426,7 +433,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
 }
 
 /// Manages download and verification of blocks gossiped to this peer.
-#[pin_project]
+#[pin_project(PinnedDrop)]
 #[derive(Debug)]
 pub struct Downloads<ZN, ZV, ZS>
 where
@@ -455,6 +462,27 @@ where
 
     /// Re-request budgets for gossiped hashes whose body was rejected as poisoned.
     poisoned_retries: PoisonedRetryBudgets,
+}
+
+#[pin_project::pinned_drop]
+impl<ZN, ZV, ZS> PinnedDrop for Downloads<ZN, ZV, ZS>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+    ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    ZV::Future: Send,
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS::Future: Send,
+{
+    fn drop(self: Pin<&mut Self>) {
+        let mut admission = self.spawner.admission();
+        // Tasks retain the admission state, so the stream must cancel them explicitly.
+        admission.closed = true;
+        admission.cancel_handles.clear();
+    }
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -791,6 +819,10 @@ where
     ) -> ParentRecovery {
         let mut admission = self.admission();
 
+        if admission.closed {
+            return ParentRecovery::Closed;
+        }
+
         if admission.cancel_handles.contains_key(&parent) {
             return ParentRecovery::Attached;
         }
@@ -822,8 +854,7 @@ where
         admission.parent_recoveries.insert(parent, charged_source);
         drop(admission);
 
-        // A closed channel means the stream was dropped, which also dropped this task's
-        // cancel handle, so the task stops by itself.
+        // Dropping the stream closes admission and drops every cancellation sender.
         let _ = self.spawned_sender.send(task);
 
         ParentRecovery::Requested

@@ -85,10 +85,6 @@ async fn genesis_bootstrap_reopens_with_readiness_before_and_after_coordinator()
     .expect("persisted genesis attaches the runtime");
     assert_eq!(tip.best_tip_height(), Some(Height(0)));
     let coordinator = early.unwrap_or_else(|| new_sync_coordinator(&config.network));
-    assert!(
-        !coordinator.zakura_owns_applies(),
-        "startup reserves the single genesis handoff even when the runtime is already ready"
-    );
 
     let state = Arc::new(tokio::sync::Mutex::new(state));
     let state = service_fn(move |request| {

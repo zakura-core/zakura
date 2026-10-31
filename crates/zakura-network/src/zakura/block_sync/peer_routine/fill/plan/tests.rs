@@ -5,6 +5,11 @@
 //! can take the probed floor height between the probe and the take. An
 //! independent model checks each decision. It never calls the planners or the
 //! admission helpers they use.
+//!
+//! Production requests one block at a time (`BS_BLOCKS_PER_RESPONSE`), so a
+//! production take holds one item. The tests prefixed `multi_item_` exercise
+//! planner behavior for longer takes, which the wire protocol permits but no
+//! current production path reaches. They do not claim production reachability.
 
 use std::collections::BTreeMap;
 
@@ -13,8 +18,10 @@ use proptest::prelude::*;
 use super::*;
 use crate::zakura::{
     block_sync::{
-        config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES, request::BlockSizeEstimate,
-        test_work_scope, work_queue::WorkQueue,
+        config::{BS_BLOCKS_PER_RESPONSE, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
+        request::BlockSizeEstimate,
+        test_work_scope,
+        work_queue::WorkQueue,
     },
     transport::ByteBudget,
 };
@@ -510,10 +517,24 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2048))]
 
+    /// Every production take: one block, because the production request cap
+    /// is `BS_BLOCKS_PER_RESPONSE`.
+    #[test]
+    fn one_block_fill_attempt_decisions_match_an_independent_model(
+        mut scenario in scenario(),
+    ) {
+        scenario.max_count = usize::try_from(BS_BLOCKS_PER_RESPONSE).unwrap();
+        let attempt = attempt(&ZakuraBlockSyncConfig::default(), &scenario);
+        check(&scenario, &attempt);
+        if let Ok((_, items)) = &attempt.selected {
+            prop_assert_eq!(items.len(), 1);
+        }
+    }
+
     /// Lane selection, retry filtering, and funding match an independent model,
     /// including when another routine takes the probed floor height first.
     #[test]
-    fn fill_attempt_decisions_match_an_independent_model(scenario in scenario()) {
+    fn multi_item_fill_attempt_decisions_match_an_independent_model(scenario in scenario()) {
         let config = ZakuraBlockSyncConfig::default();
         check(&scenario, &attempt(&config, &scenario));
     }
@@ -567,7 +588,7 @@ fn worked_scenario(pending: &[u32]) -> Scenario {
 /// The floor lane probes height 1, and another routine takes it before the
 /// take. The floor lane's take gets 3..=5, which funds as above-floor work.
 #[test]
-fn a_raced_floor_probe_funds_the_run_it_actually_took() {
+fn multi_item_a_raced_floor_probe_funds_the_run_it_actually_took() {
     let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[1, 3, 4, 5]);
     scenario.floor_raced = true;
@@ -586,7 +607,7 @@ fn a_raced_floor_probe_funds_the_run_it_actually_took() {
 /// The retry filter removes the floor item, so the retained run starts above
 /// the floor-rescue window and funds as above-floor work.
 #[test]
-fn a_retry_filter_that_removes_the_floor_item_funds_above_floor() {
+fn multi_item_a_retry_filter_that_removes_the_floor_item_funds_above_floor() {
     let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[1, 2, 3, 4]);
     scenario.facts = [(1, RetryFact::Avoided), (2, RetryFact::ProtocolBlocked)].into();

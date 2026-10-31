@@ -177,7 +177,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     use tokio::time::timeout;
     use tower::ServiceExt;
     use zakura_node_services::block_memory::{
-        model::TransactionProbe, TransactionAdmissionFailure, TransactionHandle,
+        model::PayloadProbe, PayloadAdmissionFailure, TransactionHandle,
     };
 
     let _guard = zakura_test::init();
@@ -223,7 +223,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     let TransactionHandle::Standalone(owner) = &result.tx else {
         panic!("disk transaction results carry standalone admission")
     };
-    let probe = TransactionProbe::new(owner);
+    let probe = PayloadProbe::new(owner);
     let retained = result.tx.clone();
     drop(result);
     assert_eq!(probe.holders(), 1);
@@ -238,7 +238,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     );
     assert_eq!(
         read.db.clone().transaction(hash).unwrap_err(),
-        TransactionAdmissionFailure::Capacity
+        PayloadAdmissionFailure::Capacity
     );
     let error = timeout(
         deadline,
@@ -248,13 +248,13 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     .unwrap()
     .unwrap_err();
     assert_eq!(
-        error.downcast_ref::<TransactionAdmissionFailure>(),
-        Some(&TransactionAdmissionFailure::Capacity)
+        error.downcast_ref::<PayloadAdmissionFailure>(),
+        Some(&PayloadAdmissionFailure::Capacity)
     );
     let mut refused = read.db.transactions_by_height(Height(0));
     assert_eq!(
         refused.next().unwrap().unwrap_err(),
-        TransactionAdmissionFailure::Capacity
+        PayloadAdmissionFailure::Capacity
     );
     assert!(
         refused.next().is_none(),
@@ -274,7 +274,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
         .unwrap_err();
     assert!(matches!(
         error,
-        FormatChangeError::TransactionAdmission(TransactionAdmissionFailure::Capacity)
+        FormatChangeError::PayloadAdmission(PayloadAdmissionFailure::Capacity)
     ));
     use crate::service::read::historical_tree::{
         replay_with_subtrees, DerivedFrontiers, HistoricalTreeDerivationError,
@@ -286,8 +286,8 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     };
     assert!(matches!(
         replay(),
-        Err(HistoricalTreeDerivationError::TransactionAdmission(
-            TransactionAdmissionFailure::Capacity
+        Err(HistoricalTreeDerivationError::PayloadAdmission(
+            PayloadAdmissionFailure::Capacity
         ))
     ));
     drop(retained);
@@ -316,12 +316,12 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     assert_eq!(transaction.hash(), hash);
     assert_eq!(
         read.db.transaction(hash).unwrap_err(),
-        TransactionAdmissionFailure::Capacity
+        PayloadAdmissionFailure::Capacity
     );
     let TransactionHandle::Standalone(owner) = &transaction else {
         panic!("decoded iterators return admitted owners")
     };
-    let probe = TransactionProbe::new(owner);
+    let probe = PayloadProbe::new(owner);
     drop(transactions);
     drop(state);
     drop(read);
@@ -331,6 +331,158 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     drop(transaction);
     assert_eq!(probe.holders(), 0);
     assert_eq!(pool.available_slots(), 1);
+}
+
+/// Header and serialized block results retain shared admission through final holders.
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_header_and_raw_block_results_keep_shared_admission() {
+    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use std::{num::NonZeroU16, time::Duration};
+    use tokio::time::timeout;
+    use tower::ServiceExt;
+    use zakura_node_services::block_memory::{
+        model::PayloadProbe, HeaderHandle, PayloadAdmissionFailure,
+    };
+
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let config = Config {
+        read_header_limit: NonZeroU16::MIN,
+        read_raw_block_limit: NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        deadline,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let height_zero = crate::HashOrHeight::Height(Height(0));
+    let header_read = ReadRequest::BlockHeader(height_zero);
+    let ReadResponse::BlockHeader { header, .. } =
+        timeout(deadline, read.clone().oneshot(header_read.clone()))
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("the stored genesis header is available")
+    };
+    assert_eq!(*header, *genesis.header);
+    let pool = read.db.read_headers.clone();
+    assert_eq!(
+        pool.available_slots(),
+        0,
+        "a returned disk header must retain admission"
+    );
+    let HeaderHandle::Standalone(owner) = &header else {
+        panic!("disk header results carry standalone admission")
+    };
+    let probe = PayloadProbe::new(owner);
+    let clone = header.clone();
+    drop(header);
+    assert_eq!(probe.holders(), 1);
+    assert_eq!(
+        probe.serialized_bytes(),
+        Some(genesis.header.zcash_serialized_size())
+    );
+    assert_eq!(pool.available_slots(), 0, "live clones retain admission");
+    let error = timeout(deadline, read.clone().oneshot(header_read))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<PayloadAdmissionFailure>(),
+        Some(&PayloadAdmissionFailure::Capacity)
+    );
+    let error = timeout(
+        deadline,
+        read.clone().oneshot(ReadRequest::FindBlockHeaders {
+            known_blocks: vec![],
+            stop: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<PayloadAdmissionFailure>(),
+        Some(&PayloadAdmissionFailure::Capacity),
+        "an empty Find response cannot hide a capacity refusal"
+    );
+    // Chain-context reads and control queries stay available at full capacity.
+    assert!(read.db.block_header(height_zero).is_some());
+    timeout(deadline, read.clone().oneshot(ReadRequest::Tip))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(clone);
+    assert_eq!(probe.holders(), 0);
+    assert_eq!(pool.available_slots(), 1);
+    assert!(read
+        .db
+        .block_header_result(crate::HashOrHeight::Height(Height(9)))
+        .unwrap()
+        .is_none());
+    assert_eq!(pool.available_slots(), 1);
+
+    let raw_pool = read.db.read_raw_blocks.clone();
+    let raw = read.db.raw_block_result(height_zero).unwrap().unwrap();
+    assert_eq!(
+        raw.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice()
+    );
+    assert_eq!(
+        raw_pool.available_slots(),
+        0,
+        "a serialized block result must retain admission"
+    );
+    assert_eq!(
+        read.db.raw_block_result(height_zero).unwrap_err(),
+        PayloadAdmissionFailure::Capacity
+    );
+    #[cfg(feature = "indexer")]
+    {
+        let error = timeout(
+            deadline,
+            read.clone().oneshot(ReadRequest::RawBlocksByHeightRange {
+                start: Height(0),
+                count: 1,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<PayloadAdmissionFailure>(),
+            Some(&PayloadAdmissionFailure::Capacity),
+            "a short range means the chain ended, so refusal stays explicit"
+        );
+    }
+    let probe = PayloadProbe::new(&raw);
+    let clone = raw.clone();
+    drop(raw);
+    assert_eq!(probe.holders(), 1);
+    drop(state);
+    drop(read);
+    assert_eq!(
+        raw_pool.available_slots(),
+        0,
+        "database teardown keeps the charge"
+    );
+    assert_eq!(clone.len(), genesis.zcash_serialized_size());
+    drop(clone);
+    assert_eq!(probe.holders(), 0);
+    assert_eq!(raw_pool.available_slots(), 1);
 }
 
 /// Index migration reads progress when four workers share one decode slot.
@@ -544,8 +696,10 @@ fn test_block_db_round_trip_with(
         // order in multi-transaction blocks.
         assert_eq!(
             state
-                .raw_block_bytes(finalized.height.into())
-                .expect("raw block was stored at height"),
+                .raw_block_result(finalized.height.into())
+                .unwrap()
+                .expect("raw block was stored at height")
+                .to_vec(),
             original_block
                 .zcash_serialize_to_vec()
                 .expect("serialization to vec never fails"),

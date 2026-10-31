@@ -32,7 +32,7 @@ use crate::{
         check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
         finalized_state::ZakuraDb,
         non_finalized_state::{Chain, NonFinalizedState},
-        read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
+        read::{self, block::block_header_result, FINALIZED_STATE_QUERY_RETRIES},
     },
     BoxError, KnownBlock,
 };
@@ -539,14 +539,18 @@ where
 /// Returns a list of [`block::Header`]s in the chain,
 /// following the `intersection` with the chain.
 ///
-/// See [`find_chain_hashes()`] for details.
+/// See [`find_chain_hashes()`] for details. Exhausted capacity shortens a non-empty
+/// response, which the Find protocol permits, and fails an empty one.
 fn collect_chain_headers<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     intersection: Option<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<zakura_node_services::block_memory::HeaderHandle>
+) -> Result<
+    Vec<zakura_node_services::block_memory::HeaderHandle>,
+    zakura_node_services::block_memory::PayloadAdmissionFailure,
+>
 where
     C: AsRef<Chain>,
 {
@@ -560,8 +564,13 @@ where
 
     // All the headers should be in the chain.
     // If they are not, we don't want to return them.
-    height_range.into_iter().map_while(|height| {
-        let header = block_header(chain, db, Height(height).into());
+    let mut headers = Vec::new();
+    for height in height_range {
+        let header = match block_header_result(chain, db, Height(height).into()) {
+            Ok(header) => header,
+            Err(_) if !headers.is_empty() => break,
+            Err(error) => return Err(error),
+        };
 
         // A recently committed block dropped the intersection we previously found
         if header.is_none() {
@@ -581,8 +590,12 @@ where
             "adding header to peer Find response",
         );
 
-        header
-    }).collect()
+        let Some(header) = header else {
+            break;
+        };
+        headers.push(header);
+    }
+    Ok(headers)
 }
 
 /// Finds the first hash that's in the peer's `known_blocks` and the chain.
@@ -634,7 +647,10 @@ pub fn find_chain_headers<C>(
     known_blocks: Vec<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<zakura_node_services::block_memory::HeaderHandle>
+) -> Result<
+    Vec<zakura_node_services::block_memory::HeaderHandle>,
+    zakura_node_services::block_memory::PayloadAdmissionFailure,
+>
 where
     C: AsRef<Chain>,
 {

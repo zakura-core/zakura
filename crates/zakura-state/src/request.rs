@@ -1966,7 +1966,7 @@ pub enum ReadRequest {
     ///
     /// Returns
     ///
-    /// [`ReadResponse::RawBlocks(Vec<(block::Height, Vec<u8>)>)`](crate::ReadResponse::RawBlocks).
+    /// [`ReadResponse::RawBlocks`](crate::ReadResponse::RawBlocks), or a capacity error.
     #[cfg(feature = "indexer")]
     RawBlocksByHeightRange {
         /// First height to read.

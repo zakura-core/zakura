@@ -104,7 +104,7 @@ impl DerivedFrontiers {
 pub enum HistoricalTreeDerivationError {
     /// A standalone disk transaction could not acquire decode admission.
     #[error("disk transaction admission failed: {0}")]
-    TransactionAdmission(#[from] zakura_node_services::block_memory::TransactionAdmissionFailure),
+    PayloadAdmission(#[from] zakura_node_services::block_memory::PayloadAdmissionFailure),
 
     /// Disk block decoding or retention exhausted its admission pool.
     #[error("disk block admission failed: {0}")]

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, TransactionAdmissionFailure, TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, PayloadAdmissionFailure, TransactionHandle,
 };
 
 use chrono::{DateTime, Utc};
@@ -98,6 +98,9 @@ where
 
 /// Returns the [`block::Header`] with [`block::Hash`] or
 /// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
+///
+/// Finalized reads take no admission slot, so chain-context work cannot starve.
+/// Use [`block_header_result`] for a header that leaves its read job.
 pub fn block_header<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -118,13 +121,32 @@ where
         .or_else(|| db.block_header(hash_or_height).map(Into::into))
 }
 
+/// Reads a header that leaves its read job. A finalized header retains admission
+/// through its final holder. Capacity refusal is separate from missing data.
+pub fn block_header_result<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<HeaderHandle>, PayloadAdmissionFailure>
+where
+    C: AsRef<Chain>,
+{
+    if let Some(contextual) = chain
+        .as_ref()
+        .and_then(|chain| chain.as_ref().block(hash_or_height))
+    {
+        return Ok(Some(contextual.block.retained_header()));
+    }
+    db.block_header_result(hash_or_height)
+}
+
 /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in the
 /// non-finalized `chain` or finalized `db`.
 fn transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, TransactionAdmissionFailure>
+) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -150,7 +172,7 @@ pub fn mined_transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<MinedTx>, TransactionAdmissionFailure>
+) -> Result<Option<MinedTx>, PayloadAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -173,7 +195,7 @@ pub fn any_transaction<'a>(
     chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<AnyTx>, TransactionAdmissionFailure> {
+) -> Result<Option<AnyTx>, PayloadAdmissionFailure> {
     // # Correctness
     //
     // It is ok to do this lookup in multiple different calls. Finalized state updates

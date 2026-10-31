@@ -1,11 +1,11 @@
 --- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
 +++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
-@@ -565,7 +565,7 @@
+@@ -587,7 +587,7 @@
                  return None;
              }
              let mut location = None;
--            let result = self.read_transactions.try_decode(|| {
-+            let result = zakura_node_services::block_memory::DecodedTransactionPool::new(self.config.read_transaction_limit).try_decode(|| {
+-            let result = self.read_transactions.try_decode::<Transaction>(|| {
++            let result = zakura_node_services::block_memory::DecodedPayloadPool::new(self.config.read_transaction_limit).try_decode::<Transaction>(|| {
                  let (next_location, transaction) = transactions.next()?;
                  location = Some(next_location);
                  Some(transaction)

@@ -4,8 +4,9 @@
 //! Block and derived transaction handles share one allocation and charge.
 //! A backend transfer reserves its destination before releasing the source charge.
 //! Disk reads reserve count admission before materialization. Standalone
-//! transactions keep their own slot through their final holder. These count
-//! allowances do not establish parser-memory or decoded-byte bounds.
+//! results keep their own slot through their final holder. A count bounds bytes
+//! only for payloads with a fixed maximum size, such as headers and serialized
+//! blocks. It does not bound transactions' decoded bytes or parser memory.
 
 use std::{
     fmt, io,
@@ -582,6 +583,8 @@ pub enum HeaderHandle {
     Shared(Arc<Header>),
     /// A header that still retains its block's decoded-memory charge.
     Block(OwnedBlock),
+    /// A separately decoded header that retains its own admission.
+    Standalone(OwnedHeader),
 }
 
 impl Deref for HeaderHandle {
@@ -591,6 +594,7 @@ impl Deref for HeaderHandle {
         match self {
             Self::Shared(header) => header,
             Self::Block(block) => &block.0.block.header,
+            Self::Standalone(header) => header,
         }
     }
 }
@@ -683,43 +687,58 @@ impl From<OwnedBlockTransaction> for TransactionHandle {
 }
 
 #[derive(Debug)]
-struct RetainedTransaction {
+struct RetainedPayload<T> {
     // Destroy the actual payload before releasing its admission.
-    transaction: Transaction,
+    payload: T,
     _permit: OwnedSemaphorePermit,
 }
 
-/// A standalone transaction whose final holder releases its decode admission.
-/// The owner exposes borrowed transaction data, never a raw shared handle.
-#[derive(Clone, Debug)]
-pub struct OwnedTransaction(Arc<RetainedTransaction>);
+/// A standalone payload whose final holder releases its read admission.
+/// The owner exposes borrowed data, never a raw shared handle.
+#[derive(Debug)]
+pub struct OwnedPayload<T>(Arc<RetainedPayload<T>>);
 
-/// Shared count admission for standalone transaction decoders and final holders.
-#[derive(Clone, Debug)]
-pub struct DecodedTransactionPool(Arc<Semaphore>);
+impl<T> Clone for OwnedPayload<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
-/// Why a standalone transaction cannot acquire decode admission.
+/// A standalone transaction decoded from disk.
+pub type OwnedTransaction = OwnedPayload<Transaction>;
+
+/// A standalone header decoded from disk.
+pub type OwnedHeader = OwnedPayload<Header>;
+
+/// One block's serialized bytes copied from disk.
+pub type OwnedRawBlock = OwnedPayload<Vec<u8>>;
+
+/// Shared count admission for one kind of standalone read result.
+#[derive(Clone, Debug)]
+pub struct DecodedPayloadPool(Arc<Semaphore>);
+
+/// Why a standalone payload cannot acquire read admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransactionAdmissionFailure {
-    /// Other decoders or retained transactions hold every slot.
+pub enum PayloadAdmissionFailure {
+    /// Other readers or retained results hold every slot.
     Capacity,
     /// This pool generation has permanently closed admission.
     Closed,
 }
 
-impl fmt::Display for TransactionAdmissionFailure {
+impl fmt::Display for PayloadAdmissionFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Capacity => "decoded transaction capacity exhausted",
-            Self::Closed => "decoded transaction pool closed",
+            Self::Capacity => "decoded payload capacity exhausted",
+            Self::Closed => "decoded payload pool closed",
         })
     }
 }
 
-impl std::error::Error for TransactionAdmissionFailure {}
+impl std::error::Error for PayloadAdmissionFailure {}
 
-impl DecodedTransactionPool {
-    /// Create one transaction-count allowance shared by this pool's clones.
+impl DecodedPayloadPool {
+    /// Create one count allowance shared by this pool's clones.
     pub fn new(limit: NonZeroU16) -> Self {
         Self(Arc::new(Semaphore::new(usize::from(limit.get()))))
     }
@@ -730,39 +749,53 @@ impl DecodedTransactionPool {
     }
 
     /// Acquire a count slot before lookup or decoding. Missing data and unwinding
-    /// release the slot. This count contract does not bound parser or decoded bytes.
-    pub fn try_decode(
+    /// release the slot. A count bounds bytes only when each payload's size is bounded.
+    pub fn try_decode<T>(
         &self,
-        decode: impl FnOnce() -> Option<Transaction>,
-    ) -> Result<Option<OwnedTransaction>, TransactionAdmissionFailure> {
+        decode: impl FnOnce() -> Option<T>,
+    ) -> Result<Option<OwnedPayload<T>>, PayloadAdmissionFailure> {
         let permit = self
             .0
             .clone()
             .try_acquire_owned()
             .map_err(|error| match error {
-                tokio::sync::TryAcquireError::NoPermits => TransactionAdmissionFailure::Capacity,
-                tokio::sync::TryAcquireError::Closed => TransactionAdmissionFailure::Closed,
+                tokio::sync::TryAcquireError::NoPermits => PayloadAdmissionFailure::Capacity,
+                tokio::sync::TryAcquireError::Closed => PayloadAdmissionFailure::Closed,
             })?;
-        Ok(decode().map(|transaction| {
-            OwnedTransaction(Arc::new(RetainedTransaction {
-                transaction,
+        Ok(decode().map(|payload| {
+            OwnedPayload(Arc::new(RetainedPayload {
+                payload,
                 _permit: permit,
             }))
         }))
     }
 }
 
-impl Deref for OwnedTransaction {
-    type Target = Transaction;
+impl<T: PartialEq> PartialEq for OwnedPayload<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.payload == other.0.payload
+    }
+}
 
-    fn deref(&self) -> &Transaction {
-        &self.0.transaction
+impl<T: Eq> Eq for OwnedPayload<T> {}
+
+impl<T> Deref for OwnedPayload<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0.payload
     }
 }
 
 impl From<OwnedTransaction> for TransactionHandle {
     fn from(transaction: OwnedTransaction) -> Self {
         Self::Standalone(transaction)
+    }
+}
+
+impl From<OwnedHeader> for HeaderHandle {
+    fn from(header: OwnedHeader) -> Self {
+        Self::Standalone(header)
     }
 }
 
@@ -824,7 +857,7 @@ mod tests {
 
     #[test]
     fn standalone_transaction_admission_precedes_decode_and_outlives_clones() {
-        let pool = DecodedTransactionPool::new(NonZeroU16::MIN);
+        let pool = DecodedPayloadPool::new(NonZeroU16::MIN);
         let transaction = pool
             .try_decode(|| {
                 assert_eq!(pool.available_slots(), 0, "admission precedes decode");
@@ -832,7 +865,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        let probe = model::TransactionProbe::new(&transaction);
+        let probe = model::PayloadProbe::new(&transaction);
         let clone = transaction.clone();
         drop(transaction);
         assert_eq!(probe.holders(), 1);
@@ -843,9 +876,9 @@ mod tests {
             "live standalone allocation retains its permit"
         );
         let error = pool
-            .try_decode(|| panic!("refused decode ran"))
+            .try_decode::<Transaction>(|| panic!("refused decode ran"))
             .unwrap_err();
-        assert_eq!(error, TransactionAdmissionFailure::Capacity);
+        assert_eq!(error, PayloadAdmissionFailure::Capacity);
         drop(clone);
         assert_eq!(probe.holders(), 0);
         assert_eq!(probe.serialized_bytes(), None);
@@ -853,31 +886,38 @@ mod tests {
     }
 
     #[test]
+    fn header_slots_bound_retained_header_bytes() {
+        // A header has no heap-backed fields, so a slot bounds its whole allocation.
+        assert!(std::mem::size_of::<RetainedPayload<Header>>() <= 2048);
+    }
+
+    #[test]
     fn standalone_transaction_missing_panic_and_closed_pool_settle_admission() {
-        let pool = DecodedTransactionPool::new(NonZeroU16::MIN);
-        assert!(pool.try_decode(|| None).unwrap().is_none());
+        let pool = DecodedPayloadPool::new(NonZeroU16::MIN);
+        assert!(pool.try_decode::<Transaction>(|| None).unwrap().is_none());
         assert_eq!(pool.available_slots(), 1);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = pool.try_decode(|| panic!("interrupted decode"));
+            let _ = pool.try_decode::<Transaction>(|| panic!("interrupted decode"));
         }));
         assert!(panic.is_err());
         assert_eq!(pool.available_slots(), 1);
         pool.0.close();
         assert_eq!(
-            pool.try_decode(|| panic!("closed decode ran")).unwrap_err(),
-            TransactionAdmissionFailure::Closed
+            pool.try_decode::<Transaction>(|| panic!("closed decode ran"))
+                .unwrap_err(),
+            PayloadAdmissionFailure::Closed
         );
     }
 
     #[test]
     fn equal_transactions_settle_only_their_original_pool() {
-        let first = DecodedTransactionPool::new(NonZeroU16::MIN);
-        let second = DecodedTransactionPool::new(NonZeroU16::MIN);
+        let first = DecodedPayloadPool::new(NonZeroU16::MIN);
+        let second = DecodedPayloadPool::new(NonZeroU16::MIN);
         let decode = || Some((*block().transactions[0]).clone());
         let a = first.try_decode(decode).unwrap().unwrap();
         let b = second.try_decode(decode).unwrap().unwrap();
         assert_eq!(a.hash(), b.hash());
-        let probe = model::TransactionProbe::new(&b);
+        let probe = model::PayloadProbe::new(&b);
         drop(a);
         assert_eq!(first.available_slots(), 1);
         assert_eq!(second.available_slots(), 0);

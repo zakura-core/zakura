@@ -3021,7 +3021,7 @@ impl Service<ReadRequest> for ReadStateService {
                 let next_block_hash =
                     read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
 
-                let header = read::block_header(best_chain, &state.db, height.into())
+                let header = read::block_header_result(best_chain, &state.db, height.into())?
                     .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 Ok(ReadResponse::BlockHeader {
@@ -3125,7 +3125,7 @@ impl Service<ReadRequest> for ReadStateService {
                     known_blocks,
                     stop,
                     MAX_FIND_BLOCK_HEADERS_RESULTS,
-                )
+                )?
                 .into_iter()
                 .map(|header| CountedHeader {
                     header: Arc::new(*header),
@@ -3300,20 +3300,18 @@ impl Service<ReadRequest> for ReadStateService {
             // Used by the indexer gRPC server.
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { start, count } => {
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                state
-                                    .db
-                                    .raw_block_bytes(height.into())
-                                    .map(|bytes| (height, bytes))
-                            })
-                    })
-                    .collect();
+                // A short response means the chain ended, so capacity refusal
+                // fails the whole read instead of returning a prefix.
+                let mut blocks = Vec::new();
+                for offset in 0..count {
+                    let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+                        break;
+                    };
+                    let Some(bytes) = state.db.raw_block_result(height.into())? else {
+                        break;
+                    };
+                    blocks.push((height, bytes));
+                }
 
                 Ok(ReadResponse::RawBlocks(blocks))
             }

@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -192,7 +192,7 @@
+         &self,
+         hash_or_height: HashOrHeight,
+     ) -> Result<Option<HeaderHandle>, PayloadAdmissionFailure> {
+-        let header = self.read_headers.try_decode(|| {
++        let header = zakura_node_services::block_memory::DecodedPayloadPool::new(self.config.read_header_limit).try_decode(|| {
+             let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
+             let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+             self.db

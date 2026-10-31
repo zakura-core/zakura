@@ -18,7 +18,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, TransactionAdmissionFailure, TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, PayloadAdmissionFailure,
+    TransactionHandle,
 };
 
 use zakura_chain::{
@@ -170,6 +171,9 @@ impl ZakuraDb {
     /// Returns the [`block::Header`] with [`block::Hash`] or
     /// [`Height`], if it exists in the finalized chain.
     //
+    /// This read takes no admission slot, so chain-context reads cannot starve.
+    /// Use [`Self::block_header_result`] for a header that leaves its read job.
+    //
     // TODO: move this method to the start of the section
     #[allow(clippy::unwrap_in_result)]
     pub fn block_header(&self, hash_or_height: HashOrHeight) -> Option<Arc<block::Header>> {
@@ -180,6 +184,21 @@ impl ZakuraDb {
         let header = self.db.zs_get(&block_header_by_height, &height)?;
 
         Some(header)
+    }
+
+    /// Read a header that leaves its read job. Capacity refusal returns an error
+    /// before lookup or decoding; the handle retains admission through its final clone.
+    pub fn block_header_result(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Result<Option<HeaderHandle>, PayloadAdmissionFailure> {
+        let header = self.read_headers.try_decode(|| {
+            let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
+            let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+            self.db
+                .zs_get::<_, _, block::Header>(&block_header_by_height, &height)
+        })?;
+        Ok(header.map(Into::into))
     }
 
     /// Returns the raw [`block::Header`] with [`block::Hash`] or [`Height`], if
@@ -265,13 +284,17 @@ impl ZakuraDb {
     /// [`block::Hash`] or [`Height`], if it exists in the finalized chain and
     /// its raw transaction data is available.
     ///
-    /// Returns `None` if the block does not exist, or if its transaction bodies
-    /// are missing because they have been pruned.
-    pub fn raw_block_bytes(&self, hash_or_height: HashOrHeight) -> Option<Vec<u8>> {
-        self.raw_block_bytes_within(hash_or_height, usize::MAX)
+    /// Capacity refusal returns an error before reading. The result retains admission
+    /// through its final clone. Missing or pruned bodies return `Ok(None)`.
+    pub fn raw_block_result(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Result<Option<OwnedRawBlock>, PayloadAdmissionFailure> {
+        self.read_raw_blocks
+            .try_decode(|| self.raw_block_bytes_within(hash_or_height, usize::MAX))
     }
 
-    /// Returns the serialized finalized block like [`Self::raw_block_bytes`],
+    /// Returns the serialized finalized block like [`Self::raw_block_result`],
     /// unless it is longer than `max_bytes`.
     ///
     /// The block is assembled from the stored raw bytes — the header, the
@@ -500,10 +523,9 @@ impl ZakuraDb {
     pub fn transaction(
         &self,
         hash: transaction::Hash,
-    ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, TransactionAdmissionFailure>
-    {
+    ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure> {
         let mut location_and_time = None;
-        let transaction = self.read_transactions.try_decode(|| {
+        let transaction = self.read_transactions.try_decode::<Transaction>(|| {
             let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
             let location = self.transaction_location(hash)?;
             let time = self.block_header(location.height.into())?.time;
@@ -522,7 +544,7 @@ impl ZakuraDb {
         &self,
         height: Height,
     ) -> impl Iterator<
-        Item = Result<(TransactionLocation, TransactionHandle), TransactionAdmissionFailure>,
+        Item = Result<(TransactionLocation, TransactionHandle), PayloadAdmissionFailure>,
     > + '_ {
         self.transactions_by_location_range(
             TransactionLocation::min_for_height(height)
@@ -552,7 +574,7 @@ impl ZakuraDb {
         &self,
         range: R,
     ) -> impl Iterator<
-        Item = Result<(TransactionLocation, TransactionHandle), TransactionAdmissionFailure>,
+        Item = Result<(TransactionLocation, TransactionHandle), PayloadAdmissionFailure>,
     > + '_
     where
         R: RangeBounds<TransactionLocation>,
@@ -565,7 +587,7 @@ impl ZakuraDb {
                 return None;
             }
             let mut location = None;
-            let result = self.read_transactions.try_decode(|| {
+            let result = self.read_transactions.try_decode::<Transaction>(|| {
                 let (next_location, transaction) = transactions.next()?;
                 location = Some(next_location);
                 Some(transaction)

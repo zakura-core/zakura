@@ -1042,7 +1042,9 @@ fn initial_online_prune_preserves_pre_boundary_history() {
     assert_eq!(
         state
             .db
-            .raw_block_bytes(Height(prune_from - 1).into())
+            .raw_block_result(Height(prune_from - 1).into())
+            .unwrap()
+            .map(|bytes| bytes.to_vec())
             .expect("preserved raw block below the pruning marker is still assembled"),
         state
             .db
@@ -1072,7 +1074,9 @@ fn initial_online_prune_preserves_pre_boundary_history() {
     assert!(
         state
             .db
-            .raw_block_bytes(Height(prune_from).into())
+            .raw_block_result(Height(prune_from).into())
+            .unwrap()
+            .map(|bytes| bytes.to_vec())
             .is_none(),
         "pruned raw block at the online pruning boundary is unavailable"
     );
@@ -1665,7 +1669,9 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
     assert!(
         state
             .db
-            .raw_block_bytes(Height(prune_until).into())
+            .raw_block_result(Height(prune_until).into())
+            .unwrap()
+            .map(|bytes| bytes.to_vec())
             .is_some(),
         "the body above the pruned height is retained"
     );

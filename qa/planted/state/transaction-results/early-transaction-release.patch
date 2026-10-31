@@ -1,9 +1,9 @@
 --- a/crates/zakura-node-services/src/block_memory.rs
 +++ b/crates/zakura-node-services/src/block_memory.rs
-@@ -746,7 +746,10 @@
-         Ok(decode().map(|transaction| {
-             OwnedTransaction(Arc::new(RetainedTransaction {
-                 transaction,
+@@ -765,7 +765,10 @@
+         Ok(decode().map(|payload| {
+             OwnedPayload(Arc::new(RetainedPayload {
+                 payload,
 -                _permit: permit,
 +                _permit: {
 +                    drop(permit);

@@ -108,8 +108,14 @@ pub struct ZakuraDb {
     /// Disk block decoding and final-holder admission shared by database clones.
     read_blocks: zakura_node_services::block_memory::DecodedBlockPool,
 
+    /// Standalone decoded headers share admission across read results.
+    read_headers: zakura_node_services::block_memory::DecodedPayloadPool,
+
+    /// Serialized block copies share admission across read results.
+    read_raw_blocks: zakura_node_services::block_memory::DecodedPayloadPool,
+
     /// Standalone decoded transactions share admission across lookups and iterators.
-    read_transactions: zakura_node_services::block_memory::DecodedTransactionPool,
+    read_transactions: zakura_node_services::block_memory::DecodedPayloadPool,
 
     /// Chain-tip publication cannot spend ordinary callers' result capacity.
     chain_tip_blocks: zakura_node_services::block_memory::DecodedBlockPool,
@@ -224,7 +230,13 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
-            read_transactions: zakura_node_services::block_memory::DecodedTransactionPool::new(
+            read_headers: zakura_node_services::block_memory::DecodedPayloadPool::new(
+                config.read_header_limit,
+            ),
+            read_raw_blocks: zakura_node_services::block_memory::DecodedPayloadPool::new(
+                config.read_raw_block_limit,
+            ),
+            read_transactions: zakura_node_services::block_memory::DecodedPayloadPool::new(
                 config.read_transaction_limit,
             ),
             read_blocks: zakura_node_services::block_memory::DecodedBlockPool::for_block_count(

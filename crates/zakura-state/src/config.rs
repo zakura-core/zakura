@@ -32,6 +32,17 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Maximum standalone headers being decoded from disk or retained by read results.
+    /// Database clones share the default 16384 slots. Exhaustion returns a capacity
+    /// error. Headers have a fixed maximum size, so this count also bounds their bytes.
+    /// Short-lived chain-context reads inside a read job do not take a slot.
+    pub read_header_limit: NonZeroU16,
+
+    /// Maximum serialized blocks being copied from disk or retained by read results.
+    /// Database clones share the default 128 slots. Exhaustion returns a capacity
+    /// error. Each result fits `MAX_BLOCK_BYTES`, so the default bounds 256 MB.
+    pub read_raw_block_limit: NonZeroU16,
+
     /// Maximum standalone transactions being decoded from disk or retained by readers.
     /// Database clones and decoded transaction iterators share the default 4096 slots.
     /// Exhaustion returns a capacity error. This count does not bound decoded bytes.
@@ -42,7 +53,7 @@ pub struct Config {
     /// The default is 1024. Database clones share this count limit. A result keeps
     /// its slot through its last block, header, or transaction handle. Exhaustion
     /// returns a capacity error; it does not report a stored block as missing.
-    /// This limit does not bound standalone header/transaction reads or decoded bytes.
+    /// This limit does not bound standalone read results or decoded bytes.
     pub read_block_limit: NonZeroU16,
 
     /// Maximum blocking data-read jobs admitted by one database instance.
@@ -492,6 +503,8 @@ impl Default for PruningConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            read_header_limit: NonZeroU16::new(16384).expect("the default limit is nonzero"),
+            read_raw_block_limit: NonZeroU16::new(128).expect("the default limit is nonzero"),
             read_transaction_limit: NonZeroU16::new(4096).expect("the default limit is nonzero"),
             read_block_limit: NonZeroU16::new(1024).expect("the default limit is nonzero"),
             read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
@@ -549,6 +562,11 @@ mod tests {
         );
         assert!(toml::from_str::<Config>("read_transaction_limit = 0").is_err());
         assert!(toml::from_str::<Config>("read_transaction_limit = 65536").is_err());
+        let config = toml::from_str::<Config>("").unwrap();
+        assert_eq!(config.read_header_limit.get(), 16384);
+        assert_eq!(config.read_raw_block_limit.get(), 128);
+        assert!(toml::from_str::<Config>("read_header_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_raw_block_limit = 0").is_err());
     }
 
     #[test]

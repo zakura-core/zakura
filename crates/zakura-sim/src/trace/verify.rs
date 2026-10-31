@@ -95,6 +95,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         offset,
         draws,
         obs,
+        work,
     } = recorded;
     [
         ("step", *step == produced.step),
@@ -105,6 +106,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         ("offset", *offset == produced.offset),
         ("draws", *draws == produced.draws),
         ("obs", *obs == produced.obs),
+        ("work", *work == produced.work),
     ]
     .into_iter()
     .find_map(|(field, same)| (!same).then_some(field))
@@ -166,5 +168,56 @@ pub(crate) fn trace_difference(trace: &Trace, other: &Trace) -> Option<(u64, &'s
         (Some(end), Some(other)) => end_difference(end, other).map(|field| (last, field)),
         (None, None) => None,
         _ => Some((last, "end")),
+    }
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+    use crate::{
+        plan::By,
+        record::machine::{FailurePhase, MachineFailure},
+    };
+
+    #[test]
+    fn machine_evidence_round_trips_and_changes_exact_replay() {
+        let input = [0, 0, 0, 9, 1, 0, 0, 1, 2, 0, 0, 0];
+        let history = zakura_network::zakura::trace_work_ownership_bytes(&input);
+        assert!(history.summary.as_ref().unwrap().charged > 0);
+        for step in history.steps {
+            let record = StepRecord {
+                step: step.step as u64,
+                pick: format!("machine:block-work:{}", step.step),
+                key: None,
+                options: 1,
+                by: By::Forced,
+                offset: None,
+                draws: Vec::new(),
+                obs: None,
+                work: Some(Box::new(step.into())),
+            };
+            let json = Record::Step(record.clone()).to_line();
+            let decoded: Record = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, Record::Step(record.clone()));
+            assert_eq!(step_difference(&record, &record), None);
+            let mut changed = record.clone();
+            changed.work.as_mut().unwrap().actual.reserved += 1;
+            assert_eq!(step_difference(&record, &changed), Some("work"));
+            let mut changed = record.clone();
+            changed.work.as_mut().unwrap().input[0] ^= 1;
+            assert_eq!(step_difference(&record, &changed), Some("work"));
+            let mut changed = record.clone();
+            changed.work.as_mut().unwrap().failure = Some(MachineFailure {
+                property_failure: true,
+                phase: FailurePhase::Invariant,
+                message: "block/work-ownership: changed owner".into(),
+            });
+            assert_eq!(step_difference(&record, &changed), Some("work"));
+            let json = Record::Step(changed.clone()).to_line();
+            assert_eq!(
+                serde_json::from_str::<Record>(&json).unwrap(),
+                Record::Step(changed)
+            );
+        }
     }
 }

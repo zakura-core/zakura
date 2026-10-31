@@ -303,6 +303,7 @@ mod tests {
             offset: None,
             draws: Vec::new(),
             obs: None,
+            work: None,
         })
     }
 

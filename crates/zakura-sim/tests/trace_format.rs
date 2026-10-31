@@ -697,6 +697,7 @@ fn writer_keeps_to_the_line_limit() {
             offset: None,
             draws: Vec::new(),
             obs: None,
+            work: None,
         })
     };
     sink.record(Record::Init(InitRecord::default()));
@@ -1485,6 +1486,7 @@ fn step() -> impl Strategy<Value = StepRecord> {
                 offset,
                 draws,
                 obs,
+                work: None,
             },
         )
 }
@@ -1792,6 +1794,7 @@ fn round_trip_edges() {
         offset: None,
         draws: Vec::new(),
         obs: None,
+        work: None,
     };
     let bare_end = EndRecord {
         outcome: OutcomeKind::Budget,

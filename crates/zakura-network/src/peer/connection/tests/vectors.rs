@@ -1434,6 +1434,25 @@ async fn getblocks_response_precedes_ready_block_advert() {
 /// advert to a banned peer. The pending request and the connection are unaffected.
 #[tokio::test]
 async fn queued_block_advert_is_revoked_by_ban_while_awaiting_response() {
+    queued_block_advert_is_revoked_by_ban(BanAddressForm::Same).await;
+}
+
+/// A peer connected through its IPv4-mapped IPv6 address, as on a dual-stack listener, is
+/// still revoked by a ban recorded for its canonical IPv4 address.
+#[tokio::test]
+async fn queued_block_advert_is_revoked_by_canonical_ban_of_mapped_ipv6_peer() {
+    queued_block_advert_is_revoked_by_ban(BanAddressForm::MappedPeerCanonicalBan).await;
+}
+
+/// How the banned address relates to the connection's peer address.
+enum BanAddressForm {
+    /// The ban holds the connection's own peer address.
+    Same,
+    /// The peer connected as `::ffff:A.B.C.D`, and the ban holds `A.B.C.D`.
+    MappedPeerCanonicalBan,
+}
+
+async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     let _init_guard = zakura_test::init();
     tokio::time::pause();
 
@@ -1450,13 +1469,24 @@ async fn queued_block_advert_is_revoked_by_ban_while_awaiting_response() {
         let (block_advert_tx, block_advert_rx) =
             tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
         connection.block_advert_rx = block_advert_rx;
-        let peer_ip = connection
-            .connection_info
-            .connected_addr
-            .get_transient_addr()
-            .expect("the protected test connection has a peer address")
-            .ip();
-        connection.bans = crate::BannedIps::with_banned_ip(peer_ip);
+        let banned_ip = match form {
+            BanAddressForm::Same => connection
+                .connection_info
+                .connected_addr
+                .get_transient_addr()
+                .expect("the protected test connection has a peer address")
+                .ip(),
+            BanAddressForm::MappedPeerCanonicalBan => {
+                let canonical = std::net::Ipv4Addr::new(203, 0, 113, 7);
+                let mut info = (*connection.connection_info).clone();
+                info.connected_addr = crate::peer::ConnectedAddr::new_inbound_direct(
+                    std::net::SocketAddr::new(canonical.to_ipv6_mapped().into(), 8233).into(),
+                );
+                connection.connection_info = std::sync::Arc::new(info);
+                canonical.into()
+            }
+        };
+        connection.bans = crate::BannedIps::with_banned_ip(banned_ip);
         let connection_task = tokio::spawn(connection.run(peer_rx));
 
         let (request_tx, mut request_rx) = oneshot::channel();

@@ -27,6 +27,7 @@ pub use work_queue::{
 
 use zakura_chain::block::{self, Block};
 use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
+use zakura_node_services::block_memory::{Admission, BlockHandle, DecodedBlockPool};
 use zakura_rt::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -41,6 +42,7 @@ use crate::zakura::{
 };
 
 use super::{
+    config::ZakuraBlockSyncConfig,
     events::{BlockApplyOutcome, BlockApplyToken, BlockSyncAction},
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
@@ -65,7 +67,7 @@ pub struct BenchSubmit {
     /// Submission token to echo back on commit.
     pub token: BlockApplyToken,
     /// The block to verify and commit (contiguous above the verified tip).
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
 }
 
 /// A read-only progress snapshot copied from the internal sequencer view.
@@ -93,6 +95,7 @@ pub struct BenchSequencerHandle {
 /// A cloneable handle for feeding bodies into the sequencer's reorder queue.
 #[derive(Clone)]
 pub struct BenchBodyFeeder {
+    decoded_pool: DecodedBlockPool,
     body_input: mpsc::Sender<SequencedBody>,
     body_input_bytes: Arc<AtomicU64>,
     body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
@@ -193,6 +196,12 @@ pub fn spawn_bench_sequencer(
     let body_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
 
+    let decoded_pool = ZakuraBlockSyncConfig {
+        max_submitted_block_applies: limit,
+        ..ZakuraBlockSyncConfig::default()
+    }
+    .decoded_block_pool(10_000)
+    .expect("benchmark decoded allowance fits");
     let task = SequencerIO::new(
         sequencer,
         work,
@@ -210,11 +219,13 @@ pub fn spawn_bench_sequencer(
         view_tx,
         BENCH_ACTION_SEND_TIMEOUT,
         trace.clone(),
+        decoded_pool.clone(),
     );
     let join = zakura_rt::task::spawn(task.run());
 
     BenchSequencerHandle {
         feeder: BenchBodyFeeder {
+            decoded_pool,
             body_input: body_input_tx,
             body_input_bytes: body_input_bytes.clone(),
             body_input_decoded_attributed_memory_bytes: body_input_decoded_attributed_memory_bytes
@@ -266,18 +277,21 @@ impl BenchBodyFeeder {
             .encode()
             .expect("a chain block encodes within the block-sync message limits")
             .into();
-        let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
-        let charged = charge_decoded_handoff(
-            &self.body_input_decoded_attributed_memory_bytes,
-            &self.view,
-            decoded_attributed_memory_size_bytes,
-        );
-        let body = BufferedBlockBody::for_handoff(
-            block,
-            raw_frame_payload,
-            decoded_attributed_memory_size_bytes,
-            charged,
-        );
+        let body = match Arc::try_unwrap(block).ok().and_then(|block| {
+            self.decoded_pool
+                .try_admit(block, Admission::WithinLimit)
+                .ok()
+        }) {
+            Some(block) => {
+                let charged = charge_decoded_handoff(
+                    &self.body_input_decoded_attributed_memory_bytes,
+                    &self.view,
+                    block.decoded_bytes(),
+                );
+                BufferedBlockBody::for_handoff(block, raw_frame_payload, charged)
+            }
+            None => BufferedBlockBody::RawFramePayload(raw_frame_payload),
+        };
         let body = SequencedBody::new_handed_off(
             self.owner,
             self.source,

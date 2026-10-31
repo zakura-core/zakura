@@ -1874,6 +1874,9 @@ mod tests {
             },
             (block::Height(0), block::Hash([0; 32])),
             tip_rx,
+            (zakura_network::zakura::ZakuraBlockSyncConfig::default())
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, _reactor_actions, reactor_task) =

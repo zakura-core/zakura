@@ -247,6 +247,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
+        startup.decoded_pool.clone(),
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
@@ -265,6 +266,7 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
+        decoded_pool: startup.decoded_pool.clone(),
         request_pool: crate::zakura::regulation::ReservationPool::new(BS_REQUEST_POOL_ENTRIES)
             .expect("the protocol request ceiling is positive and representable"),
         serving: Arc::new(super::regulated::session::Serving::new(

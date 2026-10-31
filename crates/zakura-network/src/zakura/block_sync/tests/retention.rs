@@ -13,7 +13,12 @@ impl RetentionHarness {
     fn new(retained: u32) -> Self {
         Self::from_startup(
             retained,
-            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()),
+            BlockSyncStartup::inert(
+                ZakuraBlockSyncConfig::default()
+                    .decoded_block_pool(10_000)
+                    .expect("fixture decoded allowance fits"),
+                ZakuraBlockSyncConfig::default(),
+            ),
         )
     }
 
@@ -159,8 +164,13 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
         }
     }
 
-    let startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
-        .with_range_source(Arc::new(StatusOnlySource));
+    let startup = BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        ZakuraBlockSyncConfig::default(),
+    )
+    .with_range_source(Arc::new(StatusOnlySource));
     let harness = RetentionHarness::from_startup(1, startup);
     let resources = harness
         .service
@@ -321,9 +331,13 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
 #[tokio::test]
 async fn retention_deferred_status_applies_after_peer_goes_quiet() {
     let config = ZakuraBlockSyncConfig::default();
-    let (handle, mut actions, task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()))
-            .expect("valid block-sync config");
+    let (handle, mut actions, task) = spawn_block_sync_reactor(BlockSyncStartup::inert(
+        config
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config.clone(),
+    ))
+    .expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let mut advertised = BlockSyncStatus {
         servable_low: block::Height(1),

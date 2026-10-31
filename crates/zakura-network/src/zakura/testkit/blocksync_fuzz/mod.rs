@@ -96,16 +96,11 @@ pub(crate) async fn run_scenario(
         )));
 
     let shutdown = CancellationToken::new();
-    let mut startup = crate::zakura::BlockSyncStartup::new_with_committed_views(
-        BlockSyncFrontiers {
+    let mut startup = crate::zakura::BlockSyncStartup::new_with_committed_views(BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: initial_verified,
             verified_block_hash: initial_verified_hash,
-        },
-        (initial_header, initial_header_hash),
-        committed_views,
-        scenario.config.clone(),
-    );
+        }, (initial_header, initial_header_hash), committed_views, (scenario.config.clone()).decoded_block_pool(10_000).expect("fixture decoded allowance fits"), scenario.config.clone());
     startup.trace = trace.clone();
     startup.shutdown = shutdown.clone();
 

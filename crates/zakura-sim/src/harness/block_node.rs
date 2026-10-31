@@ -840,6 +840,9 @@ impl BlockNode {
             },
             (frontiers.header_best.height, frontiers.header_best.hash),
             engine.subscribe_views(),
+            (config)
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
             config,
         );
         startup.max_checkpoint_height = Some(LAST_CHECKPOINT);

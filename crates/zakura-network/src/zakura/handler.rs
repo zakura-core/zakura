@@ -705,6 +705,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// Backend block-count allowance for native decoded ownership.
+    pub decoded_backend_blocks: u64,
     /// State-backed source for bounded native GetBlocks serving.
     pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
@@ -4417,6 +4419,10 @@ async fn spawn_zakura_endpoint_inner(
                 },
                 best_header_tip,
                 driver_startup.committed_views.clone(),
+                config
+                    .zakura
+                    .block_sync
+                    .decoded_block_pool(driver_startup.decoded_backend_blocks)?,
                 config.zakura.block_sync.clone(),
             )
             .with_range_source(driver_startup.block_range_source.clone());

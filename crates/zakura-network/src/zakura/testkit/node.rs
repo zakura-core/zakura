@@ -556,12 +556,7 @@ impl ZakuraTestNodeBuilder {
                 verified_block_hash: verified_block_tip_hash,
             };
             let block_header_tip = best_header_tip.unwrap_or(anchor);
-            let mut startup = BlockSyncStartup::new(
-                block_frontiers,
-                block_header_tip,
-                handle.subscribe_tip(),
-                self.block_sync_config.clone(),
-            );
+            let mut startup = BlockSyncStartup::new(block_frontiers, block_header_tip, handle.subscribe_tip(), (self.block_sync_config.clone()).decoded_block_pool(10_000).expect("fixture decoded allowance fits"), self.block_sync_config.clone());
             // Block sync schedules body work only under committed authority.
             startup.committed_views =
                 Some(startup_committed_view(block_frontiers, block_header_tip));

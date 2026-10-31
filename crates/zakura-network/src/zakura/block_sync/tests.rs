@@ -199,7 +199,15 @@ fn header_tip_startup(
     header_tip: watch::Receiver<(block::Height, block::Hash)>,
     config: ZakuraBlockSyncConfig,
 ) -> BlockSyncStartup {
-    let mut startup = BlockSyncStartup::new(frontiers, best_header_tip, header_tip, config);
+    let mut startup = BlockSyncStartup::new(
+        frontiers,
+        best_header_tip,
+        header_tip,
+        (config)
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config,
+    );
     let verified = zakura_header_chain::Frontier::new(
         frontiers.verified_block_tip,
         frontiers.verified_block_hash,
@@ -357,6 +365,9 @@ fn committed_block_sync_startup(
         frontiers,
         best_header_tip,
         committed_views,
+        (config)
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         config,
     );
 
@@ -556,6 +567,9 @@ async fn committed_views_are_the_sole_production_frontier_source() {
         legacy_frontiers,
         legacy_header,
         snapshot_rx,
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.header_tip.is_none());
@@ -644,6 +658,9 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         },
         (finalized.height, finalized.hash),
         snapshot_rx,
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -732,6 +749,9 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         },
         (header.height, header.hash),
         snapshot_rx,
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -803,7 +823,12 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (_snapshots, receiver) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        ZakuraBlockSyncConfig::default(),
+    );
     startup.committed_views = Some(receiver);
     let (handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -835,7 +860,12 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        ZakuraBlockSyncConfig::default(),
+    );
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -965,7 +995,12 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
-    let mut startup = BlockSyncStartup::inert(config.clone());
+    let mut startup = BlockSyncStartup::inert(
+        config
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config.clone(),
+    );
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -4873,7 +4908,7 @@ struct TestSequencer {
 
 struct TestSubmission {
     intent: SubmitItem,
-    block: Arc<block::Block>,
+    block: zakura_node_services::block_memory::BlockHandle,
 }
 
 impl std::ops::Deref for TestSubmission {
@@ -4959,7 +4994,16 @@ impl TestSequencer {
 
     fn prepare_submit(&mut self, height: block::Height) -> Option<TestSubmission> {
         self.settle_payloads();
-        let prepared = self.payloads.prepare(&mut self.policy, height)?;
+        let prepared = self
+            .payloads
+            .prepare(
+                &mut self.policy,
+                height,
+                &ZakuraBlockSyncConfig::default()
+                    .decoded_block_pool(10_000)
+                    .unwrap(),
+            )
+            .unwrap()?;
         self.settle_payloads();
         Some(TestSubmission {
             intent: prepared.intent,
@@ -5458,6 +5502,17 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("403 test bodies fit in usize");
     assert_eq!(submission_limit, 401);
 
+    use zakura_node_services::block_memory::{Admission, BlockHandle};
+    const BACKEND_BLOCKS: u64 = 2;
+    let pool = ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(BACKEND_BLOCKS)
+        .unwrap();
+    let backend: Vec<_> = (0..BACKEND_BLOCKS)
+        .map(|_| {
+            let block = Arc::try_unwrap(mainnet_block(&BLOCK_MAINNET_1_BYTES)).unwrap();
+            BlockHandle::Owned(pool.try_admit(block, Admission::WithinLimit).unwrap())
+        })
+        .collect();
     let blocks = fake_sequential_blocks(BLOCK_COUNT);
     let frontiers = genesis_frontiers();
     let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5468,7 +5523,8 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
     let budget = ByteBudget::new(1);
     let task = SequencerIO::new(
-        Sequencer::new(block::Height(0), submission_limit),
+        Sequencer::new(block::Height(0), submission_limit)
+            .with_decoded_window_cap(block::Height(BLOCK_COUNT), 1),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
@@ -5484,6 +5540,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
+        pool.clone(),
     );
     let task = tokio::spawn(task.run());
 
@@ -5497,10 +5554,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 height,
                 block.hash(),
                 block.header.previous_block_hash,
-                BufferedBlockBody::from_decoded_block(
-                    block.clone(),
-                    Some(raw_block_payload(block)),
-                ),
+                BufferedBlockBody::RawFramePayload(raw_block_payload(block)),
                 u64::from(block_size(block)),
                 None,
                 peer(1),
@@ -5543,7 +5597,16 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             action => panic!("unexpected action before initial submissions complete: {action:?}"),
         }
     }
+    assert_eq!(
+        pool.reserved_blocks(),
+        Some(BACKEND_BLOCKS + submission_limit_u64),
+        "backend retention must leave room for the complete checkpoint range"
+    );
     for (index, (_, block)) in initial_submissions.iter().enumerate() {
+        assert!(
+            matches!(block, BlockHandle::Owned(_)),
+            "raw checkpoint bodies acquire real retention ownership"
+        );
         assert_eq!(
             block.coinbase_height(),
             Some(block::Height(
@@ -5643,6 +5706,25 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     .expect("stale completions settle with a refilled checkpoint submission window");
 
     task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        pool.reserved_blocks(),
+        Some(BACKEND_BLOCKS + submission_limit_u64 + 1),
+        "completed submissions stay charged while driver and backend handles remain"
+    );
+    let held_bytes: u64 = backend
+        .iter()
+        .chain(initial_submissions.iter().map(|(_, block)| block))
+        .chain(std::iter::once(&block_402))
+        .map(|block| block.view().attributed_memory_size_bytes())
+        .sum();
+    assert_eq!(pool.reserved_bytes(), held_bytes);
+    drop(initial_submissions);
+    drop(block_402);
+    assert_eq!(pool.reserved_blocks(), Some(BACKEND_BLOCKS));
+    drop(backend);
+    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_bytes(), 0);
 }
 
 /// Wait up to `timeout` for the next `SubmitBlock`, skipping other actions.
@@ -5712,6 +5794,9 @@ impl CappedSequencerTask {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         Self {
             body_tx,
@@ -6173,6 +6258,9 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
     );
     let task = tokio::spawn(task.run());
 
@@ -6396,6 +6484,9 @@ impl DetachedWindow {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         let mut window = Self {
             blocks: fake_sequential_blocks(block_count),
@@ -7817,9 +7908,13 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 /// reactor, where its sender would hold the session's reservation.
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()))
-            .expect("valid block-sync config");
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        ZakuraBlockSyncConfig::default(),
+    ))
+    .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
     let cancel = CancellationToken::new();
     cancel.cancel();

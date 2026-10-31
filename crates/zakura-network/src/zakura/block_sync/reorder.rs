@@ -1,4 +1,7 @@
 use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
+use zakura_node_services::block_memory::{
+    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, OwnedBlock,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReorderBuffer {
@@ -350,11 +353,11 @@ pub(super) enum BufferedBlockBody {
     // Only tests hand the sequencer a decoded body without its raw bytes.
     #[cfg_attr(not(test), allow(dead_code))]
     Decoded {
-        block: Arc<block::Block>,
+        block: BlockHandle,
         decoded_attributed_memory_size_bytes: u64,
     },
     DecodedWithRawFramePayload {
-        block: Arc<block::Block>,
+        block: BlockHandle,
         raw_frame_payload: Arc<[u8]>,
         decoded_attributed_memory_size_bytes: u64,
     },
@@ -367,6 +370,7 @@ impl BufferedBlockBody {
         raw_frame_payload: Option<Arc<[u8]>>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+        let block = block.into();
         match raw_frame_payload {
             Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
@@ -391,14 +395,14 @@ impl BufferedBlockBody {
     /// One cap holds at every height, because the input queue is not the
     /// checkpoint window.
     pub(super) fn for_handoff(
-        block: Arc<block::Block>,
+        block: OwnedBlock,
         raw_frame_payload: Arc<[u8]>,
-        decoded_attributed_memory_size_bytes: u64,
         charged: bool,
     ) -> Self {
         if charged {
+            let decoded_attributed_memory_size_bytes = block.decoded_bytes();
             BufferedBlockBody::DecodedWithRawFramePayload {
-                block,
+                block: BlockHandle::Owned(block),
                 raw_frame_payload,
                 decoded_attributed_memory_size_bytes,
             }
@@ -442,7 +446,10 @@ impl BufferedBlockBody {
             | BufferedBlockBody::DecodedWithRawFramePayload {
                 raw_frame_payload, ..
             } => Arc::as_ptr(raw_frame_payload).cast::<u8>().addr(),
-            BufferedBlockBody::Decoded { block, .. } => Arc::as_ptr(block).addr(),
+            BufferedBlockBody::Decoded { block, .. } => match block {
+                BlockHandle::Shared(block) => Arc::as_ptr(block).addr(),
+                BlockHandle::Owned(_) => std::ptr::from_ref(block.header()).addr(),
+            },
         }
     }
 
@@ -454,7 +461,7 @@ impl BufferedBlockBody {
             BufferedBlockBody::RawFramePayload(_) => 0,
             BufferedBlockBody::Decoded { block, .. }
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => {
-                block.attributed_memory_size_bytes()
+                block.view().attributed_memory_size_bytes()
             }
         }
     }
@@ -468,29 +475,33 @@ impl BufferedBlockBody {
     /// Return the decoded block, decoding from the retained raw bytes if needed
     /// and caching the decoded copy in place (the entry enters the decode
     /// window; `retain_for_backlog_in_place` is the matching downgrade).
-    pub(super) fn decoded_block(&mut self) -> Arc<block::Block> {
+    pub(super) fn decoded_block(
+        &mut self,
+        pool: &DecodedBlockPool,
+    ) -> Result<BlockHandle, AdmissionFailure> {
         match self {
             BufferedBlockBody::Decoded { block, .. }
-            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => Ok(block.clone()),
             BufferedBlockBody::RawFramePayload(payload) => {
-                let block = decode_raw_frame_payload(payload);
-                let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+                let block = pool
+                    .try_admit(decode_raw_frame_payload(payload), Admission::WithinLimit)
+                    .map_err(|rejected| rejected.reason)?;
+                let decoded_attributed_memory_size_bytes = block.decoded_bytes();
+                let block = BlockHandle::Owned(block);
                 *self = BufferedBlockBody::DecodedWithRawFramePayload {
                     block: block.clone(),
                     raw_frame_payload: payload.clone(),
                     decoded_attributed_memory_size_bytes,
                 };
-                block
+                Ok(block)
             }
         }
     }
 }
 
-fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {
+fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> block::Block {
     let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    Arc::new(
-        block::Block::zcash_deserialize_from_slice(&mut reader).expect(
-            "raw block bytes deserialize because the peer routine decoded them before buffering",
-        ),
+    block::Block::zcash_deserialize_from_slice(&mut reader).expect(
+        "raw block bytes deserialize because the peer routine decoded them before buffering",
     )
 }

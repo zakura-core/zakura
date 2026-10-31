@@ -41,6 +41,9 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         view_tx,
         Duration::from_secs(60),
         ZakuraTrace::noop(),
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
     );
     let check = |task: &mut SequencerIO, label: &str| {
         task.payloads.apply(&mut task.state.sequencer);
@@ -283,6 +286,9 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
         view_tx,
         Duration::from_secs(60),
         ZakuraTrace::noop(),
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
     )
     .with_observer(ObserverSlot(Some(log.clone())));
 
@@ -413,9 +419,16 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     let original = weak
         .upgrade()
         .expect("the runtime owner retains the input decode");
-    let prepared = payloads.prepare(&mut policy, block::Height(1)).unwrap();
+    let prepared = payloads
+        .prepare(
+            &mut policy,
+            block::Height(1),
+            &DecodedBlockPool::new(u64::MAX),
+        )
+        .unwrap()
+        .unwrap();
     assert!(
-        Arc::ptr_eq(&original, &prepared.block),
+        matches!(&prepared.block, BlockHandle::Shared(block) if Arc::ptr_eq(&original, block)),
         "submission reuses the handoff decode"
     );
     assert_eq!(prepared.newly_decoded_wire_bytes, None);
@@ -482,4 +495,128 @@ fn runtime_payload_inventory_compares_actual_size_with_policy_size() {
             .payloads_match_policy(),
         "capture must measure the actual payload independently of policy size"
     );
+}
+
+#[tokio::test]
+async fn decoded_capacity_release_retries_pending_body_without_apply_completion() {
+    use std::{future::Future, task::Poll};
+    use zakura_node_services::block_memory::Admission;
+
+    for (release_before_wait, reset_before_release) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(1).unwrap());
+        let blocker = pool
+            .try_admit(
+                Arc::try_unwrap(test_block()).unwrap(),
+                Admission::WithinLimit,
+            )
+            .unwrap();
+        let retained = BlockHandle::Owned(blocker).transaction(0).unwrap();
+        let expected_hash = retained.hash();
+        let mut task = retention_test_task(u64::MAX);
+        task.decoded_pool = pool.clone();
+        let (actions, mut actions_rx) = mpsc::channel(1);
+        task.actions = actions;
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        task.body_input_rx = body_rx;
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        task.control_input_rx = control_rx;
+        let block = test_block();
+        let raw = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .unwrap()
+            .into();
+        let mut body = SequencedBody::new_queued(
+            super::super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            block::Height(1),
+            block.hash(),
+            block.header.previous_block_hash,
+            BufferedBlockBody::RawFramePayload(raw),
+            BLOCK_MAINNET_1_BYTES.len() as u64,
+            None,
+            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            Instant::now(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        assert!(task.decoded_capacity_blocked.is_some());
+        assert!(actions_rx.try_recv().is_err());
+        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert!(
+            task.payloads
+                .entries
+                .values()
+                .all(|body| !body.is_decoded()),
+            "failed admission must leave the raw payload intact"
+        );
+        assert_eq!(
+            retained.hash(),
+            expected_hash,
+            "the downstream payload remains readable"
+        );
+        if reset_before_release {
+            control_tx
+                .send(SequencerControlInput::FrontierReset {
+                    frontiers: genesis_frontiers(),
+                    preserve_active_successors: false,
+                    peer_has_successor_after: false,
+                    peer_outstanding_conflicts_at_tip: false,
+                })
+                .unwrap();
+        }
+        let mut retained = Some(retained);
+        if release_before_wait {
+            drop(retained.take());
+        }
+        let mut running = Box::pin(task.run());
+        if !release_before_wait {
+            std::future::poll_fn(|cx| {
+                assert!(running.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(actions_rx.try_recv().is_err());
+            drop(retained.take());
+        }
+        std::future::poll_fn(|cx| {
+            assert!(running.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        if reset_before_release {
+            assert!(
+                actions_rx.try_recv().is_err(),
+                "capacity release must not submit stale work"
+            );
+            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_bytes(), 0);
+            continue;
+        }
+        let action = actions_rx
+            .try_recv()
+            .expect("last-holder release must make the pending submission ready");
+        let BlockSyncAction::SubmitBlock {
+            block: submitted, ..
+        } = action
+        else {
+            panic!("capacity release must submit the pending body");
+        };
+        assert!(matches!(submitted, BlockHandle::Owned(_)));
+        assert_eq!(submitted.hash(), block.hash());
+        assert_eq!(pool.reserved_blocks(), Some(1));
+        drop(running);
+        assert_eq!(
+            pool.reserved_blocks(),
+            Some(1),
+            "the driver still retains the allocation"
+        );
+        drop(submitted);
+        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
 }

@@ -197,6 +197,11 @@ impl<'a> BlockView<'a> {
         self.0.transactions.iter().map(Arc::as_ref)
     }
 
+    /// Number of allocated slots in the transaction vector.
+    pub fn transaction_capacity(self) -> usize {
+        self.0.transactions.capacity()
+    }
+
     /// Borrow transactions for indexed parallel computation without cloning handles.
     pub fn parallel_transactions(
         self,

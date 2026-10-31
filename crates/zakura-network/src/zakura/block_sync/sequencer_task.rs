@@ -25,6 +25,7 @@
 //! A submitted body also lives in the driver's `SubmitBlock` action, and
 //! the `Sequencer` keeps its in-flight charge until the exact completion arrives.
 
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle, DecodedBlockPool};
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
@@ -433,7 +434,7 @@ pub(super) struct SequencerPayloads {
 
 pub(super) struct PreparedSubmission {
     pub(super) intent: super::sequencer::SubmitItem,
-    pub(super) block: Arc<block::Block>,
+    pub(super) block: BlockHandle,
     pub(super) newly_decoded_wire_bytes: Option<usize>,
 }
 
@@ -498,8 +499,11 @@ impl SequencerPayloads {
         &mut self,
         sequencer: &mut Sequencer,
         height: block::Height,
-    ) -> Option<PreparedSubmission> {
-        let facts = sequencer.submission_body(height)?;
+        pool: &DecodedBlockPool,
+    ) -> Result<Option<PreparedSubmission>, AdmissionFailure> {
+        let Some(facts) = sequencer.submission_body(height) else {
+            return Ok(None);
+        };
         let body = self
             .entries
             .get_mut(&facts.id)
@@ -511,7 +515,7 @@ impl SequencerPayloads {
             ),
             _ => None,
         };
-        let block = body.decoded_block();
+        let block = body.decoded_block(pool)?;
         let decoded_bytes = body.decoded_attributed_memory_size_bytes();
         let intent = sequencer
             .prepare_submit(height, facts.id, decoded_bytes)
@@ -520,11 +524,11 @@ impl SequencerPayloads {
             intent.body_id, facts.id,
             "submission names its materialized payload"
         );
-        Some(PreparedSubmission {
+        Ok(Some(PreparedSubmission {
             intent,
             block,
             newly_decoded_wire_bytes,
-        })
+        }))
     }
 }
 
@@ -536,6 +540,8 @@ impl SequencerPayloads {
 pub(super) struct SequencerIO {
     state: SequencerState,
     payloads: SequencerPayloads,
+    decoded_pool: DecodedBlockPool,
+    decoded_capacity_blocked: Option<u64>,
     retry_clock: Arc<dyn zakura_header_chain::Clock>,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -608,8 +614,11 @@ impl SequencerIO {
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
+        decoded_pool: DecodedBlockPool,
     ) -> Self {
         Self {
+            decoded_pool,
+            decoded_capacity_blocked: None,
             state: SequencerState::new(sequencer, frontiers, current_scope, retry_jitter),
             payloads: SequencerPayloads::default(),
             retry_clock,
@@ -746,11 +755,24 @@ impl SequencerIO {
         // top-of-loop guard breaks out before the last open channel is gated off.
         let mut control_open = true;
         let mut body_open = true;
+        let pool = self.decoded_pool.clone();
         loop {
+            if pool.is_closed() {
+                self.publish_view();
+                break;
+            }
             let submission_retry_at = self.state.submission_retry_at();
             if !control_open && !body_open && submission_retry_at.is_none() {
                 break;
             }
+            let refused_version = self.decoded_capacity_blocked;
+            let capacity = async {
+                let changed = pool.capacity().notified();
+                if pool.is_closed() || Some(pool.capacity_version()) != refused_version {
+                    return;
+                }
+                changed.await;
+            };
             zakura_rt::select! {
                 biased;
 
@@ -762,6 +784,11 @@ impl SequencerIO {
                         }
                         None => control_open = false,
                     }
+                }
+
+                _ = capacity, if refused_version.is_some() => {
+                    self.submit_pending_blocks().await;
+                    self.publish_view();
                 }
 
                 _ = time::sleep_until(submission_retry_at.unwrap_or_else(time::Instant::now)),
@@ -909,6 +936,10 @@ impl SequencerIO {
     }
 
     async fn submit_pending_blocks(&mut self) {
+        self.decoded_capacity_blocked = None;
+        if self.decoded_pool.is_closed() {
+            return;
+        }
         let Some(mut pass) = self
             .state
             .begin_submission_pass(time::Instant::now(), self.actions.is_closed())
@@ -917,14 +948,35 @@ impl SequencerIO {
         };
 
         while let Some(height) = self.state.next_submission_height(&mut pass) {
+            if self.decoded_pool.is_closed() {
+                break;
+            }
             let decode_charge = self.state.sequencer().submission_decode_charge_at(height);
             if decode_charge > 0 {
                 self.publish_decoded_ownership_view_with(decode_charge);
             }
-            let Some(prepared) = self.payloads.prepare(&mut self.state.sequencer, height) else {
-                self.publish_decoded_ownership_view();
-                continue;
-            };
+            let capacity_version = self.decoded_pool.capacity_version();
+            let prepared =
+                match self
+                    .payloads
+                    .prepare(&mut self.state.sequencer, height, &self.decoded_pool)
+                {
+                    Ok(Some(prepared)) => prepared,
+                    Ok(None) => {
+                        self.publish_decoded_ownership_view();
+                        continue;
+                    }
+                    Err(AdmissionFailure::Capacity) => {
+                        self.decoded_capacity_blocked = Some(capacity_version);
+                        self.publish_decoded_ownership_view();
+                        break;
+                    }
+                    Err(_) => {
+                        self.decoded_pool.close();
+                        self.publish_decoded_ownership_view();
+                        break;
+                    }
+                };
             let item = prepared.intent;
             let decoded_bytes = item.decoded_bytes;
             if let Some(wire_bytes) = prepared.newly_decoded_wire_bytes {
@@ -965,7 +1017,7 @@ impl SequencerIO {
                     owner: item.owner,
                     source: item.source,
                     token,
-                    block: prepared.block.into(),
+                    block: prepared.block,
                 })
                 .await;
             metrics::histogram!("sync.block.submit.queue_wait_seconds")
@@ -1081,7 +1133,7 @@ impl SequencerIO {
             .body_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);
         // Retained bodies do not charge the request budget.
-        let accounting_closed = !self.work.audit_funding();
+        let accounting_closed = !self.work.audit_funding() || self.decoded_pool.is_closed();
         let mut next = self.state.view(
             sequencer_input_decoded_attributed_memory_bytes,
             self.committed_throughput.bytes_per_sec(),
@@ -1400,6 +1452,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         )
         .with_retained_body_limit(limit)
     }
@@ -1570,6 +1625,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         assert!(
@@ -1615,6 +1673,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         let mut advanced_scope = old_scope;
         advanced_scope.header.header_generation = zakura_header_chain::HeaderGeneration::new(8);
@@ -1676,6 +1737,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -1729,6 +1793,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
@@ -1824,6 +1891,9 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -1939,6 +2009,9 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2063,6 +2136,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2144,6 +2220,9 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2245,6 +2324,9 @@ mod tests {
                     view_tx,
                     Duration::from_secs(1),
                     ZakuraTrace::noop(),
+                    ZakuraBlockSyncConfig::default()
+                        .decoded_block_pool(10_000)
+                        .expect("fixture decoded allowance fits"),
                 );
 
                 let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2348,6 +2430,9 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2458,6 +2543,9 @@ mod tests {
                 view_tx,
                 Duration::from_secs(1),
                 ZakuraTrace::noop(),
+                ZakuraBlockSyncConfig::default()
+                    .decoded_block_pool(10_000)
+                    .expect("fixture decoded allowance fits"),
             );
 
             let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2583,6 +2671,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         let task = tokio::spawn(task.run());
 
@@ -2672,6 +2763,9 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         body.leave_queue();
@@ -2729,6 +2823,9 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
 
         drop(task);

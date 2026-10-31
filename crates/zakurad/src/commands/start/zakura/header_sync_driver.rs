@@ -100,7 +100,15 @@ where
         .or(best_header_tip)
         .unwrap_or(empty_state_tip);
 
+    let backend_chains = zakura_state::constants::MAX_NON_FINALIZED_CHAIN_FORKS
+        .checked_add(zakura_state::constants::MAX_INVALIDATED_BLOCKS)
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| eyre!("backend retained-chain allowance overflow"))?;
+    let decoded_backend_blocks = backend_chains
+        .checked_mul(u64::from(zakura_state::constants::MAX_BLOCK_REORG_HEIGHT) + 1)
+        .ok_or_else(|| eyre!("backend retained-block allowance overflow"))?;
     Ok(ZakuraHeaderSyncDriverStartup {
+        decoded_backend_blocks,
         block_range_source: Arc::new(super::block_range_source::StateBlockRangeSource::new(
             read_state.clone(),
         )),

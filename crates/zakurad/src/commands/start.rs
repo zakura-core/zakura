@@ -2344,6 +2344,9 @@ mod zakura_header_sync_driver_tests {
             frontiers,
             best_header_tip,
             header_tip,
+            (config)
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
             config,
         );
         startup.committed_views = Some(test_committed_views(frontiers, best_header_tip));

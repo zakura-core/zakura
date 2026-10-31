@@ -384,7 +384,8 @@ fn judge(
             | WitnessError::MissingReport
             | WitnessError::Outcome(_)
             | WitnessError::Unrelated { .. }
-            | WitnessError::Fixed { .. } => ConfirmStatus::Nondeterministic,
+            | WitnessError::Fixed { .. }
+            | WitnessError::ChangedFailure => ConfirmStatus::Nondeterministic,
         };
         confirmation.status = status;
         confirmation.detail = Some(format!("the witness test of {want}: {error}"));

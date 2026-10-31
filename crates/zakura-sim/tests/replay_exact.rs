@@ -1240,3 +1240,36 @@ fn work_machine_preserves_empty_and_short_inputs() {
             .verified());
     }
 }
+
+#[test]
+fn work_machine_prefix_and_missing_evidence_never_verify() {
+    let dir = record_named("block/work-ownership", WORK_INPUT);
+    edit(dir.path(), |lines| {
+        lines.truncate(5);
+    });
+    assert!(TraceReader::open(dir.path()).is_err());
+    let prefix = TraceReader::open_prefix(dir.path()).unwrap();
+    let report = replay(
+        &prefix,
+        ReplayOptions {
+            prefix: true,
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.verified());
+    assert!(!report.complete);
+    assert!(report.end.is_none());
+
+    let dir = record_named("block/work-ownership", WORK_INPUT);
+    edit(dir.path(), |lines| {
+        step(lines, 2).as_object_mut().unwrap().remove("work");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 2,
+            field: "work"
+        })
+    ));
+}

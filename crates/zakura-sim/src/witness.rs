@@ -92,6 +92,8 @@ pub enum WitnessError {
     /// The verdict fits, but the run didn't reach the property's trigger
     /// history.
     LostTriggerHistory,
+    /// A reduction reached a different machine failure.
+    ChangedFailure,
     /// A `Known` property that the test expects violated holds.
     Fixed {
         /// The open bug's issue.
@@ -112,6 +114,7 @@ impl fmt::Display for WitnessError {
             WitnessError::HarnessEnd(failure) => {
                 write!(f, "the run ended at a harness failure: {failure}")
             }
+            WitnessError::ChangedFailure => f.write_str("the machine failure changed"),
             WitnessError::NoEnd => f.write_str("the run wrote no end record"),
             WitnessError::MissingReport => f.write_str("the run doesn't report the property"),
             WitnessError::Outcome(outcome) => write!(f, "the property's outcome is {outcome:?}"),

@@ -612,6 +612,101 @@ fn workers_restart_failed_fuzzers_up_to_their_limit() {
     assert!(end.added > 0, "the crashed processes' additions are kept");
 }
 
+/// The stand-in fuzzers of `run`'s workers that are alive, by worker and
+/// process ID, from their command lines, which name their corpus directory
+/// and their time limit.
+fn live_fuzzers(run: &Digest) -> Vec<(usize, u32)> {
+    let workers = format!("{run}/workers/");
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap() {
+        let entry = entry.unwrap();
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let cmdline = String::from_utf8_lossy(&cmdline);
+        // Only the fuzzer itself gets a time limit; the commands it runs,
+        // such as `mv`, name the corpus too.
+        if !cmdline.contains("-max_total_time=") {
+            continue;
+        }
+        let Some((_, rest)) = cmdline.split_once(&workers) else {
+            continue;
+        };
+        if let Some(worker) = rest.split('/').next().and_then(|w| w.parse().ok()) {
+            found.push((worker, pid));
+        }
+    }
+    found
+}
+
+/// Acceptance test 3's worker part: one worker's fuzzer killed while its
+/// supervisor runs. The worker's log says a signal ended that process, not
+/// the supervisor, and the worker restarts it. The run keeps the earlier
+/// crash's failure files and every input the killed process added, and
+/// its initial snapshot still verifies.
+#[test]
+fn a_killed_worker_keeps_the_runs_failures_and_inputs() {
+    let fixture = Fixture::new();
+    fixture.set("crash");
+    let mut child = spawn(fixture.store.root(), &fixture.start_args("4"));
+    let run = running(&fixture.store);
+    wait_for("a fuzzer to crash once", || {
+        !fixture.control.join("crash").exists()
+    });
+    let corpus = |worker: usize| {
+        fixture
+            .store
+            .run_dir(&run)
+            .join(format!("workers/{worker}/corpus"))
+    };
+    let pick = || {
+        live_fuzzers(&run).into_iter().find(|(worker, _)| {
+            fs::read_dir(corpus(*worker)).map_or(0, |entries| entries.count()) >= 3
+        })
+    };
+    wait_for("a live fuzzer with inputs", || pick().is_some());
+    let (worker, pid) = pick().unwrap();
+    let (_, failures) = left_behind(&fixture.store, &run);
+    assert!(!failures.is_empty(), "the crash left its files");
+    let status = Command::new("kill")
+        .args(["-s", "KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let added = digests_under(&corpus(worker));
+    assert!(child.wait().unwrap().success(), "the supervisor runs on");
+
+    let end = campaign::read_end(&fixture.store, &run).unwrap();
+    assert_eq!(end.recorded_by, Recorder::Supervisor, "{end:?}");
+    let attempts = read_attempts(&fixture.store, &run, worker);
+    let killed = attempts
+        .iter()
+        .find(|attempt| attempt.pid == Some(pid))
+        .unwrap_or_else(|| panic!("{attempts:?}"));
+    assert_eq!(killed.signal, Some(9), "{killed:?}");
+    assert!(!killed.killed, "the supervisor didn't kill it");
+    assert_eq!(killed.end, AttemptEnd::Failure);
+    assert!(
+        attempts.last().unwrap().attempt > killed.attempt,
+        "the worker restarted it: {attempts:?}"
+    );
+    let listed: BTreeSet<Digest> = end
+        .failures
+        .iter()
+        .map(|file| file.sha256.clone())
+        .collect();
+    assert!(listed.is_superset(&failures), "{listed:?}");
+    let kept = inputs(&fixture.store, &end.snapshot);
+    assert!(
+        kept.is_superset(&added),
+        "the killed process's inputs are kept"
+    );
+    let initial = fixture.store.read_manifest(&run).unwrap().initial_snapshot;
+    assert!(kept.is_superset(&inputs(&fixture.store, &initial)));
+    assert_store_verifies(&fixture.store);
+}
+
 /// A fuzzer that exits 0 before its time limit hasn't spent its budget:
 /// the worker restarts it, and stops at its restart limit, so the run
 /// isn't complete.

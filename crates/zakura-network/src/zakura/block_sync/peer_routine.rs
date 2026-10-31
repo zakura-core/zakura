@@ -9,9 +9,12 @@
 //! misbehavior. The routine owns its `BlockSyncPeerSession`, outstanding requests,
 //! adaptive outbound window, timeout-recovery slots, servable caps, and fill loop.
 //!
-//! The per-peer task runs the throughput-critical matched-body
-//! `sequencer_input.send(..).await`. Sequencer backpressure therefore stalls only
-//! one routine. The download decision uses the byte budget and per-peer slots.
+//! The per-peer task acquires a sequencer input permit before it decodes a body,
+//! and it waits only there. Sequencer backpressure therefore stalls only one
+//! routine. Decode, receipt settlement, and the body send then run synchronously
+//! under that permit, so no suspension point separates a request's funding from
+//! the body that replaces it. The download decision uses the byte budget and
+//! per-peer slots.
 //! `take_in_range(servable_low, servable_high, n)` uses `servable_high` as its
 //! upper bound.
 //!
@@ -48,7 +51,7 @@ use super::{
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration};
-use zakura_chain::{block, serialization::ZcashSerialize};
+use zakura_chain::block;
 
 mod fill;
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -96,8 +99,8 @@ fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
 const PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
 /// Records decoded-memory metrics for an accepted block and returns its attributed size.
-/// The decoded-to-serialized ratio is omitted when the wire size is missing or zero.
-fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>) -> u64 {
+/// The decoded-to-serialized ratio is omitted when the wire size is zero.
+fn record_decoded_memory_size(block: &block::Block, serialized_bytes: u64) -> u64 {
     let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
     // Metrics accepts f64 samples; these lossy conversions are observability-only.
     metrics::histogram!(
@@ -105,7 +108,7 @@ fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>
         "stage" => "peer"
     )
     .record(decoded_attributed_memory_size_bytes as f64);
-    if let Some(serialized_bytes) = body_wire_bytes.filter(|bytes| *bytes > 0) {
+    if serialized_bytes > 0 {
         metrics::histogram!(
             "sync.block.body.decoded.to_serialized_ratio",
             "stage" => "peer"
@@ -763,8 +766,7 @@ impl PeerRoutine {
             }
         }
         self.trace_wake("own_body");
-        self.handle_body(block, Some(body_wire_bytes), body_permit, raw_block_payload)
-            .await;
+        self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload);
         Ok(())
     }
 
@@ -1218,18 +1220,19 @@ impl PeerRoutine {
     // ===================== inbound matched body (ports `handle_block`) ======
 
     /// Handle a decoded body that a live reservation already authorized.
-    /// `raw_block_payload` is the frame payload `block` was decoded from.
-    async fn handle_body(
+    /// `raw_block_payload` is the frame payload `block` was decoded from, and
+    /// `serialized_bytes` is its length. `body_permit` is the sequencer slot
+    /// acquired before decode, so nothing here can wait.
+    fn handle_body(
         &mut self,
         block: Arc<block::Block>,
-        body_wire_bytes: Option<u64>,
+        serialized_bytes: u64,
         body_permit: mpsc::OwnedPermit<SequencedBody>,
         raw_block_payload: Arc<[u8]>,
     ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
-            self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
-                .await;
+            self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock);
             return;
         };
 
@@ -1237,17 +1240,14 @@ impl PeerRoutine {
             BodyMatch::Matched(matched) => matched,
             BodyMatch::Unmatched => {
                 // No outstanding match — run the unmatched fallthroughs locally.
-                if self
-                    .accept_unmatched_queued_body(
-                        height,
-                        hash,
-                        block.clone(),
-                        body_wire_bytes,
-                        body_permit,
-                        raw_block_payload.clone(),
-                    )
-                    .await
-                {
+                if self.accept_unmatched_queued_body(
+                    height,
+                    hash,
+                    block,
+                    serialized_bytes,
+                    body_permit,
+                    raw_block_payload,
+                ) {
                     return;
                 }
                 // Local retirement, reorgs and GC change interest, not authority.
@@ -1265,13 +1265,11 @@ impl PeerRoutine {
             }
             BodyMatch::PayloadMismatch { owner, requested } => {
                 let mismatch = header_hash_payload_mismatch(owner, self.io.source, requested, hash);
-                self.report_misbehavior(BlockSyncMisbehavior::BodyPayloadMismatch(mismatch))
-                    .await;
+                self.report_misbehavior(BlockSyncMisbehavior::BodyPayloadMismatch(mismatch));
                 return;
             }
             BodyMatch::NotRequested => {
-                self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
-                    .await;
+                self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock);
                 return;
             }
         };
@@ -1305,21 +1303,6 @@ impl PeerRoutine {
         // consensus does it on apply (`handle_block_apply_finished` attributes a
         // rejection back to the delivering peer for misbehavior scoring).
 
-        // Prefer the wire-measured body size; only re-serialize when absent (test
-        // event).
-        let serialized_bytes = match body_wire_bytes {
-            Some(bytes) => bytes,
-            None => match block.zcash_serialize_to_vec() {
-                Ok(bytes) => bytes.len() as u64,
-                Err(error) => {
-                    tracing::debug!(?error, "failed to serialize decoded block-sync body");
-                    self.finish_outstanding_at(key, Disposition::RetryOriginal);
-                    self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
-                        .await;
-                    return;
-                }
-            },
-        };
         if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
         {
             // The header matched the requested hash, so the size hint was wrong.
@@ -1336,7 +1319,6 @@ impl PeerRoutine {
             hash,
             block,
             raw_block_payload,
-            body_wire_bytes,
             serialized_bytes,
             body_permit,
         );
@@ -1351,7 +1333,6 @@ impl PeerRoutine {
         hash: block::Hash,
         block: Arc<block::Block>,
         raw_block_payload: Arc<[u8]>,
-        body_wire_bytes: Option<u64>,
         serialized_bytes: u64,
         body_permit: mpsc::OwnedPermit<SequencedBody>,
     ) {
@@ -1393,7 +1374,7 @@ impl PeerRoutine {
             return;
         };
         let decoded_attributed_memory_size_bytes =
-            record_decoded_memory_size(&block, body_wire_bytes);
+            record_decoded_memory_size(&block, serialized_bytes);
         self.trace_body_received(
             height,
             serialized_bytes,
@@ -1565,13 +1546,12 @@ impl PeerRoutine {
     /// is the sole gate for queued heights — a received body consumes no request
     /// budget; for reserved in-flight heights the arrival ends that request's
     /// reservation (first-completion-wins).
-    #[allow(clippy::too_many_arguments)]
-    async fn accept_unmatched_queued_body(
+    fn accept_unmatched_queued_body(
         &mut self,
         height: block::Height,
         hash: block::Hash,
         block: Arc<block::Block>,
-        body_wire_bytes: Option<u64>,
+        serialized_bytes: u64,
         body_permit: mpsc::OwnedPermit<SequencedBody>,
         raw_block_payload: Arc<[u8]>,
     ) -> bool {
@@ -1581,47 +1561,6 @@ impl PeerRoutine {
         if !self.state.serves(height) {
             return false;
         }
-        let serialized_bytes = match body_wire_bytes {
-            Some(bytes) => bytes,
-            None => match block.zcash_serialize_to_vec() {
-                Ok(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                Err(error) => {
-                    tracing::debug!(
-                        peer = ?self.io.peer,
-                        ?height,
-                        ?error,
-                        "failed to serialize unmatched queued block-sync body"
-                    );
-                    self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
-                        .await;
-                    return true;
-                }
-            },
-        };
-
-        self.finish_unmatched_receipt(
-            height,
-            hash,
-            block,
-            body_wire_bytes,
-            serialized_bytes,
-            body_permit,
-            raw_block_payload,
-        )
-    }
-
-    /// Claim and send a wanted late body without suspending its funding transfer.
-    #[allow(clippy::too_many_arguments)]
-    fn finish_unmatched_receipt(
-        &mut self,
-        height: block::Height,
-        hash: block::Hash,
-        block: Arc<block::Block>,
-        body_wire_bytes: Option<u64>,
-        serialized_bytes: u64,
-        body_permit: mpsc::OwnedPermit<SequencedBody>,
-        raw_block_payload: Arc<[u8]>,
-    ) -> bool {
         let reserved_in_flight = self.io.work.reserved_in_flight_charge(height);
         let is_pending = self.io.work.pending_contains(height);
         if reserved_in_flight.is_none() && !is_pending {
@@ -1684,7 +1623,7 @@ impl PeerRoutine {
         };
 
         let decoded_attributed_memory_size_bytes =
-            record_decoded_memory_size(&block, body_wire_bytes);
+            record_decoded_memory_size(&block, serialized_bytes);
         self.record_received(serialized_bytes);
         self.trace_body_received(
             height,
@@ -1993,7 +1932,7 @@ impl PeerRoutine {
 
     // ===================== misbehavior (shared count via registry) ==========
 
-    async fn report_misbehavior(&self, reason: BlockSyncMisbehavior) {
+    fn report_misbehavior(&self, reason: BlockSyncMisbehavior) {
         // This path only records misbehavior: observe and forward it, but never
         // cancel the session. Only a proven tampered body, reported by the
         // sequencer, disconnects (see `BlockSyncMisbehavior::proves_tampered_body`).

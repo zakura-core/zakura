@@ -8,13 +8,6 @@ use hex::{FromHex, FromHexError, ToHex};
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
-/// The randomness used in the Pedersen Hash for note commitment.
-///
-/// Equivalent to `sapling_crypto::note::CommitmentRandomness`,
-/// but we can't use it directly as it is not public.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CommitmentRandomness(jubjub::Fr);
-
 /// A Sapling value commitment, stored as its 32-byte compressed encoding.
 ///
 /// The commitment is a Jubjub point, but decompressing it needs a field square

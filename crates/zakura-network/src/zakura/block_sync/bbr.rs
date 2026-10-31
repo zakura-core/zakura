@@ -1,7 +1,6 @@
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Duration};
+
+use zakura_rt::time::Instant;
 
 use super::{
     config::{CwndUnit, ZakuraBlockSyncConfig},

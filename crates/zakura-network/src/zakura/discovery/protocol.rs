@@ -6,7 +6,7 @@ use std::{
     io::{self, Cursor, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -23,6 +23,7 @@ use zakura_rt::{
         HashMap, HashSet,
     },
     sync::{watch, AsyncMutex},
+    time::utc_now,
 };
 
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
@@ -1948,7 +1949,7 @@ impl ZakuraDiscoveryHandle {
         let slot = self.verify_slots.reserve().await;
         let context = self.import_validation.context(current_unix_secs());
         crate::zakura::resume_task_panic(
-            zakura_rt::task::spawn_blocking(move || {
+            zakura_rt::task::spawn_blocking_named("discovery_verify", move || {
                 let _slot = slot;
                 verify(&context)
             })
@@ -3311,7 +3312,7 @@ fn is_direct_address_import_error(error: &DiscoveryBookError) -> bool {
 }
 
 fn current_unix_secs() -> u64 {
-    SystemTime::now()
+    utc_now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
@@ -3323,7 +3324,7 @@ fn current_unix_secs() -> u64 {
 /// backward clock step can still produce a non-increasing sequence; the durable fix is to persist
 /// and reload `last_authored_sequence` in the cache-persistence task.
 fn current_sequence_tick() -> u64 {
-    SystemTime::now()
+    utc_now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)

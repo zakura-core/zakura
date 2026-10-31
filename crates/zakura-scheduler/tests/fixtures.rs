@@ -340,6 +340,584 @@ fn shutdown_drops_idle_tasks_outside_an_unwind() {
 }
 
 #[test]
+fn shutdown_leaks_a_mid_poll_spin_with_no_setter() {
+    if leaks_in_a_child("shutdown_leaks_a_mid_poll_spin_with_no_setter") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let spinner = s.spawn_root("spinner", async move {
+            // Nothing ever stores, and every load is a point.
+            while flag.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+    });
+    assert_eq!(
+        (report.cancelled, report.unwound, report.leaked),
+        (0, 0, 1),
+        "the spinner was leaked, not cancelled or unwound"
+    );
+}
+
+/// Spins on `flag` when dropped, as a guard that waits for another task in
+/// its destructor would.
+struct SpinsOnDrop(Rc<Atomic>);
+
+impl Drop for SpinsOnDrop {
+    fn drop(&mut self) {
+        while self.0.load() == 0 {}
+    }
+}
+
+/// Runs `setup` on a fresh thread and returns the cleanup report, or panics
+/// if shutdown takes longer than a minute.
+fn shutdown_report(
+    setup: impl FnOnce(&mut Scheduler) + Send + 'static,
+) -> zakura_scheduler::CleanupReport {
+    shutdown_report_with(SchedulerConfig::default(), setup)
+}
+
+/// [`shutdown_report`] with `config`.
+fn shutdown_report_with(
+    config: SchedulerConfig,
+    setup: impl FnOnce(&mut Scheduler) + Send + 'static,
+) -> zakura_scheduler::CleanupReport {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = Scheduler::new(config, SimInstant::ZERO);
+        setup(&mut s);
+        let _ = done.send(s.shutdown());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("shutdown finished")
+}
+
+#[test]
+fn shutdown_leaks_a_stuck_task_whose_drop_spins() {
+    if leaks_in_a_child("shutdown_leaks_a_stuck_task_whose_drop_spins") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let spinner = s.spawn_root("spinner", async move {
+            // Unwinding would run this guard, which spins forever.
+            let _guard = SpinsOnDrop(flag.clone());
+            while flag.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+    });
+    assert_eq!((report.leaked, report.unwound), (1, 0));
+}
+
+/// Sets `flag` when dropped, as a guard that signals another task would.
+struct SetsOnDrop(Rc<Atomic>);
+
+impl Drop for SetsOnDrop {
+    fn drop(&mut self) {
+        self.0.store(1);
+    }
+}
+
+#[test]
+fn a_leak_leaks_the_waiters_that_depend_on_it() {
+    if leaks_in_a_child("a_leak_leaks_the_waiters_that_depend_on_it") {
+        return;
+    }
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    let report = shutdown_report(|s| {
+        let lock = shared(Mutex::new(()));
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        let (a_lock, a_flag) = (lock.clone(), flag.clone());
+        // A holds the lock and spins. Unwinding A would set the flag and
+        // release the lock, but leaking A does neither.
+        let a = s.spawn_root("a", async move {
+            let _held = a_lock.lock();
+            let _signal = SetsOnDrop(a_flag);
+            while never.load() == 0 {}
+        });
+        // B parks on A's lock, holding a guard that waits for the flag.
+        let b = s.spawn_root("b", async move {
+            let _waits = SpinsOnDrop(flag);
+            drop(lock.lock());
+        });
+        for _ in 0..4 {
+            assert!(matches!(s.run(a.task()), Reached(_)));
+        }
+        while !matches!(s.run(b.task()), Parked(_)) {}
+    });
+    assert_eq!((report.leaked, report.unwound), (2, 0));
+}
+
+/// Counts its drops, as a guard with a visible destructor would.
+struct CountsDrops(Rc<Cell<u32>>);
+
+impl Drop for CountsDrops {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+#[test]
+fn a_stuck_task_stops_the_drain() {
+    if leaks_in_a_child("a_stuck_task_stops_the_drain") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        let never = shared(Atomic::default());
+        let spinner = s.spawn_root("spinner", async move { while never.load() == 0 {} });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        // Ready tasks the drain would cancel after the spinner, running
+        // their guards' destructors.
+        let drops = shared(Cell::new(0));
+        for _ in 0..3 {
+            let guard = CountsDrops(drops.clone());
+            s.spawn_root("ready", async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            });
+        }
+    });
+    assert_eq!(
+        (report.leaked, report.cancelled),
+        (4, 0),
+        "once the spinner was stuck, nothing was cancelled"
+    );
+}
+
+/// A waker whose wake panics, as a buggy joiner's might.
+struct PanicsOnWake;
+
+impl std::task::Wake for PanicsOnWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        panic!("this waker panics");
+    }
+}
+
+#[test]
+fn a_panicking_join_waker_unwinds_nothing_after_a_leak() {
+    if leaks_in_a_child("a_panicking_join_waker_unwinds_nothing_after_a_leak") {
+        return;
+    }
+    use std::future::Future;
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Signals when the thread ends, even by a panic.
+        struct Done(std::sync::mpsc::Sender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _done = Done(done);
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let lock = shared(Mutex::new(()));
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        let (a_lock, a_flag) = (lock.clone(), flag.clone());
+        let mut a = s.spawn_root("a", async move {
+            let _held = a_lock.lock();
+            let _signal = SetsOnDrop(a_flag);
+            while never.load() == 0 {}
+        });
+        let b = s.spawn_root("b", async move {
+            let _waits = SpinsOnDrop(flag);
+            drop(lock.lock());
+        });
+        for _ in 0..4 {
+            assert!(matches!(s.run(a.task()), Reached(_)));
+        }
+        while !matches!(s.run(b.task()), Parked(_)) {}
+        // A joiner of A whose waker panics when A is finished.
+        let waker = Waker::from(std::sync::Arc::new(PanicsOnWake));
+        let polled = std::pin::Pin::new(&mut a).poll(&mut std::task::Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // The waker's panic ends this thread. It must not force-unwind B on
+        // the way out.
+        let _ = s.shutdown();
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the shutdown thread ended");
+}
+
+thread_local! {
+    /// The flag a timer waker's `Drop` hands to the task it spawns. See
+    /// `a_spawn_from_a_leftover_drop_is_leaked`.
+    static LEFTOVER_FLAG: RefCell<Option<Rc<Atomic>>> = const { RefCell::new(None) };
+}
+
+/// A waker whose last drop spawns a task holding a guard that spins on
+/// [`LEFTOVER_FLAG`].
+struct SpawnsOnDrop;
+
+// `Waker::noop()` has no drop to spawn from, so this needs its own waker.
+#[allow(clippy::manual_noop_waker)]
+impl std::task::Wake for SpawnsOnDrop {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+impl Drop for SpawnsOnDrop {
+    fn drop(&mut self) {
+        let flag = LEFTOVER_FLAG
+            .with(|f| f.borrow().clone())
+            .expect("the test sets the flag first");
+        // Built outside the future, so dropping it unpolled runs the guard.
+        let waits = SpinsOnDrop(flag);
+        hooks::spawn("b", async move {
+            let _waits = waits;
+            std::future::pending::<()>().await
+        });
+    }
+}
+
+#[test]
+fn a_spawn_from_a_leftover_drop_is_leaked() {
+    if leaks_in_a_child("a_spawn_from_a_leftover_drop_is_leaked") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        LEFTOVER_FLAG.with(|f| *f.borrow_mut() = Some(flag.clone()));
+        // A spins until the cleanup bound stops it, so its guard, which
+        // would set the flag, never runs.
+        let a = s.spawn_root("a", async move {
+            let _signal = SetsOnDrop(flag);
+            while never.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(a.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        // A leftover timer whose waker spawns B when shutdown drops it. B's
+        // guard waits on A's flag.
+        let waker = Waker::from(std::sync::Arc::new(SpawnsOnDrop));
+        hooks::register_timer(
+            SimInstant::from_start(std::time::Duration::from_secs(3600)),
+            &waker,
+        );
+    });
+    // The run is abandoned with the timer still registered, so its waker
+    // never drops and B is never spawned. Only A is leaked.
+    assert_eq!((report.leaked, report.cancelled), (1, 0));
+}
+
+#[test]
+fn a_rejected_spawn_from_a_leftover_drop_runs_nothing() {
+    if leaks_in_a_child("a_rejected_spawn_from_a_leftover_drop_runs_nothing") {
+        return;
+    }
+    // With room for one task, B's spawn would be rejected, and a rejected
+    // spawn drops its future at once, guard and all.
+    let config = SchedulerConfig {
+        max_tasks: 1,
+        ..SchedulerConfig::default()
+    };
+    let report = shutdown_report_with(config, |s| {
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        LEFTOVER_FLAG.with(|f| *f.borrow_mut() = Some(flag.clone()));
+        let a = s.spawn_root("a", async move {
+            let _signal = SetsOnDrop(flag);
+            while never.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(a.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        let waker = Waker::from(std::sync::Arc::new(SpawnsOnDrop));
+        hooks::register_timer(
+            SimInstant::from_start(std::time::Duration::from_secs(3600)),
+            &waker,
+        );
+    });
+    assert_eq!((report.leaked, report.cancelled), (1, 0));
+}
+
+/// Sets its flag when woken or dropped.
+struct SetsFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl std::task::Wake for SetsFlag {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for SetsFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn no_code_runs_after_a_task_is_stuck() {
+    use std::{
+        future::Future,
+        sync::{atomic::AtomicBool, Arc},
+    };
+    if leaks_in_a_child("no_code_runs_after_a_task_is_stuck") {
+        return;
+    }
+    let (join, timer, spawned) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let flags = (join.clone(), timer.clone(), spawned.clone());
+    let report = shutdown_report(move |s| {
+        let never = shared(Atomic::default());
+        let mut spinner = s.spawn_root("spinner", async move { while never.load() == 0 {} });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        // A joiner's waker, a timer's waker, and a queued spawn's future.
+        // Waking or dropping any of them sets its flag.
+        let joiner = Waker::from(Arc::new(SetsFlag(join)));
+        let polled =
+            std::pin::Pin::new(&mut spinner).poll(&mut std::task::Context::from_waker(&joiner));
+        assert!(polled.is_pending());
+        hooks::register_timer(
+            SimInstant::from_start(std::time::Duration::from_secs(3600)),
+            &Waker::from(Arc::new(SetsFlag(timer))),
+        );
+        let guard = SetsFlag(spawned);
+        hooks::spawn("queued", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        });
+    });
+    let (join, timer, spawned) = flags;
+    let set = |flag: &AtomicBool| flag.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        (set(&join), set(&timer), set(&spawned)),
+        (false, false, false),
+        "no waker woke or dropped, and no future dropped"
+    );
+    assert_eq!(report.leaked, 2, "the spinner and the queued spawn");
+}
+
+#[test]
+fn a_caught_unwind_that_gets_stuck_abandons_the_run() {
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::{atomic::AtomicBool, Arc},
+    };
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    if leaks_in_a_child("a_caught_unwind_that_gets_stuck_abandons_the_run") {
+        return;
+    }
+    let b_ran = Arc::new(AtomicBool::new(false));
+    let flag = b_ran.clone();
+    let report = shutdown_report(move |s| {
+        let (l1, l2) = (shared(Mutex::new(())), shared(Mutex::new(())));
+        let b_flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        let (a_l1, a_l2, a_waits) = (l1.clone(), l2.clone(), b_flag);
+        // A holds l1, waits for l2 in a lock cycle with B, catches the
+        // forced unwind, then spins until the cleanup bound stops it. Its
+        // guard waits on a flag B never sets.
+        let a = s.spawn_root("a", async move {
+            let _waits = SpinsOnDrop(a_waits);
+            let _l1 = a_l1.lock();
+            point();
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(a_l2.lock())));
+            while never.load() == 0 {}
+        });
+        // B holds l2 and waits for l1. Its guard would set B's ran flag.
+        let b = s.spawn_root("b", async move {
+            let _ran = SetsFlag(flag);
+            let _l2 = l2.lock();
+            point();
+            drop(l1.lock());
+        });
+        for task in [a.task(), a.task(), b.task(), b.task()] {
+            assert!(matches!(s.run(task), Reached(_)));
+        }
+        for task in [a.task(), b.task()] {
+            let parked = (0..10).any(|_| matches!(s.run(task), Parked(_)));
+            assert!(parked, "the task parks in the lock cycle");
+        }
+    });
+    assert!(
+        !b_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "B's guard never ran"
+    );
+    assert_eq!((report.leaked, report.cancelled), (2, 0), "A and B");
+}
+
+#[test]
+fn a_panic_in_a_direct_drop_unwinds_nothing() {
+    if !leaks_in_a_child("a_panic_in_a_direct_drop_unwinds_nothing") {
+        panic_in_shutdown_unwinds_nothing(drop);
+    }
+}
+
+#[test]
+fn a_panic_in_shutdown_unwinds_nothing() {
+    if !leaks_in_a_child("a_panic_in_shutdown_unwinds_nothing") {
+        panic_in_shutdown_unwinds_nothing(|s| {
+            s.shutdown();
+        });
+    }
+}
+
+/// Ends a scheduler with `end` while a joiner's waker panics during its
+/// shutdown, and checks that a task parked on a lock was never unwound.
+fn panic_in_shutdown_unwinds_nothing(end: fn(Scheduler)) {
+    use std::{
+        future::Future,
+        sync::{atomic::AtomicBool, Arc},
+    };
+    use zakura_scheduler::RunOutcome::{Parked, Waiting};
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Signals when the thread ends, even by a panic.
+        struct Done(std::sync::mpsc::Sender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _done = Done(done);
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let lock = shared(Mutex::new(()));
+        let held = lock.clone();
+        // A waits forever, and its joiner's waker panics when A is cancelled.
+        let mut a = s.spawn_root("a", std::future::pending::<()>());
+        // H holds the lock across an await, so B stays parked on it.
+        let h = s.spawn_root("h", async move {
+            let _held = held.lock();
+            std::future::pending::<()>().await
+        });
+        // B parks on the lock. Unwinding B would run its guard.
+        let b = s.spawn_root("b", async move {
+            let _ran = SetsFlag(flag);
+            drop(lock.lock());
+        });
+        assert_eq!(s.run(a.task()), Waiting);
+        while s.run(h.task()) != Waiting {}
+        while !matches!(s.run(b.task()), Parked(_)) {}
+        let waker = Waker::from(std::sync::Arc::new(PanicsOnWake));
+        let polled = std::pin::Pin::new(&mut a).poll(&mut std::task::Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // The waker's panic ends this thread.
+        end(s);
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the thread ended");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "B was not unwound"
+    );
+}
+
+/// When woken, polls a join handle and keeps the exit it reports.
+struct RecordsExit {
+    handle: zakura_scheduler::JoinHandle,
+    exit: std::sync::Mutex<Option<TaskExit>>,
+}
+
+impl std::task::Wake for RecordsExit {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        use std::future::Future;
+        let mut handle = self.handle;
+        let noop = std::task::Context::from_waker(Waker::noop());
+        let mut cx = noop;
+        if let Poll::Ready(exit) = std::pin::Pin::new(&mut handle).poll(&mut cx) {
+            *self.exit.lock().unwrap() = Some(exit);
+        }
+    }
+}
+
+/// Locks its mutex when dropped, as a cancellation destructor might.
+struct LocksOnDrop(Rc<Mutex<()>>);
+
+impl Drop for LocksOnDrop {
+    fn drop(&mut self) {
+        drop(self.0.lock());
+    }
+}
+
+#[test]
+fn a_forced_unwind_out_of_a_cancellation_drop_is_a_cancel() {
+    use std::{future::Future, sync::Arc};
+    use zakura_scheduler::RunOutcome::Waiting;
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let (la, lb) = (shared(Mutex::new(())), shared(Mutex::new(())));
+    let (a_la, a_lb) = (la.clone(), lb.clone());
+    // A and B each hold a lock across an await, and their cancellation
+    // destructors each park on the other's lock.
+    let mut a = s.spawn_root("a", async move {
+        let _held = a_la.lock();
+        let _then = LocksOnDrop(a_lb);
+        std::future::pending::<()>().await
+    });
+    let b = s.spawn_root("b", async move {
+        let _held = lb.lock();
+        let _then = LocksOnDrop(la);
+        std::future::pending::<()>().await
+    });
+    while s.run(a.task()) != Waiting {}
+    while s.run(b.task()) != Waiting {}
+    let joiner = Arc::new(RecordsExit {
+        handle: a,
+        exit: std::sync::Mutex::new(None),
+    });
+    let waker = Waker::from(joiner.clone());
+    assert!(std::pin::Pin::new(&mut a)
+        .poll(&mut std::task::Context::from_waker(&waker))
+        .is_pending());
+    let report = s.shutdown();
+    assert_eq!(
+        *joiner.exit.lock().unwrap(),
+        Some(TaskExit::Cancelled),
+        "the forced unwind ended A as cancelled"
+    );
+    assert_eq!((report.unwound, report.panicked), (1, 0));
+}
+
+#[test]
+fn long_but_finite_cleanup_finishes() {
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let worker = s.spawn_root("worker", async move {
+            let _guard = SpinsOnDrop(flag.clone());
+            // More points than the first cleanup bound allowed, then the
+            // store the guard waits on.
+            for _ in 0..100_002 {
+                point();
+            }
+            flag.store(1);
+        });
+        assert!(matches!(
+            s.run(worker.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+    });
+    assert_eq!((report.leaked, report.unwound, report.cancelled), (0, 0, 0));
+}
+
+#[test]
 fn shutdown_drop_can_take_a_contended_lock() {
     use zakura_scheduler::RunOutcome::{Reached, Waiting};
     // `holder` keeps the lock across an await, or stops mid-poll holding it.
@@ -432,8 +1010,9 @@ fn panic_in_a_leftover_drop_leaves_no_run_behind() {
             "panic_in_a_leftover_drop_leaves_no_run_behind",
             &[("ASAN_OPTIONS", "detect_leaks=0")],
         )
-        .wait()
-        .expect("the child is ours to wait on");
+        .wait_with_output()
+        .expect("the child is ours to wait on")
+        .status;
         assert!(status.success(), "the child failed: {status}");
         return;
     }
@@ -1140,7 +1719,10 @@ const STARVATION_SCHEDULE: &[&str] = &["holder.1", "holder.1", "holder.1", "wait
 #[test]
 fn saved_schedules_for_lock_cycle_and_starvation() {
     // `noise` waits on its timer while the pair parks. Once time moves, it's
-    // ready but has no worker, and the cycle still reports `Deadlock`.
+    // ready but has no worker, and the cycle still reports `Deadlock`. That's
+    // the one shape `status()` already handles. With a spare worker, or with
+    // the timer still pending, the cycle shows as `Running` or
+    // `WaitingOnTime` instead (#1635).
     let (r, _) = replay(2, AB_BA_WITH_NOISE_SCHEDULE, ab_ba(true)).expect("replays");
     assert_eq!(r.status, Status::Deadlock);
     assert!(
@@ -1346,6 +1928,7 @@ struct CleanupReportSummary {
 
 #[test]
 fn forced_unwind_passes_through_a_production_catch_unwind() {
+    let stacks_before = unaccounted_stacks();
     for rethrow in [false, true] {
         let (report, caught, saw) = cycle_in_catch_unwind(rethrow);
         // Only the parked pair is affected, and only `ab` is force-unwound:
@@ -1364,6 +1947,11 @@ fn forced_unwind_passes_through_a_production_catch_unwind() {
             saw,
             Some(true),
             "a guard in the frame drops while unwinding"
+        );
+        assert_eq!(
+            unaccounted_stacks(),
+            stacks_before,
+            "rethrow {rethrow}: no stack leaked"
         );
         // The thread can start another run.
         drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
@@ -1480,6 +2068,38 @@ fn task_panic_reaches_the_harness_with_a_replaced_panic_hook() {
     assert!(hook_calls.load(Ordering::SeqCst) >= 1);
 }
 
+/// Reruns `test` in a child with LeakSanitizer off, for a test that leaks
+/// tasks on purpose, and checks it passed. Returns true in the parent, which
+/// should then return. In the child, returns false so the body runs.
+fn leaks_in_a_child(test: &str) -> bool {
+    use std::process::{Command, Stdio};
+    if in_child(test) {
+        return false;
+    }
+    // Added to any ASan options already set, rather than replacing them.
+    let asan = match std::env::var("ASAN_OPTIONS") {
+        Ok(options) if !options.is_empty() => format!("{options}:detect_leaks=0"),
+        _ => "detect_leaks=0".to_owned(),
+    };
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = Command::new(exe)
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env(CHILD_TEST, test)
+        .env("ASAN_OPTIONS", asan)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("the test binary can rerun itself");
+    assert!(
+        output.status.success(),
+        "the child failed: {}\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}
+
 /// Names the one test a child process started by [`rerun_in_child`] runs.
 const CHILD_TEST: &str = "ZAKURA_SCHEDULER_CHILD_TEST";
 
@@ -1488,37 +2108,42 @@ fn in_child(test: &str) -> bool {
     std::env::var_os(CHILD_TEST).is_some_and(|t| t == test)
 }
 
-/// Reruns this test binary for the single test `test`, with `envs` set and
-/// its output discarded.
+/// Reruns this test binary for the single test `test`, with `envs` set. The
+/// child's stdout, uncaptured by the test harness, is piped back.
 fn rerun_in_child(test: &str, envs: &[(&str, &str)]) -> std::process::Child {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().expect("the test binary has a path");
     Command::new(exe)
-        .args(["--exact", test, "--test-threads=1"])
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
         .env(CHILD_TEST, test)
         .envs(envs.iter().copied())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("the test binary can rerun itself")
 }
+
+/// What the watchdog child prints right before its cleanup starts.
+const CLEANUP_STARTED: &str = "zakura-scheduler watchdog child: cleanup started";
 
 /// Hangs in cleanup on purpose, but only in the child process that
 /// [`cleanup_that_never_reaches_a_point_trips_the_watchdog`] starts.
 /// Anywhere else it returns at once.
 #[test]
 fn watchdog_child_spins_in_cleanup() {
+    use std::io::Write;
     if !in_child("watchdog_child_spins_in_cleanup") {
         return;
     }
-    // A destructor that waits for a flag only another task sets. Points do
-    // nothing during shutdown, so it never lets that task run.
+    // A destructor that waits for a flag only another task sets, with no
+    // preemption point, so the scheduler can never switch to that task. A cap
+    // on points per task during shutdown wouldn't stop it either. One that
+    // spins through points is leaked at the cleanup point bound instead, as
+    // `cleanup_that_spins_through_points_is_leaked` checks.
     struct SpinOnDrop(Rc<Cell<bool>>);
     impl Drop for SpinOnDrop {
         fn drop(&mut self) {
-            while !self.0.get() {
-                point();
-            }
+            while !self.0.get() {}
         }
     }
     let flag = shared(Cell::new(false));
@@ -1530,13 +2155,67 @@ fn watchdog_child_spins_in_cleanup() {
     });
     s.spawn_root("setter", async move { flag.set(true) });
     assert_eq!(s.run(spinner.task()), zakura_scheduler::RunOutcome::Waiting);
+    // The test harness prints `test <name> ... ` first, without a newline.
+    writeln!(std::io::stdout(), "{CLEANUP_STARTED}").expect("stdout is piped to the parent");
     s.shutdown();
 }
 
 #[test]
+fn cleanup_that_spins_through_points_is_leaked() {
+    if leaks_in_a_child("cleanup_that_spins_through_points_is_leaked") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        // A destructor that waits, through points, for a flag only another
+        // task sets. Points don't switch during shutdown, so the setter never
+        // runs, and the cleanup point bound stops the destructor instead.
+        struct SpinOnDrop(Rc<Cell<bool>>);
+        impl Drop for SpinOnDrop {
+            fn drop(&mut self) {
+                while !self.0.get() {
+                    point();
+                }
+            }
+        }
+        let flag = shared(Cell::new(false));
+        let guard = SpinOnDrop(flag.clone());
+        let spinner = s.spawn_root("spinner", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        });
+        s.spawn_root("setter", async move { flag.set(true) });
+        assert_eq!(s.run(spinner.task()), zakura_scheduler::RunOutcome::Waiting);
+    });
+    // The spinner stuck inside its cancellation, so it and the setter are
+    // both leaked.
+    assert_eq!((report.leaked, report.cancelled), (2, 0));
+}
+
+#[test]
 fn cleanup_that_never_reaches_a_point_trips_the_watchdog() {
-    use std::time::{Duration, Instant};
+    use std::{
+        io::{BufRead, BufReader},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
     let mut child = rerun_in_child("watchdog_child_spins_in_cleanup", &[]);
+    // The child must reach its cleanup, so a slow or hung startup can't pass.
+    let stdout = child.stdout.take().expect("the child's stdout is piped");
+    let (started, wait_started) = mpsc::channel();
+    std::thread::spawn(move || {
+        let reached = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.ends_with(CLEANUP_STARTED));
+        if reached {
+            let _ = started.send(());
+        }
+    });
+    if wait_started.recv_timeout(Duration::from_secs(30)).is_err() {
+        let _ = child.kill();
+        let status = child.wait().expect("the child can be reaped");
+        panic!("the child never reached its cleanup: {status}");
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("the child is ours to wait on") {
@@ -1602,5 +2281,15 @@ fn stacks_past_the_pool_limit_are_freed_without_a_false_leak() {
         before,
         "{:?}",
         zakura_scheduler::stack_pool()
+    );
+}
+
+#[test]
+fn draw_kind_names_are_pinned() {
+    use zakura_scheduler::DrawKind::{HashSeed, Rng, Select, StreamMap};
+    // Draw identities and traces carry these names, so a rename fails here.
+    assert_eq!(
+        [Rng, Select, HashSeed, StreamMap].map(|kind| kind.name()),
+        ["rng", "select", "hash-seed", "stream-map"]
     );
 }

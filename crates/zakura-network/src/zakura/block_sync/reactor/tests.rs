@@ -1,7 +1,7 @@
 //! Machine test for the floor watchdog's settlement against the shared owners.
 //!
 //! The proptest runs [`cancel_expired_floor_claims`] on a real registry, work
-//! queue, and byte budget while sessions take work, get replaced, and tear
+//! queue, and queue-owned funding while sessions take work, get replaced, and tear
 //! down. An independent model tracks each height's holder, each peer's
 //! published claim, and the reserved bytes. It never calls the code it checks.
 
@@ -10,10 +10,7 @@ use std::{collections::BTreeMap, time::Duration};
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::{
-    block_sync::{test_work_scope, work_queue::RequestWrite},
-    transport::FrameWriteClaim,
-};
+use crate::zakura::{block_sync::test_work_scope, transport::FrameWriteClaim};
 
 /// Heights the test schedules. Height 1 is the floor watchdog's height.
 const HEIGHTS: [u32; 2] = [1, 2];
@@ -108,7 +105,7 @@ proptest! {
         let config = ZakuraBlockSyncConfig::default();
         let start = Instant::now();
         let registry = PeerRegistry::new();
-        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(10 * BYTES)));
         work.set_estimate_floor_for_tests(1);
         let _ = work.extend(
             test_work_scope(),
@@ -120,7 +117,6 @@ proptest! {
                 )
             }),
         );
-        let mut budget = ByteBudget::new(10 * BYTES);
         let mut model = Model::default();
         let mut next_request = 1_u64;
 
@@ -141,7 +137,7 @@ proptest! {
                     }
                     let request_id = NonZeroU64::new(next_request).expect("request IDs start at one");
                     next_request += 1;
-                    let items = work.take_for_request(
+                    let taken = work.take_request(
                         block::Height(height),
                         block::Height(height),
                         1,
@@ -149,18 +145,13 @@ proptest! {
                         generation,
                         request_id,
                     );
-                    prop_assert_eq!(items.len(), 1);
-                    let owner = items[0].1.owner.expect("a taken item has an owner");
-                    prop_assert!(budget.try_reserve(BYTES));
-                    let write = RequestWrite::new(
-                        owner,
-                        items,
-                        work.clone(),
-                        budget.clone(),
-                        CancellationToken::new(),
-                    );
+                    prop_assert_eq!(taken.items().len(), 1);
+                    let request = taken
+                        .admit(block::Height(0), CancellationToken::new())
+                        .expect("the test budget covers every height");
+                    let owner = request.owner();
                     let deadline = start + Duration::from_millis(deadline_ms);
-                    let published = write.publish(|| {
+                    let write = request.publish(|_| {
                         registry.insert_outstanding(
                             &test_peer(peer),
                             generation,
@@ -176,7 +167,7 @@ proptest! {
                             )],
                         );
                     });
-                    prop_assert!(published);
+                    let write = write.expect("no reset or cancellation races this publication");
                     prop_assert!(write.try_start());
                     write.written();
                     model.holders.insert(height, Holder { peer, generation, owner });
@@ -191,7 +182,6 @@ proptest! {
                         continue;
                     }
                     let returned = work.revoke_for_owner(holder.owner, [block::Height(height)]);
-                    budget.release(returned.released_bytes);
                     prop_assert_eq!(returned.released_bytes, BYTES);
                     model.holders.remove(&height);
                     model.reserved -= BYTES;
@@ -201,7 +191,6 @@ proptest! {
                     cancel_expired_floor_claims(
                         &registry,
                         &work,
-                        &mut budget,
                         block::Height(HEIGHTS[0]),
                         start + Duration::from_millis(now_ms),
                         Duration::from_secs(1),
@@ -220,7 +209,7 @@ proptest! {
                 }
             }
 
-            prop_assert_eq!(budget.reserved(), model.reserved);
+            prop_assert_eq!(work.budget().reserved(), model.reserved);
             prop_assert_eq!(work.reserved_bytes(), model.reserved);
             prop_assert_eq!(registry.total_unreceived(), model.claims.len());
             for height in HEIGHTS {

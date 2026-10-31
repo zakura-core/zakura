@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
 
+#[cfg(test)]
 use proptest::prelude::*;
 use zakura_header_chain::{BodyWorkEpoch, HeaderGeneration, HeaderWorkAuthority};
 
@@ -261,10 +262,12 @@ enum RetryOp {
     NextDeadline(u8),
 }
 
+#[cfg(test)]
 fn scope() -> impl Strategy<Value = Scope> {
     (0..GENERATIONS, 0..EPOCHS)
 }
 
+#[cfg(test)]
 fn retry_op() -> impl Strategy<Value = RetryOp> {
     prop_oneof![
         3 => (prop::collection::btree_set(0..SOURCES, 0..=3), scope(), 0..HASHES, 1..20u64)
@@ -313,7 +316,7 @@ impl RetryOwners {
                     hash(raw_hash),
                     self.at(now + ttl),
                 );
-                assert_eq!(skipped, 0);
+                assert_eq!(skipped, 0, "{RETRY_PROPERTY}");
             }
             RetryOp::DeferIncompatible {
                 source: raw_source,
@@ -330,7 +333,7 @@ impl RetryOwners {
                     self.at(now + ttl),
                     self.at(now),
                 );
-                assert_eq!(skipped, 0);
+                assert_eq!(skipped, 0, "{RETRY_PROPERTY}");
             }
             RetryOp::SetAlarm(alarm) => {
                 model.alarm = alarm.map(|(scope, hash, ttl)| Alarm {
@@ -367,7 +370,11 @@ impl RetryOwners {
                 let supplier = self
                     .suppliers
                     .next_deadline(source(raw_source), self.at(now));
-                assert_eq!(all.into_iter().chain(supplier).min(), expected);
+                assert_eq!(
+                    all.into_iter().chain(supplier).min(),
+                    expected,
+                    "{RETRY_PROPERTY}"
+                );
             }
         }
     }
@@ -392,8 +399,7 @@ impl RetryOwners {
                             hash(raw_hash),
                             self.base,
                         ),
-                        "stale scope {scope:?} still avoids after retaining {current:?}",
-                    );
+                        "{RETRY_PROPERTY}: stale scope {scope:?} still avoids after retaining {current:?}");
                 }
             }
         }
@@ -417,8 +423,7 @@ impl RetryOwners {
                                     self.at(at),
                                 ),
                                 model.is_avoided(raw_source, scope, raw_hash, at),
-                                "source {raw_source} scope {scope:?} hash {raw_hash} at {at}",
-                            );
+                                "{RETRY_PROPERTY}: source {raw_source} scope {scope:?} hash {raw_hash} at {at}");
                         }
                     }
                 }
@@ -427,26 +432,147 @@ impl RetryOwners {
     }
 }
 
+const RETRY_PROPERTY: &str = "block/retry-authority";
+
+/// Applicable retry operations in a decoder-v1 history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct RetryAuthorityReplaySummary {
+    /// Operations compared with the independent model.
+    pub transitions: usize,
+    /// Deferral writes checked.
+    pub deferrals: usize,
+    /// Retain or refresh operations checked.
+    pub scope_changes: usize,
+    /// Nonzero logical-time advances checked.
+    pub time_advances: usize,
+    /// Next-deadline queries checked.
+    pub deadline_queries: usize,
+}
+
+/// Replay decoder-v1 quadruples against the supplier and alarm model.
+/// Read at most 512 bytes. Time is relative to one origin per history.
+pub fn replay_retry_authority_bytes(data: &[u8]) -> RetryAuthorityReplaySummary {
+    run_retry(decode_retry(data), |_| {})
+}
+
+fn decode_retry(data: &[u8]) -> impl Iterator<Item = RetryOp> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let scope = (u64::from(b) % GENERATIONS, u64::from(b / 3) % EPOCHS);
+        let hash = c % HASHES;
+        let ttl = u64::from(d % 20) + 1;
+        match a % 8 {
+            0 => RetryOp::DeferUnavailable {
+                sources: (0..SOURCES)
+                    .filter(|source| (c / 3) & (1 << source) != 0)
+                    .collect(),
+                scope,
+                hash,
+                ttl,
+            },
+            1 => RetryOp::DeferIncompatible {
+                source: c / 3 % SOURCES,
+                bodies: vec![(scope, hash)],
+                ttl,
+            },
+            2 => RetryOp::SetAlarm((a & 128 == 0).then_some((scope, hash, ttl))),
+            3 => RetryOp::Clear(scope, hash),
+            4 => RetryOp::Retain((a & 128 == 0).then_some(scope)),
+            5 => RetryOp::Refresh(scope),
+            6 => RetryOp::Advance(u64::from(d)),
+            _ => RetryOp::NextDeadline(c % SOURCES),
+        }
+    })
+}
+
+fn run_retry(
+    ops: impl IntoIterator<Item = RetryOp>,
+    mut after_step: impl FnMut(&mut RetryOwners),
+) -> RetryAuthorityReplaySummary {
+    let mut owners = RetryOwners {
+        base: Instant::now(),
+        alarms: BodyRetryAlarms::default(),
+        suppliers: SupplierRetryState::default(),
+    };
+    let mut model = RetryModel::default();
+    let mut summary = RetryAuthorityReplaySummary::default();
+    for op in ops {
+        summary.transitions += 1;
+        summary.deferrals += usize::from(
+            matches!(&op, RetryOp::DeferUnavailable { sources, .. } if !sources.is_empty())
+                || matches!(&op, RetryOp::DeferIncompatible { bodies, .. } if !bodies.is_empty()),
+        );
+        summary.scope_changes +=
+            usize::from(matches!(op, RetryOp::Retain(_) | RetryOp::Refresh(_)));
+        summary.time_advances +=
+            usize::from(matches!(op, RetryOp::Advance(seconds) if seconds > 0));
+        summary.deadline_queries += usize::from(matches!(op, RetryOp::NextDeadline(_)));
+        owners.apply(&mut model, op);
+        after_step(&mut owners);
+        owners.check(&model);
+    }
+    summary
+}
+
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// Deferrals expire at their deadlines, stay supplier-local, follow
-    /// compatible authority refreshes, and never outlive a retain to newer work.
     #[test]
-    fn retry_avoidance_matches_an_independent_model(
-        ops in prop::collection::vec(retry_op(), 1..60),
-    ) {
-        let mut owners = RetryOwners {
-            base: Instant::now(),
-            alarms: BodyRetryAlarms::default(),
-            suppliers: SupplierRetryState::default(),
-        };
-        let mut model = RetryModel::default();
-        for op in ops {
-            owners.apply(&mut model, op);
-            owners.check(&model);
-        }
+    fn retry_avoidance_matches_an_independent_model(ops in prop::collection::vec(retry_op(), 1..60)) {
+        run_retry(ops, |_| {});
     }
+    #[test]
+    fn retry_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_retry_authority_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const RETRY_WITNESS: &[u8] = &[
+    0, 0, 3, 2, 1, 0, 3, 3, 5, 1, 0, 0, 4, 4, 0, 0, 2, 4, 0, 2, 6, 0, 0, 5, 7, 0, 0, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "witnesses print applicability counters"
+)]
+fn retry_witness_exercises_expiry_and_authority_changes() {
+    let summary = replay_retry_authority_bytes(RETRY_WITNESS);
+    assert_eq!(
+        summary,
+        RetryAuthorityReplaySummary {
+            transitions: 7,
+            deferrals: 2,
+            scope_changes: 2,
+            time_advances: 1,
+            deadline_queries: 1
+        }
+    );
+    assert_eq!(
+        replay_retry_authority_bytes(&[]),
+        RetryAuthorityReplaySummary::default()
+    );
+    println!("tier=Machine target=block_retry_authority decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "block/retry-authority")]
+fn retry_witness_rejects_lost_supplier_deferral() {
+    run_retry(decode_retry(RETRY_WITNESS), |owners| {
+        owners.suppliers = SupplierRetryState::default();
+    });
+}
+
+#[test]
+#[should_panic(expected = "block/retry-authority")]
+fn retry_witness_rejects_lost_alarm() {
+    run_retry(decode_retry(RETRY_WITNESS), |owners| {
+        owners.alarms = BodyRetryAlarms::default();
+    });
 }
 
 #[test]
@@ -531,6 +657,7 @@ enum TableOp {
 const PEERS: u8 = 3;
 const HEIGHTS: u32 = 6;
 
+#[cfg(test)]
 fn table_op() -> impl Strategy<Value = TableOp> {
     let heights = || prop::collection::vec(0..HEIGHTS, 0..4);
     prop_oneof![
@@ -605,7 +732,8 @@ fn apply_table(table: &mut PeerTable, model: &mut TableModel, op: TableOp, at: I
             );
             assert_eq!(
                 removed.map(|entry| entry.generation),
-                replaced.map(|entry| entry.generation)
+                replaced.map(|entry| entry.generation),
+                "{TABLE_PROPERTY}"
             );
         }
         TableOp::Insert {
@@ -663,7 +791,11 @@ fn apply_table(table: &mut PeerTable, model: &mut TableModel, op: TableOp, at: I
                 .owned(peer, generation)
                 .map(|entry| std::mem::take(&mut entry.outstanding).len());
             let detached = table.take_outstanding(&peer_id(peer), generation);
-            assert_eq!(detached.map(|claims| claims.len()), expected);
+            assert_eq!(
+                detached.map(|claims| claims.len()),
+                expected,
+                "{TABLE_PROPERTY}"
+            );
         }
         TableOp::ClearHeight {
             peer,
@@ -687,6 +819,7 @@ fn apply_table(table: &mut PeerTable, model: &mut TableModel, op: TableOp, at: I
                     owner(peer, request),
                 ),
                 expected,
+                "{TABLE_PROPERTY}"
             );
         }
         TableOp::Close { peer, age } => {
@@ -706,7 +839,8 @@ fn apply_table(table: &mut PeerTable, model: &mut TableModel, op: TableOp, at: I
             let removed = table.remove_closed_session(&peer_id(peer));
             assert_eq!(
                 removed.map(|entry| entry.generation),
-                expected.map(|entry| entry.generation)
+                expected.map(|entry| entry.generation),
+                "{TABLE_PROPERTY}"
             );
         }
     }
@@ -718,7 +852,7 @@ fn check_table(table: &PeerTable, model: &TableModel) {
         .values()
         .map(|entry| entry.outstanding.len())
         .sum();
-    assert_eq!(table.total_unreceived(), total);
+    assert_eq!(table.total_unreceived(), total, "{TABLE_PROPERTY}");
     for height in 0..HEIGHTS {
         let claims = table.outstanding_claims_at(block::Height(height));
         let expected: Vec<_> = model
@@ -730,12 +864,22 @@ fn check_table(table: &PeerTable, model: &TableModel) {
                 })
             })
             .collect();
-        assert_eq!(claims.len(), expected.len(), "claims at height {height}");
+        assert_eq!(
+            claims.len(),
+            expected.len(),
+            "{TABLE_PROPERTY}: claims at height {height}"
+        );
         for (peer, owner, hash) in expected {
-            assert!(claims.iter().any(|claim| {
-                claim.peer == peer && claim.meta.owner == owner && claim.meta.hash == hash
-            }));
-            assert!(table.has_outstanding_request(block::Height(height), hash));
+            assert!(
+                claims.iter().any(|claim| {
+                    claim.peer == peer && claim.meta.owner == owner && claim.meta.hash == hash
+                }),
+                "{TABLE_PROPERTY}"
+            );
+            assert!(
+                table.has_outstanding_request(block::Height(height), hash),
+                "{TABLE_PROPERTY}"
+            );
         }
         for peer in 0..PEERS {
             assert_eq!(
@@ -744,6 +888,7 @@ fn check_table(table: &PeerTable, model: &TableModel) {
                     .peers
                     .get(&peer)
                     .is_some_and(|entry| entry.outstanding.contains_key(&height)),
+                "{TABLE_PROPERTY}"
             );
         }
     }
@@ -756,25 +901,172 @@ fn check_table(table: &PeerTable, model: &TableModel) {
                 .peers
                 .get(&peer)
                 .map(|entry| (entry.generation, entry.closed)),
+            "{TABLE_PROPERTY}"
         );
     }
 }
 
+const TABLE_PROPERTY: &str = "block/peer-registry";
+
+/// Applicable peer-table operations in a decoder-v1 history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct PeerRegistryReplaySummary {
+    /// Operations compared with the independent model.
+    pub transitions: usize,
+    /// Session admissions checked.
+    pub admissions: usize,
+    /// Admissions that replaced a session.
+    pub replacements: usize,
+    /// Operations naming an older admitted generation.
+    pub stale_generations: usize,
+    /// Owner-specific removal attempts against a present peer.
+    pub owner_checks: usize,
+}
+
+/// Replay decoder-v1 quadruples against the existing peer-table model.
+/// Read at most 512 bytes and preserve exact generation and owner identities.
+pub fn replay_peer_registry_bytes(data: &[u8]) -> PeerRegistryReplaySummary {
+    run_table(decode_table(data), |_, _| {})
+}
+
+fn decode_table(data: &[u8]) -> impl Iterator<Item = TableOp> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let peer = b % PEERS;
+        let age = u64::from(b / PEERS % 2);
+        let request = u64::from(d % 3) + 1;
+        let heights = || {
+            (0..HEIGHTS)
+                .filter(|height| c & (1 << height) != 0)
+                .collect()
+        };
+        match a % 7 {
+            0 => TableOp::Admit(peer),
+            1 => TableOp::Insert {
+                peer,
+                age,
+                request,
+                heights: heights(),
+                hash: d / 3 % HASHES,
+            },
+            2 => TableOp::RemoveForOwner {
+                peer,
+                age,
+                request,
+                heights: heights(),
+            },
+            3 => TableOp::Take { peer, age },
+            4 => TableOp::ClearHeight {
+                peer,
+                height: u32::from(c) % HEIGHTS,
+                request,
+            },
+            5 => TableOp::Close { peer, age },
+            _ => TableOp::RemoveClosed(peer),
+        }
+    })
+}
+
+fn run_table(
+    ops: impl IntoIterator<Item = TableOp>,
+    mut after_step: impl FnMut(&mut PeerTable, &TableModel),
+) -> PeerRegistryReplaySummary {
+    let at = Instant::now();
+    let mut table = PeerTable::default();
+    let mut model = TableModel::default();
+    let mut summary = PeerRegistryReplaySummary::default();
+    for op in ops {
+        summary.transitions += 1;
+        match &op {
+            TableOp::Admit(peer) => {
+                summary.admissions += 1;
+                summary.replacements += usize::from(model.peers.contains_key(peer));
+            }
+            TableOp::Insert { peer, age, .. }
+            | TableOp::Take { peer, age }
+            | TableOp::Close { peer, age } => {
+                summary.stale_generations +=
+                    usize::from(*age > 0 && model.peers.contains_key(peer));
+            }
+            TableOp::RemoveForOwner { peer, age, .. } => {
+                summary.stale_generations +=
+                    usize::from(*age > 0 && model.peers.contains_key(peer));
+                summary.owner_checks += usize::from(model.peers.contains_key(peer));
+            }
+            TableOp::ClearHeight { peer, .. } => {
+                summary.owner_checks += usize::from(model.peers.contains_key(peer))
+            }
+            TableOp::RemoveClosed(_) => {}
+        }
+        apply_table(&mut table, &mut model, op, at);
+        after_step(&mut table, &model);
+        check_table(&table, &model);
+    }
+    summary
+}
+
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// A superseded generation cannot publish, remove, detach, or close the
-    /// replacement's state, and an owner removes only its own claims.
     #[test]
-    fn peer_table_isolates_stale_generations_and_owners(
-        ops in prop::collection::vec(table_op(), 1..60),
-    ) {
-        let at = Instant::now();
-        let mut table = PeerTable::default();
-        let mut model = TableModel::default();
-        for op in ops {
-            apply_table(&mut table, &mut model, op, at);
-            check_table(&table, &model);
-        }
+    fn peer_table_isolates_stale_generations_and_owners(ops in prop::collection::vec(table_op(), 1..60)) {
+        run_table(ops, |_, _| {});
     }
+    #[test]
+    fn peer_table_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_peer_registry_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const TABLE_WITNESS: &[u8] = &[
+    0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 3, 3, 0, 0, 5, 3, 0, 0, 4, 0, 0, 1, 4, 0, 0, 0,
+    5, 0, 0, 0, 6, 0, 0, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "witnesses print applicability counters"
+)]
+fn registry_witness_exercises_replacement_and_exact_owner() {
+    let summary = replay_peer_registry_bytes(TABLE_WITNESS);
+    assert_eq!(
+        summary,
+        PeerRegistryReplaySummary {
+            transitions: 10,
+            admissions: 2,
+            replacements: 1,
+            stale_generations: 2,
+            owner_checks: 2
+        }
+    );
+    assert_eq!(
+        replay_peer_registry_bytes(&[]),
+        PeerRegistryReplaySummary::default()
+    );
+    println!("tier=Machine target=block_peer_registry decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "block/peer-registry")]
+fn registry_witness_rejects_lost_outstanding_claim() {
+    run_table(decode_table(TABLE_WITNESS), |table, model| {
+        for (peer, entry) in &model.peers {
+            table.take_outstanding(&peer_id(*peer), entry.generation);
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "block/peer-registry")]
+fn registry_witness_rejects_closing_current_session() {
+    run_table(decode_table(TABLE_WITNESS), |table, model| {
+        for (peer, entry) in &model.peers {
+            table.close_session(&peer_id(*peer), entry.generation);
+        }
+    });
 }

@@ -24,6 +24,8 @@ use super::{
 };
 #[cfg(test)]
 use crate::zakura::framed_channel;
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::RegulationTap;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
@@ -33,7 +35,7 @@ use crate::zakura::{
         SessionTable, WriterFence,
     },
     spawn_supervised_pipe,
-    transport::{GuardedFrameSlot, GuardedReserveError},
+    transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
     BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
@@ -527,7 +529,7 @@ pub(crate) async fn drive_header_sync_actions(
 
 /// Native header-sync service.
 #[derive(Debug)]
-pub(crate) struct HeaderSyncService {
+pub struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
     /// Each peer's current session, with its connection direction.
     sessions: Arc<SessionTable<ServicePeerDirection>>,
@@ -541,7 +543,9 @@ pub(crate) struct HeaderSyncService {
 }
 
 impl HeaderSyncService {
-    pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
+    /// Builds the service that admits header-sync sessions for the reactor
+    /// behind `header_sync`, with no sync-lifecycle gate.
+    pub fn new(header_sync: HeaderSyncHandle) -> Self {
         Self {
             header_sync,
             sessions: Arc::default(),
@@ -738,14 +742,14 @@ impl Service for HeaderSyncService {
             subscriber,
             status,
         );
-        let (publisher, publishing) = spawn_publisher(
+        let (publisher, publishing) = sim_arg!(spawn_publisher(
             &self.header_sync,
             header_bytes,
             &peer_id,
             session_id,
             send,
             service_cancel_token.clone(),
-        );
+        ); recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)));
 
         let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();
@@ -879,6 +883,7 @@ fn spawn_publisher(
     session_id: u64,
     send: FramedSend,
     cancel: CancellationToken,
+    #[cfg(any(test, zakura_sim))] tap: Option<RegulationTap<u64>>,
 ) -> (Publisher, JoinHandle<()>) {
     let port = header_sync.port.clone();
     let push = header_sync.serving.push(peer);
@@ -888,9 +893,9 @@ fn spawn_publisher(
     };
     let limits = header_sync.page_limits;
     if header_bytes == REGTEST_HEADER_BYTES {
-        Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel)
+        sim_arg!(Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
     } else {
-        Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel)
+        sim_arg!(Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
     }
 }
 

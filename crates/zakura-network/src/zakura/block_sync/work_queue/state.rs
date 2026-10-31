@@ -22,8 +22,16 @@ use super::{
     WorkItem, WorkReturnOutcome, DEFAULT_BS_SIZE_FLOOR_BYTES,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{
+    replay_work_ownership_bytes, trace_work_funding_bytes, trace_work_ownership_bytes,
+    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
+    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
+    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
+    WorkOwnershipView,
+};
 
 /// Wakeups that a logical work transition requires.
 #[must_use]
@@ -121,6 +129,33 @@ pub(in crate::zakura::block_sync) struct WorkQueueState {
 }
 
 impl WorkQueueState {
+    /// Read each item's ownership and charge from the maps, not the tallies.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn ownership(&self) -> Vec<super::WorkItemOwnership> {
+        let pending = self
+            .pending
+            .iter()
+            .map(|(height, item)| (height, item, super::WorkItemPlace::Pending));
+        let in_flight = self.in_flight.iter().map(|(height, item)| {
+            let place = if item.provisional {
+                super::WorkItemPlace::Provisional
+            } else {
+                super::WorkItemPlace::InFlight
+            };
+            (height, item, place)
+        });
+        pending
+            .chain(in_flight)
+            .map(|(height, item, place)| super::WorkItemOwnership {
+                height: *height,
+                owner: item.owner,
+                place,
+                estimated_bytes: item.estimated_bytes,
+                reserved_bytes: item.budget.reserved_charge(),
+            })
+            .collect()
+    }
+
     pub(in crate::zakura::block_sync) fn new(floor: block::Height) -> Self {
         Self {
             pending: BTreeMap::new(),
@@ -133,7 +168,7 @@ impl WorkQueueState {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn set_estimate_floor(&mut self, floor: u64) {
         self.floor_estimate_bytes = floor.max(1);
     }
@@ -427,16 +462,19 @@ impl WorkQueueState {
 
     /// Publish a claim that [`Self::is_unpublished_claim`] accepted: its funded
     /// estimate transfers into the ledger. Returns the transferred bytes.
+    /// A missing item returns `None` after accounting for the transferred prefix;
+    /// the runtime must close admission and retain any unmatched funding.
     pub(in crate::zakura::block_sync) fn publish_claim(
         &mut self,
         items: &[(block::Height, WorkItem)],
-    ) -> u64 {
+    ) -> Option<u64> {
         let mut transferred = 0u64;
+        let mut complete = true;
         for (height, _) in items {
-            let item = self
-                .in_flight
-                .get_mut(height)
-                .expect("every provisional item was checked under the caller's lock");
+            let Some(item) = self.in_flight.get_mut(height) else {
+                complete = false;
+                break;
+            };
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
             let charge = item.estimated_bytes;
@@ -444,7 +482,7 @@ impl WorkQueueState {
             transferred = transferred.saturating_add(charge);
         }
         self.reserved_bytes = self.reserved_bytes.saturating_add(transferred);
-        transferred
+        complete.then_some(transferred)
     }
 
     /// Whether `owner` still holds a reservation on every height of its claim.
@@ -921,7 +959,7 @@ impl WorkQueueState {
     }
 
     /// Ground-truth O(pending + in_flight) recomputation of [`Self::reserved_bytes`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn reserved_bytes_scanned(&self) -> u64 {
         self.pending
             .values()

@@ -18,7 +18,7 @@
 //! Body-availability requests follow the same rule: only an accepted request
 //! records its deduplication key.
 
-use std::{collections::BTreeSet, num::NonZeroU64, time::Instant};
+use std::{collections::BTreeSet, num::NonZeroU64};
 
 use zakura_chain::block;
 use zakura_header_chain::{
@@ -26,7 +26,10 @@ use zakura_header_chain::{
     BodyWorkOwner, CommittedHeaderChainView, EngineSnapshot, EvidenceId, Frontier, Gate,
     OperatorBodyRetry, PendingOwners, SourceId, StaleReason, StateVersion,
 };
-use zakura_rt::{collections::HashMap, time};
+use zakura_rt::{
+    collections::HashMap,
+    time::{self, Instant},
+};
 
 use super::{
     BlockSyncAction, BlockSyncFrontiers, BlockSyncStatus, OutstandingClaim, SequencerView,
@@ -96,6 +99,7 @@ impl ReactorState {
         self.queries.open(QueryGate {
             force,
             header_quiet: self.bootstrap.is_header_quiet(),
+            diverged: self.verified_tip_diverged(),
             request_floor: self.progress.request_floor,
             best_header_tip: self.progress.best_header_tip,
         })
@@ -116,7 +120,22 @@ impl ReactorState {
             best_header_tip: self.progress.best_header_tip,
             best_header_hash: self.progress.best_header_hash,
             scope,
+            diverged: self.verified_tip_diverged(),
             start,
+        })
+    }
+
+    /// Whether the committed verified tip lies off the selected chain at or
+    /// above its tip.
+    ///
+    /// Such a tip leaves no selected height above the floor, yet only state's
+    /// answer names the common ancestor block sync must reset to.
+    fn verified_tip_diverged(&self) -> bool {
+        self.committed_view.as_ref().is_some_and(|view| {
+            let frontiers = view.frontiers;
+            frontiers.verified_best.height > frontiers.header_best.height
+                || (frontiers.verified_best.height == frontiers.header_best.height
+                    && frontiers.verified_best.hash != frontiers.header_best.hash)
         })
     }
 
@@ -245,6 +264,9 @@ pub(super) struct QueryGate {
     pub(super) force: bool,
     /// The empty-state header quiet period is holding body queries.
     pub(super) header_quiet: bool,
+    /// The committed verified tip left the selected chain, so a floor at the
+    /// header tip does not end the query.
+    pub(super) diverged: bool,
     pub(super) request_floor: block::Height,
     pub(super) best_header_tip: block::Height,
 }
@@ -286,6 +308,9 @@ pub(super) struct QueryRequest {
     pub(super) best_header_hash: block::Hash,
     /// Current body-work authority, if the reactor has one.
     pub(super) scope: Option<BodyWorkAuthority>,
+    /// The committed verified tip left the selected chain: without other work,
+    /// the query asks state about the header tip.
+    pub(super) diverged: bool,
     pub(super) start: QueryStart,
 }
 
@@ -384,7 +409,7 @@ impl QueryState {
         if gate.header_quiet {
             return QueryOpening::Closed;
         }
-        if gate.request_floor >= gate.best_header_tip {
+        if gate.request_floor >= gate.best_header_tip && !gate.diverged {
             self.clear();
             return QueryOpening::Closed;
         }
@@ -417,6 +442,7 @@ impl QueryState {
                 let Some(from) = work
                     .first_unclaimed
                     .filter(|from| *from <= request.best_header_tip)
+                    .or(request.diverged.then_some(request.best_header_tip))
                 else {
                     return QueryPlan::Idle;
                 };

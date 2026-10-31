@@ -341,11 +341,29 @@ pub(super) fn body_work_effect(
         new_verified,
         finality_append,
         finality_lineage.continues_verified,
-    ) {
+    ) && !verified_tip_left_selection(old_verified, new_selected, new_verified)
+    {
         BodyWorkEffect::Preserved
     } else {
         BodyWorkEffect::Invalidated
     }
+}
+
+/// True when the verified tip moved to a block off the selected chain.
+///
+/// A late commit of a block that a reset replaced grows the verified chain on the
+/// replaced branch, and both projections still retain their paths. Block sync retires
+/// work by height, so without a new epoch it would retire the replacement's heights
+/// as committed. Both final projections start at the finalized frontier, so the
+/// verified tip lies on the selected chain exactly when the verified projection is a
+/// prefix of the selected one. A tip that stays in place never fires, so a selection
+/// change that leaves the verified tip behind invalidates body work only once.
+fn verified_tip_left_selection(
+    old_verified: &[Frontier],
+    new_selected: &[Frontier],
+    new_verified: &[Frontier],
+) -> bool {
+    new_verified.last() != old_verified.last() && !new_selected.starts_with(new_verified)
 }
 
 fn projection_retains_path(
@@ -488,6 +506,95 @@ mod body_work_epoch_tests {
                 replaces(),
             ),
             BodyWorkEffect::Invalidated
+        );
+    }
+
+    #[test]
+    fn verified_growth_off_the_selected_chain_advances_body_work_epoch() {
+        // A reset replaced height 2 with the fork's block 9, and storage then committed
+        // the replaced block 3 that the node had submitted before the reset.
+        let selected = path(&[1, 2, 9, 8]);
+        let before_commit = path(&[1, 2]);
+        let late_commit = path(&[1, 2, 3]);
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected,
+                &before_commit,
+                &late_commit,
+                None,
+                replaces(),
+            ),
+            BodyWorkEffect::Invalidated
+        );
+        // Later transitions that leave the verified tip in place keep the new epoch, even
+        // when finality trims both projections.
+        let extended = path(&[1, 2, 9, 8, 7]);
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &extended,
+                &late_commit,
+                &late_commit,
+                None,
+                replaces(),
+            ),
+            BodyWorkEffect::Preserved
+        );
+        assert_eq!(
+            body_work_effect(
+                &extended,
+                &extended[1..],
+                &late_commit,
+                &late_commit[1..],
+                Some(finality(extended[1])),
+                replaces(),
+            ),
+            BodyWorkEffect::Preserved
+        );
+        // Another late commit on the replaced branch moves the tip again.
+        assert_eq!(
+            body_work_effect(
+                &extended,
+                &extended,
+                &late_commit,
+                &path(&[1, 2, 3, 4]),
+                None,
+                replaces(),
+            ),
+            BodyWorkEffect::Invalidated
+        );
+    }
+
+    #[test]
+    fn verified_growth_along_the_selected_chain_preserves_body_work_epoch() {
+        let selected = path(&[1, 2, 3, 4]);
+        let old_verified = path(&[1, 2]);
+        for grown in [path(&[1, 2, 3]), selected.clone()] {
+            assert_eq!(
+                body_work_effect(
+                    &selected,
+                    &selected,
+                    &old_verified,
+                    &grown,
+                    None,
+                    replaces(),
+                ),
+                BodyWorkEffect::Preserved
+            );
+        }
+        // Finality trims both projections to the same start, so the prefix check still
+        // finds the verified tip on the selected chain.
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected[1..],
+                &old_verified,
+                &path(&[1, 2, 3])[1..],
+                Some(finality(selected[1])),
+                replaces(),
+            ),
+            BodyWorkEffect::Preserved
         );
     }
 

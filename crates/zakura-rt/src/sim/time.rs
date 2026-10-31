@@ -63,6 +63,21 @@ fn far_future(now: Instant) -> Instant {
     now + Duration::from_secs(86_400 * 365 * 30)
 }
 
+/// The current UTC time.
+///
+/// Inside a run, it's the executor's [`utc_origin`](sim::Executor::utc_origin)
+/// plus virtual time, so the host clock never reaches the run. Outside a run,
+/// it's `SystemTime::now()`, as in production.
+pub fn utc_now() -> std::time::SystemTime {
+    match sim::executor() {
+        Some(executor) => executor
+            .utc_origin()
+            .checked_add(executor.now())
+            .expect("the executor keeps its UTC origin plus virtual time representable"),
+        None => std::time::SystemTime::now(),
+    }
+}
+
 /// A monotonic instant, as tokio's `Instant`.
 ///
 /// Inside a run, its value is the start of virtual time plus the executor's

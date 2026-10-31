@@ -33,6 +33,14 @@ enum Act {
     Lock(usize),
     /// Releases a lock this task holds.
     Unlock(usize),
+    /// Spawns a child running the given script from [`Program::children`].
+    Spawn(usize),
+}
+
+/// A generated program: root task scripts, and the scripts their spawns run.
+struct Program {
+    roots: Vec<Vec<Act>>,
+    children: Vec<Vec<Act>>,
 }
 
 /// State shared by every generated task. Never borrowed across a hook that
@@ -41,6 +49,8 @@ struct World {
     wakers: Vec<Option<Waker>>,
     holders: Vec<Option<TaskId>>,
     locks: Vec<ObjectId>,
+    /// The scripts [`Act::Spawn`] runs.
+    children: Vec<Vec<Act>>,
     /// The index of each task whose code ran, in order.
     log: Vec<usize>,
 }
@@ -99,6 +109,16 @@ fn task_future(
                     };
                     hooks::unpark_all(obj);
                 }
+                Act::Spawn(c) => {
+                    let (child, acts) = {
+                        let mut w = world.borrow_mut();
+                        w.wakers.push(None);
+                        (w.wakers.len() - 1, w.children[c].clone())
+                    };
+                    let spawned = hooks::spawn("child", task_future(child, acts, world.clone()));
+                    // Task ids follow spawn order, so they match the model's.
+                    assert_eq!(spawned.task().index(), child);
+                }
             }
         }
         Poll::Ready(())
@@ -143,8 +163,24 @@ enum Kind {
     Completed,
 }
 
+impl ModelTask {
+    /// A task that hasn't started, ready at its first poll.
+    fn new(acts: Vec<Act>) -> Self {
+        ModelTask {
+            acts,
+            pc: 0,
+            phase: Phase::Boundary,
+            woken: false,
+            has_waker: false,
+            taking: None,
+        }
+    }
+}
+
+/// Every task's state, indexed like [`TaskId::index`].
 struct Model {
     tasks: Vec<ModelTask>,
+    children: Vec<Vec<Act>>,
     holders: Vec<Option<usize>>,
     workers: usize,
 }
@@ -232,6 +268,11 @@ impl Model {
                         }
                     }
                 }
+                Act::Spawn(c) => {
+                    // Admitted when the step returns, ready at a poll boundary.
+                    let acts = self.children[c].clone();
+                    self.tasks.push(ModelTask::new(acts));
+                }
             }
         }
     }
@@ -248,41 +289,53 @@ impl Model {
     }
 }
 
-/// A random program: up to four tasks of up to eight steps over two locks.
-/// A task never takes a lock it holds, and releases what it holds at the end.
-fn program(walk: &mut Walk) -> Vec<Vec<Act>> {
-    let tasks = 1 + walk.pick(4);
-    (0..tasks)
-        .map(|_| {
-            let mut held = [false; 2];
-            let mut acts = Vec::new();
-            for _ in 0..=walk.pick(8) {
-                let m = walk.pick(2);
-                acts.push(match walk.pick(5) {
-                    0 => Act::Point,
-                    1 => Act::Wake(walk.pick(tasks)),
-                    2 => Act::Pending,
-                    _ if held[m] => {
-                        held[m] = false;
-                        Act::Unlock(m)
-                    }
-                    _ => {
-                        held[m] = true;
-                        Act::Lock(m)
-                    }
-                });
-            }
-            acts.extend((0..2).filter(|m| held[*m]).map(Act::Unlock));
-            acts
-        })
-        .collect()
+/// A random program: up to four root tasks of up to eight steps over two
+/// locks. Roots may spawn children, which run scripts of the same shape but
+/// spawn nothing. A task never takes a lock it holds, and releases what it
+/// holds at the end. Wakes target root tasks.
+fn program(walk: &mut Walk) -> Program {
+    let roots = 1 + walk.pick(4);
+    let mut children = Vec::new();
+    let script = |walk: &mut Walk, children: &mut Vec<Vec<Act>>, can_spawn: bool| {
+        let mut held = [false; 2];
+        let mut acts = Vec::new();
+        for _ in 0..=walk.pick(8) {
+            let m = walk.pick(2);
+            acts.push(match walk.pick(6) {
+                0 => Act::Point,
+                1 => Act::Wake(walk.pick(roots)),
+                2 => Act::Pending,
+                3 if can_spawn => {
+                    children.push(Vec::new());
+                    Act::Spawn(children.len() - 1)
+                }
+                _ if held[m] => {
+                    held[m] = false;
+                    Act::Unlock(m)
+                }
+                _ => {
+                    held[m] = true;
+                    Act::Lock(m)
+                }
+            });
+        }
+        acts.extend((0..2).filter(|m| held[*m]).map(Act::Unlock));
+        acts
+    };
+    let roots: Vec<Vec<Act>> = (0..roots)
+        .map(|_| script(walk, &mut children, true))
+        .collect();
+    for child in &mut children {
+        *child = script(walk, &mut Vec::new(), false);
+    }
+    Program { roots, children }
 }
 
 /// Runs one generated program with `workers`, checking each step against
 /// the model.
 fn check_program(workers: u16, seed: u64) {
     let mut walk = Walk(seed);
-    let scripts = program(&mut walk);
+    let Program { roots, children } = program(&mut walk);
     let config = SchedulerConfig {
         workers,
         stack_size: 64 * 1024,
@@ -290,44 +343,29 @@ fn check_program(workers: u16, seed: u64) {
     };
     let mut s = Scheduler::new(config, SimInstant::ZERO);
     let world = Rc::new(RefCell::new(World {
-        wakers: vec![None; scripts.len()],
+        wakers: vec![None; roots.len()],
         holders: vec![None; 2],
         locks: (0..2)
             .map(|_| hooks::new_object().expect("inside a run"))
             .collect(),
+        children: children.clone(),
         log: Vec::new(),
     }));
-    let ids: Vec<TaskId> = scripts
-        .iter()
-        .enumerate()
-        .map(|(i, acts)| {
-            s.spawn_root("t", task_future(i, acts.clone(), world.clone()))
-                .task()
-        })
-        .collect();
+    for (i, acts) in roots.iter().enumerate() {
+        let root = s.spawn_root("t", task_future(i, acts.clone(), world.clone()));
+        assert_eq!(root.task().index(), i);
+    }
     let mut model = Model {
-        tasks: scripts
-            .into_iter()
-            .map(|acts| ModelTask {
-                acts,
-                pc: 0,
-                phase: Phase::Boundary,
-                woken: false,
-                has_waker: false,
-                taking: None,
-            })
-            .collect(),
+        tasks: roots.into_iter().map(ModelTask::new).collect(),
+        children,
         holders: vec![None; 2],
         workers: usize::from(workers),
     };
     let ctx = |step: usize| format!("seed {seed}, workers {workers}, step {step}");
     for step in 0.. {
         let want = model.eligible();
-        let got: Vec<(usize, bool)> = s
-            .ready()
-            .iter()
-            .map(|r| (ids.iter().position(|t| *t == r.task).unwrap(), r.mid_poll))
-            .collect();
+        let ready = s.ready();
+        let got: Vec<(usize, bool)> = ready.iter().map(|r| (r.task.index(), r.mid_poll)).collect();
         assert_eq!(got, want, "eligible tasks, {}", ctx(step));
         assert!(model.held() <= usize::from(workers), "{}", ctx(step));
         if want.is_empty() {
@@ -345,7 +383,12 @@ fn check_program(workers: u16, seed: u64) {
         }
         let (pick, _) = want[walk.pick(want.len())];
         let before = world.borrow().log.len();
-        let outcome = s.run(ids[pick]);
+        let task = ready
+            .iter()
+            .find(|r| r.task.index() == pick)
+            .expect("the model's pick is ready")
+            .task;
+        let outcome = s.run(task);
         let kind = match outcome {
             RunOutcome::Reached(_) => Kind::Reached,
             RunOutcome::Waiting => Kind::Waiting,

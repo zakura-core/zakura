@@ -103,7 +103,7 @@ fn synchronize_persisted_body_alarm(
                 (
                     zakura_header_chain::BodyWorkAuthority::for_view(view),
                     view.frontiers.header_best.hash,
-                    retry_deadline_instant(summary.next_probe_at),
+                    retry_deadline_instant(summary.next_probe_at, &BlockSyncClock),
                 )
             })
     });
@@ -221,7 +221,6 @@ pub fn spawn_block_sync_reactor(
 
     let sequencer_task = SequencerTask::new(
         sequencer,
-        state.budget.clone(),
         state.work_queue.clone(),
         registry.clone(),
         actions_tx.clone(),
@@ -229,6 +228,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         initial_body_scope,
         crate::zakura::header_sync::SeededRetryJitter::new(retry_jitter_seed),
+        Arc::new(BlockSyncClock),
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
@@ -239,6 +239,8 @@ pub fn spawn_block_sync_reactor(
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
+    #[cfg(any(test, zakura_sim))]
+    let sequencer_task = sequencer_task.with_observer(startup.observer.clone());
     spawn_erased_named("block_sync_sequencer", sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
@@ -259,7 +261,6 @@ pub fn spawn_block_sync_reactor(
             &startup.config,
         )),
         config: startup.config.clone(),
-        budget: state.budget.clone(),
         work: state.work_queue.clone(),
         registry: registry.clone(),
         received_throughput: state.received_throughput.clone(),
@@ -272,9 +273,20 @@ pub fn spawn_block_sync_reactor(
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
         trace: startup.trace.clone(),
+        #[cfg(any(test, zakura_sim))]
+        observer: startup.observer.clone(),
+    };
+    #[cfg(any(test, zakura_sim))]
+    let routine_wiring = {
+        let mut routine_wiring = routine_wiring;
+        Arc::get_mut(&mut routine_wiring.serving)
+            .expect("nothing shares serving before the handle exists")
+            .observer = startup.observer.clone();
+        routine_wiring
     };
 
     let handle = BlockSyncHandle {
+        accounting: state.work_queue.budget().closure_reader(),
         events: events_tx,
         lifecycle: lifecycle_tx,
         needed_query_failures: needed_query_failure_tx,
@@ -404,6 +416,8 @@ impl ReactorIO {
         self.refresh_throughput();
         self.trace_sync_state(true);
         loop {
+            #[cfg(any(test, zakura_sim))]
+            self.resources.work_queue.observe_items();
             // Arm the floor watchdog to the earliest outstanding floor-claim
             // deadline (event-driven, like the per-peer routine's own-timeout
             // arm): force-cancel an expired floor request exactly when it expires
@@ -418,7 +432,7 @@ impl ReactorIO {
             let status_refresh_at = self.state.status.refresh_at();
             let status_refresh = async move {
                 match status_refresh_at {
-                    Some(deadline) => time::sleep_until(deadline.into()).await,
+                    Some(deadline) => time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
             };
@@ -540,7 +554,7 @@ impl ReactorIO {
 
     fn needed_query_retry_sleep(&self) -> time::Sleep {
         match self.state.queries.retry_at() {
-            Some(deadline) => time::sleep_until(deadline.into()),
+            Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
     }
@@ -574,11 +588,9 @@ impl ReactorIO {
         };
         let registry = self.registry.clone();
         let work_queue = self.resources.work_queue.clone();
-        let mut budget = self.resources.budget.clone();
         cancel_expired_floor_claims(
             &registry,
             &work_queue,
-            &mut budget,
             height,
             now,
             self.startup.config.effective_floor_peer_avoid_cooldown(),
@@ -645,7 +657,8 @@ impl ReactorIO {
                 hash,
                 outcome,
             } => {
-                let semantic_completion = self.body_completion_authority(source, &owner);
+                let (semantic_completion, committed_epoch) =
+                    self.body_completion_authority(source, &owner);
                 self.handle_block_apply_finished(
                     owner,
                     source,
@@ -654,6 +667,7 @@ impl ReactorIO {
                     hash,
                     outcome,
                     semantic_completion,
+                    committed_epoch,
                 )
                 .await
             }
@@ -1238,7 +1252,7 @@ impl ReactorIO {
         let eligible_sources = self.registry.eligible_sources(header.height);
         let Some(request) = self
             .state
-            .propose_supplier_restart(&eligible_sources, chrono::Utc::now())
+            .propose_supplier_restart(&eligible_sources, utc_now())
         else {
             return;
         };
@@ -1256,9 +1270,9 @@ impl ReactorIO {
             return;
         };
         let eligible_sources = self.registry.eligible_sources(header.height);
-        let Some(request) =
-            self.state
-                .propose_operator_retry(hash, &eligible_sources, chrono::Utc::now())
+        let Some(request) = self
+            .state
+            .propose_operator_retry(hash, &eligible_sources, utc_now())
         else {
             return;
         };
@@ -1280,6 +1294,7 @@ impl ReactorIO {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     ) {
         // The whole commit-pipeline body (token validate, applying removal,
         // throughput record, rollback + misbehavior, drain + submit) runs on the
@@ -1290,7 +1305,7 @@ impl ReactorIO {
             height,
             token,
             outcome.result(),
-            self.resources.budget.reserved(),
+            self.resources.work_queue.budget().reserved(),
         );
         let persisted_availability = self.state.committed_view().and_then(|snapshot| {
             (snapshot.frontiers.header_best.hash == hash)
@@ -1312,6 +1327,7 @@ impl ReactorIO {
                 eligible_sources: self.registry.eligible_sources(height),
                 persisted_availability,
                 semantic_completion,
+                committed_epoch,
             });
         self.trace_sequencer_control_send(
             "apply_finished",
@@ -1381,22 +1397,29 @@ impl ReactorIO {
         }
     }
 
-    /// Check a body completion against the latest committed view on the
-    /// watch, which can be newer than the view this reactor observed.
+    /// Judges a body completion against the latest committed view, and returns
+    /// that view's body-work epoch. The epoch can be ahead of the last one this
+    /// reactor forwarded to the sequencer.
     fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
         owner: &zakura_header_chain::BodyWorkOwner,
-    ) -> Option<(
-        zakura_header_chain::BodyWorkOwner,
-        zakura_header_chain::StateVersion,
-    )> {
+    ) -> (
+        Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
+        Option<zakura_header_chain::BodyWorkEpoch>,
+    ) {
         let current = self
             .startup
             .committed_views
             .as_ref()
-            .and_then(|snapshots| snapshots.borrow().clone())?;
-        body_completion_authority(&current, source, owner)
+            .and_then(|snapshots| snapshots.borrow().clone());
+        let Some(current) = current else {
+            return (None, None);
+        };
+        let semantic_completion = body_completion_authority(&current, source, owner)
             .inspect_err(|reason| {
                 metrics::counter!(
                     "sync.header_chain.stale_completion.total",
@@ -1404,7 +1427,8 @@ impl ReactorIO {
                 )
                 .increment(1);
             })
-            .ok()
+            .ok();
+        (semantic_completion, Some(current.body_work_epoch))
     }
 
     fn local_body_work_blocks(&self) -> usize {
@@ -1612,10 +1636,6 @@ impl ReactorIO {
         metrics::gauge!("sync.block.verified_tip.height")
             .set(self.state.progress.verified_block_tip.0 as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
-        metrics::gauge!("sync.block.budget.reserved_bytes")
-            .set(self.resources.budget.reserved() as f64);
-        metrics::gauge!("sync.block.reorder.buffered_bytes")
-            .set(self.state.progress.last_view.reorder_buffered_bytes as f64);
         metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
             .set(sequencer_input_decoded_attributed_memory_bytes as f64);
         metrics::gauge!("sync.block.reorder.decoded.attributed_memory_bytes")
@@ -1672,7 +1692,7 @@ impl ReactorIO {
         if let Some((frontier, summary)) = current {
             let hash = format!("{:?}", frontier.hash);
             let height = frontier.height.0.to_string();
-            let age_seconds = chrono::Utc::now()
+            let age_seconds = utc_now()
                 .signed_duration_since(summary.started_at)
                 .num_milliseconds()
                 .max(0) as f64
@@ -1794,14 +1814,13 @@ impl ReactorIO {
 /// Cancel every expired claim at the floor `height`.
 ///
 /// Each cancellation settles in a fixed order: clear the matching registry
-/// owner, revoke that owner's work, then release the returned charge. A claim
+/// owner, then revoke that owner's work, which settles its funding. A claim
 /// whose owner the registry no longer holds, such as one a replacement session
 /// superseded, changes nothing. `cancelled` observes each settled claim before
 /// the next one settles.
 fn cancel_expired_floor_claims(
     registry: &PeerRegistry,
     work_queue: &WorkQueue,
-    budget: &mut ByteBudget,
     height: block::Height,
     now: Instant,
     avoid_cooldown: Duration,
@@ -1817,7 +1836,6 @@ fn cancel_expired_floor_claims(
             continue;
         }
         let released = work_queue.revoke_for_owner(claim.meta.owner, [claim.height]);
-        budget.release(released.released_bytes);
         // Settlement arbitrates against writer startup, so `released` says
         // whether this owner had started writing.
         if floor_cancel_avoids_peer(servable_peers, &released) {
@@ -1893,7 +1911,7 @@ mod refill_target_tests {
                     ServicePeerDirection::Inbound,
                     config,
                     0,
-                    std::time::Instant::now(),
+                    Instant::now(),
                 )
                 .generation();
             registry.upsert_status(

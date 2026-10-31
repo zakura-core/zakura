@@ -14,8 +14,9 @@ const EVERY_30_SECONDS: Cadence = Cadence {
     send_interval: Duration::from_secs(30),
 };
 
-const fn announcement(message_type: u16) -> MessageRule {
+const fn announcement(name: &'static str, message_type: u16) -> MessageRule {
     MessageRule {
+        name,
         message_type,
         payload: PayloadLen::exact(8),
         role: MessageRole::Announcement {
@@ -24,8 +25,9 @@ const fn announcement(message_type: u16) -> MessageRule {
     }
 }
 
-const fn request(message_type: u16) -> MessageRule {
+const fn request(name: &'static str, message_type: u16) -> MessageRule {
     MessageRule {
+        name,
         message_type,
         payload: PayloadLen::exact(8),
         role: MessageRole::Request {
@@ -35,8 +37,14 @@ const fn request(message_type: u16) -> MessageRule {
     }
 }
 
-const fn response(message_type: u16, request: u16, ends_exchange: bool) -> MessageRule {
+const fn response(
+    name: &'static str,
+    message_type: u16,
+    request: u16,
+    ends_exchange: bool,
+) -> MessageRule {
     MessageRule {
+        name,
         message_type,
         payload: PayloadLen::between(1, 100),
         role: MessageRole::Response {
@@ -46,8 +54,14 @@ const fn response(message_type: u16, request: u16, ends_exchange: bool) -> Messa
     }
 }
 
-const fn subscription(message_type: u16, credit: Credit, cursor_history: u32) -> MessageRule {
+const fn subscription(
+    name: &'static str,
+    message_type: u16,
+    credit: Credit,
+    cursor_history: u32,
+) -> MessageRule {
     MessageRule {
+        name,
         message_type,
         payload: PayloadLen::exact(8),
         role: MessageRole::Subscription {
@@ -59,17 +73,17 @@ const fn subscription(message_type: u16, credit: Credit, cursor_history: u32) ->
     }
 }
 
-const STATUS: MessageRule = announcement(1);
-const GET: MessageRule = request(2);
-const PART: MessageRule = response(3, 2, false);
-const DONE: MessageRule = response(4, 2, true);
+const STATUS: MessageRule = announcement("status", 1);
+const GET: MessageRule = request("get", 2);
+const PART: MessageRule = response("part", 3, 2, false);
+const DONE: MessageRule = response("done", 4, 2, true);
 const CREDIT: Credit = Credit {
     objects: 16,
     bytes: 4096,
 };
-const WATCH: MessageRule = subscription(5, CREDIT, 16);
-const PAGE: MessageRule = response(6, 5, false);
-const ENDED: MessageRule = response(7, 5, true);
+const WATCH: MessageRule = subscription("watch", 5, CREDIT, 16);
+const PAGE: MessageRule = response("page", 6, 5, false);
+const ENDED: MessageRule = response("ended", 7, 5, true);
 
 const fn persistent(kind: u16, messages: &'static [MessageRule]) -> Stream {
     Stream {
@@ -191,10 +205,13 @@ fn a_table_needs_a_row() {
 
 #[test]
 fn a_message_type_appears_once_per_layout() {
-    let within_a_stream = [persistent(64, leak(&[STATUS, GET, PART, DONE, request(1)]))];
+    let within_a_stream = [persistent(
+        64,
+        leak(&[STATUS, GET, PART, DONE, request("get-status", 1)]),
+    )];
     let across_streams = [
         persistent(64, &[STATUS, PART, DONE]),
-        persistent(65, leak(&[GET, request(1)])),
+        persistent(65, leak(&[GET, request("get-status", 1)])),
     ];
     for layout in [&within_a_stream[..], &across_streams] {
         assert_eq!(
@@ -202,6 +219,57 @@ fn a_message_type_appears_once_per_layout() {
             Err(LayoutError::DuplicateMessageType { message_type: 1 })
         );
     }
+}
+
+#[test]
+fn a_row_name_appears_once_per_layout() {
+    let within_a_stream = [persistent(
+        64,
+        leak(&[STATUS, GET, PART, DONE, request("get", 5)]),
+    )];
+    let across_streams = [
+        persistent(64, &[STATUS, PART, DONE]),
+        persistent(65, leak(&[GET, request("status", 5)])),
+    ];
+    assert_eq!(
+        check(&within_a_stream),
+        Err(LayoutError::DuplicateName { name: "get" })
+    );
+    assert_eq!(
+        check(&across_streams),
+        Err(LayoutError::DuplicateName { name: "status" })
+    );
+}
+
+#[test]
+fn a_row_name_is_hyphenated_lowercase_words() {
+    for name in [
+        "",
+        "Get",
+        "get blocks",
+        "get_blocks",
+        "gét",
+        "-get",
+        "get-",
+        "get--blocks",
+        "-",
+    ] {
+        assert_eq!(
+            check(&[persistent(
+                64,
+                leak(&[STATUS, request(name, 2), PART, DONE])
+            )]),
+            Err(LayoutError::MalformedName { message_type: 2 }),
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        check(&[persistent(
+            64,
+            leak(&[STATUS, request("get-2-blocks", 2), PART, DONE])
+        )]),
+        Ok(())
+    );
 }
 
 #[test]
@@ -334,7 +402,7 @@ fn a_response_answers_a_request_row_of_its_layout() {
     // The named type exists, but it is an announcement.
     let answers_an_announcement = [persistent(
         64,
-        leak(&[STATUS, GET, DONE, response(3, 1, true)]),
+        leak(&[STATUS, GET, DONE, response("status-answer", 3, 1, true)]),
     )];
     for layout in [&missing[..], &answers_an_announcement] {
         assert_eq!(
@@ -393,7 +461,7 @@ fn a_subscription_grants_nonzero_credit_in_both_units() {
         assert_eq!(
             check(&[persistent(
                 64,
-                leak(&[subscription(5, credit, 16), PAGE, ENDED])
+                leak(&[subscription("watch", 5, credit, 16), PAGE, ENDED])
             )]),
             Err(LayoutError::EmptyCredit { message_type: 5 })
         );
@@ -405,14 +473,14 @@ fn a_cursor_history_covers_the_object_credit() {
     assert_eq!(
         check(&[persistent(
             64,
-            leak(&[subscription(5, CREDIT, 15), PAGE, ENDED])
+            leak(&[subscription("watch", 5, CREDIT, 15), PAGE, ENDED])
         )]),
         Err(LayoutError::ShortCursorHistory { message_type: 5 })
     );
     assert_eq!(
         check(&[persistent(
             64,
-            leak(&[subscription(5, CREDIT, 16), PAGE, ENDED])
+            leak(&[subscription("watch", 5, CREDIT, 16), PAGE, ENDED])
         )]),
         Ok(())
     );

@@ -100,6 +100,10 @@ pub(crate) struct Serving {
     max_blocks: u32,
     max_body_bytes: u32,
     advertised: u32,
+    /// Receives each session's lease and frame events, in test and simulator
+    /// builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) observer: crate::zakura::block_sync::block_sync_observe::ObserverSlot,
 }
 
 impl Serving {
@@ -117,12 +121,27 @@ impl Serving {
             max_blocks: config.advertised_max_blocks_per_response(),
             max_body_bytes: config.advertised_max_response_bytes(),
             advertised,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
+    /// `peer`'s live serving leases, as execution slots and output bytes
+    /// held, read from the slot budgets rather than from serving gauges.
+    #[cfg(test)]
+    pub(crate) fn leases_held(&self, peer: &ZakuraPeerId) -> (usize, u64) {
+        self.capacity.peer_held(peer)
+    }
+
+    /// A serving session for `peer` that sends on `send`.
+    ///
+    /// In test and simulator builds, the session reports its leases and
+    /// frames as routine session `key`.
     pub(crate) fn session(
         &self,
         peer: &ZakuraPeerId,
+        #[cfg(any(test, zakura_sim))]
+        key: crate::zakura::block_sync::block_sync_observe::SessionKey,
         send: FramedSend,
         cancel: CancellationToken,
         connection: CancellationToken,
@@ -131,7 +150,20 @@ impl Serving {
         let producer = Server::new(self.source.clone(), self.max_blocks, self.max_body_bytes)
             .expect("advertised serving limits are within the protocol bounds")
             .with_session(send.clone());
+        #[cfg(any(test, zakura_sim))]
+        let identity = crate::zakura::block_sync::block_sync_observe::ServingIdentity {
+            peer: peer.clone(),
+            conn_id: key.conn_id,
+            generation: key.generation,
+        };
+        #[cfg(any(test, zakura_sim))]
+        let producer = producer.with_observer(self.observer.clone(), identity.clone());
         ServingSession {
+            #[cfg(any(test, zakura_sim))]
+            reporter: crate::zakura::block_sync::block_sync_observe::ServingReporter::new(
+                self.observer.clone(),
+                identity,
+            ),
             // The requester matches each block to the live range expecting its
             // hash and each ending by start height, so ranges need no order.
             serve: self.capacity.session_with_order(
@@ -150,10 +182,28 @@ impl Serving {
     }
 }
 
+/// One range a serving session records, as an owner snapshot reads it.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmittedRange {
+    /// The range's first height.
+    pub first: Height,
+    /// The range's last height.
+    pub last: Height,
+    /// The range's completion is recorded: its ending was published, its
+    /// publication failed, or it was cancelled. The session doesn't tell
+    /// these apart, and the next admission removes the record either way.
+    /// Whether an ending reached the peer is the output's to say.
+    pub completed: bool,
+}
+
 pub(crate) struct ServingSession {
     serve: Serve<Server<dyn Source>>,
     ranges: BTreeMap<Height, (Height, CompletionId)>,
     completed: Completions,
+    /// Receives each admission's live ranges, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    reporter: crate::zakura::block_sync::block_sync_observe::ServingReporter,
 }
 
 impl ServingSession {
@@ -163,6 +213,15 @@ impl ServingSession {
     pub(crate) fn admit(&mut self, range: Range) -> Result<(), SinkReject> {
         let (start, last) = (range.start(), range.last());
         self.remove_completed();
+        #[cfg(any(test, zakura_sim))]
+        self.reporter.admission(
+            start,
+            range.count(),
+            self.ranges
+                .iter()
+                .map(|(first, (last, _))| (*first, *last))
+                .collect(),
+        );
         if self
             .ranges
             .range(..=last)
@@ -181,6 +240,22 @@ impl ServingSession {
             .map_err(SinkReject::protocol)?;
         self.ranges.insert(start, (last, id));
         Ok(())
+    }
+
+    /// Every range the session records, with whether its completion is
+    /// recorded. Reads the range map and the completion queue without
+    /// draining either, so cleanup stays with [`Self::admit`].
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn admitted_ranges(&self) -> Vec<AdmittedRange> {
+        let completed = self.completed.recorded();
+        self.ranges
+            .iter()
+            .map(|(start, (last, id))| AdmittedRange {
+                first: *start,
+                last: *last,
+                completed: completed.contains(id),
+            })
+            .collect()
     }
 
     /// Drain under the ending-publication lock before reusing any live range.

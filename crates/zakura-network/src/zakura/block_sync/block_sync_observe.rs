@@ -197,7 +197,7 @@ pub enum BlockEvent {
         /// The transition.
         transition: ReactorTransition,
         /// The reactor's logical state after it.
-        state: ReactorSnapshot,
+        state: Box<ReactorSnapshot>,
     },
     /// The sequencer task is dropping and takes no more bodies. Each queued
     /// body released after this has no next holder: the task's drop

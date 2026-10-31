@@ -25,7 +25,7 @@ impl BlockSyncObserver for Transitions {
             self.0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((transition, state));
+                .push((transition, *state));
         }
     }
 }

@@ -52,6 +52,7 @@ enum TransitionDetail {
         header_generation: u64,
         matched: bool,
     },
+    QueryGateChanged,
     RetryElapsed,
     View {
         reset: bool,
@@ -112,6 +113,7 @@ impl From<ReactorTransition> for TransitionDetail {
                 header_generation: scope.header.header_generation.get(),
                 matched,
             },
+            ReactorTransition::QueryGateChanged => Self::QueryGateChanged,
             ReactorTransition::RetryElapsed => Self::RetryElapsed,
             ReactorTransition::View {
                 reset,
@@ -168,6 +170,14 @@ impl ReactorIO {
                 transition,
                 state: self.state.snapshot(),
             });
+        }
+    }
+
+    /// Report a change from `before` in the query state, when the caller's
+    /// input has no transition of its own that names the change.
+    pub(super) fn report_query_gate_change(&self, before: state::QueryLifecycle) {
+        if self.state.queries.lifecycle() != before {
+            self.report_transition(ReactorTransition::QueryGateChanged);
         }
     }
 

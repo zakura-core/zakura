@@ -638,4 +638,15 @@ pub static COVERAGE: &[Coverage] = &[
         )),
         bypass: Bypass::Planted("no-room-check"),
     },
+    Coverage {
+        property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_reset_mid_flight_input_holds_reactor_query_lifecycle",
+        ),
+        bypass: Bypass::Pending(
+            "no committed input is known to fill or close the action channel, so no planted \
+             refusal bug can reach this check yet; checker tests cover crafted refusals",
+        ),
+    },
 ];

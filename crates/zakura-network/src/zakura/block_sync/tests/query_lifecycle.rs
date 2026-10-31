@@ -190,6 +190,28 @@ async fn full_action_channel_keeps_the_accepted_query_and_its_next_id() {
     fixture.reactor.abort();
 }
 
+/// A header tip at the floor retires the pending query at the next opening.
+/// No input-specific transition names that change, so the reactor reports it
+/// as a gate change.
+#[tokio::test]
+async fn a_range_at_the_floor_reports_the_retired_query_state() {
+    let fixture = Fixture::accepted_query().await;
+    fixture
+        .tips
+        .send((block::Height(0), block::Hash([0; 32])))
+        .expect("the reactor watches the header tip");
+
+    let state = fixture
+        .await_transition("the opening retires the pending query", |transition| {
+            matches!(transition, ReactorTransition::QueryGateChanged)
+        })
+        .await;
+    assert_eq!(state.pending, None);
+    assert!(!state.retry_armed);
+
+    fixture.reactor.abort();
+}
+
 /// The accepted query's reply still completes it while the channel stays full.
 #[tokio::test]
 async fn reply_completes_the_accepted_query_while_the_channel_is_full() {

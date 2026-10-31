@@ -84,10 +84,7 @@ pub fn bench_work_request(count: u32, bytes: u32, end: WorkRequestEnd) {
                             .expect("receipt funding is coherent")
                             .expect("the request owns the height");
                         assert_eq!(ended.charge, u64::from(bytes));
-                        let received = work
-                            .claim_receipt_for_owner(owner, block::Height(height))
-                            .expect("received funding is coherent");
-                        drop((ended, received));
+                        drop(ended);
                     }
                     if matches!(end, WorkRequestEnd::Partial) {
                         work.release_reserved_and_return_items_detailed_for_owner(

@@ -15,8 +15,8 @@ use std::{
 
 use zakura_sim::{
     campaign::{
-        bypasses, declared_targets, judge_run, own_applicability, resolve, run_seed, SeedRun,
-        TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
+        bypasses, declared_targets, judge_run, max_len, own_applicability, resolve, run_seed,
+        SeedRun, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
     },
     explore::{
         stats::{Counts, ProcessStats, STATS_VERSION},
@@ -73,6 +73,17 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             target.name,
             entry.name
         );
+        if let Some(max) = max_len(&target.args) {
+            for seed in &loaded.admitted {
+                assert!(
+                    seed.input.len() <= max,
+                    "{}: -max_len={max} cuts {} ({} bytes)",
+                    target.name,
+                    seed.path.display(),
+                    seed.input.len()
+                );
+            }
+        }
         let mut worker = Worker::new();
         let seeds: Vec<SeedRun> = loaded
             .admitted
@@ -207,10 +218,10 @@ fn stats(harness: &str, runs: u64, complete: bool) -> Result<ProcessStats, Strin
 }
 
 /// libFuzzer's output for a run of `seeds`.
-fn executed(seeds: &[PathBuf]) -> Vec<u8> {
+fn executed(seeds: &[(PathBuf, usize)]) -> Vec<u8> {
     seeds
         .iter()
-        .map(|seed| format!("Running: {0}\nExecuted {0} in 1 ms\n", seed.display()))
+        .map(|(seed, _)| format!("Running: {0}\nExecuted {0} in 1 ms\n", seed.display()))
         .collect::<String>()
         .into_bytes()
 }
@@ -220,12 +231,12 @@ fn executed(seeds: &[PathBuf]) -> Vec<u8> {
 #[test]
 fn each_shortfall_gets_its_own_status() {
     const HARNESS: &str = "discovery/wait-complete";
-    let seeds = [PathBuf::from("/s/a"), PathBuf::from("/s/b")];
+    let seeds = [(PathBuf::from("/s/a"), 10), (PathBuf::from("/s/b"), 4096)];
     let log = executed(&seeds);
     let applied = ["discovery/wait-complete-wakes".to_owned()];
     let ok = ProcessExit::Code(0);
     let judge = |exit, log: &[u8], files: &[Result<ProcessStats, String>], applied: &[String]| {
-        judge_run(HARNESS, &seeds, exit, log, files, applied).0
+        judge_run(HARNESS, &seeds, Some(4096), exit, log, files, applied).0
     };
 
     // libFuzzer runs a list of files without the empty input, so a run of
@@ -323,4 +334,40 @@ fn row_variables_dont_override_the_checks() {
     assert_eq!(get(EXPECT_VAR), Some(None));
     assert_eq!(get(ABANDON_LIMIT_VAR), Some(None));
     assert_eq!(get("ASAN_OPTIONS"), Some(Some("detect_leaks=0".into())));
+}
+
+/// libFuzzer cuts an input longer than `-max_len`, even one it runs as a
+/// file, so a seed longer than the row's `-max_len` never runs whole.
+#[test]
+fn a_seed_past_max_len_is_unaccounted() {
+    const HARNESS: &str = "discovery/wait-complete";
+    let args = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    assert_eq!(max_len(&args(&[])), None);
+    assert_eq!(max_len(&args(&["-max_len=4096"])), Some(4096));
+    assert_eq!(
+        max_len(&args(&["-max_len=64", "-max_len=4096"])),
+        Some(4096)
+    );
+    assert_eq!(max_len(&args(&["-max_len=4096", "-max_len=0"])), None);
+    assert_eq!(max_len(&args(&["-rss_limit_mb=4096"])), None);
+
+    let seeds = [(PathBuf::from("/s/a"), 10), (PathBuf::from("/s/b"), 4097)];
+    let log = executed(&seeds);
+    let applied = ["discovery/wait-complete-wakes".to_owned()];
+    let judge = |max| {
+        judge_run(
+            HARNESS,
+            &seeds,
+            max,
+            ProcessExit::Code(0),
+            &log,
+            &[stats(HARNESS, 2, true)],
+            &applied,
+        )
+    };
+    let (status, detail) = judge(Some(4096));
+    assert_eq!(status, TargetStatus::Unaccounted);
+    assert!(detail.unwrap().contains("/s/b"));
+    assert_eq!(judge(Some(4097)).0, TargetStatus::Ready);
+    assert_eq!(judge(None).0, TargetStatus::Ready);
 }

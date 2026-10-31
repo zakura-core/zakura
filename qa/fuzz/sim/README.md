@@ -282,7 +282,8 @@ must name the harness the table maps it to, so a target whose
   sanitizer report, a timeout or an error exit;
 - `wrong-harness`: the stats name another harness;
 - `unaccounted`: the target exited cleanly, but its output and stats don't
-  account for every seed.
+  account for every seed, or a seed is longer than the row's `-max_len`,
+  which libFuzzer cuts it to.
 
 It prints each target's status, the harness's own properties that applied
 and those that didn't, and the retained bypasses under `qa/planted/` whose

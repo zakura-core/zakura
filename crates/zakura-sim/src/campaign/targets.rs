@@ -121,7 +121,9 @@ pub enum TargetStatus {
     WrongHarness,
     /// The target exited cleanly, but its output and stats don't account
     /// for every seed: no stats file or more than one, an incomplete file,
-    /// fewer runs than seeds, or a seed libFuzzer didn't report running.
+    /// fewer runs than seeds, a seed libFuzzer didn't report running, or a
+    /// seed longer than the row's `-max_len`, which libFuzzer cuts before
+    /// it runs it.
     Unaccounted,
 }
 
@@ -286,12 +288,14 @@ pub fn own_applicability(entry: &HarnessEntry, seeds: &[SeedRun]) -> (Vec<String
         .partition(|id| seeds.iter().any(|seed| seed.applied.contains(id)))
 }
 
-/// What the target's run on `seeds` came to, judged from how it exited,
-/// its output `log`, and the stats files it left, `stats`. Only the
-/// `harness` the manifest maps the target to and the `applied` own
+/// What the target's run on `seeds`, each seed's file and its length in
+/// bytes, came to, judged from how it exited, its output `log`, and the
+/// stats files it left, `stats`. Only the `harness` the manifest maps the
+/// target to, the row's `-max_len` ([`max_len`]) and the `applied` own
 /// properties of the seeds' in-process runs are needed besides.
 ///
-/// The run must exit cleanly, report each seed's file as run, and leave
+/// The run must exit cleanly, report each seed's file as run, run each
+/// seed whole, and leave
 /// exactly one complete stats file that names `harness` and counts at least
 /// one run per seed. libFuzzer runs a list of files without the empty
 /// input it runs before fuzzing. It runs an input a second time when the
@@ -299,7 +303,8 @@ pub fn own_applicability(entry: &HarnessEntry, seeds: &[SeedRun]) -> (Vec<String
 /// count twice.
 pub fn judge_run(
     harness: &str,
-    seeds: &[PathBuf],
+    seeds: &[(PathBuf, usize)],
+    max_len: Option<usize>,
     exit: ProcessExit,
     log: &[u8],
     stats: &[Result<ProcessStats, String>],
@@ -365,7 +370,7 @@ pub fn judge_run(
         );
     }
     let text = String::from_utf8_lossy(log);
-    if let Some(missing) = seeds.iter().find(|seed| {
+    if let Some((missing, _)) = seeds.iter().find(|(seed, _)| {
         let line = format!("{EXECUTED}{}", seed.display());
         !text.lines().any(|reported| reported.starts_with(&line))
     }) {
@@ -377,6 +382,17 @@ pub fn judge_run(
             )),
         );
     }
+    if let Some((max, (cut, len))) =
+        max_len.and_then(|max| Some((max, seeds.iter().find(|(_, len)| *len > max)?)))
+    {
+        return (
+            TargetStatus::Unaccounted,
+            Some(format!(
+                "libFuzzer ran {} cut from {len} bytes to the row's -max_len={max}",
+                cut.display()
+            )),
+        );
+    }
     if applied.is_empty() {
         return (
             TargetStatus::NoApplicableProperty,
@@ -384,6 +400,16 @@ pub fn judge_run(
         );
     }
     (TargetStatus::Ready, None)
+}
+
+/// The longest input libFuzzer runs with arguments `args`: the last
+/// `-max_len`, unless it's 0, which sets no limit. libFuzzer cuts a longer
+/// input to it, even one it runs as a file.
+pub fn max_len(args: &[String]) -> Option<usize> {
+    args.iter()
+        .rev()
+        .find_map(|arg| arg.strip_prefix("-max_len=")?.parse().ok())
+        .filter(|max| *max > 0)
 }
 
 /// The retained production bypasses under `repo`'s `qa/planted/` whose
@@ -534,7 +560,7 @@ fn check_target(
         let file = seeds_dir.join(&digest);
         fs::write(&file, &seed.input)
             .map_err(CampaignError::io(format!("writing {}", file.display())))?;
-        files.push(file);
+        files.push((file, seed.input.len()));
         row.seeds.push(SeedRun {
             file: seed::from_root(&seed.path),
             sha256: digest,
@@ -559,7 +585,8 @@ fn check_target(
         Err(error) => return Ok(row.with(TargetStatus::BuildFailed, error.to_string())),
     }
 
-    let command = smoke_command(&fuzzer, target, &files, &dir, options.child);
+    let paths: Vec<PathBuf> = files.iter().map(|(file, _)| file.clone()).collect();
+    let command = smoke_command(&fuzzer, target, &paths, &dir, options.child);
     fs::create_dir_all(dir.join("artifacts"))
         .map_err(CampaignError::io(format!("creating {}", dir.display())))?;
     // Each seed gets libFuzzer's timeout twice, for its leak check's rerun.
@@ -573,7 +600,15 @@ fn check_target(
     row.fuzzer_runs = stats
         .iter()
         .find_map(|stats| stats.as_ref().ok().map(|stats| stats.counts.runs));
-    let (status, detail) = judge_run(entry.name, &files, exit, &log, &stats, &row.applied);
+    let (status, detail) = judge_run(
+        entry.name,
+        &files,
+        max_len(&target.args),
+        exit,
+        &log,
+        &stats,
+        &row.applied,
+    );
     row.status = status;
     row.detail = detail;
     Ok(row)

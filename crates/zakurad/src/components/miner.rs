@@ -59,7 +59,7 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 
-/// Replace invalid work or work whose transactions changed, retaining valid timestamp-only updates.
+/// Retain valid work across timestamp-only updates, but adopt changed transactions.
 fn should_replace_mining_template(
     current_header: Option<block::Header>,
     new_header: block::Header,
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn populated_template_replaces_empty_work_and_cancels_all_solvers() {
-        let populated = zakura_test::vectors::BLOCK_MAINNET_419200_BYTES
+        let populated = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
             .zcash_deserialize_into::<Arc<Block>>()
             .expect("the block fixture deserializes");
         assert!(

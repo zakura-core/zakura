@@ -1,0 +1,18 @@
+--- a/crates/zakura-state/src/service/read/block.rs
++++ b/crates/zakura-state/src/service/read/block.rs
+@@ -52,7 +52,14 @@
+     // but `db` stores blocks on disk, with a memory cache.)
+     chains
+         .find_map(|c| c.as_ref().block(hash_or_height))
+-        .map(|contextual| contextual.block.clone())
++        .map(|contextual| {
++            let view = contextual.block.view();
++            Arc::new(block::Block {
++                header: Arc::new(view.header().clone()),
++                transactions: view.transactions().map(|tx| Arc::new(tx.clone())).collect(),
++            })
++            .into()
++        })
+         .or_else(|| db.block(hash_or_height).map(Into::into))
+ }
+ 

@@ -137,6 +137,9 @@ where
                         peers.maintain(cx)?;
                         // Bounded channel polling participates in Tokio's cooperative budget.
                         while let Poll::Ready(Some(reply)) = refreshes.poll_recv(cx) {
+                            // Discovery may have arrived between the first maintenance pass and
+                            // this refresh. Process it after receiving the barrier, before acking.
+                            peers.maintain(cx)?;
                             let _ = reply.send(());
                         }
                         if pending.is_none() {

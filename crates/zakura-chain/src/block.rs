@@ -65,6 +65,51 @@ pub struct Block {
     pub transactions: Vec<Arc<Transaction>>,
 }
 
+/// Read-only block access that does not expose shared header or transaction handles.
+/// Runtime owners can lend this view without letting a caller clone their raw Arcs.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockView<'a>(&'a Block);
+
+impl<'a> From<&'a Block> for BlockView<'a> {
+    fn from(block: &'a Block) -> Self {
+        Self(block)
+    }
+}
+
+impl<'a> From<&'a Arc<Block>> for BlockView<'a> {
+    fn from(block: &'a Arc<Block>) -> Self {
+        Self(block)
+    }
+}
+
+impl<'a> BlockView<'a> {
+    /// Borrow the header without lending its shared handle.
+    pub fn header(self) -> &'a Header {
+        &self.0.header
+    }
+
+    /// Borrow transactions in block order without lending their shared handles.
+    pub fn transactions(
+        self,
+    ) -> impl ExactSizeIterator<Item = &'a Transaction> + DoubleEndedIterator {
+        self.0.transactions.iter().map(Arc::as_ref)
+    }
+
+    /// Return the height reported by the coinbase transaction.
+    pub fn coinbase_height(self) -> Option<Height> {
+        self.0.coinbase_height()
+    }
+
+    /// Check transaction upgrade fields against the network and coinbase height.
+    pub fn check_transaction_network_upgrade_consistency(
+        self,
+        network: &Network,
+    ) -> Result<(), error::BlockError> {
+        self.0
+            .check_transaction_network_upgrade_consistency(network)
+    }
+}
+
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut fmter = f.debug_struct("Block");

@@ -549,7 +549,7 @@ where
             // Now do the slower checks
 
             // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
-            tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
+            tx::check::coinbase_outputs_are_decryptable(coinbase_tx, &network, height)?;
 
             // Send transactions to the transaction verifier to be checked
             let mut async_checks = FuturesUnordered::new();
@@ -708,7 +708,7 @@ where
                 })?;
 
             check::miner_fees_are_valid(
-                &coinbase_tx,
+                coinbase_tx,
                 height,
                 block_transaction_fees,
                 expected_block_subsidy,

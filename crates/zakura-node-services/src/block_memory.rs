@@ -5,9 +5,13 @@
 //! and charge. A backend transfer reserves its destination before releasing the
 //! source charge, including when other handles still retain the allocation.
 
-use std::{fmt, ops::Deref, sync::Arc};
+use std::{fmt, io, ops::Deref, sync::Arc};
 
-use zakura_chain::{block::Block, transaction::Transaction};
+use zakura_chain::{
+    block::{Block, BlockView},
+    serialization::ZcashSerialize,
+    transaction::Transaction,
+};
 use zakura_rt::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex, Notify,
@@ -214,8 +218,31 @@ struct RetainedBlock {
 ///     drop(transaction);
 /// }
 /// ```
+///
+/// Borrowed views cannot return a raw shared transaction handle.
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use zakura_chain::{block::BlockView, transaction::Transaction};
+/// use zakura_node_services::block_memory::OwnedBlock;
+/// fn escape(owner: &OwnedBlock) -> Arc<Transaction> {
+///     BlockView::from(owner).transactions().next().unwrap().clone()
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct OwnedBlock(Arc<RetainedBlock>);
+
+impl<'a> From<&'a OwnedBlock> for BlockView<'a> {
+    fn from(block: &'a OwnedBlock) -> Self {
+        (&block.0.block).into()
+    }
+}
+
+impl ZcashSerialize for OwnedBlock {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.0.block.zcash_serialize(writer)
+    }
+}
 
 impl OwnedBlock {
     /// Decoded size measured once, before retained admission.

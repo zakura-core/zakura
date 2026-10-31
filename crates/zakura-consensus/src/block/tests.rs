@@ -897,6 +897,45 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
 }
 
 #[test]
+fn owned_block_view_preserves_consensus_checks_and_charge() -> Result<(), Report> {
+    use zakura_chain::block::BlockView;
+    use zakura_chain::serialization::ZcashSerialize;
+    use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+
+    let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_434873_BYTES[..])?;
+    let network = Network::Mainnet;
+    let height = block
+        .coinbase_height()
+        .expect("the fixture has a coinbase height");
+    let subsidy = block_subsidy(height, &network, None)?;
+    let hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+    let encoded = block.zcash_serialize_to_vec()?;
+    let bytes = block.attributed_memory_size_bytes();
+    let pool = DecodedBlockPool::new(bytes);
+    let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
+    let view = BlockView::from(&owner);
+    let coinbase = check::coinbase_is_first(&owner)?;
+    let retained = owner.transaction(0).unwrap();
+    assert!(std::ptr::eq(coinbase, &*retained));
+    assert!(std::ptr::eq(
+        view.transactions().next().unwrap(),
+        &*retained
+    ));
+    assert_eq!(view.transactions().len(), hashes.len());
+    assert_eq!(view.coinbase_height(), Some(height));
+    assert_eq!(owner.zcash_serialize_to_vec()?, encoded);
+    check::merkle_root_validity(&network, &owner, &hashes)?;
+    check::subsidy_is_valid(&owner, &network, subsidy)?;
+    assert!(check::merkle_root_validity(&network, &owner, &hashes[1..]).is_err());
+    assert_eq!(pool.reserved_bytes(), bytes);
+    drop(owner);
+    assert_eq!(pool.reserved_bytes(), bytes);
+    drop(retained);
+    assert_eq!(pool.reserved_bytes(), 0);
+    Ok(())
+}
+
+#[test]
 fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1331,7 +1370,7 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
                 };
 
             assert!(check::miner_fees_are_valid(
-                &coinbase_tx,
+                coinbase_tx,
                 height,
                 // Set the miner fees to a high-enough amount.
                 Amount::try_from(MAX_MONEY / 2).unwrap(),
@@ -1364,7 +1403,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 
     assert_eq!(
         check::miner_fees_are_valid(
-            check::coinbase_is_first(&block)?.as_ref(),
+            check::coinbase_is_first(&block)?,
             height,
             // Set the miner fee to an invalid amount.
             Amount::zero(),

@@ -32,14 +32,12 @@ pub use guard::{BudgetChange, BudgetChangeKind};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
-    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedFrameSlot,
-    GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
-    ResponseFrameSlot,
+    worker_framed_channel, AdmittedFrame, FrameGuard, FrameWriteClaim, FramedWorkerRecv,
+    GuardedFrameSlot, GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause,
+    QueuedFrame, ResponseFrameSlot,
 };
-#[allow(unused_imports)] // the next commit connects these owners to the stream workers
 #[cfg(test)]
 pub(crate) use lifetime::OwnerCounts;
-#[allow(unused_imports)] // the next commit connects these owners to the stream workers
 pub(crate) use lifetime::{
     frame_wire_bytes, ConnectionResources, FrameGate, NodeResources, OwnerPhase, ResourceEnvelope,
     StreamResources,

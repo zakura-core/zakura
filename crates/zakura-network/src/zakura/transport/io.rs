@@ -13,7 +13,10 @@
 
 use zakura_rt::sync::mpsc;
 
-use super::Frame;
+use super::{
+    lifetime::{frame_wire_bytes, FrameGate, FrameGrant},
+    Frame,
+};
 use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck, SlotBudget, SlotPermit};
 use std::sync::{Arc, OnceLock};
 
@@ -38,18 +41,33 @@ impl OrderedStreamFailureCause {
     }
 }
 
+/// One raw inbound frame and its admission, from the reader's allocation on.
+#[derive(Debug)]
+pub(crate) struct AdmittedFrame {
+    pub(crate) frame: Frame,
+    pub(crate) grant: FrameGrant,
+}
+
 /// Receive half for bounded, rate-admitted Zakura frames.
+///
+/// A transport-read frame stays charged after [`Self::recv`] returns it, so its
+/// bytes stay funded while the service decodes it. The next receive, or dropping
+/// this handle, returns them. A service that retains a frame longer owns that
+/// retention through its own accounting.
 #[derive(Debug)]
 pub struct FramedRecv {
     receiver: FramedReceiver,
     failure_cause: Option<OrderedStreamFailureCause>,
     precheck: Option<PrecheckSlot>,
+    /// The admission of the frame this handle returned last.
+    returned: Option<FrameGrant>,
 }
 
 #[derive(Debug)]
 enum FramedReceiver {
     Plain(mpsc::Receiver<Frame>),
     Queued(mpsc::Receiver<QueuedFrame>),
+    Admitted(mpsc::Receiver<AdmittedFrame>),
 }
 
 impl FramedRecv {
@@ -59,6 +77,17 @@ impl FramedRecv {
             receiver: FramedReceiver::Plain(receiver),
             failure_cause: None,
             precheck: None,
+            returned: None,
+        }
+    }
+
+    /// Wrap the queue from a stream's transport reader.
+    pub(crate) fn admitted(receiver: mpsc::Receiver<AdmittedFrame>) -> Self {
+        Self {
+            receiver: FramedReceiver::Admitted(receiver),
+            failure_cause: None,
+            precheck: None,
+            returned: None,
         }
     }
 
@@ -67,6 +96,7 @@ impl FramedRecv {
             receiver: FramedReceiver::Queued(receiver),
             failure_cause: None,
             precheck: None,
+            returned: None,
         }
     }
 
@@ -119,6 +149,7 @@ impl FramedRecv {
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.close(),
             FramedReceiver::Queued(receiver) => receiver.close(),
+            FramedReceiver::Admitted(receiver) => receiver.close(),
         }
     }
 
@@ -127,6 +158,7 @@ impl FramedRecv {
         if let Some(precheck) = &self.precheck {
             precheck.start();
         }
+        self.returned = None;
         match &mut self.receiver {
             // The release arm stays a bare expression, so its build is unchanged.
             #[cfg(not(any(test, zakura_sim)))]
@@ -146,6 +178,13 @@ impl FramedRecv {
                     return Ok(frame);
                 }
             },
+            FramedReceiver::Admitted(receiver) => {
+                let AdmittedFrame { frame, grant } = receiver.try_recv()?;
+                self.returned = Some(grant);
+                #[cfg(any(test, zakura_sim))]
+                self.take_tag();
+                Ok(frame)
+            }
         }
     }
 
@@ -154,6 +193,7 @@ impl FramedRecv {
         if let Some(precheck) = &self.precheck {
             precheck.start();
         }
+        self.returned = None;
         match &mut self.receiver {
             // As in `try_recv`, the release arm is unchanged.
             #[cfg(not(any(test, zakura_sim)))]
@@ -176,6 +216,13 @@ impl FramedRecv {
                 }
                 None
             }
+            FramedReceiver::Admitted(receiver) => {
+                let AdmittedFrame { frame, grant } = receiver.recv().await?;
+                self.returned = Some(grant);
+                #[cfg(any(test, zakura_sim))]
+                self.take_tag();
+                Some(frame)
+            }
         }
     }
 }
@@ -186,6 +233,8 @@ pub struct FramedSend {
     sender: FramedSender,
     response_slots: Option<SlotBudget>,
     session_resources: Option<Arc<dyn super::service::SessionResources>>,
+    /// Funds frames that arrive without a guard from another owner.
+    output: Option<FrameGate>,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +250,7 @@ impl FramedSend {
             sender: FramedSender::Plain(sender),
             response_slots: None,
             session_resources: None,
+            output: None,
         }
     }
 
@@ -211,6 +261,7 @@ impl FramedSend {
             response_slots: Some(response_slots),
             sender: FramedSender::Queued(sender),
             session_resources: None,
+            output: None,
         }
     }
 
@@ -223,25 +274,69 @@ impl FramedSend {
         self
     }
 
+    /// Fund frames without another owner from `gate`.
+    pub(crate) fn with_output_gate(mut self, gate: FrameGate) -> Self {
+        self.output = Some(gate);
+        self
+    }
+
     /// Queue a frame for transport-owned encoding and writing.
-    pub async fn send(&self, frame: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
-        match &self.sender {
-            FramedSender::Plain(sender) => sender.send(frame).await,
-            FramedSender::Queued(sender) => sender
-                .send(QueuedFrame::plain(frame))
-                .await
-                .map_err(|error| mpsc::error::SendError(error.0.into_parts().0)),
+    ///
+    /// This takes free output capacity when called, not when first polled, so
+    /// the returned future owns the frame's output from its creation. Dropping
+    /// the future at any point, including before its first poll, returns it.
+    pub fn send(
+        &self,
+        frame: Frame,
+    ) -> impl std::future::Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send + '_
+    {
+        let bytes = frame_wire_bytes(frame.payload.len());
+        let admitted = self.output.as_ref().and_then(|gate| gate.try_admit(bytes));
+        async move {
+            let sender = match &self.sender {
+                FramedSender::Plain(sender) => return sender.send(frame).await,
+                FramedSender::Queued(sender) => sender,
+            };
+            let output = match (admitted, &self.output) {
+                (Some(grant), _) => Some(grant),
+                (None, None) => None,
+                (None, Some(gate)) => zakura_rt::select! {
+                    biased;
+                    () = sender.closed() => return Err(mpsc::error::SendError(frame)),
+                    grant = gate.admit(bytes) => Some(grant),
+                },
+            };
+            // The queue's order is the order of these sends. Nothing after the
+            // send can restate it, because the worker may already hold the frame.
+            match sender.reserve().await {
+                Ok(permit) => {
+                    permit.send(QueuedFrame::plain(frame, output));
+                    Ok(())
+                }
+                Err(_) => Err(mpsc::error::SendError(frame)),
+            }
         }
     }
 
     /// Try to queue a frame without waiting for capacity.
     pub fn try_send(&self, frame: Frame) -> Result<(), mpsc::error::TrySendError<Frame>> {
-        match &self.sender {
-            FramedSender::Plain(sender) => sender.try_send(frame),
-            FramedSender::Queued(sender) => sender
-                .try_send(QueuedFrame::plain(frame))
-                .map_err(map_queued_try_send_error),
+        let sender = match &self.sender {
+            FramedSender::Plain(sender) => return sender.try_send(frame),
+            FramedSender::Queued(sender) => sender,
+        };
+        if sender.is_closed() {
+            return Err(mpsc::error::TrySendError::Closed(frame));
         }
+        let output = match &self.output {
+            None => None,
+            Some(gate) => match gate.try_admit(frame_wire_bytes(frame.payload.len())) {
+                Some(grant) => Some(grant),
+                None => return Err(mpsc::error::TrySendError::Full(frame)),
+            },
+        };
+        sender
+            .try_send(QueuedFrame::plain(frame, output))
+            .map_err(map_queued_try_send_error)
     }
 
     /// Reserve queue space before encoding a response or sharing its ownership.
@@ -329,6 +424,7 @@ impl GuardedFrameSlot<'_> {
             frame,
             guard: None,
             claim: Some(claim),
+            output: None,
         });
         !self.sender.is_closed()
     }
@@ -390,6 +486,8 @@ pub(crate) struct QueuedFrame {
     frame: Frame,
     guard: Option<FrameGuard>,
     claim: Option<Arc<dyn FrameWriteClaim>>,
+    /// Funds a frame that has no guard from another owner.
+    output: Option<FrameGrant>,
 }
 
 impl QueuedFrame {
@@ -404,11 +502,12 @@ impl QueuedFrame {
         Some(self.frame)
     }
 
-    fn plain(frame: Frame) -> Self {
+    fn plain(frame: Frame, output: Option<FrameGrant>) -> Self {
         Self {
             frame,
             guard: None,
             claim: None,
+            output,
         }
     }
 
@@ -417,6 +516,7 @@ impl QueuedFrame {
             frame,
             guard: Some(guard),
             claim: None,
+            output: None,
         }
     }
 
@@ -455,6 +555,7 @@ impl QueuedFrame {
             frame,
             guard: _guard,
             claim,
+            output: _output,
         } = self;
         let encoded = encode(frame)?;
         if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
@@ -510,8 +611,10 @@ fn map_queued_try_send_error(
 mod tests {
     use std::sync::Arc;
 
+    use futures::FutureExt as _;
+
     use super::*;
-    use crate::zakura::regulation::SlotBudget;
+    use crate::zakura::regulation::{OutputByteBudget, SlotBudget};
 
     fn frame(message_type: u16) -> Frame {
         Frame {
@@ -786,6 +889,267 @@ mod tests {
 
         assert_eq!(budget.reserved(), 0);
     }
+    /// A queue whose frames without another owner draw from `capacity` bytes.
+    fn gated_queue(
+        depth: usize,
+        capacity: u64,
+    ) -> (FramedSend, FramedWorkerRecv, OutputByteBudget) {
+        let (sender, receiver) = worker_framed_channel(depth);
+        let budget = OutputByteBudget::new(capacity).unwrap();
+        let wide = OutputByteBudget::new(1 << 30).unwrap();
+        let sender = sender.with_output_gate(FrameGate::new(budget.clone(), wide));
+        (sender, receiver, budget)
+    }
+
+    /// The bytes [`frame`]`(1)` charges.
+    fn frame_bytes() -> u64 {
+        frame_wire_bytes(frame(1).payload.len())
+    }
+
+    /// The owner exists when `send` returns, before any poll, and dropping the
+    /// unpolled future returns its bytes.
+    #[test]
+    fn an_unpolled_send_owns_its_output_and_releases_it_on_drop() {
+        let (sender, _receiver, budget) = gated_queue(1, 1024);
+        let unpolled = sender.send(frame(1));
+        assert_eq!(budget.granted(), frame_bytes());
+        drop(unpolled);
+        assert_eq!(budget.granted(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_send_cancelled_at_its_queue_wait_releases_its_output() {
+        let (sender, _receiver, budget) = gated_queue(1, 1024);
+        sender.try_send(frame(1)).unwrap();
+        let mut waiting = Box::pin(sender.send(frame(2)));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert_eq!(budget.granted(), 2 * frame_bytes());
+        drop(waiting);
+        assert_eq!(budget.granted(), frame_bytes());
+    }
+
+    #[tokio::test]
+    async fn output_stays_charged_through_the_queue_and_the_write() {
+        let (sender, mut receiver, budget) = gated_queue(2, 1024);
+        sender.send(frame(1)).await.unwrap();
+        assert_eq!(budget.granted(), frame_bytes());
+
+        let queued = receiver.recv().await.unwrap();
+        assert_eq!(budget.granted(), frame_bytes(), "dequeue is not settlement");
+        let mut write = Box::pin(queued.write_with(|_| async {
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        }));
+        assert!(futures::poll!(&mut write).is_pending());
+        assert_eq!(budget.granted(), frame_bytes(), "a pending write holds it");
+        drop(write);
+        assert_eq!(budget.granted(), 0, "a cancelled write returns it");
+
+        sender.send(frame(2)).await.unwrap();
+        let queued = receiver.recv().await.unwrap();
+        queued
+            .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+            .await
+            .unwrap();
+        assert_eq!(budget.granted(), 0, "a finished write returns it");
+    }
+
+    #[test]
+    fn dropping_the_worker_queue_returns_queued_output() {
+        let (sender, receiver, budget) = gated_queue(2, 1024);
+        sender.try_send(frame(1)).unwrap();
+        assert_eq!(budget.granted(), frame_bytes());
+        drop(receiver);
+        assert_eq!(budget.granted(), 0);
+        assert!(matches!(
+            sender.try_send(frame(2)),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert_eq!(budget.granted(), 0);
+    }
+
+    /// Output capacity and queue capacity report the same way to a caller, and
+    /// the stream's floor slot keeps one frame moving at a saturated budget.
+    #[tokio::test]
+    async fn a_saturated_budget_reports_full_and_keeps_the_floor_frame() {
+        let (sender, mut receiver, budget) = gated_queue(8, frame_bytes());
+        sender.try_send(frame(1)).unwrap();
+        sender.try_send(frame(2)).expect("the floor slot admits it");
+        assert!(matches!(
+            sender.try_send(frame(3)),
+            Err(mpsc::error::TrySendError::Full(Frame {
+                message_type: 3,
+                ..
+            }))
+        ));
+        let mut waiting = Box::pin(sender.send(frame(3)));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(receiver.recv().await.unwrap());
+        waiting.await.expect("the freed bytes admit the frame");
+        assert_eq!(budget.granted(), frame_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_send_waiting_for_output_ends_when_the_queue_closes() {
+        let (sender, receiver, _budget) = gated_queue(8, frame_bytes());
+        let _held = (sender.try_send(frame(1)), sender.try_send(frame(2)));
+        let mut waiting = Box::pin(sender.send(frame(3)));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(receiver);
+        assert!(matches!(
+            waiting.await,
+            Err(mpsc::error::SendError(Frame {
+                message_type: 3,
+                ..
+            }))
+        ));
+    }
+
+    /// A guarded frame already has an owner, so it takes no output from the
+    /// gate, and a terminal can always queue behind saturated data.
+    #[tokio::test]
+    async fn terminals_use_the_control_slot_behind_saturated_responses() {
+        let (sender, mut receiver, budget) = gated_queue(3, 1);
+        let _saturated = budget.hold_free().unwrap();
+        for byte in 1..=2 {
+            sender
+                .reserve_response_guarded()
+                .await
+                .unwrap()
+                .send(frame(byte), FrameGuard::new(Arc::new(())));
+        }
+        assert!(
+            sender.reserve_response_guarded().now_or_never().is_none(),
+            "responses leave the last queue slot free"
+        );
+        sender
+            .try_reserve_guarded()
+            .expect("the terminal finds the free slot")
+            .send(frame(3), FrameGuard::new(Arc::new(())));
+        for byte in 1..=3 {
+            let (received, _guard) = receiver.recv().await.unwrap().into_parts();
+            assert_eq!(
+                received,
+                frame(byte),
+                "the terminal stays behind prior data"
+            );
+        }
+    }
+
+    /// Many producers on real threads share one queue and one budget. Each
+    /// producer's frames stay in its order, which only the channel decides, and
+    /// the budget never counts a dequeued frame as missing: its grant was taken
+    /// before the send and returns only with the receiver's value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_channel_alone_orders_concurrent_producers() {
+        const PRODUCERS: u16 = 4;
+        const FRAMES: u16 = 500;
+        let capacity = 16 * frame_bytes();
+        let (sender, mut receiver, budget) = gated_queue(8, capacity);
+        let mut producers = Vec::new();
+        for producer in 0..PRODUCERS {
+            let sender = sender.clone();
+            producers.push(tokio::spawn(async move {
+                for sequence in 0..FRAMES {
+                    let mut payload = vec![0; 10];
+                    payload[..2].copy_from_slice(&sequence.to_le_bytes());
+                    sender
+                        .send(Frame {
+                            message_type: producer,
+                            flags: 0,
+                            payload,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        drop(sender);
+
+        let mut next = [0u16; PRODUCERS as usize];
+        while let Some(queued) = receiver.recv().await {
+            assert!(budget.granted() <= capacity);
+            let producer = usize::from(queued.frame.message_type);
+            let payload = &queued.frame.payload;
+            let sequence = u16::from_le_bytes([payload[0], payload[1]]);
+            assert_eq!(
+                sequence, next[producer],
+                "producer {producer} kept its order"
+            );
+            next[producer] += 1;
+            // The grant ends only with the write.
+            queued
+                .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+                .await
+                .unwrap();
+        }
+        for producer in producers {
+            producer.await.unwrap();
+        }
+        assert_eq!(next, [FRAMES; PRODUCERS as usize]);
+        assert_eq!(budget.granted(), 0, "every grant settled");
+    }
+
+    fn admitted(budget: &OutputByteBudget) -> AdmittedFrame {
+        let wide = OutputByteBudget::new(1 << 30).unwrap();
+        let grant = FrameGate::new(budget.clone(), wide)
+            .try_admit(frame_bytes())
+            .unwrap();
+        AdmittedFrame {
+            frame: frame(1),
+            grant,
+        }
+    }
+
+    /// A raw frame stays funded while the service decodes it, until its next
+    /// receive starts or the handle drops. The grant does not outlive either.
+    #[tokio::test]
+    async fn a_received_frame_stays_charged_until_the_next_receive() {
+        let budget = OutputByteBudget::new(1024).unwrap();
+        let (sender, receiver) = mpsc::channel(4);
+        let mut receiver = FramedRecv::admitted(receiver);
+        sender.send(admitted(&budget)).await.unwrap();
+        assert_eq!(budget.granted(), frame_bytes(), "the queue holds it");
+
+        assert_eq!(receiver.recv().await, Some(frame(1)));
+        assert_eq!(budget.granted(), frame_bytes(), "decoding holds it");
+
+        let mut next = Box::pin(receiver.recv());
+        assert!(futures::poll!(&mut next).is_pending());
+        assert_eq!(budget.granted(), 0, "the next receive released it");
+        sender.send(admitted(&budget)).await.unwrap();
+        assert_eq!(next.await, Some(frame(1)));
+        assert_eq!(budget.granted(), frame_bytes());
+
+        sender.send(admitted(&budget)).await.unwrap();
+        assert_eq!(budget.granted(), 2 * frame_bytes());
+        assert_eq!(receiver.try_recv().unwrap(), frame(1));
+        assert_eq!(
+            budget.granted(),
+            frame_bytes(),
+            "`try_recv` moves ownership too"
+        );
+
+        drop(receiver);
+        assert_eq!(budget.granted(), 0, "dropping the handle ends everything");
+    }
+
+    #[tokio::test]
+    async fn closing_the_receiver_returns_queued_raw_frames_when_it_drops() {
+        let budget = OutputByteBudget::new(1024).unwrap();
+        let (sender, receiver) = mpsc::channel(4);
+        let mut receiver = FramedRecv::admitted(receiver);
+        sender.send(admitted(&budget)).await.unwrap();
+        receiver.close();
+        assert_eq!(
+            budget.granted(),
+            frame_bytes(),
+            "closing keeps queued frames"
+        );
+        assert_eq!(receiver.recv().await, Some(frame(1)));
+        assert_eq!(receiver.recv().await, None);
+        assert_eq!(budget.granted(), 0);
+    }
+
     #[tokio::test]
     async fn quic_backpressure_holds_producer_and_preserves_another_stream() {
         use crate::zakura::testkit::LocalEndpointFactory;

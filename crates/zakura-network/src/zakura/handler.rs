@@ -57,8 +57,9 @@ use super::peer_memory::{
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
-    sim_arg, sim_chain, transport_observe, worker_framed_channel, FramedWorkerRecv,
-    OrderedStreamFailure, OrderedStreamFailureCause, SessionLayout,
+    frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
+    ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources, OrderedStreamFailure,
+    OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout, StreamResources,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -77,11 +78,12 @@ use crate::{
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
         FrameRejection, FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncPassthroughService,
         HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRule, Peer, RealClock, Service,
-        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionStep, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
-        StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
-        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
-        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
-        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionStep,
+        SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths, StreamWritePolicy,
+        ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
+        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
+        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
+        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraServiceId, ZakuraUpgradeDialStart, ZakuraValidationError, CONTROL_ACK_MAGIC,
         CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
         STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
@@ -603,6 +605,15 @@ impl ZakuraLocalLimits {
             max_inbound_queue_depth: self.max_inbound_queue_depth,
             idle_timeout_millis: self.quic_idle_timeout.as_millis().saturating_sub(1) as u32,
         }
+    }
+
+    /// Returns the transport's byte and worker bounds under these limits.
+    pub(crate) fn resource_envelope(&self) -> ResourceEnvelope {
+        ResourceEnvelope::new(
+            u64::from(self.quic.receive_window_bytes),
+            self.quic.send_window_bytes,
+            self.max_connections,
+        )
     }
 
     /// Returns the QUIC bind settings for `addrs` under these limits.
@@ -1863,6 +1874,8 @@ impl Drop for RegisteredPeerCleanupGuard {
 struct IncomingStreamSetup {
     io: SetupIo,
     permit: OwnedSemaphorePermit,
+    /// Created with the permit, so this future's first suspend finds it owned.
+    resources: StreamResources,
     stream_id: u64,
     stream: Stream,
     prelude: StreamPrelude,
@@ -1875,6 +1888,7 @@ struct StreamAdmission<'a> {
     conn: ZakuraConnTrace,
     peer_id: &'a ZakuraPeerId,
     stream_sem: &'a Arc<Semaphore>,
+    resources: &'a ConnectionResources,
     open_limiter: &'a mut TokenBucket,
     message_buckets: &'a mut MessageRateBuckets,
     workers: &'a mut JoinSet<()>,
@@ -1934,6 +1948,8 @@ struct StreamWorkerContext {
     cadence: Option<CadenceScope>,
     /// The response precheck the stream's service attaches, if any.
     precheck: PrecheckSlot,
+    /// This stream's frame gates and its place in the node's owner count.
+    resources: StreamResources,
     connection_token: CancellationToken,
     stream_token: CancellationToken,
     close_cause: CloseCause,
@@ -2234,6 +2250,8 @@ pub struct ZakuraProtocolHandler {
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
+    /// Node-wide owners of raw frames, unfunded output, and request workers.
+    resources: NodeResources,
     shutdown: CancellationToken,
     // Bound endpoint identity, used for connection collision handling.
     local_node_id: Option<NodeId>,
@@ -2320,6 +2338,16 @@ impl ZakuraProtocolHandler {
         handshake_config.supported_capabilities = registry.supported_capabilities();
         let supported_capabilities =
             Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
+        let envelope = limits.resource_envelope();
+        debug!(
+            ?envelope,
+            retained_bytes_bound = %envelope.retained_bytes_bound(
+                limits.max_connections,
+                limits.max_open_streams,
+                limits.max_frame_bytes,
+            ),
+            "Zakura transport resource envelope"
+        );
         Self {
             supervisor,
             handshake_config,
@@ -2332,6 +2360,7 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            resources: NodeResources::new(envelope),
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
@@ -2587,6 +2616,7 @@ impl ZakuraProtocolHandler {
             );
             return Err(ZakuraHandlerError::ResourceLimit("pending handshake"));
         };
+        let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
 
         self.run_native_responder_handshake(connection, remote_peer_id, conn)
             .await
@@ -2695,6 +2725,7 @@ impl ZakuraProtocolHandler {
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
+        let connection_resources = self.resources.connection();
         let mut workers = JoinSet::new();
         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();
         let mut session_io = ServiceSessionIO::default();
@@ -2827,6 +2858,7 @@ impl ZakuraProtocolHandler {
                         stream,
                         &mut workers,
                         &stream_sem,
+                        &connection_resources,
                         &mut message_buckets,
                         limits,
                         per_stream_queue_depth,
@@ -3018,6 +3050,7 @@ impl ZakuraProtocolHandler {
                             stream,
                             &mut workers,
                             &stream_sem,
+                            &connection_resources,
                             &mut message_buckets,
                             limits,
                             per_stream_queue_depth,
@@ -3106,6 +3139,7 @@ impl ZakuraProtocolHandler {
                         conn: conn.clone(),
                         peer_id: &peer_id,
                         stream_sem: &stream_sem,
+                        resources: &connection_resources,
                         open_limiter: &mut open_limiter,
                         message_buckets: &mut message_buckets,
                         workers: &mut workers,
@@ -3237,6 +3271,7 @@ impl ZakuraProtocolHandler {
                                 conn: conn.clone(),
                                 peer_id: &peer_id,
                                 stream_sem: &stream_sem,
+                                resources: &connection_resources,
                                 open_limiter: &mut open_limiter,
                                 message_buckets: &mut message_buckets,
                                 workers: &mut workers,
@@ -3359,6 +3394,7 @@ impl ZakuraProtocolHandler {
         stream: Stream,
         workers: &mut JoinSet<()>,
         stream_sem: &Arc<Semaphore>,
+        resources: &ConnectionResources,
         message_buckets: &mut MessageRateBuckets,
         limits: ZakuraConnectionLimits,
         per_stream_queue_depth: usize,
@@ -3377,7 +3413,7 @@ impl ZakuraProtocolHandler {
         if layout.primary() != stream {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
-        let resources = self
+        let reservation = self
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
@@ -3392,6 +3428,7 @@ impl ZakuraProtocolHandler {
                     member,
                     wire_id,
                     stream_sem,
+                    resources,
                     message_buckets,
                     limits,
                     connection_token.clone(),
@@ -3401,7 +3438,7 @@ impl ZakuraProtocolHandler {
                     peer_id.clone(),
                 )
                 .await?;
-            member.set_session_resources(resources.clone());
+            member.set_session_resources(reservation.clone());
             prepared.push(member);
         }
         Ok(spawn_service_session(
@@ -3430,6 +3467,7 @@ impl ZakuraProtocolHandler {
                 .trace_stream("rejected.semaphore", stream_id, None);
             return None;
         };
+        let resources = admission.resources.stream();
 
         // Charge the per-connection stream-open rate token immediately after
         // acquiring a concurrency permit, before parsing the prelude or running
@@ -3616,6 +3654,7 @@ impl ZakuraProtocolHandler {
             Some(IncomingStreamSetup {
                 io,
                 permit,
+                resources,
                 stream_id,
                 stream,
                 prelude,
@@ -3637,6 +3676,7 @@ impl ZakuraProtocolHandler {
         let IncomingStreamSetup {
             io,
             permit,
+            resources: stream_resources,
             stream_id,
             stream,
             prelude,
@@ -3686,6 +3726,7 @@ impl ZakuraProtocolHandler {
             message_bucket,
             cadence,
             precheck: PrecheckSlot::default(),
+            resources: stream_resources,
             connection_token: admission.connection_token.clone(),
             stream_token,
             close_cause: admission.close_cause.clone(),
@@ -3711,6 +3752,7 @@ impl ZakuraProtocolHandler {
                 }
             };
         }
+        context.resources.owner.advance(OwnerPhase::Installed);
         admission.workers.spawn_named(
             "request_stream_worker",
             request_stream_worker(send, recv, prelude, context, self.registry.clone()),
@@ -4866,7 +4908,7 @@ async fn persistent_stream_worker(
     recv: RecvStream,
     prelude: StreamPrelude,
     context: StreamWorkerContext,
-    inbound_tx: mpsc::Sender<Frame>,
+    inbound_tx: mpsc::Sender<AdmittedFrame>,
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
 ) {
@@ -4890,7 +4932,7 @@ async fn persistent_stream_worker_with_policy(
     recv: RecvStream,
     prelude: StreamPrelude,
     context: StreamWorkerContext,
-    inbound_tx: mpsc::Sender<Frame>,
+    inbound_tx: mpsc::Sender<AdmittedFrame>,
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     failure_cause: Option<OrderedStreamFailureCause>,
@@ -4925,7 +4967,7 @@ async fn persistent_stream_worker_with_policy(
                 biased;
                 _ = reader_context.connection_token.cancelled() => break,
                 _ = reader_context.stream_token.cancelled() => break,
-                frame = read_frame(
+                frame = read_admitted_frame(
                     &mut recv,
                     reader_context.inbound_frame_cap,
                     sim_chain!(FrameFilter::new(reader_context.messages, InboundReader::Persistent)
@@ -4938,14 +4980,18 @@ async fn persistent_stream_worker_with_policy(
                     // the freshness reaper and the QUIC idle timeout, and the
                     // cancellation tokens above end this read on teardown.
                     None,
+                    &reader_context.resources.raw,
                 ) => frame,
             };
             // Charge ingress admission once, before forwarding to the service.
             // A full service channel stops this reader from granting QUIC credit.
             let error = match frame {
-                Ok(frame) => {
+                Ok(admitted) => {
                     let _ = reader_context.freshness_tx.send(Instant::now());
-                    match admit_inbound_message(&frame, &reader_context, stream_kind) {
+                    // While the reader waited for raw capacity, the peer kept
+                    // sending into transport buffers, as during a queue wait below.
+                    reader_context.credit_read_pause(admitted.grant.waited());
+                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => {
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
@@ -4956,7 +5002,7 @@ async fn persistent_stream_worker_with_policy(
                                 biased;
                                 _ = reader_context.connection_token.cancelled() => break,
                                 _ = reader_context.stream_token.cancelled() => break,
-                                result = inbound_tx.send(frame) => result,
+                                result = inbound_tx.send(admitted) => result,
                             };
                             // While this reader waited for its own handler, the
                             // peer kept sending into transport buffers. Credit the
@@ -5141,6 +5187,7 @@ async fn persistent_stream_worker_with_policy(
         }
     }
 
+    context.resources.owner.advance(OwnerPhase::Retiring);
     // Never leave a partial frame followed by a graceful FIN.
     if drained {
         // A FIN preserves completed writes in QUIC's send buffer.
@@ -5231,7 +5278,7 @@ async fn request_stream_worker(
     let frame = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        frame = read_frame(
+        frame = read_admitted_frame(
             &mut recv,
             context.inbound_frame_cap,
             FrameFilter::new(context.messages, InboundReader::Responder),
@@ -5240,11 +5287,13 @@ async fn request_stream_worker(
             // prelude, so a peer that opens one and then goes silent is treated
             // as a stalled one-shot stream and bounded by the idle timeout.
             Some(context.limits.idle_timeout),
+            &context.resources.raw,
         ) => frame,
     };
 
-    let frame = match frame {
-        Ok(frame) => frame,
+    // The raw frame stays funded until its service's call ends.
+    let (frame, raw_grant) = match frame {
+        Ok(AdmittedFrame { frame, grant }) => (frame, grant),
         Err(error) => {
             debug!(
                 ?error,
@@ -5277,17 +5326,28 @@ async fn request_stream_worker(
     }
 
     let response_frame_cap = context.outbound_frame_cap;
-    let response_frames = match registry
-        .request(
+    // The execution slot and the raw frame's grant end with the service's call,
+    // which cancelling the connection also ends.
+    let execution = zakura_rt::select! {
+        biased;
+        _ = context.connection_token.cancelled() => return,
+        execution = context.resources.request_workers.reserve() => execution,
+    };
+    let response = zakura_rt::select! {
+        biased;
+        _ = context.connection_token.cancelled() => return,
+        response = registry.request(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
             response_frame_cap,
             context.limits.max_message_bytes,
             frame,
-        )
-        .await
-    {
+        ) => response,
+    };
+    drop(execution);
+    drop(raw_grant);
+    let response_frames = match response {
         Ok(frames) => frames,
         Err(SinkReject::Protocol(error)) => {
             debug!(
@@ -5309,6 +5369,16 @@ async fn request_stream_worker(
         }
     };
 
+    // The result is the worker's own retained memory. Fund it through the write,
+    // and stop at this owner when the output budgets are saturated.
+    let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
+        bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
+    });
+    let _result = zakura_rt::select! {
+        biased;
+        _ = context.connection_token.cancelled() => return,
+        result = context.resources.output.admit(result_bytes) => result,
+    };
     for frame in response_frames {
         if let Err(error) =
             write_response_frame(&mut send, frame, context.limits, response_frame_cap).await
@@ -5412,6 +5482,55 @@ async fn read_frame(
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
+    read_frame_under(
+        recv,
+        max_frame_bytes,
+        filter,
+        read_timeout,
+        first_byte_timeout,
+        |_| future::ready(()),
+    )
+    .await
+    .map(|(frame, ())| frame)
+}
+
+/// Read one frame as [`read_frame`] does, with `gate` admitting its bytes after
+/// the header's checks and before the payload's allocation.
+async fn read_admitted_frame(
+    recv: &mut RecvStream,
+    max_frame_bytes: u32,
+    filter: FrameFilter<'_>,
+    read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+    gate: &FrameGate,
+) -> Result<AdmittedFrame, ZakuraHandlerError> {
+    read_frame_under(
+        recv,
+        max_frame_bytes,
+        filter,
+        read_timeout,
+        first_byte_timeout,
+        |bytes| gate.admit(bytes),
+    )
+    .await
+    .map(|(frame, grant)| AdmittedFrame { frame, grant })
+}
+
+/// The frame read itself. `admit` runs once the header passed its checks, and
+/// its result funds the allocation that follows. A stalled peer's in-progress
+/// read and a local wait for capacity have separate bounds: `read_timeout` covers
+/// only the peer's bytes.
+async fn read_frame_under<G, Fut>(
+    recv: &mut RecvStream,
+    max_frame_bytes: u32,
+    filter: FrameFilter<'_>,
+    read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+    admit: impl FnOnce(u64) -> Fut,
+) -> Result<(Frame, G), ZakuraHandlerError>
+where
+    Fut: future::Future<Output = G>,
+{
     let mut header = [0; FRAME_HEADER_BYTES];
     // The first header byte is the boundary between "waiting for the next frame"
     // and "reading a frame in progress". Wait for it under `first_byte_timeout`
@@ -5466,15 +5585,19 @@ async fn read_frame(
             max_frame_bytes,
         });
     }
+    let admission = admit(frame_wire_bytes(payload_len)).await;
     let mut payload = vec![0; payload_len];
     read_frame_payload(recv, &mut payload, read_timeout).await?;
     #[cfg(any(test, zakura_sim))]
     filter.frame_read();
-    Ok(Frame {
-        message_type,
-        flags,
-        payload,
-    })
+    Ok((
+        Frame {
+            message_type,
+            flags,
+            payload,
+        },
+        admission,
+    ))
 }
 
 async fn read_frame_payload(
@@ -9106,6 +9229,7 @@ mod tests {
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             cadence: None,
             precheck: PrecheckSlot::default(),
+            resources: StreamResources::unconstrained(),
             connection_token: cancel.clone(),
             stream_token: stream_cancel.clone(),
             close_cause: CloseCause::new(),
@@ -9188,7 +9312,7 @@ mod tests {
 
         timeout(Duration::from_secs(10), async {
             for _ in 0..FRAME_COUNT {
-                assert_eq!(inbound_rx.recv().await.unwrap(), frame);
+                assert_eq!(inbound_rx.recv().await.unwrap().frame, frame);
             }
         })
         .await
@@ -9312,6 +9436,7 @@ mod tests {
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             cadence: None,
             precheck: PrecheckSlot::default(),
+            resources: StreamResources::unconstrained(),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
             close_cause: CloseCause::new(),
@@ -9520,6 +9645,7 @@ mod tests {
                 ))),
                 cadence: None,
                 precheck: PrecheckSlot::default(),
+                resources: StreamResources::unconstrained(),
                 connection_token: connection_token.clone(),
                 stream_token: connection_token.child_token(),
                 close_cause: CloseCause::new(),
@@ -9902,6 +10028,7 @@ mod tests {
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(rate_per_second))),
             cadence: cadence_scope(&buckets, stream, 900),
             precheck: PrecheckSlot::default(),
+            resources: StreamResources::unconstrained(),
             connection_token: cancel.clone(),
             stream_token: cancel.child_token(),
             close_cause: CloseCause::new(),
@@ -10864,6 +10991,7 @@ mod tests {
             conn: ZakuraConnTrace::placeholder(),
             peer_id: &peer_id,
             stream_sem: &stream_sem,
+            resources: &ConnectionResources::unconstrained(),
             open_limiter: &mut open_limiter,
             message_buckets: &mut message_buckets,
             workers: &mut workers,

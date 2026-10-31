@@ -232,11 +232,7 @@ pub(super) fn trace_session_step(
     kind: u16,
     step: SessionStep,
 ) {
-    conn.trace_stream(
-        step.label(),
-        step.identity(),
-        Some(stream_kind_label(kind)),
-    );
+    conn.trace_stream(step.label(), step.identity(), Some(stream_kind_label(kind)));
     debug!(stream_kind = kind, ?step, "Zakura service session step");
     #[cfg(any(test, zakura_sim))]
     if let Some(tap) = close_cause.tap() {
@@ -283,6 +279,11 @@ pub(super) fn spawn_service_session(
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =
             bounded_stream_queue_depths(queue_depth, prepared.context.queue_depths);
+        prepared
+            .context
+            .resources
+            .owner
+            .advance(OwnerPhase::Installed);
         let (inbound_tx, inbound_rx) = mpsc::channel(inbound_depth);
         let (sender, outbound_rx) = worker_framed_channel(outbound_depth);
         if prepared.context.messages.is_some() {
@@ -293,10 +294,12 @@ pub(super) fn spawn_service_session(
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,
-            recv: FramedRecv::new(inbound_rx)
+            recv: FramedRecv::admitted(inbound_rx)
                 .with_failure_cause(failure_cause.clone())
                 .with_precheck(prepared.context.precheck.clone()),
-            send: sender.with_session_resources(prepared.context.session_resources.clone()),
+            send: sender
+                .with_session_resources(prepared.context.session_resources.clone())
+                .with_output_gate(prepared.context.resources.output.clone()),
         });
         let failure_cause = failure_cause.clone();
         let application_drain = application_drain.clone();
@@ -343,6 +346,7 @@ impl ZakuraProtocolHandler {
         stream: Stream,
         session_id: Option<u64>,
         stream_sem: &Arc<Semaphore>,
+        resources: &ConnectionResources,
         message_buckets: &mut MessageRateBuckets,
         limits: ZakuraConnectionLimits,
         connection_token: CancellationToken,
@@ -356,6 +360,7 @@ impl ZakuraProtocolHandler {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("ordered stream permit"))?;
+        let stream_resources = resources.stream();
         let io = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
             .await
             .map_err(|_| ZakuraHandlerError::Timeout("open ordered service stream"))??;
@@ -410,6 +415,7 @@ impl ZakuraProtocolHandler {
             message_bucket,
             cadence,
             precheck: PrecheckSlot::default(),
+            resources: stream_resources,
             stream_token: connection_token.child_token(),
             connection_token,
             close_cause,

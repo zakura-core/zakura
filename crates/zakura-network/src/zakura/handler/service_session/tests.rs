@@ -595,6 +595,7 @@ struct RawFixture {
     server: QuicEndpoint,
     client: QuicEndpoint,
     connection: Connection,
+    resources: NodeResources,
     serving: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     shutdown: CancellationToken,
     service: Arc<SessionService>,
@@ -703,6 +704,7 @@ impl RawFixture {
             ])?),
         );
         let shutdown = handler.shutdown.clone();
+        let resources = handler.resources.clone();
         let mut limits = local.clamp(&local.initial_limits());
         limits.prelude_timeout = setup_timeout;
         let peer_id = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
@@ -735,6 +737,7 @@ impl RawFixture {
             server,
             client,
             connection,
+            resources,
             serving,
             shutdown,
             service,
@@ -1173,6 +1176,7 @@ fn raw_worker_context(client: &QuicEndpoint, slots: Arc<Semaphore>) -> StreamWor
         message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
         cadence: None,
         precheck: PrecheckSlot::default(),
+        resources: StreamResources::unconstrained(),
         connection_token: cancel.clone(),
         stream_token: cancel.child_token(),
         close_cause: CloseCause::new(),
@@ -1217,7 +1221,9 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
                 None,
             )));
         assert_eq!(
-            timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
+            timeout(TEST_TIMEOUT, inbound_rx.recv())
+                .await?
+                .map(|admitted: AdmittedFrame| admitted.frame),
             Some(frame(1, 0, 0))
         );
         let resources = Arc::new(Semaphore::new(1));
@@ -1408,6 +1414,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         conn: ZakuraConnTrace::without_peer(1),
         peer_id: &peer,
         stream_sem: &permits,
+        resources: &ConnectionResources::unconstrained(),
         open_limiter: &mut open_limiter,
         message_buckets: &mut buckets,
         workers: &mut workers,
@@ -1518,6 +1525,7 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
         conn: context.conn,
         peer_id: &context.peer_id,
         stream_sem: &slots,
+        resources: &ConnectionResources::unconstrained(),
         open_limiter: &mut open_limiter,
         message_buckets: &mut buckets,
         workers: &mut workers,
@@ -1600,6 +1608,7 @@ async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), 
             conn: context.conn,
             peer_id: &context.peer_id,
             stream_sem: &slots,
+            resources: &ConnectionResources::unconstrained(),
             open_limiter: &mut open_limiter,
             message_buckets: &mut buckets,
             workers: &mut workers,
@@ -1794,7 +1803,9 @@ async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(),
             None,
         )));
         assert_eq!(
-            timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
+            timeout(TEST_TIMEOUT, inbound_rx.recv())
+                .await?
+                .map(|admitted: AdmittedFrame| admitted.frame),
             Some(frame(1, 0, 0))
         );
         assert!(outbound_tx.try_reserve_guarded().unwrap().send_request(

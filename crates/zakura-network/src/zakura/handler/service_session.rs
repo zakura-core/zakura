@@ -14,6 +14,8 @@ pub(super) use state::{
     may_open_ordered_stream, ConnectionRoles, DemandChange, DemandWait, RemoteCompletion,
     ServiceSessionState, SessionExit,
 };
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{replay_service_session_bytes, ServiceSessionReplaySummary};
 use state::{MemberArrival, MemberReservation, PendingState};
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.

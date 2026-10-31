@@ -1,14 +1,15 @@
 //! Service-session policy: unit tests of each decision, the reopen-wait
-//! contract with [`ServiceSessionIO`], and a model-based proptest of pending
-//! assembly and the active generations.
-
-use std::sync::Arc;
+//! contract with [`ServiceSessionIO`], and the machine test of pending
+//! assembly and the active generations from [`super::fuzz`].
 
 use futures::StreamExt as _;
 use proptest::prelude::*;
 use zakura_rt::{sync::watch, time::timeout};
 
-use super::*;
+use super::{
+    fuzz::{layout, FOREIGN, MEMBER_A, MEMBER_B, MEMBER_C, SETUP_TIMEOUT},
+    *,
+};
 use crate::zakura::{
     handler::ServiceSessionIO, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
@@ -308,32 +309,6 @@ fn a_lost_collision_keeps_the_adopted_generation_after_the_local_exit() {
 }
 
 // Pending assembly.
-
-const MEMBER_A: Stream = Stream {
-    kind: 64,
-    version: 1,
-    frame_cap: 1024,
-    capability: 1 << 16,
-    ..Stream::PERSISTENT
-};
-const MEMBER_B: Stream = Stream {
-    kind: 65,
-    ..MEMBER_A
-};
-const MEMBER_C: Stream = Stream {
-    kind: 67,
-    ..MEMBER_A
-};
-/// A stream outside the layout.
-const FOREIGN: Stream = Stream {
-    kind: 70,
-    ..MEMBER_A
-};
-const SETUP_TIMEOUT: Duration = Duration::from_millis(100);
-
-fn layout() -> SessionLayout {
-    SessionLayout::from_validated(Arc::from([MEMBER_A, MEMBER_B, MEMBER_C]))
-}
 
 /// A member arriving just before the deadline keeps the first member's
 /// deadline, and the offer expires on it.
@@ -641,448 +616,79 @@ fn ordered_session_connection_teardown_drops_pending_waits() {
     );
 }
 
-// Model-based sequences.
-
-/// The layout members, then the foreign stream.
-const MEMBERS: [Stream; 4] = [MEMBER_A, MEMBER_B, MEMBER_C, FOREIGN];
-
-/// One input the connection loop delivers, in the order it would deliver it.
-#[derive(Clone, Debug)]
-enum Op {
-    /// A member finishes inbound setup after `advance`. A complete offer is
-    /// adopted if `open_now`, else parked under a deferred demand.
-    Arrive {
-        member: usize,
-        id: u64,
-        advance: Duration,
-        open_now: bool,
-    },
-    /// The pending deadline timer fires after `advance`.
-    Expire { advance: Duration },
-    /// The service reports demand outside any open.
-    Demand(DemandWait),
-    /// The service's reopen wait fires. The service then reports
-    /// `OpenNow` if `open_now`, and a local open succeeds if `opens`.
-    WaitFires { open_now: bool, opens: bool },
-    /// Every worker of the `generation`-th admitted generation finishes.
-    Exit { generation: usize },
-}
-
-fn demand_wait() -> impl Strategy<Value = DemandWait> {
-    prop_oneof![
-        Just(DemandWait::OpenNow),
-        Just(DemandWait::Later),
-        Just(DemandWait::Retire),
-    ]
-}
-
-/// Mostly layout members; sometimes the foreign stream.
-fn member() -> impl Strategy<Value = usize> {
-    prop_oneof![9 => 0..3usize, 1 => Just(3usize)]
-}
-
-/// Mostly one of two offers; sometimes the invalid zero identifier.
-fn wire_id() -> impl Strategy<Value = u64> {
-    prop_oneof![9 => 1..3u64, 1 => Just(0u64)]
-}
-
-fn op() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        6 => (member(), wire_id(), 0..60u64, any::<bool>()).prop_map(
-            |(member, id, advance, open_now)| Op::Arrive {
-                member,
-                id,
-                advance: Duration::from_millis(advance),
-                open_now,
-            }
-        ),
-        1 => (0..150u64).prop_map(|advance| Op::Expire {
-            advance: Duration::from_millis(advance),
-        }),
-        1 => demand_wait().prop_map(Op::Demand),
-        2 => (any::<bool>(), any::<bool>())
-            .prop_map(|(open_now, opens)| Op::WaitFires { open_now, opens }),
-        2 => (0..8usize).prop_map(|generation| Op::Exit { generation }),
-    ]
-}
-
-/// One input, or a whole offer whose members arrive back to back.
-fn ops() -> impl Strategy<Value = Vec<Op>> {
-    let offer = (wire_id(), any::<bool>()).prop_map(|(id, open_now)| {
-        (0..3)
-            .map(|member| Op::Arrive {
-                member,
-                id,
-                advance: Duration::ZERO,
-                open_now,
-            })
-            .collect()
-    });
-    prop::collection::vec(
-        prop_oneof![3 => op().prop_map(|op| vec![op]), 1 => offer],
-        1..48,
-    )
-    .prop_map(|chunks| chunks.concat())
-}
-
-fn policy() -> impl Strategy<Value = (SessionPolicy, ConnectionRoles)> {
-    (any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
-        |(either_side, reopen, is_initiator, i_open_collision_winner)| {
-            (
-                SessionPolicy {
-                    opening: if either_side {
-                        SessionOpening::EitherSide
-                    } else {
-                        SessionOpening::InitiatorOnly
-                    },
-                    reopen,
-                },
-                ConnectionRoles {
-                    is_initiator,
-                    i_open_collision_winner,
-                },
-            )
-        },
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelWait {
-    Idle,
-    Demand,
-    Transport,
-    Retired,
-}
-
-/// An independent statement of the session rules for one three-member service.
-#[derive(Debug)]
-struct Model {
-    opens_locally: bool,
-    reopens: bool,
-    winner: bool,
-    /// The incomplete offer: its id, arrived member indexes, and deadline.
-    offer: Option<(u64, Vec<usize>, Instant)>,
-    deferred_until: Option<Instant>,
-    local: Option<u64>,
-    remote: Option<u64>,
-    attempts: u32,
-    wait: ModelWait,
-}
-
-impl Model {
-    fn new(policy: SessionPolicy, roles: ConnectionRoles) -> Self {
-        let opens_locally = if policy.opening == SessionOpening::EitherSide {
-            roles.i_open_collision_winner
-        } else {
-            roles.is_initiator
-        };
-        Self {
-            opens_locally,
-            reopens: policy.reopen,
-            winner: roles.i_open_collision_winner,
-            offer: None,
-            deferred_until: None,
-            local: None,
-            remote: None,
-            attempts: 0,
-            wait: ModelWait::Idle,
-        }
-    }
-
-    fn rejects_offer(&self) -> bool {
-        self.remote.is_some() || (self.winner && self.local.is_some())
-    }
-
-    fn reservation(&self, now: Instant) -> MemberReservation {
-        match (self.deferred_until, &self.offer) {
-            (Some(until), _) if until > now => MemberReservation::Deferred,
-            (_, Some(_)) => MemberReservation::Share,
-            _ => MemberReservation::Reserve,
-        }
-    }
-
-    /// `None` means the offer is invalid and the connection closes.
-    fn arrive(&mut self, member: usize, id: u64, now: Instant) -> Option<MemberArrival> {
-        let offer = self.offer.take();
-        if member == 3 || id == 0 {
-            return None;
-        }
-        let (offer_id, mut members, deadline) =
-            offer.unwrap_or((id, Vec::new(), now + SETUP_TIMEOUT));
-        if offer_id != id {
-            self.deferred_until = Some(now + SETUP_TIMEOUT);
-            return Some(MemberArrival::Conflict);
-        }
-        if now >= deadline || members.contains(&member) {
-            return None;
-        }
-        members.push(member);
-        if members.len() == 3 {
-            return Some(MemberArrival::Complete);
-        }
-        self.offer = Some((offer_id, members, deadline));
-        Some(MemberArrival::Waiting)
-    }
-
-    fn expire(&mut self, now: Instant) -> bool {
-        if self.deferred_until.is_some_and(|until| until <= now) {
-            self.deferred_until = None;
-        }
-        let expired = self.offer.as_ref().is_some_and(|offer| offer.2 <= now);
-        if expired {
-            self.offer = None;
-            self.deferred_until = Some(now + SETUP_TIMEOUT);
-        }
-        expired
-    }
-
-    fn demand(&mut self, demand: DemandWait) -> DemandChange {
-        match (demand, self.wait) {
-            (DemandWait::Retire, _) => {
-                self.wait = ModelWait::Retired;
-                DemandChange::Cancel
-            }
-            (DemandWait::Later, ModelWait::Demand) => DemandChange::Keep,
-            _ => {
-                self.wait = ModelWait::Demand;
-                DemandChange::Start
-            }
-        }
-    }
-
-    fn backoff(&mut self) -> Option<Duration> {
-        if self.wait != ModelWait::Idle {
-            return None;
-        }
-        let delay = (Duration::from_millis(250) * 2u32.pow(self.attempts.min(8)))
-            .min(Duration::from_secs(8));
-        self.attempts += 1;
-        self.wait = ModelWait::Transport;
-        Some(delay)
-    }
-
-    fn clear_wait(&mut self) {
-        if matches!(self.wait, ModelWait::Demand | ModelWait::Transport) {
-            self.wait = ModelWait::Idle;
-        }
-    }
-
-    fn exit(&mut self, opened_locally: bool, id: u64) -> Option<Duration> {
-        let slot = if opened_locally {
-            &mut self.local
-        } else {
-            &mut self.remote
-        };
-        if *slot != Some(id) {
-            return None;
-        }
-        *slot = None;
-        let active = self.local.is_some() || self.remote.is_some();
-        if !active && self.reopens && self.opens_locally {
-            self.backoff()
-        } else {
-            None
-        }
-    }
-}
-
-/// The connection loop's one wait per service, as `ServiceSessionIO` keeps it.
-#[derive(Debug, Default)]
-struct WaitSlot(Option<DemandOrBackoff>);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DemandOrBackoff {
-    Demand,
-    Backoff,
-}
-
-impl WaitSlot {
-    fn apply(&mut self, change: DemandChange) {
-        match change {
-            DemandChange::Keep => {}
-            DemandChange::Cancel => self.0 = None,
-            DemandChange::Start => self.0 = Some(DemandOrBackoff::Demand),
-        }
-    }
-
-    fn backoff(&mut self, delay: Option<Duration>) -> Result<(), TestCaseError> {
-        if delay.is_some() {
-            prop_assert!(self.0.is_none(), "a backoff starts only without a wait");
-            self.0 = Some(DemandOrBackoff::Backoff);
-        }
-        Ok(())
-    }
-}
+// Machine test.
 
 proptest! {
-    /// After every input the session state agrees with an independent model:
-    /// one incomplete offer whose deadline only its first member sets, one
-    /// active generation per opening direction that only its own exit clears,
-    /// a reopen wait held exactly while the state is waiting, and backoffs
-    /// that grow and cap.
+    /// After every input the session state agrees with the independent model
+    /// in [`super::fuzz`].
     #[test]
     fn session_sequences_follow_the_model(
-        (policy, roles) in policy(),
-        ops in ops(),
+        bytes in prop::collection::vec(any::<u8>(), 0..512),
     ) {
-        let layout = layout();
-        let kind = MEMBER_A.kind;
-        let stream = MEMBER_A;
-        let mut now = Instant::now();
-        let mut pending = PendingState::default();
-        let mut session = ServiceSessionState::new(stream, policy, roles);
-        let mut wait = WaitSlot::default();
-        let mut model = Model::new(policy, roles);
-        // Every admitted generation: its id, direction, and whether it exited.
-        let mut generations: Vec<(u64, bool, bool)> = Vec::new();
-        let mut next_id = 1u64;
+        replay_service_session_bytes(&bytes);
+    }
+}
 
-        for op in ops {
-            match op {
-                Op::Arrive { member, id, advance, open_now } => {
-                    now += advance;
-                    prop_assert_eq!(session.rejects_remote_offer(), model.rejects_offer());
-                    if model.rejects_offer() {
-                        continue;
-                    }
-                    let reservation = pending.reservation(kind, now);
-                    prop_assert_eq!(reservation, model.reservation(now));
-                    if reservation == MemberReservation::Deferred {
-                        continue;
-                    }
-                    let arrival =
-                        pending.arrive(&layout, id, MEMBERS[member], SETUP_TIMEOUT, now);
-                    let expected = model.arrive(member, id, now);
-                    prop_assert_eq!(arrival.as_ref().ok().copied(), expected);
-                    // Production closes the connection after an invalid
-                    // offer. The state stays defined, so keep exploring.
-                    if arrival.is_err() {
-                        continue;
-                    }
-                    if expected != Some(MemberArrival::Complete) {
-                        continue;
-                    }
-                    let generation = next_id;
-                    next_id += 1;
-                    // A parked generation's exit still arrives later.
-                    generations.push((generation, false, false));
-                    let completion = session.remote_completed(generation);
-                    let collision = model.local.is_some();
-                    if collision && model.winner {
-                        prop_assert_eq!(completion, RemoteCompletion::ParkCollision);
-                        continue;
-                    }
-                    model.remote = Some(generation);
-                    if collision {
-                        prop_assert_eq!(completion, RemoteCompletion::AdoptCollision);
-                    } else {
-                        prop_assert_eq!(completion, RemoteCompletion::CheckDemand);
-                    }
-                    if collision || open_now {
-                        session.remote_adopted();
-                        wait.apply(DemandChange::Cancel);
-                        model.clear_wait();
-                    } else {
-                        let change = session.remote_parked(generation, DemandWait::Later);
-                        model.remote = None;
-                        let expected = (model.reopens && model.opens_locally)
-                            .then(|| model.demand(DemandWait::Later));
-                        prop_assert_eq!(change, expected);
-                        if let Some(change) = change {
-                            wait.apply(change);
-                        }
-                    }
-                }
-                Op::Expire { advance } => {
-                    now += advance;
-                    let expired = pending.expire(now);
-                    let expected = model.expire(now);
-                    prop_assert_eq!(expired, if expected { vec![kind] } else { Vec::new() });
-                }
-                Op::Demand(demand) => {
-                    let change = session.schedule_demand(demand);
-                    prop_assert_eq!(change, model.demand(demand));
-                    wait.apply(change);
-                }
-                Op::WaitFires { open_now, opens } => {
-                    if wait.0.take().is_none() {
-                        continue;
-                    }
-                    session.wait_finished();
-                    model.clear_wait();
-                    let may_reopen = model.opens_locally
-                        && model.local.is_none()
-                        && model.remote.is_none();
-                    prop_assert_eq!(session.may_reopen(false), may_reopen);
-                    if !may_reopen {
-                        continue;
-                    }
-                    if !open_now {
-                        let change = session.schedule_demand(DemandWait::Later);
-                        prop_assert_eq!(change, model.demand(DemandWait::Later));
-                        wait.apply(change);
-                    } else if opens {
-                        let generation = next_id;
-                        next_id += 1;
-                        session.opened(generation);
-                        wait.apply(DemandChange::Cancel);
-                        model.clear_wait();
-                        model.local = Some(generation);
-                        generations.push((generation, true, false));
-                    } else {
-                        let delay = session.schedule_transport_backoff();
-                        prop_assert_eq!(delay, model.backoff());
-                        wait.backoff(delay)?;
-                    }
-                }
-                Op::Exit { generation } => {
-                    let Some((id, opened_locally, exited)) = generations.get_mut(generation)
-                    else {
-                        continue;
-                    };
-                    if *exited {
-                        continue;
-                    }
-                    *exited = true;
-                    let before = (session.local_session_id, session.remote_session_id);
-                    let stale = if *opened_locally {
-                        model.local != Some(*id)
-                    } else {
-                        model.remote != Some(*id)
-                    };
-                    let exit = SessionExit {
-                        stream,
-                        session_id: *id,
-                        opened_locally: *opened_locally,
-                    };
-                    let delay = session.exited(exit, false);
-                    prop_assert_eq!(delay, model.exit(*opened_locally, *id));
-                    if stale {
-                        prop_assert_eq!(
-                            (session.local_session_id, session.remote_session_id),
-                            before,
-                            "a stale exit leaves the active generations"
-                        );
-                    }
-                    wait.backoff(delay)?;
-                }
-            }
-            prop_assert_eq!(pending.deadline(), model.offer.as_ref().map(|offer| offer.2));
-            prop_assert_eq!(session.local_session_id, model.local);
-            prop_assert_eq!(session.remote_session_id, model.remote);
-            prop_assert_eq!(session.reopen_attempts, model.attempts);
-            prop_assert_eq!(session.is_waiting(), wait.0.is_some());
-            prop_assert_eq!(
-                session.reopen_state,
-                match model.wait {
-                    ModelWait::Idle => SessionReopenState::Idle,
-                    ModelWait::Demand => SessionReopenState::Waiting(SessionWaitReason::Demand),
-                    ModelWait::Transport => {
-                        SessionReopenState::Waiting(SessionWaitReason::Transport)
-                    }
-                    ModelWait::Retired => SessionReopenState::Retired,
-                }
-            );
-        }
+/// Fixed seeds run the fuzz entry in every test run, and together exercise
+/// every rule the replay counts.
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "witnesses print applicability counters"
+)]
+fn fixed_seeds_exercise_every_session_rule() {
+    let mut total = ServiceSessionReplaySummary::default();
+    for seed in 1..=32u64 {
+        // A xorshift stream: reproducible bytes without a fuzzing engine.
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let bytes: Vec<u8> = (0..512)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        let summary = replay_service_session_bytes(&bytes);
+        total.completed_offers += summary.completed_offers;
+        total.invalid_members += summary.invalid_members;
+        total.conflicting_members += summary.conflicting_members;
+        total.expired_offers += summary.expired_offers;
+        total.deferred_members += summary.deferred_members;
+        total.parked_collisions += summary.parked_collisions;
+        total.adopted_collisions += summary.adopted_collisions;
+        total.local_opens += summary.local_opens;
+        total.stale_exits += summary.stale_exits;
+        total.reopen_backoffs += summary.reopen_backoffs;
+        total.retirements += summary.retirements;
+    }
+    println!("tier=Machine target=service_session decoder=1 {total:?}");
+    let ServiceSessionReplaySummary {
+        completed_offers,
+        invalid_members,
+        conflicting_members,
+        expired_offers,
+        deferred_members,
+        parked_collisions,
+        adopted_collisions,
+        local_opens,
+        stale_exits,
+        reopen_backoffs,
+        retirements,
+    } = total.clone();
+    for (rule, count) in [
+        ("completed offers", completed_offers),
+        ("invalid members", invalid_members),
+        ("conflicting members", conflicting_members),
+        ("expired offers", expired_offers),
+        ("deferred members", deferred_members),
+        ("parked collisions", parked_collisions),
+        ("adopted collisions", adopted_collisions),
+        ("local opens", local_opens),
+        ("stale exits", stale_exits),
+        ("reopen backoffs", reopen_backoffs),
+        ("retirements", retirements),
+    ] {
+        assert!(count > 0, "no fixed seed exercised {rule}: {total:?}");
     }
 }

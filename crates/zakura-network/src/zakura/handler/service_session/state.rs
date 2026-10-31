@@ -15,8 +15,13 @@ use crate::zakura::{
     ZakuraHandlerError,
 };
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod fuzz;
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use fuzz::{replay_service_session_bytes, ServiceSessionReplaySummary};
 
 /// Initial delay before a locally parked ordered stream is offered again.
 pub(in crate::zakura::handler) const ORDERED_STREAM_REOPEN_BACKOFF: Duration =

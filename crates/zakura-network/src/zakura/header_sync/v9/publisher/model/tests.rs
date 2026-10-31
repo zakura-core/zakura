@@ -441,6 +441,63 @@ fn publisher_witness_exercises_credit_terminal_and_stale_page() {
     println!("tier=Machine target=header_publisher decoder=1 {summary:?}");
 }
 
+/// The witness's history records one step per operation, and the owner's view
+/// matches the model's after each.
+#[test]
+fn publisher_trace_records_the_witness_with_agreeing_views() {
+    let history = trace_header_publisher_bytes(WITNESS);
+    assert_eq!(history.steps.len(), WITNESS.len() / 4);
+    for (index, step) in history.steps.iter().enumerate() {
+        assert_eq!(step.step, index + 1);
+        assert_eq!(step.input, WITNESS[index * 4..(index + 1) * 4]);
+        assert_eq!(step.failure, None);
+        assert_eq!(step.actual, step.expected);
+    }
+    assert_eq!(history.steps[0].expected.subscriptions.len(), 1);
+    assert_eq!(history.steps[1].expected.job, Some(1));
+    assert_eq!(
+        history.steps[2].expected.subscriptions[0].consumed,
+        (1, 263)
+    );
+    assert_eq!(history.steps[4].expected.terminals, [1]);
+    assert!(history.steps[5].expected.writing);
+    assert_eq!(history.steps[7].expected.slots, 0);
+    assert_eq!(
+        trace_header_publisher_bytes(&[]),
+        HeaderPublisherHistory::default()
+    );
+}
+
+/// A short final operation keeps its original bytes.
+#[test]
+fn publisher_trace_keeps_a_short_final_operation() {
+    let history = trace_header_publisher_bytes(&[0, 0]);
+    assert_eq!(history.steps.len(), 1);
+    assert_eq!(history.steps[0].input, [0, 0]);
+}
+
+/// A publisher that stops ends its history at that operation.
+#[test]
+fn publisher_trace_stops_with_the_publisher() {
+    let history = trace_header_publisher_bytes(&[30, 0, 0, 0, 10, 0, 0, 0]);
+    assert_eq!(history.steps.len(), 1);
+    assert_eq!(history.steps[0].actual.exit, Some("cancelled"));
+    assert_eq!(history.steps[0].actual, history.steps[0].expected);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    /// Any byte history reports no failure, and the owner's view matches the
+    /// model's after every operation.
+    #[test]
+    fn publisher_trace_views_agree(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        for step in trace_header_publisher_bytes(&bytes).steps {
+            prop_assert_eq!(step.failure, None);
+            prop_assert_eq!(step.actual, step.expected);
+        }
+    }
+}
+
 #[test]
 #[should_panic(expected = "header/publisher-policy")]
 fn publisher_witness_rejects_lost_credit() {

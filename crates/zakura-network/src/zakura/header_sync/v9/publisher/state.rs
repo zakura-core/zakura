@@ -224,6 +224,19 @@ pub(super) enum Recheck {
     Query,
 }
 
+/// What state is doing now, for a model to compare with its own view.
+#[cfg(any(test, feature = "p2p-fuzz"))]
+#[derive(Clone, Debug)]
+pub(super) struct Activity {
+    /// The subscription of the job in progress.
+    pub(super) job: Option<u64>,
+    /// Subscriptions whose terminal outcome waits to be written, in order.
+    pub(super) terminals: Vec<u64>,
+    /// Whether a terminal outcome is being written.
+    pub(super) writing: bool,
+    pub(super) exit: Option<Exit>,
+}
+
 /// The state shared between [`Publisher::apply`](super::Publisher::apply)
 /// and the publisher task.
 #[derive(Debug)]
@@ -688,6 +701,17 @@ impl PublisherState {
             {
                 subscription.stall = None;
             }
+        }
+    }
+
+    /// What state is doing now.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn activity(&self) -> Activity {
+        Activity {
+            job: self.in_progress.as_ref().map(|job| job.subscription),
+            terminals: self.terminals.iter().map(|terminal| terminal.id).collect(),
+            writing: self.writing.is_some(),
+            exit: self.exit,
         }
     }
 

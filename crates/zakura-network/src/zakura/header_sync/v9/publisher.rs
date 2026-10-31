@@ -92,7 +92,11 @@ mod model;
 mod state;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use model::{replay_header_publisher_bytes, HeaderPublisherReplaySummary};
+pub use model::{
+    replay_header_publisher_bytes, trace_header_publisher_bytes, HeaderPublisherHistory,
+    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
+    HeaderPublisherView,
+};
 pub(crate) use state::is_legal;
 use state::{
     recheck, CapacityWait, Exit, Job, JobKey, Output, Page, PublisherState, Recheck, Stall,

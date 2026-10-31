@@ -28,7 +28,7 @@ mod ip;
 mod legacy_gossip;
 mod peer_memory;
 mod regulation;
-#[cfg(any(test, feature = "zakura-testkit"))]
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
 pub mod testkit;
 mod trace;
 pub mod transport;

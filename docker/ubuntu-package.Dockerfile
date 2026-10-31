@@ -12,11 +12,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
-    clang \
     cmake \
     curl \
     git \
-    libclang-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

@@ -411,6 +411,7 @@ async fn read_page(
         },
         handle.page_limits,
         cancel.clone(),
+        None,
     );
     let page = encode_frame(&v9::RegtestMessage::Headers(Headers {
         subscription_id: open.subscription_id,

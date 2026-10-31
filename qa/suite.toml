@@ -1,0 +1,479 @@
+# The full property suite (campaign.md, C1): what the suite runs beyond the
+# harness registry. `cargo xtask sim-suite` joins this file with the
+# registered harnesses and their properties, the coverage manifest, the
+# planted cases under qa/planted/, the committed seeds, the test and fuzz
+# targets `cargo metadata` reports and their sources, and fails if any of
+# them is missing here. A new harness, fuzz target or ignored test fails
+# the check until this file runs it, excludes it with a reason, or lists it
+# as missing.
+#
+# Timeouts are generous upper bounds for a cold build on an 8-vCPU host.
+# The campaign's calibration run replaces them with measured values.
+
+schema = 1
+planted-timeout-secs = 3600
+seed-timeout-secs = 1800
+
+# Packages whose tests the simulator build runs, as CI's `zakura_sim build`
+# job does: the library's unit tests and every test binary.
+# zakura-rt's library has no unit tests, so only its test binaries run.
+[[sim-package]]
+name = "zakura-rt"
+lib = false
+timeout-secs = 1800
+
+[[sim-package]]
+name = "zakura-scheduler"
+timeout-secs = 1800
+
+[[sim-package]]
+name = "zakura-sim"
+timeout-secs = 1800
+
+[[sim-package]]
+name = "zakura-storage"
+timeout-secs = 1800
+
+[[sim-package]]
+name = "zakura-quic"
+timeout-secs = 1800
+
+# zakura-network's unit tests name tokio's types, so only its simulator
+# test binaries build under the flag.
+[[sim-package]]
+name = "zakura-network"
+lib = false
+tests = ["sim_header_sync", "sim_block_sync"]
+timeout-secs = 2700
+
+# Packages whose ordinary-build property suites run: each source file with a
+# `proptest!` block, or a call of a macro that expands to a property suite,
+# is one row, which runs that file's module. `stream_conformance_suite`
+# checks every session layout's properties over real QUIC; the other two
+# check each wire family's codec.
+[[property-package]]
+name = "zakura-network"
+suite-macros = ["item_suite", "message_suite", "stream_conformance_suite"]
+# Block sync's conformance suite builds only with the testkit.
+features = ["zakura-testkit"]
+timeout-secs = 1800
+
+# Every ignored test in the sources above, and in the child modules a
+# property suite's filter selects. CI keeps them out of its blocking path
+# because each takes a minute or more. The suite runs them with
+# `--ignored`, and a simulator test with the `planted` profile.
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "the_decoded_input_stall_input_holds_input_decoded_bound"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "the_frontier_first_input_holds_capacity_release_wakes"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "the_reply_first_input_holds_capacity_release_wakes"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_resource_properties.rs"
+test = "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_resource_properties.rs"
+test = "every_floor_churn_plan_asks_for_the_floor_before_the_reset"
+run = true
+timeout-secs = 1800
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_resource_properties.rs"
+test = "the_above_window_input_holds_lookahead_overshoot_bound"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_resource_properties.rs"
+test = "every_worker_count_holds_the_lookahead_bound_above_the_window"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_resource_properties.rs"
+test = "lookahead_estimate_to_wire_growth"
+run = true
+timeout-secs = 3600
+
+# Header serving under every default session slot, which full-coverage CI
+# runs with `--run-ignored`. Its 40-session sibling runs in the property
+# suite's row.
+[[ignored]]
+file = "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests/load.rs"
+test = "maximum_sessions_keep_header_serving_bounded"
+run = true
+timeout-secs = 1800
+
+[[ignored]]
+file = "crates/zakura-sim/tests/discovery.rs"
+test = "regenerate_wait_complete_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed input, and needs the lost-wakeup patch applied"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
+test = "regenerate_saved_plans"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved Plans"
+
+# Commands the package rows don't cover: the doc tests, and the release and
+# AddressSanitizer runs of the scheduler and runtime that CI's
+# `zakura_sim release` and `zakura_sim asan` jobs make. The ASan lane needs
+# `llvm-symbolizer` on the host.
+[[lane]]
+id = "sim-doc/zakura-sim"
+build = "sim-doc"
+args = "test --locked -p zakura-sim --doc"
+timeout-secs = 1800
+
+[[lane]]
+id = "sim-release/zakura-rt-zakura-scheduler"
+build = "sim-release"
+args = "test --locked -p zakura-rt -p zakura-scheduler --release"
+timeout-secs = 2700
+
+[[lane]]
+id = "sim-asan/zakura-rt-zakura-scheduler"
+build = "sim-asan"
+args = "test --locked -p zakura-rt -p zakura-scheduler --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --tests"
+timeout-secs = 2700
+
+# Fuzz targets. A `sim` target runs the one harness that
+# qa/fuzz/sim/Cargo.toml's `[package.metadata.zakura-sim.targets]` table
+# maps it to, and starts from that harness's admitted seeds. Its smoke run
+# is short; the campaign sets each target's search budget after
+# calibration.
+[[target]]
+package = "sim"
+name = "discovery_wait_complete"
+smoke-secs = 60
+timeout-secs = 1800
+
+# The action grammar is built for 4,096-byte inputs, as qa/fuzz/sim's README
+# says.
+[[target]]
+package = "sim"
+name = "header_sync_storage"
+smoke-secs = 60
+args = ["-max_len=4096"]
+timeout-secs = 1800
+
+# `fixtures/all` picks any race fixture in any variant, so the target's runs
+# cover each fixture's own harness and the fixed variants. Its report must
+# account for each fixture and variant.
+[[target]]
+package = "sim"
+name = "race_fixtures"
+covers = [
+    "race/lost-update",
+    "race/snapshot-reserve",
+    "race/missed-notify",
+    "race/timer-cancel",
+    "race/ab-ba",
+    "race/abort-without-join",
+    "fixtures/fixed",
+]
+smoke-secs = 60
+timeout-secs = 1800
+
+# The header-chain targets, with header-fuzz.yml's limits.
+[[target]]
+package = "header-chain"
+name = "fork_transitions"
+smoke-secs = 60
+args = ["-rss_limit_mb=4096", "-max_len=512", "-detect_leaks=1"]
+timeout-secs = 2700
+
+[[target]]
+package = "header-chain"
+name = "header_codec_v9"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=2097152", "-detect_leaks=1"]
+timeout-secs = 2700
+
+[[target]]
+package = "header-chain"
+name = "header_pursuit"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
+timeout-secs = 2700
+
+# RocksDB keeps process-global allocations after each temporary database
+# closes, so the exit-time leak check is off too, as header-fuzz.yml and the
+# package's README say.
+[[target]]
+package = "header-chain"
+name = "recovery_rows"
+smoke-secs = 60
+args = ["-rss_limit_mb=4096", "-max_len=256", "-detect_leaks=0"]
+env = ["ASAN_OPTIONS=detect_leaks=0"]
+timeout-secs = 2700
+
+[[excluded-target]]
+package = "rpc"
+name = "json_rpc_request"
+reason = "JSON-RPC parsing isn't a P2P DoS property; rpc-fuzz.yml keeps fuzzing it nightly"
+
+[[excluded-target]]
+package = "sim"
+name = "feedback_probe"
+reason = "runs no registered harness; `cargo xtask sim-feedback` builds it to check that libFuzzer keeps an input for a semantic feature alone"
+
+# Harnesses no target runs yet. Each stays in the report as unimplemented.
+[[missing-target]]
+harness = "header-sync/smoke"
+owner = "E5a"
+reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
+
+[[missing-target]]
+harness = "block-sync/storage"
+owner = "E5a"
+reason = "the target waits for E5a's readiness contract"
+
+[[missing-target]]
+harness = "header-sync/wire"
+owner = "E5a"
+reason = "the target waits for E5a's readiness contract"
+
+# Planned rows from campaign.md's requirement map and the P4 plan. Each
+# stays in the report as unimplemented until its chunk registers it, and
+# then the check fails until its row here goes.
+[[pending]]
+id = "header-sync/stale-completion-inert"
+kind = "property"
+owner = "P4a"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/chunk-budget-bound"
+kind = "property"
+owner = "P4a"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/teardown-returns-baseline"
+kind = "property"
+owner = "P4a"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/capacity-release-wakes"
+kind = "property"
+owner = "P4b"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/watch-observed-under-flood"
+kind = "property"
+owner = "P4b"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/watch-observed-under-lifecycle-flood"
+kind = "property"
+owner = "P4b"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/committed-state-adopted-under-flood"
+kind = "property"
+owner = "P4b"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/honest-progress"
+kind = "property"
+owner = "P4c"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/commit-only-authorized"
+kind = "property"
+owner = "H1"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/stale-chain-effect-inert"
+kind = "property"
+owner = "H1"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/reset-invalidates-work"
+kind = "property"
+owner = "H1"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/outstanding-work-bounded"
+kind = "property"
+owner = "H1"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/hold-release-wakes"
+kind = "property"
+owner = "H2"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/peer-retirement-progress"
+kind = "property"
+owner = "H2"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/expected-chain-selected"
+kind = "property"
+owner = "H4"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/state-publication-consistent"
+kind = "property"
+owner = "H4"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "header-sync/bounded-adversary-progress"
+kind = "property"
+owner = "H5"
+plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
+
+[[pending]]
+id = "sync/storage"
+kind = "harness"
+owner = "P8a"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "sync/block-requests-follow-headers"
+kind = "property"
+owner = "P8b"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "block-sync/query-work-authorized"
+kind = "property"
+owner = "P8b"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "sync/header-reorg-retires-block-work"
+kind = "property"
+owner = "P8b"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "block-sync/frontier-work-consistent"
+kind = "property"
+owner = "P8b"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "sync/stale-block-completion-inert"
+kind = "property"
+owner = "P8b"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "sync/tips-consistent"
+kind = "property"
+owner = "P8b"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "sync/wire"
+kind = "harness"
+owner = "P8c"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "session/replacement-preserves-authorization"
+kind = "property"
+owner = "P8c"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+[[pending]]
+id = "sync/teardown-returns-baseline"
+kind = "property"
+owner = "P8d"
+plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
+
+# The protocol-state features of the G1–G3 plan's feature table, whose
+# first eight rows campaign.md's generator coverage map repeats. G2a and G2b
+# add the actions that reach them, and E2b collects them as fuzzer feedback.
+[[pending]]
+id = "feature/request-reset"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/completion-cancellation"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/competing-forks"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/replacement"
+kind = "feature"
+owner = "G2b/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/budget"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/regulation"
+kind = "feature"
+owner = "G2b/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/hold"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/reorg-stage"
+kind = "feature"
+owner = "G2b/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/recovery"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/teardown"
+kind = "feature"
+owner = "G2b/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"

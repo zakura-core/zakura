@@ -31,18 +31,42 @@ use crate::zakura::{
         header_sync_trace as hs_trace, peer_label as trace_peer_label,
         queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
     },
+    transport::sim_arg,
     OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId,
 };
 
 mod state;
 
+#[cfg(any(test, zakura_sim))]
+use super::observe::{self, ReactorEvent};
 use state::{
     vct_error_retry, CloseAttempt, LocalOperationExpiry, LocatorDisposition, LocatorKey,
     LocatorProposal, ReactorState, RepairStallDue, SchedulingOpportunity, VctLocalOperation,
     VctRepairRetry, VctRepairRetryAttribution, VctRepairStall, VctRepairStallOutcome,
     VctSupplierRejections,
 };
+
+/// Reports the event that `$event` builds to the reactor's observer.
+///
+/// `$event` is evaluated only when an observer is installed. Outside test and
+/// simulator builds the macro expands to nothing.
+#[cfg(any(test, zakura_sim))]
+macro_rules! observe {
+    ($reactor:expr, $event:expr) => {
+        if let Some(observer) = &$reactor.startup.observer.0 {
+            observer.observe($event)
+        }
+    };
+}
+
+/// Reports the event that `$event` builds to the reactor's observer.
+///
+/// Outside test and simulator builds the macro expands to nothing.
+#[cfg(not(any(test, zakura_sim)))]
+macro_rules! observe {
+    ($reactor:expr, $event:expr) => {};
+}
 
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -188,6 +212,8 @@ fn build_header_sync_reactor(
         state: ReactorState::new(Instant::now()),
         peer_work_queue: PeerWorkQueue::default(),
         last_snapshot_refresh_trace_at: Cell::new(None),
+        #[cfg(any(test, zakura_sim))]
+        next_call: 0,
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
@@ -233,6 +259,9 @@ struct HeaderSyncReactor {
     state: ReactorState,
     peer_work_queue: PeerWorkQueue,
     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
+    /// The last port call number handed out. See [`ReactorEvent::Dispatched`].
+    #[cfg(any(test, zakura_sim))]
+    next_call: u64,
 }
 
 type PendingPortOperation = Pin<Box<dyn Future<Output = StorageOutcome> + Send + 'static>>;
@@ -288,6 +317,9 @@ enum StorageOutcome {
         completion: Box<StorageCompletion>,
         /// Header capacity the operation holds until the reactor handles its result.
         capacity: Vec<HeaderCapacityLease>,
+        /// The call's number. See [`ReactorEvent::Dispatched`].
+        #[cfg(any(test, zakura_sim))]
+        call: u64,
     },
     /// The operation panicked.
     Panicked(Box<PortPanicContext>),
@@ -326,29 +358,53 @@ struct PortPanicContext {
     target_tip_hash: Option<block::Hash>,
     /// The pending locator read that a panicked locator operation leaves behind.
     locator: Option<LocatorKey>,
+    /// The panicking call's number. See [`ReactorEvent::Dispatched`].
+    #[cfg(any(test, zakura_sim))]
+    call: u64,
 }
 
+/// Why an active header request was retired.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum HeaderRequestTerminal {
+pub enum HeaderRequestTerminal {
+    /// The publisher no longer retains the initial target.
     TargetNotRetained,
+    /// No locator hash lies on the target path.
     NoLocatorIntersection,
+    /// The publisher pruned history on the target path.
     HistoryPruned,
+    /// The publisher's selected chain changed between `Status` and `Open`.
     TargetNotSelected,
+    /// The publisher's selected chain stopped extending the cursor.
     SubscriptionSuperseded,
+    /// The publisher received `Close`.
     SubscriptionClosed,
+    /// The owning session disconnected.
     Disconnected,
+    /// A local failure ended the request.
     LocalError,
+    /// The peer sent a malformed response.
     MalformedResponse,
+    /// The repair supplier sent auxiliary input that local state excludes.
     ExcludedAuxiliaryInput,
+    /// The VCT repair the request served no longer needs it.
     RepairObsolete,
+    /// State committed a resource stall instead of the target.
     ResourceStalled,
+    /// Sending to the peer failed.
     SendError,
+    /// A new session for the same peer replaced the owning session.
     SessionReplaced,
+    /// The reactor shut down.
     Shutdown,
+    /// A committed snapshot made the request's authority obsolete.
     SnapshotObsolete,
+    /// Staging the response's pages was refused.
     StagingRefused,
+    /// State admitted the target.
     TargetAdmitted,
+    /// State or validation rejected the target.
     TargetRejected,
+    /// The request's deadline passed.
     TimedOut,
 }
 
@@ -364,7 +420,8 @@ impl HeaderRequestTerminal {
         )
     }
 
-    fn label(self) -> &'static str {
+    /// The reason's stable snake-case name, as traces and metrics record it.
+    pub fn label(self) -> &'static str {
         match self {
             Self::TargetNotRetained => "target_not_retained",
             Self::NoLocatorIntersection => "no_locator_intersection",
@@ -689,10 +746,17 @@ impl HeaderSyncReactor {
     }
 
     fn handle_port_completion(&mut self, outcome: StorageOutcome) {
+        #[cfg(any(test, zakura_sim))]
+        let (panicked, handled_call) = match &outcome {
+            StorageOutcome::Completed { call, .. } => (false, *call),
+            StorageOutcome::Panicked(context) => (true, context.call),
+        };
         match outcome {
             StorageOutcome::Completed {
                 completion,
                 capacity,
+                #[cfg(any(test, zakura_sim))]
+                    call: _,
             } => {
                 self.handle_storage_completion(*completion);
                 drop(capacity);
@@ -702,6 +766,14 @@ impl HeaderSyncReactor {
         // Apply publishes its snapshot before completing. Observe it before another
         // event can reserve the capacity that this completion released.
         self.refresh_committed_snapshot();
+        #[cfg(any(test, zakura_sim))]
+        observe!(
+            self,
+            ReactorEvent::Handled {
+                call: handled_call,
+                panicked
+            }
+        );
     }
 
     fn handle_storage_completion(&mut self, completion: StorageCompletion) {
@@ -1030,6 +1102,15 @@ impl HeaderSyncReactor {
             }
             QueueWorkResult::AtCapacity => {
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
+                observe!(
+                    self,
+                    ReactorEvent::OfferWaiting {
+                        peer: peer.clone(),
+                        session_id,
+                        target_tip_hash,
+                        cause: observe::WaitCause::StagingFull,
+                    }
+                );
             }
         }
     }
@@ -1307,7 +1388,7 @@ impl HeaderSyncReactor {
                         HeaderRequestTerminal::MalformedResponse,
                     ),
                 );
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+                sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
                 return;
             }
             let inputs: Vec<_> = response
@@ -1333,7 +1414,7 @@ impl HeaderSyncReactor {
         }
         if !active.matches_response_page(response.initial_target_tip_hash, returned_ancestor) {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
             return;
         }
         if !self
@@ -1341,7 +1422,7 @@ impl HeaderSyncReactor {
             .consume_response_capacity(&peer, response.entries.len())
         {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
             return;
         }
         self.reset_unproductive_requests(&peer, session_id);
@@ -1360,7 +1441,7 @@ impl HeaderSyncReactor {
         let target_tip_height = active.target.status.selected_tip_height;
         let Some(staged_tip) = active.staged_tip() else {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
             return;
         };
         let checkpoint_prefix_ready = self
@@ -1408,7 +1489,7 @@ impl HeaderSyncReactor {
         if complete || bounded_prefix {
             if complete && staged_tip.hash != active.target.status.selected_tip_hash {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+                sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
                 return;
             }
             let common_ancestor = active
@@ -2442,7 +2523,15 @@ impl HeaderSyncReactor {
                     "the matching locator was checked before publication"
                 );
                 if started {
-                    self.state.arm_request_deadline(
+                    observe!(
+                        self,
+                        ReactorEvent::started(
+                            self.peer_work_queue
+                                .active(&peer)
+                                .expect("the request was just started")
+                        )
+                    );
+                                        self.state.arm_request_deadline(
                         peer.clone(),
                         Instant::now(),
                         self.startup.request_timeout,
@@ -3050,7 +3139,15 @@ impl HeaderSyncReactor {
                 );
                 return;
             }
-            self.state.arm_request_deadline(
+            observe!(
+                self,
+                ReactorEvent::started(
+                    self.peer_work_queue
+                        .active(&peer)
+                        .expect("the repair request was just started")
+                )
+            );
+                        self.state.arm_request_deadline(
                 peer.clone(),
                 Instant::now(),
                 self.startup.request_timeout,
@@ -3645,20 +3742,37 @@ impl HeaderSyncReactor {
             );
             return StorageDispatch::Refused;
         }
-        let (locator_key, locator_permit) =
-            if let HeaderPortOperation::QueryHeaderLocator { peer, scope, .. } = &action {
-                let LocatorProposal::Start(key) = self.state.locators.propose(peer, *scope) else {
-                    return StorageDispatch::Joined;
-                };
-                let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
-                    self.state.refuse_locator(&key);
-                    self.locator_capacity_waiting = true;
-                    self.peer_work_queue.remove_unstarted(peer);
-                    return StorageDispatch::Deferred;
-                };
-                (Some(key), Some(port::LocatorReadPermit::new(permit)))
-            } else {
-                (None, None)
+        let (locator_key, locator_permit) = if let HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            scope,
+            #[cfg(any(test, zakura_sim))]
+            session_id,
+            #[cfg(any(test, zakura_sim))]
+            target_tip_hash,
+            ..
+        } = &action
+        {
+            let LocatorProposal::Start(key) = self.state.locators.propose(peer, *scope) else {
+                return StorageDispatch::Joined;
+            };
+            let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
+                self.state.refuse_locator(&key);
+                self.locator_capacity_waiting = true;
+                observe!(
+                    self,
+                    ReactorEvent::OfferWaiting {
+                        peer: peer.clone(),
+                        session_id: *session_id,
+                        target_tip_hash: *target_tip_hash,
+                        cause: observe::WaitCause::LocatorCapacity,
+                    }
+                );
+                self.peer_work_queue.remove_unstarted(peer);
+                return StorageDispatch::Deferred;
+            };
+            (Some(key), Some(port::LocatorReadPermit::new(permit)))
+        } else {
+            (None, None)
             };
         let capacity = match &action {
             HeaderPortOperation::PrepareHeaderTarget { peer, .. }
@@ -3668,6 +3782,15 @@ impl HeaderSyncReactor {
             _ => Vec::new(),
         };
         let panic_context = self.port_panic_context(&action, locator_key.clone());
+        #[cfg(any(test, zakura_sim))]
+        let (tap, dispatched) = self.begin_port_call(&action);
+        #[cfg(any(test, zakura_sim))]
+        let (call, panic_tap) = (tap.call, tap.clone());
+        #[cfg(any(test, zakura_sim))]
+        let panic_context = PortPanicContext {
+            call,
+            ..panic_context
+        };
         let header_chain = self.startup.header_chain_port.clone();
         let request_timeout = self.startup.request_timeout;
         let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
@@ -3695,6 +3818,8 @@ impl HeaderSyncReactor {
                     target_tip_hash: _,
                     scope: _,
                 } => Box::pin(async move {
+                    #[cfg(any(test, zakura_sim))]
+                    let end;
                     let locator = match zakura_rt::time::timeout(
                         request_timeout,
                         header_chain.continuation_locator(
@@ -3706,16 +3831,32 @@ impl HeaderSyncReactor {
                     )
                     .await
                     {
-                        Ok(Ok(locator)) => locator,
+                        Ok(Ok(locator)) => {
+                            #[cfg(any(test, zakura_sim))]
+                            {
+                                end = observe::CallEnd::Replied;
+                            }
+                            locator
+                        }
                         Ok(Err(error)) => {
+                            #[cfg(any(test, zakura_sim))]
+                            {
+                                end = observe::CallEnd::PortError;
+                            }
                             tracing::debug!(?peer, ?error, "header locator unavailable");
                             None
                         }
                         Err(_) => {
+                            #[cfg(any(test, zakura_sim))]
+                            {
+                                end = observe::CallEnd::TimedOut;
+                            }
                             tracing::debug!(?peer, "header locator query timed out");
                             None
                         }
                     };
+                    #[cfg(any(test, zakura_sim))]
+                    tap.end(end);
                     drop(locator_permit);
                     StorageCompletion::Locator {
                         key: locator_key.expect("locator dispatch recorded its read"),
@@ -3724,6 +3865,8 @@ impl HeaderSyncReactor {
                 }),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
                     Box::pin(async move {
+                        #[cfg(any(test, zakura_sim))]
+                        let end;
                         let result = match zakura_rt::time::timeout(
                             request_timeout,
                             header_chain.vct_repair_context(owner, height),
@@ -3731,20 +3874,38 @@ impl HeaderSyncReactor {
                         .await
                         {
                             Ok(Ok(port::VctRepairContextReply::Resolved(context))) => {
+                                #[cfg(any(test, zakura_sim))]
+                                {
+                                    end = observe::CallEnd::Replied;
+                                }
                                 VctRepairContextResult::Resolved(context)
                             }
                             Ok(Ok(port::VctRepairContextReply::Stale)) => {
+                                #[cfg(any(test, zakura_sim))]
+                                {
+                                    end = observe::CallEnd::Replied;
+                                }
                                 VctRepairContextResult::Stale
                             }
                             Ok(Err(error)) => {
+                                #[cfg(any(test, zakura_sim))]
+                                {
+                                    end = observe::CallEnd::PortError;
+                                }
                                 tracing::debug!(?owner, ?error, "VCT repair context unavailable");
                                 VctRepairContextResult::Unavailable
                             }
                             Err(_) => {
+                                #[cfg(any(test, zakura_sim))]
+                                {
+                                    end = observe::CallEnd::TimedOut;
+                                }
                                 tracing::debug!(?owner, "VCT repair context timed out");
                                 VctRepairContextResult::Unavailable
                             }
                         };
+                        #[cfg(any(test, zakura_sim))]
+                        tap.end(end);
                         StorageCompletion::VctRepairContext { owner, result }
                     })
                 }
@@ -3785,6 +3946,8 @@ impl HeaderSyncReactor {
                                 ),
                             ),
                         ));
+                        #[cfg(any(test, zakura_sim))]
+                        tap.end(observe::CallEnd::NotSubmitted);
                         return StorageCompletion::TargetPrepared {
                             peer,
                             source,
@@ -3812,6 +3975,8 @@ impl HeaderSyncReactor {
                                         Some(Box::new(error)),
                                     ),
                                 ));
+                            #[cfg(any(test, zakura_sim))]
+                            tap.end(observe::CallEnd::NotSubmitted);
                             return StorageCompletion::TargetPrepared {
                                 peer,
                                 source,
@@ -3832,6 +3997,8 @@ impl HeaderSyncReactor {
                         .await
                         .map(HeaderTargetPreparationResult::Prepared)
                         .unwrap_or_else(HeaderTargetPreparationResult::Failed);
+                    #[cfg(any(test, zakura_sim))]
+                    tap.end(observe::CallEnd::Replied);
                     StorageCompletion::TargetPrepared {
                         peer,
                         source,
@@ -3858,6 +4025,8 @@ impl HeaderSyncReactor {
                             }
                         })
                         .unwrap_or_else(HeaderTargetAdmissionResult::Failed);
+                    #[cfg(any(test, zakura_sim))]
+                    tap.end(observe::CallEnd::Replied);
                     StorageCompletion::TargetAdmission {
                         peer,
                         source,
@@ -3866,21 +4035,67 @@ impl HeaderSyncReactor {
                     }
                 }),
             };
-        let operation =
-            AssertUnwindSafe(operation)
-                .catch_unwind()
-                .map(move |result| match result {
+        let operation = AssertUnwindSafe(operation)
+            .catch_unwind()
+            .map(move |result| {
+                #[cfg(any(test, zakura_sim))]
+                let result = observe::rethrow_observer_panic(result);
+                match result {
                     Ok(completion) => StorageOutcome::Completed {
                         completion: Box::new(completion),
                         capacity,
+                        #[cfg(any(test, zakura_sim))]
+                        call,
                     },
-                    Err(_) => StorageOutcome::Panicked(Box::new(panic_context)),
-                });
+                    Err(_) => {
+                        // Report the panic before this closure drops `capacity`,
+                        // whose last lease release can reach a scheduling point.
+                        #[cfg(any(test, zakura_sim))]
+                        panic_tap.end_after_catch(observe::CallEnd::PortPanicked);
+                        StorageOutcome::Panicked(Box::new(panic_context))
+                    }
+                }
+            });
         if let Some(operation) = vct_local_operation {
             self.state.vct_local_operation = Some(operation);
         }
+        #[cfg(any(test, zakura_sim))]
+        if let Some(op) = dispatched {
+            observe!(self, ReactorEvent::Dispatched { call, op });
+        }
         self.pending_port_operations.push(Box::pin(operation));
         StorageDispatch::Started
+    }
+
+    /// Numbers `action` as the next port call. Returns the tap its future
+    /// reports through and, when an observer is installed, the call for its
+    /// `Dispatched` event. An action that calls no port gets call 0 and no
+    /// call.
+    #[cfg(any(test, zakura_sim))]
+    fn begin_port_call(
+        &mut self,
+        action: &HeaderPortOperation,
+    ) -> (observe::PortTap, Option<observe::PortCall>) {
+        let dispatched = self
+            .startup
+            .observer
+            .0
+            .as_ref()
+            .and_then(|_| observe::PortCall::of(action));
+        let is_port_call = !matches!(
+            action,
+            HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. }
+        );
+        let call = if is_port_call {
+            self.next_call += 1;
+            self.next_call
+        } else {
+            0
+        };
+        (
+            observe::PortTap::new(call, &self.startup.observer),
+            dispatched,
+        )
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]
@@ -3964,6 +4179,8 @@ impl HeaderSyncReactor {
             owner,
             target_tip_hash,
             locator,
+            #[cfg(any(test, zakura_sim))]
+            call: 0,
         }
     }
 
@@ -4300,6 +4517,7 @@ impl HeaderSyncReactor {
         active: &ActiveHeaderRequest,
         terminal_outcome: HeaderRequestTerminal,
     ) {
+        observe!(self, ReactorEvent::retired(active, terminal_outcome));
         if !terminal_outcome.needs_terminal_trace() {
             return;
         }
@@ -4457,7 +4675,7 @@ impl HeaderSyncReactor {
             }
             _ => return,
         };
-        self.dispatch_misbehavior(peer, reason, owner);
+        sim_arg!(self.dispatch_misbehavior(peer, reason, owner); None);
     }
 
     /// Record a violation that a reactor check found in an admitted page.
@@ -4465,7 +4683,15 @@ impl HeaderSyncReactor {
     /// It does not disconnect. These checks compare the page with local
     /// scheduler state, so a mismatch can be local. The session reader
     /// already disconnects for the reservation violations themselves.
-    fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
+    ///
+    /// In test and simulator builds, `origin` is the session of the message
+    /// that showed the violation.
+    fn report_misbehavior(
+        &mut self,
+        peer: ZakuraPeerId,
+        reason: HeaderSyncMisbehavior,
+        #[cfg(any(test, zakura_sim))] origin: u64,
+    ) {
         let category = match reason {
             HeaderSyncMisbehavior::MalformedMessage => {
                 zakura_header_chain::ErrorCategory::MalformedProtocol
@@ -4480,7 +4706,7 @@ impl HeaderSyncReactor {
             "attribution" => "header_peer",
         )
         .increment(1);
-        self.dispatch_misbehavior(peer, reason, None);
+        sim_arg!(self.dispatch_misbehavior(peer, reason, None); Some(origin));
     }
 
     /// Record `peer`'s violation. A fault in `owner`'s work also disconnects
@@ -4488,14 +4714,28 @@ impl HeaderSyncReactor {
     /// subscription never acknowledges the failed cursor. The peer then waits
     /// out the readmission cooldown, so it cannot reconnect and restage the
     /// same branch at once.
+    ///
+    /// In test and simulator builds, it reports `Misbehavior` with `owner`'s
+    /// session as the origin, or else `reported`, the session of the message
+    /// that showed the violation.
     fn dispatch_misbehavior(
         &mut self,
         peer: ZakuraPeerId,
         reason: HeaderSyncMisbehavior,
         owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
+        #[cfg(any(test, zakura_sim))] reported: Option<u64>,
     ) {
         let session = self.sessions.get(&peer).map(|handles| &handles.session);
         let session_id = session.map(|session| session.session_id());
+        observe!(
+            self,
+            ReactorEvent::Misbehavior {
+                peer: peer.clone(),
+                reason,
+                origin: owner.map(|owner| owner.session_id()).or(reported),
+                current: session_id,
+            }
+        );
         let faulted = owner.filter(|owner| Some(owner.session_id()) == session_id);
         if let (Some(owner), Some(session)) = (faulted, session) {
             session.disconnect_for_header_fault(owner.request_id().get());

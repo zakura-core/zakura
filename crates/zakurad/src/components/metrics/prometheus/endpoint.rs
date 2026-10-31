@@ -17,8 +17,8 @@ use super::recorder::PrometheusRecorder;
 
 /// Starts serving the metrics of `recorder` at `addr` on a new thread.
 ///
-/// Every request gets the metrics, whatever its method or path. Returns the address the endpoint
-/// listens on, or an error if `addr` can't be opened.
+/// `/health` returns `OK`; all other paths return metrics, regardless of method.
+/// Returns the listening address, or an error if `addr` can't be opened.
 pub(super) fn spawn(addr: SocketAddr, recorder: PrometheusRecorder) -> io::Result<SocketAddr> {
     let listener = std::net::TcpListener::bind(addr)?;
     let local_addr = listener.local_addr()?;
@@ -54,9 +54,13 @@ async fn serve(listener: std::net::TcpListener, recorder: PrometheusRecorder) {
 
         let recorder = recorder.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |_request| {
-                let mut response =
-                    Response::new(Full::new(Bytes::from(recorder.render(Instant::now()))));
+            let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                let body = if request.uri().path() == "/health" {
+                    Bytes::from_static(b"OK")
+                } else {
+                    Bytes::from(recorder.render(Instant::now()))
+                };
+                let mut response = Response::new(Full::new(body));
                 response
                     .headers_mut()
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));

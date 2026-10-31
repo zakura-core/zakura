@@ -1,6 +1,9 @@
 //! Status cadence and the latest received advertisement live with the connection.
 
-use zakura_rt::sync::{Mutex, PoisonError};
+use zakura_rt::{
+    sync::{Mutex, PoisonError},
+    time::Instant,
+};
 
 use super::wire::Message;
 use crate::zakura::{
@@ -8,7 +11,7 @@ use crate::zakura::{
     regulation::{CadenceSendError, CadenceSender, RowSend},
     FramedSend, OrderedSendError,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// What one attempt did with the latest local Status.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -73,7 +76,7 @@ impl StatusSender {
             .map_err(|error| OrderedSendError::Encode(error.into()))?;
         match sender.send_row(u16::from(MSG_BS_STATUS), send) {
             Ok(RowSend::Queued) => Ok(StatusSend::Queued),
-            Ok(RowSend::DeferredUntil(at)) => Ok(StatusSend::Deferred(at.into_std())),
+            Ok(RowSend::DeferredUntil(at)) => Ok(StatusSend::Deferred(at)),
             Ok(RowSend::Unwritten) => Ok(StatusSend::Unwritten),
             Ok(RowSend::QueueFull) => Ok(StatusSend::QueueFull),
             Ok(RowSend::Idle) => unreachable!("the Status row was updated above"),
@@ -98,7 +101,7 @@ mod tests {
             servable_high: block::Height(10),
             ..BlockSyncStatus::default()
         };
-        let sent_at = tokio::time::Instant::now().into_std();
+        let sent_at = Instant::now();
         assert_eq!(
             sender.try_send(original, &old_send).unwrap(),
             StatusSend::Queued
@@ -174,7 +177,7 @@ mod tests {
         ] {
             let sender = StatusSender::new(u32::MAX, configured);
             let (send, mut recv) = framed_channel(4);
-            let sent_at = tokio::time::Instant::now().into_std();
+            let sent_at = Instant::now();
             let status = BlockSyncStatus::default();
             assert_eq!(sender.try_send(status, &send).unwrap(), StatusSend::Queued);
             recv.recv().await.unwrap();

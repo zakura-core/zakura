@@ -242,13 +242,17 @@ impl Point {
 /// Where a ready task will resume: its `n`-th point of kind `op`.
 ///
 /// A task at the top of its coroutine is at `poll#n`, where `n` counts its
-/// polls. Displayed as `kind#n`, the form traces use.
+/// polls. Displayed as `kind#n`, the form traces use. The display leaves
+/// out `object` and `site`, so they never change a pick's identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct At {
     /// The operation the task stopped before.
     pub op: Op,
     /// How many points of this kind the task has reached, this one included.
     pub n: u32,
+    /// The object the operation touches, if the primitive reports one.
+    /// `None` at the top of the coroutine.
+    pub object: Option<ObjectId>,
     /// The point's source location. `None` at the top of the coroutine.
     pub site: Option<&'static Location<'static>>,
 }
@@ -266,7 +270,8 @@ pub struct ReadyTask {
     pub task: TaskId,
     /// Where it will resume.
     pub at: At,
-    /// True if it stopped mid-poll, so it already holds a worker.
+    /// True if it stopped mid-poll, so it already holds a worker, unless
+    /// it's a blocking job, which never holds one.
     pub mid_poll: bool,
 }
 
@@ -278,7 +283,7 @@ pub enum RunOutcome {
     /// The task's future returned `Pending`. It waits for its `Waker` and
     /// released its worker.
     Waiting,
-    /// The task parked on a sync wait and keeps its worker.
+    /// The task parked on a sync wait and keeps its worker, if it holds one.
     Parked(ObjectId),
     /// The task finished.
     Completed,
@@ -323,14 +328,19 @@ pub enum Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedulerConfig {
     /// Simulated runtime workers. A task holds one from the start of a poll
-    /// until the poll returns. At least 1. One worker hides every race inside
-    /// a single poll, so scenarios should use 2 or more.
+    /// until the poll returns. A blocking job, from
+    /// `zakura_rt::task::spawn_blocking`, holds none, as on tokio's blocking
+    /// pool. At least 1. One worker hides every race inside a single poll,
+    /// so scenarios should use 2 or more.
     pub workers: u16,
     /// The most tasks one run may spawn. A spawn past it panics in the
     /// spawning task.
     pub max_tasks: u32,
     /// Stack size for each task, in bytes. Untouched pages cost no memory.
     pub stack_size: usize,
+    /// UTC at virtual time zero, which `zakura_rt::time::utc_now` reads
+    /// from. `None` keeps `zakura-rt`'s default origin.
+    pub utc_origin: Option<std::time::SystemTime>,
 }
 
 impl Default for SchedulerConfig {
@@ -341,6 +351,7 @@ impl Default for SchedulerConfig {
             // Tokio's default worker stack, so any poll that fits on a
             // production worker fits here.
             stack_size: 2 * 1024 * 1024,
+            utc_origin: None,
         }
     }
 }
@@ -357,8 +368,13 @@ pub struct CleanupReport {
     /// Tasks still parked after the drain, such as a lock cycle, whose
     /// coroutines were force-unwound.
     pub unwound: usize,
-    /// Forced unwinds that a task's own code caught and didn't rethrow. The
-    /// stack of such a task is leaked rather than reused.
+    /// Tasks leaked when a task got stuck at the cleanup point limit and
+    /// shutdown abandoned the run: every task still live, plus any spawn
+    /// still queued. None of their code ran. Nonzero exactly when the run
+    /// was abandoned.
+    pub leaked: usize,
+    /// Forced unwinds that a task's own code caught before it suspended
+    /// again. Such a task stays live, and shutdown runs it on like any other.
     pub unwind_failures: usize,
     /// Timers still registered at shutdown.
     pub timers_left: usize,
@@ -367,8 +383,8 @@ pub struct CleanupReport {
 /// This thread's coroutine stacks, as [`stack_pool`] reports them.
 ///
 /// Every stack the thread allocated is idle in the pool, in use by a run,
-/// freed by the pool, or leaked by an unwind failure (see
-/// [`CleanupReport::unwind_failures`]). So between runs,
+/// freed by the pool, or leaked by an abandoned run (see
+/// [`CleanupReport::leaked`]) or a shutdown that panicked. So between runs,
 /// `allocated - freed - idle` counts leaked stacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackPool {

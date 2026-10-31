@@ -170,7 +170,6 @@ impl Tracing {
         tracing::info!(
             ?filter,
             TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-            LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
             "started tracing component",
         );
 

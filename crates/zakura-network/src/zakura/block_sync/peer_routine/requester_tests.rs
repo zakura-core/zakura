@@ -501,8 +501,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         .check_request_liveness(deadline - Duration::from_millis(1))
         .is_ok());
     assert!(
-        routine.earliest_deadline_sleep(None).deadline().into_std()
-            <= deadline + Duration::from_millis(1)
+        routine.earliest_deadline_sleep(None).deadline() <= deadline + Duration::from_millis(1)
     );
     assert!(matches!(
         routine.handle_deadlines(deadline).await,
@@ -608,9 +607,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         1,
         "the ending still owns authorization after all bodies arrive"
     );
-    assert!(routine
-        .check_request_liveness(time::Instant::now().into_std())
-        .is_ok());
+    assert!(routine.check_request_liveness(time::Instant::now()).is_ok());
     assert!(!connection.is_cancelled());
     routine
         .handle_frame(&mut block_sync_guard(), buffered.recv().await.unwrap())
@@ -746,7 +743,8 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     let released = routine
         .work
         .release_answered_elsewhere(owner, height)
-        .expect("the request still owns its reserved height");
+        .expect("the request still owns its reserved height")
+        .released;
     routine.budget.release(released);
     assert!(routine
         .registry
@@ -806,7 +804,7 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
             .set_deadline(key, retirement + Duration::from_secs(3600));
     }
     routine.window.block_liveness_deadline = None;
-    time::advance(retirement.saturating_duration_since(time::Instant::now().into_std())).await;
+    time::advance(retirement.saturating_duration_since(time::Instant::now())).await;
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {
         servable_low: block::Height(1),
@@ -1302,6 +1300,64 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
     assert!(futures::poll!(ranking.as_mut()).is_ready());
 }
 
+/// #1812: a measured peer whose routine parks on a full sequencer input
+/// queue can't request the floor, so an unmeasured peer stops deferring the
+/// floor to it and is woken to rank again. Once the queue has room and the
+/// handoff completes, the measured peer is the preferred carrier again.
+#[tokio::test]
+async fn a_routine_parked_on_a_full_sequencer_queue_does_not_hold_the_floor() {
+    let ((mut fast, mut fast_outbound, pool, _fast_connection, _), blocks, _fast_bodies) =
+        bulk_routine();
+    let index = |height: block::Height| usize::try_from(height.0 - 1).unwrap();
+    // Answer the probe, then one request of the next window, so the fast peer
+    // is measured, has a free slot and still waits on a request.
+    let mut requested = Vec::new();
+    while requested.len() < 2 {
+        fast.try_fill().await;
+        requested = requested_heights(&mut fast_outbound);
+        let answered = requested[0];
+        deliver(
+            &mut fast,
+            BlockSyncMessage::Block(blocks[index(answered)].clone()),
+        )
+        .await;
+        deliver(
+            &mut fast,
+            BlockSyncMessage::BlocksDone {
+                start_height: answered,
+                returned: 1,
+            },
+        )
+        .await;
+    }
+    let second = requested[1];
+    assert!(fast.window.bbr_rtprop_ms(Instant::now()).is_some());
+    let registry = Arc::clone(&fast.registry);
+    let floor = fast
+        .work
+        .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
+        .expect("the fast peer left work behind");
+    let (slow, _slow_outbound) = slower_floor_peer(&fast, pool, floor);
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+
+    let (bodies, mut received) = mpsc::channel(1);
+    let held = bodies.clone().try_reserve_owned().unwrap();
+    fast.sequencer_input = bodies;
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    let block = blocks[index(second)].clone();
+    let mut parked = Box::pin(deliver(&mut fast, BlockSyncMessage::Block(block)));
+    assert!(futures::poll!(&mut parked).is_pending());
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+
+    drop(held);
+    parked.await;
+    received.try_recv().unwrap();
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+}
+
 /// Two sessions that open every request their window allows and then withhold
 /// every ending hold at most a quarter of the node pool together, so a third
 /// session can still reserve.
@@ -1382,10 +1438,7 @@ async fn fast_peer_holding_one_exchange() -> (
     };
     let index = usize::try_from(first.0 - 1).unwrap();
     deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
-    assert!(fast
-        .window
-        .bbr_rtprop_ms(time::Instant::now().into_std())
-        .is_some());
+    assert!(fast.window.bbr_rtprop_ms(time::Instant::now()).is_some());
     assert_eq!(fast.requester.occupancy().len, 1);
     let floor = fast
         .work
@@ -1458,4 +1511,134 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     assert!(fast.pending_status.is_none());
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+}
+
+/// The work, budget, and input-queue gauges equal sums over their owners after
+/// charge, receipt, queue exit, queued-body drop, and routine drop. No check calls a
+/// publication helper, so each gauge must follow its owner on its own.
+#[tokio::test]
+async fn byte_gauges_follow_work_and_input_owners() {
+    use super::super::{tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace};
+
+    let recorder = GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
+    let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(first.hash());
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            second.hash(),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    let (body_sender, mut bodies) = mpsc::channel(1);
+    routine.sequencer_input = body_sender;
+    let budget = routine.budget.clone();
+    let work = routine.work.clone();
+    // Returns the work-reservation and queue gauges after checking every gauge
+    // against its owners.
+    let check = |queued: &[SequencedBody], label: &str| {
+        let reserved: u64 = work
+            .ownership_snapshot()
+            .iter()
+            .map(|item| item.reserved_bytes)
+            .sum();
+        let queued_bytes: u64 = queued.iter().map(SequencedBody::queued_bytes).sum();
+        let gauges = (
+            recorder.bytes("sync.block.work.reserved_bytes"),
+            recorder.bytes("sync.block.sequencer_input.queued_bytes"),
+        );
+        assert_eq!(gauges, (reserved, queued_bytes), "after {label}");
+        assert_eq!(
+            recorder.bytes("sync.block.budget.reserved_bytes"),
+            budget.reserved(),
+            "budget after {label}"
+        );
+        gauges
+    };
+
+    assert_eq!(check(&[], "start"), (0, 0));
+
+    // Admission publishes the above-floor reservation it read.
+    let view = *routine.sequencer_view.borrow();
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    let (charged, _) = check(&[], "charge");
+    assert!(charged > 0);
+    routine.admission_snapshot(&view);
+    let above: u64 = work
+        .ownership_snapshot()
+        .iter()
+        .filter(|item| item.place == WorkItemPlace::InFlight && item.height > view.download_floor)
+        .map(|item| item.reserved_bytes)
+        .sum();
+    assert_eq!(
+        recorder.bytes("sync.block.work.reserved_above_floor_bytes"),
+        above
+    );
+
+    // Receipt moves the body's bytes from its reservation to the queue, and
+    // the body carries the estimate its request reserved.
+    let first_estimate = work
+        .ownership_snapshot()
+        .iter()
+        .find(|item| item.height == block::Height(1))
+        .map(|item| item.estimated_bytes);
+    assert!(first_estimate.is_some());
+    deliver(&mut routine, BlockSyncMessage::Block(first)).await;
+    let mut queued: Vec<_> = std::iter::from_fn(|| bodies.try_recv().ok()).collect();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].admitted_estimate_bytes, first_estimate);
+    let (reserved, queued_bytes) = check(&queued, "receipt");
+    assert!(reserved < charged);
+    assert!(queued_bytes > 0);
+
+    // The sequencer takes the body out of the queue.
+    queued[0].leave_queue();
+    assert_eq!(check(&queued, "queue exit").1, 0);
+    drop(queued);
+
+    // A body dropped while queued returns its queue charge.
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert!(check(&[], "second charge").0 > 0);
+    deliver(&mut routine, BlockSyncMessage::Block(second)).await;
+    let queued: Vec<_> = std::iter::from_fn(|| bodies.try_recv().ok()).collect();
+    assert_eq!(queued.len(), 1);
+    assert!(check(&queued, "second receipt").1 > 0);
+    drop(queued);
+    assert_eq!(check(&[], "queued body drop").1, 0);
+
+    // A routine dropped with an outstanding request returns its reservation.
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(2),
+            returned: 1,
+        },
+    )
+    .await;
+    work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(3),
+            block::Hash([3; 32]),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert!(check(&[], "third charge").0 > 0);
+    drop(routine);
+    assert_eq!(check(&[], "routine drop"), (0, 0));
 }

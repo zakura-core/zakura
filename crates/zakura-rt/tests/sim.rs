@@ -15,7 +15,7 @@ use std::{
 use support::run;
 use zakura_rt::{
     sim::{self, Op},
-    task::{self, AbortOnDropHandle, JoinSet},
+    task::{self, AbortOnDropHandle, JoinSet, JoinSetExt},
     time::{self, Instant, MissedTickBehavior},
 };
 
@@ -228,6 +228,30 @@ fn join_set_returns_each_task_and_aborts_the_rest_on_drop() {
 }
 
 #[test]
+fn join_set_spawn_named_labels_the_task() {
+    let ((joined, aborted), report) = run(async {
+        let mut set = JoinSet::new();
+        set.spawn_named("worker", async { 4 });
+        set.spawn(async { 5 });
+        set.spawn_named("parked", pending::<i32>()).abort();
+        let mut joined = Vec::new();
+        let mut aborted = 0;
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(value) => joined.push(value),
+                Err(error) if error.is_cancelled() => aborted += 1,
+                Err(error) => panic!("unexpected join error: {error}"),
+            }
+        }
+        (joined, aborted)
+    });
+    assert_eq!(joined, [4, 5]);
+    assert_eq!(aborted, 1);
+    assert_eq!(report.labels, ["root", "worker", file!(), "parked"]);
+    assert_eq!(report.count(Op::Spawn), 3);
+}
+
+#[test]
 fn virtual_time_moves_only_through_the_executor() {
     let wall = std::time::Instant::now();
     let (elapsed, report) = run(async {
@@ -364,9 +388,72 @@ fn is_finished_is_a_point() {
 }
 
 #[test]
-#[should_panic(expected = "spawn_blocking isn't simulated")]
-fn spawn_blocking_is_refused_inside_a_run() {
-    run(async {
-        drop(task::spawn_blocking(|| ()));
+fn spawn_blocking_runs_as_a_task_inside_a_run() {
+    let (value, report) = run(async { task::spawn_blocking(|| 6 * 7).await.unwrap() });
+    assert_eq!(value, 42);
+    assert_eq!(report.count(Op::Spawn), 1);
+}
+
+/// UTC inside a run starts at the executor's origin and moves only with
+/// virtual time. The test executor keeps the provided default origin.
+#[test]
+fn utc_now_follows_virtual_time_from_the_origin() {
+    let origin = std::time::UNIX_EPOCH + sim::DEFAULT_UTC_ORIGIN_SINCE_EPOCH;
+    let ((start, later), _) = run(async {
+        let start = time::utc_now();
+        time::sleep(Duration::from_secs(90)).await;
+        (start, time::utc_now())
     });
+    assert_eq!(start, origin);
+    assert_eq!(later, origin + Duration::from_secs(90));
+}
+
+/// The host clock doesn't reach a run: two runs with real time between them
+/// read the same UTC values.
+#[test]
+fn utc_now_is_the_same_in_every_run() {
+    let read = || run(async { time::utc_now() }).0;
+    let first = read();
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(read(), first);
+}
+
+/// Outside a run, UTC is the host clock, as in production.
+#[test]
+fn utc_now_outside_a_run_reads_the_host_clock() {
+    let before = std::time::SystemTime::now();
+    let now = time::utc_now();
+    assert!(before <= now && now <= std::time::SystemTime::now());
+}
+
+/// `JoinSet::shutdown` aborts every task, then returns only after each one
+/// has ended, as tokio's does: a pending task's future is dropped before
+/// `shutdown` returns, and the set ends up empty.
+#[test]
+fn join_set_shutdown_aborts_and_waits_for_every_task() {
+    /// Sets its flag when the future holding it is dropped.
+    struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let (dropped, _) = run(async {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut set = JoinSet::new();
+        let guard = SetOnDrop(dropped.clone());
+        let waiting = set.spawn(async move {
+            let _guard = guard;
+            pending::<()>().await;
+        });
+        let sleeping = set.spawn(time::sleep(Duration::from_secs(60)));
+        set.spawn(async {});
+        set.shutdown().await;
+        assert!(set.is_empty());
+        assert!(waiting.is_finished() && sleeping.is_finished());
+        dropped.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    assert!(dropped);
 }

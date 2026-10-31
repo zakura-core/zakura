@@ -471,7 +471,7 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
 
             Request::Block {
                 transaction_hash: candidate.transaction.hash(),
-                transaction: candidate.transaction.clone(),
+                transaction: candidate.transaction.clone().into(),
                 known_outpoint_hashes: known_outpoint_hashes.clone(),
                 known_utxos: known_utxos.clone(),
                 height: candidate.height,

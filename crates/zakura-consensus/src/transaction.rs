@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -35,7 +36,7 @@ use zakura_chain::{
     transparent,
 };
 
-use zakura_node_services::mempool;
+use zakura_node_services::{block_memory::OwnedBlockTransaction, mempool};
 use zakura_script::{CachedFfiTransaction, Sigops};
 use zakura_state as zs;
 
@@ -202,6 +203,52 @@ impl
     }
 }
 
+/// The payload retained by transaction verification and its detached workers.
+#[derive(Clone, Debug)]
+pub enum TransactionHandle {
+    /// A caller whose memory admission has not yet migrated to block ownership.
+    Shared(Arc<Transaction>),
+    /// A transaction that retains its block's decoded-memory charge.
+    Owned(OwnedBlockTransaction),
+}
+
+impl Deref for TransactionHandle {
+    type Target = Transaction;
+
+    fn deref(&self) -> &Transaction {
+        match self {
+            Self::Shared(transaction) => transaction,
+            Self::Owned(transaction) => transaction,
+        }
+    }
+}
+
+impl AsRef<Transaction> for TransactionHandle {
+    fn as_ref(&self) -> &Transaction {
+        self
+    }
+}
+
+impl PartialEq for TransactionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for TransactionHandle {}
+
+impl From<Arc<Transaction>> for TransactionHandle {
+    fn from(transaction: Arc<Transaction>) -> Self {
+        Self::Shared(transaction)
+    }
+}
+
+impl From<OwnedBlockTransaction> for TransactionHandle {
+    fn from(transaction: OwnedBlockTransaction) -> Self {
+        Self::Owned(transaction)
+    }
+}
+
 /// Specifies whether a transaction should be verified as part of a block or as
 /// part of the mempool.
 ///
@@ -214,7 +261,7 @@ pub enum Request {
         /// The transaction hash.
         transaction_hash: transaction::Hash,
         /// The transaction itself.
-        transaction: Arc<Transaction>,
+        transaction: TransactionHandle,
         /// Set of transaction hashes that create new transparent outputs.
         known_outpoint_hashes: Arc<HashSet<transaction::Hash>>,
         /// Additional UTXOs which are known at the time of verification.
@@ -304,10 +351,10 @@ impl From<VerifiedUnminedTx> for Response {
 
 impl Request {
     /// The transaction to verify that's in this request.
-    pub fn transaction(&self) -> Arc<Transaction> {
+    pub fn transaction(&self) -> TransactionHandle {
         match self {
             Request::Block { transaction, .. } => transaction.clone(),
-            Request::Mempool { transaction, .. } => transaction.transaction().clone(),
+            Request::Mempool { transaction, .. } => transaction.transaction().clone().into(),
         }
     }
 
@@ -821,7 +868,7 @@ where
     /// - vec of `Output`s in the same order as the matching inputs in the `tx`,
     /// - vec of `Outpoint`s spent by a mempool `tx` that were not found in the best chain's utxo set.
     async fn spent_utxos(
-        tx: Arc<Transaction>,
+        tx: TransactionHandle,
         req: Request,
         state: Timeout<ZS>,
         mempool: Option<Timeout<Mempool>>,
@@ -1024,7 +1071,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
@@ -1138,7 +1185,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
@@ -1218,7 +1265,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
@@ -1280,7 +1327,7 @@ where
     fn verify_transparent_inputs_and_outputs(
         request: &Request,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
 

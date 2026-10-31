@@ -447,8 +447,8 @@ pub fn time_is_valid_at(
 /// ZIP 218 sets `SproutBlockJoinSplitLimit` to zero. Zakura rejects any
 /// JoinSplit at or after NU7, because ZIP 2003 disallows the only transaction
 /// versions that can carry one. See [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
-pub fn shielded_action_limits_are_valid<'a>(
-    transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
+pub fn shielded_action_limits_are_valid<T: AsRef<Transaction>>(
+    transactions: impl IntoIterator<Item = T>,
     height: Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
@@ -458,7 +458,7 @@ pub fn shielded_action_limits_are_valid<'a>(
 
     let totals = transactions
         .into_iter()
-        .map(|tx| tx.shielded_action_counts())
+        .map(|tx| tx.as_ref().shielded_action_counts())
         .fold(
             ShieldedActionCounts::default(),
             ShieldedActionCounts::saturating_add,

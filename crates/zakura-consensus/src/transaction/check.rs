@@ -674,11 +674,12 @@ fn validate_expiry_height_mined(
 /// valid for the block height, or a [`Err(TransactionError)`](TransactionError)
 pub fn tx_transparent_coinbase_spends_maturity(
     network: &Network,
-    tx: Arc<Transaction>,
+    tx: impl AsRef<Transaction>,
     height: Height,
     block_new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
     spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
 ) -> Result<(), TransactionError> {
+    let tx = tx.as_ref();
     for spend in tx.spent_outpoints() {
         let utxo = block_new_outputs
             .get(&spend)

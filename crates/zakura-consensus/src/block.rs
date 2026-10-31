@@ -594,7 +594,7 @@ where
                     .expect("transaction verifier is always ready")
                     .call(tx::Request::Block {
                         transaction_hash,
-                        transaction: transaction.clone(),
+                        transaction: transaction.clone().into(),
                         known_outpoint_hashes: known_outpoint_hashes.clone(),
                         known_utxos: known_utxos.clone(),
                         height,

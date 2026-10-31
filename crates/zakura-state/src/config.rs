@@ -32,6 +32,14 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Maximum full blocks being decoded from disk or retained by disk-read results.
+    ///
+    /// The default is 1024. Database clones share this count limit. A result keeps
+    /// its slot through its last block, header, or transaction handle. Exhaustion
+    /// returns a capacity error; it does not report a stored block as missing.
+    /// This limit does not bound standalone header/transaction reads or decoded bytes.
+    pub read_block_limit: NonZeroU16,
+
     /// Maximum blocking data-read jobs admitted by one database instance.
     ///
     /// The default is 64. Cloned read services share this limit. Excess reads wait
@@ -479,6 +487,7 @@ impl Default for PruningConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            read_block_limit: NonZeroU16::new(1024).expect("the default limit is nonzero"),
             read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
             cache_dir: default_cache_dir(),
             ephemeral: false,
@@ -519,6 +528,12 @@ mod tests {
         );
         assert!(toml::from_str::<Config>("read_concurrency_limit = 0").is_err());
         assert!(toml::from_str::<Config>("read_concurrency_limit = 65536").is_err());
+        assert_eq!(
+            toml::from_str::<Config>("").unwrap().read_block_limit.get(),
+            1024
+        );
+        assert!(toml::from_str::<Config>("read_block_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_block_limit = 65536").is_err());
     }
 
     #[test]

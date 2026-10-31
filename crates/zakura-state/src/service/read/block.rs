@@ -13,7 +13,9 @@
 //! - the shared finalized [`ZakuraDb`] reference.
 
 use std::sync::Arc;
-use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
+use zakura_node_services::block_memory::{
+    AdmissionFailure, BlockHandle, HeaderHandle, TransactionHandle,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -44,16 +46,16 @@ pub fn any_block<'a, C: AsRef<Chain> + 'a>(
     mut chains: impl Iterator<Item = &'a C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<BlockHandle> {
+) -> Result<Option<BlockHandle>, AdmissionFailure> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
     // check the most efficient alternative first. (`chain` is always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chains
-        .find_map(|c| c.as_ref().block(hash_or_height))
-        .map(|contextual| contextual.block.clone())
-        .or_else(|| db.block(hash_or_height).map(Into::into))
+    if let Some(contextual) = chains.find_map(|c| c.as_ref().block(hash_or_height)) {
+        return Ok(Some(contextual.block.clone()));
+    }
+    db.block(hash_or_height)
 }
 
 /// Returns the [`Block`] with [`block::Hash`] or
@@ -62,7 +64,7 @@ pub fn block<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<BlockHandle>
+) -> Result<Option<BlockHandle>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -75,7 +77,7 @@ pub fn block_and_size<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<(BlockHandle, usize)>
+) -> Result<Option<(BlockHandle, usize)>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -84,17 +86,14 @@ where
     // Since blocks are the same in the finalized and non-finalized state, we
     // check the most efficient alternative first. (`chain` is always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chain
+    if let Some(contextual) = chain
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
-        .map(|contextual| {
-            let size = contextual.block.zcash_serialize_to_vec().unwrap().len();
-            (contextual.block.clone(), size)
-        })
-        .or_else(|| {
-            db.block_and_size(hash_or_height)
-                .map(|(block, size)| (block.into(), size))
-        })
+    {
+        let size = contextual.block.zcash_serialized_size();
+        return Ok(Some((contextual.block.clone(), size)));
+    }
+    db.block_and_size(hash_or_height)
 }
 
 /// Returns the [`block::Header`] with [`block::Hash`] or

@@ -105,6 +105,12 @@ pub struct ZakuraDb {
     /// Shared admission for blocking read-service jobs, including cancelled waiters' jobs.
     read_workers: Arc<tokio::sync::Semaphore>,
 
+    /// Disk block decoding and final-holder admission shared by database clones.
+    read_blocks: zakura_node_services::block_memory::DecodedBlockPool,
+
+    /// Chain-tip publication cannot spend ordinary callers' result capacity.
+    chain_tip_blocks: zakura_node_services::block_memory::DecodedBlockPool,
+
     /// Admission reserved for bounded chain-tip and depth queries.
     control_read_workers: Arc<tokio::sync::Semaphore>,
 
@@ -215,6 +221,13 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
+            read_blocks: zakura_node_services::block_memory::DecodedBlockPool::for_block_count(
+                config.read_block_limit.into(),
+            ),
+            chain_tip_blocks: zakura_node_services::block_memory::DecodedBlockPool::for_block_count(
+                std::num::NonZeroU64::new(crate::constants::CHAIN_TIP_BLOCK_RETENTION)
+                    .expect("chain-tip retention has a nonzero fixed allowance"),
+            ),
             read_workers: Arc::new(tokio::sync::Semaphore::new(usize::from(
                 config.read_concurrency_limit.get(),
             ))),

@@ -35,6 +35,140 @@ use crate::{
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock,
 };
 
+/// A real disk result keeps admission after its worker and database handles end.
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_block_results_keep_shared_admission_through_final_payload_holders() {
+    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use std::{num::NonZeroU16, time::Duration};
+    use tokio::time::timeout;
+    use tower::ServiceExt;
+    use zakura_node_services::block_memory::{model::Probe, AdmissionFailure, BlockHandle};
+
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let config = Config {
+        read_block_limit: NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        deadline,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let ReadResponse::Block(Some(block)) = timeout(
+        deadline,
+        read.clone().oneshot(ReadRequest::Block(Height(0).into())),
+    )
+    .await
+    .unwrap()
+    .unwrap() else {
+        panic!("the disk contains genesis")
+    };
+    assert_eq!(block.hash(), genesis.hash());
+    let BlockHandle::Owned(owner) = &block else {
+        panic!("disk reads return an admitted owner")
+    };
+    let probe = Probe::new(owner);
+    let bytes = owner.decoded_bytes();
+    let pool = read.db.read_blocks.clone();
+    let header = block.retained_header();
+    let transaction = block.transaction(0).unwrap();
+    drop(block);
+
+    let error = timeout(
+        deadline,
+        read.clone().oneshot(ReadRequest::Block(Height(0).into())),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<AdmissionFailure>(),
+        Some(&AdmissionFailure::Capacity)
+    );
+    assert_eq!(
+        read.db
+            .clone()
+            .block_and_size(Height(0).into())
+            .unwrap_err(),
+        AdmissionFailure::Capacity
+    );
+    assert_eq!(pool.reserved_blocks(), Some(1));
+    let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+    assert_eq!(actual.measured_bytes, Some(bytes));
+    assert_eq!(actual.header_holders, 1);
+    assert_eq!(actual.transaction_holders, vec![1]);
+    assert_eq!(pool.reserved_bytes(), bytes);
+
+    // Control reads and tip publication do not spend the data-result allowance.
+    timeout(
+        deadline,
+        read.clone()
+            .oneshot(ReadRequest::BestChainNextMedianTimePast),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let tip = crate::service::finalized_chain_tip(&read.db)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tip.hash, genesis.hash());
+    assert_eq!(pool.reserved_blocks(), Some(1));
+    drop(tip);
+
+    drop(header);
+    assert_eq!(transaction.hash(), genesis.transactions[0].hash());
+    assert_eq!(pool.reserved_blocks(), Some(1));
+    drop(transaction);
+    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_bytes(), 0);
+    let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+    assert_eq!(actual.holders, 0);
+    assert_eq!(actual.header_holders, 0);
+    assert_eq!(actual.transaction_holders, vec![0]);
+    assert!(read.db.block(Height(1).into()).unwrap().is_none());
+    assert_eq!(pool.reserved_blocks(), Some(0));
+
+    let (block, size) = read.db.block_and_size(Height(0).into()).unwrap().unwrap();
+    assert_eq!(size, genesis.zcash_serialized_size());
+    let BlockHandle::Owned(owner) = &block else {
+        panic!("sized reads retain admission")
+    };
+    let probe = Probe::new(owner);
+    drop(state);
+    drop(read);
+    assert_eq!(block.hash(), genesis.hash());
+    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(
+        probe
+            .read(2, std::slice::from_ref(&pool))
+            .unwrap()
+            .measured_bytes,
+        Some(bytes)
+    );
+    drop(block);
+    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(
+        probe
+            .read(2, std::slice::from_ref(&pool))
+            .unwrap()
+            .header_holders,
+        0
+    );
+}
+
 /// Storage round-trip test for block and transaction data in the finalized state database.
 #[test]
 fn test_block_db_round_trip() {
@@ -161,9 +295,10 @@ fn test_block_db_round_trip_with(
         // Now read it back from the state
         let stored_block = state
             .block(finalized.height.into())
+            .unwrap()
             .expect("block was stored at height");
 
-        if stored_block != original_block {
+        if stored_block != original_block.clone().into() {
             error!(
                 "
                 detailed block mismatch report:
@@ -179,7 +314,7 @@ fn test_block_db_round_trip_with(
             );
         }
 
-        assert_eq!(stored_block, original_block);
+        assert_eq!(stored_block, original_block.clone().into());
 
         // The raw read path assembles exactly the bytes the block serializes
         // to, including the CompactSize transaction count and the transaction

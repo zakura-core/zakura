@@ -1672,14 +1672,14 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // legacy/archive node derives from its per-height trees.
             let below_handoff = Height((seed + 1) as u32)..=Height(last as u32 - 1);
             let served = fast.db.commitment_roots_by_height_range(below_handoff.clone());
-            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff.clone());
+            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff.clone()).unwrap();
             prop_assert!(!served.is_empty(), "a fast-synced node serves below-handoff roots from the index");
             prop_assert_eq!(served, expected.clone(), "index-served roots match the legacy per-height-tree roots");
 
             // The same range goes through `serve_block_roots`: with `U = 0` the request starts at
             // or above the upgrade height, so it is served entirely from the index — no per-height
             // trees (which the fast-synced node lacks below the handoff) are consulted.
-            prop_assert_eq!(serve_block_roots(&fast.db, below_handoff), expected, "serve_block_roots serves the fast-synced range from the index");
+            prop_assert_eq!(serve_block_roots(&fast.db, below_handoff).unwrap(), expected, "serve_block_roots serves the fast-synced range from the index");
 
             // The `z_gettreestate` RPC gate predicate matches the read guard: a
             // below-handoff height is unavailable (typed archive-mode error), while the
@@ -2531,7 +2531,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             let produced_roots = commitment_aux::produce_block_roots(
                 &legacy.db,
                 Height((seed + 1) as u32)..=last_height,
-            );
+            ).unwrap();
             let produced_frontiers = commitment_aux::produce_final_frontiers(&legacy.db, last_height)
                 .expect("legacy DB has the tip frontier");
 
@@ -2579,7 +2579,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             // boundary that would stall the client's minimum-progress check.
             let serve_range = Height((seed + 1) as u32)..=last_height;
             let all_trees_reference =
-                commitment_aux::produce_block_roots(&legacy.db, serve_range.clone());
+                commitment_aux::produce_block_roots(&legacy.db, serve_range.clone()).unwrap();
             let upgrade = Height(((seed + 1 + last) / 2) as u32);
             prop_assert!(
                 serve_range.start() < &upgrade && upgrade <= last_height,
@@ -2827,7 +2827,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 .db
                 .write_batch(batch)
                 .expect("restoring the fixture handoff succeeds");
-            let stitched = serve_block_roots(&legacy.db, serve_range);
+            let stitched = serve_block_roots(&legacy.db, serve_range).unwrap();
             prop_assert_eq!(
                 stitched,
                 all_trees_reference,
@@ -2910,7 +2910,7 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
             let produced_roots = commitment_aux::produce_block_roots(
                 &legacy.db,
                 Height((seed + 1) as u32)..=Height(last as u32),
-            );
+            ).unwrap();
 
             // Consume the untrusted roots in a fresh fast-sync state.
             // The test buffers each fast block's successor before commit, as the write loop does.

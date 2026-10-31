@@ -28,7 +28,7 @@ use zakura_chain::{
 use crate::{
     constants,
     service::{
-        block_iter::any_ancestor_blocks,
+        block_iter::any_chain_ancestor_iter,
         check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
         finalized_state::ZakuraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -70,7 +70,10 @@ where
 pub fn tip_block<C>(
     chain: Option<C>,
     db: &ZakuraDb,
-) -> Option<zakura_node_services::block_memory::BlockHandle>
+) -> Result<
+    Option<zakura_node_services::block_memory::BlockHandle>,
+    zakura_node_services::block_memory::AdmissionFailure,
+>
 where
     C: AsRef<Chain>,
 {
@@ -80,9 +83,11 @@ where
     // where the finalized tip is above the non-finalized tip,
     // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
     // so it is acceptable to return either tip.
-    chain
-        .and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
-        .or_else(|| db.tip_block().map(Into::into))
+    if let Some(block) = chain.and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
+    {
+        return Ok(Some(block));
+    }
+    db.tip_block()
 }
 
 /// Returns the tip [`Height`] of `chain`.
@@ -684,13 +689,16 @@ pub fn next_median_time_past(
 fn best_relevant_chain(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-) -> Result<Vec<zakura_node_services::block_memory::BlockHandle>, BoxError> {
+) -> Result<Vec<zakura_node_services::block_memory::HeaderHandle>, BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
-    let best_relevant_chain =
-        any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
+    let best_relevant_chain = any_chain_ancestor_iter::<block::Header>(
+        non_finalized_state,
+        db,
+        state_tip_before_queries.1,
+    );
     let best_relevant_chain: Vec<_> = best_relevant_chain
         .into_iter()
         .take(POW_MEDIAN_BLOCK_SPAN)
@@ -718,12 +726,10 @@ fn best_relevant_chain(
 ///
 /// See [`next_median_time_past()`] for details.
 pub(crate) fn calculate_median_time_past(
-    relevant_chain: Vec<zakura_node_services::block_memory::BlockHandle>,
+    relevant_chain: Vec<zakura_node_services::block_memory::HeaderHandle>,
 ) -> DateTime32 {
-    let relevant_data: Vec<DateTime<Utc>> = relevant_chain
-        .iter()
-        .map(|block| block.header().time)
-        .collect();
+    let relevant_data: Vec<DateTime<Utc>> =
+        relevant_chain.iter().map(|header| header.time).collect();
 
     // > Define the median-time-past of a block to be the median of the nTime fields of the
     // > preceding PoWMedianBlockSpan blocks (or all preceding blocks if there are fewer than

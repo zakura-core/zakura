@@ -600,7 +600,7 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
             "block header is retained for skipped checkpoint transaction"
         );
         assert!(
-            state.db.block(Height(height).into()).is_none(),
+            state.db.block(Height(height).into()).unwrap().is_none(),
             "block reconstruction fails cleanly when raw checkpoint transactions are skipped"
         );
     }
@@ -613,7 +613,7 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
             "checkpoint raw transaction is retained at or after the checkpoint retention start"
         );
         assert!(
-            state.db.block(Height(height).into()).is_some(),
+            state.db.block(Height(height).into()).unwrap().is_some(),
             "retained checkpoint-window block can be reconstructed"
         );
     }
@@ -642,6 +642,7 @@ fn chain_identity_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
     assert_eq!(state.db.height(tip_hash), Some(tip_height));
 
     let initial_tip = crate::service::finalized_chain_tip(&state.db)
+        .unwrap()
         .expect("a bodyless pruned finalized tip still initializes chain sync");
     assert_eq!(
         (initial_tip.height, initial_tip.hash),
@@ -880,7 +881,7 @@ fn archive_mode_keeps_checkpoint_raw_transactions_before_checkpoint_retention_st
             "archive mode keeps checkpoint raw transaction data"
         );
         assert!(
-            state.db.block(Height(height).into()).is_some(),
+            state.db.block(Height(height).into()).unwrap().is_some(),
             "archive mode reconstructs checkpoint blocks"
         );
     }
@@ -1007,13 +1008,18 @@ fn initial_online_prune_preserves_pre_boundary_history() {
         "raw transaction before the online pruning boundary is preserved"
     );
     assert!(
-        state.db.block(Height(prune_from - 1).into()).is_some(),
+        state
+            .db
+            .block(Height(prune_from - 1).into())
+            .unwrap()
+            .is_some(),
         "preserved block below the pruning marker is still reconstructed"
     );
     assert!(
         state
             .db
             .block_and_size(Height(prune_from - 1).into())
+            .unwrap()
             .is_some(),
         "preserved block and size below the pruning marker is still available"
     );
@@ -1025,6 +1031,7 @@ fn initial_online_prune_preserves_pre_boundary_history() {
         state
             .db
             .block(Height(prune_from - 1).into())
+            .unwrap()
             .expect("preserved block below the pruning marker is still reconstructed")
             .zcash_serialize_to_vec()
             .expect("serialization works for a previously committed block"),
@@ -1035,11 +1042,15 @@ fn initial_online_prune_preserves_pre_boundary_history() {
         "raw transaction at the online pruning boundary is pruned"
     );
     assert!(
-        state.db.block(Height(prune_from).into()).is_none(),
+        state.db.block(Height(prune_from).into()).unwrap().is_none(),
         "pruned block at the online pruning boundary is not reconstructed"
     );
     assert!(
-        state.db.block_and_size(Height(prune_from).into()).is_none(),
+        state
+            .db
+            .block_and_size(Height(prune_from).into())
+            .unwrap()
+            .is_none(),
         "pruned block and size at the online pruning boundary is unavailable"
     );
     assert!(
@@ -1111,11 +1122,11 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
             "block header retained at height {height}"
         );
         assert!(
-            state.db.block(Height(height).into()).is_none(),
+            state.db.block(Height(height).into()).unwrap().is_none(),
             "block reconstruction returns None when raw transaction data is pruned at height {height}"
         );
         assert!(
-            state.db.block_and_size(Height(height).into()).is_none(),
+            state.db.block_and_size(Height(height).into()).unwrap().is_none(),
             "block and size lookup returns None when raw transaction data is pruned at height {height}"
         );
     }
@@ -1132,13 +1143,18 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
         let block = state
             .db
             .block(Height(height).into())
+            .unwrap()
             .expect("retained block is available");
         assert!(
-            !block.transactions.is_empty(),
+            block.transactions().len() > 0,
             "retained block has transactions at height {height}"
         );
         assert!(
-            state.db.block_and_size(Height(height).into()).is_some(),
+            state
+                .db
+                .block_and_size(Height(height).into())
+                .unwrap()
+                .is_some(),
             "retained block and size is available at height {height}"
         );
         assert!(
@@ -1303,11 +1319,13 @@ fn pruned_block_bodies_stop_tree_derived_root_serving() {
         "pruning retains the tree used by the historical roots producer"
     );
     assert!(
-        state.db.block(Height(1).into()).is_none(),
+        state.db.block(Height(1).into()).unwrap().is_none(),
         "pruning removes the body needed for auxiliary root metadata"
     );
     assert!(
-        serve_block_roots(&state.db, Height(1)..=Height(3)).is_empty(),
+        serve_block_roots(&state.db, Height(1)..=Height(3))
+            .unwrap()
+            .is_empty(),
         "root serving stops instead of fabricating counts and an auth-data root"
     );
 }

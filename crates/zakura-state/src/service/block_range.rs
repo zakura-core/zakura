@@ -33,9 +33,12 @@ impl BlockRangeSnapshot {
         &self,
         db: &ZakuraDb,
         height: block::Height,
-    ) -> Option<(zakura_node_services::block_memory::BlockHandle, usize)> {
-        if height > self.tip? {
-            return None;
+    ) -> Result<
+        Option<(zakura_node_services::block_memory::BlockHandle, usize)>,
+        zakura_node_services::block_memory::AdmissionFailure,
+    > {
+        if self.tip.is_none_or(|tip| height > tip) {
+            return Ok(None);
         }
         read::block_and_size(self.chain.clone(), db, height.into())
     }

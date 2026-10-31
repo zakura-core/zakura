@@ -45,6 +45,10 @@ pub(super) struct FinalFrontiers {
 /// Errors producing [`FinalFrontiers`] from a finalized database.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FinalFrontiersGenerationError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The database has no finalized tip identity to bind the generated frontier.
     #[error("cannot produce final frontiers at height {height:?}: finalized database is empty")]
     MissingFinalizedTip {
@@ -490,7 +494,7 @@ fn ironwood_root_or_empty(
 pub(crate) fn produce_block_roots(
     db: &ZakuraDb,
     range: std::ops::RangeInclusive<block::Height>,
-) -> Vec<BlockCommitmentRoots> {
+) -> Result<Vec<BlockCommitmentRoots>, zakura_node_services::block_memory::AdmissionFailure> {
     let (start, end) = (range.start().0, range.end().0);
     let mut roots = Vec::new();
     for h in start..=end {
@@ -510,7 +514,7 @@ pub(crate) fn produce_block_roots(
         // Pruned nodes can retain these trees after deleting the body. Stop at the first
         // missing body so callers never mistake fabricated zero metadata for a complete
         // payload.
-        let Some(block) = db.block(height.into()) else {
+        let Some(block) = db.block(height.into())? else {
             metrics::counter!("state.block_roots.missing_body").increment(1);
             static MISSING_BODIES: AtomicU64 = AtomicU64::new(0);
             let occurrences = MISSING_BODIES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -524,9 +528,9 @@ pub(crate) fn produce_block_roots(
             break;
         };
         let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
-            block.sapling_transactions_count(),
-            block.orchard_transactions_count(),
-            block.ironwood_transactions_count(),
+            block.view().sapling_transactions_count(),
+            block.view().orchard_transactions_count(),
+            block.view().ironwood_transactions_count(),
             block.auth_data_root(),
         );
         roots.push(BlockCommitmentRoots {
@@ -540,7 +544,7 @@ pub(crate) fn produce_block_roots(
             auth_data_root,
         });
     }
-    roots
+    Ok(roots)
 }
 
 /// Serve the per-block roots for `range`, joining tree-derived roots below the VCT upgrade height
@@ -551,7 +555,7 @@ pub(crate) fn produce_block_roots(
 pub(crate) fn serve_block_roots(
     db: &ZakuraDb,
     range: std::ops::RangeInclusive<block::Height>,
-) -> Vec<BlockCommitmentRoots> {
+) -> Result<Vec<BlockCommitmentRoots>, zakura_node_services::block_memory::AdmissionFailure> {
     // Below the VCT upgrade height, we use the per-height trees to derive the roots.
     let Some(upgrade) = db.vct_upgrade_height() else {
         return produce_block_roots(db, range);
@@ -562,12 +566,12 @@ pub(crate) fn serve_block_roots(
     // Wholly at/above `U`: the VCT-specific index covers it. (`U == 0` for a node that fast-synced from
     // genesis takes this path for every request, never touching the absent per-height trees.)
     if start >= upgrade {
-        return db.commitment_roots_by_height_range(range);
+        return Ok(db.commitment_roots_by_height_range(range));
     }
 
     // Below `U`: derive the per-height-tree run up to `U - 1` (`start < upgrade` so `upgrade >= 1`).
     let trees_end = block::Height(end.0.min(upgrade.0 - 1));
-    let mut roots = produce_block_roots(db, start..=trees_end);
+    let mut roots = produce_block_roots(db, start..=trees_end)?;
 
     // Continue into the index only if the tree run is contiguous up to `U - 1`; a short run means a
     // gap below `U`, so serve it alone and let the client retry the remainder.
@@ -575,7 +579,7 @@ pub(crate) fn serve_block_roots(
         roots.extend(db.commitment_roots_by_height_range(upgrade..=end));
     }
 
-    roots
+    Ok(roots)
 }
 
 /// Produce the final frontiers at the finalized database tip `height`.
@@ -627,14 +631,14 @@ pub(super) fn produce_settled_final_frontiers(
     let mut last_change = None;
     for raw_height in height.0.saturating_add(1)..=tip.0 {
         let scan_height = block::Height(raw_height);
-        let block = db.block(scan_height.into()).ok_or(
+        let block = db.block(scan_height.into())?.ok_or(
             FinalFrontiersGenerationError::MissingBlockInSproutWindow {
                 missing: scan_height,
                 height,
                 tip,
             },
         )?;
-        if block.sprout_note_commitments().next().is_some() {
+        if block.view().sprout_note_commitments().next().is_some() {
             last_change = Some(scan_height);
         }
     }
@@ -940,7 +944,7 @@ mod tests {
         seed_trees(&db, [1, 2]);
         seed_finalized_tip(&db, block::Height(2));
 
-        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(4));
+        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1000,7 +1004,7 @@ mod tests {
             .expect("overwriting the seeded Ironwood tree succeeds");
         seed_finalized_tip(&db, block::Height(1));
 
-        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(1));
+        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(1)).unwrap();
 
         assert_eq!(
             roots,
@@ -1021,7 +1025,7 @@ mod tests {
         seed_index_roots(&db, [1, 2]);
         seed_finalized_tip(&db, block::Height(2));
 
-        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(2));
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(2)).unwrap();
 
         assert_eq!(
             roots,
@@ -1040,7 +1044,7 @@ mod tests {
         seed_finalized_tip(&db, block::Height(4));
         set_upgrade_height(&db, block::Height(3));
 
-        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4));
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1064,7 +1068,7 @@ mod tests {
         seed_finalized_tip(&db, block::Height(1));
         set_upgrade_height(&db, block::Height(3));
 
-        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4));
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1082,7 +1086,7 @@ mod tests {
         seed_finalized_tip(&db, block::Height(4));
         set_upgrade_height(&db, block::Height(3));
 
-        let roots = serve_block_roots(&db, block::Height(3)..=block::Height(4));
+        let roots = serve_block_roots(&db, block::Height(3)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,

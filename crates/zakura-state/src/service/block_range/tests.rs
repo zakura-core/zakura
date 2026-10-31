@@ -220,6 +220,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
         earlier_snapshot
             .block_and_size(&read_state.db, block::Height(2))
             .unwrap()
+            .unwrap()
             .0
             .hash(),
         selected.hash(),
@@ -227,6 +228,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
     );
     assert!(earlier_snapshot
         .block_and_size(&read_state.db, block::Height(3))
+        .unwrap()
         .is_none());
 
     if header_runtime {

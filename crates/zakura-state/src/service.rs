@@ -106,15 +106,23 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
-fn finalized_chain_tip(db: &ZakuraDb) -> Option<ChainTipBlock> {
-    let (height, hash) = db.tip()?;
-    if let Some(block) = db.tip_block() {
-        return Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(block)));
+fn finalized_chain_tip(
+    db: &ZakuraDb,
+) -> Result<Option<ChainTipBlock>, zakura_node_services::block_memory::AdmissionFailure> {
+    let Some((height, hash)) = db.tip() else {
+        return Ok(None);
+    };
+    if let Some(block) = db.chain_tip_block()? {
+        return Ok(Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(
+            block,
+        ))));
     }
 
-    let header = db.block_header(height.into())?;
-    (header.hash() == hash)
-        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header))
+    let Some(header) = db.block_header(height.into()) else {
+        return Ok(None);
+    };
+    Ok((header.hash() == hash)
+        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header)))
 }
 
 /// A read-write service for Zebra's cached blockchain state.
@@ -455,7 +463,7 @@ impl StateService {
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
-                let finalized_tip = finalized_chain_tip(&finalized_state.db);
+                let finalized_tip = finalized_chain_tip(&finalized_state.db)?;
                 let historical_trees = load_historical_frontier_artifact(
                     &network,
                     &config,
@@ -638,6 +646,11 @@ impl StateService {
                 &state.network,
                 MAX_LEGACY_CHAIN_BLOCKS,
             ) {
+                if let Some(admission) =
+                    error.downcast_ref::<zakura_node_services::block_memory::AdmissionFailure>()
+                {
+                    return Err(StateInitError::BlockAdmission(*admission));
+                }
                 let legacy_db_path = state.read_service.db.path().to_path_buf();
                 panic!(
                     "Cached state contains a legacy chain.\n\
@@ -2724,7 +2737,7 @@ where
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
-            finalized_state::serve_block_roots(db, height..=height)
+            finalized_state::serve_block_roots(db, height..=height)?
                 .into_iter()
                 .next()
         } else if let Some(chain) = chain
@@ -2975,17 +2988,17 @@ impl Service<ReadRequest> for ReadStateService {
                 state.latest_best_chain(),
                 &state.db,
                 hash_or_height,
-            ))),
+            )?)),
 
             ReadRequest::AnyChainBlock(hash_or_height) => Ok(ReadResponse::Block(read::any_block(
                 state.latest_non_finalized_state().chain_iter(),
                 &state.db,
                 hash_or_height,
-            ))),
+            )?)),
 
             // Used by the get_block (raw) RPC and the StateService.
             ReadRequest::BlockAndSize(hash_or_height) => Ok(ReadResponse::BlockAndSize(
-                read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height),
+                read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height)?,
             )),
 
             // Used by the get_block (verbose) RPC and the StateService.
@@ -3270,19 +3283,16 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::BlocksByHeightRange { start, count } => {
                 let snapshot = state.block_range_snapshot()?;
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                snapshot
-                                    .block_and_size(&state.db, height)
-                                    .map(|(block, size)| (height, block, size))
-                            })
-                    })
-                    .collect();
+                let mut blocks = Vec::new();
+                for offset in 0..count {
+                    let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+                        break;
+                    };
+                    let Some((block, size)) = snapshot.block_and_size(&state.db, height)? else {
+                        break;
+                    };
+                    blocks.push((height, block, size));
+                }
 
                 Ok(ReadResponse::Blocks(blocks))
             }
@@ -3659,23 +3669,18 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::TipBlockSize => {
-                // Respond with the length of the obtained block if any.
-                Ok(ReadResponse::TipBlockSize(
-                    state
-                        .best_tip()
-                        .and_then(|(tip_height, _)| {
-                            read::block_info(
-                                state.latest_best_chain(),
-                                &state.db,
-                                tip_height.into(),
-                            )
-                        })
-                        .map(|info| info.size().try_into().expect("u32 should fit in usize"))
-                        .or_else(|| {
-                            find::tip_block(state.latest_best_chain(), &state.db)
-                                .map(|b| b.zcash_serialized_size())
-                        }),
-                ))
+                let size = state
+                    .best_tip()
+                    .and_then(|(height, _)| {
+                        read::block_info(state.latest_best_chain(), &state.db, height.into())
+                    })
+                    .map(|info| usize::try_from(info.size()).expect("u32 fits in usize"));
+                let size = match size {
+                    Some(size) => Some(size),
+                    None => find::tip_block(state.latest_best_chain(), &state.db)?
+                        .map(|block| block.zcash_serialized_size()),
+                };
+                Ok(ReadResponse::TipBlockSize(size))
             }
 
             // Used by the getchaintips RPC.

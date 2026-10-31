@@ -496,6 +496,7 @@ async fn retired_state_snapshots_and_read_results_keep_decoded_ownership() {
                 .unwrap()
                 .block_and_size(&read.db, Height(2))
                 .unwrap()
+                .unwrap()
                 .0
                 .hash(),
             hash
@@ -623,6 +624,63 @@ async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
         assert!(matches!(result, Ok(Ok(_))), "checkpoint commit: {result:?}");
     }
     state
+}
+
+/// Capacity refusal must precede the writer's logical and durable operator change.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_tip_capacity_refuses_invalidation_before_changing_the_writer() {
+    use zakura_node_services::block_memory::AdmissionFailure;
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+    let child = chain.last().unwrap().clone();
+    let hash = child.hash();
+    timeout(
+        deadline,
+        state.queue_and_commit_to_non_finalized_state(SemanticallyVerifiedBlock::from(child), None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    wait_for_idle_writer(&state, deadline).await;
+    let read = state.read_service.clone();
+    let mut tips: Vec<_> = (0..crate::constants::CHAIN_TIP_BLOCK_RETENTION)
+        .map(|_| super::finalized_chain_tip(&read.db).unwrap().unwrap())
+        .collect();
+
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    let error = timeout(deadline, state.call(Request::InvalidateBlock(hash)))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::error::InvalidateError>(),
+        Some(crate::error::InvalidateError::BlockAdmission(
+            AdmissionFailure::Capacity
+        ))
+    ));
+
+    // This request reads the writer's actual chain set, not its last published snapshot.
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    timeout(deadline, state.call(Request::PreciousBlock(hash)))
+        .await
+        .unwrap()
+        .expect("capacity refusal must leave the writer's block eligible");
+    assert_eq!(
+        read.best_tip().unwrap().1,
+        hash,
+        "capacity refusal must preserve the writer selected tip"
+    );
+
+    drop(tips.pop());
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    timeout(deadline, state.call(Request::InvalidateBlock(hash)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.best_tip().unwrap().1, chain[1].hash());
 }
 
 fn await_block_info_error(result: Result<Response, BoxError>) -> crate::AwaitBlockInfoError {
@@ -1015,6 +1073,7 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
             .take(11)
             .last()
             .expect("the context has a median-time window")
+            .unwrap()
             .view()
             .header()
             .time;
@@ -1023,6 +1082,7 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
         super::any_ancestor_blocks(&fixture.non_finalized, &fixture.finalized.db, parent_hash)
             .take(POW_ADJUSTMENT_BLOCK_SPAN)
             .map(|block| {
+                let block = block.unwrap();
                 (
                     block.view().header().difficulty_threshold,
                     block.view().header().time,
@@ -2548,7 +2608,7 @@ proptest! {
     fn some_block_less_than_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(4, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));
@@ -2565,7 +2625,7 @@ proptest! {
             .coinbase_height()
             .expect("chain contains valid blocks");
 
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(
@@ -2603,7 +2663,7 @@ proptest! {
 
         let response = crate::service::check::legacy_chain(
             nu_activation_height,
-            chain.clone().into_iter().rev().map(Into::into),
+            chain.clone().into_iter().rev().map(|block| Ok(block.into())),
             &network,
             TEST_LEGACY_CHAIN_LIMIT,
         ).map_err(|error| error.to_string());
@@ -2622,7 +2682,7 @@ proptest! {
     fn at_least_one_transaction_with_valid_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Nu5)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));

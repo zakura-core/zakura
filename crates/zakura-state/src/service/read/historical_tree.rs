@@ -102,6 +102,10 @@ impl DerivedFrontiers {
 /// path, and a node that cannot derive simply cannot answer the request.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HistoricalTreeDerivationError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// A subtree audit endpoint is not above its anchor, so there is no replay range.
     #[error(
         "cannot verify note commitment subtrees in ({from:?}, {to:?}]: the endpoint must be above \
@@ -699,7 +703,7 @@ pub(crate) fn verify_against_available_roots(
     height: Height,
     frontiers: &DerivedFrontiers,
 ) -> Result<(), HistoricalTreeDerivationError> {
-    let roots = serve_block_roots(db, height..=height)
+    let roots = serve_block_roots(db, height..=height)?
         .into_iter()
         .next()
         .filter(|roots| roots.height == height)

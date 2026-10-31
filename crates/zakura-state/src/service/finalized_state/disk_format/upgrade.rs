@@ -285,6 +285,10 @@ impl CancelReceiver {
 /// An error that prevents the coordinator from updating the database format version.
 #[derive(Debug, Error)]
 pub enum FormatChangeError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// Shutdown cancels the format change.
     #[error("database format change was cancelled")]
     Cancelled,
@@ -758,7 +762,9 @@ impl DbFormatChange {
 
     /// Run quick checks that the current database format is valid.
     #[allow(clippy::vec_init_then_push)]
-    pub fn format_validity_checks_quick(db: &ZakuraDb) -> Result<(), String> {
+    pub fn format_validity_checks_quick(
+        db: &ZakuraDb,
+    ) -> Result<Result<(), String>, FormatChangeError> {
         let timer = CodeTimer::start();
         let mut results = Vec::new();
 
@@ -768,7 +774,7 @@ impl DbFormatChange {
         // This check can be run before the upgrade, but the upgrade code is finished, so we don't
         // run it early any more. (If future code changes accidentally make it depend on the
         // upgrade, they would accidentally break compatibility with older Zebra cached states.)
-        results.push(add_subtrees::subtree_format_calculation_pre_checks(db));
+        results.push(add_subtrees::subtree_format_calculation_pre_checks(db)?);
 
         results.push(cache_genesis_roots::quick_check(db));
         results.push(fix_tree_key_type::quick_check(db));
@@ -779,10 +785,10 @@ impl DbFormatChange {
         if results.iter().any(Result::is_err) {
             let err = Err(format!("invalid quick check: {results:?}"));
             error!(?err);
-            return err;
+            return Ok(err);
         }
 
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// Run detailed checks that the current database format is valid.
@@ -797,7 +803,7 @@ impl DbFormatChange {
         // Check the entire format before returning any errors.
         //
         // Do the quick checks first, so we don't have to do this in every detailed check.
-        results.push(Self::format_validity_checks_quick(db));
+        results.push(Self::format_validity_checks_quick(db)?);
         results.push(prune_trees::detailed_check(db, cancel_receiver)?);
         results.push(add_subtrees::detailed_check(db, cancel_receiver)?);
         results.push(cache_genesis_roots::detailed_check(db, cancel_receiver)?);

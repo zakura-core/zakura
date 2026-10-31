@@ -17,6 +17,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle};
 
 use zakura_chain::{
     amount::NonNegative,
@@ -201,58 +202,61 @@ impl ZakuraDb {
     //
     // TODO: move this method to the start of the section
     #[allow(clippy::unwrap_in_result)]
-    pub fn block(&self, hash_or_height: HashOrHeight) -> Option<Arc<Block>> {
-        let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
-
-        let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
-        let transactions = raw_txs
-            .iter()
-            .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
-            .collect();
-
-        Some(Arc::new(Block {
-            header,
-            transactions,
-        }))
+    pub fn block(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Result<Option<BlockHandle>, AdmissionFailure> {
+        self.block_from_pool(hash_or_height, &self.read_blocks)
     }
 
-    /// Returns the [`Block`] with [`block::Hash`] or [`Height`], if it exists
-    /// in the finalized chain, and its serialized size, if its raw transaction
-    /// data is available.
-    ///
-    /// Returns `None` if the block does not exist, or if its transaction bodies
-    /// are missing because they have been pruned.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn block_and_size(&self, hash_or_height: HashOrHeight) -> Option<(Arc<Block>, usize)> {
-        let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
-
-        let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
-        let txs: Vec<_> = raw_txs
-            .iter()
-            .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
-            .collect();
-
-        // Compute the size of the block from the size of header and size of
-        // transactions. This requires summing them all and also adding the
-        // size of the CompactSize-encoded transaction count.
-        // See https://developer.bitcoin.org/reference/block_chain.html#serialized-blocks
-        let tx_count = CompactSizeMessage::try_from(txs.len())
-            .expect("must work for a previously serialized block");
-        let tx_raw = tx_count
-            .zcash_serialize_to_vec()
-            .expect("must work for a previously serialized block");
-        let size = raw_header.raw_bytes().len()
-            + raw_txs
+    fn block_from_pool(
+        &self,
+        hash_or_height: HashOrHeight,
+        pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    ) -> Result<Option<BlockHandle>, AdmissionFailure> {
+        pool.try_decode(|| {
+            let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
+            let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
+            let transactions = raw_txs
                 .iter()
-                .map(|raw_tx| raw_tx.raw_bytes().len())
-                .sum::<usize>()
-            + tx_raw.len();
+                .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
+                .collect();
+            Some(Block {
+                header,
+                transactions,
+            })
+        })
+        .map(|block| block.map(Into::into))
+    }
 
-        let block = Block {
-            header,
-            transactions: txs,
-        };
-        Some((Arc::new(block), size))
+    /// Read a full block and its serialized size under final-holder admission.
+    /// Missing or pruned bodies return `Ok(None)`; capacity refusal returns an error.
+    pub fn block_and_size(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Result<Option<(BlockHandle, usize)>, AdmissionFailure> {
+        let mut size = 0;
+        let block = self.read_blocks.try_decode(|| {
+            let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
+            let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
+            let transactions: Vec<_> = raw_txs
+                .iter()
+                .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
+                .collect();
+            let tx_count = CompactSizeMessage::try_from(transactions.len())
+                .expect("stored block transaction count fits the wire format");
+            let tx_raw = tx_count
+                .zcash_serialize_to_vec()
+                .expect("serializing a transaction count to a vec cannot fail");
+            size = raw_header.raw_bytes().len()
+                + raw_txs.iter().map(|tx| tx.raw_bytes().len()).sum::<usize>()
+                + tx_raw.len();
+            Some(Block {
+                header,
+                transactions,
+            })
+        })?;
+        Ok(block.map(|block| (block.into(), size)))
     }
 
     /// Returns the Zcash consensus serialization of the [`Block`] with
@@ -412,9 +416,19 @@ impl ZakuraDb {
     }
 
     /// Returns the tip block, if there is one.
-    pub fn tip_block(&self) -> Option<Arc<Block>> {
-        let (height, _hash) = self.tip()?;
+    pub fn tip_block(&self) -> Result<Option<BlockHandle>, AdmissionFailure> {
+        let Some((height, _hash)) = self.tip() else {
+            return Ok(None);
+        };
         self.block(height.into())
+    }
+
+    /// Reserve a full block for chain-tip publication without spending data-result capacity.
+    pub fn chain_tip_block(&self) -> Result<Option<BlockHandle>, AdmissionFailure> {
+        let Some((height, _)) = self.tip() else {
+            return Ok(None);
+        };
+        self.block_from_pool(height.into(), &self.chain_tip_blocks)
     }
 
     #[allow(clippy::unwrap_in_result)]

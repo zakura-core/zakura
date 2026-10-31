@@ -60,6 +60,8 @@ pub enum AdmissionFailure {
     Closed,
     /// An interrupted transfer poisoned the block's charge owner.
     Poisoned,
+    /// Pre-decode admission requires a block-count pool, not a byte pool.
+    DecodeRequiresCountLimit,
 }
 
 impl fmt::Display for AdmissionFailure {
@@ -69,6 +71,7 @@ impl fmt::Display for AdmissionFailure {
             Self::Capacity => "decoded block capacity exhausted",
             Self::Closed => "decoded block pool closed",
             Self::Poisoned => "decoded block charge owner poisoned",
+            Self::DecodeRequiresCountLimit => "pre-decode admission requires a block-count pool",
         })
     }
 }
@@ -97,6 +100,54 @@ impl DecodedBlockPool {
     /// This constructor does not establish a decoded-byte bound.
     pub fn for_block_count(limit: NonZeroU64) -> Self {
         Self::with_limit(RetentionLimit::Blocks(limit))
+    }
+
+    /// Reserve one block before reading or decoding it, then retain that reservation
+    /// through its final holder. Missing data and unwinding release the reservation.
+    ///
+    /// Only count-limited pools support this operation. The count includes active
+    /// decoders and returned blocks. Decoded bytes are measured after materialization;
+    /// this count contract does not establish a parser-memory or decoded-byte bound.
+    pub fn try_decode(
+        &self,
+        decode: impl FnOnce() -> Option<Block>,
+    ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
+        if !matches!(self.0.limit, RetentionLimit::Blocks(_)) {
+            return Err(AdmissionFailure::DecodeRequiresCountLimit);
+        }
+        let mut charge = self.reserve(0, Admission::WithinLimit)?;
+        let Some(mut block) = decode() else {
+            return Ok(None);
+        };
+        if Arc::get_mut(&mut block.header).is_none()
+            || block
+                .transactions
+                .iter_mut()
+                .any(|transaction| Arc::get_mut(transaction).is_none())
+        {
+            return Err(AdmissionFailure::AliasedPayload);
+        }
+        let bytes = block.attributed_memory_size_bytes();
+        if self
+            .0
+            .counted_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+            })
+            .is_err()
+        {
+            self.close();
+            return Err(AdmissionFailure::Closed);
+        }
+        charge.bytes = bytes;
+        if self.is_closed() {
+            return Err(AdmissionFailure::Closed);
+        }
+        Ok(Some(OwnedBlock(Arc::new(RetainedBlock {
+            block,
+            charge: Mutex::new(charge),
+            bytes,
+        }))))
     }
 
     fn with_limit(limit: RetentionLimit) -> Self {
@@ -628,6 +679,53 @@ mod tests {
 
     fn block() -> Block {
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap()
+    }
+
+    #[test]
+    fn decode_admission_precedes_materialization_and_survives_final_holders() {
+        let pool = DecodedBlockPool::for_block_count(NonZeroU64::MIN);
+        let owner = pool
+            .try_decode(|| {
+                assert_eq!(pool.reserved_blocks(), Some(1));
+                Some(block())
+            })
+            .unwrap()
+            .unwrap();
+        let actual = Arc::downgrade(&owner.0.block.header);
+        let transaction = owner.transaction(0).unwrap();
+        drop(owner);
+        assert!(actual.upgrade().is_some());
+        let called = std::cell::Cell::new(false);
+        let error = pool
+            .try_decode(|| {
+                called.set(true);
+                Some(block())
+            })
+            .unwrap_err();
+        assert_eq!(error, AdmissionFailure::Capacity);
+        assert!(!called.get(), "refusal precedes disk reads and decoding");
+        drop(transaction);
+        assert!(actual.upgrade().is_none());
+        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn absent_or_panicking_decode_settles_its_reservation() {
+        let pool = DecodedBlockPool::for_block_count(NonZeroU64::MIN);
+        assert!(pool.try_decode(|| None).unwrap().is_none());
+        assert_eq!(pool.reserved_blocks(), Some(0));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.try_decode(|| {
+                let _block = block();
+                assert_eq!(pool.reserved_blocks(), Some(1));
+                panic!("interrupted disk decode")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(pool.try_decode(|| Some(block())).unwrap().is_some());
     }
 
     #[test]

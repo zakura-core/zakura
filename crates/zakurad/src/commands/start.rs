@@ -566,7 +566,7 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
-        let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
+        let (peer_set, address_book, misbehavior_sender, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
                 config.network.clone(),
                 inbound,
@@ -835,7 +835,7 @@ impl StartCmd {
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change.clone(),
-                peer_set.clone(),
+                block_adverts,
                 Some(submit_block_channel.receiver()),
             )
             .in_current_span(),

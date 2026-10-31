@@ -4564,7 +4564,13 @@ mod tests {
             assert_eq!(queued, bytes);
             assert_eq!(pool.reserved_blocks(), Some(1));
             assert_eq!(pool.reserved_bytes(), bytes);
-            let block = sequenced.body.decoded_block(&pool).unwrap();
+            let block = sequenced
+                .body
+                .decoded_block(
+                    &pool,
+                    zakura_node_services::block_memory::Admission::WithinLimit,
+                )
+                .unwrap();
             assert!(
                 matches!(block, BlockHandle::Owned(_)),
                 "the real frame decoder must retain an admitted owner"
@@ -4633,6 +4639,34 @@ mod tests {
         }
     }
 
+    /// A requested body whose raw bytes used the peer's whole reservation still
+    /// reaches the sequencer when decoded retention is full. The peer keeps its
+    /// session and its request funding settles, and the sequencer decodes later.
+    #[tokio::test]
+    async fn a_conformant_body_is_sequenced_raw_at_the_decoded_byte_bound() {
+        use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+        for late in [false, true] {
+            let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(8).unwrap(), 1);
+            let (bytes, mut sequenced, queued) = timeout(
+                Duration::from_secs(5),
+                hand_off_mainnet_block_1_with_pool(0, 0, pool.clone(), late, false),
+            )
+            .await
+            .expect("the decoded byte bound must not delay a requested body")
+            .expect("the routine sequences the requested body");
+            assert!(!sequenced.body.is_decoded());
+            assert_eq!(queued, 0);
+            assert_eq!(pool.pipeline_bytes(), 0);
+            assert!(!pool.is_closed(), "refused retention is not a fault");
+            let block = sequenced
+                .body
+                .decoded_block(&pool, Admission::PipelineExempt)
+                .unwrap();
+            assert_eq!(block.view().attributed_memory_size_bytes(), bytes);
+            assert_eq!(pool.pipeline_bytes(), bytes);
+        }
+    }
+
     /// The witness for #1522 under a slow verifier: once `applying`'s and the
     /// input queue's decoded bytes leave no room for the body under the
     /// decoded cap, the routine hands over raw bytes only. A body that fills
@@ -4675,6 +4709,7 @@ mod tests {
                 &ZakuraBlockSyncConfig::default()
                     .decoded_block_pool(10_000)
                     .unwrap(),
+                zakura_node_services::block_memory::Admission::WithinLimit,
             )
             .unwrap();
 

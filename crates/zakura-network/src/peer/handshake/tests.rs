@@ -1105,3 +1105,41 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
 }
+
+/// L.handshake: a saturated owner refuses before the handshake reads a byte, and a
+/// finished handshake returns its slot.
+#[tokio::test]
+async fn the_handshake_owner_bounds_unfinished_handshakes() {
+    let (updater, _updates) = tokio::sync::mpsc::channel(8);
+    let mut handshake = test_handshake_without_zakura_connector(Config::default(), updater);
+    handshake.handshake_owner = TcpHandshakeOwner::new(1);
+    let owner = handshake.handshake_owner.clone();
+    let held = owner.try_admit().expect("the owner is idle");
+    let mut counter = ActiveConnectionCounter::new_counter();
+
+    let request = |stream, counter: &mut ActiveConnectionCounter| HandshakeRequest {
+        data_stream: stream,
+        connected_addr: ConnectedAddr::Isolated,
+        connection_tracker: counter.track_connection(),
+    };
+
+    let (stream, _remote) = duplex(1024);
+    let refused = handshake
+        .call(request(stream, &mut counter))
+        .await
+        .expect_err("the only slot is held");
+    assert!(refused.to_string().contains("at capacity"));
+    drop(held);
+
+    // The peer's transport is already closed, so this handshake ends immediately.
+    let (stream, remote) = duplex(1024);
+    drop(remote);
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handshake.call(request(stream, &mut counter)),
+    )
+    .await
+    .expect("a closed transport ends the handshake");
+    assert!(finished.is_err());
+    assert_eq!(owner.available(), 1);
+}

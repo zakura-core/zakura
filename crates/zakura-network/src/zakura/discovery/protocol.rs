@@ -7360,12 +7360,12 @@ mod tests {
     /// family delays no verification, and a verification holds no transport bytes.
     #[tokio::test]
     async fn verification_capacity_is_independent_of_transport_saturation() {
-        use crate::zakura::transport::{NodeResources, ResourceEnvelope};
+        use crate::zakura::transport::{NodeResources, ResourceEnvelope, TransportLimits};
 
         let (_connected, connected_rx) = watch::channel(Vec::new());
         let mut handle = discovery_handle_with_connected(connected_rx);
         handle.verify_slots = SlotBudget::new(1).unwrap();
-        let node = NodeResources::new(ResourceEnvelope::new(64, 64, 1));
+        let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(64, 1)));
         let stream = node.connection().stream();
         let _transport_hold = node.hold_node_budgets();
         let frame_bytes = node.usage().raw_bytes;

@@ -29,6 +29,10 @@
 //!
 //! Disk retention has no representation here. Store policies own durable limits,
 //! and a memory lease says nothing about what a commit wrote.
+//!
+//! A pipeline pool also limits the bytes its pipeline still holds. A block leaves
+//! that share when its pipeline work ends, so downstream retention can never
+//! refuse the work that would let downstream stores release their blocks.
 
 use std::{
     fmt, io,
@@ -62,6 +66,8 @@ struct Pool {
     capacity_version: AtomicU64,
     closed: AtomicBool,
     capacity: Notify,
+    pipeline_limit: Option<u64>,
+    pipeline_bytes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +83,9 @@ pub enum Admission {
     WithinLimit,
     /// Permit one oversized block only while this pool has no other charge.
     SingleOversized,
+    /// Pass the pipeline byte limit and keep every other limit.
+    /// The caller's own count window bounds these blocks, and they stay charged.
+    PipelineExempt,
 }
 
 /// Why a decoded block cannot enter or transfer between pools.
@@ -128,14 +137,14 @@ pub struct RejectedBlock {
 impl DecodedBlockPool {
     /// Create one immutable byte-capacity generation.
     pub fn new(limit: u64) -> Self {
-        Self::with_limit(RetentionLimit::Bytes(limit))
+        Self::with_limit(RetentionLimit::Bytes(limit), None)
     }
 
     /// Enforce a block-count allowance while tracking its actual decoded bytes.
     /// Checkpoint and backend owners can preserve their existing count contracts.
     /// This constructor does not establish a decoded-byte bound.
     pub fn for_block_count(limit: NonZeroU64) -> Self {
-        Self::with_limit(RetentionLimit::Blocks(limit))
+        Self::with_limit(RetentionLimit::Blocks(limit), None)
     }
 
     /// Reserve one block before reading or decoding it, then retain that reservation
@@ -175,7 +184,9 @@ impl DecodedBlockPool {
         decode: impl FnOnce() -> Result<Option<Block>, AdmissionFailure>,
         retain: impl FnOnce(u64) -> Result<Option<ByteLease>, AdmissionFailure>,
     ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
-        if !matches!(self.0.limit, RetentionLimit::Blocks(_)) {
+        // A pipeline pool charges measured bytes at admission, and a decode reserves
+        // before it can measure them.
+        if !matches!(self.0.limit, RetentionLimit::Blocks(_)) || self.0.pipeline_limit.is_some() {
             return Err(AdmissionFailure::DecodeRequiresCountLimit);
         }
         let mut charge = self.reserve(0, Admission::WithinLimit)?;
@@ -215,7 +226,14 @@ impl DecodedBlockPool {
         }))))
     }
 
-    fn with_limit(limit: RetentionLimit) -> Self {
+    /// Enforce a block-count allowance on all holders and a byte limit on the
+    /// bytes their pipeline holds. [`OwnedBlock::leave_pipeline`] ends a block's
+    /// byte share while downstream holders keep its count and retained bytes.
+    pub fn for_pipeline(blocks: NonZeroU64, pipeline_bytes: u64) -> Self {
+        Self::with_limit(RetentionLimit::Blocks(blocks), Some(pipeline_bytes))
+    }
+
+    fn with_limit(limit: RetentionLimit, pipeline_limit: Option<u64>) -> Self {
         Self(Arc::new(Pool {
             limit,
             reserved: AtomicU64::new(0),
@@ -223,6 +241,8 @@ impl DecodedBlockPool {
             capacity_version: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             capacity: Notify::new(),
+            pipeline_limit,
+            pipeline_bytes: AtomicU64::new(0),
         }))
     }
 
@@ -270,6 +290,11 @@ impl DecodedBlockPool {
             RetentionLimit::Bytes(_) => self.0.reserved.load(Ordering::Acquire),
             RetentionLimit::Blocks(_) => self.0.counted_bytes.load(Ordering::Acquire),
         }
+    }
+
+    /// Attributed decoded bytes the pipeline still holds. Zero without a pipeline limit.
+    pub fn pipeline_bytes(&self) -> u64 {
+        self.0.pipeline_bytes.load(Ordering::Acquire)
     }
 
     /// Current retained allocations when this pool enforces a block-count allowance.
@@ -328,6 +353,66 @@ impl DecodedBlockPool {
     }
 
     fn reserve(&self, bytes: u64, admission: Admission) -> Result<Charge, AdmissionFailure> {
+        let pipeline_bytes = self.charge_pipeline(bytes, admission)?;
+        match self.reserve_retention(bytes, admission) {
+            Ok(mut charge) => {
+                charge.pipeline_bytes = pipeline_bytes;
+                Ok(charge)
+            }
+            Err(reason) => {
+                if pipeline_bytes > 0 {
+                    // Another caller may have been refused because of this brief charge.
+                    self.release_pipeline(pipeline_bytes);
+                    self.notify_capacity();
+                }
+                Err(reason)
+            }
+        }
+    }
+
+    /// Take the block's pipeline share and return the bytes charged.
+    /// A count refusal returns first, so it causes no rollback wakeups.
+    fn charge_pipeline(&self, bytes: u64, admission: Admission) -> Result<u64, AdmissionFailure> {
+        let Some(limit) = self.0.pipeline_limit else {
+            return Ok(0);
+        };
+        if let RetentionLimit::Blocks(blocks) = self.0.limit {
+            let used = self.0.reserved.load(Ordering::Acquire);
+            if used >= blocks.get() && admission != Admission::SingleOversized {
+                return Err(AdmissionFailure::Capacity);
+            }
+        }
+        self.0
+            .pipeline_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let next = used.checked_add(bytes)?;
+                (next <= limit
+                    || admission == Admission::PipelineExempt
+                    || (used == 0 && admission == Admission::SingleOversized))
+                    .then_some(next)
+            })
+            .map_err(|_| AdmissionFailure::Capacity)?;
+        Ok(bytes)
+    }
+
+    fn release_pipeline(&self, bytes: u64) {
+        if self
+            .0
+            .pipeline_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_sub(bytes)
+            })
+            .is_err()
+        {
+            self.close();
+        }
+    }
+
+    fn reserve_retention(
+        &self,
+        bytes: u64,
+        admission: Admission,
+    ) -> Result<Charge, AdmissionFailure> {
         let (units, limit) = match self.0.limit {
             RetentionLimit::Bytes(limit) => (bytes, limit),
             RetentionLimit::Blocks(limit) => (1, limit.get()),
@@ -371,6 +456,7 @@ impl DecodedBlockPool {
                         pool: self.clone(),
                         bytes,
                         units,
+                        pipeline_bytes: 0,
                     };
                     if self.is_closed() {
                         drop(charge);
@@ -389,10 +475,24 @@ struct Charge {
     pool: DecodedBlockPool,
     bytes: u64,
     units: u64,
+    pipeline_bytes: u64,
+}
+
+impl Charge {
+    fn leave_pipeline(&mut self) {
+        let bytes = std::mem::take(&mut self.pipeline_bytes);
+        if bytes > 0 {
+            self.pool.release_pipeline(bytes);
+            self.pool.notify_capacity();
+        }
+    }
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
+        if self.pipeline_bytes > 0 {
+            self.pool.release_pipeline(self.pipeline_bytes);
+        }
         if matches!(self.pool.0.limit, RetentionLimit::Blocks(_))
             && self
                 .pool
@@ -485,6 +585,19 @@ impl OwnedBlock {
         })
     }
 
+    /// End this block's pipeline byte share. Downstream handles keep its retained
+    /// charge. Repeating the call changes nothing.
+    pub fn leave_pipeline(&self) {
+        match self.0.charge.lock() {
+            Ok(mut charge) => charge.leave_pipeline(),
+            Err(poisoned) => {
+                let pool = poisoned.get_ref().pool.clone();
+                drop(poisoned);
+                pool.close();
+            }
+        }
+    }
+
     /// Move the allocation's shared charge to a backend pool.
     /// All existing handles follow this transfer. Refusal preserves the source.
     pub fn transfer_to(
@@ -542,6 +655,21 @@ impl BlockHandle {
         match self {
             Self::Shared(block) => block,
             Self::Owned(block) => &block.0.block,
+        }
+    }
+
+    /// Attributed decoded bytes of this block. A shared block measures them on each call.
+    pub fn decoded_bytes(&self) -> u64 {
+        match self {
+            Self::Shared(block) => block.attributed_memory_size_bytes(),
+            Self::Owned(block) => block.decoded_bytes(),
+        }
+    }
+
+    /// End the pipeline byte share when this handle owns a charge.
+    pub fn leave_pipeline(&self) {
+        if let Self::Owned(block) = self {
+            block.leave_pipeline();
         }
     }
 
@@ -1368,6 +1496,107 @@ mod tests {
         drop(b);
         assert_eq!(second.available_slots(), 1);
         assert_eq!(probe.holders(), 0);
+    }
+
+    fn pipeline_pool(limit: u64) -> DecodedBlockPool {
+        DecodedBlockPool::for_pipeline(NonZeroU64::new(8).unwrap(), limit)
+    }
+
+    #[test]
+    fn pipeline_limit_refuses_within_limit_and_charges_exempt_blocks() {
+        let bytes = block().attributed_memory_size_bytes();
+        let pool = pipeline_pool(bytes);
+        let first = pool.try_admit(block(), Admission::WithinLimit).unwrap();
+        let version = pool.capacity_version();
+        let refused = pool.try_admit(block(), Admission::WithinLimit).unwrap_err();
+        assert_eq!(refused.reason, AdmissionFailure::Capacity);
+        assert_eq!(refused.decoded_bytes, bytes);
+        assert_eq!(
+            pool.try_admit(block(), Admission::SingleOversized)
+                .unwrap_err()
+                .reason,
+            AdmissionFailure::Capacity,
+            "another pipeline holder rules out the oversized exception"
+        );
+        assert_eq!(pool.pipeline_bytes(), bytes);
+        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(
+            pool.capacity_version(),
+            version,
+            "a refusal is not a capacity release"
+        );
+        let exempt = pool.try_admit(block(), Admission::PipelineExempt).unwrap();
+        assert_eq!(pool.pipeline_bytes(), 2 * bytes);
+        assert_eq!(pool.reserved_bytes(), 2 * bytes);
+        drop(first);
+        assert_eq!(pool.pipeline_bytes(), bytes);
+        drop(exempt);
+        assert_eq!(pool.pipeline_bytes(), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(!pool.is_closed());
+    }
+
+    #[test]
+    fn downstream_retention_after_the_pipeline_cannot_refuse_new_work() {
+        let bytes = block().attributed_memory_size_bytes();
+        let pool = pipeline_pool(bytes);
+        let retained: Vec<_> = (0..3)
+            .map(|_| {
+                let owner = pool.try_admit(block(), Admission::WithinLimit).unwrap();
+                let version = pool.capacity_version();
+                let handle = BlockHandle::from(owner);
+                handle.leave_pipeline();
+                handle.leave_pipeline();
+                assert_ne!(pool.capacity_version(), version, "a waiter can retry");
+                handle
+            })
+            .collect();
+        assert_eq!(pool.pipeline_bytes(), 0);
+        assert_eq!(pool.reserved_bytes(), 3 * bytes);
+        assert_eq!(pool.reserved_blocks(), Some(3));
+        drop(retained);
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert!(!pool.is_closed(), "one owner settles each share once");
+    }
+
+    #[test]
+    fn count_refusal_leaves_the_pipeline_share_unchanged() {
+        let bytes = block().attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::for_pipeline(NonZeroU64::MIN, u64::MAX);
+        let owner = pool.try_admit(block(), Admission::WithinLimit).unwrap();
+        let version = pool.capacity_version();
+        assert_eq!(
+            pool.try_admit(block(), Admission::PipelineExempt)
+                .unwrap_err()
+                .reason,
+            AdmissionFailure::Capacity
+        );
+        assert_eq!(pool.pipeline_bytes(), bytes);
+        assert_eq!(pool.capacity_version(), version);
+        drop(owner);
+        assert_eq!(pool.pipeline_bytes(), 0);
+    }
+
+    #[test]
+    fn a_pipeline_pool_refuses_a_decode_it_could_not_charge() {
+        let pool = pipeline_pool(u64::MAX);
+        assert_eq!(
+            pool.try_decode(|| Some(block())).unwrap_err(),
+            AdmissionFailure::DecodeRequiresCountLimit
+        );
+        assert_eq!(pool.reserved_blocks(), Some(0));
+    }
+
+    #[test]
+    fn pipeline_exempt_keeps_a_byte_pool_limit() {
+        let pool = DecodedBlockPool::new(0);
+        assert_eq!(
+            pool.try_admit(block(), Admission::PipelineExempt)
+                .unwrap_err()
+                .reason,
+            AdmissionFailure::Capacity
+        );
     }
 
     #[test]

@@ -418,13 +418,18 @@ impl ZakuraBlockSyncConfig {
     /// Fund decoded allocations through the pipeline and the caller's backend allowance.
     /// Four submission windows cover input, applying, driver overlap, and replacement
     /// headroom. Peer slots cover synchronous handoffs outside those collections.
-    /// Retiring holders keep their slots; this is a count contract, not a byte bound.
+    /// Retiring holders keep their slots. The count covers all holders, and
+    /// [`Self::decoded_pipeline_byte_bound`] limits the bytes before backend retention.
     pub fn decoded_block_pool(
         &self,
         backend_blocks: u64,
     ) -> Result<zakura_node_services::block_memory::DecodedBlockPool, &'static str> {
-        self.decoded_block_allowance(backend_blocks)
-            .map(zakura_node_services::block_memory::DecodedBlockPool::for_block_count)
+        self.decoded_block_allowance(backend_blocks).map(|blocks| {
+            zakura_node_services::block_memory::DecodedBlockPool::for_pipeline(
+                blocks,
+                self.decoded_pipeline_byte_bound(),
+            )
+        })
     }
 
     /// Return the block count that a [decoded pool](Self::decoded_block_pool) admits.
@@ -446,6 +451,20 @@ impl ZakuraBlockSyncConfig {
             .and_then(|count| count.checked_add(backend_blocks))
             .and_then(std::num::NonZeroU64::new)
             .ok_or("decoded block-count allowance overflow")
+    }
+
+    /// Decoded bytes the pipeline may hold before gated work must wait or stay raw.
+    ///
+    /// This derives from what the reactor can request: the resident look-ahead budget,
+    /// one commit window of maximum-size blocks, and one response. The last two can
+    /// pass the look-ahead gate, so they carry the decoded multiple. The commit window
+    /// itself is exempt at submission and receipts fall back to raw bytes, so reaching
+    /// this bound delays only submissions above the window until earlier work finishes.
+    pub fn decoded_pipeline_byte_bound(&self) -> u64 {
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR
+            .saturating_add(u64::from(self.max_response_bytes))
+            .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR)
+            .saturating_add(self.effective_max_reorder_lookahead_bytes())
     }
 
     /// Return the resident look-ahead byte cap.

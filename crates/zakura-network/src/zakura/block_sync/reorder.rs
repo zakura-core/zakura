@@ -475,16 +475,18 @@ impl BufferedBlockBody {
     /// Return the decoded block, decoding from the retained raw bytes if needed
     /// and caching the decoded copy in place (the entry enters the decode
     /// window; `retain_for_backlog_in_place` is the matching downgrade).
+    /// A refused decode keeps the raw bytes for a later attempt.
     pub(super) fn decoded_block(
         &mut self,
         pool: &DecodedBlockPool,
+        admission: Admission,
     ) -> Result<BlockHandle, AdmissionFailure> {
         match self {
             BufferedBlockBody::Decoded { block, .. }
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => Ok(block.clone()),
             BufferedBlockBody::RawFramePayload(payload) => {
                 let block = pool
-                    .try_admit(decode_raw_frame_payload(payload), Admission::WithinLimit)
+                    .try_admit(decode_raw_frame_payload(payload), admission)
                     .map_err(|rejected| rejected.reason)?;
                 let decoded_attributed_memory_size_bytes = block.decoded_bytes();
                 let block = BlockHandle::Owned(block);

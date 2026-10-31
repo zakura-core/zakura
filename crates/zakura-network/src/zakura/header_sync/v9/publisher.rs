@@ -539,11 +539,11 @@ async fn publish<const HEADER_BYTES: usize>(
 
 /// Write `terminal` on `send`, and report the result to state.
 ///
-/// A full queue must not keep a cancelled session's task alive, hide a page
-/// job's panic, or stop another subscription's page. That page settles at
-/// once: its job gives its execution slots back, and a page that holds the
-/// queue slot this terminal waits for is queued instead of kept. A page whose
-/// subscription ended in the same batch fails its commit and is dropped.
+/// The terminal waits for no queue slot, so its first poll ends this wait.
+/// Before it, a cancelled session stops here, a page job's panic surfaces, and
+/// another subscription's finished page settles: its job gives its execution
+/// slots back. A page whose subscription ended in the same batch fails its
+/// commit and is dropped.
 async fn write_terminal<'a>(
     shared: &Mutex<PublisherOwner>,
     selected: &watch::Receiver<Option<EngineSnapshot>>,

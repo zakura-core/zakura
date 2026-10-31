@@ -2,7 +2,7 @@
 
 use super::read_close_cause::Link;
 use super::*;
-use crate::zakura::regulation::{OutputByteBudget, SlotBudget};
+use crate::zakura::{regulation::OutputByteBudget, RequestResponseService};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a test watches for something that must not happen.
@@ -87,7 +87,10 @@ async fn a_saturated_gate_holds_the_payload_until_capacity_returns() -> Result<(
 #[tokio::test]
 async fn a_saturated_node_delivers_another_streams_floor_frame() -> Result<(), BoxError> {
     let mut link = Link::connect().await?;
-    let node = NodeResources::new(ResourceEnvelope::new(1 << 20, 1 << 20, 1));
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+        1 << 20,
+        1,
+    )));
     let connection = node.connection();
     let (raw_hold, output_hold) = node.hold_node_budgets();
     let held_raw = node.usage().raw_bytes;
@@ -168,7 +171,10 @@ async fn a_saturated_node_delivers_another_streams_floor_frame() -> Result<(), B
 async fn cancelling_a_partial_frame_returns_its_admission() -> Result<(), BoxError> {
     let mut link = Link::connect().await?;
     let mut context = tabled_context(None, 128);
-    let node = NodeResources::new(ResourceEnvelope::new(1 << 20, 1 << 20, 1));
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+        1 << 20,
+        1,
+    )));
     let (gate, budget) = raw_gate(1 << 20);
     context.resources = node.connection().stream();
     context.resources.raw = gate;
@@ -206,69 +212,106 @@ async fn cancelling_a_partial_frame_returns_its_admission() -> Result<(), BoxErr
     Ok(())
 }
 
-/// A request waits for an execution slot before its service runs. Cancelling
-/// that wait ends the worker, and the raw frame's charge ends with it.
+/// A request service that answers only after the test releases it.
+#[derive(Debug)]
+struct WaitingRequests {
+    streams: [Stream; 1],
+    calls: Arc<Semaphore>,
+}
+
+impl Service for WaitingRequests {
+    fn name(&self) -> &'static str {
+        "waiting-requests"
+    }
+    fn streams(&self) -> &[Stream] {
+        &self.streams
+    }
+    fn as_request_response(&self) -> Option<&dyn RequestResponseService> {
+        Some(self)
+    }
+    fn add_peer(&self, _peer: Peer) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+}
+
+impl RequestResponseService for WaitingRequests {
+    fn request_frame<'a>(
+        &'a self,
+        _peer_id: ZakuraPeerId,
+        _stream_kind: u16,
+        _request_id: u64,
+        _max_frame_bytes: u32,
+        _max_message_bytes: u32,
+        _frame: Frame,
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
+        Box::pin(async move {
+            let _call = self.calls.acquire().await;
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Every open request runs at once, with no execution slot to wait for. Each
+/// keeps its raw frame's charge until its call ends or its connection cancels.
 #[tokio::test]
-async fn a_request_waits_for_an_execution_slot_and_cancels_cleanly() -> Result<(), BoxError> {
+async fn concurrent_requests_all_run_and_settle_their_raw_charges() -> Result<(), BoxError> {
+    // The test link allows two open streams.
+    const REQUESTS: u64 = 2;
     let mut link = Link::connect().await?;
-    let mut context = tabled_context(None, 128);
-    let workers = SlotBudget::new(1).unwrap();
-    let held = workers.try_reserve().unwrap();
     let (gate, budget) = raw_gate(1 << 20);
-    context.resources.request_workers = workers.clone();
-    context.resources.raw = gate;
-    let cancel = context.connection_token.clone();
+    let calls = Arc::new(Semaphore::new(0));
+    let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(WaitingRequests {
+        streams: [Stream {
+            kind: 900,
+            version: 1,
+            frame_cap: 1024,
+            capability: 1 << 20,
+            ..Stream::REQUEST_RESPONSE
+        }],
+        calls: calls.clone(),
+    })])?);
 
     let bytes = frame_bytes(1, 16);
-    let (_peer_send, _peer_recv, send, recv) = link.open(&bytes).await?;
-    let worker = AbortOnDropHandle::new(tokio::spawn(request_stream_worker(
-        send,
-        recv,
-        prelude(Some(1)),
-        context,
-        Arc::new(ServiceRegistry::new(vec![])?),
-    )));
+    let mut held = Vec::new();
+    let mut workers = Vec::new();
+    let mut cancel = None;
+    for request in 0..REQUESTS {
+        let mut context = tabled_context(None, 128);
+        context.resources.raw = gate.clone();
+        cancel = Some(context.connection_token.clone());
+        let (peer_send, peer_recv, send, recv) = link.open(&bytes).await?;
+        held.push((peer_send, peer_recv));
+        workers.push(AbortOnDropHandle::new(tokio::spawn(request_stream_worker(
+            send,
+            recv,
+            prelude(Some(request)),
+            context,
+            registry.clone(),
+        ))));
+    }
     timeout(TEST_TIMEOUT, async {
-        while budget.granted() != 24 {
+        while budget.granted() != REQUESTS * 24 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await?;
     tokio::time::sleep(HELD).await;
-    assert!(!worker.is_finished(), "the request waits for its slot");
-    assert_eq!(budget.granted(), 24, "the waiting request keeps its frame");
+    assert_eq!(
+        budget.granted(),
+        REQUESTS * 24,
+        "the calls keep their frames"
+    );
 
-    cancel.cancel();
-    timeout(TEST_TIMEOUT, worker).await??;
+    // Cancellation ends the last call, and the release ends the other.
+    let cancelled = workers.pop().ok_or("the test opened requests")?;
+    cancel.ok_or("the test opened requests")?.cancel();
+    timeout(TEST_TIMEOUT, cancelled).await??;
+    assert_eq!(budget.granted(), (REQUESTS - 1) * 24);
+
+    calls.add_permits(usize::try_from(REQUESTS)?);
+    for worker in workers {
+        timeout(TEST_TIMEOUT, worker).await??;
+    }
     assert_eq!(budget.granted(), 0);
-    drop(held);
-    assert!(workers.try_reserve().is_some());
-    link.close().await;
-    Ok(())
-}
-
-/// When a slot is free the request runs and the slot returns with its call.
-#[tokio::test]
-async fn a_request_returns_its_slot_with_its_call() -> Result<(), BoxError> {
-    let mut link = Link::connect().await?;
-    let mut context = tabled_context(None, 128);
-    let workers = SlotBudget::new(1).unwrap();
-    context.resources.request_workers = workers.clone();
-
-    let bytes = frame_bytes(1, 16);
-    let (_peer_send, _peer_recv, send, recv) = link.open(&bytes).await?;
-    timeout(
-        TEST_TIMEOUT,
-        request_stream_worker(
-            send,
-            recv,
-            prelude(Some(1)),
-            context,
-            Arc::new(ServiceRegistry::new(vec![])?),
-        ),
-    )
-    .await?;
-    assert_eq!(workers.reserved(), 0);
     link.close().await;
     Ok(())
 }
@@ -277,7 +320,10 @@ async fn a_request_returns_its_slot_with_its_call() -> Result<(), BoxError> {
 /// that carries them leaves nothing, as the connection loop's teardown does.
 #[test]
 fn dropped_stream_resources_leave_no_owner() {
-    let node = NodeResources::new(ResourceEnvelope::new(1 << 20, 1 << 20, 1));
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+        1 << 20,
+        1,
+    )));
     let resources = node.connection().stream();
     let setup = async move {
         let _resources = resources;

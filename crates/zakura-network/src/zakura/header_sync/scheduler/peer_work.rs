@@ -739,7 +739,7 @@ mod tests {
     use super::*;
     use crate::zakura::{
         header_sync::{wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, MAX_HS_RANGE},
-        transport::{NodeResources, ResourceEnvelope},
+        transport::{NodeResources, ResourceEnvelope, TransportLimits},
     };
     use zakura_chain::{block, block::genesis::regtest_genesis_block, work::difficulty::U256};
     use zakura_header_chain::{
@@ -755,7 +755,7 @@ mod tests {
     /// saturating either leaves the other's capacity free.
     #[test]
     fn header_chunk_capacity_is_independent_of_transport_saturation() {
-        let node = NodeResources::new(ResourceEnvelope::new(64, 64, 1));
+        let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(64, 1)));
         let stream = node.connection().stream();
         let budget = HeaderChunkBudget::default();
 

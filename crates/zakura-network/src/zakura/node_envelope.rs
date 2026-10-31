@@ -8,7 +8,8 @@
 //! buffers until a reader takes them, and to a raw grant afterwards. The peer memory
 //! budget funds the former and the transport envelope funds the latter. TCP decoders
 //! hold their incomplete messages under a connection limit of their own. Decoded
-//! block memory counts blocks, not bytes, so it stays a separate allowance.
+//! blocks stay a separate allowance: a count across every holder, and a byte limit
+//! only on what the block pipeline still holds.
 
 use std::num::NonZeroU64;
 
@@ -55,6 +56,7 @@ pub(crate) struct NodeEnvelopeInputs {
     pub(crate) max_frame_bytes: u32,
     pub(crate) peer_memory_budget_bytes: u64,
     pub(crate) tcp_connections: usize,
+    pub(crate) decoded_pipeline_bytes: u64,
 }
 
 /// The bounds of every owner family on one node.
@@ -64,12 +66,16 @@ pub(crate) struct NodeEnvelope {
     pub(crate) owners: OwnerBound,
     /// The most frame bytes that transport owners retain.
     pub(crate) transport_bytes: u128,
+    /// The most request-stream executions that open streams allow at once.
+    pub(crate) request_executions: usize,
     /// The most bytes in QUIC's buffers and the sockets' queues.
     pub(crate) quic_bytes: u64,
     /// The most bytes that TCP decoders hold for incomplete messages.
     pub(crate) tcp_ingress_bytes: u64,
     /// The most blocks that the decoded pool admits within its limit.
     pub(crate) decoded_blocks: u64,
+    /// The most decoded bytes that the block pipeline holds within its limit.
+    pub(crate) decoded_pipeline_bytes: u64,
 }
 
 impl NodeEnvelope {
@@ -122,14 +128,12 @@ impl NodeEnvelope {
 
         Ok(Self {
             owners,
-            transport_bytes: inputs.transport.retained_bytes_bound(
-                inputs.max_connections,
-                inputs.max_open_streams,
-                inputs.max_frame_bytes,
-            ),
+            transport_bytes: inputs.transport.retained_frame_bytes(),
+            request_executions: inputs.transport.request_executions,
             quic_bytes: inputs.peer_memory_budget_bytes,
             tcp_ingress_bytes,
             decoded_blocks: decoded_blocks.get(),
+            decoded_pipeline_bytes: inputs.decoded_pipeline_bytes,
         })
     }
 
@@ -150,6 +154,7 @@ impl NodeEnvelope {
                 max_frame_bytes: limits.max_frame_bytes,
                 peer_memory_budget_bytes: config.zakura.peer_memory_budget_bytes,
                 tcp_connections: config.peerset_total_connection_limit(),
+                decoded_pipeline_bytes: config.zakura.block_sync.decoded_pipeline_byte_bound(),
             },
             decoded_allowance(&config.zakura.block_sync, decoded_backend_blocks)?,
         )

@@ -1448,11 +1448,15 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
     };
     Stream::check_layout(&[stream])?;
     let limits = raw_worker_context(&client, Arc::new(Semaphore::new(1))).limits;
-    let node = NodeResources::new(ResourceEnvelope::new(1 << 20, 1 << 20, 1));
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+        1 << 20,
+        1,
+    )));
     let resources = node.connection();
 
     // A saturated partition holds the exchange back before its stream opens.
-    let capacity = ResourceEnvelope::new(1 << 20, 1 << 20, 1).compat_response_bytes;
+    let capacity =
+        ResourceEnvelope::new(TransportLimits::with_windows(1 << 20, 1)).compat_response_bytes;
     let saturated = resources.admit_compat_response(capacity).await;
     let blocked = write_outbound_request_frame(
         &connection,

@@ -16,7 +16,10 @@ use crate::{
     config::Config,
     zakura::{
         regulation::{test_family, OutputByteBudget, ServeCapacity, ServeLimits, SessionCapacity},
-        transport::{ByteBudget, FrameGate, NodeResources, NodeUsage, OwnerCounts, OwnerPhase},
+        transport::{
+            ByteBudget, FrameGate, NodeResources, NodeUsage, OwnerCounts, OwnerPhase,
+            TransportLimits,
+        },
         ServicePeerDirection, ServicePeerLimits,
     },
 };
@@ -37,7 +40,14 @@ const SERVE_LIMITS: ServeLimits = ServeLimits {
 };
 
 fn transport() -> ResourceEnvelope {
-    ResourceEnvelope::new(WINDOW, WINDOW, MAX_CONNECTIONS)
+    ResourceEnvelope::new(TransportLimits {
+        receive_window: WINDOW as u32,
+        send_window: WINDOW,
+        max_connections: MAX_CONNECTIONS,
+        max_pending_handshakes: 1,
+        max_open_streams: MAX_OPEN_STREAMS,
+        max_frame_bytes: MAX_FRAME_BYTES,
+    })
 }
 
 fn inputs() -> NodeEnvelopeInputs {
@@ -51,6 +61,7 @@ fn inputs() -> NodeEnvelopeInputs {
         max_frame_bytes: MAX_FRAME_BYTES,
         peer_memory_budget_bytes: 1 << 20,
         tcp_connections: 3,
+        decoded_pipeline_bytes: 1 << 30,
     }
 }
 
@@ -59,7 +70,7 @@ fn bound() -> OwnerBound {
 }
 
 fn retained_bound() -> u128 {
-    transport().retained_bytes_bound(MAX_CONNECTIONS, MAX_OPEN_STREAMS, MAX_FRAME_BYTES)
+    transport().retained_frame_bytes()
 }
 
 fn block() -> Block {
@@ -170,6 +181,11 @@ fn the_byte_bound_adds_each_owner_once() {
     let envelope = NodeEnvelope::new(inputs(), NonZeroU64::MIN).expect("the inputs fit");
 
     assert_eq!(envelope.transport_bytes, retained_bound());
+    assert_eq!(
+        envelope.request_executions,
+        MAX_CONNECTIONS * usize::from(MAX_OPEN_STREAMS)
+    );
+    assert_eq!(envelope.decoded_pipeline_bytes, 1 << 30);
     assert_eq!(
         envelope.retained_bytes_bound(),
         retained_bound() + (1 << 20) + 3 * MAX_INCOMPLETE_MESSAGE_BYTES as u128
@@ -290,10 +306,6 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
             .admit_compat_response(1)
             .now_or_never()
             .expect("the compatibility partition is separate from raw bytes");
-        let worker = blocks
-            .request_workers
-            .try_reserve()
-            .expect("request workers are separate from frame bytes");
 
         let backend = ByteBudget::new(1 << 10);
         let reservation = backend
@@ -309,7 +321,6 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
 
         let usage = node.report_usage(bound());
         assert!(bound().admits(&usage.owners));
-        assert_eq!(usage.request_workers, 1);
         assert!(
             u128::from(usage.raw_bytes)
                 + u128::from(usage.output_bytes)
@@ -317,7 +328,6 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
                 <= retained_bound()
         );
 
-        drop(worker);
         drop(compat);
         drop(reservation);
         drop(retained);

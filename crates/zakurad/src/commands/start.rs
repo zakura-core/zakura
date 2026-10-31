@@ -501,10 +501,10 @@ impl StartCmd {
             .network
             .v2_p2p()
             .then(|| read_only_state_service.subscribe_header_runtime_status());
-        let legacy_bootstrap_needed = zakura_bootstrap_runtime_status
-            .as_ref()
-            .is_some_and(|status| !status.borrow().is_ready());
-        let zakura_block_sync_handoff = if legacy_bootstrap_needed {
+        // Zakura block sync always runs `bootstrap_genesis_then_pause`, whose handoff only
+        // succeeds from `LegacyBootstrap`. Don't key this on header runtime readiness, because
+        // the state can publish Ready before this line runs when the durable chain is tiny.
+        let zakura_block_sync_handoff = if use_zakura_block_sync(&config.network) {
             zakura::SyncCoordinator::new_legacy_bootstrap()
         } else {
             zakura::SyncCoordinator::new()

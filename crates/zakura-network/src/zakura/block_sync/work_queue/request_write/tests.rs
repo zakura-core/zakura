@@ -1386,6 +1386,115 @@ fn funding_drift_closes_publication_and_survives_reset() {
 }
 
 #[test]
+fn accounting_closure_wakes_after_the_queue_unlocks() {
+    use std::{
+        future::Future,
+        task::{Context, Wake, Waker},
+    };
+    use zakura_rt::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct ClosureWake {
+        work: Arc<WorkQueue>,
+        woke_locked: AtomicBool,
+        count: AtomicUsize,
+    }
+    impl Wake for ClosureWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            if matches!(
+                self.work.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                self.woke_locked.store(true, Ordering::SeqCst);
+            }
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    for operation in 0..5 {
+        let mut f = Fixture::new();
+        let reader = f.budget.closure_reader();
+        let mut closed = Box::pin(reader.closed());
+        let wake = Arc::new(ClosureWake {
+            work: f.work.clone(),
+            woke_locked: AtomicBool::new(false),
+            count: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        drop(f.budget.reserve_owned(17).unwrap());
+        assert_eq!(
+            wake.count.load(Ordering::SeqCst),
+            0,
+            "normal release must not signal closure"
+        );
+        let mut held = Vec::new();
+        let mut claims = Vec::new();
+        match operation {
+            0 => {
+                f.work
+                    .lock()
+                    .funding
+                    .merge(&mut f.budget.reserve_owned(1).unwrap())
+                    .unwrap();
+                assert!(!f.work.audit_funding());
+            }
+            1 | 2 => {
+                let claim = f.take(1).publish(|_| {}).unwrap();
+                assert!(claim.try_start());
+                held.push(f.work.lock().funding.split(150).unwrap());
+                if operation == 1 {
+                    assert!(f
+                        .work
+                        .begin_receipt_for_owner(claim.owner(), block::Height(1))
+                        .is_err());
+                } else {
+                    f.work.reset_above(block::Height(0));
+                }
+                claims.push(claim);
+            }
+            3 => {
+                let mut request = f.take(1);
+                held.push(request.funding.split(1).unwrap());
+                assert!(request
+                    .publish(|_| panic!("underfunded request published"))
+                    .is_none());
+            }
+            4 => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _lock = f.work.lock();
+                    f.budget.close(BudgetClosure::Funding {
+                        logical: 1,
+                        funded: 0,
+                    });
+                    panic!("interrupted accounting failure");
+                }));
+                assert!(result.is_err());
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            wake.count.load(Ordering::SeqCst) > 0,
+            "closure did not wake its waiter: {operation}"
+        );
+        assert!(
+            !wake.woke_locked.load(Ordering::SeqCst),
+            "closure woke under the queue lock: {operation}"
+        );
+        assert!(closed.as_mut().poll(&mut cx).is_ready());
+        assert!(
+            Box::pin(reader.closed()).as_mut().poll(&mut cx).is_ready(),
+            "late registration observes closure"
+        );
+        drop(claims);
+        drop(held);
+    }
+}
+
+#[test]
 fn funding_drift_refuses_normal_and_floor_admission() {
     for floor in [block::Height(0), block::Height(1)] {
         let f = Fixture::new();

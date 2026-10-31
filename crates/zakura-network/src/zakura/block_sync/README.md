@@ -105,8 +105,13 @@ The sequencer publishes `accounting_closed` in its view and block-state trace.
 Fill passes report `accounting_closed` separately from capacity exhaustion.
 Typed admission refusals also distinguish cancellation and stale claims.
 
-The current implementation requires a process restart after accounting closure.
-It provides no automatic subsystem replacement or in-place recovery.
+The queue guard notifies closure waiters after unlocking, including during unwind.
+Counter release also publishes closure if its arithmetic fails. The driver reads
+this signal independently of action-queue capacity and sequencer-view publication.
+It stops starting verification work, discards queued work, and drains its in-flight
+verification futures. Its exit triggers the existing critical-driver supervisor,
+which starts node shutdown. Recovery requires a new process. The old budget never
+reopens, and the node creates no replacement subsystem in the same process.
 
 ## Look-ahead rules: `admit()` and the commit window
 

@@ -35,11 +35,35 @@ pub(crate) struct ByteBudget {
     inner: Arc<ByteBudgetInner>,
 }
 
+/// A closure signal with no reservation or settlement authority.
+#[derive(Clone, Debug)]
+pub(crate) struct BudgetClosureReader(Arc<ByteBudgetInner>);
+
+impl BudgetClosureReader {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    /// Wait for permanent closure, including closure before registration.
+    pub(crate) async fn closed(&self) {
+        loop {
+            let notified = self.0.closure.notified();
+            zakura_rt::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ByteBudgetInner {
     max_bytes: u64,
     reserved_bytes: AtomicU64,
     closed: AtomicBool,
+    closure: Notify,
     /// Notified whenever bytes are released/shrunk, so a consumer blocked on a
     /// full budget can re-check capacity. Uses `notify_waiters` (no stored
     /// permit), so a waiter must register `subscribe_capacity().notified()`
@@ -105,6 +129,16 @@ pub(crate) struct ByteReservation {
 pub(crate) struct ByteRelease<'a> {
     budget: &'a ByteBudget,
     bytes: u64,
+}
+
+/// Publishes closure after the caller releases its synchronization guard.
+#[must_use = "retain this notification until the protected lock is released"]
+pub(crate) struct BudgetClosureNotification<'a>(&'a ByteBudget);
+
+impl Drop for BudgetClosureNotification<'_> {
+    fn drop(&mut self) {
+        self.0.publish_closure();
+    }
 }
 
 impl Drop for ByteRelease<'_> {
@@ -286,6 +320,7 @@ impl ByteBudget {
                 max_bytes,
                 reserved_bytes: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
+                closure: Notify::new(),
                 capacity: Notify::new(),
                 #[cfg(any(test, zakura_sim))]
                 observer: None,
@@ -320,6 +355,9 @@ impl ByteBudget {
         self.inner.closed.load(Ordering::Acquire)
     }
 
+    /// Close admission immediately. The caller must retain a deferred closure
+    /// notification until its locks are released. Counter release publishes its
+    /// own closure notification after settlement.
     pub(crate) fn close(&self, cause: BudgetClosure) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             metrics::counter!("sync.block.budget.closed").increment(1);
@@ -330,6 +368,20 @@ impl ByteBudget {
                 "block request accounting closed; retained owners remain charged"
             );
         }
+    }
+
+    pub(crate) fn defer_closure_notification(&self) -> BudgetClosureNotification<'_> {
+        BudgetClosureNotification(self)
+    }
+
+    fn publish_closure(&self) {
+        if self.is_closed() {
+            self.inner.closure.notify_waiters();
+        }
+    }
+
+    pub(crate) fn closure_reader(&self) -> BudgetClosureReader {
+        BudgetClosureReader(self.inner.clone())
     }
 
     pub(crate) fn available(&self) -> u64 {
@@ -395,6 +447,7 @@ impl ByteBudget {
     /// it wakes runs. Does nothing for 0 bytes.
     fn release_then(&self, bytes: u64, released: impl FnOnce()) {
         if bytes == 0 {
+            self.publish_closure();
             return;
         }
         let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
@@ -419,6 +472,7 @@ impl ByteBudget {
             }
         }
         released();
+        self.publish_closure();
         self.inner.capacity.notify_waiters();
     }
 
@@ -696,10 +750,34 @@ mod tests {
 
     #[test]
     fn underflow_keeps_charge_and_closes_all_admission() {
+        use std::{
+            future::Future,
+            task::{Context, Wake, Waker},
+        };
+        struct ClosureWake(std::sync::atomic::AtomicUsize);
+        impl Wake for ClosureWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut budget = ByteBudget::new(1_000);
         let funding = budget.reserve_owned(400).unwrap();
         let clone = budget.clone();
+        let reader = budget.closure_reader();
+        let mut closed = Box::pin(reader.closed());
+        let wake = Arc::new(ClosureWake(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
         budget.release(401);
+        assert!(
+            wake.0.load(Ordering::SeqCst) > 0,
+            "counter failure must notify closure"
+        );
+        assert!(closed.as_mut().poll(&mut cx).is_ready());
         assert!(clone.is_closed());
         assert_eq!(clone.reserved(), 400);
         assert_eq!(clone.available(), 0);

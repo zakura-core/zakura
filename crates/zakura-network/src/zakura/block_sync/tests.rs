@@ -7119,6 +7119,50 @@ fn block_budget_ledger_releases_reserved_exactly_once() {
     assert_eq!(released.release_reserved(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn reactor_handle_observes_its_actual_request_budget_closing() {
+    let (_tip, handle, _actions, reactor) = spawn_genesis_reactor(ZakuraBlockSyncConfig::default());
+    let work = &handle.routine_wiring.as_ref().unwrap().work;
+    work.set_estimate_floor_for_tests(1);
+    work.extend(
+        test_work_scope(),
+        [(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Confirmed(100),
+        )],
+    );
+    let claim = work
+        .take_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            100,
+            7,
+            std::num::NonZeroU64::new(1).unwrap(),
+        )
+        .admit(block::Height(0), CancellationToken::new())
+        .unwrap()
+        .publish(|_| {})
+        .unwrap();
+    let mut closed = Box::pin(handle.accounting_closed());
+    assert!(futures::poll!(&mut closed).is_pending());
+    let retained = work.retain_funding_for_test(1);
+    assert!(!work.audit_funding());
+    assert!(
+        futures::poll!(&mut closed).is_ready(),
+        "the real handle must read the queue's closed budget"
+    );
+    assert_eq!(
+        work.budget().reserved(),
+        100,
+        "signaling closure cannot erase held funding"
+    );
+    drop(claim);
+    drop(retained);
+    reactor.abort();
+}
+
 #[test]
 fn received_body_admission_ignores_request_budget() {
     // A received body consumes no request budget, so a wire budget saturated by
@@ -7999,6 +8043,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
+        accounting: ByteBudget::new(config.max_inflight_block_bytes).closure_reader(),
         events,
         lifecycle,
         needed_query_failures,

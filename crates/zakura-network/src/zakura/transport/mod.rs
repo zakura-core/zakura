@@ -26,8 +26,8 @@ pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 pub(crate) use guard::BudgetObserver;
 #[allow(unused_imports)]
 pub(crate) use guard::{
-    Admit, BudgetClosure, ByteBudget, ByteRelease, ByteReservation, PeerMeters, ReservationError,
-    SessionGuard,
+    Admit, BudgetClosure, BudgetClosureNotification, BudgetClosureReader, ByteBudget, ByteRelease,
+    ByteReservation, PeerMeters, ReservationError, SessionGuard,
 };
 #[cfg(any(test, zakura_sim))]
 pub use guard::{BudgetChange, BudgetChangeKind};

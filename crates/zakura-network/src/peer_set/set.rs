@@ -241,6 +241,10 @@ where
 
     /// Senders for the current ready and busy connection generations.
     block_gossip_peers: HashMap<D::Key, BlockGossipPeer>,
+    /// Publishes `block_gossip_peers` to block advertisers, which do not wait for a ready peer.
+    block_gossip_peers_tx: watch::Sender<Vec<BlockGossipPeer>>,
+    /// Whether `block_gossip_peers` changed since it was last published.
+    block_gossip_peers_changed: bool,
     /// Share the cap across early, committed, and concurrent block broadcasts.
     block_gossip_slots: Arc<tokio::sync::Semaphore>,
 
@@ -385,6 +389,8 @@ where
             inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
             queued_broadcast_all: VecDeque::new(),
             block_gossip_peers: HashMap::new(),
+            block_gossip_peers_tx: watch::channel(Vec::new()).0,
+            block_gossip_peers_changed: false,
             block_gossip_slots: Arc::new(tokio::sync::Semaphore::new(BLOCK_GOSSIP_CONCURRENCY)),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
@@ -492,6 +498,7 @@ where
         // Drop services and cancel their background tasks.
         self.ready_services = HashMap::new();
         self.block_gossip_peers.clear();
+        self.block_gossip_peers_tx.send_replace(Vec::new());
 
         for (_peer_key, handle) in self.cancel_handles.drain() {
             let _ = handle.send(CancelClientWork);
@@ -1003,6 +1010,7 @@ where
         let mut peer = svc.block_gossip.clone();
         peer.sidecar = self.is_zcashd_compat_peer(svc);
         self.block_gossip_peers.insert(key, peer);
+        self.block_gossip_peers_changed = true;
     }
 
     /// Returns true if `service` is a configured zcashd sidecar peer.
@@ -1351,34 +1359,39 @@ where
         });
         // A minimum version increase cancels busy outdated peers only after their current work.
         let minimum_version = self.minimum_peer_version.current();
-        let peers = crate::peer::block_gossip::order_peers(
-            self.block_gossip_peers
-                .values()
-                .filter(|peer| peer.version >= minimum_version)
-                .cloned()
-                .collect(),
+        let peers = self
+            .block_gossip_peers
+            .values()
+            .filter(|peer| peer.version >= minimum_version)
+            .cloned()
+            .collect();
+        crate::peer::block_gossip::broadcast_block(
+            peers,
+            hash,
             mined,
-            &mut rand_10::rng(),
-        );
-        let slots = self.block_gossip_slots.clone();
-        async move {
-            let mut sends = futures::stream::iter(
-                peers
-                    .into_iter()
-                    .map(|peer| peer.advertise(hash, slots.clone())),
-            )
-            .buffer_unordered(BLOCK_GOSSIP_CONCURRENCY);
-            let mut succeeded = false;
-            while let Some(sent) = sends.next().await {
-                succeeded |= sent;
-            }
-            if succeeded {
-                Ok(Response::Nil)
-            } else {
-                Err(std::io::Error::other("block broadcast reached no peers").into())
-            }
+            self.block_gossip_slots.clone(),
+        )
+    }
+
+    /// Publishes the block gossip peers to block advertisers, if they changed.
+    fn publish_block_gossip_peers(&mut self) {
+        if std::mem::take(&mut self.block_gossip_peers_changed) {
+            self.block_gossip_peers_tx
+                .send_replace(self.block_gossip_peers.values().cloned().collect());
         }
-        .boxed()
+    }
+
+    /// Returns a block advertiser that reaches this peer set's connected peers, including busy
+    /// ones, without waiting for the peer set to have a ready peer.
+    pub(crate) fn block_advertiser(&self) -> crate::peer::block_gossip::BlockAdvertiser<C>
+    where
+        C: Clone,
+    {
+        crate::peer::block_gossip::BlockAdvertiser {
+            peers: self.block_gossip_peers_tx.subscribe(),
+            slots: self.block_gossip_slots.clone(),
+            minimum_peer_version: self.minimum_peer_version.clone(),
+        }
     }
 
     /// Broadcasts the same request and succeeds after at least one peer accepts it.
@@ -1656,9 +1669,12 @@ where
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
         let ready_peers = self.poll_peers(cx)?;
+        let block_gossip_peers = self.block_gossip_peers.len();
         self.block_gossip_peers.retain(|key, _| {
             self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
         });
+        self.block_gossip_peers_changed |= self.block_gossip_peers.len() != block_gossip_peers;
+        self.publish_block_gossip_peers();
 
         // Peers leave the set through many paths. Pruning here, instead of at each
         // path, keeps stall counts bounded by the live peers.

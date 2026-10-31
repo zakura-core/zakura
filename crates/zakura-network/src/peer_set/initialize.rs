@@ -332,6 +332,7 @@ where
             .with_latest_chain_tip(latest_chain_tip.clone())
             .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
+            .with_bans(bans.clone())
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {
@@ -384,6 +385,8 @@ where
         .as_ref()
         .map(ZakuraEndpoint::background_shutdown_token)
         .unwrap_or_default();
+    // Block advertisements must reach busy peers, so they bypass the buffer's readiness wait.
+    let block_advertiser = peer_set.block_advertiser();
     // Using Buffer::pair returns the background service, letting us inject our cancellation
     let (peer_set, worker) =
         Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
@@ -520,6 +523,16 @@ where
                 .collect(),
         )
         .unwrap();
+
+    // Send block advertisements through the advertiser, so they don't wait for a ready peer.
+    // The crawler and candidate set above keep using the unwrapped peer set.
+    let peer_set = spawn_buffer(
+        BoxService::new(RouteBlockAdverts {
+            peer_set,
+            block_advertiser,
+        }),
+        constants::PEERSET_BUFFER_SIZE,
+    );
 
     // When the Zakura endpoint is active, wrap the legacy peer set so locally
     // originated gossip and inventory fetches also flow over Zakura. The internal
@@ -1675,4 +1688,44 @@ async fn report_failed(
 
     // Ignore send errors on Zebra shutdown.
     let _ = address_book_updater.send(addr).await;
+}
+
+/// Routes block advertisements to a [`BlockAdvertiser`], and every other request to the
+/// buffered peer set.
+///
+/// The peer set only accepts a request once it has a ready peer, and a peer awaiting a response
+/// is not ready. Block advertisements don't expect a response, so they must not wait for one.
+///
+/// [`BlockAdvertiser`]: crate::peer::block_gossip::BlockAdvertiser
+#[derive(Clone)]
+struct RouteBlockAdverts<P, C> {
+    peer_set: P,
+    block_advertiser: crate::peer::block_gossip::BlockAdvertiser<C>,
+}
+
+impl<P, C> Service<Request> for RouteBlockAdverts<P, C>
+where
+    P: Service<Request, Response = Response, Error = BoxError> + Clone + Send + 'static,
+    P::Future: Send + 'static,
+    C: ChainTip,
+{
+    type Response = Response;
+    type Error = BoxError;
+    type Future = futures::future::BoxFuture<'static, Result<Response, BoxError>>;
+
+    /// Always ready: each request waits for the peer set inside its own future, so a block
+    /// advertisement is never queued behind a request that is waiting for a ready peer.
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        if crate::peer::block_gossip::BlockAdvertiser::<C>::handles(&request) {
+            return self.block_advertiser.advertise(request);
+        }
+        self.peer_set.clone().oneshot(request).boxed()
+    }
 }

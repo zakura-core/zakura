@@ -802,7 +802,8 @@ fn block_gossip_skips_busy_outdated_peers() {
         let (cancel, _cancel_rx) =
             crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
         peer_set.cancel_handles.insert(outdated_addr, cancel);
-        let (sender, mut outdated) = futures::channel::mpsc::channel(0);
+        let (sender, mut outdated) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
         peer_set.block_gossip_peers.insert(
             outdated_addr,
             crate::peer::block_gossip::BlockGossipPeer {
@@ -818,11 +819,10 @@ fn block_gossip_skips_busy_outdated_peers() {
         let _broadcast =
             tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
         tokio::task::yield_now().await;
-        let request = handles[0]
-            .try_to_receive_outbound_client_request()
-            .request()
+        let advert = handles[0]
+            .try_to_receive_block_advert()
             .expect("the supported peer receives the advertisement");
-        assert_eq!(request.request, Request::AdvertiseBlock(hash, None));
+        assert_eq!(advert.hash, hash);
         assert!(
             outdated.try_recv().is_err(),
             "outdated peer receives nothing"
@@ -1816,22 +1816,18 @@ fn find_blocks_stall_event_for_departed_peer_is_ignored() {
     });
 }
 
-/// Returns the block hash of the next `AdvertiseBlock` request the mock peer
-/// received, or `None` if it received nothing. Panics on any other request.
+/// Returns the block hash of the next block advert the mock peer received, or `None` if it
+/// received nothing. Panics if the peer received an ordinary request instead.
 fn recv_advertise_block(handle: &mut ClientTestHarness) -> Option<block::Hash> {
-    match handle.try_to_receive_outbound_client_request().request() {
-        Some(ClientRequest {
-            request: Request::AdvertiseBlock(hash, _),
-            tx,
-            ..
-        }) => {
-            tx.send(Ok(Response::Nil))
-                .expect("broadcast awaits the response");
-            Some(hash)
-        }
-        Some(other) => panic!("unexpected outbound request: {:?}", other.request),
-        None => None,
+    if let Some(other) = handle.try_to_receive_outbound_client_request().request() {
+        panic!("unexpected outbound request: {:?}", other.request);
     }
+    let advert = handle.try_to_receive_block_advert()?;
+    advert
+        .result
+        .send(Ok(()))
+        .expect("broadcast awaits the write");
+    Some(advert.hash)
 }
 
 /// Builds a discovery stream of two ready inbound-direct peers: a sidecar at
@@ -1912,5 +1908,70 @@ fn unready_sidecar_block_gossip_is_delivered() {
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
         assert!(broadcast.await.unwrap().is_ok());
         assert_eq!(recv_advertise_block(&mut sidecar_handle), None);
+    });
+}
+
+/// The block advertiser reaches busy peers while the peer set has no ready peer, so a block is
+/// not held behind requests waiting for one, such as a `getblocks` to a peer at our tip.
+#[test]
+fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+    let (discovered, sidecar_addr, ordinary_addr, mut sidecar_handle, mut ordinary_handle) =
+        sidecar_and_ordinary_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .with_block_gossip_peer_ips(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .build();
+        peer_set.ready().await.unwrap();
+        let mut advertiser = peer_set.block_advertiser();
+
+        // Every peer is busy, so the peer set would not accept an ordinary request.
+        for addr in [sidecar_addr, ordinary_addr] {
+            let peer = peer_set.take_ready_service(&addr).unwrap();
+            peer_set.push_unready(addr, peer);
+        }
+        assert!(peer_set.ready_services.is_empty());
+
+        let hash = block::Hash([8; 32]);
+        let broadcast = tokio::spawn(advertiser.advertise(Request::AdvertiseMinedBlock(hash)));
+        tokio::task::yield_now().await;
+        assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
+        assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
+        assert!(broadcast.await.unwrap().is_ok());
+    });
+}
+
+/// The block advertiser waits for a peer instead of failing while none is connected.
+#[test]
+fn block_advertiser_waits_for_a_connected_peer() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(futures::stream::pending::<
+                Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>,
+            >())
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+        let mut advertiser = peer_set.block_advertiser();
+        let broadcast = advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32])));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), broadcast)
+                .await
+                .is_err(),
+            "the advertisement waits for a peer"
+        );
     });
 }

@@ -367,11 +367,9 @@ fn sidecar_peer_always_receives_block_gossip() {
         let mut received = 0;
         let mut sidecar_received = false;
         for (index, handle) in handles.iter_mut().enumerate() {
-            if let ReceiveRequestAttempt::Request(request) =
-                handle.try_to_receive_outbound_client_request()
-            {
-                assert_eq!(request.request, Request::AdvertiseBlock(block_hash, None));
-                request.tx.send(Ok(crate::Response::Nil)).unwrap();
+            if let Some(advert) = handle.try_to_receive_block_advert() {
+                assert_eq!(advert.hash, block_hash);
+                advert.result.send(Ok(())).unwrap();
                 received += 1;
                 sidecar_received |= index == SIDECAR_INDEX;
             }
@@ -387,19 +385,14 @@ fn sidecar_peer_always_receives_block_gossip() {
         tokio::task::yield_now().await;
         // Inventory completion alone cannot start the remaining advertisements.
         for handle in &mut handles {
-            assert!(handle
-                .try_to_receive_outbound_client_request()
-                .request()
-                .is_none());
+            assert!(handle.try_to_receive_block_advert().is_none());
         }
         // Let the executor drain all first-wave responses before advancing paused time.
         tokio::time::sleep(std::time::Duration::from_millis(3001)).await;
         for handle in &mut handles {
-            if let ReceiveRequestAttempt::Request(request) =
-                handle.try_to_receive_outbound_client_request()
-            {
-                assert_eq!(request.request, Request::AdvertiseBlock(block_hash, None));
-                request.tx.send(Ok(crate::Response::Nil)).unwrap();
+            if let Some(advert) = handle.try_to_receive_block_advert() {
+                assert_eq!(advert.hash, block_hash);
+                advert.result.send(Ok(())).unwrap();
                 received += 1;
             }
         }

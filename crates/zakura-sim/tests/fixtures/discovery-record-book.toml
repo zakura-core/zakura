@@ -1,0 +1,9 @@
+harness = "discovery/record-book"
+generator = 2
+sha256 = "8941dfeecf6e6db0395461d8f06579972c3f75bc567a49b816870e1324623bf3"
+scenario_sha256 = "cd16c1102c099bd9ee0c889dd6d195eb0432b9c016e64440013bf460620c1dbc"
+source = "crates/zakura-sim/tests/replay_exact.rs"
+
+[[witness]]
+property = "discovery/record-book"
+expect = "holds"

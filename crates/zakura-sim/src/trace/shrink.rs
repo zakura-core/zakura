@@ -384,17 +384,20 @@ pub fn shrink_with(
 
 /// The direct machine decoder owns these bytes; scheduler inputs stay separate.
 fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
-    if !matches!(name, "block/work-ownership" | "block/work-funding") {
+    if !matches!(
+        name,
+        "discovery/record-book" | "discovery/session-installation"
+    ) {
         return None;
     }
-    serde_json::from_value::<crate::harness::block_work::Scenario>(scenario.clone())
+    serde_json::from_value::<crate::harness::discovery_machine::Scenario>(scenario.clone())
         .ok()
         .map(|scenario| scenario.input)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MachineFailureKey {
-    Driver(crate::record::machine::MachineFailure),
+    Driver(zakura_network::zakura::DriverFailure),
     State { expected: String, actual: String },
 }
 
@@ -405,8 +408,8 @@ fn machine_failure<'a>(
     let mut machine = false;
     for step in steps.into_iter().filter_map(|step| step.machine.as_deref()) {
         let failure = match step {
-            crate::record::machine::MachineStep::Work(work) => &work.failure,
-            crate::record::machine::MachineStep::WorkFunding(work) => &work.failure,
+            crate::record::machine::MachineStep::DiscoveryBook(book) => &book.failure,
+            crate::record::machine::MachineStep::DiscoveryState(state) => &state.failure,
         };
         machine = true;
         if let Some(failure) = failure {

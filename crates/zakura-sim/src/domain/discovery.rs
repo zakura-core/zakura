@@ -1,14 +1,102 @@
 //! Discovery's properties (properties.md, Discovery).
 
-use std::{collections::BTreeMap, ops::RangeInclusive, sync::OnceLock};
+use std::{
+    collections::BTreeMap,
+    ops::RangeInclusive,
+    sync::{atomic::Ordering, Arc, OnceLock},
+};
 
 use zakura_scheduler::Status as SchedulerStatus;
 
 use crate::{
+    harness::discovery::{CapacityEvidence, VERIFICATION_READERS, VERIFICATION_SLOTS},
     observe::Entry,
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
     Observation, ObservationLog, Violation,
 };
+
+/// Verification capacity covers each result until its record installs.
+pub const VERIFICATION_CAPACITY: &str = "discovery/verification-capacity";
+
+/// The label of each real record-verification worker.
+const VERIFICATION_WORKER: &str = "discovery_verify";
+
+/// A nonblocking read of the real handle and the harness tasks' published facts.
+#[derive(Clone, Debug)]
+pub struct VerificationView {
+    /// The handle's free verification slots.
+    pub free_slots: u64,
+    /// The harness tasks' facts.
+    pub evidence: Arc<CapacityEvidence>,
+}
+
+/// The actual verification workers the scheduler started so far. Their count
+/// comes from the schedule, independently of the slots that should bound them.
+fn started_workers(log: &ObservationLog) -> u64 {
+    let started = log.entries().iter().filter(|entry| {
+        matches!(&entry.obs, Observation::TaskSpawned { task } if task.contains(VERIFICATION_WORKER))
+    });
+    started.count() as u64
+}
+
+/// [`VERIFICATION_CAPACITY`]: while a slow holder keeps the state lock, no result
+/// can install, so each started worker without an installed record is an
+/// unsettled result. Their count stays within the slots. After every reader
+/// returns, all slots are free and every record is stored.
+pub fn verification_capacity<S: HasView<View = VerificationView>>() -> Property<S> {
+    Property {
+        id: PropertyId::new(VERIFICATION_CAPACITY),
+        claim: "unsettled verification results stay within the node's verification slots",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Schedule, Source::View],
+        status: Status::Active,
+        check: check_verification_capacity::<S>,
+        witness: Some(|log| started_workers(log) == VERIFICATION_READERS),
+    }
+}
+
+/// Checks [`VERIFICATION_CAPACITY`] at each boundary with an applicable view.
+fn check_verification_capacity<S: HasView<View = VerificationView>>(
+    cx: &mut CheckCtx<'_, S>,
+) -> Verdict {
+    let view = cx.view();
+    let started = started_workers(cx.log);
+    if let Some(records) = view
+        .evidence
+        .held_records
+        .load(Ordering::SeqCst)
+        .checked_sub(1)
+    {
+        let unsettled = started.saturating_sub(records);
+        view.evidence
+            .peak_unsettled
+            .fetch_max(unsettled, Ordering::SeqCst);
+        if unsettled > VERIFICATION_SLOTS {
+            return Verdict::Violated(Violation {
+                property: VERIFICATION_CAPACITY.to_owned(),
+                step: cx.step,
+                witness: (1..=cx.step).collect(),
+                expected: format!("at most {VERIFICATION_SLOTS} unsettled verification result"),
+                actual: format!("{started} workers started with {records} records installed"),
+            });
+        }
+        return Verdict::Holds;
+    }
+    if view.evidence.done.load(Ordering::SeqCst) < VERIFICATION_READERS {
+        return Verdict::NotApplicable;
+    }
+    if view.free_slots != VERIFICATION_SLOTS {
+        return Verdict::Violated(Violation {
+            property: VERIFICATION_CAPACITY.to_owned(),
+            step: cx.step,
+            witness: (1..=cx.step).collect(),
+            expected: format!("{VERIFICATION_SLOTS} free slot after every reader returned"),
+            actual: format!("{} free slots", view.free_slots),
+        });
+    }
+    Verdict::Holds
+}
 
 /// `wait_complete` wakes the source once the initial exchange completes.
 pub const WAIT_COMPLETE_WAKES: &str = "discovery/wait-complete-wakes";

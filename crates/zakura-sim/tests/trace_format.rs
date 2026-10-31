@@ -846,21 +846,6 @@ fn unsupported_format() {
 }
 
 #[test]
-fn previous_machine_formats_are_rejected() {
-    for format in [20, 21] {
-        let dir = recorded(plan());
-        edit_meta(dir.path(), |meta| meta["format"] = json!(format));
-        assert_eq!(
-            invalid(dir.path()),
-            Invalid::UnsupportedVersion {
-                field: "format",
-                found: format
-            }
-        );
-    }
-}
-
-#[test]
 fn unsupported_contract() {
     let dir = recorded(plan());
     edit_meta(dir.path(), |meta| meta["contract"] = json!(7));

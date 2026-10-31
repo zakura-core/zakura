@@ -95,6 +95,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         offset,
         draws,
         obs,
+        machine,
     } = recorded;
     [
         ("step", *step == produced.step),
@@ -105,6 +106,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         ("offset", *offset == produced.offset),
         ("draws", *draws == produced.draws),
         ("obs", *obs == produced.obs),
+        ("machine", *machine == produced.machine),
     ]
     .into_iter()
     .find_map(|(field, same)| (!same).then_some(field))

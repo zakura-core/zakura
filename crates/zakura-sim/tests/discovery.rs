@@ -257,3 +257,44 @@ fn seed_sweep_wakes() {
         assert_wakes(&run_wait_complete(plan));
     }
 }
+
+/// The slow holder saw a parked result, and the slots still bound it.
+#[test]
+fn verification_results_keep_their_slots() {
+    use std::sync::{atomic::Ordering, Arc};
+    use zakura_sim::{
+        domain::discovery::VERIFICATION_CAPACITY,
+        harness::{
+            discovery::{
+                CapacityEvidence, CapacityScenario, VerificationCapacity, VERIFICATION_READERS,
+            },
+            run_prepared,
+        },
+        witness::Expect,
+    };
+    let evidence = Arc::new(CapacityEvidence::default());
+    let report = run_prepared::<VerificationCapacity>(
+        &CapacityScenario::default(),
+        Arc::clone(&evidence),
+        zakura_sim::PlanInput::Bytes(Vec::new()),
+        &mut zakura_sim::NullSink,
+        None,
+    )
+    .expect("the run ends without a harness failure");
+    zakura_sim::witness::judge_report::<VerificationCapacity>(
+        &report,
+        VERIFICATION_CAPACITY,
+        Expect::Holds,
+    )
+    .unwrap_or_else(|error| panic!("{error}: {:?}", report.end));
+    assert_eq!(
+        evidence.done.load(Ordering::SeqCst),
+        VERIFICATION_READERS,
+        "every reader installs its record"
+    );
+    assert_eq!(
+        evidence.peak_unsettled.load(Ordering::SeqCst),
+        1,
+        "the holder keeps the lock while a verified result waits to install"
+    );
+}

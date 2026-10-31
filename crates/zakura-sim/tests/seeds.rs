@@ -65,6 +65,14 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     }
     match stem {
         "discovery-wait-complete" => value(discovery::Scenario::default()),
+        "discovery-record-book" => value(zakura_sim::harness::discovery_machine::Scenario {
+            input: include_bytes!("fixtures/discovery-record-book.bin").to_vec(),
+        }),
+        "discovery-session-installation" => {
+            value(zakura_sim::harness::discovery_machine::Scenario {
+                input: include_bytes!("fixtures/discovery-session-installation.bin").to_vec(),
+            })
+        }
         "block-sync-handoff" => value(BlockScenario::default()),
         "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),
         "block-sync-paused-handoffs" => value(BlockScenario::paused_handoffs()),

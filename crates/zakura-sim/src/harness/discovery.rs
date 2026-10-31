@@ -4,7 +4,11 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::UNIX_EPOCH,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -27,8 +31,8 @@ use zakura_scheduler::SchedulerConfig;
 
 use super::Subsystem;
 use crate::{
-    domain::discovery::wait_complete_wakes,
-    property::{HasView, Property},
+    domain::discovery::{verification_capacity, wait_complete_wakes, VerificationView},
+    property::{HasView, Property, Source, Sources},
     RunConfig, Sim,
 };
 
@@ -220,4 +224,149 @@ pub fn run_config() -> RunConfig {
         drain_bound: 1_000,
         ..RunConfig::default()
     }
+}
+
+/// The readers [`VerificationCapacity`] runs, each with one relayed record.
+pub const VERIFICATION_READERS: u64 = 3;
+/// The verification slots [`VerificationCapacity`] fixes, in place of the host's count.
+pub const VERIFICATION_SLOTS: u64 = 1;
+
+/// The `verification-capacity` scenario. It has no knobs, so its fuzz input is
+/// all Plan bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityScenario {}
+
+/// What the harness's tasks publish for the nonblocking view.
+#[derive(Debug, Default)]
+pub struct CapacityEvidence {
+    /// One more than the records the book held when a slow holder took the state
+    /// lock, or 0 while no holder has it.
+    pub held_records: AtomicU64,
+    /// The readers whose import returned.
+    pub done: AtomicU64,
+    /// The largest count of unsettled verification results that a check saw.
+    pub peak_unsettled: AtomicU64,
+}
+
+/// The real discovery handle, with readers importing relayed records while a
+/// slow holder keeps the state lock, checked by [`verification_capacity`].
+pub struct VerificationCapacity {
+    handle: ZakuraDiscoveryHandle,
+    evidence: Arc<CapacityEvidence>,
+}
+
+impl HasView for VerificationCapacity {
+    type View = VerificationView;
+
+    /// Reads the slots and the tasks' published facts without blocking.
+    fn view(&self) -> VerificationView {
+        VerificationView {
+            free_slots: u64::try_from(self.handle.free_verification_slots())
+                .expect("the fixture's slot count is small"),
+            evidence: Arc::clone(&self.evidence),
+        }
+    }
+}
+
+impl Subsystem for VerificationCapacity {
+    const NAME: &'static str = "discovery/verification-capacity";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = CapacityScenario;
+    type Prepared = Arc<CapacityEvidence>;
+
+    /// [`run_config`].
+    fn config(_: &CapacityScenario) -> RunConfig {
+        run_config()
+    }
+
+    /// The evidence a caller may keep, to read after the run.
+    fn prepare(_: &CapacityScenario) -> Arc<CapacityEvidence> {
+        Arc::default()
+    }
+
+    /// [`spawn_capacity`].
+    fn build(sim: &mut Sim, _: &CapacityScenario, evidence: Arc<CapacityEvidence>) -> Self {
+        let handle = spawn_capacity(sim, &evidence);
+        VerificationCapacity { handle, evidence }
+    }
+
+    /// [`verification_capacity`].
+    fn properties() -> Vec<Property<Self>> {
+        vec![verification_capacity()]
+    }
+
+    /// The schedule shows actual workers, and the view shows the handle's slots.
+    fn sources() -> Sources {
+        Sources::observed(&[Source::Schedule, Source::View])
+    }
+
+    /// The only scenario.
+    fn draw(_: &[u8]) -> CapacityScenario {
+        CapacityScenario {}
+    }
+}
+
+/// Starts the readers and the slow state holder on one real handle.
+fn spawn_capacity(sim: &mut Sim, evidence: &Arc<CapacityEvidence>) -> ZakuraDiscoveryHandle {
+    let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+    let (connected, connected_rx) = watch::channel(Vec::new());
+    let handle = ZakuraDiscoveryHandle::new(
+        ZakuraDiscoveryLocalConfig {
+            secret_key: NodeSecretKey::from_bytes(&[31; 32]),
+            direct_addrs: Vec::new(),
+            services: vec![ZakuraServiceId::discovery()],
+            zakura_protocol_min: handshake.zakura_protocol_min,
+            zakura_protocol_max: handshake.zakura_protocol_max,
+            network_id: handshake.network_id,
+            chain_id: handshake.chain_id,
+            last_authored_sequence: None,
+        },
+        ZakuraDiscoveryConfig::default(),
+        connected_rx,
+    )
+    .expect("the fixture config is valid")
+    .with_verification_slots(VERIFICATION_SLOTS as usize);
+    let relay = NodeSecretKey::from_bytes(&[32; 32]).public();
+    for (reader, name) in ["reader-0", "reader-1", "reader-2"].into_iter().enumerate() {
+        let handle = handle.clone();
+        let evidence = Arc::clone(evidence);
+        let handshake = handshake.clone();
+        let author = 33 + u8::try_from(reader).expect("the fixture has few readers");
+        sim.scheduler().spawn_root(name, async move {
+            let now = utc_now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the run clock is after the epoch")
+                .as_secs();
+            let secret = NodeSecretKey::from_bytes(&[author; 32]);
+            let outcome = handle
+                .import_peer_records([record(&secret, &handshake, now)], Some(relay))
+                .await
+                .expect("the fixture record is authentic");
+            assert_eq!(outcome.added, 1, "the fixture record is new");
+            evidence.done.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    let holder = handle.clone();
+    let evidence = Arc::clone(evidence);
+    sim.scheduler().spawn_root("holder", async move {
+        // Keeps the handle's connected watch open for the whole run.
+        let _connected = connected;
+        while evidence.done.load(Ordering::SeqCst) < VERIFICATION_READERS {
+            if holder.free_verification_slots() == 0 {
+                let evidence = &evidence;
+                holder
+                    .hold_state(|records| async move {
+                        let records = u64::try_from(records).expect("the fixture book is small");
+                        evidence.held_records.store(records + 1, Ordering::SeqCst);
+                        zakura_rt::time::sleep(Duration::from_secs(1)).await;
+                        evidence.held_records.store(0, Ordering::SeqCst);
+                    })
+                    .await;
+            }
+            zakura_rt::task::yield_now().await;
+        }
+    });
+    handle
 }

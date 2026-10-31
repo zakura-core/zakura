@@ -271,7 +271,7 @@ impl RecordSink for EndSeen<'_> {
 
 /// Checks `property`'s report in `report` against `expect`, before its
 /// trigger history.
-fn judge(
+pub(crate) fn judge(
     report: &RunReport,
     property: &str,
     status: Status,

@@ -13,6 +13,7 @@ cargo-fuzz = true
 discovery_wait_complete = "discovery/wait-complete"
 header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
+block_work_ownership = "block/work-ownership"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -59,3 +60,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "block_work_ownership"
+path = "fuzz_targets/block_work_ownership.rs"
+test = false
+doc = false
+bench = false

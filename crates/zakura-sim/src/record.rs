@@ -43,7 +43,8 @@ pub const FORMAT_VERSION: u32 = 20;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
-pub const CONTRACT_VERSION: u32 = 1;
+/// Version 2 adds `machine:<name>:<step>` identities.
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// One draw's identity, bound, answer, and what chose the answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

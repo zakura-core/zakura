@@ -1156,3 +1156,87 @@ fn a_foreign_storage_failure_replays_exactly() {
     .expect("the trace replays");
     assert!(report.verified(), "{report:?}");
 }
+
+const WORK_INPUT: &[u8] = include_bytes!("fixtures/block-work-ownership.bin");
+
+#[test]
+fn work_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_WORK_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(report.end.unwrap().steps, 10);
+    }
+}
+
+#[test]
+fn work_machine_records_and_replays_without_transport() {
+    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let trace = open(dir.path());
+    let entry = harness::find("block/work-ownership").unwrap();
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/work-ownership",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), 10);
+    assert_eq!(trace.meta.scenario["input"], json!(WORK_INPUT));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:block-work:")));
+    assert!(trace.steps.iter().all(|step| step.draws.is_empty()));
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.work.as_ref().unwrap().actual.reserved > 0));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    assert!(matches!(
+        report.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 10 }
+    ));
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "work_machine_replay_child"])
+        .env("ZAKURA_WORK_MACHINE_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 3)["work"]["actual"]["reserved"] = json!(999);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 3,
+            field: "work"
+        })
+    ));
+}
+
+#[test]
+fn work_machine_preserves_empty_and_short_inputs() {
+    for input in [&[][..], &[0, 0][..], WORK_INPUT] {
+        let entry = harness::find("block/work-ownership").unwrap();
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        let mut sink = zakura_sim::MemorySink::default();
+        let explored = (entry.run_bytes)(input, &mut sink, None);
+        assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+        assert_eq!(
+            explored.result.unwrap().end.steps,
+            input.len().div_ceil(4) as u64
+        );
+        assert_eq!(trace.steps.len(), input.len().div_ceil(4));
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+}

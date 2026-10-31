@@ -268,10 +268,7 @@ pub fn confirm(
     // An ID that isn't valid can't name a registered property.
     let id = PropertyId::generated(property.to_owned())
         .map_err(|_| RecordError::Witness(WitnessError::Unregistered))?;
-    let split = entry.scenario_bytes.min(input.len());
-    let mut prefix = input[..split].to_vec();
-    prefix.resize(entry.scenario_bytes, 0);
-    let scenario = (entry.draw)(&prefix);
+    let scenario = entry.scenario(input);
     let meta = (entry.meta)(&scenario).map_err(RecordError::Harness)?;
     let confirmation = Confirmation {
         status: ConfirmStatus::Confirmed,

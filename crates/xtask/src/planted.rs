@@ -44,6 +44,17 @@
 //! violates it without its trigger history, so the gate stays the committed
 //! input, which must violate exactly the case's property.
 //!
+//! `--targets` runs only the cases whose committed input runs on a harness
+//! that a simulator fuzz target runs, as the fuzz package's
+//! `[package.metadata.zakura-sim.targets]` table maps them, and prints
+//! each target's cases, or that it has none. After step 3 it also confirms
+//! each patched input through its target in fresh processes, as
+//! `cargo xtask sim-minimize` confirms an original: the patched target must
+//! crash with the case's property alone and name the harness,
+//! `zakura-sim confirm` must find the property's trigger history, and a
+//! fresh `zakura-sim replay` must match the trace Exact. A check that fails
+//! is its own failure, never a catch.
+//!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
 //! checks changed, or every case if the shared machinery changed: this
@@ -56,15 +67,22 @@ use std::{
     env,
     ffi::OsString,
     fmt, fs,
-    path::{Component, Path, PathBuf},
+    path::{self, Component, Path, PathBuf},
     process::Command,
+    sync::atomic::AtomicBool,
+    time::Duration,
 };
 
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{run_command, sim::SIM_RUSTFLAGS, BoxError};
+use crate::{
+    run_command,
+    sim::SIM_RUSTFLAGS,
+    sim_minimize::{self, Sanitizer, Status},
+    BoxError,
+};
 
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
@@ -96,6 +114,9 @@ const CAMPAIGN_INPUTS: usize = 32;
 /// The campaign's longest input, in bytes.
 const CAMPAIGN_INPUT_BYTES: usize = 64;
 
+/// The longest one child of a confirmation through a fuzz target may run.
+const TARGET_CHILD: Duration = Duration::from_secs(300);
+
 /// One retained bypass patch.
 #[derive(Clone, Debug)]
 struct Case {
@@ -112,6 +133,9 @@ struct Case {
     /// Other properties the patch's bug breaks, which a campaign run may
     /// violate instead of the case's property.
     also_violates: Vec<String>,
+    /// The simulator fuzz target that runs the input's harness, with
+    /// `--targets`.
+    target: Option<String>,
 }
 
 /// A case's `<name>.toml`.
@@ -207,6 +231,14 @@ enum Verdict {
     /// The patched run violated the property, but its witness test failed,
     /// as when the run missed the trigger history.
     WitnessFails(String),
+    /// The patched input didn't confirm through the fuzz target that runs
+    /// its harness.
+    TargetMisses {
+        /// The target.
+        target: String,
+        /// The confirmation's status and reason.
+        why: String,
+    },
     /// A campaign input's patched run failed, ended at a harness failure,
     /// violated another property, didn't report the case's property, or
     /// violated it without its trigger history.
@@ -251,6 +283,12 @@ impl fmt::Display for Verdict {
             Verdict::WitnessFails(why) => {
                 write!(f, "the patched run's witness test fails: {why}")
             }
+            Verdict::TargetMisses { target, why } => {
+                write!(
+                    f,
+                    "the patched input doesn't confirm through {target}: {why}"
+                )
+            }
             Verdict::CampaignFails { input, verdict } => {
                 write!(f, "campaign input {}: {verdict}", input.display())
             }
@@ -260,20 +298,50 @@ impl fmt::Display for Verdict {
 
 /// Runs every planted case, or only `property`'s, and fails unless each is
 /// caught. With `changed_since`, it runs only the cases a change since that
-/// revision affects, and passes if none is.
+/// revision affects, and passes if none is. With `targets`, it runs only
+/// the cases a simulator fuzz target runs, and confirms each through its
+/// target.
 pub(super) fn run(
     repo_root: &Path,
     property: Option<&str>,
     changed_since: Option<&str>,
+    targets: bool,
 ) -> Result<(), BoxError> {
-    let cases: Vec<Case> = cases(repo_root)?
+    let mut cases: Vec<Case> = cases(repo_root)?
         .into_iter()
         .filter(|case| property.is_none_or(|p| case.property == p))
         .collect();
+    if targets {
+        let harnesses = sim_minimize::fuzz_targets(repo_root)?;
+        let mut on_targets = Vec::new();
+        for mut case in cases {
+            case.target = target_of(&harnesses, &harness_of(repo_root, &case.input)?);
+            if case.target.is_some() {
+                on_targets.push(case);
+            }
+        }
+        cases = on_targets;
+        for (target, harness) in &harnesses {
+            let Some(harness) = harness else { continue };
+            let names: Vec<String> = cases
+                .iter()
+                .filter(|case| case.target.as_ref() == Some(target))
+                .map(|case| format!("{} {}", case.property, case.patch.display()))
+                .collect();
+            match names.as_slice() {
+                [] => println!("{target} ({harness}): no retained production bypass"),
+                names => println!("{target} ({harness}): {}", names.join(", ")),
+            }
+        }
+    }
     if cases.is_empty() {
-        return Err(match property {
-            Some(property) => format!("no planted case for {property}").into(),
-            None => format!("no planted cases under {PLANTED_DIR}").into(),
+        return Err(match (property, targets) {
+            (Some(property), true) => {
+                format!("no planted case for {property} runs on a fuzz target").into()
+            }
+            (Some(property), false) => format!("no planted case for {property}").into(),
+            (None, true) => "no planted case runs on a fuzz target".into(),
+            (None, false) => format!("no planted cases under {PLANTED_DIR}").into(),
         });
     }
     let cases = match changed_since {
@@ -353,6 +421,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 input,
                 checks,
                 also_violates,
+                target: None,
             })
         })
         .collect()
@@ -552,10 +621,77 @@ fn check_case(
         "violated",
         &scratch.join("patched"),
     )?;
-    match classify(&case.property, &patched) {
-        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign")),
-        verdict => Ok(verdict),
+    let verdict = match classify(&case.property, &patched) {
+        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
+        verdict => return Ok(verdict),
+    };
+    match (&verdict, &case.target) {
+        (Verdict::Caught(_), Some(fuzz)) => {
+            Ok(through_target(worktree, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
+        }
+        _ => Ok(verdict),
     }
+}
+
+/// The fuzz target that runs `harness`, from the fuzz package's targets
+/// and the harnesses they run, `harnesses`. The first by name, if several
+/// do.
+fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Option<String> {
+    harnesses
+        .iter()
+        .find(|(_, runs)| runs.as_deref() == Some(harness))
+        .map(|(target, _)| target.clone())
+}
+
+/// Confirms `case`'s committed input in the patched `worktree` through the
+/// fuzz target `target`, which runs `harness`, in fresh processes, with
+/// [`sim_minimize::confirm`]: the target must crash with the case's
+/// property alone and name `harness`, `zakura-sim confirm` must find the
+/// property's trigger history, and a fresh replay must match Exact. Writes
+/// under `scratch`. `None` if every check passed.
+fn through_target(
+    worktree: &Path,
+    scratch: &Path,
+    case: &Case,
+    target: &str,
+    harness: &str,
+) -> Result<Option<Verdict>, BoxError> {
+    let out = path::absolute(scratch.join("target"))?;
+    if out.exists() {
+        fs::remove_dir_all(&out)?;
+    }
+    let request = sim_minimize::Request {
+        target: target.to_owned(),
+        harness: harness.to_owned(),
+        input: path::absolute(worktree.join(&case.input))?,
+        property: case.property.clone(),
+        out: out.clone(),
+        budget: sim_minimize::Budget {
+            runs: 1,
+            wall: TARGET_CHILD,
+            child: TARGET_CHILD,
+        },
+        sanitizer: Sanitizer::Address,
+    };
+    let report = sim_minimize::confirm(worktree, &request, &AtomicBool::new(false))?;
+    if report.status == Status::Confirmed {
+        println!(
+            "{} {}: confirmed through {target}; see {}",
+            case.property,
+            case.patch.display(),
+            out.join(sim_minimize::REPORT_FILE).display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(Verdict::TargetMisses {
+        target: target.to_owned(),
+        why: format!(
+            "{}: {}; see {}",
+            report.status,
+            report.reason.as_deref().unwrap_or("no reason given"),
+            out.join(sim_minimize::REPORT_FILE).display()
+        ),
+    }))
 }
 
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
@@ -1093,6 +1229,44 @@ mod tests {
         ] {
             assert!(is_affected(&watched, &[PathBuf::from(path)]), "{path}");
         }
+    }
+
+    /// With `--targets`, a case runs through the fuzz target that runs its
+    /// input's harness: the discovery case through `discovery_wait_complete`,
+    /// and no block-sync case, since no target runs `block-sync/storage`.
+    #[test]
+    fn committed_cases_run_through_the_target_of_their_harness() {
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
+        let mut on_targets = BTreeMap::new();
+        for case in cases(&repo_root).expect("the planted cases parse") {
+            let harness = harness_of(&repo_root, &case.input).expect("the input has a sidecar");
+            if let Some(target) = target_of(&harnesses, &harness) {
+                on_targets.insert(case.property, target);
+            }
+        }
+        assert_eq!(
+            on_targets,
+            BTreeMap::from([(
+                "discovery/wait-complete-wakes".to_owned(),
+                "discovery_wait_complete".to_owned()
+            )])
+        );
+    }
+
+    /// A harness maps to the first target by name that runs it, and a
+    /// target that runs no harness maps nothing.
+    #[test]
+    fn a_harness_maps_to_the_first_target_that_runs_it() {
+        let harnesses = BTreeMap::from([
+            ("a_probe".to_owned(), None),
+            ("b_target".to_owned(), Some("h/one".to_owned())),
+            ("c_target".to_owned(), Some("h/one".to_owned())),
+            ("d_target".to_owned(), Some("h/two".to_owned())),
+        ]);
+        assert_eq!(target_of(&harnesses, "h/one").as_deref(), Some("b_target"));
+        assert_eq!(target_of(&harnesses, "h/two").as_deref(), Some("d_target"));
+        assert_eq!(target_of(&harnesses, "h/three"), None);
     }
 
     /// Runs `git` in `dir` with a fixed identity, and expects it to pass.

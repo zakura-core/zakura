@@ -157,7 +157,9 @@ timeout-secs = 2700
 # qa/fuzz/sim/Cargo.toml's `[package.metadata.zakura-sim.targets]` table
 # maps it to, and starts from that harness's admitted seeds. Its smoke run
 # is short; the campaign sets each target's search budget after
-# calibration.
+# calibration. `cargo xtask sim-targets` runs each `sim` target on those
+# seeds alone, with the row's arguments and variables, and needs at least
+# one seed that applies a property of the harness's own.
 [[target]]
 package = "sim"
 name = "discovery_wait_complete"
@@ -243,12 +245,12 @@ reason = "no target: the harness has a fixed scenario, and no plan maps it to a 
 [[missing-target]]
 harness = "block-sync/storage"
 owner = "E5a"
-reason = "the target waits for E5a's readiness contract"
+reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
 
 [[missing-target]]
 harness = "header-sync/wire"
 owner = "E5a"
-reason = "the target waits for E5a's readiness contract"
+reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
 
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and

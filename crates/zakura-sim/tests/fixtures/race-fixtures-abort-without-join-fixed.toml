@@ -1,0 +1,8 @@
+# The committed fuzz input `race-fixtures-abort-without-join-fixed.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its three bytes pick
+# the `race/abort-without-join` fixture, its fixed variant and one worker.
+harness = "fixtures/all"
+generator = 1
+sha256 = "da075e9d699084fc189cdd233081c49f74df331a5eb414438cb3cfa9f19aedd9"
+scenario_sha256 = "5fe430a49c25f1bac8d1f1c14dd6b02a60c88a522a907aa238f543713fe68b3c"
+source = "crates/zakura-sim/tests/race_fixtures.rs"

@@ -10,7 +10,13 @@ use std::{
 use serde::Serialize;
 use tempfile::TempDir;
 use zakura_sim::{
-    harness::{block_sync::BlockScenario, discovery, wire_plans::SavedPlan},
+    harness::{
+        block_sync::BlockScenario,
+        discovery,
+        fixtures::{PickScenario, Variant, Which},
+        header_sync::StorageScenario,
+        wire_plans::SavedPlan,
+    },
     seed::{self, SeedError, SeedKind, SeedReport},
 };
 
@@ -63,7 +69,20 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     {
         return value(plan.scenario());
     }
+    if let Some(fixture) = Which::ALL.into_iter().find(|fixture| {
+        stem == format!(
+            "race-fixtures-{}-fixed",
+            fixture.property().trim_start_matches("race/")
+        )
+    }) {
+        return value(PickScenario {
+            fixture,
+            variant: Variant::Fixed,
+            workers: 1,
+        });
+    }
     match stem {
+        "header-sync-storage-default" => value(StorageScenario::default()),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
         "block-sync-handoff" => value(BlockScenario::default()),
         "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),

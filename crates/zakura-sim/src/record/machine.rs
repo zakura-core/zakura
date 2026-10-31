@@ -1,6 +1,7 @@
 //! Semantic evidence from transport-free machine drivers.
 
 use serde::{Deserialize, Serialize};
+use zakura_network::zakura::{BookStep, DiscoverySessionStep, DriverFailure};
 
 use crate::observe::{WorkOwner, WorkScope};
 
@@ -23,17 +24,23 @@ pub enum MachineStep {
     HeaderReactor(HeaderReactorStep),
     /// Reactor query and view policy and its independent model.
     Reactor(ReactorStep),
+    /// The real discovery book, its independent model, and its signed samples.
+    DiscoveryBook(BookStep),
+    /// Discovery's real session and hint owner and its independent model.
+    DiscoveryState(DiscoverySessionStep),
 }
 
 impl MachineStep {
     /// The failure that stopped the run at this operation, if any.
-    pub fn failure(&self) -> Option<&MachineFailure> {
+    pub fn failure(&self) -> Option<MachineFailure> {
         match self {
-            Self::Work(step) => step.failure.as_ref(),
-            Self::WorkFunding(step) => step.failure.as_ref(),
-            Self::DecodedRetention(step) => step.failure.as_ref(),
-            Self::HeaderReactor(step) => step.failure.as_ref(),
-            Self::Reactor(step) => step.failure.as_ref(),
+            Self::Work(step) => step.failure.clone(),
+            Self::WorkFunding(step) => step.failure.clone(),
+            Self::DecodedRetention(step) => step.failure.clone(),
+            Self::HeaderReactor(step) => step.failure.clone(),
+            Self::Reactor(step) => step.failure.clone(),
+            Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
+            Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
         }
     }
 }
@@ -449,6 +456,17 @@ impl From<zakura_network::zakura::WorkOwnershipFailure> for MachineFailure {
                 WorkOwnershipPhase::Transition => FailurePhase::Transition,
                 WorkOwnershipPhase::Invariant => FailurePhase::Invariant,
             },
+            message: value.message,
+        }
+    }
+}
+
+impl From<DriverFailure> for MachineFailure {
+    /// Discovery drivers stop only on a checked invariant or a driver panic.
+    fn from(value: DriverFailure) -> Self {
+        Self {
+            property_failure: value.property_failure,
+            phase: FailurePhase::Invariant,
             message: value.message,
         }
     }

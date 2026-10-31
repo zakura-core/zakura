@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index f80874e5f..ab427eed5 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -1613,7 +1613,8 @@ impl ZakuraDiscoveryHandle {
+                 outcome.rejected += unverified_len;
+                 return Ok(outcome);
+             };
+-            verification_slot = Some(slot);
++            drop(slot);
++            verification_slot = None::<SlotPermit>;
+             let (fresh, dropped) = verified?;
+             outcome.rejected += dropped;
+             authentic.extend(fresh);

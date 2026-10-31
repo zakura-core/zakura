@@ -321,6 +321,12 @@ impl ResponsesWritten {
         // The sender lives in `self`, so the wait cannot fail.
         let _ = count.wait_for(|count| *count == 0).await;
     }
+
+    /// Whether every admitted request's last frame has finished its transport
+    /// write, or the request was dropped with its session.
+    pub(crate) fn is_written(&self) -> bool {
+        *self.0.borrow() == 0
+    }
 }
 
 /// An admitted request that waits for capacity.

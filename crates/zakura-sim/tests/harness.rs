@@ -399,6 +399,7 @@ fn every_harness_names_its_statuses() {
         let properties = (entry.properties)();
         if zakura_sim::harness::block_work::is_machine(entry.name)
             || zakura_sim::harness::header_work::is_machine(entry.name)
+            || zakura_sim::harness::discovery_machine::is_machine(entry.name)
         {
             assert_eq!(properties.len(), 1);
             assert_eq!(properties[0].id, entry.name);

@@ -389,6 +389,13 @@ fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
             .ok()
             .map(|scenario| scenario.input);
     }
+    if crate::harness::discovery_machine::is_machine(name) {
+        return serde_json::from_value::<crate::harness::discovery_machine::Scenario>(
+            scenario.clone(),
+        )
+        .ok()
+        .map(|scenario| scenario.input);
+    }
     if !crate::harness::header_work::is_machine(name) {
         return None;
     }
@@ -412,7 +419,7 @@ fn machine_failure<'a>(
         let failure = step.failure();
         machine = true;
         if let Some(failure) = failure {
-            return Some(MachineFailureKey::Driver(failure.clone()));
+            return Some(MachineFailureKey::Driver(failure));
         }
     }
     // The adapter can detect a state mismatch even when the driver did not panic.

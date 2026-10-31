@@ -21,8 +21,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discovery_book"
+path = "fuzz_targets/discovery_book.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_peer_registry"
 path = "fuzz_targets/block_peer_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_state"
+path = "fuzz_targets/discovery_state.rs"
 test = false
 doc = false
 bench = false
@@ -35,6 +49,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discovery_redial"
+path = "fuzz_targets/discovery_redial.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_sequencer_order"
 path = "fuzz_targets/block_sequencer_order.rs"
 test = false
@@ -42,8 +63,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discovery_session"
+path = "fuzz_targets/discovery_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_fill"
 path = "fuzz_targets/block_fill.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_query"
+path = "fuzz_targets/discovery_query.rs"
 test = false
 doc = false
 bench = false
@@ -93,6 +128,13 @@ bench = false
 [[bin]]
 name = "block_request_lifecycle"
 path = "fuzz_targets/block_request_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_candidate"
+path = "fuzz_targets/discovery_candidate.rs"
 test = false
 doc = false
 bench = false

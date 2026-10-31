@@ -21,26 +21,12 @@ use zakura_sim::{
     domain::discovery::{
         is_source, wait_complete_wakes, WaitState, WAIT_COMPLETE_WAKES as PROPERTY,
     },
-    harness::{
-        discovery::{run_config, spawn, Spawned, WaitComplete},
-        run_harness, HarnessError,
-    },
+    harness::discovery::{run_config, spawn, Spawned, WaitComplete},
     property::{Assumptions, Registry, RegistryChecker, Source, Sources, Tee},
     record::DrawRecord,
     record::Record,
-    MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
+    Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
-
-/// Runs the harness under `plan`.
-fn run_wait_complete(plan: PlanInput) -> RunReport {
-    match run_harness::<WaitComplete>(&Default::default(), plan, &mut MemorySink::default(), None) {
-        Ok(report) => report,
-        Err(HarnessError::Run { failure, .. }) => {
-            panic!("the run hit a harness failure: {failure}")
-        }
-        Err(error) => panic!("{error}"),
-    }
-}
 
 /// The registry's check of [`PROPERTY`] alone, for runs outside the
 /// harness.
@@ -251,9 +237,64 @@ fn the_peer_record_enters_the_book() {
     );
 }
 
+/// The sweep covers the worker counts that change how the source and the sink
+/// interleave.
 #[test]
 fn seed_sweep_wakes() {
-    for plan in inputs(200, 64) {
-        assert_wakes(&run_wait_complete(plan));
+    for workers in [1, 2, 4] {
+        for plan in inputs(200, 64) {
+            let mut config = run_config();
+            config.scheduler.workers = workers;
+            let (report, _) = recorded(
+                config,
+                plan,
+                |sim| {
+                    spawn(sim);
+                },
+                &mut wakes_checker(),
+            );
+            assert_wakes(&report);
+        }
     }
+}
+
+/// The slow holder saw a parked result, and the slots still bound it.
+#[test]
+fn verification_results_keep_their_slots() {
+    use std::sync::{atomic::Ordering, Arc};
+    use zakura_sim::{
+        domain::discovery::VERIFICATION_CAPACITY,
+        harness::{
+            discovery::{
+                CapacityEvidence, CapacityScenario, VerificationCapacity, VERIFICATION_READERS,
+            },
+            run_prepared,
+        },
+        witness::Expect,
+    };
+    let evidence = Arc::new(CapacityEvidence::default());
+    let report = run_prepared::<VerificationCapacity>(
+        &CapacityScenario::default(),
+        Arc::clone(&evidence),
+        zakura_sim::PlanInput::Bytes(Vec::new()),
+        &mut zakura_sim::NullSink,
+        None,
+    )
+    .expect("the run ends without a harness failure");
+    zakura_sim::witness::judge_report::<VerificationCapacity>(
+        &report,
+        VERIFICATION_CAPACITY,
+        Expect::Holds,
+    )
+    .unwrap_or_else(|error| panic!("{error}: {:?}", report.end));
+    assert_eq!(
+        evidence.done.load(Ordering::SeqCst),
+        VERIFICATION_READERS,
+        "every reader installs its record"
+    );
+    assert_eq!(
+        evidence.peak_unsettled.load(Ordering::SeqCst),
+        1,
+        "the holder keeps the lock while a verified result waits to install"
+    );
 }

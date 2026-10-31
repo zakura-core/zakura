@@ -403,12 +403,14 @@ impl Harness {
                 // Staging spends the offer before dispatch.
                 self.state.spend_status(&peer_id(peer));
                 session.spent = true;
-                let proposal = self
-                    .state
-                    .locators
-                    .propose(&peer_id(peer), authority.scope());
-                if self.model.pending.contains_key(&peer) {
-                    assert_eq!(proposal, LocatorProposal::Joined, "{PROPERTY}");
+                let proposal = self.state.locators.propose(
+                    &peer_id(peer),
+                    authority.scope(),
+                    &mut self.state.calls,
+                );
+                if let Some(pending) = self.model.pending.get(&peer) {
+                    let (_, joined) = &self.started[pending.read];
+                    assert_eq!(proposal, LocatorProposal::Joined(joined.call), "{PROPERTY}");
                     return;
                 }
                 let LocatorProposal::Start(key) = proposal else {
@@ -424,6 +426,7 @@ impl Harness {
                             authority,
                         },
                     );
+                    self.state.calls.accept(key.call);
                     self.started.push((peer, key));
                 } else {
                     // A refusal for local capacity keeps the offer for a later pass.
@@ -442,6 +445,16 @@ impl Harness {
                     return;
                 };
                 let target = awaiting.map(|authority| authority.target(0));
+                let was_pending = self
+                    .model
+                    .pending
+                    .get(&peer)
+                    .is_some_and(|pending| pending.read == read % self.started.len());
+                assert_eq!(
+                    self.state.calls.settle(key.call).is_ok(),
+                    was_pending,
+                    "{PROPERTY}: only the pending call settles"
+                );
                 let disposition = self.state.locators.settle(&key, target.as_ref(), found);
                 let expected = match self.model.pending.get(&peer) {
                     Some(pending) if pending.read == read % self.started.len() => {
@@ -470,6 +483,11 @@ impl Harness {
                     .pending
                     .get(&peer)
                     .is_some_and(|pending| pending.read == read % self.started.len());
+                assert_eq!(
+                    self.state.calls.settle(key.call).is_ok(),
+                    matches,
+                    "{PROPERTY}: only the pending call settles"
+                );
                 if matches {
                     self.model.pending.remove(&peer);
                 }
@@ -747,6 +765,18 @@ impl Harness {
                 peer
             );
         }
+        let mut expected_calls: Vec<_> = self
+            .model
+            .pending
+            .values()
+            .map(|pending| self.started[pending.read].1.call)
+            .collect();
+        expected_calls.sort_unstable_by_key(|call| call.number);
+        assert_eq!(
+            self.state.calls.pending(),
+            expected_calls,
+            "{PROPERTY}: accepted locator calls"
+        );
         let suppliers: Vec<_> = self
             .state
             .vct_supplier_order
@@ -1211,6 +1241,276 @@ pub struct HeaderReactorReplaySummary {
 /// Read at most 512 bytes and keep every deadline relative to one clock origin.
 pub fn replay_header_reactor_bytes(data: &[u8]) -> HeaderReactorReplaySummary {
     run_with(decode(data), |_| {}).summary
+}
+
+/// Where a header machine driver stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderMachinePhase {
+    /// Applying the input and checking its immediate outcome.
+    Transition,
+    /// Comparing the resulting owner with the independent model.
+    Invariant,
+}
+
+/// The first failure of a header machine history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderMachineFailure {
+    /// Whether the independent checker named its property.
+    pub property_failure: bool,
+    /// Where execution stopped.
+    pub phase: HeaderMachinePhase,
+    /// Panic payload without the panic hook's source location.
+    pub message: String,
+}
+
+impl HeaderMachineFailure {
+    /// The failure a driver's panic `payload` reports in `phase`, for `property`.
+    pub(in crate::zakura::header_sync) fn of_panic(
+        property: &str,
+        phase: HeaderMachinePhase,
+        payload: &(dyn std::any::Any + Send),
+    ) -> Self {
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        Self {
+            property_failure: message == property
+                || message.starts_with(&format!("{property}:"))
+                || (message.starts_with("assertion")
+                    && message.contains(&format!("failed: {property}"))),
+            phase,
+            message,
+        }
+    }
+}
+
+/// One admitted session in a [`HeaderReactorView`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReactorSessionView {
+    /// The peer's model index.
+    pub peer: usize,
+    /// The selected tip of the peer's last status.
+    pub status: Option<block::Hash>,
+    /// Whether the status is spent.
+    pub spent: bool,
+}
+
+/// One pending locator read in a [`HeaderReactorView`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReactorReadView {
+    /// The peer's model index.
+    pub peer: usize,
+    /// The read's exact call: its number and kind.
+    pub call: (u64, StorageCallKind),
+}
+
+/// A reactor state view, read from the machine or derived by its model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReactorView {
+    /// Admitted sessions, by peer.
+    pub sessions: Vec<HeaderReactorSessionView>,
+    /// Pending locator reads, by peer.
+    pub reads: Vec<HeaderReactorReadView>,
+    /// Accepted storage calls that have not settled, by number.
+    pub calls: Vec<(u64, StorageCallKind)>,
+    /// The scheduling revision.
+    pub revision: u64,
+    /// Repair supplier order, front first.
+    pub suppliers: Vec<usize>,
+    /// Whether a resource stall pauses ordinary discovery.
+    pub paused: bool,
+    /// The current repair: its generation and height.
+    pub repair: Option<(u64, u32)>,
+    /// Whether a changed cached-pass key waits for its budget.
+    pub cached_deferred: bool,
+    /// Milliseconds from the clock origin to the next deadline. A deferred
+    /// cached pass adds a refill the model bounds rather than predicts, so
+    /// this holds `None` on both sides then.
+    pub next_deadline_millis: Option<u64>,
+}
+
+/// One decoder-v1 operation with both views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReactorStep {
+    /// The operation's number, from 1.
+    pub step: usize,
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the production pure owner.
+    pub actual: HeaderReactorView,
+    /// State derived independently by the model.
+    pub expected: HeaderReactorView,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<HeaderMachineFailure>,
+}
+
+/// A decoder-v1 reactor history. It stops at the first failure.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HeaderReactorHistory {
+    /// Every applied operation, at most 128.
+    pub steps: Vec<HeaderReactorStep>,
+}
+
+impl Harness {
+    /// Milliseconds from the clock origin to `at`.
+    fn millis(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.start).as_millis())
+            .expect("a bounded history's virtual time fits u64")
+    }
+
+    /// The state read from the production owner.
+    fn actual_view(&self) -> HeaderReactorView {
+        let sessions = (0..PEERS)
+            .filter_map(|peer| {
+                let schedule = self.state.peers.get(&peer_id(peer))?;
+                Some(HeaderReactorSessionView {
+                    peer,
+                    status: schedule
+                        .last_status
+                        .as_ref()
+                        .map(|status| status.selected_tip_hash),
+                    spent: schedule.status_spent,
+                })
+            })
+            .collect();
+        let reads = (0..PEERS)
+            .filter_map(|peer| {
+                let (call, _) = self.state.locators.pending_read(&peer_id(peer))?;
+                Some(HeaderReactorReadView {
+                    peer,
+                    call: (call.number, call.kind),
+                })
+            })
+            .collect();
+        let committed = self
+            .model
+            .committed
+            .map(|version| zakura_header_chain::StateVersion::new(u64::from(version)));
+        HeaderReactorView {
+            sessions,
+            reads,
+            calls: self
+                .state
+                .calls
+                .pending()
+                .into_iter()
+                .map(|call| (call.number, call.kind))
+                .collect(),
+            revision: self.state.scheduling_revision,
+            suppliers: self
+                .state
+                .vct_supplier_order
+                .iter()
+                .map(|peer| self.peer_index(peer))
+                .collect(),
+            paused: self.state.ordinary_discovery_paused(committed),
+            repair: self
+                .state
+                .vct_repair
+                .current()
+                .map(|task| (task.repair_generation, task.height.0)),
+            cached_deferred: self.state.cached_pass_deferred,
+            next_deadline_millis: (!self.state.cached_pass_deferred)
+                .then(|| self.state.next_deadline())
+                .flatten()
+                .map(|at| self.millis(at)),
+        }
+    }
+
+    /// The state the model derives. It reads nothing from the production owner
+    /// except the call numbers `Harness::started` recorded when each read began.
+    fn expected_view(&self) -> HeaderReactorView {
+        let reads: Vec<_> = self
+            .model
+            .pending
+            .iter()
+            .map(|(peer, pending)| {
+                let call = self.started[pending.read].1.call;
+                HeaderReactorReadView {
+                    peer: *peer,
+                    call: (call.number, call.kind),
+                }
+            })
+            .collect();
+        let mut calls: Vec<_> = reads.iter().map(|read| read.call).collect();
+        calls.sort_unstable_by_key(|(number, _)| *number);
+        HeaderReactorView {
+            sessions: self
+                .model
+                .sessions
+                .iter()
+                .map(|(peer, session)| HeaderReactorSessionView {
+                    peer: *peer,
+                    status: session.status.map(|tip| status(tip).selected_tip_hash),
+                    spent: session.spent,
+                })
+                .collect(),
+            reads,
+            calls,
+            revision: self.model.revision,
+            suppliers: self.model.suppliers.iter().copied().collect(),
+            paused: self.model.stalled_at.is_some_and(|stalled| {
+                self.model
+                    .committed
+                    .is_none_or(|version| version <= stalled)
+            }),
+            repair: self
+                .model
+                .repair
+                .map(|(generation, height)| (u64::from(generation), u32::from(height) + 1)),
+            cached_deferred: self.model.cached_deferred,
+            next_deadline_millis: (!self.model.cached_deferred)
+                .then(|| {
+                    self.model
+                        .close_retries
+                        .values()
+                        .chain(self.model.close_outcomes.values())
+                        .map(|(_, at)| *at)
+                        .chain(self.model.stall.map(ModelStall::next_deadline))
+                        .min()
+                })
+                .flatten()
+                .map(|at| self.millis(at)),
+        }
+    }
+}
+
+/// Capture decoder-v1 operations without changing the decoder or starting a runtime.
+/// Driver panics stop the history and stay distinct from property failures.
+pub fn trace_header_reactor_bytes(data: &[u8]) -> HeaderReactorHistory {
+    let input = &data[..data.len().min(512)];
+    let mut harness = Harness::new();
+    let mut steps = Vec::new();
+    for (index, op) in decode(input).enumerate() {
+        let step = index + 1;
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.apply(op)))
+            .map_err(|payload| (HeaderMachinePhase::Transition, payload))
+            .and_then(|()| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.check()))
+                    .map_err(|payload| (HeaderMachinePhase::Invariant, payload))
+            });
+        let failure = applied.err().map(|(phase, payload)| {
+            HeaderMachineFailure::of_panic(PROPERTY, phase, payload.as_ref())
+        });
+        let stop = failure.is_some();
+        steps.push(HeaderReactorStep {
+            step,
+            input: input[index * 4..(step * 4).min(input.len())].to_vec(),
+            actual: harness.actual_view(),
+            expected: harness.expected_view(),
+            failure,
+        });
+        if stop {
+            break;
+        }
+    }
+    HeaderReactorHistory { steps }
 }
 
 fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {

@@ -22,6 +22,8 @@ use super::{
 pub(super) struct ReactorState {
     /// Scheduling facts for each admitted peer's current session.
     pub(super) peers: HashMap<ZakuraPeerId, PeerSchedule>,
+    /// Direct storage calls in flight, with their exact identities.
+    pub(super) calls: StorageCalls,
     /// Direct continuation-locator reads in flight.
     pub(super) locators: LocatorQueries,
     /// Changes whenever an input can make a held-back ordinary offer eligible.
@@ -68,6 +70,7 @@ impl ReactorState {
     pub(super) fn new(now: Instant) -> Self {
         Self {
             peers: HashMap::new(),
+            calls: StorageCalls::default(),
             locators: LocatorQueries::default(),
             scheduling_revision: 0,
             last_scheduling_opportunity: None,
@@ -784,20 +787,112 @@ pub(super) struct PeerSchedule {
     pub(super) unproductive_requests: u32,
 }
 
+/// What one header storage call asks storage for.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum StorageCallKind {
+    /// A continuation-locator read.
+    Locator,
+    /// A VCT repair context read.
+    VctRepairContext,
+    /// A target preparation.
+    Prepare,
+    /// A prepared target's application.
+    Apply,
+}
+
+impl StorageCallKind {
+    /// The kind of storage call `action` makes, or `None` for an action that
+    /// the reactor only records.
+    pub(super) fn of(action: &HeaderPortOperation) -> Option<Self> {
+        match action {
+            HeaderPortOperation::QueryHeaderLocator { .. } => Some(Self::Locator),
+            HeaderPortOperation::QueryVctRepairContext { .. } => Some(Self::VctRepairContext),
+            HeaderPortOperation::PrepareHeaderTarget { .. } => Some(Self::Prepare),
+            HeaderPortOperation::ApplyHeaderTarget { .. } => Some(Self::Apply),
+            HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. } => None,
+        }
+    }
+}
+
+/// One header storage call's exact identity.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct StorageCall {
+    /// Counts from 1 per reactor, across accepted and refused calls.
+    pub(super) number: u64,
+    pub(super) kind: StorageCallKind,
+}
+
+/// Why a settlement names no accepted call.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct UnknownStorageCall;
+
+/// Accepted direct storage calls that have not settled.
+///
+/// Each call settles once, and only its exact number and kind settle it. The
+/// reactor pushes one future per accepted call, so its pending futures bound
+/// this map.
+#[derive(Debug, Default)]
+pub(super) struct StorageCalls {
+    last: u64,
+    pending: HashMap<u64, StorageCallKind>,
+}
+
+impl StorageCalls {
+    /// Number a new call of `kind`. The call has not started.
+    pub(super) fn propose(&mut self, kind: StorageCallKind) -> StorageCall {
+        self.last = self.last.wrapping_add(1);
+        StorageCall {
+            number: self.last,
+            kind,
+        }
+    }
+
+    /// Record that `call` started.
+    pub(super) fn accept(&mut self, call: StorageCall) {
+        self.pending.insert(call.number, call.kind);
+    }
+
+    /// Settle exactly `call`.
+    pub(super) fn settle(&mut self, call: StorageCall) -> Result<(), UnknownStorageCall> {
+        match self.pending.get(&call.number) {
+            Some(kind) if *kind == call.kind => {
+                self.pending.remove(&call.number);
+                Ok(())
+            }
+            _ => Err(UnknownStorageCall),
+        }
+    }
+
+    /// Accepted calls that have not settled, by ascending number.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn pending(&self) -> Vec<StorageCall> {
+        let mut pending: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(number, kind)| StorageCall {
+                number: *number,
+                kind: *kind,
+            })
+            .collect();
+        pending.sort_unstable_by_key(|call| call.number);
+        pending
+    }
+}
+
 /// The identity of one continuation-locator read.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct LocatorKey {
     /// The peer whose awaiting target the read serves.
     pub(super) peer: ZakuraPeerId,
-    /// Distinguishes this read from every other read for `peer`.
-    pub(super) query: u64,
+    /// The storage call that performs this read.
+    pub(super) call: StorageCall,
 }
 
 /// How a locator request for one peer proceeds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum LocatorProposal {
-    /// The peer's read in flight also serves this request.
-    Joined,
+    /// The peer's read in flight, this exact call, also serves this request.
+    Joined(StorageCall),
     /// State recorded a new read, which IO must start or refuse.
     Start(LocatorKey),
 }
@@ -816,7 +911,7 @@ pub(super) enum LocatorDisposition {
 /// One pending continuation-locator read.
 #[derive(Copy, Clone, Debug)]
 struct LocatorQuery {
-    query: u64,
+    call: StorageCall,
     /// The authority whose selected path the read follows.
     scope: HeaderWorkAuthority,
 }
@@ -829,11 +924,20 @@ struct LocatorQuery {
 #[derive(Debug, Default)]
 pub(super) struct LocatorQueries {
     pending: HashMap<ZakuraPeerId, LocatorQuery>,
-    /// The query number of the next recorded read.
-    next_query: u64,
 }
 
 impl LocatorQueries {
+    /// The read pending for `peer`, with its call and authority.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn pending_read(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<(StorageCall, HeaderWorkAuthority)> {
+        self.pending
+            .get(peer)
+            .map(|query| (query.call, query.scope))
+    }
+
     /// Whether a read for `peer` is pending.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn contains(&self, peer: &ZakuraPeerId) -> bool {
@@ -851,17 +955,17 @@ impl LocatorQueries {
         &mut self,
         peer: &ZakuraPeerId,
         scope: HeaderWorkAuthority,
+        calls: &mut StorageCalls,
     ) -> LocatorProposal {
-        if self.pending.contains_key(peer) {
-            return LocatorProposal::Joined;
+        if let Some(pending) = self.pending.get(peer) {
+            return LocatorProposal::Joined(pending.call);
         }
-        let query = self.next_query;
-        self.next_query = self.next_query.wrapping_add(1);
+        let call = calls.propose(StorageCallKind::Locator);
         self.pending
-            .insert(peer.clone(), LocatorQuery { query, scope });
+            .insert(peer.clone(), LocatorQuery { call, scope });
         LocatorProposal::Start(LocatorKey {
             peer: peer.clone(),
-            query,
+            call,
         })
     }
 
@@ -870,7 +974,7 @@ impl LocatorQueries {
     /// Another read for the same peer stays pending.
     pub(super) fn remove_exact(&mut self, key: &LocatorKey) -> Option<HeaderWorkAuthority> {
         let pending = self.pending.get(&key.peer)?;
-        if pending.query != key.query {
+        if pending.call != key.call {
             return None;
         }
         let scope = pending.scope;

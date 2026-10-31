@@ -1002,7 +1002,10 @@ fn apply_completion_observes_committed_headers_before_reusing_capacity() {
     committed.state_version = committed.state_version.checked_next().unwrap();
     snapshots_tx.send_replace(Some(committed.clone()));
 
+    let call = reactor.state.calls.propose(StorageCallKind::Apply);
+    reactor.state.calls.accept(call);
     reactor.handle_port_completion(StorageOutcome::Completed {
+        call,
         completion: Box::new(StorageCompletion::TargetAdmission {
             peer,
             source,
@@ -1010,7 +1013,6 @@ fn apply_completion_observes_committed_headers_before_reusing_capacity() {
             result: HeaderTargetAdmissionResult::Applied,
         }),
         capacity: Vec::new(),
-        call: 0,
     });
 
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);

@@ -13,7 +13,10 @@ use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthorit
 use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
 };
-pub use super::{reactor::HeaderRequestTerminal, scheduler::peer_work::HeaderTargetPhase};
+pub use super::{
+    reactor::{HeaderRequestTerminal, StorageCallKind},
+    scheduler::peer_work::HeaderTargetPhase,
+};
 use crate::zakura::ZakuraPeerId;
 
 /// Receives reactor events as they happen.
@@ -50,8 +53,8 @@ impl fmt::Debug for ObserverSlot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReactorEvent {
-    /// A port future was pushed. `call` counts from 1 per reactor, once per
-    /// physical storage call.
+    /// A port future was pushed. `call` counts from 1 per reactor. Accepted
+    /// and refused calls share the count.
     Dispatched {
         /// The call's number.
         call: u64,
@@ -72,6 +75,21 @@ pub enum ReactorEvent {
         call: u64,
         /// Whether the call's future was caught panicking.
         panicked: bool,
+    },
+    /// A request joined this locator call instead of starting another.
+    StorageJoined {
+        /// The call in flight.
+        call: u64,
+    },
+    /// The reactor refused a storage call before it started. The call settles
+    /// nothing and takes a number no later call reuses.
+    StorageRefused {
+        /// The refused call's number.
+        call: u64,
+        /// What the call would have asked storage for.
+        kind: StorageCallKind,
+        /// Why the reactor refused it.
+        cause: RefusalCause,
     },
     /// An active request started.
     Started {
@@ -236,6 +254,17 @@ pub enum CallEnd {
     NotSubmitted,
     /// The future panicked, and the reactor caught it.
     PortPanicked,
+}
+
+/// Why the reactor refused a storage call.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RefusalCause {
+    /// Every locator read permit was taken.
+    LocatorCapacity,
+    /// Another local VCT repair operation owns the slot.
+    LocalOperationBusy,
+    /// The external driver's action queue refused the call.
+    ExternalQueue,
 }
 
 /// Which local capacity refused an offer.

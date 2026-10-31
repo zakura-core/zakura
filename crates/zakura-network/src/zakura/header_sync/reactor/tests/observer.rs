@@ -510,10 +510,10 @@ async fn handled_follows_the_callbacks_effects() {
     let seeded = active(&reactor, &peer);
     recorder.take();
 
-    assert_eq!(
-        StorageDispatch::Started,
-        reactor.dispatch_action(apply_operation(&reactor, &peer))
-    );
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
     complete_next(&mut reactor).await;
 
     assert_eq!(
@@ -602,7 +602,10 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
         )
     };
     recorder.take();
-    assert_eq!(StorageDispatch::Started, reactor.dispatch_action(operation));
+    assert!(matches!(
+        reactor.dispatch_action(operation),
+        StorageDispatch::Started(_)
+    ));
 
     let _new_outbound = connect(&mut reactor, &peer, 2);
     seed_applying_request(&mut reactor, &snapshot, peer.clone(), 2);
@@ -669,15 +672,15 @@ async fn timed_out_locator_ends_timed_out() {
     recorder.take();
 
     let started = Instant::now();
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     complete_next(&mut reactor).await;
 
     assert_eq!(started.elapsed(), reactor.startup.request_timeout);
@@ -743,7 +746,10 @@ async fn synthetic_prepare_ends_not_submitted() {
     recorder.take();
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
-        assert_eq!(StorageDispatch::Started, reactor.dispatch_action(operation));
+        assert!(matches!(
+            reactor.dispatch_action(operation),
+            StorageDispatch::Started(_)
+        ));
         complete_next(&mut reactor).await;
         assert_eq!(
             recorder.take(),
@@ -792,10 +798,10 @@ async fn port_panic_before_and_after_submission() {
         let seeded = active(&reactor, &peer);
         recorder.take();
 
-        assert_eq!(
-            StorageDispatch::Started,
-            reactor.dispatch_action(apply_operation(&reactor, &peer))
-        );
+        assert!(matches!(
+            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            StorageDispatch::Started(_)
+        ));
         complete_next(&mut reactor).await;
 
         assert_eq!(
@@ -859,10 +865,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     observer.recorder.take();
 
-    assert_eq!(
-        StorageDispatch::Started,
-        reactor.dispatch_action(apply_operation(&reactor, &peer))
-    );
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
     let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
         .catch_unwind()
         .await;
@@ -910,10 +916,10 @@ async fn observer_panic_unwinds_with_its_own_payload() {
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
 
-        assert_eq!(
-            StorageDispatch::Started,
-            reactor.dispatch_action(apply_operation(&reactor, &peer))
-        );
+        assert!(matches!(
+            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            StorageDispatch::Started(_)
+        ));
         let payload = AssertUnwindSafe(reactor.pending_port_operations.next())
             .catch_unwind()
             .await
@@ -997,24 +1003,31 @@ async fn offer_waiting_on_staging_full_and_locator_capacity() {
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
     recorder.take();
 
-    assert_eq!(
-        StorageDispatch::Deferred,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Deferred(_)
+    ));
 
     assert_eq!(
         recorder.take(),
-        vec![ReactorEvent::OfferWaiting {
-            peer,
-            session_id: 0,
-            target_tip_hash: target,
-            cause: WaitCause::LocatorCapacity,
-        }]
+        vec![
+            ReactorEvent::StorageRefused {
+                call: 1,
+                kind: StorageCallKind::Locator,
+                cause: observe::RefusalCause::LocatorCapacity,
+            },
+            ReactorEvent::OfferWaiting {
+                peer,
+                session_id: 0,
+                target_tip_hash: target,
+                cause: WaitCause::LocatorCapacity,
+            }
+        ]
     );
     assert!(reactor.pending_port_operations.is_empty());
 }

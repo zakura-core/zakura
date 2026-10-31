@@ -38,13 +38,15 @@ use crate::zakura::{
 
 mod state;
 
+pub use state::StorageCallKind;
+
 #[cfg(any(test, zakura_sim))]
 use super::observe::{self, ReactorEvent};
 use state::{
     vct_error_retry, CloseAttempt, LocalOperationExpiry, LocatorDisposition, LocatorKey,
-    LocatorProposal, ReactorState, RepairStallDue, SchedulingOpportunity, VctLocalOperation,
-    VctRepairRetry, VctRepairRetryAttribution, VctRepairStall, VctRepairStallOutcome,
-    VctSupplierRejections,
+    LocatorProposal, ReactorState, RepairStallDue, SchedulingOpportunity, StorageCall,
+    VctLocalOperation, VctRepairRetry, VctRepairRetryAttribution, VctRepairStall,
+    VctRepairStallOutcome, VctSupplierRejections,
 };
 
 /// Reports the event that `$event` builds to the reactor's observer.
@@ -212,8 +214,6 @@ fn build_header_sync_reactor(
         state: ReactorState::new(Instant::now()),
         peer_work_queue: PeerWorkQueue::default(),
         last_snapshot_refresh_trace_at: Cell::new(None),
-        #[cfg(any(test, zakura_sim))]
-        next_call: 0,
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
@@ -259,9 +259,6 @@ struct HeaderSyncReactor {
     state: ReactorState,
     peer_work_queue: PeerWorkQueue,
     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
-    /// The last port call number handed out. See [`ReactorEvent::Dispatched`].
-    #[cfg(any(test, zakura_sim))]
-    next_call: u64,
 }
 
 type PendingPortOperation = Pin<Box<dyn Future<Output = StorageOutcome> + Send + 'static>>;
@@ -314,12 +311,11 @@ enum StorageCompletion {
 enum StorageOutcome {
     /// The operation returned a result.
     Completed {
+        /// The accepted call this result settles.
+        call: StorageCall,
         completion: Box<StorageCompletion>,
         /// Header capacity the operation holds until the reactor handles its result.
         capacity: Vec<HeaderCapacityLease>,
-        /// The call's number. See [`ReactorEvent::Dispatched`].
-        #[cfg(any(test, zakura_sim))]
-        call: u64,
     },
     /// The operation panicked.
     Panicked(Box<PortPanicContext>),
@@ -329,22 +325,22 @@ enum StorageOutcome {
 #[must_use]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum StorageDispatch {
-    /// The operation started, or entered the external driver's queue.
-    Started,
-    /// The peer's locator read in flight also serves this request.
-    Joined,
-    /// Locator capacity is exhausted, so the peer's offer waits for a permit.
-    Deferred,
+    /// This call started, or entered the external driver's queue.
+    Started(StorageCall),
+    /// This locator read in flight also serves the request.
+    Joined(StorageCall),
+    /// Locator capacity refused this call, so the peer's offer waits for a permit.
+    Deferred(StorageCall),
     /// The operation needs no storage work, so the reactor only recorded it.
     Recorded,
-    /// The operation cannot run.
-    Refused,
+    /// This call cannot run. A record-only action has no call.
+    Refused(Option<StorageCall>),
 }
 
 impl StorageDispatch {
     /// Whether the operation cannot run, so its caller must retire the work.
     fn is_refused(self) -> bool {
-        self == Self::Refused
+        matches!(self, Self::Refused(_))
     }
 }
 
@@ -358,9 +354,8 @@ struct PortPanicContext {
     target_tip_hash: Option<block::Hash>,
     /// The pending locator read that a panicked locator operation leaves behind.
     locator: Option<LocatorKey>,
-    /// The panicking call's number. See [`ReactorEvent::Dispatched`].
-    #[cfg(any(test, zakura_sim))]
-    call: u64,
+    /// The accepted call that panicked.
+    call: StorageCall,
 }
 
 /// Why an active header request was retired.
@@ -747,16 +742,24 @@ impl HeaderSyncReactor {
 
     fn handle_port_completion(&mut self, outcome: StorageOutcome) {
         #[cfg(any(test, zakura_sim))]
-        let (panicked, handled_call) = match &outcome {
-            StorageOutcome::Completed { call, .. } => (false, *call),
-            StorageOutcome::Panicked(context) => (true, context.call),
+        let panicked = matches!(outcome, StorageOutcome::Panicked(_));
+        let call = match &outcome {
+            StorageOutcome::Completed { call, .. } => *call,
+            StorageOutcome::Panicked(context) => context.call,
         };
+        if self.state.calls.settle(call).is_err() {
+            tracing::error!(
+                ?call,
+                "a header storage call settled twice or never started"
+            );
+            metrics::counter!("sync.header.port.unknown_settlement").increment(1);
+            return;
+        }
         match outcome {
             StorageOutcome::Completed {
                 completion,
                 capacity,
-                #[cfg(any(test, zakura_sim))]
-                    call: _,
+                ..
             } => {
                 self.handle_storage_completion(*completion);
                 drop(capacity);
@@ -770,7 +773,7 @@ impl HeaderSyncReactor {
         observe!(
             self,
             ReactorEvent::Handled {
-                call: handled_call,
+                call: call.number,
                 panicked
             }
         );
@@ -3733,71 +3736,10 @@ impl HeaderSyncReactor {
     fn dispatch_direct_port_operation(&mut self, action: HeaderPortOperation) -> StorageDispatch {
         use zakura_node_services::header_chain as port;
 
-        let vct_local_operation = VctLocalOperation::from_action(&action, Instant::now());
-        if vct_local_operation.is_some() && self.state.vct_local_operation.is_some() {
-            tracing::error!(
-                current = ?self.state.vct_local_operation,
-                attempted = ?vct_local_operation,
-                "refused to replace an owned VCT local operation"
-            );
-            return StorageDispatch::Refused;
-        }
-        let (locator_key, locator_permit) = if let HeaderPortOperation::QueryHeaderLocator {
-            peer,
-            scope,
-            #[cfg(any(test, zakura_sim))]
-            session_id,
-            #[cfg(any(test, zakura_sim))]
-            target_tip_hash,
-            ..
-        } = &action
-        {
-            let LocatorProposal::Start(key) = self.state.locators.propose(peer, *scope) else {
-                return StorageDispatch::Joined;
-            };
-            let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
-                self.state.refuse_locator(&key);
-                self.locator_capacity_waiting = true;
-                observe!(
-                    self,
-                    ReactorEvent::OfferWaiting {
-                        peer: peer.clone(),
-                        session_id: *session_id,
-                        target_tip_hash: *target_tip_hash,
-                        cause: observe::WaitCause::LocatorCapacity,
-                    }
-                );
-                self.peer_work_queue.remove_unstarted(peer);
-                return StorageDispatch::Deferred;
-            };
-            (Some(key), Some(port::LocatorReadPermit::new(permit)))
-        } else {
-            (None, None)
-        };
-        let capacity = match &action {
-            HeaderPortOperation::PrepareHeaderTarget { peer, .. }
-            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
-                self.peer_work_queue.retain_header_capacity(peer)
-            }
-            _ => Vec::new(),
-        };
-        let panic_context = self.port_panic_context(&action, locator_key.clone());
-        #[cfg(any(test, zakura_sim))]
-        let (tap, dispatched) = self.begin_port_call(&action);
-        #[cfg(any(test, zakura_sim))]
-        let (call, panic_tap) = (tap.call, tap.clone());
-        #[cfg(any(test, zakura_sim))]
-        let panic_context = PortPanicContext {
-            call,
-            ..panic_context
-        };
-        let header_chain = self.startup.header_chain_port.clone();
-        let request_timeout = self.startup.request_timeout;
-        let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
+        let Some(kind) = StorageCallKind::of(&action) else {
             match action {
                 HeaderPortOperation::Misbehavior { peer, reason } => {
                     tracing::debug!(?peer, ?reason, "recorded Zakura header-sync peer violation");
-                    return StorageDispatch::Recorded;
                 }
                 HeaderPortOperation::DropPeer {
                     peer,
@@ -3810,7 +3752,98 @@ impl HeaderSyncReactor {
                         reason,
                         "dropped an unproductive Zakura header-sync peer"
                     );
-                    return StorageDispatch::Recorded;
+                }
+                _ => {}
+            }
+            return StorageDispatch::Recorded;
+        };
+        let vct_local_operation = VctLocalOperation::from_action(&action, Instant::now());
+        if vct_local_operation.is_some() && self.state.vct_local_operation.is_some() {
+            tracing::error!(
+                current = ?self.state.vct_local_operation,
+                attempted = ?vct_local_operation,
+                "refused to replace an owned VCT local operation"
+            );
+            let call = self.state.calls.propose(kind);
+            observe!(
+                self,
+                ReactorEvent::StorageRefused {
+                    call: call.number,
+                    kind,
+                    cause: observe::RefusalCause::LocalOperationBusy,
+                }
+            );
+            return StorageDispatch::Refused(Some(call));
+        }
+        let (locator_key, locator_permit) = if let HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            scope,
+            #[cfg(any(test, zakura_sim))]
+            session_id,
+            #[cfg(any(test, zakura_sim))]
+            target_tip_hash,
+            ..
+        } = &action
+        {
+            let key = match self
+                .state
+                .locators
+                .propose(peer, *scope, &mut self.state.calls)
+            {
+                LocatorProposal::Start(key) => key,
+                LocatorProposal::Joined(call) => {
+                    observe!(self, ReactorEvent::StorageJoined { call: call.number });
+                    return StorageDispatch::Joined(call);
+                }
+            };
+            let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
+                self.state.refuse_locator(&key);
+                self.locator_capacity_waiting = true;
+                observe!(
+                    self,
+                    ReactorEvent::StorageRefused {
+                        call: key.call.number,
+                        kind,
+                        cause: observe::RefusalCause::LocatorCapacity,
+                    }
+                );
+                observe!(
+                    self,
+                    ReactorEvent::OfferWaiting {
+                        peer: peer.clone(),
+                        session_id: *session_id,
+                        target_tip_hash: *target_tip_hash,
+                        cause: observe::WaitCause::LocatorCapacity,
+                    }
+                );
+                self.peer_work_queue.remove_unstarted(peer);
+                return StorageDispatch::Deferred(key.call);
+            };
+            (Some(key), Some(port::LocatorReadPermit::new(permit)))
+        } else {
+            (None, None)
+        };
+        let call = locator_key
+            .as_ref()
+            .map_or_else(|| self.state.calls.propose(kind), |key| key.call);
+        let capacity = match &action {
+            HeaderPortOperation::PrepareHeaderTarget { peer, .. }
+            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
+                self.peer_work_queue.retain_header_capacity(peer)
+            }
+            _ => Vec::new(),
+        };
+        let panic_context = self.port_panic_context(&action, locator_key.clone(), call);
+        #[cfg(any(test, zakura_sim))]
+        let (tap, dispatched) = self.begin_port_call(&action, call);
+        #[cfg(any(test, zakura_sim))]
+        let panic_tap = tap.clone();
+        let header_chain = self.startup.header_chain_port.clone();
+        let request_timeout = self.startup.request_timeout;
+        let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
+            match action {
+                HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. } => {
+                    unreachable!("a record-only action returned before its storage call")
                 }
                 HeaderPortOperation::QueryHeaderLocator {
                     peer,
@@ -4042,10 +4075,9 @@ impl HeaderSyncReactor {
                 let result = observe::rethrow_observer_panic(result);
                 match result {
                     Ok(completion) => StorageOutcome::Completed {
+                        call,
                         completion: Box::new(completion),
                         capacity,
-                        #[cfg(any(test, zakura_sim))]
-                        call,
                     },
                     Err(_) => {
                         // Report the panic before this closure drops `capacity`,
@@ -4061,20 +4093,26 @@ impl HeaderSyncReactor {
         }
         #[cfg(any(test, zakura_sim))]
         if let Some(op) = dispatched {
-            observe!(self, ReactorEvent::Dispatched { call, op });
+            observe!(
+                self,
+                ReactorEvent::Dispatched {
+                    call: call.number,
+                    op
+                }
+            );
         }
+        self.state.calls.accept(call);
         self.pending_port_operations.push(Box::pin(operation));
-        StorageDispatch::Started
+        StorageDispatch::Started(call)
     }
 
-    /// Numbers `action` as the next port call. Returns the tap its future
-    /// reports through and, when an observer is installed, the call for its
-    /// `Dispatched` event. An action that calls no port gets call 0 and no
-    /// call.
+    /// Returns the tap `call`'s future reports through and, when an observer is
+    /// installed, the call for its `Dispatched` event.
     #[cfg(any(test, zakura_sim))]
     fn begin_port_call(
-        &mut self,
+        &self,
         action: &HeaderPortOperation,
+        call: StorageCall,
     ) -> (observe::PortTap, Option<observe::PortCall>) {
         let dispatched = self
             .startup
@@ -4082,29 +4120,30 @@ impl HeaderSyncReactor {
             .0
             .as_ref()
             .and_then(|_| observe::PortCall::of(action));
-        let is_port_call = !matches!(
-            action,
-            HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. }
-        );
-        let call = if is_port_call {
-            self.next_call += 1;
-            self.next_call
-        } else {
-            0
-        };
         (
-            observe::PortTap::new(call, &self.startup.observer),
+            observe::PortTap::new(call.number, &self.startup.observer),
             dispatched,
         )
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]
     fn dispatch_external_port_operation(&mut self, action: HeaderPortOperation) -> StorageDispatch {
+        let call = StorageCallKind::of(&action).map(|kind| self.state.calls.propose(kind));
         match self.actions.try_send(action) {
-            Ok(()) => StorageDispatch::Started,
+            Ok(()) => call.map_or(StorageDispatch::Recorded, StorageDispatch::Started),
             Err(error) => {
                 tracing::debug!(?error, "header-sync action queue unavailable");
-                StorageDispatch::Refused
+                if let Some(call) = call {
+                    observe!(
+                        self,
+                        ReactorEvent::StorageRefused {
+                            call: call.number,
+                            kind: call.kind,
+                            cause: observe::RefusalCause::ExternalQueue,
+                        }
+                    );
+                }
+                StorageDispatch::Refused(call)
             }
         }
     }
@@ -4113,6 +4152,7 @@ impl HeaderSyncReactor {
         &self,
         action: &HeaderPortOperation,
         locator: Option<LocatorKey>,
+        call: StorageCall,
     ) -> PortPanicContext {
         let (operation, peer, session_id, owner, target_tip_hash) = match action {
             HeaderPortOperation::QueryHeaderLocator {
@@ -4179,8 +4219,7 @@ impl HeaderSyncReactor {
             owner,
             target_tip_hash,
             locator,
-            #[cfg(any(test, zakura_sim))]
-            call: 0,
+            call,
         }
     }
 
@@ -4875,7 +4914,11 @@ fn ordered_send_error_label(error: &OrderedSendError) -> &'static str {
 #[path = "reactor/tests/state_machine.rs"]
 mod machine_tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use machine_tests::{replay_header_reactor_bytes, HeaderReactorReplaySummary};
+pub use machine_tests::{
+    replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
+    HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
+    HeaderReactorSessionView, HeaderReactorStep, HeaderReactorView,
+};
 
 #[cfg(test)]
 mod tests;

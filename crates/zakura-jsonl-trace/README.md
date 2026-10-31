@@ -1,6 +1,6 @@
 # Structured CSV traces
 
-The node writes all twelve structured trace tables as CSV.
+The node writes every table registered in `tables::ALL` as CSV.
 `JsonlTraceTable::csv` defines a table with an explicit column list.
 The crate retains its published name, but no longer supports JSONL output.
 

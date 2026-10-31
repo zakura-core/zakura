@@ -36,7 +36,7 @@ use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
 use zakura_rpc::PendingBlockRegistry;
 
-use crate::BoxError;
+use crate::{components::block_verify_trace::BlockVerifyTrace, BoxError};
 
 // Re-use the syncer timeouts for consistency.
 use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};
@@ -281,6 +281,9 @@ pub struct InboundSetupData {
 
     /// A channel to send misbehavior reports to the [`AddressBook`].
     pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+
+    /// Records download, verification, and commit timing for gossiped blocks.
+    pub block_verify_trace: BlockVerifyTrace,
 }
 
 /// Tracks the internal state of the [`Inbound`] service during setup.
@@ -474,6 +477,7 @@ impl Service<zn::Request> for Inbound {
                         latest_chain_tip,
                         network,
                         misbehavior_sender,
+                        block_verify_trace,
                     } = setup_data;
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
@@ -486,6 +490,7 @@ impl Service<zn::Request> for Inbound {
                         state.clone(),
                         latest_chain_tip,
                         network,
+                        block_verify_trace,
                     ));
 
                     result = Ok(());

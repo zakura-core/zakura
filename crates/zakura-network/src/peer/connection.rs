@@ -26,6 +26,7 @@ use crate::{
         self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
         OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
+    lifecycle_trace::ConnectionTrace,
     meta_addr::MetaAddr,
     peer::{
         connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
@@ -617,6 +618,9 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Records received messages and the client requests this connection serves.
+    trace: ConnectionTrace,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -653,6 +657,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        trace: ConnectionTrace,
     ) -> Self {
         Connection {
             connection_info,
@@ -662,12 +667,13 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             error_slot,
-            peer_tx: peer_tx.into(),
+            peer_tx: PeerTx::new(peer_tx, trace.clone()),
             block_uploads: Default::default(),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
             last_overload_time: None,
+            trace,
         }
     }
 }
@@ -758,6 +764,7 @@ where
                         }
                         Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Left((Some(Ok(msg)), _)) => {
+                            self.trace.p2p_recv(&msg);
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -807,6 +814,8 @@ where
                         ..
                     } = tmp_state
                     {
+                        self.trace
+                            .request_finished(if response.is_ok() { "ok" } else { "error" });
                         if let Ok(response) = response.as_ref() {
                             debug!(%response, "finished receiving peer response to Zakura request");
                             // Add a metric for inbound responses to outbound requests.
@@ -867,6 +876,7 @@ where
                         }
                         Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Right((Some(Ok(peer_msg)), _cancel)) => {
+                            self.trace.p2p_recv(&peer_msg);
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
 
                             // Try to process the message using the handler.
@@ -920,6 +930,7 @@ where
                                     tx,
                                     ..
                                 } => {
+                                    self.trace.request_finished("timeout");
                                     // We replaced the original state, which means `fail_with` won't see it.
                                     // So we do the state request cleanup manually.
                                     let e = SharedPeerError::from(e);
@@ -929,6 +940,7 @@ where
                                 }
                                 // Other request timeouts fail the request.
                                 State::AwaitingResponse { tx, .. } => {
+                                    self.trace.request_finished("timeout");
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
@@ -941,6 +953,7 @@ where
                         Either::Left((Either::Left(_), _peer_fut)) => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
+                            self.trace.request_finished("canceled");
                             self.state = State::AwaitingRequest;
                         }
                     }
@@ -987,7 +1000,13 @@ where
         trace!(?req.request);
         use Request::*;
         use State::*;
-        let InProgressClientRequest { request, tx, span } = req;
+        let InProgressClientRequest {
+            request,
+            tx,
+            span,
+            trace,
+        } = req;
+        self.trace.dequeued(&trace, &request, tx.is_canceled());
 
         if tx.is_canceled() {
             metrics::counter!("peer.canceled").increment(1);
@@ -1170,6 +1189,8 @@ where
                     )
             }
         };
+
+        self.trace.request_written(new_handler.as_ref().err());
 
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {

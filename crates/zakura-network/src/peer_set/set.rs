@@ -128,6 +128,7 @@ use zakura_chain::{block, chain_tip::ChainTip, parameters::Network};
 use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
+    lifecycle_trace::LifecycleTrace,
     peer::{
         block_gossip::{BlockGossipPeer, BLOCK_GOSSIP_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
@@ -256,6 +257,9 @@ where
 
     /// Structured attribution for legacy peer discovery and block requests.
     legacy_peer_trace: LegacyPeerTrace,
+
+    /// Block broadcast scheduling trace.
+    lifecycle_trace: LifecycleTrace,
 
     // Peer Tracking: Busy Peers
     //
@@ -388,6 +392,7 @@ where
             block_gossip_slots: Arc::new(tokio::sync::Semaphore::new(BLOCK_GOSSIP_CONCURRENCY)),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.spawn_tracer()),
+            lifecycle_trace: LifecycleTrace::noop(),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),
@@ -446,6 +451,12 @@ where
                 Poll::Ready(Err("all peer set background tasks have exited".into()))
             }
         }
+    }
+
+    /// Records block broadcast scheduling with `lifecycle_trace`.
+    pub(crate) fn with_lifecycle_trace(mut self, lifecycle_trace: LifecycleTrace) -> Self {
+        self.lifecycle_trace = lifecycle_trace;
+        self
     }
 
     /// Receive background tasks, if they've been sent on the channel, but not consumed yet.
@@ -1051,9 +1062,17 @@ where
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
+            let request_id = self.legacy_peer_trace.next_request_id();
+            // The selected peer was removed from the ready list above.
+            svc.connection_trace().dispatched(
+                request_id,
+                &req,
+                "p2c",
+                self.ready_services.len() + 1,
+            );
             let find_blocks_trace = match &req {
                 Request::FindBlocks { known_blocks, stop } => Some((
-                    self.legacy_peer_trace.next_request_id(),
+                    request_id,
                     self.legacy_peer_trace_context(p2c_key, &svc),
                     known_blocks.first().copied(),
                     *stop,
@@ -1153,9 +1172,16 @@ where
                 "routing to a peer which advertised inventory"
             );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
+            let request_id = self.legacy_peer_trace.next_request_id();
+            svc.connection_trace().dispatched(
+                request_id,
+                &req,
+                "advertised",
+                advertising_peer_list.len(),
+            );
             let trace_context = match hash {
                 InventoryHash::Block(hash) => Some((
-                    self.legacy_peer_trace.next_request_id(),
+                    request_id,
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),
@@ -1206,9 +1232,12 @@ where
                 "routing to a peer that might have inventory"
             );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
+            let request_id = self.legacy_peer_trace.next_request_id();
+            svc.connection_trace()
+                .dispatched(request_id, &req, "maybe", maybe_peer_list.len());
             let trace_context = match hash {
                 InventoryHash::Block(hash) => Some((
-                    self.legacy_peer_trace.next_request_id(),
+                    request_id,
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),
@@ -1361,18 +1390,26 @@ where
             &mut rand_10::rng(),
         );
         let slots = self.block_gossip_slots.clone();
+        let broadcast = self.lifecycle_trace.block_broadcast(
+            hash,
+            mined,
+            peers.len(),
+            BLOCK_GOSSIP_CONCURRENCY,
+            slots.available_permits(),
+        );
         async move {
-            let mut sends = futures::stream::iter(
-                peers
-                    .into_iter()
-                    .map(|peer| peer.advertise(hash, slots.clone())),
-            )
-            .buffer_unordered(BLOCK_GOSSIP_CONCURRENCY);
-            let mut succeeded = false;
+            let mut sends =
+                futures::stream::iter(peers.into_iter().enumerate().map(|(position, peer)| {
+                    let advert = broadcast.advert(position, &peer.trace);
+                    peer.advertise(hash, slots.clone(), advert)
+                }))
+                .buffer_unordered(BLOCK_GOSSIP_CONCURRENCY);
+            let mut succeeded_peers = 0;
             while let Some(sent) = sends.next().await {
-                succeeded |= sent;
+                succeeded_peers += usize::from(sent);
             }
-            if succeeded {
+            broadcast.finished(succeeded_peers);
+            if succeeded_peers > 0 {
                 Ok(Response::Nil)
             } else {
                 Err(std::io::Error::other("block broadcast reached no peers").into())

@@ -161,6 +161,7 @@ mod address_book;
 mod address_book_updater;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod isolated;
+mod lifecycle_trace;
 mod meta_addr;
 mod peer;
 mod peer_cache_updater;

@@ -34,6 +34,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
+    block_verify_trace::{BlockSource, BlockVerification, BlockVerifyTrace, ParentAtArrival},
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -373,6 +374,9 @@ where
 
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
+
+    /// Download, verification, and commit timing for each block.
+    verify_trace: BlockVerifyTrace,
 }
 
 fn take_task_state(
@@ -471,6 +475,7 @@ where
         chain_network: Network,
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
+        verify_trace: BlockVerifyTrace,
     ) -> Self {
         let past_lookahead_limit_receiver =
             zs::WatchReceiver::new(past_lookahead_limit_sender.subscribe());
@@ -490,6 +495,7 @@ where
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
             trace,
+            verify_trace,
         }
     }
 
@@ -615,6 +621,7 @@ where
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
         let task_states = self.task_states.clone();
         let trace = self.trace.clone();
+        let verify_trace = self.verify_trace.clone();
 
         let task = tokio::spawn(
             async move {
@@ -632,6 +639,7 @@ where
                     }
                     rsp = block_req => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
                 };
+                let download = download_start.elapsed();
                 Self::transition_task(
                     &task_states,
                     &trace,
@@ -757,6 +765,9 @@ where
                     });
                 }
 
+                let parent_hash = block.header.previous_block_hash;
+                let parent = ParentAtArrival::classify(block_height, parent_hash, best_tip);
+
                 trace.block_downloaded(
                     hash,
                     block_height,
@@ -879,6 +890,18 @@ where
                     }
                     verification = rsp => verification,
                 };
+                verify_trace.record(BlockVerification {
+                    source: BlockSource::Sync,
+                    hash,
+                    height: block_height,
+                    parent_hash,
+                    parent,
+                    tip_height,
+                    download,
+                    wait: verify_start.saturating_duration_since(download_start + download),
+                    verify: verify_start.elapsed(),
+                    error: verification.as_ref().err().map(|error| error as &dyn std::fmt::Display),
+                });
 
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)

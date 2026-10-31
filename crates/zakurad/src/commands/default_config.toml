@@ -126,6 +126,10 @@ trace_tables = [
     "legacy_peer_request",
     "legacy_sync",
     "mining",
+    "p2p",
+    "p2p_request",
+    "block_gossip",
+    "block_verify",
 ]
 
 [network.zakura.quic]

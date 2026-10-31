@@ -169,10 +169,6 @@ fn the_envelope_derives_each_bound_from_windows_connections_and_streams() {
     assert_eq!(envelope.node_output_bytes, 256 * (32 << 20));
     assert_eq!(envelope.request_executions, 256 * 1024);
     assert_eq!(envelope.floor_frame_bytes, 2 * 256 * 1024 * (1 << 20));
-    assert_eq!(
-        envelope.waiting_result_bytes,
-        256 * 1024 * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u128
-    );
     assert_eq!(envelope.transport_credit_bytes, 288 * (48 << 20));
     assert_eq!(
         envelope.transport_memory_bytes(),
@@ -180,7 +176,6 @@ fn the_envelope_derives_each_bound_from_windows_connections_and_streams() {
             + u128::from(envelope.node_output_bytes)
             + u128::from(envelope.compat_response_bytes)
             + envelope.floor_frame_bytes
-            + envelope.waiting_result_bytes
             + envelope.transport_credit_bytes,
     );
 }
@@ -212,6 +207,62 @@ fn only_a_one_frame_result_uses_the_floor() {
     assert_eq!(connection.granted(), 10);
     drop(shared);
     assert_eq!(connection.granted(), 0);
+}
+
+/// A shrink returns the unused bytes to both budgets at once, and they wake a waiter
+/// that the whole reservation had blocked.
+#[tokio::test]
+async fn shrinking_a_reservation_frees_room_for_a_waiter() {
+    let (gate, connection, node) = gate(100, 200);
+    let mut reservation = gate.admit_result(2, 80).await;
+    let mut waiter = Box::pin(gate.admit_result(2, 50));
+    assert!(futures::poll!(&mut waiter).is_pending());
+    assert_eq!(node.granted(), 80);
+
+    reservation.shrink_to(10);
+    let waiting = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the returned bytes fund the waiter");
+    assert_eq!((connection.granted(), node.granted()), (60, 60));
+
+    reservation.shrink_to(1_000);
+    assert_eq!(connection.granted(), 60, "a shrink never grows a grant");
+    drop((reservation, waiting));
+    assert_eq!((connection.granted(), node.granted()), (0, 0));
+}
+
+/// A floor slot charges no shared bytes, so a shrink leaves it and the budgets alone.
+#[test]
+fn shrinking_a_floor_grant_changes_nothing() {
+    let (gate, connection, _node) = gate(10, 200);
+    let _shared = gate.try_admit(10).unwrap();
+    let mut floor = gate.try_admit(10).unwrap();
+    floor.shrink_to(0);
+    assert_eq!(connection.granted(), 10);
+    assert!(gate.try_admit(1).is_none(), "the floor slot stays taken");
+}
+
+/// A large reservation that waits at the head of the connection's budget holds back
+/// every later shared grant, and a one-frame result on another stream still passes
+/// through its own floor. A multi-frame result behind it waits its turn.
+#[test]
+fn a_queued_large_reservation_delays_only_multi_frame_results() {
+    let connection = OutputByteBudget::new(100).unwrap();
+    let node = OutputByteBudget::new(1_000).unwrap();
+    let streams = |_| FrameGate::new(connection.clone(), node.clone());
+    let [running, large, small, medium] = [0, 1, 2, 3].map(streams);
+    let _running = running.try_admit(90).unwrap();
+
+    let mut waiting = Box::pin(large.admit_result(2, 50));
+    assert!((&mut waiting).now_or_never().is_none());
+    assert!(
+        medium.admit_result(2, 1).now_or_never().is_none(),
+        "FIFO order holds a multi-frame result behind the head"
+    );
+    assert!(
+        small.admit_result(1, 1).now_or_never().is_some(),
+        "a one-frame result never waits for its stream's fresh floor"
+    );
 }
 
 /// The compatibility partition never charges or waits for native raw or output

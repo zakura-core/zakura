@@ -30,9 +30,10 @@
 //! moves its bytes out of QUIC's buffers, so a raw grant and transport credit
 //! never charge the same bytes, and [`ResourceEnvelope`] adds the two.
 //!
-//! Request-stream executions need no budget here. Each runs on a stream that
-//! holds one of its connection's `max_open_streams` permits, and a connection
-//! keeps its slot until its stream workers settle.
+//! A request stream funds its response from the output budgets before its service
+//! runs, so no materialized result waits unfunded. Each execution also runs on a
+//! stream that holds one of its connection's `max_open_streams` permits, and a
+//! connection keeps its slot until its stream workers settle.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,9 +103,6 @@ pub(crate) struct ResourceEnvelope {
     pub(crate) compat_response_bytes: u64,
     /// The frames each stream's raw and output floor slots may retain, in bytes.
     pub(crate) floor_frame_bytes: u128,
-    /// The compatibility results that request executions may hold while they wait
-    /// for output admission, in bytes. Only an open stream bounds them.
-    pub(crate) waiting_result_bytes: u128,
     /// Unspent transport credit the peer memory budget funds, in bytes.
     pub(crate) transport_credit_bytes: u128,
 }
@@ -134,7 +132,6 @@ impl ResourceEnvelope {
             request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
             compat_response_bytes: COMPAT_RESPONSE_EXCHANGES * COMPAT_EXCHANGE_MAX_BYTES,
             floor_frame_bytes: 2 * streams * u128::from(limits.max_frame_bytes),
-            waiting_result_bytes: streams * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u128,
             transport_credit_bytes: live_connections
                 * u128::from(zakura_quic::connection_memory_bytes(
                     limits.receive_window,
@@ -144,15 +141,13 @@ impl ResourceEnvelope {
     }
 
     /// The most frame bytes these bounds allow this module's owners to retain:
-    /// the node budgets, the compatibility partition, each stream's raw and output
-    /// floor frame, and the compatibility results that wait for output admission
-    /// while they hold a stream.
+    /// the node budgets, the compatibility partition, and each stream's raw and
+    /// output floor frame.
     pub(crate) fn retained_frame_bytes(&self) -> u128 {
         u128::from(self.node_raw_bytes)
             + u128::from(self.node_output_bytes)
             + u128::from(self.compat_response_bytes)
             + self.floor_frame_bytes
-            + self.waiting_result_bytes
     }
 
     /// The most transport memory these bounds allow: retained frames, plus the
@@ -367,7 +362,7 @@ impl FrameGate {
         shared
             .or_else(|| self.floor.try_reserve().map(FrameCharge::floor))
             .map(|charge| FrameGrant {
-                _charge: charge,
+                charge,
                 waited: Duration::ZERO,
             })
     }
@@ -385,12 +380,13 @@ impl FrameGate {
             shared = self.shared(bytes) => FrameCharge::shared(shared),
         };
         FrameGrant {
-            _charge: charge,
+            charge,
             waited: started.elapsed(),
         }
     }
 
-    /// Wait for a materialized result of `frames` frames and `bytes` bytes.
+    /// Wait to fund a result of at most `frames` frames and `bytes` bytes.
+    /// Cancelling the wait takes nothing.
     ///
     /// A one-frame result may use the floor slot, because the floor funds one frame.
     /// A larger result waits for the shared budgets, so a saturated node cannot hide
@@ -402,7 +398,7 @@ impl FrameGate {
         let started = Instant::now();
         let charge = FrameCharge::shared(self.shared(bytes).await);
         FrameGrant {
-            _charge: charge,
+            charge,
             waited: started.elapsed(),
         }
     }
@@ -430,7 +426,7 @@ pub(crate) fn frame_wire_bytes(payload_len: usize) -> u64 {
 #[derive(Debug)]
 #[must_use = "dropping a frame grant releases its capacity"]
 pub(crate) struct FrameGrant {
-    _charge: FrameCharge,
+    charge: FrameCharge,
     waited: Duration,
 }
 
@@ -439,6 +435,15 @@ impl FrameGrant {
     pub(crate) fn waited(&self) -> Duration {
         self.waited
     }
+
+    /// Return every shared byte above `bytes`, which wakes the budgets' waiters.
+    /// A floor slot funds one frame of any size, so it stays as it is.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        if let FrameCharge::Shared { node, connection } = &mut self.charge {
+            node.shrink_to(bytes);
+            connection.shrink_to(bytes);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -446,8 +451,8 @@ enum FrameCharge {
     /// Field order is drop order: the node's bytes return first, because
     /// admission takes the connection's bytes first.
     Shared {
-        _node: OutputGrant,
-        _connection: OutputGrant,
+        node: OutputGrant,
+        connection: OutputGrant,
     },
     Floor {
         _slot: SlotPermit,
@@ -460,10 +465,7 @@ impl FrameCharge {
     }
 
     fn shared((connection, node): (OutputGrant, OutputGrant)) -> Self {
-        Self::Shared {
-            _node: node,
-            _connection: connection,
-        }
+        Self::Shared { node, connection }
     }
 }
 

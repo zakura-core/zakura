@@ -156,7 +156,7 @@ impl OutputByteBudget {
             .acquire_many_owned(bytes)
             .await
             .expect("output budget semaphore stays open because this type never closes it");
-        OutputGrant { _permit: permit }
+        OutputGrant { permit }
     }
 
     /// Take `bytes` now, or nothing. Pass a value from [`Self::clamp`].
@@ -165,7 +165,7 @@ impl OutputByteBudget {
             .clone()
             .try_acquire_many_owned(bytes)
             .ok()
-            .map(|permit| OutputGrant { _permit: permit })
+            .map(|permit| OutputGrant { permit })
     }
 
     /// Take every free byte, up to 4 GiB.
@@ -176,7 +176,7 @@ impl OutputByteBudget {
             .clone()
             .try_acquire_many_owned(free)
             .ok()
-            .map(|permit| OutputGrant { _permit: permit })
+            .map(|permit| OutputGrant { permit })
     }
 
     pub(super) fn downgrade(&self) -> WeakOutputByteBudget {
@@ -191,7 +191,16 @@ impl OutputByteBudget {
 #[derive(Debug)]
 #[must_use = "dropping an output grant releases its bytes"]
 pub(crate) struct OutputGrant {
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
+}
+
+impl OutputGrant {
+    /// Return every granted byte above `bytes`. A smaller grant stays as it is.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let keep = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let extra = self.permit.num_permits().saturating_sub(keep);
+        drop(self.permit.split(extra));
+    }
 }
 
 /// A registry handle to an output budget that does not keep it alive.

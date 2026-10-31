@@ -27,7 +27,9 @@ use thiserror::Error;
 use zakura_chain::{
     block::{self, Block, CountedHeader},
     parameters::{Network, NetworkKind},
-    serialization::{CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE},
+    serialization::{
+        CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+    },
     transaction::Transaction,
 };
 use zakura_node_services::task::{erased, spawn_erased_named};
@@ -231,6 +233,8 @@ const LEGACY_RESPONSE_CHUNK_HEADER_BYTES: usize = LEGACY_RESPONSE_REQUEST_ID_BYT
 const LEGACY_COMPACT_SIZE_PREFIX_BYTES: usize = 9;
 const LEGACY_BLOCK_HASH_BYTES: usize = 32;
 const LEGACY_INVENTORY_HASH_BYTES: usize = 36;
+/// A witnessed transaction's inventory entry: a type code and two 32-byte hashes.
+const LEGACY_WTX_INVENTORY_BYTES: usize = 68;
 const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 /// Maximum cumulative response payload bytes the requester will retain in the
 /// accepted-frame `Vec` before `decode_response` consumes it.
@@ -5425,6 +5429,21 @@ async fn request_stream_worker(
     }
 
     let response_frame_cap = context.outbound_frame_cap;
+    // Fund the whole response before the service runs, so a saturated output budget
+    // stops the request here and no result waits unfunded. The stream's permit and
+    // the raw frame's grant stay held during this wait.
+    let bound = response_bound(
+        prelude.stream_kind,
+        &frame,
+        context.limits,
+        response_frame_cap,
+    );
+    let mut output = zakura_rt::select! {
+        biased;
+        _ = context.connection_token.cancelled() => return,
+        output = context.resources.output.admit_result(bound.frames, bound.bytes) => output,
+    };
+
     // The raw frame's grant ends with the service's call, which cancelling the
     // connection also ends.
     let response = zakura_rt::select! {
@@ -5462,17 +5481,22 @@ async fn request_stream_worker(
         }
     };
 
-    // The result is the worker's own retained memory. Fund it through the write,
-    // and stop at this owner when the output budgets are saturated. The stream's
-    // permit stays held until then, so open streams bound the unfunded results.
+    // The result is the worker's own retained memory, and `output` funds it through
+    // the write. A result above its bound has no funding, so it never reaches the
+    // write. The bytes the service did not use return to the budgets now.
     let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
         bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
     });
-    let _result = zakura_rt::select! {
-        biased;
-        _ = context.connection_token.cancelled() => return,
-        result = context.resources.output.admit_result(response_frames.len(), result_bytes) => result,
-    };
+    if result_bytes > bound.bytes {
+        debug!(
+            result_bytes,
+            bound_bytes = bound.bytes,
+            "Zakura request service returned more than its response bound"
+        );
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+        return;
+    }
+    output.shrink_to(result_bytes);
     for frame in response_frames {
         if let Err(error) =
             write_response_frame(&mut send, frame, context.limits, response_frame_cap).await
@@ -6084,6 +6108,113 @@ impl LegacyResponseBudget {
             max_bytes,
             max_message_bytes,
         })
+    }
+}
+
+/// The most output one response to a request can need.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ResponseBound {
+    frames: usize,
+    /// Wire bytes, including each frame's header.
+    bytes: u64,
+}
+
+impl ResponseBound {
+    /// The bound of a request whose response has no derivable limit: any number of
+    /// frames, up to the compatibility response cap.
+    const MAX: Self = Self {
+        frames: usize::MAX,
+        // Widening usize to u64 is lossless on supported targets.
+        bytes: LEGACY_RESPONSE_MAX_AGGREGATE_BYTES as u64,
+    };
+}
+
+/// The most output this service's response to `frame` can need under these caps.
+///
+/// A request that the legacy budget cannot parse gets [`ResponseBound::MAX`], so the
+/// service stays the one owner that rejects it.
+fn response_bound(
+    stream_kind: u16,
+    frame: &Frame,
+    limits: ZakuraConnectionLimits,
+    max_frame_bytes: u32,
+) -> ResponseBound {
+    if stream_kind != LEGACY_REQUEST_STREAM_KIND {
+        return ResponseBound::MAX;
+    }
+    LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
+        .map_or(ResponseBound::MAX, |budget| {
+            budget.response_bound(max_frame_bytes)
+        })
+}
+
+impl LegacyResponseBudget {
+    /// The output the local responder can need for this request.
+    ///
+    /// This differs from the budget's own byte limit, which checks a peer's
+    /// response. A peer negotiates the caps here, so this limit charges every chunk's
+    /// headers and never trusts a small message cap to make a response small.
+    fn response_bound(&self, max_frame_bytes: u32) -> ResponseBound {
+        // Widening u32 to usize is lossless on supported targets.
+        let frame_payload_bytes = (max_frame_bytes as usize).saturating_sub(FRAME_HEADER_BYTES);
+        let one_frame = |payload_bytes: usize| ResponseBound {
+            frames: 1,
+            // Widening usize to u64 is lossless on supported targets.
+            bytes: payload_bytes
+                .min(frame_payload_bytes)
+                .saturating_add(FRAME_HEADER_BYTES) as u64,
+        };
+        match self.kind {
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                let message_cap = u32::try_from(self.max_message_bytes).unwrap_or(u32::MAX);
+                let Some(chunk_bytes) =
+                    super::legacy_gossip::response_chunk_bytes(max_frame_bytes, message_cap)
+                else {
+                    return ResponseBound::MAX;
+                };
+                self.inventory_bound(chunk_bytes)
+            }
+            LegacyResponseKind::TransactionIds => one_frame(
+                LEGACY_RESPONSE_REQUEST_ID_BYTES
+                    .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
+                    .saturating_add(self.max_items.saturating_mul(LEGACY_WTX_INVENTORY_BYTES)),
+            ),
+            LegacyResponseKind::BlockHashes
+            | LegacyResponseKind::BlockHeaders
+            | LegacyResponseKind::Pong
+            | LegacyResponseKind::Nil => one_frame(self.max_bytes),
+        }
+    }
+
+    /// The output of a block or transaction response that splits each object into
+    /// frames carrying `chunk_bytes` object bytes.
+    ///
+    /// Each item is either one object of up to a protocol message, or a missing-item
+    /// entry that is smaller than that. All missing entries share one more frame.
+    /// The encoder refuses a response above the aggregate cap, and each frame it
+    /// emits within that cap carries at least one object byte after its chunk header.
+    fn inventory_bound(&self, chunk_bytes: usize) -> ResponseBound {
+        let chunks_per_item = MAX_PROTOCOL_MESSAGE_LEN.div_ceil(chunk_bytes);
+        let item_payload_bytes = MAX_PROTOCOL_MESSAGE_LEN
+            .saturating_add(chunks_per_item.saturating_mul(LEGACY_RESPONSE_CHUNK_HEADER_BYTES));
+        let payload_bytes = self
+            .max_items
+            .saturating_mul(item_payload_bytes)
+            .saturating_add(LEGACY_RESPONSE_REQUEST_ID_BYTES)
+            .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
+            .min(LEGACY_RESPONSE_MAX_AGGREGATE_BYTES);
+        let most_frames = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES
+            / LEGACY_RESPONSE_CHUNK_HEADER_BYTES.saturating_add(1);
+        let frames = self
+            .max_items
+            .saturating_mul(chunks_per_item)
+            .min(most_frames)
+            .saturating_add(1);
+        ResponseBound {
+            frames,
+            // Widening usize to u64 is lossless on supported targets.
+            bytes: payload_bytes.saturating_add(frames.saturating_mul(FRAME_HEADER_BYTES)) as u64,
+        }
     }
 }
 

@@ -1100,6 +1100,24 @@ fn push_response_frame(
     Ok(())
 }
 
+/// The object bytes each chunk frame carries under these caps, or `None` when the
+/// caps leave no room for an object byte.
+///
+/// A chunk frame fits the *effective* outbound cap: the smaller of the negotiated
+/// frame payload cap (`max_frame_bytes - FRAME_HEADER_BYTES`) and the peer's
+/// negotiated `max_message_bytes`. The handshake clamps the two caps independently,
+/// so sizing against the frame cap alone produces chunk frames whose payload exceeds
+/// the peer's accepted message cap, which the peer (and our own
+/// `write_response_frame`) reject as oversize.
+pub(super) fn response_chunk_bytes(max_frame_bytes: u32, max_message_bytes: u32) -> Option<usize> {
+    let max_payload_bytes = usize::try_from(max_frame_bytes)
+        .ok()?
+        .saturating_sub(FRAME_HEADER_BYTES)
+        .min(usize::try_from(max_message_bytes).ok()?);
+    let max_chunk_bytes = max_payload_bytes.checked_sub(RESPONSE_CHUNK_HEADER_BYTES)?;
+    (max_chunk_bytes > 0).then(|| LEGACY_RESPONSE_CHUNK_BYTES.min(max_chunk_bytes))
+}
+
 fn push_chunked_response(
     frames: &mut Vec<Frame>,
     budget: &mut ResponseEncodeBudget,
@@ -1113,22 +1131,8 @@ fn push_chunked_response(
         return Err(LegacyGossipError::OversizedResponse(bytes.len()));
     }
 
-    // Size each chunk frame against the *effective* outbound cap: the smaller of
-    // the negotiated frame payload cap (`max_frame_bytes - FRAME_HEADER_BYTES`)
-    // and the peer's negotiated `max_message_bytes`. The handshake clamps the two
-    // caps independently, so sizing against the frame cap alone produces chunk
-    // frames whose payload exceeds the peer's accepted message cap, which the
-    // peer (and our own `write_response_frame`) reject as oversize.
-    let max_payload_bytes = usize::try_from(max_frame_bytes)?
-        .saturating_sub(FRAME_HEADER_BYTES)
-        .min(usize::try_from(max_message_bytes)?);
-    let max_chunk_bytes = max_payload_bytes
-        .checked_sub(RESPONSE_CHUNK_HEADER_BYTES)
+    let chunk_bytes = response_chunk_bytes(max_frame_bytes, max_message_bytes)
         .ok_or(LegacyGossipError::OversizedResponse(bytes.len()))?;
-    if max_chunk_bytes == 0 {
-        return Err(LegacyGossipError::OversizedResponse(bytes.len()));
-    }
-    let chunk_bytes = LEGACY_RESPONSE_CHUNK_BYTES.min(max_chunk_bytes);
 
     debug_assert!(!bytes.is_empty());
     let chunks = bytes.chunks(chunk_bytes).collect::<Vec<_>>();

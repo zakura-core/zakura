@@ -138,7 +138,7 @@ async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
 
 /// Exercise the production receipt future while the sequencer queue is full.
 #[tokio::test(flavor = "current_thread")]
-async fn receipt_settlement_survives_handoff_and_releases_on_cancel() {
+async fn receipt_waits_for_admission_before_settlement() {
     for (matched, cancel_handoff) in [(true, false), (true, true), (false, false), (false, true)] {
         let Probe {
             mut routine,
@@ -165,31 +165,39 @@ async fn receipt_settlement_survives_handoff_and_releases_on_cancel() {
         let slot = sender.clone().reserve_owned().await.unwrap();
         routine.sequencer_input = sender;
         let resident = routine.sequencer_input_bytes.clone();
-        let mut handoff =
-            Box::pin(routine.handle_body(blocks[0].clone(), None, None, Arc::from([])));
+        let frame = BlockSyncMessage::Block(blocks[0].clone())
+            .encode_frame()
+            .unwrap();
+        let mut guard = block_sync_guard();
+        let mut handoff = Box::pin(routine.handle_frame(&mut guard, frame));
 
         assert!(futures::poll!(&mut handoff).is_pending());
         assert_eq!(
             work.reserved_bytes(),
-            0,
-            "receipt ended the ledger reservation"
+            charge,
+            "waiting for admission preserves the request reservation"
         );
         assert_eq!(
             budget.reserved(),
             charge + 17,
-            "handoff still owns the charge"
+            "the request still owns the charge"
         );
-        assert!(resident.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(resident.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         if cancel_handoff {
             drop(handoff);
             drop(slot);
             assert!(receiver.try_recv().is_err());
+            assert_eq!(work.reserved_bytes(), charge);
+            assert_eq!(budget.reserved(), charge + 17);
+            work.reset_above(block::Height(0));
         } else {
             drop(slot);
             tokio::time::timeout(Duration::from_secs(1), handoff)
                 .await
+                .unwrap()
                 .unwrap();
+            assert_eq!(work.reserved_bytes(), 0);
             assert_eq!(budget.reserved(), 17);
             drop(
                 receiver
@@ -210,6 +218,89 @@ async fn receipt_settlement_survives_handoff_and_releases_on_cancel() {
             "routine cleanup cannot release twice"
         );
         budget.release(17);
+    }
+}
+
+/// A receiver wake can race with cancellation before the sender settles funding.
+#[tokio::test(flavor = "current_thread")]
+async fn receipt_keeps_funding_until_the_production_send_completes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct ReceiverWake {
+        budget: ByteBudget,
+        resident: Arc<AtomicU64>,
+        charge_at_send: AtomicU64,
+        resident_at_send: AtomicU64,
+        cancel: CancellationToken,
+    }
+
+    impl futures::task::ArcWake for ReceiverWake {
+        fn wake_by_ref(waker: &Arc<Self>) {
+            waker
+                .charge_at_send
+                .store(waker.budget.reserved(), Ordering::SeqCst);
+            waker
+                .resident_at_send
+                .store(waker.resident.load(Ordering::Relaxed), Ordering::SeqCst);
+            waker.cancel.cancel();
+        }
+    }
+
+    for matched in [true, false] {
+        let Probe {
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies,
+            _events,
+        } = probe(1);
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let charge = routine.work.reserved_bytes();
+        assert!(charge > 0);
+        let unrelated = routine.budget.reserve_owned(17).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        routine.sequencer_input = sender;
+        let wake = Arc::new(ReceiverWake {
+            budget: routine.budget.clone(),
+            resident: routine.sequencer_input_bytes.clone(),
+            charge_at_send: AtomicU64::new(0),
+            resident_at_send: AtomicU64::new(0),
+            cancel: routine.cancel.clone(),
+        });
+        let waker = futures::task::waker(wake.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(receiver.poll_recv(&mut context).is_pending());
+
+        deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
+
+        assert!(routine.cancel.is_cancelled(), "the send woke the receiver");
+        assert_eq!(
+            wake.charge_at_send.load(Ordering::SeqCst),
+            charge + 17,
+            "the request charge survives until the send completes"
+        );
+        assert!(
+            wake.resident_at_send.load(Ordering::SeqCst) > 0,
+            "the body is charged before the receiver can run"
+        );
+        assert_eq!(routine.work.reserved_bytes(), 0);
+        assert_eq!(routine.budget.reserved(), 17);
+        drop(
+            receiver
+                .try_recv()
+                .expect("cancellation cannot interrupt the admitted send"),
+        );
+        assert_eq!(wake.resident.load(Ordering::Relaxed), 0);
+        drop(unrelated);
+        assert_eq!(routine.budget.reserved(), 0);
     }
 }
 

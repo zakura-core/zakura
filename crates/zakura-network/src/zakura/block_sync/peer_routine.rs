@@ -1024,13 +1024,8 @@ impl PeerRoutine {
             }
         }
         self.trace_wake("own_body");
-        self.handle_body(
-            block,
-            Some(body_wire_bytes),
-            Some(body_permit),
-            raw_block_payload,
-        )
-        .await;
+        self.handle_body(block, Some(body_wire_bytes), body_permit, raw_block_payload)
+            .await;
         Ok(())
     }
 
@@ -2036,7 +2031,7 @@ impl PeerRoutine {
         &mut self,
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
-        body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+        body_permit: mpsc::OwnedPermit<SequencedBody>,
         raw_block_payload: Arc<[u8]>,
     ) {
         let hash = block.hash();
@@ -2216,12 +2211,8 @@ impl PeerRoutine {
             self.publish_slot_diagnostics();
         }
 
-        // Forward the body to the commit-pipeline task. THE ONLY blocking send in
-        // the routine: a slow verifier blocks the task draining input, the bounded
-        // input channel fills, and this routine blocks here — backpressure
-        // isolated to this peer (the per-peer routines throughput win).
-        // Keep the routine out of floor-carrier selection until settlement.
-        // Both guards also run when the handoff is cancelled.
+        // Admission reserved the sequencer slot before decode. Transfer the body
+        // synchronously, then settle its request funding.
         let handoff_blocked = HandoffBlocked::start(self);
         let receipt_settlement =
             ReceiptSettlement::new(self, outstanding_owner, height, receipt_settlement.funding);
@@ -2235,8 +2226,7 @@ impl PeerRoutine {
             serialized_bytes,
             Some(estimated_bytes),
             body_permit,
-        )
-        .await;
+        );
         drop(receipt_settlement);
         drop(handoff_blocked);
         // This body opened only this peer's slots; the want-work loop runs at the
@@ -2273,7 +2263,7 @@ impl PeerRoutine {
     // ===================== unmatched fallthroughs (ported) ==================
 
     #[allow(clippy::too_many_arguments)]
-    async fn forward_body_to_sequencer(
+    fn forward_body_to_sequencer(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
@@ -2283,7 +2273,7 @@ impl PeerRoutine {
         decoded_attributed_memory_size_bytes: u64,
         serialized_bytes: u64,
         admitted_estimate_bytes: Option<u64>,
-        body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+        body_permit: mpsc::OwnedPermit<SequencedBody>,
     ) {
         let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
@@ -2315,11 +2305,10 @@ impl PeerRoutine {
             self.sequencer_input_decoded_attributed_memory_bytes.clone(),
         );
 
-        // The input queue holds the body from the send on. Report that before
-        // the send, because the sequencer can dequeue it before this task runs
-        // again, and report its release if the send fails.
+        // Report retention before sending because the sequencer can dequeue
+        // the body immediately on another thread.
         #[cfg(any(test, zakura_sim))]
-        let queued = {
+        {
             use super::block_sync_observe::{BlockEvent, HeldBody, Holder, HolderChange};
             let queued = (
                 HeldBody {
@@ -2343,34 +2332,9 @@ impl PeerRoutine {
                     change: HolderChange::Retained,
                 }
             );
-            queued
-        };
-        let ok = if let Some(permit) = body_permit {
-            permit.send(body);
-            true
-        } else {
-            let _read_pause = self.requester.pause_reading();
-            let send_result = self.sequencer_input.send(body).await;
-            send_result.is_ok()
-        };
-        // Only the `None`-permit path can fail, and production always passes a
-        // permit, so this branch is unreachable today. A cancelled
-        // `send().await` on that path would also leave the `Queued` retain
-        // above without its release.
-        #[cfg(any(test, zakura_sim))]
-        if !ok {
-            let (body, holder) = queued;
-            observe!(
-                self.observer,
-                super::block_sync_observe::BlockEvent::Holder {
-                    body,
-                    holder,
-                    change: super::block_sync_observe::HolderChange::Released,
-                }
-            );
         }
-
-        self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), ok);
+        body_permit.send(body);
+        self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), true);
     }
 
     /// Accept a wanted unmatched body whose original requester is gone or whose
@@ -2385,7 +2349,7 @@ impl PeerRoutine {
         hash: block::Hash,
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
-        body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+        body_permit: mpsc::OwnedPermit<SequencedBody>,
         raw_block_payload: Arc<[u8]>,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
@@ -2500,8 +2464,7 @@ impl PeerRoutine {
             serialized_bytes,
             admitted_estimate_bytes,
             body_permit,
-        )
-        .await;
+        );
         // Release the ended reservation only now that the body is counted in
         // `sequencer_input_bytes`, mirroring the matched receipt path above, so
         // the bytes are never invisible to both the limiter and the resident

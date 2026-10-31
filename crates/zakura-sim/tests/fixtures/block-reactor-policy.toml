@@ -1,0 +1,9 @@
+harness = "block/reactor-policy"
+generator = 1
+sha256 = "866eab29ee4b80c036ede067022d9d7cd8906370f6065b9e322e2a9e3c8da9a8"
+scenario_sha256 = "aaea0bac4f03213a5139e8f30badde0ce12b698bc1df2fa649519d098b490f49"
+source = "crates/zakura-sim/tests/replay_exact.rs"
+
+[[witness]]
+property = "block/reactor-policy"
+expect = "holds"

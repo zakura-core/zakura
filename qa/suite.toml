@@ -528,3 +528,10 @@ name = "block_work_funding"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800

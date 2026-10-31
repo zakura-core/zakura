@@ -1,22 +1,12 @@
-//! Sequencing policy and retained payloads for the block-sync commit pipeline.
+//! Sequencing decisions over body identities, size facts, and apply attempts.
 //!
-//! [`SequencerState`] owns the [`Sequencer`] (reorder buffer, applying queue, and
-//! submission identities), the committed-frontier mirrors, the body-work
-//! authority, the global state version, the reset and reaction epochs, body retry
-//! episodes, submission-retry timing, and required evidence that the driver has
-//! not yet accepted. Time enters as explicit arguments. Retry jitter comes from
-//! the seed given at construction. Payload decoding and payload destruction
-//! still run through the retained `Sequencer`; this state is not yet pure.
+//! State owns ordering, authority, retry policy, and required evidence. IO owns
+//! payloads. State emits payload release and downgrade operations; IO applies
+//! those operations after each transition and before suspension. IO reports a
+//! measured decoded size before state assigns the submission token.
 //!
-//! Each transition returns [`SequencerOperation`]s in the order the task runs
-//! them. [`SequencerIO`](super::SequencerIO) runs each operation against the
-//! shared work queue, peer registry, and action channel.
-//!
-//! Retained bodies are immutable payloads (`Arc` bytes or an `Arc` block), so the
-//! `Sequencer` keeps them. IO keeps the input-queue accounting guard and releases
-//! it before it hands a body to [`SequencerState::accept_body`]. An apply attempt
-//! is identified by its [`BlockApplyToken`]. The `Sequencer` never reuses a token,
-//! and a completion must match the token's owner, source, height, and hash before
+//! Time enters as explicit arguments. Retry jitter uses the constructor seed.
+//! An apply completion must match owner, source, token, height, and hash before
 //! it changes current work.
 
 use std::collections::VecDeque;
@@ -107,7 +97,7 @@ impl BodyAcceptance {
     }
 }
 
-/// A received body after IO released its input-queue accounting.
+/// Facts for a received payload retained by IO.
 #[derive(Debug)]
 pub(super) struct ReceivedBody {
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -115,7 +105,7 @@ pub(super) struct ReceivedBody {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) previous_block_hash: block::Hash,
-    pub(super) body: BufferedBlockBody,
+    pub(super) body: super::super::reorder::BodyFacts,
     pub(super) bytes: u64,
     pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) peer: ZakuraPeerId,
@@ -1076,11 +1066,6 @@ impl SequencerState {
             return None;
         }
         Some(height)
-    }
-
-    /// Decode the selected body and assign its submission token.
-    pub(super) fn prepare_submission(&mut self, height: block::Height) -> Option<SubmitItem> {
-        self.sequencer.prepare_submit(height)
     }
 
     /// The driver accepted the submission of `height`.

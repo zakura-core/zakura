@@ -112,9 +112,10 @@ fn received(block: &Arc<block::Block>, height: u32, epoch: u64) -> ReceivedBody 
         height: block::Height(height),
         hash: hash(height, epoch),
         previous_block_hash: hash(height.saturating_sub(1), epoch),
-        body: BufferedBlockBody::Decoded {
-            block: block.clone(),
-            decoded_attributed_memory_size_bytes: block.attributed_memory_size_bytes(),
+        body: super::super::super::reorder::BodyFacts {
+            id: super::super::super::reorder::BodyId((epoch << 32) + u64::from(height) + 1),
+            decoded_bytes: block.attributed_memory_size_bytes(),
+            raw_wire_bytes: None,
         },
         bytes: 100,
         admitted_estimate_bytes: None,
@@ -143,7 +144,14 @@ fn submission_pass(
         return accepted;
     };
     while let Some(height) = state.next_submission_height(&mut pass) {
-        let Some(item) = state.sequencer.prepare_submit(height) else {
+        let facts = state
+            .sequencer
+            .submission_body(height)
+            .expect("selected body exists");
+        let Some(item) = state
+            .sequencer
+            .prepare_submit(height, facts.id, facts.decoded_bytes)
+        else {
             continue;
         };
         if accepted.len() == accepts {
@@ -1241,13 +1249,6 @@ fn state_histories_do_not_publish_metrics() {
     }
 
     let block = test_block();
-    let frame = BlockSyncMessage::Block(block.clone())
-        .encode_frame()
-        .unwrap();
-    let (_, Some(raw)) = BlockSyncMessage::decode_frame_with_raw_block_payload(frame).unwrap()
-    else {
-        panic!("the block frame retains its bytes");
-    };
     let recorder = NoMetrics;
     let _guard = metrics::set_default_local_recorder(&recorder);
     replay_sequencer_order_bytes(ORDER_WITNESS);
@@ -1256,15 +1257,14 @@ fn state_histories_do_not_publish_metrics() {
 
     let mut state = new_state(1);
     let mut body = received(&block, 1, 0);
-    body.body = BufferedBlockBody::RawFramePayload(raw);
+    body.body.decoded_bytes = 0;
+    body.body.raw_wire_bytes = Some(include_bytes!("mainnet-block-1.bin").len());
+    let id = body.body.id;
     assert!(matches!(state.accept_body(body), BodyAcceptance::Buffered));
     let item = state
-        .prepare_submission(block::Height(1))
+        .sequencer
+        .prepare_submit(block::Height(1), id, block.attributed_memory_size_bytes())
         .expect("the body is applying");
-    assert_eq!(item.block, block);
+    assert_eq!(item.body_id, id);
     assert_eq!(item.decoded_bytes, block.attributed_memory_size_bytes());
-    assert_eq!(
-        item.newly_decoded_wire_bytes,
-        Some(include_bytes!("mainnet-block-1.bin").len())
-    );
 }

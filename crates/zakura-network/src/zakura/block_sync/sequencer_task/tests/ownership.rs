@@ -43,7 +43,11 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         ZakuraTrace::noop(),
     );
     let check = |task: &mut SequencerIO, label: &str| {
-        let owners = task.state.sequencer.ownership_snapshot();
+        task.payloads.apply(&mut task.state.sequencer);
+        let owners = task
+            .state
+            .sequencer
+            .ownership_snapshot(&task.payloads.entries);
         let reorder: u64 = owners.reorder.iter().map(|body| body.bytes).sum();
         let applying: u64 = owners.applying.iter().map(|body| body.bytes).sum();
         let submissions: u64 = owners.submissions.iter().map(|owner| owner.bytes).sum();
@@ -308,5 +312,92 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
                 change: HolderChange::Released,
             },
         ]
+    );
+}
+
+fn runtime_payload(
+    height: block::Height,
+    block: Arc<block::Block>,
+) -> (Sequencer, SequencerPayloads, std::sync::Weak<block::Block>) {
+    let weak = Arc::downgrade(&block);
+    let frame = BlockSyncMessage::Block(block.clone())
+        .encode_frame()
+        .unwrap();
+    let (_, Some(raw)) = BlockSyncMessage::decode_frame_with_raw_block_payload(frame).unwrap()
+    else {
+        panic!("the block frame retains its raw payload");
+    };
+    let hash = block.hash();
+    let previous = block.header.previous_block_hash;
+    let bytes = u64::try_from(raw.len()).unwrap();
+    let mut payloads = SequencerPayloads::default();
+    let facts = payloads.insert(BufferedBlockBody::from_decoded_block(block, Some(raw)));
+    let mut policy = Sequencer::new(block::Height(0), 1);
+    assert!(matches!(
+        policy.accept_buffered_body(
+            super::super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            hash,
+            previous,
+            facts,
+            bytes,
+            None,
+            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+        ),
+        super::super::sequencer::AcceptOutcome::Buffered { .. }
+    ));
+    policy.drain_ready_into_applying();
+    payloads.apply(&mut policy);
+    (policy, payloads, weak)
+}
+
+#[test]
+fn runtime_payload_demotion_drops_the_decoded_copy() {
+    let block = Arc::new(
+        BLOCK_MAINNET_2_BYTES
+            .as_slice()
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    let (policy, payloads, weak) = runtime_payload(block::Height(2), block);
+    assert_eq!(policy.reorder_len(), 1);
+    assert_eq!(payloads.retained_ids().count(), 1);
+    assert!(
+        weak.upgrade().is_none(),
+        "raw retention must release the decoded payload"
+    );
+}
+
+#[test]
+fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_payload() {
+    let (mut policy, mut payloads, weak) = runtime_payload(block::Height(1), test_block());
+    let original = weak
+        .upgrade()
+        .expect("the runtime owner retains the input decode");
+    let prepared = payloads.prepare(&mut policy, block::Height(1)).unwrap();
+    assert!(
+        Arc::ptr_eq(&original, &prepared.block),
+        "submission reuses the handoff decode"
+    );
+    assert_eq!(prepared.newly_decoded_wire_bytes, None);
+    drop(original);
+    let policy_snapshot = policy.clone();
+    policy.reset_to(block::Height(0), false);
+    payloads.apply(&mut policy);
+    assert!(
+        weak.upgrade().is_some(),
+        "the driver still holds its submitted copy"
+    );
+    drop(prepared);
+    assert!(
+        weak.upgrade().is_none(),
+        "reset owner retained decoded payload after driver drop"
+    );
+    assert_eq!(payloads.retained_ids().count(), 0);
+    assert_eq!(
+        policy_snapshot.applying_len(),
+        1,
+        "the policy snapshot still holds only facts"
     );
 }

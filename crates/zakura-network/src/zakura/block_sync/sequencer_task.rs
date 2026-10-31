@@ -19,9 +19,10 @@
 //!
 //! A body's ownership moves in three steps. A peer routine charges the input-queue
 //! counters when it queues a [`SequencedBody`]. IO releases that charge when it
-//! receives the body, then hands the immutable payload to the state. The state's
-//! `Sequencer` retains the payload until a frontier, reset, or apply completion
-//! drops it. A submitted body also lives in the driver's `SubmitBlock` action, and
+//! receives the body, then retains the payload in `SequencerPayloads`. State
+//! keeps the corresponding identity and size facts. IO applies the payload
+//! operations that state emits at frontier, reset, and completion boundaries.
+//! A submitted body also lives in the driver's `SubmitBlock` action, and
 //! the `Sequencer` keeps its in-flight charge until the exact completion arrives.
 
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
@@ -393,6 +394,110 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     }
 }
 
+/// Runtime payload storage. Policy receives only identities and measured facts.
+#[derive(Debug, Default)]
+pub(super) struct SequencerPayloads {
+    entries: std::collections::BTreeMap<super::reorder::BodyId, BufferedBlockBody>,
+    next_id: u64,
+}
+
+pub(super) struct PreparedSubmission {
+    pub(super) intent: super::sequencer::SubmitItem,
+    pub(super) block: Arc<block::Block>,
+    pub(super) newly_decoded_wire_bytes: Option<usize>,
+}
+
+impl SequencerPayloads {
+    #[cfg(test)]
+    pub(super) fn retained_ids(&self) -> impl Iterator<Item = super::reorder::BodyId> + '_ {
+        self.entries.keys().copied()
+    }
+
+    pub(super) fn insert(&mut self, body: BufferedBlockBody) -> super::reorder::BodyFacts {
+        use super::reorder::{BodyFacts, BodyId};
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("sequencer payload identity exhausted");
+        let id = BodyId(self.next_id);
+        let raw_wire_bytes = match &body {
+            BufferedBlockBody::RawFramePayload(raw)
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                raw_frame_payload: raw,
+                ..
+            } => Some(
+                raw.len()
+                    .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+            ),
+            BufferedBlockBody::Decoded { .. } => None,
+        };
+        let facts = BodyFacts {
+            id,
+            decoded_bytes: body.decoded_attributed_memory_size_bytes(),
+            raw_wire_bytes,
+        };
+        assert!(
+            self.entries.insert(id, body).is_none(),
+            "payload identities never repeat"
+        );
+        facts
+    }
+
+    pub(super) fn release(&mut self, id: super::reorder::BodyId) {
+        self.entries
+            .remove(&id)
+            .expect("policy releases a retained payload exactly once");
+    }
+
+    pub(super) fn apply(&mut self, sequencer: &mut Sequencer) {
+        use super::reorder::PayloadChange;
+        for change in sequencer.take_payload_changes() {
+            match change {
+                PayloadChange::KeepRaw(id) => self
+                    .entries
+                    .get_mut(&id)
+                    .expect("policy downgrades a retained payload")
+                    .retain_for_backlog_in_place(),
+                PayloadChange::Release(id) => self.release(id),
+            }
+        }
+    }
+
+    #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
+    pub(super) fn prepare(
+        &mut self,
+        sequencer: &mut Sequencer,
+        height: block::Height,
+    ) -> Option<PreparedSubmission> {
+        let facts = sequencer.submission_body(height)?;
+        let body = self
+            .entries
+            .get_mut(&facts.id)
+            .expect("policy names a retained payload");
+        let newly_decoded_wire_bytes = match body {
+            BufferedBlockBody::RawFramePayload(raw) => Some(
+                raw.len()
+                    .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+            ),
+            _ => None,
+        };
+        let block = body.decoded_block();
+        let decoded_bytes = body.decoded_attributed_memory_size_bytes();
+        let intent = sequencer
+            .prepare_submit(height, facts.id, decoded_bytes)
+            .expect("materialization and submission run synchronously under one owner");
+        assert_eq!(
+            intent.body_id, facts.id,
+            "submission names its materialized payload"
+        );
+        Some(PreparedSubmission {
+            intent,
+            block,
+            newly_decoded_wire_bytes,
+        })
+    }
+}
+
 /// The serial commit-pipeline task's IO half. Owns [`SequencerState`], an
 /// `Arc<WorkQueue>` clone, the peer registry, an action
 /// sender clone, and the committed throughput meter. Runs the state's operations
@@ -400,6 +505,7 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 /// uses.
 pub(super) struct SequencerIO {
     state: SequencerState,
+    payloads: SequencerPayloads,
     retry_clock: Arc<dyn zakura_header_chain::Clock>,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -472,6 +578,7 @@ impl SequencerIO {
     ) -> Self {
         Self {
             state: SequencerState::new(sequencer, frontiers, current_scope, retry_jitter),
+            payloads: SequencerPayloads::default(),
             retry_clock,
             work,
             registry,
@@ -533,7 +640,10 @@ impl SequencerIO {
         if self.observer.0.is_none() {
             return;
         }
-        let ownership = self.state.sequencer().ownership_snapshot();
+        let ownership = self
+            .state
+            .sequencer()
+            .ownership_snapshot(&self.payloads.entries);
         let current = ownership.holders();
         let released = self
             .observed_holders
@@ -669,6 +779,7 @@ impl SequencerIO {
 
     /// Record one control transition's diagnostics and run its operations.
     async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
+        self.payloads.apply(&mut self.state.sequencer);
         self.publish_state_metrics();
         if let Some(classified) = outputs.frontier_reset {
             if classified.kind != state::FrontierResetKind::Growth {
@@ -689,17 +800,22 @@ impl SequencerIO {
     fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
         let height = body.height;
+        let facts = self.payloads.insert(body.body);
         let acceptance = self.state.accept_body(ReceivedBody {
             owner: body.owner,
             source: body.source,
             height,
             hash: body.hash,
             previous_block_hash: body.previous_block_hash,
-            body: body.body,
+            body: facts,
             bytes: body.bytes,
             admitted_estimate_bytes: body.admitted_estimate_bytes,
             peer: body.peer,
         });
+        if !matches!(acceptance, BodyAcceptance::Buffered) {
+            self.payloads.release(facts.id);
+        }
+        self.payloads.apply(&mut self.state.sequencer);
         if let BodyAcceptance::RetentionDeferred {
             owner,
             height,
@@ -718,6 +834,7 @@ impl SequencerIO {
 
     /// Run one transition's operations in order.
     async fn execute(&mut self, operations: Vec<SequencerOperation>) {
+        self.payloads.apply(&mut self.state.sequencer);
         for operation in operations {
             match operation {
                 SequencerOperation::RefreshWorkAuthority(authority) => {
@@ -773,12 +890,13 @@ impl SequencerIO {
             if decode_charge > 0 {
                 self.publish_decoded_ownership_view_with(decode_charge);
             }
-            let Some(item) = self.state.prepare_submission(height) else {
+            let Some(prepared) = self.payloads.prepare(&mut self.state.sequencer, height) else {
                 self.publish_decoded_ownership_view();
                 continue;
             };
+            let item = prepared.intent;
             let decoded_bytes = item.decoded_bytes;
-            if let Some(wire_bytes) = item.newly_decoded_wire_bytes {
+            if let Some(wire_bytes) = prepared.newly_decoded_wire_bytes {
                 // Metrics use f64; admission and collection totals remain integers.
                 metrics::histogram!(
                     "sync.block.body.decoded.attributed_memory_size_bytes",
@@ -816,7 +934,7 @@ impl SequencerIO {
                     owner: item.owner,
                     source: item.source,
                     token,
-                    block: item.block,
+                    block: prepared.block,
                 })
                 .await;
             metrics::histogram!("sync.block.submit.queue_wait_seconds")
@@ -831,6 +949,7 @@ impl SequencerIO {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
                     self.trace_submission_retry_scheduled(height);
                 }
+                self.payloads.apply(&mut self.state.sequencer);
                 self.publish_state_metrics();
                 return;
             }

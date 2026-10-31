@@ -4865,8 +4865,177 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
 
 // ---- Sequencer commit pipeline ----
 
-fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {
-    Sequencer::new(block::Height(verified_tip), submitted_apply_limit)
+/// Drive the production payload owner beside the real sequencing policy.
+struct TestSequencer {
+    policy: Sequencer,
+    payloads: sequencer_task::SequencerPayloads,
+}
+
+struct TestSubmission {
+    intent: SubmitItem,
+    block: Arc<block::Block>,
+}
+
+impl std::ops::Deref for TestSubmission {
+    type Target = SubmitItem;
+    fn deref(&self) -> &Self::Target {
+        &self.intent
+    }
+}
+
+impl std::ops::Deref for TestSequencer {
+    type Target = Sequencer;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
+impl std::ops::DerefMut for TestSequencer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.policy
+    }
+}
+
+impl TestSequencer {
+    fn settle_payloads(&mut self) {
+        self.payloads.apply(&mut self.policy);
+        assert_eq!(
+            self.payloads.retained_ids().collect::<BTreeSet<_>>(),
+            self.policy.retained_ids().collect::<BTreeSet<_>>(),
+            "runtime payloads match every retained policy identity",
+        );
+    }
+
+    fn with_decoded_window_cap(mut self, height: block::Height, bytes: u64) -> Self {
+        self.policy = self.policy.with_decoded_window_cap(height, bytes);
+        self
+    }
+
+    fn accept_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        body: Arc<block::Block>,
+        bytes: u64,
+        peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        let previous = body.header.previous_block_hash;
+        self.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            hash,
+            previous,
+            BufferedBlockBody::from_decoded_block(body, None),
+            bytes,
+            None,
+            peer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_buffered_body(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        previous: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        estimate: Option<u64>,
+        peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        let facts = self.payloads.insert(body);
+        let result = self.policy.accept_buffered_body(
+            owner, source, height, hash, previous, facts, bytes, estimate, peer,
+        );
+        if matches!(result, AcceptOutcome::Redundant { .. }) {
+            self.payloads.release(facts.id);
+        }
+        self.settle_payloads();
+        result
+    }
+
+    fn prepare_submit(&mut self, height: block::Height) -> Option<TestSubmission> {
+        self.settle_payloads();
+        let prepared = self.payloads.prepare(&mut self.policy, height)?;
+        self.settle_payloads();
+        Some(TestSubmission {
+            intent: prepared.intent,
+            block: prepared.block,
+        })
+    }
+
+    fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
+        let result = self.policy.drain_ready_into_applying();
+        self.settle_payloads();
+        result
+    }
+
+    fn unsubmit(&mut self, height: block::Height, token: BlockApplyToken) {
+        self.policy.unsubmit(height, token);
+        self.settle_payloads();
+    }
+
+    fn remove_applying(
+        &mut self,
+        height: block::Height,
+    ) -> Option<super::sequencer::ApplyingBlock> {
+        let result = self.policy.remove_applying(height);
+        self.settle_payloads();
+        result
+    }
+
+    fn advance_verified_tip(
+        &mut self,
+        height: block::Height,
+        release: bool,
+    ) -> super::sequencer::AdvanceOutcome {
+        let result = self.policy.advance_verified_tip(height, release);
+        self.settle_payloads();
+        result
+    }
+
+    fn reset_to(&mut self, height: block::Height, keep: bool) -> u64 {
+        let result = self.policy.reset_to(height, keep);
+        self.settle_payloads();
+        result
+    }
+
+    fn release_applying_blocks_from(&mut self, height: block::Height) -> u64 {
+        let result = self.policy.release_applying_blocks_from(height);
+        self.settle_payloads();
+        result
+    }
+
+    fn release_applied_through(&mut self, height: block::Height) -> u64 {
+        let result = self.policy.release_applied_through(height);
+        self.settle_payloads();
+        result
+    }
+
+    fn finish_attached_submission(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        token: BlockApplyToken,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> bool {
+        let result = self
+            .policy
+            .finish_attached_submission(owner, source, token, height, hash);
+        self.settle_payloads();
+        result
+    }
+}
+
+fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> TestSequencer {
+    TestSequencer {
+        policy: Sequencer::new(block::Height(verified_tip), submitted_apply_limit),
+        payloads: Default::default(),
+    }
 }
 
 #[test]
@@ -5044,7 +5213,7 @@ fn capped_sequencer_with_blocks_1_to_3(
     max_checkpoint_height: u32,
     max_decoded_bytes: u64,
     wire_bytes: u64,
-) -> (Sequencer, Vec<Arc<block::Block>>) {
+) -> (TestSequencer, Vec<Arc<block::Block>>) {
     let mut seq = test_sequencer(0, 8)
         .with_decoded_window_cap(block::Height(max_checkpoint_height), max_decoded_bytes);
     let blocks = mainnet_blocks_1_to_3();
@@ -5071,7 +5240,7 @@ fn capped_sequencer_with_blocks_1_to_3(
 /// Submit every currently submittable height the way the sequencer task does,
 /// rechecking the measured decoded window before each one, and return the
 /// dispatch items.
-fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
+fn submit_all(seq: &mut TestSequencer) -> Vec<TestSubmission> {
     let mut items = Vec::new();
     for height in seq.submittable_heights() {
         if !seq.submission_fits_decoded_window(height) {
@@ -5083,7 +5252,7 @@ fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
 }
 
 /// Retire a submission the way a committed apply completion does.
-fn finish_committed(seq: &mut Sequencer, item: &SubmitItem) {
+fn finish_committed(seq: &mut TestSequencer, item: &TestSubmission) {
     seq.remove_applying(item.height);
     assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
 }
@@ -6443,7 +6612,7 @@ async fn stale_completions_ahead_of_their_epoch_change_wake_no_invalid_work() {
 fn a_raw_body_reports_its_decode_estimate_until_submitted() {
     let blocks = fake_sequential_blocks(1);
     let block = &blocks[0];
-    let mut sequencer = Sequencer::new(block::Height(0), 1);
+    let mut sequencer = test_sequencer(0, 1);
     sequencer.accept_buffered_body(
         test_work_owner(),
         zakura_header_chain::SourceId::from_digest([1; 32]),

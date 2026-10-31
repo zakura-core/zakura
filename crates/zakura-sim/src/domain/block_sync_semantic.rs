@@ -16,6 +16,10 @@
 //! decoded-byte target, [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], is a
 //! constant.
 
+mod reactor_queries;
+
+pub use reactor_queries::ReactorQueries;
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -54,8 +58,16 @@ pub const DETACHED_SUBMISSION_BOUNDED: &str = "block-sync/detached-submission-bo
 /// and `applying`'s decoded bytes leave room for it under the decoded cap.
 pub const INPUT_DECODED_BOUND: &str = "block-sync/input-decoded-bound";
 
-/// What every property here reads.
+/// The reactor's accepted and refused needed-block queries keep their exact
+/// identities, and refusal and close leave only the retries they owe.
+pub const REACTOR_QUERY_LIFECYCLE: &str = "block-sync/reactor-query-lifecycle";
+
+/// What every property here but [`REACTOR_QUERY_LIFECYCLE`] reads.
 const NEEDS: &[Source] = &[Source::Storage, Source::Frames, Source::View];
+
+/// What [`REACTOR_QUERY_LIFECYCLE`] reads: storage's queries, and the
+/// reactor's transitions through the view's tap. See [`reactor_queries`].
+const REACTOR_NEEDS: &[Source] = &[Source::Storage, Source::View];
 
 /// A view that carries a [`SemanticModel`].
 pub trait SemanticView {
@@ -66,7 +78,8 @@ pub trait SemanticView {
 /// The block-sync semantic properties, for a harness whose view carries the
 /// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`],
 /// [`DETACHED_SUBMISSION_BOUNDED`], [`CAPACITY_RELEASE_WAKES`] and
-/// [`INPUT_DECODED_BOUND`], all active.
+/// [`INPUT_DECODED_BOUND`], all active, and [`REACTOR_QUERY_LIFECYCLE`], a
+/// draft until a simulated run exercises it.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -139,6 +152,20 @@ where
             status: Status::Active,
             check: check_input_decoded_bound::<S>,
             witness: Some(any_decoded_queued),
+        },
+        Property {
+            id: PropertyId::new(REACTOR_QUERY_LIFECYCLE),
+            claim: "each needed-block query the reactor offers takes the next ID under the \
+                    current authority, past an open retry gate and with any owed force; \
+                    storage takes only accepted queries under their exact identities; a \
+                    refusal keeps the pending query and next ID, and owes a retry unless the \
+                    channel closed, which ends dispatch and owes nothing",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: REACTOR_NEEDS,
+            status: Status::Draft,
+            check: check_reactor_query_lifecycle::<S>,
+            witness: Some(query_reached_storage),
         },
     ]
 }
@@ -285,6 +312,8 @@ pub struct SemanticModel {
     detached_findings: Vec<Finding>,
     /// Findings for [`INPUT_DECODED_BOUND`], not yet reported.
     input_findings: Vec<Finding>,
+    /// [`REACTOR_QUERY_LIFECYCLE`]'s model, with its findings.
+    pub reactor_queries: ReactorQueries,
     /// Triggers of [`CAPACITY_RELEASE_WAKES`], not yet obliged.
     rooms: Vec<RoomFreed>,
 
@@ -505,6 +534,8 @@ impl SemanticModel {
                 StorageRequest::QueryNeededBlocks { scope, .. } => {
                     self.queries.insert(*id, scope.body_work_epoch);
                     self.note_epoch(scope.body_work_epoch);
+                    self.reactor_queries
+                        .storage_query(self.step.unwrap_or_default(), request);
                 }
                 StorageRequest::SubmitBlock {
                     owner,
@@ -709,6 +740,10 @@ impl SemanticModel {
                     .filter(|submission| submission.detached)
                     .map(|submission| submission.decoded_attributed_memory_bytes);
                 self.applying_decoded = applying.chain(detached).fold(0, u64::saturating_add);
+            }
+            BlockSyncFact::Reactor { transition, state } => {
+                self.reactor_queries
+                    .transition(self.step.unwrap_or_default(), transition, state);
             }
             BlockSyncFact::SequencerClosed => self.closed = true,
             _ => {}
@@ -1228,6 +1263,31 @@ where
     })
 }
 
+/// Checks [`REACTOR_QUERY_LIFECYCLE`] after each reactor transition and
+/// storage query. Once no task can run, a query storage took that the channel
+/// never accepted is a finding too.
+fn check_reactor_query_lifecycle<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: SemanticView,
+{
+    let model = caught_up(cx);
+    let (findings, applicable) = {
+        let mut model = model.borrow_mut();
+        let queries = &mut model.reactor_queries;
+        let mut findings = std::mem::take(&mut queries.findings);
+        if cx.status != zakura_scheduler::Status::Running {
+            findings.extend(queries.take_unaccepted(cx.step));
+        }
+        (findings, queries.saw_proposal)
+    };
+    report(cx, findings).unwrap_or(if applicable {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    })
+}
+
 /// [`SUBMIT_ONLY_REQUESTED`]'s trigger history: storage took a submission.
 fn any_submission(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_submission
@@ -1264,6 +1324,13 @@ fn reset_or_verdict_while_held(log: &ObservationLog) -> bool {
 /// queue holding its decoded block, which the check judges.
 fn any_decoded_queued(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_decoded_queued
+}
+
+/// [`REACTOR_QUERY_LIFECYCLE`]'s trigger history: storage took a query the
+/// action channel accepted, under its exact identity. A refusal needs a full
+/// or closed action channel, which this history doesn't require.
+fn query_reached_storage(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).reactor_queries.saw_query_at_storage
 }
 
 #[cfg(test)]

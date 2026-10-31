@@ -1034,3 +1034,92 @@ fn the_binary_takes_the_minimizer_flags_together() {
     }
     assert!(!out.exists(), "a usage error archives nothing");
 }
+
+/// A `fixtures/all` input that loses an update in `race/lost-update`'s
+/// planted variant, as in `minimize.rs`.
+const LOST_UPDATE: [u8; 27] = [
+    0x00, 0x00, 0x01, 0x5a, 0x46, 0x17, 0xb5, 0x61, 0x56, 0xad, 0x3e, 0x87, 0x76, 0x2d, 0xd4, 0x33,
+    0x7e, 0xe2, 0xc5, 0x71, 0x8b, 0x3c, 0xc5, 0xc0, 0x7b, 0x6b, 0xff,
+];
+
+/// The binary's `triage` runs every input's children on a copy of itself
+/// that it makes before the first input. A minimizer that replaces the
+/// binary, as `cargo xtask sim-minimize`'s rebuild does, then can't change
+/// what a later input's children run, so a second copy of the input files
+/// where the first did. The copy is gone once `triage` exits.
+#[test]
+fn the_binary_pins_itself_for_the_batch() {
+    let scratch = Scratch::new();
+    let dir = scratch.dir.path();
+    let exe = dir.join("zakura-sim");
+    fs::copy(env!("CARGO_BIN_EXE_zakura-sim"), &exe).unwrap();
+    // Stands in for `cargo`: replaces the binary with one that exits 3, by
+    // rename, as cargo's build does, and fails as a minimizer.
+    let cargo = dir.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\n\
+         printf '#!/bin/sh\\nexit 3\\n' > \"$REBUILT.new\"\n\
+         chmod +x \"$REBUILT.new\"\n\
+         mv \"$REBUILT.new\" \"$REBUILT\"\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let inputs = ["first", "second"].map(|name| {
+        let input = dir.join(name);
+        fs::write(&input, LOST_UPDATE).unwrap();
+        input
+    });
+    let out = scratch.out();
+    let output = Command::new(&exe)
+        .args(["triage", "--sim", "fixtures/all", "--out"])
+        .arg(&out)
+        .args([
+            "--target",
+            "race_fixtures",
+            "--runs",
+            "1",
+            "--wall-secs",
+            "1",
+        ])
+        .args(&inputs)
+        .env("CARGO", &cargo)
+        .env("REBUILT", &exe)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read(&exe).unwrap(), b"#!/bin/sh\nexit 3\n");
+
+    let [bundle] = <[PathBuf; 1]>::try_from(bundles(&out).unwrap()).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let filed: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.contains(": not minimized: "))
+        .collect();
+    let class = "confirmed in active: active race/lost-update";
+    assert_eq!(
+        filed,
+        [
+            format!(
+                "{}: {class}; archived in {}",
+                inputs[0].display(),
+                bundle.display()
+            ),
+            format!(
+                "{}: {class}; already archived in {}",
+                inputs[1].display(),
+                bundle.display()
+            ),
+        ],
+        "{stdout}"
+    );
+    for staging in fs::read_dir(out.join(STAGING_DIR)).unwrap() {
+        let staging = staging.unwrap().path();
+        assert!(
+            !staging.join("zakura-sim").exists(),
+            "{}",
+            staging.display()
+        );
+    }
+}

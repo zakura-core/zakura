@@ -67,8 +67,8 @@ mod cli {
     use serde_json::{json, Value};
     use zakura_sim::{
         explore::triage::{
-            self, Minimization, SimChildren, SimMinimize, TriageOptions, MINIMIZED_FILE,
-            TRIAGE_FILE,
+            self, Minimization, PinnedBinary, SimChildren, SimMinimize, TriageOptions,
+            MINIMIZED_FILE, TRIAGE_FILE,
         },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
@@ -945,9 +945,12 @@ mod cli {
             }
         };
         let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
+        // Every input's children run one copy of this binary, even after
+        // the minimizer rebuilds it.
+        let pinned = PinnedBinary::new(&out)
+            .map_err(|error| Error::Failed(format!("pinning this binary: {error}")))?;
         let children = SimChildren {
-            exe: std::env::current_exe()
-                .map_err(|error| Error::Failed(format!("finding this binary: {error}")))?,
+            exe: pinned.exe().to_owned(),
             harness: sim,
             minimize,
         };

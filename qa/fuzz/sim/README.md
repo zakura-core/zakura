@@ -207,7 +207,12 @@ The failure's bundle is in place before the minimizer starts, and the
 minimizer reads that bundle's `input.bin`. So a minimizer that fails or is
 killed never costs the failure its bundle, and the failure's bundle never
 changes. The minimizer writes under `.staging/`, with no time limit from
-triage: its own budgets bound `tmin` and each check. If its report says
+triage: its own budgets bound `tmin` and each check. The minimizer rebuilds
+`zakura-sim` in the target directory triage runs from, so before the first
+input triage copies its own binary under `.staging/`, and every input's
+`record` and `replay` children run that copy. Triage refuses to start if the
+copy's SHA-256 isn't the running build's, and removes the copy when it exits.
+If its report says
 `minimized`, triage copies its output, without the pinned binaries in
 `bin/`, into a new bundle, and holds it to the failure's bundle:
 

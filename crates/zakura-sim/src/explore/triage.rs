@@ -224,6 +224,63 @@ impl Children for SimChildren {
     }
 }
 
+/// A copy of the running executable for [`SimChildren::exe`], so every
+/// child of one batch runs the build that the batch's bundles name.
+///
+/// `cargo xtask sim-minimize` rebuilds `zakura-sim` in the target directory
+/// that `cargo xtask sim-triage` runs it from. Without the copy, the
+/// children of every later input in the batch would run that rebuild, while
+/// [`TRIAGE_FILE`] and the provenance named this process's build. Dropping
+/// it removes the copy. A killed triage leaves it under [`STAGING_DIR`].
+#[derive(Debug)]
+pub struct PinnedBinary {
+    /// Its staging directory.
+    dir: PathBuf,
+    /// The copy.
+    exe: PathBuf,
+}
+
+impl PinnedBinary {
+    /// Copies the running executable into a new staging directory under
+    /// the archive root `out`. Fails if the copy's SHA-256 isn't
+    /// [`BuildInfo::current`]'s, as when the file was replaced after this
+    /// process read it.
+    pub fn new(out: &Path) -> io::Result<Self> {
+        let build = BuildInfo::current();
+        let running = std::env::current_exe()?;
+        let dir = new_staging(out)?;
+        // Built before the copy, so a failed copy drops it, which removes
+        // the staging directory.
+        let pinned = PinnedBinary {
+            exe: dir.join(running.file_name().unwrap_or("zakura-sim".as_ref())),
+            dir,
+        };
+        fs::copy(&running, &pinned.exe)?;
+        let copied = hex(&Sha256::digest(fs::read(&pinned.exe)?));
+        if copied != build.binary {
+            return Err(io::Error::other(format!(
+                "{} changed after this process started: its SHA-256 is {copied}, and this \
+                 process's build has binary {}",
+                running.display(),
+                build.binary
+            )));
+        }
+        Ok(pinned)
+    }
+
+    /// The copy's path.
+    pub fn exe(&self) -> &Path {
+        &self.exe
+    }
+}
+
+impl Drop for PinnedBinary {
+    /// Removes the copy and its staging directory.
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// What triage concluded about an input. Each status means one thing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

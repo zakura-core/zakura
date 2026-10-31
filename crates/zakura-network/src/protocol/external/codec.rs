@@ -57,6 +57,20 @@ const MAX_UNRECEIVED_BODY_RESERVATION: usize = 64 * 1024;
 /// header and one body of the protocol's maximum size.
 pub(crate) const MAX_INCOMPLETE_MESSAGE_BYTES: usize = HEADER_LEN + MAX_PROTOCOL_MESSAGE_LEN;
 
+/// The most ignored Bloom commands one decode turn discards.
+///
+/// This node does not advertise `NODE_BLOOM`, so a conformant peer sends it no Bloom
+/// traffic, and a client that does sends few commands. A longer burst pauses
+/// decoding: the turn returns `Ok(None)`, the buffer keeps every later byte, and the
+/// next socket read resumes it. The peer is not faulted.
+const MAX_DISCARDED_COMMANDS_PER_DECODE_TURN: usize = 64;
+
+/// The most ignored Bloom body bytes one decode turn checksums before it pauses.
+///
+/// BIP 37 limits `filterload` to 36,000 bytes. The turn always finishes the command
+/// that crosses this bound.
+const MAX_DISCARDED_BYTES_PER_DECODE_TURN: usize = 1024 * 1024;
+
 /// The maximum body length allowed before the handshake completes.
 ///
 /// Version messages are ~344 bytes max (including a 256-byte user agent);
@@ -394,6 +408,9 @@ impl Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         use Error::Parse;
 
+        let mut discarded_commands = 0usize;
+        let mut discarded_bytes = 0usize;
+
         'messages: loop {
             match self.state {
                 DecodeState::Head => {
@@ -479,6 +496,13 @@ impl Decoder for Codec {
                             command = %escape_command(&command),
                             "ignored unsupported bloom filter message"
                         );
+                        discarded_commands = discarded_commands.saturating_add(1);
+                        discarded_bytes = discarded_bytes.saturating_add(body_len);
+                        if discarded_commands >= MAX_DISCARDED_COMMANDS_PER_DECODE_TURN
+                            || discarded_bytes >= MAX_DISCARDED_BYTES_PER_DECODE_TURN
+                        {
+                            return Ok(None);
+                        }
                         continue 'messages;
                     }
 

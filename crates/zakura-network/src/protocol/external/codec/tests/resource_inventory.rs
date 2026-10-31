@@ -175,3 +175,103 @@ fn unknown_commands_are_ignored_after_their_checksum() {
     let mut src = BytesMut::from(&bad[..]);
     assert!(full_codec().decode(&mut src).is_err());
 }
+
+/// One Bloom command per decode turn's count bound, followed by a ping.
+fn bloom_burst(commands: usize, body_len: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..commands {
+        bytes.extend_from_slice(&message(&BLOOM_FILTER_COMMANDS[1], &vec![1; body_len]));
+    }
+    bytes.extend_from_slice(&message(b"ping\0\0\0\0\0\0\0\0", &7u64.to_le_bytes()));
+    bytes
+}
+
+/// L.ignored: a burst below the bound stays in one decode turn, so the message after
+/// it arrives without another socket read.
+#[test]
+fn a_short_bloom_burst_stays_in_one_turn() {
+    let bytes = bloom_burst(MAX_DISCARDED_COMMANDS_PER_DECODE_TURN - 1, 8);
+    let mut src = BytesMut::from(&bytes[..]);
+    assert!(matches!(
+        full_codec().decode(&mut src),
+        Ok(Some(Message::Ping(_)))
+    ));
+}
+
+/// L.ignored: a long burst ends each turn at the count bound. No turn loses a byte or
+/// faults the peer, and the following message survives.
+#[test]
+fn a_long_bloom_burst_pauses_at_the_count_bound() {
+    let bytes = bloom_burst(MAX_DISCARDED_COMMANDS_PER_DECODE_TURN + 1, 8);
+    let one_command = HEADER_LEN + 8;
+    let mut codec = full_codec();
+    let mut src = BytesMut::from(&bytes[..]);
+    let before = src.len();
+    assert!(matches!(codec.decode(&mut src), Ok(None)));
+    assert_eq!(
+        before - src.len(),
+        MAX_DISCARDED_COMMANDS_PER_DECODE_TURN * one_command
+    );
+    assert!(matches!(codec.decode(&mut src), Ok(Some(Message::Ping(_)))));
+    assert!(src.is_empty());
+}
+
+/// L.ignored: checksum work also ends a turn. The command that crosses the byte bound
+/// finishes first, so one large legal body always makes progress.
+#[test]
+fn large_bloom_bodies_pause_at_the_byte_bound() {
+    let body_len = MAX_DISCARDED_BYTES_PER_DECODE_TURN / 2;
+    let bytes = bloom_burst(3, body_len);
+    let mut codec = full_codec();
+    let mut src = BytesMut::from(&bytes[..]);
+    let before = src.len();
+    assert!(matches!(codec.decode(&mut src), Ok(None)));
+    assert_eq!(before - src.len(), 2 * (HEADER_LEN + body_len));
+    // The next turn starts a new bound, so the last body stays below it.
+    assert!(matches!(codec.decode(&mut src), Ok(Some(Message::Ping(_)))));
+}
+
+/// L.unknown: one unknown command ends its turn, so a run of them does one checksum
+/// per turn. Neither the run nor a Bloom command before it faults the peer.
+#[test]
+fn each_unknown_command_ends_its_turn() {
+    let mut bytes = message(&BLOOM_FILTER_COMMANDS[0], &[1; 8]);
+    let unknown = message(UNKNOWN_COMMAND, &[1; 8]);
+    bytes.extend_from_slice(&unknown);
+    bytes.extend_from_slice(&unknown);
+    let mut codec = full_codec();
+    let mut src = BytesMut::from(&bytes[..]);
+    assert!(matches!(codec.decode(&mut src), Ok(None)));
+    assert_eq!(src.len(), unknown.len());
+    assert!(matches!(codec.decode(&mut src), Ok(None)));
+    assert!(src.is_empty());
+}
+
+/// L.handshake: before the handshake ends, a body above the small limit stops at its
+/// header, and a `version` user agent above its limit stops at its length.
+#[test]
+fn handshake_messages_have_their_own_bounds() {
+    let mut codec = Codec::builder().for_network(&Network::Mainnet).finish();
+    let oversized = u32::try_from(MAX_HANDSHAKE_BODY_LEN + 1).unwrap();
+    let mut src = BytesMut::from(&header(b"version\0\0\0\0\0", &[], oversized)[..]);
+    assert!(codec.decode(&mut src).is_err());
+    assert!(
+        src.capacity() < MAX_HANDSHAKE_BODY_LEN + HEADER_LEN + 1024,
+        "the refused body has no reservation"
+    );
+
+    // Every fixed field of a version message, then a user agent one byte too long.
+    let mut body = vec![0; 4 + 8 + 8 + 26 + 26 + 8];
+    let too_long = MAX_USER_AGENT_LENGTH + 1;
+    CompactSizeMessage::try_from(too_long)
+        .unwrap()
+        .zcash_serialize(&mut body)
+        .unwrap();
+    body.extend(std::iter::repeat_n(b'x', too_long));
+    let mut src = BytesMut::from(&message(b"version\0\0\0\0\0", &body)[..]);
+    assert!(Codec::builder()
+        .for_network(&Network::Mainnet)
+        .finish()
+        .decode(&mut src)
+        .is_err());
+}

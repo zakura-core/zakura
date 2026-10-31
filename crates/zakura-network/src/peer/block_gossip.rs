@@ -243,15 +243,6 @@ impl BlockGossipPeer {
     ) -> (bool, SlotRelease) {
         let (tx, rx) = oneshot::channel();
         let request = Request::AdvertiseBlock(hash, None);
-        let request_trace = self.trace.stamp(None, &request);
-        let request = ClientRequest {
-            request,
-            tx,
-            inv_collector: None,
-            transient_addr: None,
-            span: tracing::Span::current(),
-            trace: request_trace,
-        };
         // A sidecar learns the tip only from inventory, so it waits for its busy connection.
         // Other connections that cannot write inventory promptly must not hold the slot.
         let inventory_wait = if self.sidecar {
@@ -264,6 +255,15 @@ impl BlockGossipPeer {
             futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *sender).poll_ready(cx))
                 .await
                 .ok()?;
+            let request_trace = connection.stamp(None, &request);
+            let request = ClientRequest {
+                request,
+                tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: tracing::Span::current(),
+                trace: request_trace,
+            };
             connection.enqueued(&request_trace);
             advert.inv_enqueued();
             if std::pin::Pin::new(&mut *sender)

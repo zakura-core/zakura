@@ -495,6 +495,20 @@ args = ["-max_len=512"]
 timeout-secs = 1800
 
 [[target]]
+package = "p2p"
+name = "discovery_session"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_redial"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
 package = "sim"
 name = "discovery_record_book"
 smoke-secs = 60

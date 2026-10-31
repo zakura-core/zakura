@@ -11,8 +11,10 @@ use zakura_rt::{sync::watch, time::Instant};
 use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
 
 mod state;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod state_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state_tests::{replay_redial_bytes, RedialReplaySummary};
 
 use state::{RedialNext, RedialStart, RedialState};
 

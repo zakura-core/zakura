@@ -26,3 +26,17 @@ path = "fuzz_targets/discovery_state.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "discovery_redial"
+path = "fuzz_targets/discovery_redial.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_session"
+path = "fuzz_targets/discovery_session.rs"
+test = false
+doc = false
+bench = false

@@ -1236,7 +1236,10 @@ fn phase_after(step: RequestStep) -> Option<RequestWritePhase> {
         RequestStep::Started => Some(RequestWritePhase::Started),
         RequestStep::Written => Some(RequestWritePhase::Written),
         RequestStep::Expired => Some(RequestWritePhase::Skipped),
-        RequestStep::Dropped(_) | RequestStep::DeliveryFailed | RequestStep::Reset => None,
+        RequestStep::Funded
+        | RequestStep::Dropped(_)
+        | RequestStep::DeliveryFailed
+        | RequestStep::Reset => None,
     }
 }
 

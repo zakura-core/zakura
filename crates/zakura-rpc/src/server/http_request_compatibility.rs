@@ -32,6 +32,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 ///
 /// <http://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0>
 ///
+/// Batches are converted the same way when every member uses the same legacy
+/// format, because pool software such as s-nomp checks its node with a legacy
+/// batch at startup. Other batches are passed through unchanged.
+///
 /// ### Add missing `content-type` HTTP header
 ///
 /// Some RPC clients don't include a `content-type` HTTP header.
@@ -125,10 +129,12 @@ impl<S> HttpRequestMiddleware<S> {
     }
 
     /// Maps whatever JSON-RPC version the client is using to JSON-RPC 2.0.
+    ///
+    /// Returns the client's format, so the response can be mapped back to it.
     async fn request_to_json_rpc_2<B>(
         request: HttpRequest<B>,
         max_request_body_size: usize,
-    ) -> Result<(JsonRpcVersion, HttpRequest<HttpBody>), BoxError>
+    ) -> Result<(ClientFormat, HttpRequest<HttpBody>), BoxError>
     where
         B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
         B::Error: Into<BoxError>,
@@ -138,40 +144,79 @@ impl<S> HttpRequestMiddleware<S> {
             .collect()
             .await?
             .to_bytes();
-        let (version, bytes) =
+        let (format, bytes) =
             if let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(bytes.as_ref()) {
                 let version = request.version();
                 if matches!(version, JsonRpcVersion::Unknown) {
-                    (version, bytes)
+                    (ClientFormat::Unchanged, bytes)
                 } else {
                     (
-                        version,
+                        ClientFormat::Single(version),
                         serde_json::to_vec(&request.into_2()).expect("valid").into(),
                     )
                 }
+            } else if let Some((version, batch)) = Self::legacy_batch(bytes.as_ref()) {
+                (
+                    ClientFormat::Batch(version),
+                    serde_json::to_vec(&batch).expect("valid").into(),
+                )
             } else {
-                (JsonRpcVersion::Unknown, bytes)
+                (ClientFormat::Unchanged, bytes)
             };
         Ok((
-            version,
+            format,
             HttpRequest::from_parts(parts, HttpBody::from(bytes.as_ref().to_vec())),
         ))
     }
-    /// Maps JSON-2.0 to whatever JSON-RPC version the client is using.
+
+    /// Returns a JSON-RPC 2.0 copy of `bytes` and the members' format, if `bytes` is a
+    /// non-empty batch whose members all use the same legacy format.
+    fn legacy_batch(bytes: &[u8]) -> Option<(JsonRpcVersion, Vec<JsonRpcRequest>)> {
+        let batch = serde_json::from_slice::<'_, Vec<JsonRpcRequest>>(bytes).ok()?;
+        let version = batch.first()?.version();
+        if !matches!(
+            version,
+            JsonRpcVersion::Bitcoind | JsonRpcVersion::Lightwalletd
+        ) || batch.iter().any(|request| request.version() != version)
+        {
+            return None;
+        }
+
+        Some((
+            version,
+            batch.into_iter().map(JsonRpcRequest::into_2).collect(),
+        ))
+    }
+    /// Maps JSON-2.0 to whatever JSON-RPC format the client is using.
     async fn response_from_json_rpc_2(
-        version: JsonRpcVersion,
+        format: ClientFormat,
         response: HttpResponse<HttpBody>,
     ) -> Result<HttpResponse<HttpBody>, BoxError> {
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await?.to_bytes();
-        let bytes =
-            if let Ok(response) = serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref()) {
-                serde_json::to_vec(&response.into_version(version))
-                    .expect("valid")
-                    .into()
-            } else {
-                bytes
-            };
+        let converted = match format {
+            ClientFormat::Single(version) => {
+                serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref())
+                    .ok()
+                    .map(|response| serde_json::to_vec(&response.into_version(version)))
+            }
+            ClientFormat::Batch(version) => {
+                serde_json::from_slice::<'_, Vec<JsonRpcResponse>>(bytes.as_ref())
+                    .ok()
+                    .map(|responses| {
+                        serde_json::to_vec(
+                            &responses
+                                .into_iter()
+                                .map(|response| response.into_version(version))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+            }
+            ClientFormat::Unchanged => None,
+        };
+        let bytes = converted.map_or(bytes, |converted| {
+            converted.expect("serializing parsed JSON succeeds").into()
+        });
         Ok(HttpResponse::from_parts(
             parts,
             HttpBody::from(bytes.as_ref().to_vec()),
@@ -239,16 +284,27 @@ where
         let max_request_body_size = self.max_request_body_size;
 
         async move {
-            let (version, request) =
+            let (format, request) =
                 Self::request_to_json_rpc_2(request, max_request_body_size).await?;
             let response = service.call(request).await.map_err(Into::into)?;
-            Self::response_from_json_rpc_2(version, response).await
+            Self::response_from_json_rpc_2(format, response).await
         }
         .boxed()
     }
 }
 
+/// How the client sent its request, so its response can be sent back the same way.
 #[derive(Clone, Copy, Debug)]
+enum ClientFormat {
+    /// A single request in this version, converted to JSON-RPC 2.0.
+    Single(JsonRpcVersion),
+    /// A batch whose members all use this legacy version, converted to JSON-RPC 2.0.
+    Batch(JsonRpcVersion),
+    /// A request the JSON-RPC server handles as sent.
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JsonRpcVersion {
     /// bitcoind used a mishmash of 1.0, 1.1, and 2.0 for its JSON-RPC.
     Bitcoind,

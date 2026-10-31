@@ -744,7 +744,7 @@ pub trait RpcServer {
     /// # Parameters
     ///
     /// - `hexdata`: (string, required)
-    /// - `jsonparametersobject`: (string, optional)
+    /// - `jsonparametersobject`: (object, optional) ignored; any JSON value is accepted
     ///
     /// # Notes
     ///
@@ -3882,6 +3882,7 @@ where
         }
 
         let solution_rate_fut = self.get_network_sol_ps(None, None);
+        let difficulty = chain_tip_difficulty(network.clone(), read_state.clone(), true).await?;
         // Get the current block size.
         let mut current_block_size = None;
         if tip_height > 0 {
@@ -3898,6 +3899,7 @@ where
             current_block_size,
             current_block_tx,
             network,
+            difficulty,
             solution_rate_fut.await?,
         ))
     }

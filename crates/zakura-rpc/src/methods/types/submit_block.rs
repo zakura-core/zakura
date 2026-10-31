@@ -21,7 +21,12 @@ use crate::methods::GetBlockTemplateHandler;
 /// Optional argument `jsonparametersobject` for `submitblock` RPC request
 ///
 /// See the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.
+///
+/// Zakura ignores this argument, so it accepts any JSON value: pool software such as
+/// s-nomp sends values other than an object when it checks for `submitblock` support.
+/// Only an object's string `workid` field is kept.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "serde_json::Value")]
 pub struct SubmitBlockParameters {
     /// The workid for the block template.
     ///
@@ -39,8 +44,21 @@ pub struct SubmitBlockParameters {
     /// Zakura accepts this field but does not read it. The verifier identifies a prepared
     /// candidate by its content, so a submission reuses the prepared work whether or not the
     /// miner echoes the work ID back.
-    #[serde(rename = "workid")]
     pub work_id: Option<String>,
+}
+
+impl From<serde_json::Value> for SubmitBlockParameters {
+    fn from(value: serde_json::Value) -> Self {
+        let work_id = match value {
+            serde_json::Value::Object(mut fields) => match fields.remove("workid") {
+                Some(serde_json::Value::String(work_id)) => Some(work_id),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        Self { work_id }
+    }
 }
 
 /// A compact mined-block submission.
@@ -453,6 +471,31 @@ impl Default for SubmitBlockChannel {
 mod tests {
     use super::*;
     use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+
+    /// Pool software sends ignored values that are not objects, so every value parses.
+    #[test]
+    fn submit_block_parameters_accept_any_value() {
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<SubmitBlockParameters>(value)
+                .expect("every JSON value parses")
+                .work_id
+        };
+
+        assert_eq!(
+            parse(serde_json::json!({"workid": "abc"})),
+            Some("abc".to_string())
+        );
+        for ignored in [
+            serde_json::json!({}),
+            serde_json::json!({"workid": 7}),
+            serde_json::json!("abc"),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(parse(ignored.clone()), None, "{ignored}");
+        }
+    }
 
     fn test_block() -> Arc<Block> {
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES

@@ -121,6 +121,7 @@ impl BlockSyncReactor {
                 Some(saturating_usize(sequencer_input_queued_blocks));
             row.sequencer_input_capacity = Some(saturating_usize(sequencer_input_capacity));
             row.sequencer_input_max_capacity = Some(saturating_usize(sequencer_input_max_capacity));
+            row.accounting_closed = Some(view.accounting_closed);
             row.reorder_buffered_bytes = Some(view.reorder_buffered_bytes);
             row.applying_buffered_bytes = Some(view.applying_buffered_bytes);
             row.unsubmitted_applying_count = Some(view.unsubmitted_applying_count);

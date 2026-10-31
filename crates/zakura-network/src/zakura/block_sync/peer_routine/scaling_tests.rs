@@ -269,6 +269,31 @@ async fn synchronous_receipts_do_not_wake_floor_rankers() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn accounting_closure_has_a_distinct_fill_stop() {
+    let Probe {
+        mut routine,
+        mut outbound,
+        _events: mut events,
+        ..
+    } = probe(1);
+    routine.try_fill().await;
+    outbound.try_recv().unwrap();
+    while events.try_recv().is_ok() {}
+    let retained = routine.work.retain_funding_for_test(1);
+    assert!(!routine.work.audit_funding());
+    routine.try_fill().await;
+    assert!(routine.fill_stop_trace_at.contains_key("accounting_closed"));
+    assert!(!routine.fill_stop_trace_at.contains_key("budget"));
+    assert!(outbound.try_recv().is_err());
+    assert!(
+        events.try_recv().is_err(),
+        "closed accounting cannot request more work"
+    );
+    assert_eq!(routine.budget.available(), 0);
+    drop(retained);
+}
+
 /// A receiver wake can race with cancellation before the sender settles funding.
 #[tokio::test(flavor = "current_thread")]
 async fn receipt_keeps_funding_until_the_production_send_completes() {

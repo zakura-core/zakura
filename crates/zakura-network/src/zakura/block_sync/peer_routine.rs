@@ -48,7 +48,7 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker, RequestKey,
         ThroughputMeter,
     },
-    work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
+    work_queue::{AdmitRefusal, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace,
 };
@@ -124,6 +124,9 @@ enum FillStop {
     InflightBudget,
     RetryAvoid,
     Budget,
+    AccountingClosed,
+    Cancelled,
+    StaleWork,
     Internal,
     OutboundFull,
     SendError,
@@ -149,6 +152,9 @@ impl FillStop {
             FillStop::InflightBudget => "inflight_budget",
             FillStop::RetryAvoid => "retry_avoid",
             FillStop::Budget => "budget",
+            FillStop::AccountingClosed => "accounting_closed",
+            FillStop::Cancelled => "cancelled",
+            FillStop::StaleWork => "stale_work",
             FillStop::Internal => "internal",
             FillStop::OutboundFull => "outbound_full",
             FillStop::SendError => "send_error",
@@ -1260,6 +1266,9 @@ impl PeerRoutine {
         let mut fill_sent = 0u32;
         let request_sender = self.session.request_sender();
         let fill_stop: FillStop = loop {
+            if self.budget.is_closed() {
+                break FillStop::AccountingClosed;
+            }
             // Floor bypass scaled by reliability: a healthy saturated carrier keeps the
             // full bypass so the floor keeps moving; a failing/sealed peer earns *no*
             // above-window slots even for a near-floor block.
@@ -1490,9 +1499,19 @@ impl PeerRoutine {
                 break FillStop::Internal;
             };
             let kept_count = taken.items().len();
-            let Some(unpublished) = taken.admit(view.download_floor, self.session.cancel_token())
-            else {
-                break FillStop::Budget;
+            let unpublished = match taken.admit(view.download_floor, self.session.cancel_token()) {
+                Ok(request) => request,
+                Err(refusal) => {
+                    break match refusal {
+                        AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
+                        AdmitRefusal::Capacity => FillStop::Budget,
+                        AdmitRefusal::Cancelled => FillStop::Cancelled,
+                        AdmitRefusal::StaleClaim => FillStop::StaleWork,
+                        AdmitRefusal::Empty
+                        | AdmitRefusal::MissingOwner
+                        | AdmitRefusal::AmountOverflow => FillStop::Internal,
+                    }
+                }
             };
             let reserved_bytes = unpublished.bytes();
             let request_priority = unpublished.priority();
@@ -1661,7 +1680,9 @@ impl PeerRoutine {
 
         // If pending work is running low, ping the reactor to re-query (the
         // producer self-gates on low-water, so this is idempotent/cheap).
-        if self.work.pending_len() < self.refill_low_water_blocks() {
+        if fill_stop != FillStop::AccountingClosed
+            && self.work.pending_len() < self.refill_low_water_blocks()
+        {
             let _ = self
                 .routine_to_reactor
                 .try_send(RoutineToReactor::RequeryNeeded);

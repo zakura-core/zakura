@@ -12,7 +12,7 @@ use super::super::admission::{request_priority, RequestPriority};
 use super::{block, WorkItem, WorkQueue};
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::block_sync::block_sync_observe::{BlockEvent, RequestStep};
-use crate::zakura::transport::{ByteReservation, FrameWriteClaim};
+use crate::zakura::transport::{BudgetClosure, ByteReservation, FrameWriteClaim};
 
 const UNPUBLISHED: u8 = 0;
 const QUEUED: u8 = 1;
@@ -149,6 +149,18 @@ pub(in crate::zakura::block_sync) struct TakenRequest {
     reporter: Option<RequestReporter>,
 }
 
+/// Why a provisional take could not acquire funding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) enum AdmitRefusal {
+    Empty,
+    MissingOwner,
+    AmountOverflow,
+    AccountingClosed,
+    Cancelled,
+    StaleClaim,
+    Capacity,
+}
+
 impl TakenRequest {
     pub(super) fn new(work: Arc<WorkQueue>, items: Vec<(block::Height, WorkItem)>) -> Self {
         Self {
@@ -181,29 +193,40 @@ impl TakenRequest {
         self,
         download_floor: block::Height,
         cancel: CancellationToken,
-    ) -> Option<UnpublishedRequest> {
-        let (first_height, first_item) = self.items.first()?;
-        let owner = first_item.owner?;
+    ) -> Result<UnpublishedRequest, AdmitRefusal> {
+        let (first_height, first_item) = self.items.first().ok_or(AdmitRefusal::Empty)?;
+        let owner = first_item.owner.ok_or(AdmitRefusal::MissingOwner)?;
         let priority = request_priority(download_floor, *first_height);
-        let bytes = self.items.iter().try_fold(0u64, |total, (_, item)| {
-            total.checked_add(item.estimated_bytes)
-        })?;
+        let bytes = self
+            .items
+            .iter()
+            .try_fold(0u64, |total, (_, item)| {
+                total.checked_add(item.estimated_bytes)
+            })
+            .ok_or(AdmitRefusal::AmountOverflow)?;
         let funding = {
             let inner = self.work.lock();
-            if inner.admission_closed
-                || cancel.is_cancelled()
-                || !inner.state.is_unpublished_claim(owner, &self.items)
-            {
-                return None;
+            if self.work.budget.is_closed() {
+                return Err(AdmitRefusal::AccountingClosed);
+            }
+            if cancel.is_cancelled() {
+                return Err(AdmitRefusal::Cancelled);
+            }
+            if !inner.state.is_unpublished_claim(owner, &self.items) {
+                return Err(AdmitRefusal::StaleClaim);
             }
             match self.work.budget.reserve_owned(bytes) {
                 Some(funding) => funding,
                 None if priority == RequestPriority::Floor => {
-                    let funding = self.work.budget.charge_owned(bytes)?;
+                    let funding = self
+                        .work
+                        .budget
+                        .charge_owned(bytes)
+                        .ok_or_else(|| self.funding_refusal())?;
                     metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
                     funding
                 }
-                None => return None,
+                None => return Err(self.funding_refusal()),
             }
         };
         #[cfg(any(test, zakura_sim))]
@@ -219,13 +242,21 @@ impl TakenRequest {
                 estimated_bytes: bytes,
             });
         }
-        Some(UnpublishedRequest {
+        Ok(UnpublishedRequest {
             taken: self_owned,
             owner,
             priority,
             funding,
             cancel,
         })
+    }
+
+    fn funding_refusal(&self) -> AdmitRefusal {
+        if self.work.budget.is_closed() {
+            AdmitRefusal::AccountingClosed
+        } else {
+            AdmitRefusal::Capacity
+        }
     }
 }
 
@@ -304,8 +335,7 @@ impl UnpublishedRequest {
         });
         {
             let mut inner = claim.work.lock();
-            if inner.admission_closed
-                || claim.work.budget.is_closed()
+            if claim.work.budget.is_closed()
                 || claim.cancel.is_cancelled()
                 || !inner.state.is_unpublished_claim(claim.owner, &claim.items)
             {
@@ -313,13 +343,14 @@ impl UnpublishedRequest {
             }
             let funded_bytes = funding.bytes();
             if inner.funding.merge(&mut funding).is_err() {
-                inner.admission_closed = true;
                 return None;
             }
             let transferred = inner.state.publish_claim(&claim.items);
             if transferred != funded_bytes {
-                inner.admission_closed = true;
-                claim.work.budget.close();
+                claim.work.budget.close(BudgetClosure::Funding {
+                    logical: inner.state.reserved_bytes(),
+                    funded: inner.funding.bytes(),
+                });
                 return None;
             }
             inner.request_writes.insert(
@@ -410,8 +441,7 @@ impl RequestWrite {
 impl FrameWriteClaim for RequestWrite {
     fn try_start(&self) -> bool {
         let inner = self.work.lock();
-        let current = !inner.admission_closed
-            && !self.work.budget.is_closed()
+        let current = !self.work.budget.is_closed()
             && !self.cancel.is_cancelled()
             && inner.state.is_published_claim(self.owner, self.heights());
         if !current {

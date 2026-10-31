@@ -1194,7 +1194,10 @@ fn full_budget_refuses_speculation_but_funds_only_the_owned_floor() {
         7,
         NonZeroU64::new(1).unwrap(),
     );
-    assert!(above.admit(block::Height(0), f.cancel.clone()).is_none());
+    assert_eq!(
+        above.admit(block::Height(0), f.cancel.clone()).unwrap_err(),
+        AdmitRefusal::Capacity
+    );
     assert!(f.work.pending_contains(block::Height(2)));
     assert_eq!(f.budget.reserved(), 1000);
     let floor = f
@@ -1220,9 +1223,12 @@ fn full_budget_refuses_speculation_but_funds_only_the_owned_floor() {
         8,
         NonZeroU64::new(3).unwrap(),
     );
-    assert!(duplicate
-        .admit(block::Height(0), f.cancel.clone())
-        .is_none());
+    assert_eq!(
+        duplicate
+            .admit(block::Height(0), f.cancel.clone())
+            .unwrap_err(),
+        AdmitRefusal::Empty
+    );
     assert_eq!(f.budget.reserved(), 1100);
     drop(floor);
     assert_eq!(f.budget.reserved(), 1000);
@@ -1250,7 +1256,10 @@ fn stale_take_cannot_fund_or_return_replacement_work() {
         7,
         NonZeroU64::new(2).unwrap(),
     );
-    assert!(old.admit(block::Height(0), f.cancel.clone()).is_none());
+    assert_eq!(
+        old.admit(block::Height(0), f.cancel.clone()).unwrap_err(),
+        AdmitRefusal::StaleClaim
+    );
     assert_eq!(f.budget.reserved(), 0);
     assert_eq!(f.work.in_flight_len(), 2);
     assert_eq!(f.work.pending_len(), 0);
@@ -1359,6 +1368,12 @@ fn funding_drift_closes_publication_and_survives_reset() {
             .unwrap();
     }
     assert!(!f.work.audit_funding());
+    assert!(f.budget.is_closed());
+    assert_eq!(
+        f.budget.available(),
+        0,
+        "closed admission has no available capacity"
+    );
     assert!(request
         .publish(|_| panic!("closed queue published"))
         .is_none());
@@ -1388,10 +1403,62 @@ fn funding_drift_refuses_normal_and_floor_admission() {
             .merge(&mut f.budget.reserve_owned(1).unwrap())
             .unwrap();
         assert!(!f.work.audit_funding());
-        assert!(taken.admit(floor, f.cancel.clone()).is_none());
+        assert_eq!(
+            taken.admit(floor, f.cancel.clone()).unwrap_err(),
+            AdmitRefusal::AccountingClosed
+        );
         assert_eq!(f.budget.reserved(), 1);
         assert_eq!(f.work.pending_len(), 2);
     }
+}
+
+#[test]
+fn funding_audit_checks_the_actual_counter_and_allows_held_receipts() {
+    let mut f = Fixture::new();
+    let claim = f.take(1).publish(|_| {}).unwrap();
+    assert!(claim.try_start());
+    assert!(f.work.audit_funding());
+    let receipt = f
+        .work
+        .begin_receipt_for_owner(claim.owner(), block::Height(1))
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.work.audit_funding(),
+        "a held receipt remains charged outside the pool"
+    );
+    drop(receipt);
+    assert!(f.work.audit_funding());
+
+    // Replace the pool's remaining charge with funding from another budget.
+    // Its logical and funded totals still agree, but its actual counter does not.
+    let other = ByteBudget::new(1_000);
+    let funded = f.work.lock().funding.bytes();
+    assert!(funded > 0);
+    let original = std::mem::replace(
+        &mut f.work.lock().funding,
+        other.reserve_owned(funded).unwrap(),
+    );
+    drop(original);
+    assert_eq!(f.work.reserved_bytes(), funded);
+    assert_eq!(f.budget.reserved(), 0);
+    assert!(
+        !f.work.audit_funding(),
+        "an actual counter shortfall closes admission"
+    );
+    assert!(f.budget.is_closed());
+    assert_eq!(f.budget.available(), 0);
+    drop(claim);
+    f.work.reset_above(block::Height(0));
+    assert!(
+        !f.work.audit_funding(),
+        "reset cannot reopen a corrupt generation"
+    );
+    assert_eq!(
+        other.reserved(),
+        funded,
+        "rejected settlement keeps its owner charged"
+    );
 }
 
 #[test]
@@ -1406,7 +1473,6 @@ fn failed_receipt_transfer_preserves_funding_and_reports_error() {
         outcome,
         Err(crate::zakura::transport::ReservationError::Amount)
     ));
-    assert!(f.work.lock().admission_closed);
     assert!(f.budget.is_closed());
     assert_eq!(f.work.lock().funding.bytes(), 50);
     assert_eq!(f.budget.reserved(), 200);
@@ -1442,7 +1508,6 @@ fn failed_settlement_retains_pool_without_poisoning_queue() {
                 .release_reserved_heights_for_owner(claim.owner(), [block::Height(1)]),
             _ => unreachable!(),
         }
-        assert!(f.work.lock().admission_closed);
         assert!(f.budget.is_closed());
         assert_eq!(f.work.lock().funding.bytes(), 50);
         assert_eq!(f.budget.reserved(), 200);
@@ -1478,7 +1543,6 @@ fn rejected_publication_releases_wrong_budget_after_unlock() {
     assert!(request
         .publish(|_| panic!("wrong-budget request published"))
         .is_none());
-    assert!(f.work.lock().admission_closed);
     assert!(f.budget.is_closed());
     assert!(other.is_closed());
     assert_eq!(other.reserved(), 0);
@@ -1501,7 +1565,6 @@ fn publication_amount_mismatch_quarantines_funding() {
     assert!(request
         .publish(|_| panic!("underfunded request published"))
         .is_none());
-    assert!(f.work.lock().admission_closed);
     assert!(f.budget.is_closed());
     assert_eq!(f.work.lock().funding.bytes(), 199);
     assert_eq!(f.budget.reserved(), 200);
@@ -1517,7 +1580,10 @@ fn closed_queue_never_starts_previously_published_request() {
         let mut f = Fixture::new();
         let claim = f.take(1).publish(|_| {}).unwrap();
         if close_budget {
-            f.budget.close();
+            f.budget.close(BudgetClosure::Funding {
+                logical: 200,
+                funded: 199,
+            });
         } else {
             f.work
                 .lock()

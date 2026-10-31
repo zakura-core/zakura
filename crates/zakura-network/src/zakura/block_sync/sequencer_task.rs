@@ -320,6 +320,8 @@ pub(super) enum SequencerControlInput {
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SequencerView {
+    /// Accounting drift has permanently closed this request-budget generation.
+    pub(super) accounting_closed: bool,
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
     pub(super) download_floor: block::Height,
@@ -354,6 +356,7 @@ pub(super) struct SequencerView {
 /// Build the initial view from the startup frontiers, before the task runs.
 pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     SequencerView {
+        accounting_closed: false,
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
         download_floor: frontiers.verified_block_tip,
@@ -1479,8 +1482,9 @@ impl SequencerTask {
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
                 .saturating_add(applying_decoded_attributed_memory_bytes);
         // Retained bodies do not charge the request budget.
-        self.work.audit_funding();
+        let accounting_closed = !self.work.audit_funding();
         let next = SequencerView {
+            accounting_closed,
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
             download_floor: self.sequencer.floor(),
@@ -1633,6 +1637,7 @@ mod tests {
 
     fn test_view() -> SequencerView {
         SequencerView {
+            accounting_closed: false,
             verified_tip: block::Height(1),
             verified_hash: block::Hash([1; 32]),
             download_floor: block::Height(1),
@@ -3120,5 +3125,65 @@ mod tests {
             .await
             .expect("sequencer view sender is still live");
         assert_eq!(*view_rx.borrow(), schedulable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accounting_closure_is_published_and_wakes_view_watchers() {
+        let mut task = retention_test_task(u64::MAX);
+        let mut view = task.view_tx.subscribe();
+        assert!(!view.borrow_and_update().accounting_closed);
+        task.work.set_estimate_floor_for_tests(1);
+        task.work.extend(
+            super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                super::super::request::BlockSizeEstimate::Confirmed(100),
+            )],
+        );
+        let claim = task
+            .work
+            .take_request(
+                block::Height(1),
+                block::Height(1),
+                1,
+                100,
+                7,
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .admit(block::Height(0), zakura_rt::sync::CancellationToken::new())
+            .unwrap()
+            .publish(|_| {})
+            .unwrap();
+        let held = task.work.retain_funding_for_test(1);
+        assert!(!task.work.budget().is_closed());
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "the view must expose accounting closure"
+        );
+        time::timeout(Duration::from_secs(1), view.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(view.borrow_and_update().accounting_closed);
+        assert_eq!(task.work.budget().reserved(), 100);
+        drop(held);
+        drop(claim);
+        task.work.reset_above(block::Height(0));
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "reset does not reopen the generation"
+        );
+        assert_eq!(
+            task.work.budget().reserved(),
+            99,
+            "quarantine retains unmatched funding"
+        );
+        assert!(
+            !view.has_changed().unwrap(),
+            "unchanged closure does not create a wake loop"
+        );
     }
 }

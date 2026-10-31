@@ -7120,24 +7120,6 @@ fn block_budget_ledger_releases_reserved_exactly_once() {
 }
 
 #[test]
-fn budget_audit_catches_injected_drift() {
-    let budget = ByteBudget::new(1_000);
-    let funding = budget.reserve_owned(400).unwrap();
-    assert!(budget.audit(400, "test matching audit"));
-    // A budget excess is expected receipt-handoff skew (paired call sites drain
-    // the source ledger before releasing the budget), never drift.
-    assert!(budget.audit(300, "test transient handoff excess"));
-    // A budget shortfall cannot be produced by any healthy interleaving
-    // (a double release or lost charge): drift.
-    assert!(
-        !budget.audit(500, "test injected drift"),
-        "audit reports a budget shortfall as drift"
-    );
-    drop(funding);
-    assert!(budget.audit(0, "test released audit"));
-}
-
-#[test]
 fn received_body_admission_ignores_request_budget() {
     // A received body consumes no request budget, so a wire budget saturated by
     // outstanding requests must not cause it to be dropped and re-downloaded:

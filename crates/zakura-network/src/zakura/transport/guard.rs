@@ -122,6 +122,23 @@ pub(crate) enum ReservationError {
     Amount,
 }
 
+/// The local accounting failure that permanently closes a budget generation.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub(crate) enum BudgetClosure {
+    #[error("ownership transfer crossed budgets")]
+    WrongBudget,
+    #[error("{operation} cannot transfer {amount} bytes from {owned} owned bytes")]
+    Arithmetic {
+        operation: &'static str,
+        owned: u64,
+        amount: u64,
+    },
+    #[error("queue funding disagrees: logical={logical}, funded={funded}")]
+    Funding { logical: u64, funded: u64 },
+    #[error("counter cannot release {release} bytes")]
+    CounterUnderflow { release: u64 },
+}
+
 impl ByteReservation {
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn release_then(mut self, released: impl FnOnce()) {
@@ -140,12 +157,16 @@ impl ByteReservation {
     /// Transfer an admitted charge. Rejection preserves both owners and closes admission.
     pub(crate) fn merge(&mut self, other: &mut Self) -> Result<(), ReservationError> {
         if !self.same_budget(other) {
-            self.budget.close();
-            other.budget.close();
+            self.budget.close(BudgetClosure::WrongBudget);
+            other.budget.close(BudgetClosure::WrongBudget);
             return Err(ReservationError::Budget);
         }
         let Some(total) = self.bytes.checked_add(other.bytes) else {
-            self.budget.close();
+            self.budget.close(BudgetClosure::Arithmetic {
+                operation: "merge",
+                owned: self.bytes,
+                amount: other.bytes,
+            });
             return Err(ReservationError::Amount);
         };
         self.bytes = total;
@@ -160,8 +181,8 @@ impl ByteReservation {
         bytes: u64,
     ) -> Result<(), ReservationError> {
         if !Arc::ptr_eq(&self.budget.inner, &release.budget.inner) {
-            self.budget.close();
-            release.budget.close();
+            self.budget.close(BudgetClosure::WrongBudget);
+            release.budget.close(BudgetClosure::WrongBudget);
             return Err(ReservationError::Budget);
         }
         let amounts = self
@@ -169,7 +190,11 @@ impl ByteReservation {
             .checked_sub(bytes)
             .zip(release.bytes.checked_add(bytes));
         let Some((remaining, released)) = amounts else {
-            self.budget.close();
+            self.budget.close(BudgetClosure::Arithmetic {
+                operation: "deferred settlement",
+                owned: self.bytes,
+                amount: bytes,
+            });
             return Err(ReservationError::Amount);
         };
         self.bytes = remaining;
@@ -180,7 +205,11 @@ impl ByteReservation {
     /// Transfer part of this charge. Rejection preserves funding and closes admission.
     pub(crate) fn split(&mut self, bytes: u64) -> Result<Self, ReservationError> {
         let Some(remaining) = self.bytes.checked_sub(bytes) else {
-            self.budget.close();
+            self.budget.close(BudgetClosure::Arithmetic {
+                operation: "split",
+                owned: self.bytes,
+                amount: bytes,
+            });
             return Err(ReservationError::Amount);
         };
         self.bytes = remaining;
@@ -286,14 +315,20 @@ impl ByteBudget {
         }
     }
 
-    /// A failed accounting operation closes this budget until its owner is replaced.
+    /// A failed accounting operation permanently closes this budget generation.
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
 
-    pub(crate) fn close(&self) {
+    pub(crate) fn close(&self, cause: BudgetClosure) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             metrics::counter!("sync.block.budget.closed").increment(1);
+            tracing::error!(
+                %cause,
+                reserved_bytes = self.reserved(),
+                limit_bytes = self.inner.max_bytes,
+                "block request accounting closed; retained owners remain charged"
+            );
         }
     }
 
@@ -365,7 +400,7 @@ impl ByteBudget {
         let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
         loop {
             let Some(next) = reserved.checked_sub(bytes) else {
-                self.close();
+                self.close(BudgetClosure::CounterUnderflow { release: bytes });
                 break;
             };
             match self.inner.reserved_bytes.compare_exchange_weak(
@@ -385,19 +420,6 @@ impl ByteBudget {
         }
         released();
         self.inner.capacity.notify_waiters();
-    }
-
-    /// Audit the shared counter against an externally-derived expected value.
-    ///
-    /// Handoff ordering can transiently leave the budget above the source
-    /// ledger; only a shortfall proves a double release or lost charge.
-    pub(crate) fn audit(&self, expected: u64, _context: &'static str) -> bool {
-        let actual = self.reserved();
-        let ok = !self.is_closed() && actual >= expected;
-        if !ok {
-            metrics::counter!("sync.block.budget.audit_drift").increment(1);
-        }
-        ok
     }
 
     /// Subscribe to capacity-freed notifications. A consumer blocked on a full
@@ -686,7 +708,6 @@ mod tests {
             clone.charge_owned(1).is_none(),
             "floor cannot bypass closure"
         );
-        assert!(!clone.audit(400, "closed budget"));
         drop(funding);
         assert_eq!(clone.reserved(), 0, "existing owners can still settle");
         assert!(clone.is_closed(), "drain must not reopen admission");

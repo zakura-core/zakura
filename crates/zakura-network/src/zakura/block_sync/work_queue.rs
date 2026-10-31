@@ -35,7 +35,9 @@ use zakura_rt::{
 };
 
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
-use crate::zakura::transport::{ByteBudget, ByteReservation, ReservationError};
+use crate::zakura::transport::{
+    BudgetClosure, ByteBudget, ByteRelease, ByteReservation, ReservationError,
+};
 
 mod request_write;
 pub(super) mod state;
@@ -43,7 +45,7 @@ pub(super) mod state;
 #[cfg(any(test, zakura_sim))]
 pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
-pub(super) use request_write::{RequestWrite, RequestWriteStatus, TakenRequest};
+pub(super) use request_write::{AdmitRefusal, RequestWrite, RequestWriteStatus, TakenRequest};
 use state::{WorkQueueState, WorkWake};
 
 /// Lower clamp on a body-size estimate.
@@ -149,10 +151,16 @@ impl WorkReturnOutcome {
 struct WorkQueueInner {
     state: WorkQueueState,
     funding: ByteReservation,
-    admission_closed: bool,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
     request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
+}
+
+impl WorkQueueInner {
+    fn settle(&mut self, release: &mut ByteRelease<'_>, bytes: u64) {
+        // Rejection closes the budget and preserves both owners.
+        let _ = self.funding.settle_into(release, bytes);
+    }
 }
 
 /// Publishes a changed reservation gauge before releasing the queue lock.
@@ -207,7 +215,6 @@ impl WorkQueue {
             inner: StdMutex::new(WorkQueueInner {
                 state: WorkQueueState::new(floor),
                 funding: budget.empty_reservation(),
-                admission_closed: false,
                 request_writes: HashMap::new(),
             }),
             budget,
@@ -550,8 +557,11 @@ impl WorkQueue {
             .ok_or(ReservationError::Amount)
             .and_then(|bytes| inner.funding.split(bytes));
         if funding.is_err() {
-            inner.admission_closed = true;
-            self.budget.close();
+            self.budget.close(BudgetClosure::Arithmetic {
+                operation: "receipt settlement",
+                owned: receipt,
+                amount: retired,
+            });
         }
         funding
     }
@@ -606,9 +616,7 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let bytes = inner.state.release_reserved_heights(None, heights);
-        if inner.funding.settle_into(&mut release, bytes).is_err() {
-            inner.admission_closed = true;
-        }
+        inner.settle(&mut release, bytes);
         drop(inner);
         drop(release);
         bytes
@@ -622,9 +630,7 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let bytes = inner.state.release_reserved_heights(Some(owner), heights);
-        if inner.funding.settle_into(&mut release, bytes).is_err() {
-            inner.admission_closed = true;
-        }
+        inner.settle(&mut release, bytes);
         drop(inner);
         drop(release);
     }
@@ -638,13 +644,7 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let delta = inner.state.release_and_return_items(heights);
-        if inner
-            .funding
-            .settle_into(&mut release, delta.released_bytes)
-            .is_err()
-        {
-            inner.admission_closed = true;
-        }
+        inner.settle(&mut release, delta.released_bytes);
         drop(inner);
         drop(release);
         self.wake(delta.wake);
@@ -690,13 +690,7 @@ impl WorkQueue {
         let (outcome, claim) = {
             let mut inner = self.lock();
             let result = self.return_items_locked(&mut inner, owner, heights);
-            if inner
-                .funding
-                .settle_into(&mut release, result.0.released_bytes)
-                .is_err()
-            {
-                inner.admission_closed = true;
-            }
+            inner.settle(&mut release, result.0.released_bytes);
             result
         };
         drop(release);
@@ -767,13 +761,7 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let delta = inner.state.advance_floor(floor);
-        if inner
-            .funding
-            .settle_into(&mut release, delta.released_bytes)
-            .is_err()
-        {
-            inner.admission_closed = true;
-        }
+        inner.settle(&mut release, delta.released_bytes);
         drop(inner);
         drop(release);
         self.wake(delta.wake);
@@ -799,13 +787,7 @@ impl WorkQueue {
             inner.request_writes.remove(&claim.owner());
         }
         let delta = inner.state.reset_above(floor);
-        if inner
-            .funding
-            .settle_into(&mut release, delta.released_bytes)
-            .is_err()
-        {
-            inner.admission_closed = true;
-        }
+        inner.settle(&mut release, delta.released_bytes);
         drop(inner);
         drop(release);
         drop(claims);
@@ -839,14 +821,16 @@ impl WorkQueue {
     /// Close admission and publication when queue funding disagrees with its ledger.
     /// Reset can drain owners but cannot reopen this queue.
     pub(super) fn audit_funding(&self) -> bool {
-        let mut inner = self.lock();
+        let inner = self.lock();
         let logical = inner.state.reserved_bytes();
         let funded = inner.funding.bytes();
-        let counter_ok = self.budget.audit(funded, "block-sync queue funding");
-        if logical != funded || !counter_ok {
-            inner.admission_closed = true;
+        // Unpublished requests and receipt handoffs can retain additional charge.
+        if logical != funded || self.budget.reserved() < funded {
+            metrics::counter!("sync.block.budget.audit_drift").increment(1);
+            self.budget
+                .close(BudgetClosure::Funding { logical, funded });
         }
-        !inner.admission_closed
+        !self.budget.is_closed()
     }
 
     /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.

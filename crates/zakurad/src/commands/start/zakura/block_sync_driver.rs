@@ -111,12 +111,25 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut deferred_actions = VecDeque::new();
     let mut shutting_down = false;
     let mut apply_phase = block_sync_handoff.subscribe_apply_phase();
+    let accounting_closed = block_sync.accounting_closed();
+    pin!(accounting_closed);
 
     loop {
+        if !shutting_down && block_sync.is_accounting_closed() {
+            error!("stopping the critical block-sync driver after local accounting failure");
+            shutting_down = true;
+            block_sync_handoff.request_apply_shutdown();
+            release_pending_applies(&block_sync, &mut pending_applies, &trace);
+            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
+            deferred_actions.clear();
+        }
         if block_sync_handoff.is_yielded_to_legacy() {
             release_pending_applies(&block_sync, &mut pending_applies, &trace);
             release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-        } else if block_sync_handoff.zakura_owns_applies() && !pending_applies.is_empty() {
+        } else if !shutting_down
+            && block_sync_handoff.zakura_owns_applies()
+            && !pending_applies.is_empty()
+        {
             drain_pending_block_applies(
                 &block_sync_handoff,
                 &mut pending_applies,
@@ -202,6 +215,15 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             action
         } else {
             select! {
+                _ = &mut accounting_closed => {
+                    error!("stopping the critical block-sync driver after local accounting failure");
+                    shutting_down = true;
+                    block_sync_handoff.request_apply_shutdown();
+                    release_pending_applies(&block_sync, &mut pending_applies, &trace);
+                    release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
+                    deferred_actions.clear();
+                    continue;
+                },
                 _ = &mut shutdown => {
                     shutting_down = true;
                     block_sync_handoff.request_apply_shutdown();
@@ -267,6 +289,12 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             coalesce_stale_needed_block_queries(action, &mut actions, &mut deferred_actions);
 
         trace.trace_block_action_received(&action);
+        // Receiving an action can race with closure, including a capacity wake
+        // from dequeue. Recheck before authorizing its backend work.
+        if block_sync.is_accounting_closed() {
+            deferred_actions.push_front(action);
+            continue;
+        }
         match action {
             BlockSyncAction::RecordBodyUnavailable {
                 expected_version,

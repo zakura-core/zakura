@@ -48,6 +48,8 @@ sync-metrics = []
 
 # Testing features that activate extra dependencies
 header-fuzz = []
+# Exposes the preserved P2P machine drivers to fuzz and replay tools.
+p2p-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 
@@ -132,5 +134,20 @@ required-features = ["internal-bench"]
 
 [[bench]]
 name = "supervised_spawn"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_work_ownership"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_work_allocations"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_work_churn"
 harness = false
 required-features = ["internal-bench"]

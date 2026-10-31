@@ -320,6 +320,8 @@ pub(super) enum SequencerControlInput {
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SequencerView {
+    /// Accounting drift has permanently closed this request-budget generation.
+    pub(super) accounting_closed: bool,
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
     pub(super) download_floor: block::Height,
@@ -354,6 +356,7 @@ pub(super) struct SequencerView {
 /// Build the initial view from the startup frontiers, before the task runs.
 pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     SequencerView {
+        accounting_closed: false,
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
         download_floor: frontiers.verified_block_tip,
@@ -377,13 +380,12 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 }
 
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
-/// `ByteBudget` clone, an `Arc<WorkQueue>` clone, an action sender clone, and the
+/// work queue, an action sender, and the
 /// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
 /// `Misbehavior` on the same action channel the reactor uses.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
     retained_body_limit: u64,
-    budget: ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     actions: mpsc::Sender<BlockSyncAction>,
@@ -455,7 +457,6 @@ impl SequencerTask {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         sequencer: Sequencer,
-        budget: ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
         actions: mpsc::Sender<BlockSyncAction>,
@@ -476,7 +477,6 @@ impl SequencerTask {
             sequencer,
             retained_body_limit: ZakuraBlockSyncConfig::default()
                 .effective_max_reorder_lookahead_bytes(),
-            budget,
             work,
             registry,
             actions,
@@ -846,8 +846,8 @@ impl SequencerTask {
     /// Reset the body pipeline and queued work above `tip` under one reset epoch.
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
-        let released = self.work.reset_above(tip);
-        self.budget.release(released);
+        self.work.reset_above(tip);
+
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
@@ -873,8 +873,8 @@ impl SequencerTask {
             .sequencer
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         if advance.changed {
-            let released = self.work.advance_floor(frontiers.verified_block_tip);
-            self.budget.release(released);
+            self.work.advance_floor(frontiers.verified_block_tip);
+
             self.release_contiguous_blocks().await;
         }
     }
@@ -1137,8 +1137,8 @@ impl SequencerTask {
                 // re-requestable (the reactor's `query_needed_blocks` re-fills).
                 let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
-                let released = self.work.reset_above(self.sequencer.floor());
-                self.budget.release(released);
+                self.work.reset_above(self.sequencer.floor());
+
                 let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result identifies a bad body from a peer.
                 // Attribute it to the delivering peer.
@@ -1482,9 +1482,9 @@ impl SequencerTask {
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
                 .saturating_add(applying_decoded_attributed_memory_bytes);
         // Retained bodies do not charge the request budget.
-        self.budget
-            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
+        let accounting_closed = !self.work.audit_funding();
         let next = SequencerView {
+            accounting_closed,
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
             download_floor: self.sequencer.floor(),
@@ -1637,6 +1637,7 @@ mod tests {
 
     fn test_view() -> SequencerView {
         SequencerView {
+            accounting_closed: false,
             verified_tip: block::Height(1),
             verified_hash: block::Hash([1; 32]),
             download_floor: block::Height(1),
@@ -1779,10 +1780,10 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(1_000_000);
         SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1_000_000),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1831,14 +1832,13 @@ mod tests {
             std::num::NonZeroU64::new(1).unwrap(),
         );
         let owner = taken[0].1.owner.unwrap();
-        let reserved = task.work.mark_reserved_for_owner(owner, [height]);
-        task.budget.charge(reserved);
-        assert_eq!(
+        task.work.mark_reserved_for_owner(owner, [height]);
+        drop(
             task.work
-                .release_active_reserved_height_for_owner(owner, height),
-            Some(reserved)
+                .begin_receipt_for_owner(owner, height)
+                .unwrap()
+                .expect("the test published this owner's reservation"),
         );
-        task.budget.release(reserved);
         let mut body = SequencedBody::new_queued(
             owner,
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -1868,7 +1868,7 @@ mod tests {
         task.handle_accept_body(body);
         assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
         assert_eq!(task.work.reserved_bytes(), 0);
-        assert_eq!(task.budget.reserved(), 0);
+        assert_eq!(task.work.budget().reserved(), 0);
         assert!(task.work.pending_contains(block::Height(500)));
         assert!(task
             .work
@@ -1932,10 +1932,10 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1977,10 +1977,10 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2024,7 +2024,7 @@ mod tests {
     async fn body_invalid_reselection_resets_block_pipeline() {
         let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
-        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX)));
         work.extend(
             old_authority,
             [(
@@ -2041,7 +2041,6 @@ mod tests {
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
             work.clone(),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2092,10 +2091,10 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2186,10 +2185,10 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2301,10 +2300,10 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2425,10 +2424,10 @@ mod tests {
         let registry = Arc::new(PeerRegistry::new());
         // A day ahead, so an episode or failure dated by the host clock lands a
         // day early: the deadline collapses to now, or the episode alarms.
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget)),
             registry.clone(),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2504,10 +2503,10 @@ mod tests {
         let (actions, actions_rx) = mpsc::channel(1);
         drop(actions_rx);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2577,10 +2576,10 @@ mod tests {
                 let (_control_tx, control_rx) = mpsc::unbounded_channel();
                 let (actions, mut actions_rx) = mpsc::channel(4);
                 let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+                let budget = ByteBudget::new(123);
                 let mut task = SequencerTask::new(
                     Sequencer::new(block::Height(0), 1),
-                    ByteBudget::new(123),
-                    Arc::new(WorkQueue::new(block::Height(0))),
+                    Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                     Arc::new(PeerRegistry::new()),
                     actions,
                     ThroughputMeter::new(Instant::now()),
@@ -2679,10 +2678,10 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions.clone(),
             ThroughputMeter::new(Instant::now()),
@@ -2788,10 +2787,10 @@ mod tests {
             let (_control_tx, control_rx) = mpsc::unbounded_channel();
             let (actions, mut actions_rx) = mpsc::channel(4);
             let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let budget = ByteBudget::new(123);
             let mut task = SequencerTask::new(
                 Sequencer::new(block::Height(0), 1),
-                ByteBudget::new(123),
-                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions,
                 ThroughputMeter::new(Instant::now()),
@@ -2912,10 +2911,10 @@ mod tests {
             })
             .expect("test fills the action channel");
         let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3001,10 +3000,10 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3058,10 +3057,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(30);
         let (view_tx, view_rx) = watch::channel(initial);
+        let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3126,5 +3125,65 @@ mod tests {
             .await
             .expect("sequencer view sender is still live");
         assert_eq!(*view_rx.borrow(), schedulable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accounting_closure_is_published_and_wakes_view_watchers() {
+        let mut task = retention_test_task(u64::MAX);
+        let mut view = task.view_tx.subscribe();
+        assert!(!view.borrow_and_update().accounting_closed);
+        task.work.set_estimate_floor_for_tests(1);
+        task.work.extend(
+            super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                super::super::request::BlockSizeEstimate::Confirmed(100),
+            )],
+        );
+        let claim = task
+            .work
+            .take_request(
+                block::Height(1),
+                block::Height(1),
+                1,
+                100,
+                7,
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .admit(block::Height(0), zakura_rt::sync::CancellationToken::new())
+            .unwrap()
+            .publish(|_| {})
+            .unwrap();
+        let held = task.work.retain_funding_for_test(1);
+        assert!(!task.work.budget().is_closed());
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "the view must expose accounting closure"
+        );
+        time::timeout(Duration::from_secs(1), view.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(view.borrow_and_update().accounting_closed);
+        assert_eq!(task.work.budget().reserved(), 100);
+        drop(held);
+        drop(claim);
+        task.work.reset_above(block::Height(0));
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "reset does not reopen the generation"
+        );
+        assert_eq!(
+            task.work.budget().reserved(),
+            99,
+            "quarantine retains unmatched funding"
+        );
+        assert!(
+            !view.has_changed().unwrap(),
+            "unchanged closure does not create a wake loop"
+        );
     }
 }

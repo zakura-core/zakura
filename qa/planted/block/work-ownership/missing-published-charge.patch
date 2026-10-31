@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+@@ -481,7 +481,7 @@
+             self.in_flight_reserved.add(charge);
+             transferred = transferred.saturating_add(charge);
+         }
+-        self.reserved_bytes = self.reserved_bytes.saturating_add(transferred);
++        self.reserved_bytes = self.reserved_bytes.saturating_add(0);
+         complete.then_some(transferred)
+     }
+ 

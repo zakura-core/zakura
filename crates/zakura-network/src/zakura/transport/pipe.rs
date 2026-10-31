@@ -578,7 +578,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::zakura::transport::guard::ByteBudget;
 
     const SHAPE: PipeShape = PipeShape {
         service: "test",
@@ -622,7 +621,7 @@ mod tests {
 
     fn pass_guard() -> SessionGuard {
         // Allow message type 1, generous size cap, no byte budget.
-        SessionGuard::new(&[1], 1_024, None)
+        SessionGuard::new(&[1], 1_024)
     }
 
     fn frame(message_type: u16) -> Frame {
@@ -650,17 +649,6 @@ mod tests {
     fn run_one_passes_admitted_frame_to_entry() {
         let mut pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
         assert!(matches!(pipe.run_one(frame(1)), Flow::Continue(())));
-    }
-
-    #[test]
-    fn run_one_throttles_when_budget_exhausted() {
-        // A budget that admits one 4-byte payload then throttles the next.
-        let guard = SessionGuard::new(&[1], 1_024, Some(ByteBudget::new(4)));
-        let mut pipe = Pipe::new(peer_id(), (), (), guard, noop_entry, &SHAPE);
-        let mut framed = frame(1);
-        framed.payload = vec![0u8; 4];
-        assert!(matches!(pipe.run_one(framed.clone()), Flow::Continue(())));
-        assert!(matches!(pipe.run_one(framed), Flow::Done));
     }
 
     #[test]

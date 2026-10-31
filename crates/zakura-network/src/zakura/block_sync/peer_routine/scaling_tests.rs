@@ -1,4 +1,4 @@
-//! Manual scaling probe for the routine's per-request bookkeeping.
+//! Receipt lifecycle tests and a scaling probe for per-request bookkeeping.
 //!
 //! Run with `cargo test -p zakura-network --release --lib request_bookkeeping_scaling
 //! -- --ignored --nocapture`. Each request event should cost about the same at
@@ -8,11 +8,13 @@
 use super::super::request::BlockSizeEstimate;
 use super::*;
 use crate::zakura::regulation::ReservationPool;
+use crate::zakura::transport::ByteBudget;
 use zakura_chain::serialization::ZcashDeserializeInto;
 
 /// A routine with `window` single-block requests' worth of work and capacity.
 pub(super) struct Probe {
     pub(super) routine: PeerRoutine,
+    pub(super) budget: ByteBudget,
     pub(super) outbound: FramedRecv,
     pub(super) blocks: Vec<Arc<block::Block>>,
     _bodies: mpsc::Receiver<SequencedBody>,
@@ -50,7 +52,8 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     let generation = registry
         .admit_session(&peer, session.direction(), &config, 0, Instant::now())
         .generation();
-    let work = Arc::new(WorkQueue::new(block::Height(0)));
+    let budget = ByteBudget::new(config.max_inflight_block_bytes);
+    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
     let (sequencer_input_tx, bodies) = mpsc::channel(capacity);
     let (routine_to_reactor_tx, events) = mpsc::channel(capacity);
     let (_view_tx, view_rx) = watch::channel(super::super::sequencer_task::initial_view(
@@ -77,7 +80,6 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         config.clone(),
         true,
         generation,
-        super::super::state::ByteBudget::new(config.max_inflight_block_bytes),
         Arc::clone(&work),
         registry,
         Arc::new(std::sync::Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -118,6 +120,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         }),
     );
     Probe {
+        budget,
         routine,
         outbound,
         blocks,
@@ -134,6 +137,250 @@ async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
         .expect("the routine accepts the frame");
 }
 
+/// Exercise the production receipt future while the sequencer queue is full.
+#[tokio::test(flavor = "current_thread")]
+async fn receipt_waits_for_admission_before_settlement() {
+    for (matched, cancel_handoff) in [(true, false), (true, true), (false, false), (false, true)] {
+        let Probe {
+            budget,
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies,
+            _events,
+        } = probe(1);
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let work = routine.work.clone();
+        let charge = work.reserved_bytes();
+        assert!(charge > 0);
+        let unrelated = budget.reserve_owned(17).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let slot = sender.clone().reserve_owned().await.unwrap();
+        routine.sequencer_input = sender;
+        let resident = routine.sequencer_input_bytes.clone();
+        let frame = BlockSyncMessage::Block(blocks[0].clone())
+            .encode_frame()
+            .unwrap();
+        let mut guard = block_sync_guard();
+        let mut handoff = Box::pin(routine.handle_frame(&mut guard, frame));
+
+        assert!(futures::poll!(&mut handoff).is_pending());
+        assert_eq!(
+            work.reserved_bytes(),
+            charge,
+            "waiting for admission preserves the request reservation"
+        );
+        assert_eq!(
+            budget.reserved(),
+            charge + 17,
+            "the request still owns the charge"
+        );
+        assert_eq!(resident.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        if cancel_handoff {
+            drop(handoff);
+            drop(slot);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(work.reserved_bytes(), charge);
+            assert_eq!(budget.reserved(), charge + 17);
+            work.reset_above(block::Height(0));
+        } else {
+            drop(slot);
+            tokio::time::timeout(Duration::from_secs(1), handoff)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(work.reserved_bytes(), 0);
+            assert_eq!(budget.reserved(), 17);
+            drop(
+                receiver
+                    .try_recv()
+                    .expect("completed handoff queued the body"),
+            );
+        }
+        assert_eq!(resident.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            budget.reserved(),
+            17,
+            "settlement preserves unrelated charges"
+        );
+        drop(routine);
+        assert_eq!(
+            budget.reserved(),
+            17,
+            "routine cleanup cannot release twice"
+        );
+        drop(unrelated);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn synchronous_receipts_do_not_wake_floor_rankers() {
+    for matched in [true, false] {
+        let Probe {
+            budget: _,
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies: mut bodies,
+            _events,
+        } = probe(3);
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 3,
+            ..BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        outbound.recv().await.unwrap();
+        assert!(outbound.try_recv().is_err());
+        // Prime the RTT with a real receipt. Paused time keeps the next receipt's
+        // RTT unchanged, so neither slots nor RTT require a ranking notification.
+        deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
+        bodies.try_recv().unwrap();
+        assert!(routine.published_free_slots);
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(2))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let registry = routine.registry.clone();
+        let ranked = registry.subscribe_floor_ranking().notified();
+        tokio::pin!(ranked);
+        assert!(futures::poll!(&mut ranked).is_pending());
+
+        deliver(&mut routine, BlockSyncMessage::Block(blocks[1].clone())).await;
+
+        assert!(bodies.try_recv().is_ok(), "the body reached the sequencer");
+        assert!(
+            futures::poll!(&mut ranked).is_pending(),
+            "a synchronous receipt must not wake floor rankers: matched={matched}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn accounting_closure_has_a_distinct_fill_stop() {
+    let Probe {
+        budget: _,
+        mut routine,
+        mut outbound,
+        _events: mut events,
+        ..
+    } = probe(1);
+    routine.try_fill().await;
+    outbound.try_recv().unwrap();
+    while events.try_recv().is_ok() {}
+    let retained = routine.work.retain_funding_for_test(1);
+    assert!(!routine.work.audit_funding());
+    routine.try_fill().await;
+    assert!(routine.fill_stop_trace_at.contains_key("accounting_closed"));
+    assert!(!routine.fill_stop_trace_at.contains_key("budget"));
+    assert!(outbound.try_recv().is_err());
+    assert!(
+        events.try_recv().is_err(),
+        "closed accounting cannot request more work"
+    );
+    assert_eq!(routine.budget.available(), 0);
+    drop(retained);
+}
+
+/// A receiver wake can race with cancellation before the sender settles funding.
+#[tokio::test(flavor = "current_thread")]
+async fn receipt_keeps_funding_until_the_production_send_completes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct ReceiverWake {
+        budget: ByteBudget,
+        resident: Arc<AtomicU64>,
+        charge_at_send: AtomicU64,
+        resident_at_send: AtomicU64,
+        cancel: CancellationToken,
+    }
+
+    impl futures::task::ArcWake for ReceiverWake {
+        fn wake_by_ref(waker: &Arc<Self>) {
+            waker
+                .charge_at_send
+                .store(waker.budget.reserved(), Ordering::SeqCst);
+            waker
+                .resident_at_send
+                .store(waker.resident.load(Ordering::Relaxed), Ordering::SeqCst);
+            waker.cancel.cancel();
+        }
+    }
+
+    for matched in [true, false] {
+        let Probe {
+            budget,
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies,
+            _events,
+        } = probe(1);
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let charge = routine.work.reserved_bytes();
+        assert!(charge > 0);
+        let unrelated = budget.reserve_owned(17).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        routine.sequencer_input = sender;
+        let wake = Arc::new(ReceiverWake {
+            budget: budget.clone(),
+            resident: routine.sequencer_input_bytes.clone(),
+            charge_at_send: AtomicU64::new(0),
+            resident_at_send: AtomicU64::new(0),
+            cancel: routine.cancel.clone(),
+        });
+        let waker = futures::task::waker(wake.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(receiver.poll_recv(&mut context).is_pending());
+
+        deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
+
+        assert!(routine.cancel.is_cancelled(), "the send woke the receiver");
+        assert_eq!(
+            wake.charge_at_send.load(Ordering::SeqCst),
+            charge + 17,
+            "the request charge survives until the send completes"
+        );
+        assert!(
+            wake.resident_at_send.load(Ordering::SeqCst) > 0,
+            "the body is charged before the receiver can run"
+        );
+        assert_eq!(routine.work.reserved_bytes(), 0);
+        assert_eq!(routine.budget.reserved(), 17);
+        drop(
+            receiver
+                .try_recv()
+                .expect("cancellation cannot interrupt the admitted send"),
+        );
+        assert_eq!(wake.resident.load(Ordering::Relaxed), 0);
+        drop(unrelated);
+        assert_eq!(routine.budget.reserved(), 0);
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual scaling probe; run in release with --nocapture"]
 #[allow(clippy::print_stderr)] // Report the per-event cost with --nocapture.
@@ -144,6 +391,7 @@ async fn request_bookkeeping_scaling() {
     let largest = u32::try_from(SESSION_RESERVATIONS).expect("the session share fits u32");
     for window in [largest / 8, largest / 4, largest / 2, largest] {
         let Probe {
+            budget: _,
             mut routine,
             mut outbound,
             blocks,
@@ -191,5 +439,59 @@ async fn request_bookkeeping_scaling() {
             settle,
             settle / window,
         );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn accounting_failure_cancels_production_receipt() {
+    for matched in [true, false] {
+        let Probe {
+            budget,
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies: mut bodies,
+            _events,
+        } = probe(1);
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let charge = routine.work.reserved_bytes();
+        assert!(charge > 0);
+        // Keep actual funding live while removing it from the queue's settlement pool.
+        let retained = routine.work.retain_funding_for_test(charge);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())),
+        )
+        .await
+        .unwrap();
+        assert!(
+            routine.cancel.is_cancelled(),
+            "receipt accounting failure did not cancel the routine"
+        );
+        assert!(budget.is_closed());
+        assert!(
+            bodies.try_recv().is_err(),
+            "failed receipt published a body"
+        );
+        assert_eq!(
+            routine
+                .sequencer_input_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(budget.reserved(), charge);
+        drop(routine);
+        assert_eq!(budget.reserved(), charge);
+        drop(retained);
+        assert_eq!(budget.reserved(), 0);
+        assert!(budget.is_closed());
     }
 }

@@ -1,0 +1,9 @@
+harness = "block/work-funding"
+generator = 1
+sha256 = "44f34297f8e8c3f67b002320dd48ac4fb3f3b3528ef1857ffce603e4db04fce4"
+scenario_sha256 = "d633e7079a5bdead2690df7abf1bf400ac285f10969aa2340db1fb23f1709b28"
+source = "crates/zakura-sim/tests/replay_exact.rs"
+
+[[witness]]
+property = "block/work-funding"
+expect = "holds"

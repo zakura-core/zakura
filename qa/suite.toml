@@ -477,3 +477,40 @@ id = "feature/teardown"
 kind = "feature"
 owner = "G2b/E2b"
 plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+# Preserved machine drivers run without the simulator. The semantic work
+# target uses the shared artifact pipeline without starting Sim or QUIC.
+[[target]]
+package = "p2p"
+name = "block_work_ownership"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_peer_registry"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_retry_authority"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_work_ownership"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_work_funding"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800

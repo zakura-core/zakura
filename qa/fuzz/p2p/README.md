@@ -20,10 +20,11 @@ the stale result, installs the current result and expires a live service summary
 Two planted failures remove the current admission or install an unearned hint.
 Each planted failure must report the intended property ID.
 
-The byte decoder excludes peer sampling because production uses a random
-hash key to select disclosure windows. The existing proptest still checks
-sampling eligibility and disclosure limits. Exact disclosure replay needs a
-controlled hash-key boundary. Record metadata and session checks compare
-normalized state and do not depend on hash iteration order. These targets check
-synchronous installation rules; simulator adapters must check actual task
-cancellation and verification waits.
+Decoder version 1 excludes peer sampling, and its corpus keeps that meaning.
+The existing proptest checks sampling eligibility and disclosure limits. The
+`zakura-sim` target `discovery/record-book` uses decoder version 2 to replay
+signed samples under a fixed disclosure key, a seeded shuffle and a fixture clock.
+Record metadata and session checks compare normalized state and do not depend on
+hash iteration order. These targets check synchronous installation rules;
+`discovery/verification-capacity` checks the real handle's task cancellation and
+verification waits.

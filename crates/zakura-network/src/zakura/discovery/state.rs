@@ -14,7 +14,7 @@ use super::protocol::{
     ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate,
     ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry,
     ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
-    MAX_DISCOVERY_EXCLUDED_NODE_IDS,
+    MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
 use crate::zakura::{
@@ -153,6 +153,13 @@ impl ZakuraActiveServiceEntry {
         for summary in summaries {
             self.live_summaries.push(summary);
         }
+        // One response cannot exceed this limit. The newest summaries win, so
+        // successive responses cannot grow one peer's cache past it.
+        let excess = self
+            .live_summaries
+            .len()
+            .saturating_sub(MAX_SERVICE_SUMMARIES_PER_RESPONSE);
+        self.live_summaries.drain(..excess);
         if self.record.is_none() {
             self.refresh_live_derived_services();
         }
@@ -472,12 +479,13 @@ impl DiscoveryState {
         &mut self,
         session: &DiscoverySessionKey,
         record: VerifiedRecord,
+        connected: &[NodeId],
         now: u64,
     ) -> Result<ImportOutcome, SessionRecordError> {
         if !self.is_current_session(session) {
             return Err(SessionRecordError::Superseded);
         }
-        Ok(self.install_connected_peer_record(record, now)?)
+        Ok(self.install_connected_peer_record(record, connected, now)?)
     }
 
     /// Installs a connected peer's own record and updates its service hints.
@@ -485,11 +493,16 @@ impl DiscoveryState {
     /// Addressless or locally non-dialable records still update the service
     /// hints, because the live connection already exists; the book still
     /// rejects them.
+    ///
+    /// The install first drops hints of peers no longer `connected`, so
+    /// connection churn cannot grow the hints past the connection limit.
     pub(super) fn install_connected_peer_record(
         &mut self,
         record: VerifiedRecord,
+        connected: &[NodeId],
         now: u64,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
+        self.sync_active_services(connected, now);
         let max_services = self.config.book_limits.max_services_per_record;
         if record.body.services.len() > max_services {
             return Err(DiscoveryBookError::Limit {
@@ -698,6 +711,38 @@ impl DiscoveryState {
             (self.config.dial_backoff_base, self.config.dial_backoff_max),
             rng,
         )
+    }
+
+    /// Returns the admitted sessions by node id: connection, session, and whether outbound.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn admitted_sessions(&self) -> Vec<(ZakuraPeerId, ZakuraConnId, u64, bool)> {
+        let mut admitted: Vec<_> = self
+            .admitted_peers
+            .iter()
+            .map(|(peer, admitted)| {
+                (
+                    peer.clone(),
+                    admitted.conn_id,
+                    admitted.session_id,
+                    admitted.direction == ServicePeerDirection::Outbound,
+                )
+            })
+            .collect();
+        admitted.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        admitted
+    }
+
+    /// Returns each peer's retained hint without dropping stale ones: its node
+    /// id, whether its record backs the hint, and its live summary count.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn retained_hints(&self) -> Vec<(NodeId, bool, usize)> {
+        let mut hints: Vec<_> = self
+            .active_services
+            .iter()
+            .map(|(node_id, entry)| (*node_id, entry.record.is_some(), entry.live_summaries.len()))
+            .collect();
+        hints.sort_unstable_by_key(|(node_id, _, _)| *node_id.as_bytes());
+        hints
     }
 
     /// Drops service hints of peers not in `connected`, expired live

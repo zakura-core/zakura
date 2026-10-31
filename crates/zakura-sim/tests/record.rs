@@ -89,9 +89,11 @@ fn record_writes_a_complete_trace() {
         assert_eq!(read, trace);
         assert!(read.is_complete());
         assert_eq!(read.meta.sim, entry.name);
-        // Record mode reads missing scenario bytes as 0.
+        // Fixed-prefix harnesses read missing scenario bytes as 0.
         let mut prefix = BYTES[..entry.scenario_bytes.min(BYTES.len())].to_vec();
-        prefix.resize(entry.scenario_bytes, 0);
+        if entry.pad_scenario {
+            prefix.resize(entry.scenario_bytes, 0);
+        }
         assert_eq!(read.meta.scenario, (entry.draw)(&prefix));
         let input = read.meta.input.as_ref().expect("a full input is saved");
         assert_eq!(input.len, u64::try_from(BYTES.len()).unwrap());

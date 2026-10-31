@@ -1122,6 +1122,46 @@ impl fmt::Debug for DisclosureKey {
     }
 }
 
+/// One change to the book's stored signed records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BookChange {
+    /// A new entry stores its first record.
+    Installed {
+        node_id: NodeId,
+        sequence: u64,
+        source: Option<NodeId>,
+    },
+    /// An existing entry stores a record that replaces its old one.
+    Replaced {
+        node_id: NodeId,
+        previous_sequence: u64,
+        sequence: u64,
+        source: Option<NodeId>,
+    },
+    /// An entry left the book to make room.
+    Evicted {
+        node_id: NodeId,
+        sequence: u64,
+        cause: EvictionCause,
+    },
+}
+
+/// Why an entry left the book.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EvictionCause {
+    /// An expired entry gave way to its relay's next record.
+    RelayQuota,
+    /// The book exceeded its record limit.
+    BookLimit,
+}
+
+/// Logs each change to the book.
+fn log_book_changes(changes: &[BookChange]) {
+    for change in changes {
+        tracing::debug!(?change, "Zakura discovery book changed");
+    }
+}
+
 /// In-memory storage for signed Zakura discovery records.
 #[derive(Clone, Debug)]
 pub struct ZakuraDiscoveryBook {
@@ -1663,10 +1703,11 @@ impl ZakuraDiscoveryHandle {
             .verify_connected_peer_record(record, peer_node_id)
             .await?;
         let now = current_unix_secs();
+        let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
         self.inner
             .lock()
             .await
-            .install_connected_peer_record(verified.0, now)
+            .install_connected_peer_record(verified.0, &connected_node_ids, now)
     }
 
     /// Imports a connected peer's latest self-record, received on `session`, as
@@ -1682,10 +1723,13 @@ impl ZakuraDiscoveryHandle {
             .verify_connected_peer_record(record, peer_node_id)
             .await?;
         let now = current_unix_secs();
-        self.inner
-            .lock()
-            .await
-            .install_session_record(session, verified.0, now)
+        let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
+        self.inner.lock().await.install_session_record(
+            session,
+            verified.0,
+            &connected_node_ids,
+            now,
+        )
     }
 
     /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
@@ -1922,6 +1966,32 @@ impl ZakuraDiscoveryHandle {
             .live_service_summaries(node_id, &connected, now)
     }
 
+    /// Replaces the host-derived verification slots, so a replay runs with a fixed count.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    #[must_use]
+    pub fn with_verification_slots(mut self, slots: usize) -> Self {
+        self.verify_slots = SlotBudget::new(slots).expect("the fixture's slot count is valid");
+        self
+    }
+
+    /// Returns how many verification slots are free.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub fn free_verification_slots(&self) -> usize {
+        self.verify_slots.available()
+    }
+
+    /// Holds the state lock, as a slow transition does, while `hold` runs.
+    /// `hold` receives the number of discovered records in the book.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub async fn hold_state<F: std::future::Future<Output = ()>>(
+        &self,
+        hold: impl FnOnce(usize) -> F,
+    ) {
+        let state = self.inner.lock().await;
+        hold(state.book().discovered_len()).await;
+        drop(state);
+    }
+
     /// Holds every free verification slot until the returned permits drop.
     #[cfg(test)]
     pub(super) fn hold_verify_slots(&self) -> Vec<crate::zakura::regulation::SlotPermit> {
@@ -1978,6 +2048,22 @@ impl ZakuraDiscoveryBook {
             generation: 0,
             relayed: HashMap::new(),
         }
+    }
+
+    /// Returns how many node ids the current sample snapshot retains.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn sample_snapshot_len(&self) -> usize {
+        self.sample_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.node_ids.len())
+    }
+
+    /// Returns each relay's attributed entries, in node id order.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn relayed_counts(&self) -> Vec<(NodeId, usize)> {
+        let mut counts: Vec<_> = self.relayed.iter().map(|(id, n)| (*id, *n)).collect();
+        counts.sort_unstable_by_key(|(id, _)| node_id_sort_key(id));
+        counts
     }
 
     /// Returns the storage limits.
@@ -2080,8 +2166,24 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
+        let mut changes = Vec::new();
+        let result = self.import_verified_tracked(record, source, now, context, &mut changes);
+        log_book_changes(&changes);
+        result
+    }
+
+    /// Imports one peer record as [`Self::import_verified_record`] does, and
+    /// appends each resulting change to `changes`, including on failure.
+    pub(super) fn import_verified_tracked(
+        &mut self,
+        record: VerifiedRecord,
+        source: Option<NodeId>,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
+    ) -> Result<ImportOutcome, DiscoveryBookError> {
         let metadata = import_metadata(&record, source, false, now);
-        self.install_record(record, metadata, now, context)
+        self.install_record(record, metadata, now, context, changes)
     }
 
     /// Imports one signed static/bootstrap record.
@@ -2256,6 +2358,12 @@ impl ZakuraDiscoveryBook {
         node_ids.sort_unstable_by_key(node_id_sort_key);
         node_ids.shuffle(rng);
         node_ids
+    }
+
+    /// Returns `requester`'s window hash in `epoch`.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn window_hash(&self, requester: NodeId, epoch: u64) -> u64 {
+        self.disclosure_hash(requester, epoch)
     }
 
     /// Keys a requester's sample window with domain-separated BLAKE2b.
@@ -2491,7 +2599,10 @@ impl ZakuraDiscoveryBook {
             failure_count: entry.failure_count,
         };
         let record = self.verify_foreign(entry.record, context)?;
-        self.install_record(record, metadata, now, context)
+        let mut changes = Vec::new();
+        let result = self.install_record(record, metadata, now, context, &mut changes);
+        log_book_changes(&changes);
+        result
     }
 
     fn import_record_inner(
@@ -2504,7 +2615,10 @@ impl ZakuraDiscoveryBook {
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let record = self.verify_foreign(record, context)?;
         let metadata = import_metadata(&record, source, is_static, now);
-        self.install_record(record, metadata, now, context)
+        let mut changes = Vec::new();
+        let result = self.install_record(record, metadata, now, context, &mut changes);
+        log_book_changes(&changes);
+        result
     }
 
     /// Runs the author checks of a record about another node.
@@ -2532,6 +2646,7 @@ impl ZakuraDiscoveryBook {
         metadata: DiscoveryEntryMetadata,
         now: u64,
         context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         if self.local_node_id == Some(record.body.node_id) {
             return Err(DiscoveryBookError::SelfRecord);
@@ -2547,6 +2662,7 @@ impl ZakuraDiscoveryBook {
         validate_discovery_direct_addrs(&record, direct_addr_policy)?;
 
         let node_id = record.body.node_id;
+        let sequence = record.body.sequence;
         // A relay may hold only so many third-party entries.
         let full_relay = relay_of(metadata.source, node_id).filter(|relay| {
             self.relayed.get(relay).copied().unwrap_or(0) >= self.limits.max_records_per_source
@@ -2561,7 +2677,16 @@ impl ZakuraDiscoveryBook {
             }
             let old_relay = relay_of(entry.source, node_id);
             let was_confirmed = entry.last_confirmed.is_some();
+            let previous_sequence = entry.record.body.sequence;
             let outcome = update_existing_entry(entry, record, metadata, now);
+            if outcome == ImportOutcome::Updated {
+                changes.push(BookChange::Replaced {
+                    node_id,
+                    previous_sequence,
+                    sequence,
+                    source: entry.source,
+                });
+            }
             if outcome == ImportOutcome::Updated
                 || (!was_confirmed && entry.last_confirmed.is_some())
             {
@@ -2575,7 +2700,7 @@ impl ZakuraDiscoveryBook {
             return Ok(outcome);
         }
         if let Some(relay) = full_relay {
-            if !self.remove_expired_relayed(relay, now) {
+            if !self.remove_expired_relayed(relay, now, changes) {
                 return Err(DiscoveryBookError::Limit {
                     field: "records per relay",
                     actual: self.limits.max_records_per_source + 1,
@@ -2587,6 +2712,11 @@ impl ZakuraDiscoveryBook {
             self.generation += 1;
         }
         self.attribute(relay_of(metadata.source, node_id));
+        changes.push(BookChange::Installed {
+            node_id,
+            sequence,
+            source: metadata.source,
+        });
 
         self.entries.insert(
             node_id,
@@ -2603,7 +2733,7 @@ impl ZakuraDiscoveryBook {
                 alpn_backoff_until: None,
             },
         );
-        self.evict_to_limits(now);
+        self.evict_to_limits(now, changes);
         if !self.entries.contains_key(&node_id) {
             // Every other entry outranks the new one, so it was evicted.
             return Err(DiscoveryBookError::Limit {
@@ -2646,19 +2776,29 @@ impl ZakuraDiscoveryBook {
         Ok(())
     }
 
-    fn evict_to_limits(&mut self, now: u64) {
+    fn evict_to_limits(&mut self, now: u64, changes: &mut Vec<BookChange>) {
         while self.discovered_len() > self.limits.max_records {
             let Some(node_id) = self.next_eviction_candidate(now) else {
                 break;
             };
-            self.remove_entry(&node_id);
+            self.remove_entry(&node_id, EvictionCause::BookLimit, changes);
         }
     }
 
     /// Removes `node_id`'s entry and its attribution.
-    fn remove_entry(&mut self, node_id: &NodeId) {
+    fn remove_entry(
+        &mut self,
+        node_id: &NodeId,
+        cause: EvictionCause,
+        changes: &mut Vec<BookChange>,
+    ) {
         if let Some(entry) = self.entries.remove(node_id) {
             self.unattribute(relay_of(entry.source, *node_id));
+            changes.push(BookChange::Evicted {
+                node_id: *node_id,
+                sequence: entry.record.body.sequence,
+                cause,
+            });
         }
     }
 
@@ -2666,8 +2806,13 @@ impl ZakuraDiscoveryBook {
     /// were removed.
     ///
     /// It scans the book, but only for a relay at its quota.
-    fn remove_expired_relayed(&mut self, relay: NodeId, now: u64) -> bool {
-        let expired: Vec<NodeId> = self
+    fn remove_expired_relayed(
+        &mut self,
+        relay: NodeId,
+        now: u64,
+        changes: &mut Vec<BookChange>,
+    ) -> bool {
+        let mut expired: Vec<NodeId> = self
             .entries
             .iter()
             .filter(|(node_id, entry)| {
@@ -2675,8 +2820,10 @@ impl ZakuraDiscoveryBook {
             })
             .map(|(node_id, _)| *node_id)
             .collect();
+        // Hash-table iteration must not choose the order of the changes.
+        expired.sort_unstable_by_key(node_id_sort_key);
         for node_id in &expired {
-            self.remove_entry(node_id);
+            self.remove_entry(node_id, EvictionCause::RelayQuota, changes);
         }
         !expired.is_empty()
     }

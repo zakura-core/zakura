@@ -696,10 +696,7 @@ fn recordings_difference(staging: &Path) -> Option<Difference> {
 /// harness's decoder panics on it. The recordings then crash the same way,
 /// and their bundle shows it.
 fn draw(entry: &HarnessEntry, input: &[u8]) -> Option<Value> {
-    let mut prefix = vec![0u8; entry.scenario_bytes];
-    let n = input.len().min(entry.scenario_bytes);
-    prefix[..n].copy_from_slice(&input[..n]);
-    panic::catch_unwind(AssertUnwindSafe(|| (entry.draw)(&prefix))).ok()
+    panic::catch_unwind(AssertUnwindSafe(|| entry.scenario(input))).ok()
 }
 
 /// Runs `command` with its standard output and error in files under `dir`,

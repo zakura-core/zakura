@@ -401,6 +401,19 @@ For new DigitalOcean volume-backed fleet hosts, format and mount the attached
 volume at `/mnt/data` in `/etc/fstab`; do not use droplet-specific mount names
 for new hosts.
 
+### Pasta assembly
+
+On an x86-64 build host, the deployer adds zakurad's `x86_64-asm` feature to
+each node's `build_features`, so the binary uses Pasta's BMI2/ADX assembly field
+arithmetic. The feature is part of the cache key (`zakurad-<sha>-x86_64-asm`),
+so a portable binary is never reused for an assembly build or the reverse.
+Before installing an assembly binary, the deployer checks that the host is
+x86-64 and that `/proc/cpuinfo` lists `adx` and `bmi2`; a host without them fails
+before anything is copied to it. Set `pasta_asm = false` for such a host. Commits
+whose zakurad predates the feature, such as older rollback targets, build with
+portable Pasta arithmetic as before. Other compiler flags and features are
+unchanged. Published release binaries and Docker images stay `portable`.
+
 ## What gets installed on a node
 
 - Binary at `bin_path` (default `/usr/local/bin/zakurad`), previous kept as `.bak`.

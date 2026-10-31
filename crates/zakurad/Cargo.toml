@@ -84,6 +84,11 @@ indicatif = []
 # Local builds can use BMI2+ADX when enabled by the Rust target.
 portable = ["dep:orchard", "orchard/portable"]
 
+# Force x86-64 Pasta assembly without changing the Rust target features. The
+# binary then requires a CPU with BMI2 and ADX. `portable` takes precedence,
+# and other architectures ignore this feature. Used by fleet deployments.
+x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # The indexer gRPC server, started when `rpc.indexer_listen_addr` is configured

@@ -739,5 +739,91 @@ class SharedHostStagingTests(unittest.TestCase):
 
 
 
+class PastaAsmTests(NodeBuilder, unittest.TestCase):
+    """Fleet builds use Pasta assembly only where the commit and host CPU support it."""
+
+    MANIFEST_WITH_ASM = '[features]\nportable = []\nx86_64-asm = []\n'
+    MANIFEST_WITHOUT_ASM = '[features]\nportable = []\n'
+
+    def resolve(self, node, manifest, *, machine="x86_64"):
+        show = mock.Mock(returncode=0, stdout=manifest)
+        with mock.patch.object(deploy, "run", return_value=show), \
+                mock.patch.object(deploy.platform, "machine", return_value=machine):
+            deploy.add_pasta_asm_feature(Path("."), node)
+        return node.build_features
+
+    def test_feature_added_when_commit_declares_it(self):
+        node = self.node(build_features=["internal-miner"], sha="a" * 40)
+
+        self.assertEqual(self.resolve(node, self.MANIFEST_WITH_ASM),
+                         ["internal-miner", "x86_64-asm"])
+        # The assembly build must not reuse the portable cache entry.
+        self.assertEqual(deploy.build_key(node.sha, node.build_features),
+                         f"{'a' * 40}-internal-miner-x86_64-asm")
+
+    def test_older_commit_without_the_feature_builds_portable(self):
+        node = self.node(sha="a" * 40)
+
+        self.assertEqual(self.resolve(node, self.MANIFEST_WITHOUT_ASM), [])
+
+    def test_opted_out_node_builds_portable(self):
+        node = self.node(sha="a" * 40, pasta_asm=False)
+
+        self.assertEqual(self.resolve(node, self.MANIFEST_WITH_ASM), [])
+
+    def test_non_x86_build_host_builds_portable(self):
+        node = self.node(sha="a" * 40)
+
+        self.assertEqual(self.resolve(node, self.MANIFEST_WITH_ASM, machine="aarch64"), [])
+
+    def deploy_asm_node(self, cpu_check_rc):
+        node = self.node(manage_config=False, build_features=["x86_64-asm"])
+        installs = []
+
+        def fake_ssh(_node, script):
+            installs.append(script)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(deploy, "load_nodes", return_value=[node]), \
+                mock.patch.object(deploy, "build_nodes",
+                                  return_value={"-x86_64-asm": Path("/bin/true")}), \
+                mock.patch.object(deploy, "build_publishers", return_value={}), \
+                mock.patch.object(deploy, "run", return_value=mock.Mock(stdout="/tmp/zakurad-deploy.test")), \
+                mock.patch.object(deploy, "ssh_capture_script",
+                                  return_value=mock.Mock(returncode=cpu_check_rc)) as cpu_check, \
+                mock.patch.object(deploy, "ssh_with_stdin", side_effect=fake_ssh):
+            args = mock.Mock(config="nodes.toml", node=None, force=False, no_restart=False)
+            status = deploy.cmd_deploy(args)
+        return status, installs, cpu_check
+
+    def test_host_without_adx_or_bmi2_is_refused_before_install(self):
+        status, installs, cpu_check = self.deploy_asm_node(cpu_check_rc=4)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(installs, [])
+        cpu_check.assert_called_once()
+
+    def test_host_with_adx_and_bmi2_is_installed(self):
+        status, installs, _ = self.deploy_asm_node(cpu_check_rc=0)
+
+        self.assertEqual(status, 0)
+        self.assertTrue(installs)
+
+    def test_cpu_check_script_matches_this_host(self):
+        node = self.node()
+        with mock.patch.object(node, "ssh_cmd", side_effect=lambda *remote: list(remote)):
+            try:
+                deploy.require_pasta_asm_cpu(node)
+                accepted = True
+            except deploy.DeployError:
+                accepted = False
+
+        flags = Path("/proc/cpuinfo").read_text() if Path("/proc/cpuinfo").exists() else ""
+        flag_line = next((line for line in flags.splitlines() if line.startswith("flags")), "")
+        expected = (deploy.platform.machine() == "x86_64"
+                    and all(flag in flag_line.split() for flag in deploy.PASTA_ASM_CPU_FLAGS))
+        self.assertEqual(accepted, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

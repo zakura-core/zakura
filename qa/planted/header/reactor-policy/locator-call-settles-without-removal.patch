@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -856,7 +856,6 @@
+     pub(super) fn settle(&mut self, call: StorageCall) -> Result<(), UnknownStorageCall> {
+         match self.pending.get(&call.number) {
+             Some(kind) if *kind == call.kind => {
+-                self.pending.remove(&call.number);
+                 Ok(())
+             }
+             _ => Err(UnknownStorageCall),

@@ -73,6 +73,14 @@ impl Target {
     }
 }
 
+/// Whether `name` names a machine harness in this module.
+pub fn is_machine(name: &str) -> bool {
+    matches!(
+        name,
+        "block/work-ownership" | "block/work-funding" | "block/decoded-retention"
+    )
+}
+
 /// Causal input for the selected harness's decoder-v1.
 ///
 /// Each harness has its own decoder identity and consumes at most 512 bytes.
@@ -471,7 +479,7 @@ impl RecordSink for WitnessSink<'_> {
                         })
                         && work.expected.pools.iter().all(|pool| pool.bytes == 0);
                 }
-                None => {}
+                _ => {}
             }
         }
         self.sink.record(record);

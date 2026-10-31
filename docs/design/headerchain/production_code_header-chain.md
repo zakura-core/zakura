@@ -436,7 +436,7 @@ by branch and generation, so a fork switch retires only stale work.
 The header-sync stream uses its version as a compatibility boundary. This implements
 [immutable schema evolution (`LC-WIRE-15`)](../../specs/fork-aware-header-chain-engine.md#lc-wire-15):
 changing a message schema requires a new schema identifier or stream version. The
-[`pipe`](../../../crates/zakura-network/src/zakura/header_sync/pipe.rs) briefly remembers
+[`peer`](../../../crates/zakura-network/src/zakura/header_sync/peer.rs) briefly remembers
 cancelled request IDs, so a late valid response does not count as peer misbehavior.
 
 ### `zakurad`: process coordination

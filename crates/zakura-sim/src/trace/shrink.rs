@@ -384,13 +384,15 @@ pub fn shrink_with(
 
 /// The direct machine decoder owns these bytes; scheduler inputs stay separate.
 fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
-    if !matches!(
-        name,
-        "block/work-ownership" | "block/work-funding" | "block/decoded-retention"
-    ) {
+    if crate::harness::block_work::is_machine(name) {
+        return serde_json::from_value::<crate::harness::block_work::Scenario>(scenario.clone())
+            .ok()
+            .map(|scenario| scenario.input);
+    }
+    if !crate::harness::header_work::is_machine(name) {
         return None;
     }
-    serde_json::from_value::<crate::harness::block_work::Scenario>(scenario.clone())
+    serde_json::from_value::<crate::harness::header_work::Scenario>(scenario.clone())
         .ok()
         .map(|scenario| scenario.input)
 }
@@ -407,11 +409,7 @@ fn machine_failure<'a>(
 ) -> Option<MachineFailureKey> {
     let mut machine = false;
     for step in steps.into_iter().filter_map(|step| step.machine.as_deref()) {
-        let failure = match step {
-            crate::record::machine::MachineStep::Work(work) => &work.failure,
-            crate::record::machine::MachineStep::WorkFunding(work) => &work.failure,
-            crate::record::machine::MachineStep::DecodedRetention(work) => &work.failure,
-        };
+        let failure = step.failure();
         machine = true;
         if let Some(failure) = failure {
             return Some(MachineFailureKey::Driver(failure.clone()));

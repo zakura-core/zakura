@@ -12,10 +12,17 @@ mod events;
 mod fuzz;
 #[cfg(any(test, zakura_sim))]
 pub mod observe;
-mod pipe;
+mod peer;
 mod reactor;
 mod scheduler;
 mod service;
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{
+    replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
+    HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
+    HeaderReactorSessionView, HeaderReactorStep, HeaderReactorView,
+};
 #[cfg(test)]
 mod tests;
 pub mod v9;
@@ -50,3 +57,6 @@ pub use wire::{
     MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use v9::{replay_header_publisher_bytes, HeaderPublisherReplaySummary};

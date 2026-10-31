@@ -1905,17 +1905,20 @@ fn session_trace_separates_stale_results_and_retained_hints() {
     assert!(steps.iter().any(|step| !step.actual.hints.is_empty()));
 }
 
-/// Fills the book, replaces a record, evicts on quota and on the record limit, and samples.
+/// Fills the book, replaces a record, evicts on quota and on the record limit, samples,
+/// and moves a record to another relay.
 const BOOK_TRACE_WITNESS: &[u8] = &[
     // Authors 0..=3 import their own records, valid for 110 seconds.
-    0, 0, 1, 255, 0, 1, 1, 255, 0, 2, 1, 255, 0, 3, 1, 255, // Author 4 evicts one of them.
+    0, 0, 1, 255, 0, 1, 1, 255, 0, 2, 1, 255, 0, 3, 1, 255, // A dial confirms author 0.
+    3, 0, 0, 0, // Author 4 evicts one of the unconfirmed records.
     0, 4, 1, 255, // Sample four, under a window of three.
-    6, 0, 4, 0, // Author 0 replaces or reinstalls with a later sequence.
+    6, 0, 4, 0, // Author 0 replaces its record with a later sequence.
     0, 0, 3, 255, // Advance 765 seconds, so every record expires.
     5, 0, 0, 255, // Relay 0 takes authors 0 and 1.
     1, 0, 2, 255, 1, 1, 2, 255, // Advance again, so its entries expire.
     5, 0, 0, 255, // Relay 0's next new record, from author 5, removes them.
-    1, 5, 2, 255,
+    1, 5, 2, 255, // Relay 1 supplies author 5's later sequence, so the attribution moves.
+    1, 11, 3, 255,
 ];
 
 /// Installs a current result, rejects a stale result, retains a hint, and reads it.

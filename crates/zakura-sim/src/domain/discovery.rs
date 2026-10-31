@@ -52,7 +52,8 @@ pub fn verification_capacity<S: HasView<View = VerificationView>>() -> Property<
         needs: &[Source::Schedule, Source::View],
         status: Status::Active,
         check: check_verification_capacity::<S>,
-        witness: Some(|log| started_workers(log) == VERIFICATION_READERS),
+        // A violation ends the run as soon as one worker exceeds the slots.
+        witness: Some(|log| started_workers(log) > VERIFICATION_SLOTS),
     }
 }
 

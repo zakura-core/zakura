@@ -19,6 +19,10 @@ pub use super::{
 };
 use crate::zakura::ZakuraPeerId;
 
+mod ledger;
+
+pub use ledger::HeaderWorkLedger;
+
 /// Receives reactor events as they happen.
 ///
 /// Called synchronously on the reactor task, never while the reactor holds a
@@ -45,9 +49,9 @@ impl fmt::Debug for ObserverSlot {
 
 /// One reactor event.
 ///
-/// Every `Dispatched { call }` is followed by exactly one `CallEnded { call }`
-/// and then one `Handled { call }`, unless the reactor task unwinds or stops
-/// with the call still pending. The events
+/// Every `Dispatched { call }` is followed by exactly one `CallEnded { call }`.
+/// `Handled { call }` follows unless that end is [`CallEnd::Dropped`] or the
+/// reactor task unwinds. The events
 /// strictly between `CallEnded { call }` and `Handled { call }` ran while the
 /// reactor processed that completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,6 +282,8 @@ pub enum CallEnd {
     NotSubmitted,
     /// The future panicked, and the reactor caught it.
     PortPanicked,
+    /// The reactor dropped the future unfinished, as its teardown does.
+    Dropped,
 }
 
 /// Why the reactor refused a storage call.
@@ -370,6 +376,42 @@ impl PortTap {
                 call: self.call,
                 end,
             });
+        }
+    }
+}
+
+/// Reports the end of a port future that drops before it finishes.
+///
+/// The reactor keeps one beside each port future. A panicking thread reports
+/// nothing, as [`HeaderSyncObserver`] says.
+#[derive(Debug)]
+pub(crate) struct PendingCall {
+    tap: PortTap,
+    done: bool,
+}
+
+impl PendingCall {
+    /// A guard on the call `tap` reports for.
+    pub(crate) fn new(tap: PortTap) -> Self {
+        Self { tap, done: false }
+    }
+
+    /// The call's future finished, and reported its own end.
+    pub(crate) fn finished(mut self) {
+        self.done = true;
+    }
+
+    /// The reactor caught the call's future panicking.
+    pub(crate) fn panicked(mut self) {
+        self.done = true;
+        self.tap.end_after_catch(CallEnd::PortPanicked);
+    }
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if !self.done && !std::thread::panicking() {
+            self.tap.end_after_catch(CallEnd::Dropped);
         }
     }
 }

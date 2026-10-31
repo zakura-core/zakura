@@ -41,7 +41,12 @@ impl Recorder {
             .filter(|event| {
                 !matches!(
                     event,
-                    ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
+                    ReactorEvent::HeadersHeld { .. }
+                        | ReactorEvent::HeadersEnded { .. }
+                        | ReactorEvent::CallEnded {
+                            end: CallEnd::Dropped,
+                            ..
+                        }
                 )
             })
             .collect()
@@ -52,6 +57,8 @@ impl Recorder {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
     }
 }
+
+mod retained;
 
 /// Where a [`ScriptedPort`] call panics.
 #[derive(Copy, Clone, Debug)]
@@ -77,6 +84,10 @@ struct ScriptedPort {
     panic: Option<PanicAt>,
     /// Prepares the port answered.
     prepares: AtomicUsize,
+    /// Targets that later prepares seal, last first, before prepares fail.
+    prepared: StdMutex<Vec<port::PreparedHeaderTarget>>,
+    /// Applies succeed.
+    applies: bool,
 }
 
 impl ScriptedPort {
@@ -169,7 +180,12 @@ impl port::Port for ScriptedPort {
         Box::pin(async move {
             self.answer().await;
             self.prepares.fetch_add(1, Ordering::SeqCst);
-            Err(local_failure(request.owner))
+            let sealed = self
+                .prepared
+                .lock()
+                .expect("no test panics while holding it")
+                .pop();
+            sealed.ok_or_else(|| local_failure(request.owner))
         })
     }
 
@@ -181,6 +197,9 @@ impl port::Port for ScriptedPort {
         let owner = target.owner();
         Box::pin(async move {
             self.answer().await;
+            if self.applies {
+                return Ok(port::ApplyHeaderTargetOutcome::Applied);
+            }
             Err(local_failure(owner))
         })
     }

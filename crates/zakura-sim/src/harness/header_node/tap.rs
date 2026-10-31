@@ -27,8 +27,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, PortCall, ReactorEvent, RefusalCause,
-        RequestRef, StorageCallKind, WaitCause,
+        CallEnd, HeaderSyncObserver, HeaderTargetPhase, HeaderWorkLedger, PortCall, ReactorEvent,
+        RefusalCause, RequestRef, StorageCallKind, WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
@@ -76,6 +76,15 @@ struct TapState {
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
     buffer: Mutex<Buffer>,
+    /// Checks each call's identity and retained headers as events arrive.
+    work: Mutex<WorkCheck>,
+}
+
+/// The tap's ownership check, and the first rule a history broke.
+#[derive(Default)]
+struct WorkCheck {
+    ledger: HeaderWorkLedger,
+    broken: Option<String>,
 }
 
 /// Events recorded and not yet drained.
@@ -92,6 +101,20 @@ impl TapState {
     /// elsewhere can't leave it half changed.
     fn buffer(&self) -> std::sync::MutexGuard<'_, Buffer> {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Feeds `event` to the ownership check, keeping the first broken rule.
+    fn check_work(&self, event: &ReactorEvent) {
+        let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        if work.broken.is_none() {
+            work.broken = work.ledger.observe(event).err();
+        }
+    }
+
+    /// The first rule this run's history broke.
+    fn broken_work_rule(&self) -> Option<String> {
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.broken.clone()
     }
 }
 
@@ -134,10 +157,28 @@ impl HeaderSyncObserver for TapObserver {
     /// tap's run. Neither step yields.
     fn observe(&self, event: ReactorEvent) {
         let state = &self.0;
-        if zakura_rt::sim::run_id() != Some(state.run) {
+        let in_run = zakura_rt::sim::run_id() == Some(state.run);
+        // Ownership events and dropped calls stay out of the observation log,
+        // whose format pinned Plans fix. A teardown may report them after the run.
+        if matches!(
+            event,
+            ReactorEvent::HeadersHeld { .. }
+                | ReactorEvent::HeadersEnded { .. }
+                | ReactorEvent::CallEnded {
+                    end: CallEnd::Dropped,
+                    ..
+                }
+        ) {
+            if in_run {
+                state.check_work(&event);
+            }
+            return;
+        }
+        if !in_run {
             state.refused.store(true, Ordering::Relaxed);
             return;
         }
+        state.check_work(&event);
         // The port's own std lock, which the reactor never holds here.
         let storage_seq = match state.port.upgrade() {
             Some(port) => port.last_seq(),
@@ -180,6 +221,7 @@ impl ReactorTap {
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
                 buffer: Mutex::default(),
+                work: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -319,6 +361,7 @@ fn end(end: CallEnd) -> &'static str {
         CallEnd::TimedOut => "timed-out",
         CallEnd::NotSubmitted => "not-submitted",
         CallEnd::PortPanicked => "port-panicked",
+        CallEnd::Dropped => "dropped",
     }
 }
 
@@ -459,6 +502,9 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
+        if let Some(rule) = self.state.broken_work_rule() {
+            return Err(rule);
+        }
         match paired {
             Ok(()) => Ok(()),
             // A reactor that unwound, from a callback or observer panic,

@@ -64,6 +64,7 @@ use crate::zakura::{
         wire::{AuxSchema, HeaderEntry},
     },
     regulation::{Applied, ExecutionSlots, Push, PushPermit, PushSend, SubscriptionFault},
+    transport::sim_chain,
     wire_codec::encode_frame,
     FramedSend,
 };
@@ -135,7 +136,8 @@ impl Publisher {
     /// and can close the session.
     ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
-    /// version 9 codec.
+    /// version 9 codec. In test and simulator builds, `tap` reports the
+    /// subscription transitions.
     pub(crate) fn spawn<const HEADER_BYTES: usize>(
         port: Arc<dyn Port>,
         push: Push,
@@ -143,8 +145,11 @@ impl Publisher {
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
+        #[cfg(any(test, zakura_sim))] tap: Option<crate::zakura::RegulationTap<u64>>,
     ) -> (Self, JoinHandle<()>) {
-        let shared = Arc::new(Mutex::new(PublisherState::new()));
+        let shared = Arc::new(Mutex::new(sim_chain!(
+            PublisherState::new() => observed_by(tap)
+        )));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
         let (panics, panicked) = mpsc::channel(1);

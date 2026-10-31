@@ -38,6 +38,8 @@ pub(crate) use serve::{
     PushSend, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,
     ServeConfigError, ServeEnd, ServeLimits, ServeViolation, SinkError, SinkProgress, WorkLease,
 };
+#[cfg(any(test, zakura_sim))]
+pub(crate) use serve::{ReleaseReport, ServeStep};
 
 mod reservations;
 pub(crate) use reservations::{
@@ -68,7 +70,7 @@ pub(crate) use writer_fence::{
     Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
 };
 
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 pub(crate) mod test_family;
 #[cfg(test)]
 mod tests;

@@ -1,0 +1,10 @@
+# Keeps a detached submission after its verdict arrives: the stale
+# completion matches no entry, so the detached holder, its slot and its
+# decoded bytes stay charged for good. The input resets the chain while
+# storage holds a submission, and that submission's verdict then reaches
+# block sync after the reset detached it.
+input = "crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin"
+# Besides sequencer.rs, which the patch changes, the rest of block sync
+# decides when the stale verdict arrives. A change there can move the input
+# off the detached submission.
+checks = ["crates/zakura-network/src/zakura/block_sync"]

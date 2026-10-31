@@ -71,15 +71,16 @@ pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
 /// blocks. There the sequencer stops keeping decoded copies and stops
 /// submitting once the window's decoded heap would exceed this cap. Later
 /// bodies stay raw and decode at submit as earlier submissions finish. When
-/// none of the window's bodies is submitted, the next one is always allowed,
-/// so a single oversized block still progresses. Checkpoint heights are exempt
-/// because a whole checkpoint range must be co-resident (see
+/// no submission is in flight, attached or detached, the next body is always
+/// allowed, so a single oversized block still progresses. Checkpoint heights
+/// are exempt because a whole checkpoint range must be co-resident (see
 /// [`MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES`]).
 ///
-/// The cap gates new submissions and is not a hard ceiling. Submissions
-/// detached by a failure or reset stay charged but never block the next body,
-/// so after repeated resets the window can exceed the cap within the count
-/// limit.
+/// Submissions detached by a failure or reset stay charged until their exact
+/// completions, so detaching one frees no room. The window passes the cap
+/// only by that one oversized block, or by a body that decodes larger than
+/// its estimate. While storage never completes the detached submissions,
+/// submission stops once they fill the cap.
 ///
 /// 512 MiB is about 1.5x the 354 MiB decoded-window peak measured while
 /// syncing the Mainnet sandblasting range.

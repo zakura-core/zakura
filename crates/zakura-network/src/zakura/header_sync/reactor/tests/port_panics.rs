@@ -156,15 +156,15 @@ async fn port_future_panic_disconnects_exact_session_and_reactor_survives() {
     let target = block::Hash([0x81; 32]);
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
 
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     let completion = reactor
         .pending_port_operations
         .next()
@@ -198,15 +198,15 @@ async fn stale_port_panic_does_not_disconnect_replacement_session() {
         .expect("the fixture has a committed snapshot");
     let target = block::Hash([0x83; 32]);
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 10,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
 
     let (replacement_cancel, _) = connected_session(&mut reactor, peer.clone(), 11);
     release.notify_one();
@@ -247,13 +247,13 @@ async fn internal_vct_port_panic_is_contained_without_peer_disconnect() {
         std::num::NonZeroU64::new(1).expect("one is nonzero"),
     );
 
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryVctRepairContext {
             owner,
             height: block::Height(1),
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     let completion = reactor
         .pending_port_operations
         .next()
@@ -281,13 +281,13 @@ async fn hanging_vct_port_future_is_removed_at_the_request_deadline() {
     );
     let started = Instant::now();
 
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryVctRepairContext {
             owner,
             height: block::Height(1),
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     let completion = reactor
         .pending_port_operations
         .next()
@@ -330,15 +330,15 @@ async fn port_panic_trace_is_bounded_and_request_scope_serializes_null_generatio
         1,
         AuxSchema::V1,
     );
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer,
             session_id: 7,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     let completion = reactor
         .pending_port_operations
         .next()
@@ -655,15 +655,15 @@ async fn hanging_locator_port_future_is_removed_at_the_request_deadline() {
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
     let started = Instant::now();
 
-    assert_eq!(
-        StorageDispatch::Started,
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 7,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     let completion = reactor
         .pending_port_operations
         .next()

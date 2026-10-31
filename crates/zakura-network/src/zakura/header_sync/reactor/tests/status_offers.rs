@@ -76,7 +76,10 @@ fn connect_with_sender(
     (peer, outbound, send)
 }
 
-fn status_for(snapshot: &zakura_header_chain::EngineSnapshot, target: block::Hash) -> Status {
+pub(super) fn status_for(
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    target: block::Hash,
+) -> Status {
     let anchor = snapshot.frontiers.finalized;
     Status {
         work_anchor_height: anchor.height,

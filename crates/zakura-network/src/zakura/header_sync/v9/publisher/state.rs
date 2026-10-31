@@ -245,6 +245,14 @@ impl PublisherState {
         }
     }
 
+    /// This state, reporting its subscription transitions through `tap` if
+    /// there is one.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<u64>>) -> Self {
+        self.publications = self.publications.observed_by(tap);
+        self
+    }
+
     /// Check `update` and apply it to the subscription tools. A refused
     /// update changes nothing.
     pub(super) fn apply(

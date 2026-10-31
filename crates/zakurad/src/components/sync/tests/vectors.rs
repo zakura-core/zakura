@@ -4416,8 +4416,8 @@ fn scaled_lookahead_stays_below_the_drop_height() {
 /// Regression for a startup race: the coordinator's initial phase used to depend on whether the
 /// state had published Ready yet. A genesis-only database could publish it first, so the
 /// coordinator started `Native` and this handoff failed with "illegal sync lifecycle transition".
-/// Startup waits for Ready before spawning the syncer on a restart, so Ready is the state this
-/// task sees there.
+/// When the database already has a durable header runtime, startup waits for Ready before
+/// spawning the syncer, so Ready is the state this task sees on that restart.
 #[tokio::test]
 async fn ready_restart_hands_genesis_bootstrap_to_native_sync() {
     use zakura_network::P2pStack;

@@ -901,6 +901,58 @@ async fn incomplete_three_stream_session_releases_all_arrivals_on_expiry() -> Re
     fixture.close().await
 }
 
+/// The node's owner count sees partial setup, an installed session, and
+/// teardown, and connection teardown settles every owner before it returns.
+#[tokio::test]
+async fn owner_counts_follow_partial_setup_and_teardown_settles_them() -> Result<(), BoxError> {
+    let mut fixture =
+        RawFixture::start_with_streams(1, Duration::from_millis(300), &[DATA, REQUESTS, EVENTS])
+            .await?;
+    let owners = fixture.resources.owners().clone();
+    let wait_for = |want: fn(&crate::zakura::transport::OwnerCounts) -> bool| {
+        let owners = owners.clone();
+        async move {
+            timeout(TEST_TIMEOUT, async {
+                while !want(&owners.counts()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        }
+    };
+
+    // Two members wait for the third, counted as setup owners.
+    let first = fixture.offer(REQUESTS, Some(7)).await?;
+    let second = fixture.offer(EVENTS, Some(7)).await?;
+    wait_for(|counts| counts.setup == 2).await?;
+    assert_eq!(owners.counts().installed, 0);
+
+    // Expiry releases both members and no owner survives.
+    wait_for(|counts| counts.total() == 0).await?;
+    drop((first, second));
+
+    // The service defers a new offer until the expired offer's delay passes.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let _members = (
+        fixture.offer(DATA, Some(9)).await?,
+        fixture.offer(REQUESTS, Some(9)).await?,
+        fixture.offer(EVENTS, Some(9)).await?,
+    );
+    wait_for(|counts| counts.installed == 3).await?;
+    let session = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+        .await?
+        .ok_or("the complete offer reaches its service")?;
+    drop(session);
+
+    fixture.close().await?;
+    assert_eq!(
+        owners.counts().total(),
+        0,
+        "connection teardown returned only after its owners settled"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn withheld_pair_id_does_not_reserve_service_capacity() -> Result<(), BoxError> {
     let fixture = RawFixture::start(1, Duration::from_secs(2)).await?;

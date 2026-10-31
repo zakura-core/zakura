@@ -3372,6 +3372,18 @@ impl ZakuraProtocolHandler {
         #[cfg(any(test, zakura_sim))]
         let drained = workers.is_empty();
         workers.abort_all();
+        // An aborted worker keeps its owners until its task actually ends.
+        // Settle them before this connection returns its admission slot, so a
+        // replacement cannot run beside the old generation's stream owners.
+        while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
+            .await
+            .ok()
+            .flatten()
+        {
+            if let Err(error) = joined {
+                debug!(?error, "aborted Zakura stream worker ended");
+            }
+        }
         cleanup_guard.cleanup_registered_peer().await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
         conn.trace_connection(

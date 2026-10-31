@@ -8,7 +8,7 @@ use std::{
 
 use futures::{
     channel::{mpsc, oneshot},
-    SinkExt,
+    Sink, SinkExt,
 };
 use tokio::{
     sync::{watch, Semaphore},
@@ -261,9 +261,19 @@ impl BlockGossipPeer {
         };
         let (sender, connection) = (&mut self.sender, &self.trace);
         let advertised = timeout(inventory_wait, async {
-            sender.send(request).await.ok()?;
+            futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *sender).poll_ready(cx))
+                .await
+                .ok()?;
             connection.enqueued(&request_trace);
             advert.inv_enqueued();
+            if std::pin::Pin::new(&mut *sender)
+                .start_send(request)
+                .is_err()
+            {
+                connection.enqueue_failed(&request_trace);
+                return None;
+            }
+            sender.flush().await.ok()?;
             rx.await.ok()?.ok()
         })
         .await;

@@ -671,6 +671,8 @@ impl Client {
         // request.
         let span = tracing::Span::current();
 
+        // Publish the trace before the channel can wake the connection task.
+        self.connection_trace.enqueued(&trace);
         match self.server_tx.try_send(ClientRequest {
             request,
             tx,
@@ -680,6 +682,7 @@ impl Client {
             trace,
         }) {
             Err(e) => {
+                self.connection_trace.enqueue_failed(&trace);
                 if e.is_disconnected() {
                     let peer_error = self
                         .error_slot
@@ -697,7 +700,6 @@ impl Client {
                 }
             }
             Ok(()) => {
-                self.connection_trace.enqueued(&trace);
                 // The receiver end of the oneshot is itself a future.
                 rx.map(|oneshot_recv_result| {
                     // The ClientRequest oneshot sender should not be dropped before sending a

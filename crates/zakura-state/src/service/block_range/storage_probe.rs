@@ -63,6 +63,9 @@ fn elapsed_us(began: Instant) -> u32 {
 /// serving encode on a blocking thread, which copies those bytes into frames,
 /// and `p50_us`/`p99_us` cover both. `ZAKURA_STORAGE_PROBE_CONTROL=1` also
 /// measures chain-tip reads every 10 ms while the data reads run.
+/// `ZAKURA_STORAGE_PROBE_DECODE=1` instead reads decoded block batches through
+/// the read service. That mode excludes encoding and caps concurrency at 48,
+/// so its largest batch workload retains at most 768 of the 1024 data slots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual storage evidence; requires ZAKURA_STORAGE_PROBE_CACHE_DIR"]
 #[allow(clippy::print_stderr)]
@@ -80,6 +83,11 @@ async fn getblocks_storage_read_probe() {
         .unwrap_or(10);
     let drop_caches = std::env::var_os("ZAKURA_PROBE_DROP_CACHES").is_some();
     let encode = std::env::var_os("ZAKURA_STORAGE_PROBE_ENCODE").is_some();
+    let decode = std::env::var_os("ZAKURA_STORAGE_PROBE_DECODE").is_some();
+    assert!(
+        !(encode && decode),
+        "choose serialized encoding or decoded reads"
+    );
     let control_reads = std::env::var_os("ZAKURA_STORAGE_PROBE_CONTROL").is_some();
     let storage_mode = if std::env::var_os("ZAKURA_STORAGE_PROBE_ARCHIVE").is_some() {
         StorageMode::Archive
@@ -130,6 +138,9 @@ async fn getblocks_storage_read_probe() {
         ("unavailable_above_tip", 1),
     ] {
         for concurrency in [1_usize, 4, 8, 16, 19, 24, 32, 38, 48, 64, 76] {
+            if decode && concurrency > 48 {
+                continue;
+            }
             if drop_caches {
                 std::process::Command::new("sync").status().unwrap();
                 std::fs::write("/proc/sys/vm/drop_caches", "3").unwrap();
@@ -188,6 +199,35 @@ async fn getblocks_storage_read_probe() {
                                 _ => retained.0 + seed % span,
                             };
                             let began = Instant::now();
+                            if decode {
+                                let response = state
+                                    .clone()
+                                    .oneshot(ReadRequest::BlocksByHeightRange {
+                                        start: Height(start),
+                                        count,
+                                    })
+                                    .await
+                                    .unwrap();
+                                let ReadResponse::Blocks(blocks) = response else {
+                                    panic!("decoded range requests return block batches")
+                                };
+                                let expected = if start > retained.1 {
+                                    0
+                                } else {
+                                    count.min(retained.1 - start + 1)
+                                };
+                                assert_eq!(blocks.len(), usize::try_from(expected).unwrap());
+                                for (offset, (height, block, size)) in blocks.iter().enumerate() {
+                                    assert_eq!(height.0, start + u32::try_from(offset).unwrap());
+                                    assert_eq!(block.coinbase_height(), Some(*height));
+                                    tally.bytes += u64::try_from(*size).unwrap();
+                                }
+                                tally.blocks += u64::try_from(blocks.len()).unwrap();
+                                drop(std::hint::black_box(blocks));
+                                tally.latencies_us.push(elapsed_us(began));
+                                tally.reads += 1;
+                                continue;
+                            }
                             let range = state
                                 .read_owned_block_range(
                                     Height(start),
@@ -252,7 +292,7 @@ async fn getblocks_storage_read_probe() {
             let per_second = |value: u64| value as f64 / elapsed_seconds;
             eprintln!(
                 "storage_probe shape={shape} count={count} concurrency={concurrency} \
-                 cold_cache={drop_caches} encode={encode} elapsed_s={elapsed_seconds:.6} \
+                 cold_cache={drop_caches} encode={encode} decode={decode} elapsed_s={elapsed_seconds:.6} \
                  reads_per_s={:.0} blocks_per_s={:.0} \
                  mb_per_s={:.2} p50_us={} p99_us={} max_us={} encode_p50_us={} encode_p99_us={} \
                  control_reads={} control_p99_us={} control_max_us={} \

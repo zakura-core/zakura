@@ -587,6 +587,7 @@ mod tests {
                     addr: format!("127.0.0.1:{}", i + 1).parse().unwrap(),
                     user_agent: "test".into(),
                     version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+                    start_height: zakura_chain::block::Height(0),
                     is_inbound: false,
                     rtt: millis.map(Duration::from_millis),
                     ping_sent_at: None,

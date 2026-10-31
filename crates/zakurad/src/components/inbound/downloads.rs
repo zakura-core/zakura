@@ -851,6 +851,9 @@ where
 }
 
 #[cfg(test)]
+mod missing_parent_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt as _;

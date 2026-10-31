@@ -45,7 +45,7 @@ impl RequestWriteStatus {
     }
 
     /// Where the frame write stands now.
-    #[cfg(any(test, zakura_sim))]
+    #[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn phase(&self) -> RequestWritePhase {
         match self.0.load(Ordering::Acquire) {
             UNPUBLISHED => RequestWritePhase::Unpublished,
@@ -104,7 +104,7 @@ impl RequestReporter {
 
 /// Where a request's frame write stands. A queued request is published but
 /// not yet sent: transport can still skip it.
-#[cfg(any(test, zakura_sim))]
+#[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RequestWritePhase {
     /// The attempt holds its items provisionally and hasn't published them.

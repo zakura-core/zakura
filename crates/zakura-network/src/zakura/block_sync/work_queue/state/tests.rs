@@ -1243,3 +1243,9 @@ fn semantic_capture_runs_when_an_input_panics() {
     assert!(failure.is_err());
     assert!(captured);
 }
+
+mod funding;
+pub use funding::{
+    trace_work_funding_bytes, FundingReceiptView, FundingRequestPhase, FundingRequestView,
+    WorkFundingHistory, WorkFundingStep, WorkFundingView,
+};

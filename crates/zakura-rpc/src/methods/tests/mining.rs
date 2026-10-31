@@ -745,8 +745,8 @@ async fn preactivation_template_accepts_negative_balance() {
 fn assert_reward(template: &BlockTemplateResponse, balance: i64) {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
     let base = halving_block_subsidy(Height(template.height), &network()).unwrap();
-    // Independent fixed NU7 payout oracle, including rounding up.
-    let bonus = (i128::from(balance) * 1_375 + 9_999_999_999) / 10_000_000_000;
+    // Independent Regtest NU7 payout oracle, including rounding up.
+    let bonus = (i128::from(balance) * 8_022_777 + 9_999_999_999) / 10_000_000_000;
     let expected = i64::from(base)
         + if template.height >= 3 {
             i64::try_from(bonus).unwrap()

@@ -3034,7 +3034,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_raw_transaction RPC and the StateService.
             ReadRequest::Transaction(hash) => Ok(ReadResponse::Transaction(
-                read::mined_transaction(state.latest_best_chain(), &state.db, hash),
+                read::mined_transaction(state.latest_best_chain(), &state.db, hash)?,
             )),
 
             ReadRequest::AnyChainTransaction(hash) => {
@@ -3042,7 +3042,7 @@ impl Service<ReadRequest> for ReadStateService {
                     state.latest_non_finalized_state().chain_iter(),
                     &state.db,
                     hash,
-                )))
+                )?))
             }
 
             // Used by the getblock (verbose) RPC.

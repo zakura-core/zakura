@@ -13,6 +13,29 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+/// Weak reads of the actual standalone transaction allocation.
+pub struct TransactionProbe(Weak<RetainedTransaction>);
+
+impl TransactionProbe {
+    /// Observe a returned allocation without extending its lifetime.
+    pub fn new(transaction: &OwnedTransaction) -> Self {
+        Self(Arc::downgrade(&transaction.0))
+    }
+
+    /// Count actual retained handles at a stable boundary.
+    pub fn holders(&self) -> usize {
+        self.0.strong_count()
+    }
+
+    /// Measure the live payload's serialization independently of admission bookkeeping.
+    /// This measures content, not the allocation's decoded memory size.
+    pub fn serialized_bytes(&self) -> Option<usize> {
+        self.0
+            .upgrade()
+            .map(|allocation| allocation.transaction.zcash_serialized_size())
+    }
+}
+
 const SLOTS: usize = 8;
 
 /// One pool's current counters, read after a completed operation.

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, TransactionAdmissionFailure, TransactionHandle,
 };
 
 use chrono::{DateTime, Utc};
@@ -124,7 +124,7 @@ fn transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<(TransactionHandle, Height, DateTime<Utc>)>
+) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, TransactionAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -133,17 +133,15 @@ where
     // Since transactions are the same in the finalized and non-finalized state,
     // we check the most efficient alternative first. (`chain` is always in
     // memory, but `db` stores transactions on disk, with a memory cache.)
-    chain
-        .and_then(|chain| {
-            chain
-                .as_ref()
-                .transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time))
-        })
-        .or_else(|| {
-            db.transaction(hash)
-                .map(|(tx, height, time)| (tx.into(), height, time))
-        })
+    if let Some(transaction) = chain.and_then(|chain| {
+        chain
+            .as_ref()
+            .transaction(hash)
+            .map(|(tx, height, time)| (tx.clone(), height, time))
+    }) {
+        return Ok(Some(transaction));
+    }
+    db.transaction(hash)
 }
 
 /// Returns a [`MinedTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -152,7 +150,7 @@ pub fn mined_transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<MinedTx>
+) -> Result<Option<MinedTx>, TransactionAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -162,10 +160,10 @@ where
     // can only add overlapping blocks, and hashes are unique.
     let chain = chain.as_ref();
 
-    let (tx, height, time) = transaction(chain, db, hash)?;
-    let confirmations = 1 + tip_height(chain, db)?.0 - height.0;
-
-    Some(MinedTx::new(tx, height, confirmations, time))
+    let Some((tx, height, time)) = transaction(chain, db, hash)? else {
+        return Ok(None);
+    };
+    Ok(tip_height(chain, db).map(|tip| MinedTx::new(tx, height, 1 + tip.0 - height.0, time)))
 }
 
 /// Returns a [`AnyTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -175,7 +173,7 @@ pub fn any_transaction<'a>(
     chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<AnyTx> {
+) -> Result<Option<AnyTx>, TransactionAdmissionFailure> {
     // # Correctness
     //
     // It is ok to do this lookup in multiple different calls. Finalized state updates
@@ -190,25 +188,29 @@ pub fn any_transaction<'a>(
     // still be used in find_map below.
     let mut chains = chains.peekable();
     let best_chain = chains.peek().copied();
-    let (tx, height, time, in_best_chain, containing_chain) = chains
-        .enumerate()
-        .find_map(|(i, chain)| {
-            chain
-                .as_ref()
-                .transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
-        })
-        .or_else(|| {
-            db.transaction(hash)
-                .map(|(tx, height, time)| (tx.into(), height, time, true, None))
-        })?;
+    let in_memory = chains.enumerate().find_map(|(i, chain)| {
+        chain
+            .as_ref()
+            .transaction(hash)
+            .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
+    });
+    let transaction = match in_memory {
+        Some(transaction) => Some(transaction),
+        None => db
+            .transaction(hash)?
+            .map(|(tx, height, time)| (tx, height, time, true, None)),
+    };
+    let Some((tx, height, time, in_best_chain, containing_chain)) = transaction else {
+        return Ok(None);
+    };
 
     if in_best_chain {
-        let confirmations = 1 + tip_height(best_chain, db)?.0 - height.0;
-        Some(AnyTx::Mined(MinedTx::new(tx, height, confirmations, time)))
+        Ok(tip_height(best_chain, db)
+            .map(|tip| AnyTx::Mined(MinedTx::new(tx, height, 1 + tip.0 - height.0, time))))
     } else {
-        let block_hash = containing_chain?.block(height.into())?.hash;
-        Some(AnyTx::Side((tx, block_hash)))
+        Ok(containing_chain
+            .and_then(|chain| chain.block(height.into()))
+            .map(|block| AnyTx::Side((tx, block.hash))))
     }
 }
 

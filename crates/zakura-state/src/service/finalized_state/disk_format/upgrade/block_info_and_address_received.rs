@@ -67,8 +67,9 @@ impl DiskFormatUpgrade for Upgrade {
         // amounts to. Block info is still added.
         let skip_transparent_indexes = db.skips_transparent_indexes();
         // Each parallel result retains one block until the batch consumes it.
-        let chunk_size =
-            rayon::current_num_threads().min(usize::from(db.config().read_block_limit.get()));
+        let chunk_size = rayon::current_num_threads()
+            .min(usize::from(db.config().read_block_limit.get()))
+            .min(usize::from(db.config().read_transaction_limit.get()));
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
         let chunks = (0..=initial_finalized_tip_height.0).chunks(chunk_size);
@@ -109,7 +110,7 @@ impl DiskFormatUpgrade for Upgrade {
                         for input in tx.inputs() {
                             if let Some(outpoint) = input.outpoint() {
                                 let (tx, h, _) = db
-                                    .transaction(outpoint.hash)
+                                    .transaction(outpoint.hash)?
                                     .expect("transaction should be in the database");
                                 let output = tx
                                     .outputs()
@@ -305,17 +306,17 @@ impl DiskFormatUpgrade for Upgrade {
 
         // Collect the set of addresses that received transparent funds in the last query range (last 1000 blocks).
         let tx_loc_range = TransactionLocation::min_for_height(start_height)..;
-        let addresses: HashSet<_> = db
-            .transactions_by_location_range(tx_loc_range)
-            .flat_map(|(_, tx)| tx.outputs().to_vec())
-            .filter_map(|output| {
+        let mut addresses = HashSet::new();
+        for transaction in db.transactions_by_location_range(tx_loc_range) {
+            let (_, transaction) = transaction?;
+            addresses.extend(transaction.outputs().iter().filter_map(|output| {
                 if output.value != 0 {
                     output.address(&network)
                 } else {
                     None
                 }
-            })
-            .collect();
+            }));
+        }
 
         // Check that no address balances for that set of addresses have a received field of `0`.
         for address in addresses {

@@ -32,6 +32,11 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Maximum standalone transactions being decoded from disk or retained by readers.
+    /// Database clones and decoded transaction iterators share the default 4096 slots.
+    /// Exhaustion returns a capacity error. This count does not bound decoded bytes.
+    pub read_transaction_limit: NonZeroU16,
+
     /// Maximum full blocks being decoded from disk or retained by disk-read results.
     ///
     /// The default is 1024. Database clones share this count limit. A result keeps
@@ -487,6 +492,7 @@ impl Default for PruningConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            read_transaction_limit: NonZeroU16::new(4096).expect("the default limit is nonzero"),
             read_block_limit: NonZeroU16::new(1024).expect("the default limit is nonzero"),
             read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
             cache_dir: default_cache_dir(),
@@ -534,6 +540,15 @@ mod tests {
         );
         assert!(toml::from_str::<Config>("read_block_limit = 0").is_err());
         assert!(toml::from_str::<Config>("read_block_limit = 65536").is_err());
+        assert_eq!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .read_transaction_limit
+                .get(),
+            4096
+        );
+        assert!(toml::from_str::<Config>("read_transaction_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_transaction_limit = 65536").is_err());
     }
 
     #[test]

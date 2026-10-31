@@ -104,6 +104,10 @@ pub struct RollbackFinalizedStateSummary {
 /// Errors returned by finalized-state rollback.
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackFinalizedStateError {
+    /// A standalone disk transaction could not acquire decode admission.
+    #[error("disk transaction admission failed: {0}")]
+    TransactionAdmission(#[from] zakura_node_services::block_memory::TransactionAdmissionFailure),
+
     /// Disk block decoding or retention exhausted its admission pool.
     #[error("disk block admission failed: {0}")]
     BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
@@ -906,7 +910,7 @@ fn finalized_output(
         },
     )?;
     let transaction =
-        db.transaction(outpoint.hash)
+        db.transaction(outpoint.hash)?
             .ok_or(RollbackFinalizedStateError::MissingTransaction {
                 hash: outpoint.hash,
             })?;

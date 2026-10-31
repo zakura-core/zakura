@@ -245,6 +245,7 @@ fn retention_plan_prepare_prune_writes_expected_pruning_batch() {
         prune_state
             .db
             .transaction(coinbase_tx_hash(&network, 1))
+            .unwrap()
             .is_none(),
         "ordinary prune plans delete raw transactions inside the range"
     );
@@ -252,6 +253,7 @@ fn retention_plan_prepare_prune_writes_expected_pruning_batch() {
         prune_state
             .db
             .transaction(coinbase_tx_hash(&network, 3))
+            .unwrap()
             .is_some(),
         "ordinary prune plans keep raw transactions at the exclusive range end"
     );
@@ -277,6 +279,7 @@ fn retention_plan_prepare_prune_writes_expected_pruning_batch() {
         backlog_state
             .db
             .transaction(coinbase_tx_hash(&network, 5))
+            .unwrap()
             .is_some(),
         "non-final archive-backlog drains do not delete the current checkpoint block"
     );
@@ -298,6 +301,7 @@ fn retention_plan_prepare_prune_writes_expected_pruning_batch() {
         skip_state
             .db
             .transaction(coinbase_tx_hash(&network, 1))
+            .unwrap()
             .is_some(),
         "checkpoint skip plans only write the marker; backlog drains do the range deletion"
     );
@@ -384,6 +388,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
             state
                 .db
                 .transaction(coinbase_tx_hash(&network, height))
+                .unwrap()
                 .is_none(),
             "raw transaction is skipped before the checkpoint retention start"
         );
@@ -392,6 +397,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         state
             .db
             .transaction(coinbase_tx_hash(&network, checkpoint_lowest_retained.0))
+            .unwrap()
             .is_some(),
         "raw transaction is retained at the checkpoint retention start before handoff"
     );
@@ -422,6 +428,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         state
             .db
             .transaction(coinbase_tx_hash(&network, checkpoint_lowest_retained.0))
+            .unwrap()
             .is_none(),
         "online pruning deletes the checkpoint retention start height after the checkpoint target"
     );
@@ -429,6 +436,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         state
             .db
             .transaction(coinbase_tx_hash(&network, online_prune_until.0))
+            .unwrap()
             .is_some(),
         "the next height remains retained, so there is no pruning gap"
     );
@@ -575,6 +583,7 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
         state
             .db
             .transaction(coinbase_tx_hash(&network, 0))
+            .unwrap()
             .is_some(),
         "genesis raw transaction is always retained"
     );
@@ -583,11 +592,16 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
         let tx_hash = coinbase_tx_hash(&network, height);
 
         assert!(
-            state.db.transaction(tx_hash).is_none(),
+            state.db.transaction(tx_hash).unwrap().is_none(),
             "checkpoint raw transaction is skipped before the checkpoint retention start"
         );
         assert_eq!(
-            state.db.transactions_by_height(Height(height)).count(),
+            state
+                .db
+                .transactions_by_height(Height(height))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
             0,
             "tx_by_loc has no raw transactions before the checkpoint retention start"
         );
@@ -609,7 +623,7 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
         let tx_hash = coinbase_tx_hash(&network, height);
 
         assert!(
-            state.db.transaction(tx_hash).is_some(),
+            state.db.transaction(tx_hash).unwrap().is_some(),
             "checkpoint raw transaction is retained at or after the checkpoint retention start"
         );
         assert!(
@@ -710,6 +724,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         archive_state
             .db
             .transaction(coinbase_tx_hash(&network, TEST_BLOCKS - 1))
+            .unwrap()
             .is_some(),
         "archive phase stores raw transactions before the future checkpoint retention start"
     );
@@ -760,6 +775,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
             pruned_state
                 .db
                 .transaction(coinbase_tx_hash(&network, height))
+                .unwrap()
                 .is_none(),
             "archive raw transaction data is pruned at height {height}"
         );
@@ -877,7 +893,7 @@ fn archive_mode_keeps_checkpoint_raw_transactions_before_checkpoint_retention_st
         let tx_hash = coinbase_tx_hash(&network, height);
 
         assert!(
-            state.db.transaction(tx_hash).is_some(),
+            state.db.transaction(tx_hash).unwrap().is_some(),
             "archive mode keeps checkpoint raw transaction data"
         );
         assert!(
@@ -937,7 +953,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
     assert!(
         state
             .db
-            .transaction(coinbase_tx_hash(&network, 1))
+            .transaction(coinbase_tx_hash(&network, 1)).unwrap()
             .is_some(),
         "contextual finalized commits keep raw transaction data even before the checkpoint retention start"
     );
@@ -1004,7 +1020,7 @@ fn initial_online_prune_preserves_pre_boundary_history() {
     state.db.write_batch(batch).expect("prune batch writes");
 
     assert!(
-        state.db.transaction(preserved_tx_hash).is_some(),
+        state.db.transaction(preserved_tx_hash).unwrap().is_some(),
         "raw transaction before the online pruning boundary is preserved"
     );
     assert!(
@@ -1038,7 +1054,7 @@ fn initial_online_prune_preserves_pre_boundary_history() {
         "assembled raw block bytes match the block's consensus serialization"
     );
     assert!(
-        state.db.transaction(pruned_tx_hash).is_none(),
+        state.db.transaction(pruned_tx_hash).unwrap().is_none(),
         "raw transaction at the online pruning boundary is pruned"
     );
     assert!(
@@ -1082,7 +1098,7 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
     let pruned_tx_hash = coinbase_tx_hash(&network, 1);
     let pruned_outpoint = transparent::OutPoint::from_usize(pruned_tx_hash, 0);
     assert!(
-        state.db.transaction(pruned_tx_hash).is_some(),
+        state.db.transaction(pruned_tx_hash).unwrap().is_some(),
         "raw transaction present before pruning"
     );
     let utxo_before = state.db.utxo(&pruned_outpoint);
@@ -1100,11 +1116,16 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
     for height in 1..4 {
         let tx_hash = coinbase_tx_hash(&network, height);
         assert!(
-            state.db.transaction(tx_hash).is_none(),
+            state.db.transaction(tx_hash).unwrap().is_none(),
             "raw transaction pruned at height {height}"
         );
         assert_eq!(
-            state.db.transactions_by_height(Height(height)).count(),
+            state
+                .db
+                .transactions_by_height(Height(height))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
             0,
             "tx_by_loc pruned at height {height}"
         );
@@ -1136,6 +1157,7 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
         state
             .db
             .transaction(coinbase_tx_hash(&network, 0))
+            .unwrap()
             .is_some(),
         "genesis transaction retained"
     );
@@ -1161,6 +1183,7 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
             state
                 .db
                 .transaction(coinbase_tx_hash(&network, height))
+                .unwrap()
                 .is_some(),
             "transaction retained at height {height}"
         );

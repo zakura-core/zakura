@@ -17,7 +17,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
-use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle};
+use zakura_node_services::block_memory::{
+    AdmissionFailure, BlockHandle, TransactionAdmissionFailure, TransactionHandle,
+};
 
 use zakura_chain::{
     amount::NonNegative,
@@ -492,22 +494,26 @@ impl ZakuraDb {
 
     /// Returns the [`Transaction`] with [`transaction::Hash`], and its [`Height`],
     /// if a transaction with that hash exists in the finalized chain.
+    /// Capacity refusal returns an error before lookup or decoding. A returned
+    /// handle retains admission through its final clone.
     #[allow(clippy::unwrap_in_result)]
     pub fn transaction(
         &self,
         hash: transaction::Hash,
-    ) -> Option<(Arc<Transaction>, Height, DateTime<Utc>)> {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-
-        let transaction_location = self.transaction_location(hash)?;
-
-        let block_time = self
-            .block_header(transaction_location.height.into())
-            .map(|header| header.time);
-
-        self.db
-            .zs_get(&tx_by_loc, &transaction_location)
-            .and_then(|tx| block_time.map(|time| (tx, transaction_location.height, time)))
+    ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, TransactionAdmissionFailure>
+    {
+        let mut location_and_time = None;
+        let transaction = self.read_transactions.try_decode(|| {
+            let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+            let location = self.transaction_location(hash)?;
+            let time = self.block_header(location.height.into())?.time;
+            location_and_time = Some((location.height, time));
+            self.db.zs_get(&tx_by_loc, &location)
+        })?;
+        Ok(transaction.map(|transaction| {
+            let (height, time) = location_and_time.expect("a decoded transaction has its location");
+            (transaction.into(), height, time)
+        }))
     }
 
     /// Returns an iterator of all [`Transaction`]s for a provided block height in finalized state.
@@ -515,7 +521,9 @@ impl ZakuraDb {
     pub fn transactions_by_height(
         &self,
         height: Height,
-    ) -> impl Iterator<Item = (TransactionLocation, Transaction)> + '_ {
+    ) -> impl Iterator<
+        Item = Result<(TransactionLocation, TransactionHandle), TransactionAdmissionFailure>,
+    > + '_ {
         self.transactions_by_location_range(
             TransactionLocation::min_for_height(height)
                 ..=TransactionLocation::max_for_height(height),
@@ -537,16 +545,46 @@ impl ZakuraDb {
 
     /// Returns an iterator of all [`Transaction`]s in the provided range
     /// of [`TransactionLocation`]s in finalized state.
+    /// Each item acquires admission before decoding and retains it through its
+    /// final holder. The iterator ends after its first explicit capacity error.
     #[allow(clippy::unwrap_in_result)]
     pub fn transactions_by_location_range<R>(
         &self,
         range: R,
-    ) -> impl Iterator<Item = (TransactionLocation, Transaction)> + '_
+    ) -> impl Iterator<
+        Item = Result<(TransactionLocation, TransactionHandle), TransactionAdmissionFailure>,
+    > + '_
     where
         R: RangeBounds<TransactionLocation>,
     {
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        self.db.zs_forward_range_iter(tx_by_loc, range)
+        let mut transactions = self.db.zs_forward_range_iter(tx_by_loc, range);
+        let mut finished = false;
+        std::iter::from_fn(move || {
+            if finished {
+                return None;
+            }
+            let mut location = None;
+            let result = self.read_transactions.try_decode(|| {
+                let (next_location, transaction) = transactions.next()?;
+                location = Some(next_location);
+                Some(transaction)
+            });
+            match result {
+                Ok(Some(transaction)) => Some(Ok((
+                    location.expect("the decoded item has a location"),
+                    transaction.into(),
+                ))),
+                Ok(None) => {
+                    finished = true;
+                    None
+                }
+                Err(error) => {
+                    finished = true;
+                    Some(Err(error))
+                }
+            }
+        })
     }
 
     /// Returns an iterator of all raw [`Transaction`]s in the provided range

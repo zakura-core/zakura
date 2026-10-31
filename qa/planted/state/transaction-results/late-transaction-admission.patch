@@ -1,0 +1,19 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -735,6 +735,7 @@
+         &self,
+         decode: impl FnOnce() -> Option<Transaction>,
+     ) -> Result<Option<OwnedTransaction>, TransactionAdmissionFailure> {
++        let decoded = decode();
+         let permit = self
+             .0
+             .clone()
+@@ -743,7 +744,7 @@
+                 tokio::sync::TryAcquireError::NoPermits => TransactionAdmissionFailure::Capacity,
+                 tokio::sync::TryAcquireError::Closed => TransactionAdmissionFailure::Closed,
+             })?;
+-        Ok(decode().map(|transaction| {
++        Ok(decoded.map(|transaction| {
+             OwnedTransaction(Arc::new(RetainedTransaction {
+                 transaction,
+                 _permit: permit,

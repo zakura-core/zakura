@@ -1,5 +1,6 @@
 //! Tracks transaction locations by their inputs and revealed nullifiers.
 
+use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::mpsc::TryRecvError;
 
@@ -7,20 +8,20 @@ use zakura_chain::block::Height;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{super::super::DiskWriteBatch, CancelFormatChange, CancelReceiver};
+use super::{super::super::DiskWriteBatch, CancelFormatChange, CancelReceiver, FormatChangeError};
 
 /// Runs disk format upgrade for tracking transaction locations by their inputs and revealed nullifiers.
 ///
-/// Returns `Ok` if the upgrade completed, and `Err` if it was cancelled.
+/// Cancellation or exhausted read capacity returns an error.
 #[allow(clippy::unwrap_in_result)]
 #[instrument(skip(zakura_db, cancel_receiver))]
 pub fn run(
     initial_finalized_tip_height: Height,
     zakura_db: &ZakuraDb,
     cancel_receiver: &CancelReceiver,
-) -> Result<(), CancelFormatChange> {
+) -> Result<(), FormatChangeError> {
     if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-        return Err(CancelFormatChange);
+        return Err(CancelFormatChange.into());
     }
 
     let _ = zakura_db
@@ -33,40 +34,46 @@ pub fn run(
         .write_batch();
 
     if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-        return Err(CancelFormatChange);
+        return Err(CancelFormatChange.into());
     }
 
-    (0..=initial_finalized_tip_height.0)
-        .into_par_iter()
-        .try_for_each(|height| {
-            let height = Height(height);
-            let mut batch = DiskWriteBatch::new();
+    let batch_size = rayon::current_num_threads()
+        .min(usize::from(zakura_db.config().read_transaction_limit.get()));
+    for heights in &(0..=initial_finalized_tip_height.0).chunks(batch_size) {
+        heights.collect_vec().into_par_iter().try_for_each(
+            |height| -> Result<(), FormatChangeError> {
+                let height = Height(height);
+                let mut batch = DiskWriteBatch::new();
 
-            let transactions = zakura_db.transactions_by_location_range(
-                crate::TransactionLocation::from_index(height, 1)
-                    ..=crate::TransactionLocation::max_for_height(height),
-            );
+                let transactions = zakura_db.transactions_by_location_range(
+                    crate::TransactionLocation::from_index(height, 1)
+                        ..=crate::TransactionLocation::max_for_height(height),
+                );
 
-            for (_tx_loc, tx) in transactions {
-                if tx.is_coinbase() {
-                    continue;
+                for transaction in transactions {
+                    let (_tx_loc, tx) = transaction?;
+                    if tx.is_coinbase() {
+                        continue;
+                    }
+
+                    batch.prepare_nullifier_batch(zakura_db, &tx);
                 }
 
-                batch.prepare_nullifier_batch(zakura_db, &tx);
-            }
+                if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
+                    return Err(CancelFormatChange.into());
+                }
 
-            if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange);
-            }
+                zakura_db
+                    .write_batch(batch)
+                    .expect("unexpected database write failure");
 
-            zakura_db
-                .write_batch(batch)
-                .expect("unexpected database write failure");
+                if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
+                    return Err(CancelFormatChange.into());
+                }
 
-            if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange);
-            }
-
-            Ok(())
-        })
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
 }

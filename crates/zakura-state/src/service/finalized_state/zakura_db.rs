@@ -108,6 +108,9 @@ pub struct ZakuraDb {
     /// Disk block decoding and final-holder admission shared by database clones.
     read_blocks: zakura_node_services::block_memory::DecodedBlockPool,
 
+    /// Standalone decoded transactions share admission across lookups and iterators.
+    read_transactions: zakura_node_services::block_memory::DecodedTransactionPool,
+
     /// Chain-tip publication cannot spend ordinary callers' result capacity.
     chain_tip_blocks: zakura_node_services::block_memory::DecodedBlockPool,
 
@@ -221,6 +224,9 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
+            read_transactions: zakura_node_services::block_memory::DecodedTransactionPool::new(
+                config.read_transaction_limit,
+            ),
             read_blocks: zakura_node_services::block_memory::DecodedBlockPool::for_block_count(
                 config.read_block_limit.into(),
             ),
@@ -470,14 +476,21 @@ impl ZakuraDb {
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
                 if disk_version >= self.db.format_version_in_code() {
-                    DbFormatChange::check_new_blocks(self)
-                        .run_format_change_or_check(
-                            self,
-                            // The initial tip height is not used by the new blocks format check.
-                            None,
-                            &never_cancel_receiver,
-                        )
-                        .expect("cancel handle is never used");
+                    let result = DbFormatChange::check_new_blocks(self).run_format_change_or_check(
+                        self,
+                        // The initial tip height is not used by the new blocks format check.
+                        None,
+                        &never_cancel_receiver,
+                    );
+                    match result {
+                        Err(error) if error.is_read_capacity_exhausted() => {
+                            tracing::warn!(
+                                ?error,
+                                "final database format check incomplete: live results hold read capacity"
+                            );
+                        }
+                        result => result.expect("final database format check must succeed"),
+                    }
                 }
             }
         }

@@ -169,6 +169,229 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     );
 }
 
+/// Direct reads, services, and iterators share final-holder transaction admission.
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_transactions_keep_shared_admission_through_clones_and_database_drop() {
+    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use std::{num::NonZeroU16, time::Duration};
+    use tokio::time::timeout;
+    use tower::ServiceExt;
+    use zakura_node_services::block_memory::{
+        model::TransactionProbe, TransactionAdmissionFailure, TransactionHandle,
+    };
+
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let config = Config {
+        read_transaction_limit: NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        deadline,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let hash = genesis.transactions[0].hash();
+    let ReadResponse::Transaction(Some(result)) = timeout(
+        deadline,
+        read.clone().oneshot(ReadRequest::Transaction(hash)),
+    )
+    .await
+    .unwrap()
+    .unwrap() else {
+        panic!("the stored genesis transaction is available")
+    };
+    assert_eq!(result.tx.hash(), hash);
+    assert_eq!(result.height, Height(0));
+    let pool = read.db.read_transactions.clone();
+    assert_eq!(
+        pool.available_slots(),
+        0,
+        "a returned disk allocation must retain admission"
+    );
+    let TransactionHandle::Standalone(owner) = &result.tx else {
+        panic!("disk transaction results carry standalone admission")
+    };
+    let probe = TransactionProbe::new(owner);
+    let retained = result.tx.clone();
+    drop(result);
+    assert_eq!(probe.holders(), 1);
+    assert_eq!(
+        probe.serialized_bytes(),
+        Some(genesis.transactions[0].zcash_serialized_size())
+    );
+    assert_eq!(
+        pool.available_slots(),
+        0,
+        "live payloads retain their original admission"
+    );
+    assert_eq!(
+        read.db.clone().transaction(hash).unwrap_err(),
+        TransactionAdmissionFailure::Capacity
+    );
+    let error = timeout(
+        deadline,
+        read.clone().oneshot(ReadRequest::AnyChainTransaction(hash)),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TransactionAdmissionFailure>(),
+        Some(&TransactionAdmissionFailure::Capacity)
+    );
+    let mut refused = read.db.transactions_by_height(Height(0));
+    assert_eq!(
+        refused.next().unwrap().unwrap_err(),
+        TransactionAdmissionFailure::Capacity
+    );
+    assert!(
+        refused.next().is_none(),
+        "a failed iterator ends after its explicit error"
+    );
+    drop(refused);
+    timeout(deadline, read.clone().oneshot(ReadRequest::Tip))
+        .await
+        .unwrap()
+        .unwrap();
+    use crate::service::finalized_state::disk_format::upgrade::{
+        cancel_channel, DbFormatChange, FormatChangeError,
+    };
+    let (_cancel, cancel_receiver) = cancel_channel();
+    let error = DbFormatChange::check_new_blocks(&read.db)
+        .run_format_change_or_check(&read.db, None, &cancel_receiver)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        FormatChangeError::TransactionAdmission(TransactionAdmissionFailure::Capacity)
+    ));
+    use crate::service::read::historical_tree::{
+        replay_with_subtrees, DerivedFrontiers, HistoricalTreeDerivationError,
+    };
+    let replay = || {
+        replay_with_subtrees(&read.db, Height(0), 0, DerivedFrontiers::empty(), |_, _| {
+            panic!("genesis has no shielded commitments")
+        })
+    };
+    assert!(matches!(
+        replay(),
+        Err(HistoricalTreeDerivationError::TransactionAdmission(
+            TransactionAdmissionFailure::Capacity
+        ))
+    ));
+    drop(retained);
+    assert_eq!(probe.holders(), 0);
+    assert_eq!(probe.serialized_bytes(), None);
+    assert_eq!(pool.available_slots(), 1);
+    DbFormatChange::check_new_blocks(&read.db)
+        .run_format_change_or_check(&read.db, None, &cancel_receiver)
+        .unwrap();
+    let replayed = replay().expect("historical replay progresses with one transaction slot");
+    assert_eq!(
+        replayed.sapling.root(),
+        DerivedFrontiers::empty().sapling.root()
+    );
+    assert_eq!(pool.available_slots(), 1);
+    assert!(read
+        .db
+        .transaction(zakura_chain::transaction::Hash([0xff; 32]))
+        .unwrap()
+        .is_none());
+    assert_eq!(pool.available_slots(), 1);
+
+    let mut transactions = read.db.transactions_by_height(Height(0));
+    let (location, transaction) = transactions.next().unwrap().unwrap();
+    assert_eq!(location.height, Height(0));
+    assert_eq!(transaction.hash(), hash);
+    assert_eq!(
+        read.db.transaction(hash).unwrap_err(),
+        TransactionAdmissionFailure::Capacity
+    );
+    let TransactionHandle::Standalone(owner) = &transaction else {
+        panic!("decoded iterators return admitted owners")
+    };
+    let probe = TransactionProbe::new(owner);
+    drop(transactions);
+    drop(state);
+    drop(read);
+    assert_eq!(probe.holders(), 1);
+    assert_eq!(pool.available_slots(), 0);
+    assert_eq!(transaction.hash(), hash);
+    drop(transaction);
+    assert_eq!(probe.holders(), 0);
+    assert_eq!(pool.available_slots(), 1);
+}
+
+/// Index migration reads progress when four workers share one decode slot.
+#[test]
+fn transaction_index_migrations_progress_with_one_decode_slot() {
+    use crate::service::finalized_state::disk_db::WriteDisk;
+    use crate::service::finalized_state::disk_format::upgrade;
+    use std::num::NonZeroU16;
+
+    let _guard = zakura_test::init();
+    let config = Config {
+        read_transaction_limit: NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let db = ZakuraDb::new(
+        &config,
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+    .unwrap();
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let mut batch = DiskWriteBatch::new();
+    let transactions = db.db.cf_handle("tx_by_loc").unwrap();
+    // These rows exercise migration reads; they are not a complete chain fixture.
+    for height in 0..32 {
+        batch.zs_insert(
+            &transactions,
+            crate::TransactionLocation::from_index(Height(height), 1),
+            block.transactions[0].clone(),
+        );
+    }
+    db.write_batch(batch).unwrap();
+    let (_, transaction) = db
+        .transactions_by_height(Height(0))
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(transaction.hash(), block.transactions[0].hash());
+    drop(transaction);
+    let (_cancel, receiver) = upgrade::cancel_channel();
+    let workers = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    workers.install(|| {
+        #[cfg(feature = "indexer")]
+        upgrade::track_tx_locs_by_spends::run(Height(31), &db, &receiver).unwrap();
+        #[cfg(not(feature = "indexer"))]
+        upgrade::drop_tx_locs_by_spends::run(Height(31), &db, &receiver).unwrap();
+    });
+    assert_eq!(db.read_transactions.available_slots(), 1);
+}
+
 /// Storage round-trip test for block and transaction data in the finalized state database.
 #[test]
 fn test_block_db_round_trip() {

@@ -285,6 +285,10 @@ impl CancelReceiver {
 /// An error that prevents the coordinator from updating the database format version.
 #[derive(Debug, Error)]
 pub enum FormatChangeError {
+    /// A standalone disk transaction could not acquire decode admission.
+    #[error("disk transaction admission failed: {0}")]
+    TransactionAdmission(#[from] zakura_node_services::block_memory::TransactionAdmissionFailure),
+
     /// Disk block decoding or retention exhausted its admission pool.
     #[error("disk block admission failed: {0}")]
     BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
@@ -306,6 +310,19 @@ pub enum FormatChangeError {
 impl From<CancelFormatChange> for FormatChangeError {
     fn from(_: CancelFormatChange) -> Self {
         Self::Cancelled
+    }
+}
+
+impl FormatChangeError {
+    /// Read pressure prevents observation; it does not establish a format defect.
+    pub(crate) fn is_read_capacity_exhausted(&self) -> bool {
+        matches!(
+            self,
+            Self::BlockAdmission(zakura_node_services::block_memory::AdmissionFailure::Capacity)
+                | Self::TransactionAdmission(
+                    zakura_node_services::block_memory::TransactionAdmissionFailure::Capacity
+                )
+        )
     }
 }
 
@@ -525,11 +542,20 @@ impl DbFormatChange {
                 return Err(FormatChangeError::Cancelled);
             }
 
-            Self::check_new_blocks(&db).run_format_change_or_check(
+            let result = Self::check_new_blocks(&db).run_format_change_or_check(
                 &db,
                 initial_finalized_tip_height,
                 &cancel_receiver,
-            )?;
+            );
+            match result {
+                Err(error) if error.is_read_capacity_exhausted() => {
+                    warn!(
+                        ?error,
+                        "database format check incomplete; retrying at the next interval"
+                    );
+                }
+                result => result?,
+            }
         }
     }
 

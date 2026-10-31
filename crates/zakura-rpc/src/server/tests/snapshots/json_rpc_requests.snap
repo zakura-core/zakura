@@ -955,9 +955,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 78
+content-length: 65
 
-[{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}]
+[{"id":1,"result":{"standard_fee":400,"version":0},"error":null}]
 
 === batch of a number
 POST content-type=Some("application/json")

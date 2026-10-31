@@ -88,3 +88,114 @@ async fn oversized_request_body_is_rejected() {
 
     assert!(result.is_err(), "oversized request body should be rejected");
 }
+
+/// A mock JSON-RPC server that, like jsonrpsee, answers each batch member and
+/// rejects members that are not JSON-RPC 2.0.
+#[derive(Clone)]
+struct BatchEchoService;
+
+impl Service<HttpRequest> for BatchEchoService {
+    type Response = HttpResponse;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            use http_body_util::BodyExt;
+
+            let bytes = request.into_body().collect().await?.to_bytes();
+            let batch: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+            let responses: Vec<_> = batch
+                .iter()
+                .map(|member| {
+                    if member["jsonrpc"] == "2.0" {
+                        serde_json::json!({"jsonrpc": "2.0", "id": member["id"], "result": member["method"]})
+                    } else {
+                        serde_json::json!({"jsonrpc": "2.0", "id": member["id"], "error": {"code": -32600, "message": "Invalid request"}})
+                    }
+                })
+                .collect();
+            Ok(HttpResponse::new(HttpBody::from(serde_json::to_vec(
+                &responses,
+            )?)))
+        })
+    }
+}
+
+/// Sends `body` through the middleware to [`BatchEchoService`], and returns the response.
+async fn batch_round_trip(body: serde_json::Value) -> serde_json::Value {
+    use http_body_util::BodyExt;
+
+    let request = HttpRequest::builder()
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(HttpBody::from(
+            serde_json::to_vec(&body).expect("valid JSON"),
+        ))
+        .expect("valid request");
+    let response = HttpRequestMiddleware::new(BatchEchoService, None, 2_097_152)
+        .call(request)
+        .await
+        .expect("the mock server responds");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the mock body is complete")
+        .to_bytes();
+    serde_json::from_slice(&bytes).expect("the response is JSON")
+}
+
+/// A JSON-RPC 1.0 batch, like s-nomp's startup checks, is answered in JSON-RPC 1.0.
+#[tokio::test]
+async fn json_rpc_1_batch_is_converted_both_ways() {
+    let response = batch_round_trip(serde_json::json!([
+        {"jsonrpc": "1.0", "method": "getinfo", "params": [], "id": 1},
+        {"jsonrpc": "1.0", "method": "getmininginfo", "params": [], "id": 2},
+    ]))
+    .await;
+
+    assert_eq!(
+        response,
+        serde_json::json!([
+            {"jsonrpc": "1.0", "id": 1, "result": "getinfo", "error": null},
+            {"jsonrpc": "1.0", "id": 2, "result": "getmininginfo", "error": null},
+        ])
+    );
+}
+
+/// A versionless batch is answered without a `jsonrpc` field.
+#[tokio::test]
+async fn versionless_batch_is_converted_both_ways() {
+    let response = batch_round_trip(serde_json::json!([
+        {"method": "getblockcount", "params": [], "id": "a"},
+    ]))
+    .await;
+
+    assert_eq!(
+        response,
+        serde_json::json!([{"id": "a", "result": "getblockcount", "error": null}])
+    );
+}
+
+/// A batch mixing formats is passed to the server unchanged.
+#[tokio::test]
+async fn mixed_batch_is_unchanged() {
+    let response = batch_round_trip(serde_json::json!([
+        {"jsonrpc": "2.0", "method": "getblockcount", "params": [], "id": 1},
+        {"jsonrpc": "1.0", "method": "getinfo", "params": [], "id": 2},
+    ]))
+    .await;
+
+    assert_eq!(
+        response,
+        serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "result": "getblockcount"},
+            {"jsonrpc": "2.0", "id": 2, "error": {"code": -32600, "message": "Invalid request"}},
+        ])
+    );
+}

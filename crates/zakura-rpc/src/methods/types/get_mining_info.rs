@@ -5,12 +5,12 @@ use getset::{CopyGetters, Getters};
 use zakura_chain::parameters::Network;
 
 /// Response to a `getmininginfo` RPC request.
+#[allow(clippy::too_many_arguments)]
 #[derive(
     Debug,
     Default,
     Clone,
     PartialEq,
-    Eq,
     serde::Serialize,
     serde::Deserialize,
     Getters,
@@ -32,6 +32,10 @@ pub struct GetMiningInfoResponse {
     #[serde(rename = "currentblocktx", skip_serializing_if = "Option::is_none")]
     #[getset(get_copy = "pub")]
     current_block_tx: Option<usize>,
+
+    /// The current network difficulty, as a multiple of the minimum difficulty.
+    #[getset(get_copy = "pub")]
+    difficulty: f64,
 
     /// The estimated network solution rate in Sol/s.
     #[getset(get_copy = "pub")]
@@ -57,12 +61,14 @@ impl GetMiningInfoResponse {
         current_block_size: Option<usize>,
         current_block_tx: Option<usize>,
         network: Network,
+        difficulty: f64,
         networksolps: u64,
     ) -> Self {
         Self {
             tip_height,
             current_block_size,
             current_block_tx,
+            difficulty,
             networksolps,
             networkhashps: networksolps,
             chain: network.bip70_network_name(),

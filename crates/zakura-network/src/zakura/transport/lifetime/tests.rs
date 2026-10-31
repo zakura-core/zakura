@@ -186,7 +186,11 @@ fn only_a_one_frame_result_uses_the_floor() {
         .admit_result(1, 10)
         .now_or_never()
         .expect("the floor funds one frame");
-    assert_eq!(connection.granted(), 10, "the floor charges no shared bytes");
+    assert_eq!(
+        connection.granted(),
+        10,
+        "the floor charges no shared bytes"
+    );
     drop((floor, saturating));
     let shared = gate
         .admit_result(2, 10)
@@ -214,10 +218,7 @@ fn compat_exchanges_use_their_own_partition() {
     assert_eq!(partition.granted(), capacity);
     assert_eq!(node.owners().counts().installed, 1);
 
-    assert!(connection
-        .admit_compat_response(1)
-        .now_or_never()
-        .is_none());
+    assert!(connection.admit_compat_response(1).now_or_never().is_none());
     assert_eq!(partition.granted(), capacity, "the waiter took nothing");
 
     drop(held);

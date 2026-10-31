@@ -58,8 +58,9 @@ use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
-    CompatResponseGrant, ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources, OrderedStreamFailure,
-    OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout, StreamResources,
+    CompatResponseGrant, ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources,
+    OrderedStreamFailure, OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout,
+    StreamResources,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -243,7 +244,8 @@ const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 /// (`legacy_gossip::LEGACY_RESPONSE_MAX_AGGREGATE_BYTES`), so an honest peer
 /// never sends more than this; clamping the requester budget to the same
 /// operational aggregate is the symmetric requester-side mirror.
-const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize = super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
+const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
+    super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -1428,6 +1430,26 @@ pub enum ZakuraOutboundFrame {
 }
 
 impl ZakuraSupervisorHandle {
+    /// Register `handle` as a connected legacy-gossip peer.
+    #[cfg(test)]
+    pub(crate) async fn register_handle_for_tests(&self, handle: ZakuraPeerHandle) {
+        let registration = self
+            .register(
+                1,
+                handle.peer_id().clone(),
+                Some("192.0.2.6".parse().expect("test IP parses")),
+                [6; TRANSCRIPT_HASH_BYTES],
+                handle,
+                CancellationToken::new(),
+                super::ZAKURA_CAP_LEGACY_GOSSIP,
+            )
+            .await;
+        assert!(matches!(
+            registration,
+            ZakuraRegistration::Registered { .. }
+        ));
+    }
+
     /// Create an empty supervisor.
     pub fn new(max_connections_per_ip: usize) -> Self {
         Self::new_inner(max_connections_per_ip, None)
@@ -6045,10 +6067,9 @@ impl LegacyResponseBudget {
     /// plus the validator's and the decoder's reassembly copies of one object.
     fn retained_bytes(&self) -> u64 {
         let copies = match self.kind {
-            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => self
-                .max_bytes
-                .min(self.max_message_bytes)
-                .saturating_mul(2),
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                self.max_bytes.min(self.max_message_bytes).saturating_mul(2)
+            }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
             | LegacyResponseKind::TransactionIds

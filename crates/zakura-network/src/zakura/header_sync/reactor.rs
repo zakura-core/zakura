@@ -4221,6 +4221,8 @@ impl HeaderSyncReactor {
             Err(error) => {
                 tracing::debug!(?error, "header-sync action queue unavailable");
                 if let Some(call) = call {
+                    #[cfg(not(any(test, zakura_sim)))]
+                    let _ = call;
                     observe!(
                         self,
                         ReactorEvent::StorageRefused {

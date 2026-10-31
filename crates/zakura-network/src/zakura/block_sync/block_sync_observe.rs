@@ -208,6 +208,9 @@ pub enum BlockEvent {
 /// One step of a request's frame write.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RequestStep {
+    /// Admission moved the exact charge for the request's retained run from the
+    /// budget into unpublished funding.
+    Funded,
     /// The request reserved its heights and queued its frame.
     Published,
     /// Transport started writing the frame.

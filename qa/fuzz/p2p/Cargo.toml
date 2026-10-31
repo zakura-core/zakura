@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "block_fill"
+path = "fuzz_targets/block_fill.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_query"
 path = "fuzz_targets/block_query.rs"
 test = false
@@ -79,6 +86,13 @@ bench = false
 [[bin]]
 name = "block_reactor"
 path = "fuzz_targets/block_reactor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_request_lifecycle"
+path = "fuzz_targets/block_request_lifecycle.rs"
 test = false
 doc = false
 bench = false

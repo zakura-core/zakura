@@ -10,12 +10,6 @@ use crate::zakura::{
 };
 use std::{num::NonZeroU64, time::Duration};
 
-impl RequestWriteStatus {
-    pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)), None)
-    }
-}
-
 thread_local! {
     static BEFORE_RESET_HEIGHT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
@@ -998,7 +992,7 @@ fn each_write_outcome_reports_its_steps() {
     drop(claim);
     assert_eq!(
         log.take(),
-        [Published, Started, Written, Dropped(Phase::Written)]
+        [Funded, Published, Started, Written, Dropped(Phase::Written)]
     );
 
     // The queue lost its receiver during publication.
@@ -1023,7 +1017,13 @@ fn each_write_outcome_reports_its_steps() {
     drop(claim);
     assert_eq!(
         log.take(),
-        [Published, DeliveryFailed, Expired, Dropped(Phase::Skipped)]
+        [
+            Funded,
+            Published,
+            DeliveryFailed,
+            Expired,
+            Dropped(Phase::Skipped)
+        ]
     );
 
     // A queued request expires, so transport skips it.
@@ -1033,7 +1033,10 @@ fn each_write_outcome_reports_its_steps() {
     f.expire(claim.owner());
     assert!(!claim.try_start());
     drop(claim);
-    assert_eq!(log.take(), [Published, Expired, Dropped(Phase::Skipped)]);
+    assert_eq!(
+        log.take(),
+        [Funded, Published, Expired, Dropped(Phase::Skipped)]
+    );
 
     // A routine expires a queued request through the status it kept, as its
     // timeout and retirement paths do.
@@ -1044,7 +1047,10 @@ fn each_write_outcome_reports_its_steps() {
     assert!(status.expire_unwritten());
     assert!(!status.expire_unwritten(), "only the transition reports");
     drop(claim);
-    assert_eq!(log.take(), [Published, Expired, Dropped(Phase::Skipped)]);
+    assert_eq!(
+        log.take(),
+        [Funded, Published, Expired, Dropped(Phase::Skipped)]
+    );
 
     // A reset retires a queued request and a started one. Only the queued
     // request expires.
@@ -1058,9 +1064,9 @@ fn each_write_outcome_reports_its_steps() {
         f.reset();
         drop(claim);
         let expected: &[RequestStep] = if started {
-            &[Published, Started, Reset, Dropped(Phase::Started)]
+            &[Funded, Published, Started, Reset, Dropped(Phase::Started)]
         } else {
-            &[Published, Reset, Expired, Dropped(Phase::Skipped)]
+            &[Funded, Published, Reset, Expired, Dropped(Phase::Skipped)]
         };
         assert_eq!(log.take(), expected);
     }
@@ -1068,7 +1074,7 @@ fn each_write_outcome_reports_its_steps() {
     // A take that never publishes drops unpublished.
     let (mut f, log) = Fixture::observed();
     drop(f.take(1));
-    assert_eq!(log.take(), [Dropped(Phase::Unpublished)]);
+    assert_eq!(log.take(), [Funded, Dropped(Phase::Unpublished)]);
 }
 
 #[test]

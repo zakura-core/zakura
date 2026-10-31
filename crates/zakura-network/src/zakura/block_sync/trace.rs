@@ -34,6 +34,10 @@ pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_priority: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub range_start: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range_count: Option<u64>,
@@ -679,6 +683,20 @@ fn block_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
 
 pub(super) fn peer(peer: &ZakuraPeerId) -> String {
     peer_label(peer)
+}
+
+/// One request's exact work identity: its header and verified generations, its
+/// branch, its session, and its request ID.
+pub(super) fn request_owner(owner: &zakura_header_chain::BodyWorkOwner) -> String {
+    format!(
+        "{}/{}/{}/{}/{}/{}",
+        owner.header_generation.get(),
+        owner.verified_generation.get(),
+        owner.branch.anchor_hash,
+        owner.branch.target_tip_hash,
+        owner.session_id,
+        owner.request_id,
+    )
 }
 
 pub(super) fn height(height: block::Height) -> u64 {

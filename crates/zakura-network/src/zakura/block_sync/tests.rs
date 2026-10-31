@@ -1258,7 +1258,6 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1283,7 +1282,6 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -7374,7 +7372,6 @@ fn outstanding_three_block_range() -> OutstandingBlockRange {
     };
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request,
         queued_at: now,
         deadline: now,
@@ -7800,7 +7797,6 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let funding = budget.reserve_owned(request.estimated_bytes).unwrap();
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request,
         queued_at: now,
         deadline: now,

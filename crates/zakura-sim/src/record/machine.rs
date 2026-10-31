@@ -28,6 +28,8 @@ pub enum MachineStep {
     DiscoveryBook(BookStep),
     /// Discovery's real session and hint owner and its independent model.
     DiscoveryState(DiscoverySessionStep),
+    /// Header publisher credit and terminal policy, with its independent model.
+    HeaderPublisher(HeaderPublisherStep),
 }
 
 impl MachineStep {
@@ -41,6 +43,7 @@ impl MachineStep {
             Self::Reactor(step) => step.failure.clone(),
             Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
             Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
+            Self::HeaderPublisher(step) => step.failure.clone(),
         }
     }
 }
@@ -257,6 +260,60 @@ pub struct HeaderReactorStep {
     pub actual: HeaderReactorView,
     /// State derived independently by the model.
     pub expected: HeaderReactorView,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
+}
+
+/// One subscription in a publisher state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublisherSubscriptionView {
+    /// The subscription's ID.
+    pub id: u64,
+    /// Credit granted so far: headers and bytes.
+    pub granted: (u64, u64),
+    /// Credit consumed so far: headers and bytes.
+    pub consumed: (u64, u64),
+    /// Sent pages the subscriber has not acknowledged.
+    pub unacknowledged: usize,
+    /// The height of the cursor the next page follows.
+    pub last_height: u32,
+    /// The hash of the cursor the next page follows, in hex.
+    pub last_hash: String,
+    /// Whether the subscriber sent `Close`.
+    pub closing: bool,
+}
+
+/// A publisher state view, read from the owner or derived by its model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPublisherView {
+    /// Live and closing subscriptions, by ID.
+    pub subscriptions: Vec<PublisherSubscriptionView>,
+    /// Tombstones held.
+    pub tombstones: usize,
+    /// The subscription of the job in progress.
+    pub job: Option<u64>,
+    /// Subscriptions whose terminal outcome waits to be written, in order.
+    pub terminals: Vec<u64>,
+    /// Whether a terminal outcome is being written.
+    pub writing: bool,
+    /// Subscription slots held.
+    pub slots: usize,
+    /// Why the publisher stopped, if it did.
+    pub exit: Option<String>,
+}
+
+/// One decoder-v1 header publisher operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPublisherStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the production owner.
+    pub actual: HeaderPublisherView,
+    /// State derived independently by the model.
+    pub expected: HeaderPublisherView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -755,6 +812,43 @@ impl From<zakura_network::zakura::BlockReactorStep> for ReactorStep {
         Self {
             input: value.input,
             actions: value.actions.into_iter().map(Into::into).collect(),
+            actual: value.actual.into(),
+            expected: value.expected.into(),
+            failure: value.failure.map(Into::into),
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderPublisherView> for HeaderPublisherView {
+    fn from(value: zakura_network::zakura::HeaderPublisherView) -> Self {
+        Self {
+            subscriptions: value
+                .subscriptions
+                .into_iter()
+                .map(|subscription| PublisherSubscriptionView {
+                    id: subscription.id,
+                    granted: subscription.granted,
+                    consumed: subscription.consumed,
+                    unacknowledged: subscription.unacknowledged,
+                    last_height: subscription.last_height,
+                    last_hash: subscription.last_hash.to_string(),
+                    closing: subscription.closing,
+                })
+                .collect(),
+            tombstones: value.tombstones,
+            job: value.job,
+            terminals: value.terminals,
+            writing: value.writing,
+            slots: value.slots,
+            exit: value.exit.map(str::to_owned),
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderPublisherStep> for HeaderPublisherStep {
+    fn from(value: zakura_network::zakura::HeaderPublisherStep) -> Self {
+        Self {
+            input: value.input,
             actual: value.actual.into(),
             expected: value.expected.into(),
             failure: value.failure.map(Into::into),

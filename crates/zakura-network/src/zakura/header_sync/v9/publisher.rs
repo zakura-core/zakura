@@ -32,7 +32,8 @@
 //! [`PublisherState`] holds the subscription policy, which runs without a
 //! runtime and holds only values. This module holds the resources: the lock,
 //! the task, subscription slots, capacity signals, serving permits,
-//! retained-path leases, storage calls, and output slots.
+//! retained-path leases, storage calls, and output slots. It also reports what
+//! state returns as metrics, logs, and transition events.
 //!
 //! # Resource lifetimes
 //!
@@ -78,8 +79,8 @@ use crate::zakura::{
         wire::{AuxSchema, HeaderEntry},
     },
     regulation::{
-        Applied, ExecutionSlots, PublicationSlots, Push, PushPermit, PushSend, SlotId,
-        SubscriptionFault, SubscriptionLimits, TerminalPermit,
+        Applied, ExecutionSlots, PublicationReporter, PublicationSlots, Push, PushPermit, PushSend,
+        SlotId, SubscriptionFault, SubscriptionLimits, TerminalPermit,
     },
     transport::sim_chain,
     wire_codec::encode_frame,
@@ -91,7 +92,11 @@ mod model;
 mod state;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use model::{replay_header_publisher_bytes, HeaderPublisherReplaySummary};
+pub use model::{
+    replay_header_publisher_bytes, trace_header_publisher_bytes, HeaderPublisherHistory,
+    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
+    HeaderPublisherView,
+};
 pub(crate) use state::is_legal;
 use state::{
     recheck, CapacityWait, Exit, Job, JobKey, Output, Page, PublisherState, Recheck, Stall,
@@ -157,6 +162,7 @@ struct PublisherOwner {
     state: PublisherState,
     slots: PublicationSlots,
     waits: CapacityWaits,
+    reporter: PublicationReporter<u64>,
 }
 
 impl PublisherOwner {
@@ -168,25 +174,62 @@ impl PublisherOwner {
             state,
             slots: PublicationSlots::new(&limits),
             waits: CapacityWaits::default(),
+            reporter: PublicationReporter::new(limits),
         }
     }
 
-    /// Apply `update`. An `Open` reserves its slot first, and a refused `Open`
-    /// frees it.
+    /// This owner, reporting its subscription transitions through `tap` if
+    /// there is one.
+    #[cfg(any(test, zakura_sim))]
+    fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<u64>>) -> Self {
+        self.reporter = self.reporter.observed_by(tap);
+        self
+    }
+
+    /// Apply `update` and report the result. An `Open` reserves its slot
+    /// first, and a refused `Open` frees it.
     fn apply(
         &mut self,
         update: &SubscribeHeaders,
         limits: PageLimits,
     ) -> Result<Applied, PublisherFault> {
-        if update.operation != Operation::Open {
-            return self.state.update(update);
-        }
-        let offer = self.slots.offer();
-        let opened = self.state.open(update, limits, offer);
-        if opened.is_err() {
-            self.slots.refused(offer);
-        }
-        opened.map(|()| Applied::Live)
+        let id = update.subscription_id;
+        let applied = match update.operation {
+            Operation::Open => {
+                let offer = self.slots.offer();
+                let opened = self.state.open(update, limits, offer);
+                if opened.is_err() {
+                    self.slots.refused(offer);
+                }
+                opened.map(|opened| {
+                    self.reporter.opened(&id, update.added_credit, opened);
+                    Applied::Live
+                })
+            }
+            Operation::Close => self.state.update(update).inspect(|applied| {
+                self.reporter.closed(&id, *applied);
+            }),
+            Operation::Grant => self.state.update(update).inspect(|applied| {
+                self.reporter.granted(&id, update.added_credit, *applied);
+            }),
+        };
+        applied.map_err(|fault| match fault {
+            PublisherFault::Subscription(fault) => self.reporter.refused(fault).into(),
+            fault => fault,
+        })
+    }
+
+    /// End every subscription state says is due, report each end, and return
+    /// the outcomes in order.
+    fn end_due(&mut self) -> Vec<HeadersOutcomeCode> {
+        self.state
+            .end_due()
+            .into_iter()
+            .map(|(id, outcome)| {
+                self.reporter.ended(&id);
+                outcome
+            })
+            .collect()
     }
 
     /// Take the next terminal outcome state lets the task write, and bind it
@@ -335,9 +378,9 @@ impl Publisher {
         cancel: CancellationToken,
         #[cfg(any(test, zakura_sim))] tap: Option<crate::zakura::RegulationTap<u64>>,
     ) -> (Self, JoinHandle<()>) {
-        let shared = Arc::new(Mutex::new(PublisherOwner::new(sim_chain!(
-            PublisherState::new() => observed_by(tap)
-        ))));
+        let shared = Arc::new(Mutex::new(sim_chain!(
+            PublisherOwner::new(PublisherState::new()) => observed_by(tap)
+        )));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
         let (panics, panicked) = mpsc::channel(1);
@@ -457,7 +500,7 @@ async fn publish<const HEADER_BYTES: usize>(
     // The page in progress, under the key state recorded for its job.
     let mut work: Option<(JobKey, Work<'_>)> = None;
     loop {
-        for outcome in lock(&task.shared).state.end_due() {
+        for outcome in lock(&task.shared).end_due() {
             metrics::counter!(
                 "sync.header.v9.publisher.outcome",
                 "outcome" => outcome_label(outcome),

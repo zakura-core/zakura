@@ -21,6 +21,7 @@ block_work_funding = "block/work-funding"
 block_decoded_retention = "block/decoded-retention"
 header_reactor_policy = "header/reactor-policy"
 block_reactor_policy = "block/reactor-policy"
+header_publisher_policy = "header/publisher-policy"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -99,6 +100,13 @@ bench = false
 [[bin]]
 name = "block_decoded_retention"
 path = "fuzz_targets/block_decoded_retention.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_publisher_policy"
+path = "fuzz_targets/header_publisher_policy.rs"
 test = false
 doc = false
 bench = false

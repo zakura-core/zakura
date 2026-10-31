@@ -21,7 +21,9 @@
 //! - the owner holds exactly one slot per live subscription and unwritten
 //!   terminal outcome, and one capacity signal per distinct stalled wait.
 //!
-//! [`replay_header_publisher_bytes`] drives the same model from fuzz bytes.
+//! [`replay_header_publisher_bytes`] drives the same model from fuzz bytes, and
+//! [`trace_header_publisher_bytes`] records each operation's state read from
+//! the owner beside the state the model derived.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -37,6 +39,7 @@ use super::*;
 use crate::zakura::{
     header_sync::{
         config::REGTEST_HEADER_BYTES,
+        reactor::{HeaderMachineFailure, HeaderMachinePhase},
         v9::{Cursor, Operation, RegtestMessage, MAX_HS_SUBSCRIPTIONS},
     },
     regulation::Totals,
@@ -387,6 +390,95 @@ impl Machine {
         }
         self.step(step);
         self.check_owner();
+    }
+
+    /// The owner's credit totals match the model's until the publisher stops.
+    fn check_ledger(&self) {
+        if self.model.exit.is_some() {
+            return;
+        }
+        let expected: Vec<_> = self
+            .model
+            .subs
+            .iter()
+            .map(|(id, sub)| {
+                (
+                    *id,
+                    Totals {
+                        objects: sub.granted.objects,
+                        bytes: sub.granted.bytes,
+                    },
+                    Totals {
+                        objects: sub.consumed.objects,
+                        bytes: sub.consumed.bytes,
+                    },
+                    Some(sub.sent.len()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observe(&self.owner.state),
+            expected,
+            "{PROPERTY}: credit ledger"
+        );
+    }
+
+    /// The state read from the production owner.
+    fn actual_view(&self) -> HeaderPublisherView {
+        let state = &self.owner.state;
+        let activity = state.activity();
+        HeaderPublisherView {
+            subscriptions: (1..=IDS)
+                .filter_map(|id| {
+                    let credit = state.publications.credit(&id)?;
+                    let last = state.publications.last_sent(&id)?;
+                    Some(HeaderPublisherSubscriptionView {
+                        id,
+                        granted: (credit.granted().objects, credit.granted().bytes),
+                        consumed: (credit.consumed().objects, credit.consumed().bytes),
+                        unacknowledged: state.publications.unacknowledged(&id)?,
+                        last_height: last.height.0,
+                        last_hash: last.hash,
+                        closing: state.publications.is_closing(&id),
+                    })
+                })
+                .collect(),
+            tombstones: state.publications.tombstones(),
+            job: activity.job,
+            terminals: activity.terminals,
+            writing: activity.writing,
+            slots: self.owner.slots.held(),
+            exit: activity.exit.map(exit_name),
+        }
+    }
+
+    /// The state the model derived.
+    fn expected_view(&self) -> HeaderPublisherView {
+        let model = &self.model;
+        HeaderPublisherView {
+            subscriptions: model
+                .subs
+                .iter()
+                .map(|(id, sub)| {
+                    let last = sub.sent.back().unwrap_or(&sub.acknowledged);
+                    HeaderPublisherSubscriptionView {
+                        id: *id,
+                        granted: (sub.granted.objects, sub.granted.bytes),
+                        consumed: (sub.consumed.objects, sub.consumed.bytes),
+                        unacknowledged: sub.sent.len(),
+                        last_height: last.height.0,
+                        last_hash: last.hash,
+                        closing: sub.closing,
+                    }
+                })
+                .collect(),
+            tombstones: model.tombstones.len(),
+            job: model.in_progress.as_ref().map(|record| record.job.id),
+            terminals: model.queued.iter().map(|terminal| terminal.id).collect(),
+            writing: model.writing.is_some(),
+            slots: model.subs.len() + model.held_terminals(),
+            exit: model.exit.map(exit_name),
+        }
     }
 
     /// The owner holds a resource only for what the model says is live.
@@ -927,7 +1019,7 @@ impl Machine {
     }
 
     fn end_due(&mut self) {
-        let ended = self.owner.state.end_due();
+        let ended = self.owner.end_due();
         let model = &mut self.model;
         let expected: Vec<(u64, HeadersOutcomeCode)> = model
             .subs
@@ -1090,6 +1182,112 @@ pub struct HeaderPublisherReplaySummary {
     pub terminals: usize,
 }
 
+/// One subscription in a [`HeaderPublisherView`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderPublisherSubscriptionView {
+    /// The subscription's ID.
+    pub id: u64,
+    /// Credit granted so far: headers and bytes.
+    pub granted: (u64, u64),
+    /// Credit consumed so far: headers and bytes.
+    pub consumed: (u64, u64),
+    /// Sent pages the subscriber has not acknowledged.
+    pub unacknowledged: usize,
+    /// The height of the cursor the next page follows.
+    pub last_height: u32,
+    /// The hash of the cursor the next page follows.
+    pub last_hash: block::Hash,
+    /// Whether the subscriber sent `Close`.
+    pub closing: bool,
+}
+
+/// A publisher state view, read from the owner or derived by the model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderPublisherView {
+    /// Live and closing subscriptions, by ID.
+    pub subscriptions: Vec<HeaderPublisherSubscriptionView>,
+    /// Tombstones held.
+    pub tombstones: usize,
+    /// The subscription of the job in progress.
+    pub job: Option<u64>,
+    /// Subscriptions whose terminal outcome waits to be written, in order.
+    pub terminals: Vec<u64>,
+    /// Whether a terminal outcome is being written.
+    pub writing: bool,
+    /// Subscription slots held.
+    pub slots: usize,
+    /// Why the publisher stopped, if it did.
+    pub exit: Option<&'static str>,
+}
+
+/// One decoder-v1 publisher operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderPublisherStep {
+    /// The operation's number, from one.
+    pub step: usize,
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the production owner.
+    pub actual: HeaderPublisherView,
+    /// State derived independently by the model.
+    pub expected: HeaderPublisherView,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<HeaderMachineFailure>,
+}
+
+/// A decoder-v1 publisher history. It stops at the first failure or when the
+/// publisher stops.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HeaderPublisherHistory {
+    /// Every applied operation, at most 128.
+    pub steps: Vec<HeaderPublisherStep>,
+}
+
+/// A stable name for `exit`.
+fn exit_name(exit: Exit) -> &'static str {
+    match exit {
+        Exit::Cancelled => "cancelled",
+        Exit::Closed => "closed",
+    }
+}
+
+/// Capture decoder-v1 operations without changing the decoder or starting a
+/// runtime. Driver panics stop the history and stay distinct from property
+/// failures.
+pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
+    let input = &data[..data.len().min(512)];
+    let mut machine = Machine::new();
+    let mut steps = Vec::new();
+    for (index, step) in decode(input).enumerate() {
+        let number = index + 1;
+        let applied =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.step(&step)))
+                .map_err(|payload| (HeaderMachinePhase::Transition, payload))
+                .and_then(|()| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        machine.check_owner();
+                        machine.check_ledger();
+                    }))
+                    .map_err(|payload| (HeaderMachinePhase::Invariant, payload))
+                });
+        let failure = applied.err().map(|(phase, payload)| {
+            HeaderMachineFailure::of_panic(PROPERTY, phase, payload.as_ref())
+        });
+        let stop = failure.is_some() || machine.model.exit.is_some();
+        steps.push(HeaderPublisherStep {
+            step: number,
+            input: input[index * 4..(number * 4).min(input.len())].to_vec(),
+            actual: machine.actual_view(),
+            expected: machine.expected_view(),
+            failure,
+        });
+        if stop {
+            break;
+        }
+    }
+    HeaderPublisherHistory { steps }
+}
+
 /// Replay decoder-v1 quadruples against the existing publisher model.
 /// Read at most 512 bytes. The model derives page sizes from the wire layout.
 pub fn replay_header_publisher_bytes(data: &[u8]) -> HeaderPublisherReplaySummary {
@@ -1213,32 +1411,7 @@ fn run(
             summary.bytes += after.1.saturating_sub(before.1);
         }
         after_step(&mut machine, &step);
-        if machine.model.exit.is_none() {
-            let expected: Vec<_> = machine
-                .model
-                .subs
-                .iter()
-                .map(|(id, sub)| {
-                    (
-                        *id,
-                        Totals {
-                            objects: sub.granted.objects,
-                            bytes: sub.granted.bytes,
-                        },
-                        Totals {
-                            objects: sub.consumed.objects,
-                            bytes: sub.consumed.bytes,
-                        },
-                        Some(sub.sent.len()),
-                    )
-                })
-                .collect();
-            assert_eq!(
-                observe(&machine.owner.state),
-                expected,
-                "{PROPERTY}: credit ledger"
-            );
-        }
+        machine.check_ledger();
     }
     summary
 }

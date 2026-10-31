@@ -1261,7 +1261,7 @@ async fn a_queued_outcome_wins_over_a_later_close() {
             .state
             .queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
         assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
-        let ended = shared.state.end_due();
+        let ended = shared.end_due();
         assert_eq!(ended, [HeadersOutcomeCode::SubscriptionSuperseded]);
         let terminal = shared.next_terminal::<HB>().expect("one subscription ends");
         assert!(
@@ -1992,10 +1992,7 @@ fn close_wins_over_an_outcome_found_after_it() {
     assert_eq!(owner.apply(&close, limits()), Ok(Applied::Live));
     let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
     owner.state.finish(job.key, found, None);
-    assert_eq!(
-        owner.state.end_due(),
-        [HeadersOutcomeCode::SubscriptionClosed]
-    );
+    assert_eq!(owner.end_due(), [HeadersOutcomeCode::SubscriptionClosed]);
     let OwnedTerminal { frame, .. } = owner.next_terminal::<HB>().expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),

@@ -1,4 +1,5 @@
-//! Transport-free execution of header reactor and work ownership models.
+//! Transport-free execution of the header reactor, work ownership, and
+//! publisher models.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -30,18 +31,21 @@ use crate::{
 #[derive(Clone, Copy)]
 enum Target {
     Reactor,
+    Publisher,
 }
 
 impl Target {
     const fn name(self) -> &'static str {
         match self {
             Self::Reactor => "header/reactor-policy",
+            Self::Publisher => "header/publisher-policy",
         }
     }
 
     const fn identity(self) -> &'static str {
         match self {
             Self::Reactor => "header-reactor",
+            Self::Publisher => "header-publisher",
         }
     }
 
@@ -50,6 +54,10 @@ impl Target {
             Self::Reactor => {
                 "The header reactor's scheduling and locator state agree with the \
                  independent model after every input, with exact storage call identities."
+            }
+            Self::Publisher => {
+                "The header publisher's credit, jobs, terminal outcomes, and slots agree with \
+                 the independent model after every input."
             }
         }
     }
@@ -61,6 +69,11 @@ impl Target {
                 .into_iter()
                 .map(|step| (step.step, MachineStep::HeaderReactor(step.into())))
                 .collect(),
+            Self::Publisher => zakura_network::zakura::trace_header_publisher_bytes(input)
+                .steps
+                .into_iter()
+                .map(|step| (step.step, MachineStep::HeaderPublisher(step.into())))
+                .collect(),
         }
     }
 
@@ -68,6 +81,7 @@ impl Target {
     fn reached(self, step: &MachineStep) -> bool {
         match (self, step) {
             (Self::Reactor, MachineStep::HeaderReactor(work)) => !work.expected.calls.is_empty(),
+            (Self::Publisher, MachineStep::HeaderPublisher(work)) => work.expected.slots > 0,
             _ => false,
         }
     }
@@ -77,6 +91,8 @@ impl Target {
         match step {
             MachineStep::HeaderReactor(work) => (work.actual != work.expected)
                 .then(|| (format!("{:?}", work.expected), format!("{:?}", work.actual))),
+            MachineStep::HeaderPublisher(work) => (work.actual != work.expected)
+                .then(|| (format!("{:?}", work.expected), format!("{:?}", work.actual))),
             other => Some((self.identity().to_owned(), format!("{other:?}"))),
         }
     }
@@ -84,7 +100,7 @@ impl Target {
 
 /// Whether `name` names a machine harness in this module.
 pub fn is_machine(name: &str) -> bool {
-    matches!(name, "header/reactor-policy")
+    matches!(name, "header/reactor-policy" | "header/publisher-policy")
 }
 
 /// Causal input for the selected harness's decoder-v1.
@@ -124,6 +140,7 @@ fn properties(target: Target) -> Vec<Property<Handle>> {
         status: Status::Active,
         check: match target {
             Target::Reactor => |cx| check(Target::Reactor, cx),
+            Target::Publisher => |cx| check(Target::Publisher, cx),
         },
         witness: None,
     }]
@@ -177,7 +194,7 @@ fn config(target: Target, value: &Value) -> Result<RunConfig, HarnessError> {
     let _ = scenario(value)?;
     Ok(RunConfig {
         budget: match target {
-            Target::Reactor => 128,
+            Target::Reactor | Target::Publisher => 128,
         },
         drain_bound: 0,
         ..RunConfig::default()
@@ -438,4 +455,24 @@ pub const REACTOR_ENTRY: HarnessEntry = HarnessEntry {
         witness(Target::Reactor, value, input, property, expect, sink)
     },
     run_bytes: |bytes, sink, extra| run_bytes(Target::Reactor, bytes, sink, extra),
+};
+
+/// Header publisher policy uses the shared registry, recorder, replay verifier
+/// and explorer without starting a runtime.
+pub const PUBLISHER_ENTRY: HarnessEntry = HarnessEntry {
+    name: Target::Publisher.name(),
+    generator: 1,
+    scenario_bytes: 512,
+    pad_scenario: false,
+    composes: &[],
+    planted: false,
+    run: |value, input, sink| run(Target::Publisher, value, input, sink),
+    meta: |value| meta(Target::Publisher, value),
+    config: |value| config(Target::Publisher, value),
+    draw,
+    properties: || registered(Target::Publisher),
+    witness: |value, input, property, expect, sink| {
+        witness(Target::Publisher, value, input, property, expect, sink)
+    },
+    run_bytes: |bytes, sink, extra| run_bytes(Target::Publisher, bytes, sink, extra),
 };

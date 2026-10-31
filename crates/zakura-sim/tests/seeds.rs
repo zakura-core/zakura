@@ -83,6 +83,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-reactor-policy" => value(zakura_sim::harness::header_work::Scenario {
             input: include_bytes!("fixtures/header-reactor-policy.bin").to_vec(),
         }),
+        "header-publisher-policy" => value(zakura_sim::harness::header_work::Scenario {
+            input: include_bytes!("fixtures/header-publisher-policy.bin").to_vec(),
+        }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
         "discovery-verification-capacity" => value(discovery::CapacityScenario::default()),
         "discovery-record-book" => value(zakura_sim::harness::discovery_machine::Scenario {

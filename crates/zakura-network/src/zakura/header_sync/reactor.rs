@@ -3912,7 +3912,7 @@ impl HeaderSyncReactor {
         #[cfg(any(test, zakura_sim))]
         let (tap, dispatched) = self.begin_port_call(&action, call);
         #[cfg(any(test, zakura_sim))]
-        let pending_call = observe::PendingCall::new(tap.clone());
+        let (panic_tap, pending_tap) = (tap.clone(), tap.clone());
         let header_chain = self.startup.header_chain_port.clone();
         let request_timeout = self.startup.request_timeout;
         let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
@@ -4165,20 +4165,16 @@ impl HeaderSyncReactor {
                 #[cfg(any(test, zakura_sim))]
                 let result = observe::rethrow_observer_panic(result);
                 match result {
-                    Ok(completion) => {
-                        #[cfg(any(test, zakura_sim))]
-                        pending_call.finished();
-                        StorageOutcome::Completed {
-                            call,
-                            completion: Box::new(completion),
-                            retained,
-                        }
-                    }
+                    Ok(completion) => StorageOutcome::Completed {
+                        call,
+                        completion: Box::new(completion),
+                        retained,
+                    },
                     Err(_) => {
                         // Report the panic before this closure drops `retained`,
                         // whose last lease release can reach a scheduling point.
                         #[cfg(any(test, zakura_sim))]
-                        pending_call.panicked();
+                        panic_tap.end_after_catch(observe::CallEnd::PortPanicked);
                         end_retained(&mut retained, HeaderWorkEnd::Panicked);
                         drop(retained);
                         StorageOutcome::Panicked(Box::new(panic_context))
@@ -4189,6 +4185,8 @@ impl HeaderSyncReactor {
             self.state.vct_local_operation = Some(operation);
         }
         self.state.calls.accept(call);
+        #[cfg(any(test, zakura_sim))]
+        let operation = observe::PendingCall::new(operation, pending_tap);
         self.pending_port_operations.push(Box::pin(operation));
         StorageDispatch::Started(call)
     }

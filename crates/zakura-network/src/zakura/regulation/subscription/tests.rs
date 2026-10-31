@@ -1502,6 +1502,35 @@ async fn an_unpolled_terminal_send_frees_its_slot() {
     publications.open(3, 0, LIMIT, 0).unwrap();
 }
 
+/// The ledger returns what an `Open` found and leaves reporting to its owner:
+/// the margin's admission is a value it counts and hands back.
+#[test]
+fn the_ledger_returns_an_admission_above_the_limit_as_a_fact() {
+    let row = limits(1);
+    let mut slots = PublicationSlots::new(&row);
+    let mut ledger: PublicationLedger<u8, u32> = PublicationLedger::new(row);
+
+    let first = ledger.open(1, 0, LIMIT, 0, slots.offer()).unwrap();
+    assert_eq!(
+        first,
+        PublicationOpened {
+            held: 0,
+            over_limit: false
+        }
+    );
+    assert_eq!(ledger.over_limit_count(), 0);
+
+    let second = ledger.open(2, 0, LIMIT, 0, slots.offer()).unwrap();
+    assert_eq!(
+        second,
+        PublicationOpened {
+            held: 1,
+            over_limit: true
+        }
+    );
+    assert_eq!(ledger.over_limit_count(), 1);
+}
+
 /// A refused `Open` frees its offered slot, and a slot is held from `Open`
 /// until its terminal permit drops, even when a new subscription reuses the
 /// key while the old terminal outcome is still being written.

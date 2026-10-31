@@ -5,10 +5,11 @@
 //! This module exists only in test and `zakura_sim` builds. Production builds
 //! compile none of it, and the reactor's `observe!` macro drops its tokens.
 
-use std::{any::Any, fmt, panic::AssertUnwindSafe, sync::Arc};
+use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, task};
 
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
+use zakura_rt::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
@@ -282,7 +283,9 @@ pub enum CallEnd {
     NotSubmitted,
     /// The future panicked, and the reactor caught it.
     PortPanicked,
-    /// The reactor dropped the future unfinished, as its teardown does.
+    /// The reactor dropped the future unfinished, as its teardown does. Reported
+    /// right before the drop, so any storage receipt the drop leaves comes after
+    /// it.
     Dropped,
 }
 
@@ -343,6 +346,9 @@ pub(crate) struct PortTap {
     /// The call's number, or 0 for an action that calls no port.
     pub(crate) call: u64,
     observer: Option<Arc<dyn HeaderSyncObserver>>,
+    /// Set once the call's end is reported, through any clone, so a
+    /// [`PendingCall`] dropped after it reports nothing.
+    ended: Arc<AtomicBool>,
 }
 
 impl PortTap {
@@ -351,6 +357,7 @@ impl PortTap {
         Self {
             call,
             observer: slot.0.clone(),
+            ended: Arc::default(),
         }
     }
 
@@ -371,6 +378,7 @@ impl PortTap {
     /// Reports that the call ended with `end`, from outside the port future's
     /// panic catch, where an observer panic already unwinds the reactor.
     pub(crate) fn end_after_catch(&self, end: CallEnd) {
+        self.ended.store(true, Ordering::Relaxed);
         if let Some(observer) = &self.observer {
             observer.observe(ReactorEvent::CallEnded {
                 call: self.call,
@@ -380,39 +388,168 @@ impl PortTap {
     }
 }
 
-/// Reports the end of a port future that drops before it finishes.
+/// A port call's number, from 1, as [`ReactorEvent::Dispatched`] hands it out.
+/// In a simulator build, storage tags each operation a call's poll submits with
+/// it (see [`as_call`]), so each storage receipt pairs with exactly the call that
+/// submitted it.
+pub type CallId = u64;
+
+/// Runs `poll` as call `call`'s poll, so in a simulator build `polling_call` names
+/// `call` inside it, on this task only, as a storage call submitted there reads
+/// it. The task's previous call is restored after, on unwind too.
+pub fn as_call<R>(call: CallId, poll: impl FnOnce() -> R) -> R {
+    #[cfg(zakura_sim)]
+    let _scope = call_scope::CallScope::enter(call);
+    #[cfg(not(zakura_sim))]
+    let _ = call;
+    poll()
+}
+
+/// The call whose poll the current task is running, if any. See [`as_call`].
+#[cfg(zakura_sim)]
+pub fn polling_call() -> Option<CallId> {
+    call_scope::current()
+}
+
+/// Each task's polling call. Keyed by run and task, not just by thread, because a
+/// poll can reach a scheduling point, and the run then switches to another task
+/// on this thread before the poll returns.
+#[cfg(zakura_sim)]
+mod call_scope {
+    use std::cell::RefCell;
+
+    use zakura_rt::sim::{RunId, TaskId};
+
+    use super::CallId;
+
+    std::thread_local! {
+        /// Each task's polling call, with `None` for code outside a run or a task.
+        static CALLS: RefCell<Vec<(Task, CallId)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A run's task.
+    type Task = (Option<RunId>, Option<TaskId>);
+
+    /// The task running now.
+    fn task() -> Task {
+        (
+            zakura_rt::sim::run_id(),
+            zakura_rt::sim::executor().and_then(|executor| executor.current_task()),
+        )
+    }
+
+    /// The current task's polling call.
+    pub(super) fn current() -> Option<CallId> {
+        let task = task();
+        CALLS.with_borrow(|calls| {
+            calls
+                .iter()
+                .find(|(t, _)| *t == task)
+                .map(|(_, call)| *call)
+        })
+    }
+
+    /// One task's call, until dropped.
+    pub(super) struct CallScope {
+        task: Task,
+        previous: Option<CallId>,
+    }
+
+    impl CallScope {
+        /// Makes `call` the current task's polling call.
+        pub(super) fn enter(call: CallId) -> Self {
+            let task = task();
+            let previous =
+                CALLS.with_borrow_mut(|calls| match calls.iter_mut().find(|(t, _)| *t == task) {
+                    Some((_, current)) => Some(std::mem::replace(current, call)),
+                    None => {
+                        calls.push((task, call));
+                        None
+                    }
+                });
+            Self { task, previous }
+        }
+    }
+
+    impl Drop for CallScope {
+        /// Restores the task's previous polling call, or none.
+        fn drop(&mut self) {
+            CALLS.with_borrow_mut(|calls| {
+                let Some(index) = calls.iter().position(|(t, _)| *t == self.task) else {
+                    return;
+                };
+                match self.previous {
+                    Some(previous) => calls[index].1 = previous,
+                    None => {
+                        calls.swap_remove(index);
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// A port call's whole future, guarded so that dropping it unfinished, as the
+/// reactor's teardown does, reports [`CallEnd::Dropped`] through the call's tap.
 ///
-/// The reactor keeps one beside each port future. A panicking thread reports
-/// nothing, as [`HeaderSyncObserver`] says.
-#[derive(Debug)]
-pub(crate) struct PendingCall {
+/// The guard reports first and then drops the future: the storage call, whose
+/// drop may leave a `CallerDropped` or `ReplyDropped` receipt, and everything else
+/// it holds. So for a dropped call alone, the end comes before its receipt. A
+/// panicking thread reports nothing, as [`HeaderSyncObserver`] says.
+pub(crate) struct PendingCall<F> {
+    future: Option<F>,
     tap: PortTap,
+    /// Set once a poll returned or unwound, so the call's own end reports it.
     done: bool,
 }
 
-impl PendingCall {
-    /// A guard on the call `tap` reports for.
-    pub(crate) fn new(tap: PortTap) -> Self {
-        Self { tap, done: false }
-    }
-
-    /// The call's future finished, and reported its own end.
-    pub(crate) fn finished(mut self) {
-        self.done = true;
-    }
-
-    /// The reactor caught the call's future panicking.
-    pub(crate) fn panicked(mut self) {
-        self.done = true;
-        self.tap.end_after_catch(CallEnd::PortPanicked);
+impl<F> PendingCall<F> {
+    /// Guards `future`, the future of the call `tap` reports for.
+    pub(crate) fn new(future: F, tap: PortTap) -> Self {
+        Self {
+            future: Some(future),
+            tap,
+            done: false,
+        }
     }
 }
 
-impl Drop for PendingCall {
+impl<F: Future + Unpin> Future for PendingCall<F> {
+    type Output = F::Output;
+
+    /// Polls the guarded future as its call's (see [`as_call`]).
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<F::Output> {
+        let call = self.tap.call;
+        let future = self
+            .future
+            .as_mut()
+            .expect("a pending call's future lives until its guard drops");
+        let polled = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            as_call(call, || Pin::new(future).poll(cx))
+        }));
+        match polled {
+            Ok(task::Poll::Pending) => task::Poll::Pending,
+            Ok(ready) => {
+                self.done = true;
+                ready
+            }
+            Err(payload) => {
+                self.done = true;
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+}
+
+impl<F> Drop for PendingCall<F> {
+    /// Reports the call dropped unless a poll finished, its end was already
+    /// reported, or the thread is unwinding, then drops the future.
     fn drop(&mut self) {
-        if !self.done && !std::thread::panicking() {
+        let reported = self.done || self.tap.ended.load(Ordering::Relaxed);
+        if !reported && !std::thread::panicking() {
             self.tap.end_after_catch(CallEnd::Dropped);
         }
+        drop(self.future.take());
     }
 }
 

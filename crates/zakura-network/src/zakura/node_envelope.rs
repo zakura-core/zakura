@@ -22,6 +22,8 @@ use crate::{
 };
 
 #[cfg(test)]
+mod comparison;
+#[cfg(test)]
 mod tests;
 
 /// Why a node's limits cannot fund its owners.

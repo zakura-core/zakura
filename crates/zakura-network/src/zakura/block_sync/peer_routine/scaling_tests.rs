@@ -461,6 +461,54 @@ async fn request_bookkeeping_scaling() {
     }
 }
 
+/// The same fill, then partial receipts on half the window and one reset of the rest.
+///
+/// Each event's cost should stay flat as the window grows. A reset's release should
+/// be one aggregated settlement, not a per-item wake.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual scaling probe; run in release with --nocapture"]
+#[allow(clippy::print_stderr)] // Report the per-event cost with --nocapture.
+async fn partial_receipts_and_reset_batch_scaling() {
+    use super::super::regulated::live_requester::SESSION_RESERVATIONS;
+
+    let largest = u32::try_from(SESSION_RESERVATIONS).expect("the session share fits u32");
+    for window in [largest / 8, largest / 4, largest / 2, largest] {
+        let Probe {
+            budget: _,
+            mut routine,
+            mut outbound,
+            blocks,
+            bodies: _bodies,
+            inbound: _inbound,
+            _events,
+        } = probe(window);
+        while routine.state.window.outstanding.len() < blocks.len() {
+            routine.try_fill();
+        }
+        while outbound.try_recv().is_ok() {}
+
+        // Bodies arrive without their terminal, so these requests stay partly answered.
+        let received = blocks.len() / 2;
+        let started = Instant::now();
+        for block in &blocks[..received] {
+            deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
+        }
+        let partial = started.elapsed();
+
+        let work = Arc::clone(&routine.io.work);
+        let started = Instant::now();
+        work.reset_above(block::Height(0));
+        let reset = started.elapsed();
+        assert_eq!(work.reserved_bytes(), 0);
+
+        eprintln!(
+            "window={window:>6} partial={partial:>9.1?} ({:>7.2?}/body) reset={reset:>9.1?} ({:>7.2?}/request)",
+            partial / u32::try_from(received.max(1)).expect("the window fits u32"),
+            reset / window,
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn accounting_failure_cancels_production_receipt() {
     for matched in [true, false] {

@@ -187,23 +187,18 @@ fn new_test_connection_with_protection<A>(
 /// `block_advert_rx`.
 fn test_connection_channels(
     client_rx: mpsc::Receiver<ClientRequest>,
-) -> (
-    mpsc::Receiver<ClientRequest>,
-    tokio::sync::mpsc::Receiver<crate::peer::block_gossip::BlockAdvert>,
-    crate::peer::MinimumPeerVersion<zakura_chain::chain_tip::NoChainTip>,
-    crate::BannedIps,
-) {
+) -> super::ConnectionRequests<zakura_chain::chain_tip::NoChainTip> {
     let (_block_advert_tx, block_advert_rx) =
         tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
-    (
+    super::ConnectionRequests {
         client_rx,
         block_advert_rx,
-        crate::peer::MinimumPeerVersion::new(
+        minimum_peer_version: crate::peer::MinimumPeerVersion::new(
             zakura_chain::chain_tip::NoChainTip,
             &zakura_chain::parameters::Network::Mainnet,
         ),
-        crate::BannedIps::default(),
-    )
+        bans: crate::BannedIps::default(),
+    }
 }
 
 /// Creates a connection whose peer writer never finishes closing.

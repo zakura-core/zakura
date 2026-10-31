@@ -544,6 +544,17 @@ impl From<Request> for InboundMessage {
     }
 }
 
+/// Where a connection reads our requests from, and the authorization it rechecks before
+/// writing a block advert.
+pub(crate) struct ConnectionRequests<C> {
+    /// Ordinary requests, which may wait for a response.
+    pub(crate) client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
+    /// Block adverts, read even while a request is awaiting its response.
+    pub(crate) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
+    pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
+    pub(crate) bans: BannedIps,
+}
+
 /// The channels, services, and associated state for a peer connection.
 pub struct Connection<S, Tx, C = NoChainTip>
 where
@@ -656,12 +667,12 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inbound_service: S,
-        (client_rx, block_advert_rx, minimum_peer_version, bans): (
-            futures::channel::mpsc::Receiver<ClientRequest>,
-            tokio::sync::mpsc::Receiver<BlockAdvert>,
-            MinimumPeerVersion<C>,
-            BannedIps,
-        ),
+        ConnectionRequests {
+            client_rx,
+            block_advert_rx,
+            minimum_peer_version,
+            bans,
+        }: ConnectionRequests<C>,
         error_slot: ErrorSlot,
         peer_tx: Tx,
         connection_tracker: ConnectionTracker,
@@ -1105,6 +1116,9 @@ where
 
         let new_handler = match (&self.state, request) {
             (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
+            (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
+                unreachable!("the peer set sends block adverts through the connection's advert queue")
+            }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,
@@ -1243,19 +1257,6 @@ where
                     .send(Message::Inv(hashes))
                     .await
                     .map(|()|
-                         Handler::Finished(Ok(Response::Nil))
-                    )
-            }
-            (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash) | AdvertiseMinedBlock(hash)) => {
-                let sent = self
-                    .peer_tx
-                    .send(Message::Inv(vec![hash.into()]))
-                    .await;
-                if sent.is_ok() {
-                    // Mark the write before reading the peer's next message, which can be its getdata.
-                    self.block_uploads.advertised(hash);
-                }
-                sent.map(|()|
                          Handler::Finished(Ok(Response::Nil))
                     )
             }

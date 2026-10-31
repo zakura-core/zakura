@@ -94,7 +94,7 @@
 //! [ZIP-201]: https://zips.z.cash/zip-0201
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     convert,
     fmt::Debug,
     marker::PhantomData,
@@ -162,8 +162,6 @@ pub struct MorePeers;
 /// [1]: crate::peer::Client
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CancelClientWork;
-
-type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
 
 /// Classification of a `FindBlocks`/`FindHeaders` response, sent from a
 /// response-wrapping future to [`PeerSet::poll_ready`] via an mpsc channel so
@@ -247,13 +245,6 @@ where
     block_gossip_peers_changed: bool,
     /// Share the cap across early, committed, and concurrent block broadcasts.
     block_gossip_slots: Arc<tokio::sync::Semaphore>,
-
-    /// Stores requests that should be routed to peers once they are ready.
-    queued_broadcast_all: VecDeque<(
-        Request,
-        tokio::sync::mpsc::UnboundedSender<ResponseFuture>,
-        HashSet<D::Key>,
-    )>,
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
@@ -387,7 +378,6 @@ where
             ready_services: HashMap::new(),
             // Request Routing
             inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
-            queued_broadcast_all: VecDeque::new(),
             block_gossip_peers: HashMap::new(),
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
@@ -1356,7 +1346,7 @@ where
     /// Pace legacy inventory through the corresponding uploads, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         let (hash, mined) = match req {
-            Request::AdvertiseBlock(hash, _) => (hash, false),
+            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => (hash, false),
             Request::AdvertiseMinedBlock(hash) => (hash, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
@@ -1397,112 +1387,6 @@ where
             peers: self.block_gossip_peers_tx.subscribe(),
             slots: self.block_gossip_slots.clone(),
             minimum_peer_version: self.minimum_peer_version.clone(),
-        }
-    }
-
-    /// Broadcasts the same request and succeeds after at least one peer accepts it.
-    fn broadcast_all(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let ready_peers: Vec<_> = self.ready_services.keys().copied().collect();
-        let had_ready_peers = !ready_peers.is_empty();
-        let queued_broadcast = self.queue_broadcast_all_unready(&req);
-        let send_multiple_fut = self.send_multiple(req.clone(), ready_peers);
-        let Some(mut queued_broadcast_fut_receiver) = queued_broadcast else {
-            if !had_ready_peers {
-                return async {
-                    Err(std::io::Error::other("block broadcast had no connected peers").into())
-                }
-                .boxed();
-            }
-            return send_multiple_fut;
-        };
-
-        async move {
-            let mut succeeded = had_ready_peers && send_multiple_fut.await.is_ok();
-            // Each queued item is a `send_multiple` future whose response receivers
-            // keep the enqueued peer requests from being treated as canceled (see the
-            // `tx.is_canceled()` skip in `Connection::handle_client_request`).
-            // `send_multiple` calls `Client::call`, which enqueues each request to the
-            // connection task synchronously but holds the response receiver inside the
-            // returned future. Dropping that future unpolled — as `.is_some() {}` did —
-            // drops the receiver before the connection task drains the request, so it
-            // sees a canceled request and racily skips the block `inv`. Poll each future to
-            // completion so it keeps its receivers alive and contributes to the
-            // delivery result.
-            while let Some(send_fut) = queued_broadcast_fut_receiver.recv().await {
-                succeeded |= send_fut.await.is_ok();
-            }
-            if succeeded {
-                Ok(Response::Nil)
-            } else {
-                Err(std::io::Error::other("block broadcast reached no peers").into())
-            }
-        }
-        .boxed()
-    }
-
-    /// If there are unready peers, queues a request to be broadcasted to them and
-    /// returns a channel receiver for callers to await the broadcast_all() futures, or
-    /// returns None if there are no unready peers.
-    fn queue_broadcast_all_unready(
-        &mut self,
-        req: &Request,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ResponseFuture>> {
-        if !self.cancel_handles.is_empty() {
-            // Each original peer is removed after its delivery is queued, so the total
-            // number of futures in this channel is bounded by the peer snapshot below.
-            // An unbounded channel avoids stalling the peer set on capacity without a
-            // registered wakeup when several peer readiness waves happen close together.
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let unready_peers: HashSet<_> = self.cancel_handles.keys().cloned().collect();
-            let queued = (req.clone(), sender, unready_peers);
-            self.queued_broadcast_all.push_back(queued);
-
-            Some(receiver)
-        } else {
-            None
-        }
-    }
-
-    /// Broadcasts the same requests to all ready peers which were unready when
-    /// [`PeerSet::broadcast_all()`] was last called, ignoring return values.
-    fn broadcast_all_queued(&mut self) {
-        let mut queued = std::mem::take(&mut self.queued_broadcast_all);
-        while let Some((req, sender, mut remaining_peers)) = queued.pop_front() {
-            if sender.is_closed() {
-                continue;
-            }
-
-            remaining_peers.retain(|addr| {
-                !self.bans.contains(canonical_ip(addr.ip()))
-                    && (self.ready_services.contains_key(addr)
-                        || self.cancel_handles.contains_key(addr))
-            });
-            if remaining_peers.is_empty() {
-                continue;
-            }
-
-            let peers: Vec<_> = self
-                .ready_services
-                .keys()
-                .filter(|ready_peer| remaining_peers.contains(ready_peer))
-                .copied()
-                .collect();
-            for peer in &peers {
-                remaining_peers.remove(peer);
-            }
-
-            if !peers.is_empty()
-                && sender
-                    .send(self.send_multiple(req.clone(), peers).boxed())
-                    .is_err()
-            {
-                continue;
-            }
-
-            if !remaining_peers.is_empty() {
-                self.queued_broadcast_all
-                    .push_back((req, sender, remaining_peers));
-            }
         }
     }
 
@@ -1695,10 +1579,6 @@ where
         self.log_peer_set_size();
         self.update_metrics();
 
-        // This also drops queued peers that disconnected while they were unready,
-        // even if there are no ready peers left in the peer set.
-        self.broadcast_all_queued();
-
         if ready_peers.is_pending() {
             // # Correctness
             //
@@ -1753,10 +1633,9 @@ where
 
             // Broadcast advertisements to lots of peers
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),
-            Request::AdvertiseBlock(_, _) | Request::AdvertiseMinedBlock(_) => {
-                self.route_block_broadcast(req)
-            }
-            Request::AdvertiseBlockToAll(_) => self.broadcast_all(req),
+            Request::AdvertiseBlock(_, _)
+            | Request::AdvertiseBlockToAll(_)
+            | Request::AdvertiseMinedBlock(_) => self.route_block_broadcast(req),
 
             // Choose a random less-loaded peer for all other requests
             _ => self.route_p2c(req),

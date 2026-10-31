@@ -41,8 +41,8 @@ use crate::{
     constants,
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
-        MinimumPeerVersion, PeerError,
+        CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
+        HandshakeError, MinimumPeerVersion, PeerError,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -612,16 +612,16 @@ where
     /// These are operator-configured block-gossip / zcashd-compat sidecar IPs
     /// (canonicalized for IPv4-mapped matching). If this is unset, no peer is
     /// exempted and every connection behaves exactly as before.
+    pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
+        self.protected_peer_ips = Some(protected_peer_ips);
+        self
+    }
+
     /// Share the live ban list with connection advert delivery. Optional.
     ///
     /// If this is unset, block adverts are not checked against bans when they are written.
     pub fn with_bans(mut self, bans: BannedIps) -> Self {
         self.bans = Some(bans);
-        self
-    }
-
-    pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
-        self.protected_peer_ips = Some(protected_peer_ips);
         self
     }
 
@@ -1857,7 +1857,12 @@ where
 
             let server = Connection::new(
                 inbound_service,
-                (server_rx, block_advert_rx, minimum_peer_version, bans),
+                ConnectionRequests {
+                    client_rx: server_rx,
+                    block_advert_rx,
+                    minimum_peer_version,
+                    bans,
+                },
                 error_slot.clone(),
                 peer_tx,
                 connection_tracker,

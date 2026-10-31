@@ -266,8 +266,7 @@ pub enum Request {
     /// Returns [`Response::Nil`](super::Response::Nil).
     AdvertiseBlock(block::Hash, Option<PeerSource>),
 
-    /// Advertise a block to all connected peers without upload pacing.
-    /// The peer set queues delivery to busy peers.
+    /// Advertise a block to connected peers, paced like [`Request::AdvertiseBlock`].
     /// Tip gossip uses [`Request::AdvertiseBlock`] or [`Request::AdvertiseMinedBlock`].
     AdvertiseBlockToAll(block::Hash),
 

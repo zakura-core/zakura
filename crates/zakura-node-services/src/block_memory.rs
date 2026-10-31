@@ -184,7 +184,9 @@ impl DecodedBlockPool {
         decode: impl FnOnce() -> Result<Option<Block>, AdmissionFailure>,
         retain: impl FnOnce(u64) -> Result<Option<ByteLease>, AdmissionFailure>,
     ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
-        if !matches!(self.0.limit, RetentionLimit::Blocks(_)) {
+        // A pipeline pool charges measured bytes at admission, and a decode reserves
+        // before it can measure them.
+        if !matches!(self.0.limit, RetentionLimit::Blocks(_)) || self.0.pipeline_limit.is_some() {
             return Err(AdmissionFailure::DecodeRequiresCountLimit);
         }
         let mut charge = self.reserve(0, Admission::WithinLimit)?;
@@ -1566,6 +1568,16 @@ mod tests {
         assert_eq!(pool.capacity_version(), version);
         drop(owner);
         assert_eq!(pool.pipeline_bytes(), 0);
+    }
+
+    #[test]
+    fn a_pipeline_pool_refuses_a_decode_it_could_not_charge() {
+        let pool = pipeline_pool(u64::MAX);
+        assert_eq!(
+            pool.try_decode(|| Some(block())).unwrap_err(),
+            AdmissionFailure::DecodeRequiresCountLimit
+        );
+        assert_eq!(pool.reserved_blocks(), Some(0));
     }
 
     #[test]

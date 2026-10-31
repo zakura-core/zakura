@@ -2324,33 +2324,196 @@ impl TimedSpan {
         Self { timer, span }
     }
 
-    /// Spawns a blocking tokio task in scope of the `span` field.
+    /// Admit a blocking read before spawning it in this span.
+    ///
+    /// The worker owns its slot until execution ends, even if the caller drops
+    /// the returned future. An unadmitted read waits without spawning a worker.
+    /// Dropping that waiting future releases its request and removes its waiter.
     #[track_caller]
     pub fn spawn_blocking<T: Send + 'static>(
         mut self,
+        workers: Arc<tokio::sync::Semaphore>,
         f: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
     ) -> Pin<Box<dyn futures::Future<Output = Result<T, BoxError>> + Send>> {
         let location = std::panic::Location::caller();
-        // # Performance
-        //
-        // Allow other async tasks to make progress while concurrently reading blocks from disk.
-
-        // The work is done in the future.
-        tokio::task::spawn_blocking(move || {
-            self.span.in_scope(move || {
-                let result = f();
-                self.timer
-                    .finish_inner(Some(location.file()), Some(location.line()), "");
-                result
+        let spawn = move |slot: tokio::sync::OwnedSemaphorePermit| {
+            tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                self.span.in_scope(move || {
+                    let result = f();
+                    self.timer
+                        .finish_inner(Some(location.file()), Some(location.line()), "");
+                    result
+                })
             })
-        })
-        .wait_for_panics()
+            .wait_for_panics()
+        };
+        match workers.clone().try_acquire_owned() {
+            Ok(slot) => spawn(slot),
+            Err(_) => Box::pin(async move {
+                let slot = workers.acquire_owned().await?;
+                spawn(slot).await
+            }),
+        }
     }
 }
 
 #[cfg(test)]
 mod locator_capacity_tests {
     use super::*;
+
+    /// Cancelling delivery cannot make a live blocking job's slot available.
+    #[tokio::test]
+    async fn blocking_read_slot_survives_caller_drop_and_worker_panic() {
+        use std::{sync::atomic::AtomicUsize, time::Duration};
+        use tokio::{sync::Semaphore, time::timeout};
+
+        struct LiveJob(Arc<AtomicUsize>);
+        impl Drop for LiveJob {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        for panic in [false, true] {
+            let workers = Arc::new(Semaphore::new(1));
+            let active = Arc::new(AtomicUsize::new(0));
+            let running = active.clone();
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let result = TimedSpan::new(CodeTimer::start_desc("read_slot"), tracing::Span::none())
+                .spawn_blocking(workers.clone(), move || {
+                    running.fetch_add(1, Ordering::SeqCst);
+                    let _job = LiveJob(running);
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(!panic, "test blocking read panic");
+                    Ok(())
+                });
+            timeout(Duration::from_secs(10), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(result);
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                workers.available_permits(),
+                0,
+                "the actual worker owns its slot"
+            );
+            release.send(()).unwrap();
+            let slot = timeout(Duration::from_secs(10), workers.clone().acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                active.load(Ordering::SeqCst),
+                0,
+                "execution ends before slot release"
+            );
+            drop(slot);
+            assert_eq!(workers.available_permits(), 1);
+        }
+    }
+
+    /// Dropping either an unpolled or a waiting read discards its work before admission.
+    #[tokio::test]
+    async fn blocking_read_waiter_cancellation_drops_unstarted_work() {
+        struct PendingInput(Arc<AtomicBool>);
+        impl Drop for PendingInput {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for poll in [false, true] {
+            let workers = Arc::new(tokio::sync::Semaphore::new(1));
+            let occupied = workers.clone().try_acquire_owned().unwrap();
+            let released = Arc::new(AtomicBool::new(false));
+            let input = PendingInput(released.clone());
+            let ran = Arc::new(AtomicBool::new(false));
+            let executed = ran.clone();
+            let mut pending =
+                TimedSpan::new(CodeTimer::start_desc("read_waiter"), tracing::Span::none())
+                    .spawn_blocking(workers.clone(), move || {
+                        executed.store(true, Ordering::SeqCst);
+                        drop(input);
+                        Ok(())
+                    });
+            if poll {
+                assert!(futures::poll!(&mut pending).is_pending());
+            }
+            drop(pending);
+            assert!(
+                released.load(Ordering::SeqCst),
+                "cancellation drops the waiting input"
+            );
+            assert!(!ran.load(Ordering::SeqCst), "unadmitted work never starts");
+            assert_eq!(workers.available_permits(), 0);
+            drop(occupied);
+            let next = TimedSpan::new(
+                CodeTimer::start_desc("read_after_cancel"),
+                tracing::Span::none(),
+            )
+            .spawn_blocking(workers.clone(), || Ok(7));
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), next)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                7
+            );
+            assert_eq!(workers.available_permits(), 1);
+        }
+    }
+
+    /// An admitted job stays charged while Tokio queues it behind another blocking job.
+    #[test]
+    fn blocking_read_slot_covers_the_executor_queue() {
+        use std::time::Duration;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            tokio::time::timeout(Duration::from_secs(10), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let workers = Arc::new(tokio::sync::Semaphore::new(1));
+            let ran = Arc::new(AtomicBool::new(false));
+            let executed = ran.clone();
+            let result =
+                TimedSpan::new(CodeTimer::start_desc("queued_read"), tracing::Span::none())
+                    .spawn_blocking(workers.clone(), move || {
+                        executed.store(true, Ordering::SeqCst);
+                        Ok(())
+                    });
+            drop(result);
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(
+                workers.available_permits(),
+                0,
+                "the queued job keeps its admission"
+            );
+            release.send(()).unwrap();
+            let slot =
+                tokio::time::timeout(Duration::from_secs(10), workers.clone().acquire_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(ran.load(Ordering::SeqCst));
+            drop(slot);
+            blocker.await.unwrap();
+        });
+    }
 
     #[tokio::test]
     async fn accepted_locator_keeps_permit_after_caller_drop_until_exit_or_panic() {
@@ -2367,7 +2530,7 @@ mod locator_capacity_tests {
                 CodeTimer::start_desc("locator_capacity_test"),
                 tracing::Span::none(),
             )
-            .spawn_blocking(move || {
+            .spawn_blocking(Arc::new(tokio::sync::Semaphore::new(1)), move || {
                 let ReadRequest::HeaderLocator { permit: _permit } = request else {
                     unreachable!();
                 };

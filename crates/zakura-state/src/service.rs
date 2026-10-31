@@ -2869,6 +2869,14 @@ impl Service<ReadRequest> for ReadStateService {
             .boxed();
         };
 
+        let workers = match &req {
+            ReadRequest::Tip
+            | ReadRequest::FinalizedTip
+            | ReadRequest::Depth(_)
+            | ReadRequest::BestChainNextMedianTimePast => self.db.control_read_worker_capacity(),
+            _ => self.db.read_worker_capacity(),
+        };
+
         if let ReadRequest::AcquireRetainedHeaderPath {
             peer,
             session_id,
@@ -2886,7 +2894,7 @@ impl Service<ReadRequest> for ReadStateService {
                 }
                 .boxed();
             };
-            let acquisition = timed_span.spawn_blocking(move || {
+            let acquisition = timed_span.spawn_blocking(workers, move || {
                 let outcome = reader.acquire_retained_path(
                     peer,
                     session_id,
@@ -3713,7 +3721,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
         };
 
-        timed_span.spawn_blocking(request_handler)
+        timed_span.spawn_blocking(workers, request_handler)
     }
 }
 

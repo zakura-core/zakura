@@ -327,6 +327,121 @@ async fn wait_for_decoded_payload_release(
     );
 }
 
+/// Cloned service reads and native range reads share the database's live worker cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
+    use crate::{request::TimedSpan, ReadRequest, ReadResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zakura_chain::{diagnostic::CodeTimer, serialization::ZcashSerialize};
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let config = Config {
+        read_concurrency_limit: std::num::NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let workers = read.db.read_worker_capacity();
+    let active = Arc::new(AtomicBool::new(false));
+    let running = active.clone();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let first = TimedSpan::new(
+        CodeTimer::start_desc("blocked_state_read"),
+        tracing::Span::none(),
+    )
+    .spawn_blocking(workers.clone(), move || {
+        running.store(true, Ordering::SeqCst);
+        started.send(()).unwrap();
+        release_rx.recv_timeout(limit).unwrap();
+        running.store(false, Ordering::SeqCst);
+        Ok(())
+    });
+    timeout(limit, started_rx).await.unwrap().unwrap();
+    drop(first);
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(
+        workers.available_permits(),
+        0,
+        "the cancelled caller leaves its worker charged"
+    );
+
+    let ReadResponse::Tip(Some((height, hash))) = timeout(
+        Duration::from_secs(1),
+        read.clone().oneshot(ReadRequest::Tip),
+    )
+    .await
+    .expect("control read must progress while the data worker stays occupied")
+    .unwrap() else {
+        panic!("the control read returns the stored tip")
+    };
+    assert_eq!((height, hash), (Height(0), genesis.hash()));
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(workers.available_permits(), 0);
+
+    let mut block_reader = read.clone();
+    let mut block_read = block_reader
+        .ready()
+        .await
+        .unwrap()
+        .call(ReadRequest::Block(Height(0).into()));
+    assert!(
+        timeout(Duration::from_millis(100), &mut block_read)
+            .await
+            .is_err(),
+        "ordinary state reads must wait for the shared worker slot"
+    );
+    let mut range_reader = read.clone();
+    let range_read = range_reader.read_owned_block_range(Height(0), 1, u32::MAX, (), |_| false);
+    tokio::pin!(range_read);
+    assert!(
+        timeout(Duration::from_millis(100), &mut range_read)
+            .await
+            .is_err(),
+        "owned range reads must wait for the shared worker slot"
+    );
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(workers.available_permits(), 0);
+
+    release.send(()).unwrap();
+    let ReadResponse::Block(Some(block)) = timeout(limit, block_read).await.unwrap().unwrap()
+    else {
+        panic!("the admitted read returns the stored genesis block")
+    };
+    assert_eq!(block.hash(), genesis.hash());
+    let (blocks, ()) = timeout(limit, range_read)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts();
+    assert_eq!(
+        blocks,
+        vec![(Height(0), genesis.zcash_serialize_to_vec().unwrap())]
+    );
+    assert!(!active.load(Ordering::SeqCst));
+    assert_eq!(
+        workers.available_permits(),
+        1,
+        "completed workers release their slots"
+    );
+}
+
 /// Each real state snapshot or read result keeps its allocation charged after
 /// invalidation and writer shutdown. The final drop releases the actual payloads.
 #[tokio::test(flavor = "multi_thread")]

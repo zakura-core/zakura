@@ -4,6 +4,7 @@ use std::{
     fmt,
     fs::{self, canonicalize, remove_dir_all, DirEntry, ReadDir},
     io::ErrorKind,
+    num::NonZeroU16,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -31,6 +32,18 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Maximum blocking data-read jobs admitted by one database instance.
+    ///
+    /// The default is 64. Cloned read services share this limit. Excess reads wait
+    /// asynchronously before entering Tokio's blocking queue. Cancelling a caller
+    /// does not release a slot while its admitted job still runs.
+    ///
+    /// This limit covers read-service jobs, including owned block-range reads and
+    /// retained header-path acquisition. A separate fixed pool admits bounded
+    /// chain-tip and depth queries. This limit does not bound returned payloads,
+    /// waiting callers, direct synchronous database users, or the writer thread.
+    pub read_concurrency_limit: NonZeroU16,
+
     /// The root directory for storing cached block data.
     ///
     /// If you change this directory, you might also want to change `network.cache_dir`.
@@ -466,6 +479,7 @@ impl Default for PruningConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
             cache_dir: default_cache_dir(),
             ephemeral: false,
             should_backup_non_finalized_state: true,
@@ -486,6 +500,26 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_concurrency_limit_requires_positive_bounded_capacity() {
+        assert_eq!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .read_concurrency_limit
+                .get(),
+            64
+        );
+        assert_eq!(
+            toml::from_str::<Config>("read_concurrency_limit = 1")
+                .unwrap()
+                .read_concurrency_limit
+                .get(),
+            1
+        );
+        assert!(toml::from_str::<Config>("read_concurrency_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_concurrency_limit = 65536").is_err());
+    }
 
     #[test]
     fn optional_duration_preserves_config_toml() {

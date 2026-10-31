@@ -102,6 +102,12 @@ pub struct ZakuraDb {
     // TODO: move the generic upgrade code and fields to DiskDb
     format_change_handle: Option<DbFormatChangeThreadHandle>,
 
+    /// Shared admission for blocking read-service jobs, including cancelled waiters' jobs.
+    read_workers: Arc<tokio::sync::Semaphore>,
+
+    /// Admission reserved for bounded chain-tip and depth queries.
+    control_read_workers: Arc<tokio::sync::Semaphore>,
+
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
 }
@@ -209,6 +215,12 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
+            read_workers: Arc::new(tokio::sync::Semaphore::new(usize::from(
+                config.read_concurrency_limit.get(),
+            ))),
+            control_read_workers: Arc::new(tokio::sync::Semaphore::new(
+                crate::constants::CONTROL_READ_CONCURRENCY,
+            )),
             debug_skip_format_upgrades,
             format_change_handle: None,
             db: disk_db,
@@ -290,6 +302,16 @@ impl ZakuraDb {
     /// indicate that Zebra has finished applying any required db format upgrades.
     pub fn finished_format_upgrades(&self) -> bool {
         self.db.finished_format_upgrades()
+    }
+
+    /// Return the shared admission pool for blocking read-service jobs.
+    pub(crate) fn read_worker_capacity(&self) -> Arc<tokio::sync::Semaphore> {
+        self.read_workers.clone()
+    }
+
+    /// Return the admission pool that bulk reads cannot occupy.
+    pub(crate) fn control_read_worker_capacity(&self) -> Arc<tokio::sync::Semaphore> {
+        self.control_read_workers.clone()
     }
 
     /// Returns config for this database.

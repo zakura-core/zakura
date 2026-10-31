@@ -173,6 +173,7 @@ impl ReadStateService {
         ReadRequest::BlocksByHeightRange { start, count }.count_metric();
         let state = self.clone();
         spawn_owned_block_range(
+            self.db.read_worker_capacity(),
             start,
             count,
             max_response_bytes,
@@ -196,6 +197,7 @@ impl ReadStateService {
 /// cannot release reservations still needed by the read. Move them into
 /// [`OwnedBlockRange`] on completion so they remain with the returned blocks.
 fn spawn_owned_block_range<R, G>(
+    workers: Arc<tokio::sync::Semaphore>,
     start: block::Height,
     count: u32,
     max_response_bytes: u32,
@@ -211,7 +213,7 @@ where
         CodeTimer::start_desc("blocks_by_height_range"),
         Span::current(),
     );
-    timed_span.spawn_blocking(move || {
+    timed_span.spawn_blocking(workers, move || {
         if is_cancelled(&resources) {
             return Ok(OwnedBlockRange {
                 blocks: Vec::new(),

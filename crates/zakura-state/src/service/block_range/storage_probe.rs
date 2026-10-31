@@ -12,10 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tower::ServiceExt;
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_test::process_stats::{cpu_seconds, memory_kib};
 
-use crate::{init_read_only, Config, PruningConfig, StorageMode};
+use crate::{init_read_only, Config, PruningConfig, ReadRequest, ReadResponse, StorageMode};
 
 /// Production advertises this many body bytes per response by default.
 const MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
@@ -60,7 +61,8 @@ fn elapsed_us(began: Instant) -> u32 {
 /// page cache. Reads return serialized bytes, so finalized blocks are never
 /// decoded. With `ZAKURA_STORAGE_PROBE_ENCODE=1`, each read is followed by the
 /// serving encode on a blocking thread, which copies those bytes into frames,
-/// and `p50_us`/`p99_us` cover both.
+/// and `p50_us`/`p99_us` cover both. `ZAKURA_STORAGE_PROBE_CONTROL=1` also
+/// measures chain-tip reads every 10 ms while the data reads run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual storage evidence; requires ZAKURA_STORAGE_PROBE_CACHE_DIR"]
 #[allow(clippy::print_stderr)]
@@ -78,6 +80,7 @@ async fn getblocks_storage_read_probe() {
         .unwrap_or(10);
     let drop_caches = std::env::var_os("ZAKURA_PROBE_DROP_CACHES").is_some();
     let encode = std::env::var_os("ZAKURA_STORAGE_PROBE_ENCODE").is_some();
+    let control_reads = std::env::var_os("ZAKURA_STORAGE_PROBE_CONTROL").is_some();
     let storage_mode = if std::env::var_os("ZAKURA_STORAGE_PROBE_ARCHIVE").is_some() {
         StorageMode::Archive
     } else {
@@ -136,6 +139,29 @@ async fn getblocks_storage_read_probe() {
             ));
             let cpu_start = cpu_seconds();
             let deadline = Instant::now() + Duration::from_secs(seconds);
+            let control = control_reads.then(|| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut latencies = Vec::new();
+                    while Instant::now() < deadline {
+                        let began = Instant::now();
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            state.clone().oneshot(ReadRequest::Tip),
+                        )
+                        .await
+                        .expect("chain-tip reads keep progressing during data-read saturation")
+                        .unwrap();
+                        let ReadResponse::Tip(Some((height, _))) = response else {
+                            panic!("the read-only database retains its chain tip")
+                        };
+                        assert_eq!(height, tip, "the secondary keeps the measured state fixed");
+                        latencies.push(elapsed_us(began));
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    latencies
+                })
+            });
             let workers: Vec<_> = (0..concurrency)
                 .map(|worker| {
                     let mut state = state.clone();
@@ -204,6 +230,12 @@ async fn getblocks_storage_read_probe() {
                 total.latencies_us.extend(tally.latencies_us);
                 total.encode_us.extend(tally.encode_us);
             }
+            let mut control_latencies = match control {
+                Some(control) => control.await.unwrap(),
+                None => Vec::new(),
+            };
+            assert!(!control_reads || !control_latencies.is_empty());
+            control_latencies.sort_unstable();
             let cpu = cpu_seconds().zip(cpu_start).map(|(end, start)| end - start);
             total.latencies_us.sort_unstable();
             total.encode_us.sort_unstable();
@@ -220,6 +252,7 @@ async fn getblocks_storage_read_probe() {
                 "storage_probe shape={shape} count={count} concurrency={concurrency} \
                  cold_cache={drop_caches} encode={encode} reads_per_s={:.0} blocks_per_s={:.0} \
                  mb_per_s={:.2} p50_us={} p99_us={} max_us={} encode_p50_us={} encode_p99_us={} \
+                 control_reads={} control_p99_us={} control_max_us={} \
                  cpu_s={cpu:?} rss_kib={:?}",
                 per_second(total.reads),
                 per_second(total.blocks),
@@ -229,6 +262,9 @@ async fn getblocks_storage_read_probe() {
                 total.latencies_us.last().copied().unwrap_or(0),
                 at(&total.encode_us, 50),
                 at(&total.encode_us, 99),
+                control_latencies.len(),
+                at(&control_latencies, 99),
+                control_latencies.last().copied().unwrap_or(0),
                 memory_kib(),
             );
         }

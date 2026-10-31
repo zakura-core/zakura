@@ -25,7 +25,11 @@ use super::{
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use tests::{replay_work_ownership_bytes, WorkOwnershipReplaySummary};
+pub use tests::{
+    replay_work_ownership_bytes, trace_work_ownership_bytes, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
+};
 
 /// Wakeups that a logical work transition requires.
 #[must_use]

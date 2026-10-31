@@ -82,14 +82,20 @@ fn take(
 
 #[cfg(test)]
 fn publish(state: &mut WorkQueueState, items: &[(block::Height, WorkItem)]) -> u64 {
-    let owner = items[0].1.owner.expect("a request take binds an owner");
+    let owner = items[0]
+        .1
+        .owner
+        .unwrap_or_else(|| panic!("{PROPERTY}: a request take binds an owner"));
     assert!(state.is_unpublished_claim(owner, items));
     state.publish_claim(items)
 }
 
 #[cfg(test)]
 fn owner_of(items: &[(block::Height, WorkItem)]) -> BodyWorkOwner {
-    items[0].1.owner.expect("a request take binds an owner")
+    items[0]
+        .1
+        .owner
+        .unwrap_or_else(|| panic!("{PROPERTY}: a request take binds an owner"))
 }
 
 fn heights_of(items: &[(block::Height, WorkItem)]) -> BTreeSet<block::Height> {
@@ -570,7 +576,7 @@ fn check(state: &WorkQueueState, model: &Model) {
         );
         let item = state
             .item_for_height(height(raw))
-            .expect("a queued height has an item");
+            .unwrap_or_else(|| panic!("{PROPERTY}: a queued height has an item"));
         assert_eq!(item.owner, entry.owner, "{PROPERTY}: owner of height {raw}");
         assert_eq!(
             item.provisional, entry.provisional,
@@ -670,7 +676,9 @@ fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>,
             let taken: Vec<_> = items.iter().map(|(height, _)| height.0).collect();
             assert_eq!(taken, expected, "{PROPERTY}: take selects the model's run");
             if let Some(&(_, item)) = items.first() {
-                let owner = item.owner.expect("a request take binds an owner");
+                let owner = item
+                    .owner
+                    .unwrap_or_else(|| panic!("{PROPERTY}: a request take binds an owner"));
                 claims.push(Claim {
                     owner,
                     raw_heights: taken,
@@ -796,6 +804,198 @@ fn return_owned(
 
 const PROPERTY: &str = "block/work-ownership";
 
+/// One item read from a completed or interrupted pure transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkOwnershipEntry {
+    /// Block height.
+    pub height: u32,
+    /// Whether the item occupies the in-flight map.
+    pub in_flight: bool,
+    /// Authority that selected this work.
+    pub scope: BodyWorkAuthority,
+    /// Exact request owner, including its generation.
+    pub owner: Option<BodyWorkOwner>,
+    /// Whether publication is still pending.
+    pub provisional: bool,
+    /// Request estimate retained by this item.
+    pub estimate: u64,
+    /// Charge retained by this item.
+    pub charge: u64,
+}
+
+/// The actual owner state or the independent model's expected state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkOwnershipView {
+    /// Current download floor.
+    pub floor: u32,
+    /// Current work authority.
+    pub authority: Option<BodyWorkAuthority>,
+    /// Items sorted by height and location. Duplicate heights remain visible.
+    pub items: Vec<WorkOwnershipEntry>,
+    /// Maintained total, or the model's independently summed charges.
+    pub reserved: u64,
+    /// Charges read from the actual maps, or summed from model entries.
+    pub scanned: u64,
+    /// Reserved bytes and items above the floor.
+    pub above_floor: (u64, u64),
+}
+
+/// Where a machine failure occurred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkOwnershipPhase {
+    /// Applying an input and checking its immediate outcome.
+    Transition,
+    /// Checking the resulting state against the independent model.
+    Invariant,
+}
+
+/// A checked property failure or an unexpected driver panic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkOwnershipFailure {
+    /// True only when the independent checker named its property.
+    pub property_failure: bool,
+    /// The phase that stopped the transition.
+    pub phase: WorkOwnershipPhase,
+    /// Exact panic payload, without source locations from the panic hook.
+    pub message: String,
+}
+
+/// Semantic evidence from one operation in a decoder-v1 history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkOwnershipStep {
+    /// One-based operation index.
+    pub step: usize,
+    /// Original decoder bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the real pure owner after the operation or interruption.
+    pub actual: WorkOwnershipView,
+    /// State derived independently by the model.
+    pub expected: WorkOwnershipView,
+    /// The failure that interrupted this operation, if any.
+    pub failure: Option<WorkOwnershipFailure>,
+}
+
+/// A bounded semantic history. A failed history has no successful summary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct WorkOwnershipHistory {
+    /// Every operation reached, including the first failing operation.
+    pub steps: Vec<WorkOwnershipStep>,
+    /// Present only when the full decoder-v1 input completed.
+    pub summary: Option<WorkOwnershipReplaySummary>,
+}
+
+fn actual_view(state: &WorkQueueState) -> WorkOwnershipView {
+    let mut items: Vec<_> = state
+        .pending
+        .iter()
+        .map(|(height, item)| (height, item, false))
+        .chain(
+            state
+                .in_flight
+                .iter()
+                .map(|(height, item)| (height, item, true)),
+        )
+        .map(|(height, item, in_flight)| WorkOwnershipEntry {
+            height: height.0,
+            in_flight,
+            scope: item.scope,
+            owner: item.owner,
+            provisional: item.provisional,
+            estimate: item.estimated_bytes,
+            charge: item.budget.reserved_charge(),
+        })
+        .collect();
+    items.sort_by_key(|item| (item.height, item.in_flight));
+    WorkOwnershipView {
+        floor: state.floor.0,
+        authority: state.current_authority,
+        items,
+        reserved: state.reserved_bytes(),
+        scanned: state.reserved_bytes_scanned(),
+        above_floor: state.reserved_above(state.floor),
+    }
+}
+
+fn expected_view(model: &Model) -> WorkOwnershipView {
+    let items: Vec<_> = model
+        .entries
+        .iter()
+        .map(|(height, entry)| WorkOwnershipEntry {
+            height: *height,
+            in_flight: entry.in_flight,
+            scope: entry.scope,
+            owner: entry.owner,
+            provisional: entry.provisional,
+            estimate: entry.estimate,
+            charge: entry.charge,
+        })
+        .collect();
+    let reserved = items.iter().map(|item| item.charge).sum();
+    let above: Vec<_> = items
+        .iter()
+        .filter(|item| item.height > model.floor && item.in_flight && item.charge > 0)
+        .collect();
+    WorkOwnershipView {
+        floor: model.floor,
+        authority: model.current_authority,
+        reserved,
+        scanned: reserved,
+        above_floor: (
+            above.iter().map(|item| item.charge).sum(),
+            u64::try_from(above.len()).expect("the model holds few heights"),
+        ),
+        items,
+    }
+}
+
+/// Capture decoder-v1 operations without changing the decoder or starting a runtime.
+/// The history contains at most 128 steps. Driver panics remain distinct from property failures.
+pub fn trace_work_ownership_bytes(data: &[u8]) -> WorkOwnershipHistory {
+    trace_with(data, |_, _| {})
+}
+
+fn trace_with(
+    data: &[u8],
+    after_step: impl FnMut(&mut WorkQueueState, &Model),
+) -> WorkOwnershipHistory {
+    let mut steps = Vec::new();
+    let input = &data[..data.len().min(512)];
+    let mut capture = |state: &WorkQueueState,
+                       model: &Model,
+                       step: usize,
+                       phase: WorkOwnershipPhase,
+                       failure: Option<&(dyn std::any::Any + Send)>| {
+        let failure = failure.map(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_owned())
+                })
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            WorkOwnershipFailure {
+                property_failure: message == PROPERTY
+                    || message.starts_with(&format!("{PROPERTY}:"))
+                    || (message.starts_with("assertion")
+                        && message.contains(&format!("failed: {PROPERTY}"))),
+                phase,
+                message,
+            }
+        });
+        steps.push(WorkOwnershipStep {
+            step,
+            input: input[(step - 1) * 4..(step * 4).min(input.len())].to_vec(),
+            actual: actual_view(state),
+            expected: expected_view(model),
+            failure,
+        });
+    };
+    let summary = run_captured(decode(data), after_step, &mut capture).ok();
+    WorkOwnershipHistory { steps, summary }
+}
+
 /// Applicable operations and conserved bytes in a decoder-v1 work history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct WorkOwnershipReplaySummary {
@@ -852,8 +1052,25 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
 
 fn run(
     ops: impl IntoIterator<Item = Op>,
-    mut after_step: impl FnMut(&mut WorkQueueState, &Model),
+    after_step: impl FnMut(&mut WorkQueueState, &Model),
 ) -> WorkOwnershipReplaySummary {
+    match run_captured(ops, after_step, &mut |_, _, _, _, _| {}) {
+        Ok(summary) => summary,
+        Err(failure) => std::panic::resume_unwind(failure),
+    }
+}
+
+fn run_captured(
+    ops: impl IntoIterator<Item = Op>,
+    mut after_step: impl FnMut(&mut WorkQueueState, &Model),
+    capture: &mut impl FnMut(
+        &WorkQueueState,
+        &Model,
+        usize,
+        WorkOwnershipPhase,
+        Option<&(dyn std::any::Any + Send)>,
+    ),
+) -> Result<WorkOwnershipReplaySummary, Box<dyn std::any::Any + Send>> {
     let mut state = new_state();
     let mut model = Model::default();
     let mut claims = Vec::new();
@@ -871,14 +1088,26 @@ fn run(
                 }));
             }
         }
-        apply(&mut state, &mut model, &mut claims, op);
-        after_step(&mut state, &model);
-        check(&state, &model);
+        let mut phase = WorkOwnershipPhase::Transition;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply(&mut state, &mut model, &mut claims, op);
+            phase = WorkOwnershipPhase::Invariant;
+            after_step(&mut state, &model);
+            check(&state, &model);
+        }));
+        capture(
+            &state,
+            &model,
+            summary.transitions,
+            phase,
+            result.as_ref().err().map(|error| &**error),
+        );
+        result?;
     }
     summary.claims = claims.len();
     summary.charged = model.ledgers.values().map(|ledger| ledger.charged).sum();
     summary.settled = model.ledgers.values().map(|ledger| ledger.settled).sum();
-    summary
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -942,4 +1171,75 @@ fn work_witness_rejects_lost_owner() {
             item.owner = None;
         }
     });
+}
+
+#[test]
+fn semantic_history_keeps_inputs_and_independent_states() {
+    let history = trace_work_ownership_bytes(WITNESS);
+    assert_eq!(history.summary, Some(replay_work_ownership_bytes(WITNESS)));
+    assert_eq!(history.steps.len(), 10);
+    for (step, input) in history.steps.iter().zip(WITNESS.chunks(4)) {
+        assert_eq!(step.input, input);
+        assert_eq!(step.actual, step.expected);
+        assert!(step.failure.is_none());
+    }
+    let short = trace_work_ownership_bytes(&[0, 0]);
+    assert_eq!(short.steps[0].input, [0, 0]);
+    assert_eq!(short.steps[0].actual, short.steps[0].expected);
+    let empty = trace_work_ownership_bytes(&[]);
+    assert!(empty.steps.is_empty());
+    assert_eq!(empty.summary, Some(WorkOwnershipReplaySummary::default()));
+}
+
+#[test]
+fn semantic_history_retains_the_first_property_failure() {
+    let history = trace_with(WITNESS, |state, _| state.reserved_bytes = 0);
+    assert!(history.summary.is_none());
+    let last = history.steps.last().unwrap();
+    let failure = last.failure.as_ref().unwrap();
+    assert!(failure.property_failure);
+    assert_eq!(failure.phase, WorkOwnershipPhase::Invariant);
+    assert!(failure.message.contains(PROPERTY));
+    assert_eq!(last.actual.reserved, 0);
+    assert!(last.expected.reserved > 0);
+    assert!(history.steps[..history.steps.len() - 1]
+        .iter()
+        .all(|step| step.failure.is_none()));
+}
+
+#[test]
+fn semantic_history_keeps_driver_failures_distinct() {
+    let history = trace_with(WITNESS, |_, _| {
+        panic!("driver failed while collecting block/work-ownership")
+    });
+    assert!(history.summary.is_none());
+    assert_eq!(history.steps.len(), 1);
+    let failure = history.steps[0].failure.as_ref().unwrap();
+    assert!(!failure.property_failure);
+    assert_eq!(
+        failure.message,
+        "driver failed while collecting block/work-ownership"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn semantic_capture_runs_when_an_input_panics() {
+    let mut captured = false;
+    let failure = run_captured(
+        [Op::Extend {
+            low: u32::MAX,
+            len: 1,
+            size: 1,
+        }],
+        |_, _| {},
+        &mut |_, _, step, phase, error| {
+            assert_eq!(step, 1);
+            assert_eq!(phase, WorkOwnershipPhase::Transition);
+            assert!(error.is_some());
+            captured = true;
+        },
+    );
+    assert!(failure.is_err());
+    assert!(captured);
 }

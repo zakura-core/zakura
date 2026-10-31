@@ -404,9 +404,12 @@ fn machine_failure<'a>(
 ) -> Option<MachineFailureKey> {
     let mut machine = false;
     for step in steps.into_iter().filter_map(|step| step.machine.as_deref()) {
-        let crate::record::machine::MachineStep::Work(work) = step;
+        let failure = match step {
+            crate::record::machine::MachineStep::Work(work) => &work.failure,
+            crate::record::machine::MachineStep::WorkFunding(work) => &work.failure,
+        };
         machine = true;
-        if let Some(failure) = &work.failure {
+        if let Some(failure) = failure {
             return Some(MachineFailureKey::Driver(failure.clone()));
         }
     }

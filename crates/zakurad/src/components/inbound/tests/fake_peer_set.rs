@@ -1272,7 +1272,7 @@ async fn caches_getaddr_response() {
 
         let peer_set = MockService::build()
             .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
-            .for_unit_tests();
+            .for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>();
         let buffered_peer_set =
             BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 

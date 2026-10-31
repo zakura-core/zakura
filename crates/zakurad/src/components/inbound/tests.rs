@@ -164,7 +164,11 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
             Span::none(),
         ))),
         block_download_peer_set: tower::util::BoxCloneSyncService::new(Buffer::new(
-            BoxService::new(MockService::build().for_unit_tests()),
+            BoxService::new(MockService::build().for_unit_tests::<
+                zakura_network::Request,
+                zakura_network::Response,
+                crate::BoxError,
+            >()),
             1,
         )),
         block_verifier: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),

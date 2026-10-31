@@ -11,7 +11,7 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . header_codec_v9
 ```
 
 The available targets are `header_codec_v9`, `fork_transitions`, `header_pursuit`,
-and `recovery_rows`. `header_codec_v9` fuzzes the header sync version 9 codec.
+`header_publisher`, and `recovery_rows`. `header_codec_v9` fuzzes the header sync version 9 codec.
 Its first input byte selects the header size and message type, and the rest is
 the payload.
 `cargo-fuzz` creates and updates each target's local `corpus/` and `artifacts/`

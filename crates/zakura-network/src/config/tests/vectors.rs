@@ -1652,3 +1652,37 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
         assert!(error.contains("at most 3,633"), "unexpected error: {error}");
     }
 }
+
+#[test]
+fn pq_activation_config_is_regtest_only_and_requires_support() {
+    let default: Config = toml::from_str("network = 'Regtest'").unwrap();
+    assert_eq!(default.network.pq_p2sh_activation_height(), None);
+    for height in [0, 10, 100] {
+        for source in [
+            format!("network = {{ params = {{ pq_p2sh_activation_height = {height} }} }}"),
+            format!(
+                "network = 'Regtest'\n[testnet_parameters]\npq_p2sh_activation_height = {height}"
+            ),
+        ] {
+            let parsed = toml::from_str::<Config>(&source);
+            if cfg!(feature = "pq") {
+                let config = parsed.unwrap();
+                assert_eq!(
+                    config.network.pq_p2sh_activation_height(),
+                    Some(Height(height))
+                );
+                let serialized = toml::to_string(&config).unwrap();
+                let restored: Config = toml::from_str(&serialized).unwrap();
+                assert_eq!(
+                    restored.network.pq_p2sh_activation_height(),
+                    Some(Height(height))
+                );
+            } else {
+                assert!(parsed.unwrap_err().to_string().contains("pq feature"));
+            }
+        }
+    }
+    let error =
+        toml::from_str::<Config>("network = { pq_p2sh_activation_height = 0 }").unwrap_err();
+    assert!(error.to_string().contains("only supported on Regtest"));
+}

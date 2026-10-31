@@ -14,9 +14,15 @@ keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["cryptography::cryptocurrencies"]
 
+[features]
+default = []
+# Bounded PQ P2SH validation, selected only by explicit local Regtest activation.
+pq = ["dep:zcash_transparent", "zcash_transparent/pq"]
+
 [dependencies]
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
+zcash_transparent = { workspace = true, optional = true }
 zakura-chain = { path = "../zakura-chain", version = "11.0.0" }
 
 thiserror = { workspace = true }

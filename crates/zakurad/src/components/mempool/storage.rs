@@ -215,6 +215,8 @@ impl RemovedTransactionIds {
 
 /// Hold mempool verified and rejected mempool transactions.
 pub struct Storage {
+    /// Trusted network parameters used by input relay policy.
+    network: zakura_chain::parameters::Network,
     /// The set of verified transactions in the mempool.
     verified: VerifiedSet,
 
@@ -265,8 +267,11 @@ impl Drop for Storage {
 
 impl Storage {
     #[allow(clippy::field_reassign_with_default)]
-    pub(crate) fn new(config: &config::Config) -> Self {
-        Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES)
+    pub(crate) fn new(
+        config: &config::Config,
+        network: &zakura_chain::parameters::Network,
+    ) -> Self {
+        Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES, network)
     }
 
     /// Constructs storage with a configurable rejection-list capacity.
@@ -277,6 +282,7 @@ impl Storage {
     fn new_with_rejection_list_capacity(
         config: &config::Config,
         rejection_list_capacity: usize,
+        network: &zakura_chain::parameters::Network,
     ) -> Self {
         assert!(
             rejection_list_capacity > 0,
@@ -284,6 +290,7 @@ impl Storage {
         );
 
         Self {
+            network: network.clone(),
             tx_cost_limit: config.tx_cost_limit,
             eviction_memory_time: config.eviction_memory_time,
             rejection_list_capacity,
@@ -309,49 +316,31 @@ impl Storage {
     /// Currently, we implement: per-transaction sigops limit, standard input script checks,
     /// input scriptSig size/push-only checks, standard output script checks (including OP_RETURN
     /// limits), and dust checks.
-    fn reject_if_non_standard_tx(&mut self, tx: &VerifiedUnminedTx) -> Result<(), MempoolError> {
-        use zcash_script::script::{self, Evaluable as _};
-
+    fn reject_if_non_standard_tx(
+        &mut self,
+        tx: &VerifiedUnminedTx,
+        tip_height: Option<Height>,
+    ) -> Result<(), MempoolError> {
         let transaction = tx.transaction.transaction().as_ref();
         let spent_outputs = &tx.spent_outputs;
 
-        for input in transaction.inputs() {
-            let unlock_script = match input {
-                transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
-                transparent::Input::Coinbase { .. } => continue,
-            };
-
-            // Rule: scriptSig size must be within the standard limit.
-            if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::ScriptSigTooLarge);
-            }
-
-            let code = script::Code(unlock_script.as_raw_bytes().to_vec());
-            // Rule: scriptSig must be push-only.
-            if !code.is_push_only() {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::ScriptSigNotPushOnly);
-            }
-        }
-
         if !spent_outputs.is_empty() {
-            // Validate that spent_outputs aligns with transparent inputs.
-            if transaction.inputs().len() != spent_outputs.len() {
-                tracing::warn!(
-                    inputs = transaction.inputs().len(),
-                    spent_outputs = spent_outputs.len(),
-                    "spent_outputs length mismatch, rejecting as non-standard"
-                );
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
-            }
-
-            // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
-            // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-            if !policy::are_inputs_standard(transaction, spent_outputs) {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
+            // Insertion uses the current tip; verification and templates use the next block.
+            let height = tip_height
+                .and_then(|height| height + 1)
+                .unwrap_or(Height(0));
+            if let Err(error) = policy::mempool_standard_input_scripts_for_network(
+                transaction,
+                spent_outputs,
+                &self.network,
+                height,
+            ) {
+                let reason = match error {
+                    zakura_consensus::error::TransactionError::NonStandardScriptSigSize { .. } => NonStandardTransactionError::ScriptSigTooLarge,
+                    zakura_consensus::error::TransactionError::NonStandardScriptSigNotPushOnly { .. } => NonStandardTransactionError::ScriptSigNotPushOnly,
+                    _ => NonStandardTransactionError::NonStandardInputs,
+                };
+                return self.reject_non_standard(tx, reason);
             }
 
             // Rule: per-transaction sigops (legacy + P2SH) must not exceed the limit.
@@ -362,6 +351,24 @@ impl Storage {
                 return self.reject_non_standard(tx, NonStandardTransactionError::TooManySigops);
             }
         } else {
+            // Preserve legacy envelope checks for callers without spent-output metadata.
+            // Such callers cannot select PQ rules without authenticating the output.
+            use zcash_script::script::{self, Evaluable as _};
+            for input in transaction.inputs() {
+                let transparent::Input::PrevOut { unlock_script, .. } = input else {
+                    continue;
+                };
+                if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
+                    return self
+                        .reject_non_standard(tx, NonStandardTransactionError::ScriptSigTooLarge);
+                }
+                if !script::Code(unlock_script.as_raw_bytes().to_vec()).is_push_only() {
+                    return self.reject_non_standard(
+                        tx,
+                        NonStandardTransactionError::ScriptSigNotPushOnly,
+                    );
+                }
+            }
             // No spent outputs available (e.g. shielded-only transaction).
             // Only check legacy sigops.
             if tx.legacy_sigop_count > policy::MAX_STANDARD_TX_SIGOPS {
@@ -533,7 +540,7 @@ impl Storage {
         }
 
         // Check that the transaction is standard.
-        if let Err(error) = self.reject_if_non_standard_tx(&tx) {
+        if let Err(error) = self.reject_if_non_standard_tx(&tx, height) {
             return (Err(error), HashSet::new());
         }
 

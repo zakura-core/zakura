@@ -5376,6 +5376,9 @@ mod tests {
         let BlockSyncAction::SubmitBlock { block, .. } = action else {
             panic!("expected a body submission, got {action:?}");
         };
+        let zakura_node_services::block_memory::BlockHandle::Shared(block) = block else {
+            panic!("the current peer decoder supplies a shared block");
+        };
         assert!(Arc::ptr_eq(&block, &routine_decode));
     }
 

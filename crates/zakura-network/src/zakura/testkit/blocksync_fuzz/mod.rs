@@ -302,7 +302,7 @@ fn spawn_action_driver(
                     let height = block
                         .coinbase_height()
                         .expect("synthetic submitted block has height");
-                    let outcome = apply.apply(block.as_ref());
+                    let outcome = apply.apply(block.view());
                     if outcome.result == BlockApplyResult::Committed {
                         let _ = committed_tx.send(outcome.frontiers.verified_block_tip);
                     }

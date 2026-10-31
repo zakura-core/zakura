@@ -965,7 +965,7 @@ impl SequencerIO {
                     owner: item.owner,
                     source: item.source,
                     token,
-                    block: prepared.block,
+                    block: prepared.block.into(),
                 })
                 .await;
             metrics::histogram!("sync.block.submit.queue_wait_seconds")

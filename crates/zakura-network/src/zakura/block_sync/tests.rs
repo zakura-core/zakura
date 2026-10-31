@@ -5649,7 +5649,10 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
 async fn next_submission(
     actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
     timeout: Duration,
-) -> Option<(BlockApplyToken, Arc<block::Block>)> {
+) -> Option<(
+    BlockApplyToken,
+    zakura_node_services::block_memory::BlockHandle,
+)> {
     time::timeout(timeout, async {
         loop {
             let action = actions_rx
@@ -6353,7 +6356,7 @@ struct DetachedWindow {
         zakura_header_chain::BodyWorkOwner,
         zakura_header_chain::SourceId,
         BlockApplyToken,
-        Arc<block::Block>,
+        zakura_node_services::block_memory::BlockHandle,
     )>,
     task: tokio::task::JoinHandle<()>,
 }

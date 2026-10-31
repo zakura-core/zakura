@@ -1397,7 +1397,7 @@ impl Topology {
             },
             source,
             token: u64::MAX,
-            block: body.block,
+            block: body.block.into(),
         };
         self.node_service()
             .take_received(action, &mut VecDeque::new());

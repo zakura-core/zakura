@@ -75,10 +75,11 @@ impl BlocksyncThroughputProbe {
     /// the next contiguous height. Returns the apply result and, on a synthetic
     /// commit, the advanced frontier (the driver feeds it back into the reactor
     /// exactly as a real commit's frontier would be).
-    pub(crate) fn apply_block(
+    pub(crate) fn apply_block<'a>(
         &self,
-        block: &block::Block,
+        block: impl Into<block::BlockView<'a>>,
     ) -> (BlockApplyResult, Option<BlockSyncFrontiers>) {
+        let block = block.into();
         let Some(height) = block.coinbase_height() else {
             let hash = block.hash();
             warn!(

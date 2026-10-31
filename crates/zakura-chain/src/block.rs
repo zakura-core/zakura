@@ -83,6 +83,11 @@ impl<'a> From<&'a Arc<Block>> for BlockView<'a> {
 }
 
 impl<'a> BlockView<'a> {
+    /// Measure the borrowed decoded payload without exposing shared handles.
+    pub fn attributed_memory_size_bytes(self) -> u64 {
+        self.0.attributed_memory_size_bytes()
+    }
+
     /// Borrow sprout nullifiers in transaction order.
     pub fn sprout_nullifiers(self) -> impl Iterator<Item = &'a sprout::Nullifier> {
         self.0.sprout_nullifiers()

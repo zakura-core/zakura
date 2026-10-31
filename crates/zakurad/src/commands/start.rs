@@ -201,6 +201,19 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
+/// Keep native applies paused until the genesis task completes its single handoff.
+/// Header-runtime readiness can precede this startup, including on a height-zero reopen.
+fn new_sync_coordinator(config: &zakura_network::Config) -> Arc<zakura::SyncCoordinator> {
+    if use_zakura_block_sync(config) {
+        zakura::SyncCoordinator::new_legacy_bootstrap()
+    } else {
+        zakura::SyncCoordinator::new()
+    }
+}
+
+#[cfg(test)]
+mod genesis_bootstrap_tests;
+
 #[derive(Default)]
 // Keeps track of `JoinHandle`s, and when `Drop`ped, `aborts` all of them.
 struct NodeTasks(Vec<AbortHandle>);
@@ -501,14 +514,7 @@ impl StartCmd {
             .network
             .v2_p2p()
             .then(|| read_only_state_service.subscribe_header_runtime_status());
-        let legacy_bootstrap_needed = zakura_bootstrap_runtime_status
-            .as_ref()
-            .is_some_and(|status| !status.borrow().is_ready());
-        let zakura_block_sync_handoff = if legacy_bootstrap_needed {
-            zakura::SyncCoordinator::new_legacy_bootstrap()
-        } else {
-            zakura::SyncCoordinator::new()
-        };
+        let zakura_block_sync_handoff = new_sync_coordinator(&config.network);
 
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(

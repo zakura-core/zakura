@@ -1306,7 +1306,7 @@ impl Driver {
                 self.actions.push(ReactorMachineAction::Reply {
                     query_id: id,
                     scope: authority(scope),
-                    outcome: reply_outcome(actual),
+                    outcome: actual.outcome(),
                 });
                 assert_eq!(model_reply(actual), expected, "{PROPERTY}");
             }
@@ -1460,31 +1460,6 @@ fn machine_query(query: PendingNeededQuery) -> ReactorMachineQuery {
     }
 }
 
-/// How the production state classified a needed-block reply.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ReactorMachineReply {
-    /// The reply matched no pending query.
-    Stale,
-    /// The reply matched under a retired authority.
-    StaleAuthority,
-    /// State's anchor moved ahead of the verified mirror.
-    AnchorAdvanced,
-    /// State's anchor sits behind or beside the verified mirror.
-    AnchorReset,
-    /// The reply's blocks became current work.
-    Accepted,
-}
-
-fn reply_outcome(reply: NeededReply) -> ReactorMachineReply {
-    match reply {
-        NeededReply::Stale => ReactorMachineReply::Stale,
-        NeededReply::StaleAuthority => ReactorMachineReply::StaleAuthority,
-        NeededReply::AnchorAdvanced(_) => ReactorMachineReply::AnchorAdvanced,
-        NeededReply::AnchorReset(_) => ReactorMachineReply::AnchorReset,
-        NeededReply::Accept(_) => ReactorMachineReply::Accepted,
-    }
-}
-
 /// One transition an input caused, named by its exact identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReactorMachineAction {
@@ -1504,7 +1479,7 @@ pub enum ReactorMachineAction {
         /// The reply's authority.
         scope: BodyWorkAuthority,
         /// The classification.
-        outcome: ReactorMachineReply,
+        outcome: QueryReplyOutcome,
     },
     /// A query failure reached the state.
     Failed {

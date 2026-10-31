@@ -11,8 +11,8 @@ use rand_10::Rng;
 use state::{
     admission_decision, block_sync_frontiers, body_completion_authority,
     empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
-    ActionRefusal, AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply,
-    QueryOpening, QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts,
+    AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply, QueryOpening,
+    QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts,
 };
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased_named;
@@ -24,7 +24,10 @@ mod state;
 pub use state::{
     replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
     BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
-    ReactorMachineAction, ReactorMachineQuery, ReactorMachineReply, ReactorMachineView,
+    ReactorMachineAction, ReactorMachineQuery, ReactorMachineView,
+};
+pub use state::{
+    ActionRefusal, QueryIdentity, QueryReplyOutcome, ReactorSnapshot, ReactorTransition,
 };
 #[cfg(test)]
 mod tests;
@@ -552,6 +555,7 @@ impl ReactorIO {
                 }
                 _ = &mut needed_query_retry, if self.state.queries.retry_at().is_some() => {
                     self.state.queries.retry_elapsed();
+                    self.report_transition(ReactorTransition::RetryElapsed);
                     self.query_needed_blocks().await;
                 }
             }
@@ -845,6 +849,10 @@ impl ReactorIO {
                 authority,
                 frontiers,
             }) => {
+                self.report_transition(ReactorTransition::AuthorityChanged {
+                    authority,
+                    epoch_changed: true,
+                });
                 let _ = self
                     .sequencer_control
                     .send(SequencerControlInput::BodyWorkEpochChanged {
@@ -853,6 +861,10 @@ impl ReactorIO {
                     });
             }
             Some(AuthorityUpdate::Refreshed(authority)) => {
+                self.report_transition(ReactorTransition::AuthorityChanged {
+                    authority,
+                    epoch_changed: false,
+                });
                 self.resources.work_queue.refresh_authority(authority);
                 let _ = self
                     .sequencer_control
@@ -972,6 +984,9 @@ impl ReactorIO {
         preserve_active_successors: bool,
     ) {
         self.state.queries.clear();
+        self.report_transition(ReactorTransition::TipReset {
+            tip: frontiers.verified_block_tip,
+        });
         // Reactor-owned prep: precompute the two peer-outstanding-derived halves
         // of the reset decision (the reactor owns peer state; the task ORs them
         // with its Sequencer-internal predicates). The `verified_tip()`/`floor()`
@@ -1039,6 +1054,10 @@ impl ReactorIO {
         else {
             return;
         };
+        self.report_transition(ReactorTransition::View {
+            reset,
+            tip_advanced,
+        });
 
         if reset {
             // A destructive reset. The Sequencer already pinned its floor and
@@ -1156,10 +1175,15 @@ impl ReactorIO {
         body_anchor: zakura_header_chain::Frontier,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        let completed_query = match self
+        let reply = self
             .state
-            .complete_needed_query(query_id, scope, body_anchor)
-        {
+            .complete_needed_query(query_id, scope, body_anchor);
+        self.report_transition(ReactorTransition::QueryReply {
+            query_id,
+            scope,
+            outcome: reply.outcome(),
+        });
+        let completed_query = match reply {
             NeededReply::Stale => {
                 metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
                     .increment(1);
@@ -1200,7 +1224,13 @@ impl ReactorIO {
         query_id: NonZeroU64,
         scope: zakura_header_chain::BodyWorkAuthority,
     ) {
-        if !self.state.queries.fail(query_id, scope, Instant::now()) {
+        let matched = self.state.queries.fail(query_id, scope, Instant::now());
+        self.report_transition(ReactorTransition::QueryFailed {
+            query_id,
+            scope,
+            matched,
+        });
+        if !matched {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query_failed")
                 .increment(1);
             return;
@@ -1377,12 +1407,17 @@ impl ReactorIO {
             }
             QueryPlan::Dispatch(proposal) => proposal,
         };
+        let query = QueryIdentity::from(proposal.query());
         match self.dispatch_action(proposal.action()) {
-            Ok(()) => self.state.queries.accepted(proposal),
+            Ok(()) => {
+                self.state.queries.accepted(proposal);
+                self.report_transition(ReactorTransition::QueryAccepted(query));
+            }
             Err(refusal) => {
                 self.state
                     .queries
                     .refused(proposal, refusal, Instant::now());
+                self.report_transition(ReactorTransition::QueryRefused { query, refusal });
                 if refusal != ActionRefusal::Closed {
                     metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
                 }

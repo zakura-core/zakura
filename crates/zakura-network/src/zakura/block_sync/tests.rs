@@ -1,4 +1,5 @@
 pub(super) mod gauge_recorder;
+mod query_lifecycle;
 mod retention;
 
 use std::{

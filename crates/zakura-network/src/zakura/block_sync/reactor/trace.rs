@@ -1,8 +1,176 @@
+use serde::Serialize;
+use zakura_jsonl_trace::JsonlTraceEvent;
 use zakura_rt::sync::atomic::Ordering;
 
 use super::*;
 
+/// One reactor transition with the state it left behind.
+#[derive(Serialize)]
+struct BlockReactorTransitionEvent {
+    event: &'static str,
+    #[serde(flatten)]
+    transition: TransitionDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_query_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_query_id: Option<u64>,
+    retry_armed: bool,
+    retry_forced: bool,
+    dispatch_closed: bool,
+    verified_tip: u32,
+    request_floor: u32,
+    best_header_tip: u32,
+    reset_epoch: u64,
+    reaction_epoch: u64,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "transition", rename_all = "snake_case")]
+enum TransitionDetail {
+    QueryAccepted {
+        query_id: u64,
+        range_start: u32,
+        range_count: u32,
+        forced: bool,
+        header_generation: u64,
+    },
+    QueryRefused {
+        query_id: u64,
+        range_start: u32,
+        range_count: u32,
+        forced: bool,
+        header_generation: u64,
+        refusal: &'static str,
+    },
+    QueryReply {
+        query_id: u64,
+        header_generation: u64,
+        outcome: &'static str,
+    },
+    QueryFailed {
+        query_id: u64,
+        header_generation: u64,
+        matched: bool,
+    },
+    RetryElapsed,
+    View {
+        reset: bool,
+        tip_advanced: bool,
+    },
+    AuthorityChanged {
+        header_generation: u64,
+        epoch_changed: bool,
+    },
+    TipReset {
+        tip: u32,
+    },
+}
+
+impl From<ReactorTransition> for TransitionDetail {
+    fn from(transition: ReactorTransition) -> Self {
+        match transition {
+            ReactorTransition::QueryAccepted(query) => Self::QueryAccepted {
+                query_id: query.query_id.get(),
+                range_start: query.from.0,
+                range_count: query.limit,
+                forced: query.forced,
+                header_generation: query.scope.header.header_generation.get(),
+            },
+            ReactorTransition::QueryRefused { query, refusal } => Self::QueryRefused {
+                query_id: query.query_id.get(),
+                range_start: query.from.0,
+                range_count: query.limit,
+                forced: query.forced,
+                header_generation: query.scope.header.header_generation.get(),
+                refusal: match refusal {
+                    ActionRefusal::ControlReserve => "control_reserve",
+                    ActionRefusal::Full => "full",
+                    ActionRefusal::Closed => "closed",
+                },
+            },
+            ReactorTransition::QueryReply {
+                query_id,
+                scope,
+                outcome,
+            } => Self::QueryReply {
+                query_id: query_id.get(),
+                header_generation: scope.header.header_generation.get(),
+                outcome: match outcome {
+                    QueryReplyOutcome::Stale => "stale",
+                    QueryReplyOutcome::StaleAuthority => "stale_authority",
+                    QueryReplyOutcome::AnchorAdvanced => "anchor_advanced",
+                    QueryReplyOutcome::AnchorReset => "anchor_reset",
+                    QueryReplyOutcome::Accepted => "accepted",
+                },
+            },
+            ReactorTransition::QueryFailed {
+                query_id,
+                scope,
+                matched,
+            } => Self::QueryFailed {
+                query_id: query_id.get(),
+                header_generation: scope.header.header_generation.get(),
+                matched,
+            },
+            ReactorTransition::RetryElapsed => Self::RetryElapsed,
+            ReactorTransition::View {
+                reset,
+                tip_advanced,
+            } => Self::View {
+                reset,
+                tip_advanced,
+            },
+            ReactorTransition::AuthorityChanged {
+                authority,
+                epoch_changed,
+            } => Self::AuthorityChanged {
+                header_generation: authority.header.header_generation.get(),
+                epoch_changed,
+            },
+            ReactorTransition::TipReset { tip } => Self::TipReset { tip: tip.0 },
+        }
+    }
+}
+
+impl BlockReactorTransitionEvent {
+    fn new(transition: ReactorTransition, state: ReactorSnapshot) -> Self {
+        Self {
+            event: "reactor_transition",
+            transition: transition.into(),
+            pending_query_id: state.pending.map(|query| query.query_id.get()),
+            next_query_id: state.next_query_id.map(NonZeroU64::get),
+            retry_armed: state.retry_armed,
+            retry_forced: state.retry_forced,
+            dispatch_closed: state.dispatch_closed,
+            verified_tip: state.verified_block_tip.0,
+            request_floor: state.request_floor.0,
+            best_header_tip: state.best_header_tip.0,
+            reset_epoch: state.last_reset_epoch,
+            reaction_epoch: state.last_reaction_epoch,
+        }
+    }
+}
+
+impl JsonlTraceEvent for BlockReactorTransitionEvent {
+    const TABLE: zakura_jsonl_trace::JsonlTraceTable = crate::zakura::trace::BLOCK_SYNC_TABLE;
+}
+
 impl ReactorIO {
+    /// Report a completed transition to the trace and to an installed observer,
+    /// with the state it left behind. Neither takes a lock or yields.
+    pub(super) fn report_transition(&self, transition: ReactorTransition) {
+        self.startup
+            .trace
+            .emit_event(|| BlockReactorTransitionEvent::new(transition, self.state.snapshot()));
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observer) = &self.startup.observer.0 {
+            observer.observe(super::block_sync_observe::BlockEvent::Reactor {
+                transition,
+                state: self.state.snapshot(),
+            });
+        }
+    }
+
     pub(super) fn emit_block(
         &self,
         event: &'static str,

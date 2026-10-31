@@ -2154,8 +2154,15 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         // End the request reservation at receipt, but release its bytes only
         // after the body is visible to the resident-memory accounting.
-        let Some(receipt_settlement) = self.work.begin_receipt_for_owner(outstanding_owner, height)
-        else {
+        let receipt_settlement = match self.work.begin_receipt_for_owner(outstanding_owner, height)
+        {
+            Ok(settlement) => settlement,
+            Err(_) => {
+                self.cancel.cancel();
+                return;
+            }
+        };
+        let Some(receipt_settlement) = receipt_settlement else {
             tracing::debug!(
                 peer = ?self.peer,
                 ?height,
@@ -2411,14 +2418,26 @@ impl PeerRoutine {
             // stale request reservation the height still owned is released below.
             let _ = self.work.take_in_range(height, height, 1);
             metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-            (self.work.claim_receipt_for_owner(owner, height), None)
+            let funding = match self.work.claim_receipt_for_owner(owner, height) {
+                Ok(funding) => funding,
+                Err(_) => {
+                    self.cancel.cancel();
+                    return true;
+                }
+            };
+            (funding, None)
         } else {
             // First-completion-wins for a timed-out height already re-issued to
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
             // request slot.
-            let Some(settlement) = self.work.begin_competing_receipt(owner, height) else {
-                return false;
+            let settlement = match self.work.begin_competing_receipt(owner, height) {
+                Ok(Some(settlement)) => settlement,
+                Ok(None) => return false,
+                Err(_) => {
+                    self.cancel.cancel();
+                    return true;
+                }
             };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
             (settlement.funding, Some(settlement.charge))
@@ -4294,6 +4313,7 @@ mod tests {
         // this exact owner until the sequencer consumes it.
         drop(
             work.begin_receipt_for_owner(owner, block::Height(2))
+                .unwrap()
                 .unwrap(),
         );
         match order {
@@ -4474,6 +4494,7 @@ mod tests {
         let owner = work.owner_for_height(block::Height(1)).unwrap();
         let settlement = work
             .begin_receipt_for_owner(owner, block::Height(1))
+            .unwrap()
             .expect("height 1 still owns its active reservation");
         assert_eq!(settlement.funding.bytes(), 1_000);
         assert_eq!(budget_probe.reserved(), 1_000);

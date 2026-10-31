@@ -7307,15 +7307,15 @@ proptest::proptest! {
         let mut funding = budget.reserve_owned(estimate).unwrap();
 
         if release_before_receipt {
-            drop(funding.split(ledger.release_reserved()));
+            drop(funding.split(ledger.release_reserved()).unwrap());
             prop_assert_eq!(budget.reserved(), 0);
             prop_assert!(!ledger.is_reserved());
         }
-        drop(funding.split(ledger.release_reserved()));
+        drop(funding.split(ledger.release_reserved()).unwrap());
         prop_assert_eq!(budget.reserved(), 0);
         prop_assert_eq!(ledger.reserved_charge(), 0);
         // A third release still yields nothing.
-        drop(funding.split(ledger.release_reserved()));
+        drop(funding.split(ledger.release_reserved()).unwrap());
         prop_assert_eq!(budget.reserved(), 0);
     }
 }
@@ -7345,7 +7345,7 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
             .into_iter()
             .enumerate()
         {
-            drop(funding.split(estimate));
+            drop(funding.split(estimate).unwrap());
             outstanding.mark_received(height);
             assert_eq!(
                 reorder.insert(height, block.clone(), actuals[index], peer(0)),
@@ -7382,13 +7382,13 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
         let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), estimate * 3);
         // A short response delivers only height 1; its estimate is released.
-        drop(funding.split(estimate));
+        drop(funding.split(estimate).unwrap());
         outstanding.mark_received(block::Height(1));
         // The remaining two unreceived heights still reserve their estimate each.
         assert_eq!(outstanding.reserved_bytes(), estimate * 2);
         assert_eq!(budget.reserved(), estimate * 2);
         // On timeout the outstanding range releases its still-reserved estimates.
-        drop(funding.split(outstanding.reserved_bytes()));
+        drop(funding.split(outstanding.reserved_bytes()).unwrap());
         assert_eq!(budget.reserved(), 0);
     }
 

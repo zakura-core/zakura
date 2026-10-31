@@ -363,3 +363,57 @@ async fn request_bookkeeping_scaling() {
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn accounting_failure_cancels_production_receipt() {
+    for matched in [true, false] {
+        let Probe {
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies: mut bodies,
+            _events,
+        } = probe(1);
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let budget = routine.budget.clone();
+        let charge = routine.work.reserved_bytes();
+        assert!(charge > 0);
+        // Keep actual funding live while removing it from the queue's settlement pool.
+        let retained = routine.work.retain_funding_for_test(charge);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())),
+        )
+        .await
+        .unwrap();
+        assert!(
+            routine.cancel.is_cancelled(),
+            "receipt accounting failure did not cancel the routine"
+        );
+        assert!(budget.is_closed());
+        assert!(
+            bodies.try_recv().is_err(),
+            "failed receipt published a body"
+        );
+        assert_eq!(
+            routine
+                .sequencer_input_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(budget.reserved(), charge);
+        drop(routine);
+        assert_eq!(budget.reserved(), charge);
+        drop(retained);
+        assert_eq!(budget.reserved(), 0);
+        assert!(budget.is_closed());
+    }
+}

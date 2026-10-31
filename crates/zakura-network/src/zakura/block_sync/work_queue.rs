@@ -35,7 +35,7 @@ use zakura_rt::{
 };
 
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
-use crate::zakura::transport::{ByteBudget, ByteReservation};
+use crate::zakura::transport::{ByteBudget, ByteReservation, ReservationError};
 
 mod request_write;
 pub(super) mod state;
@@ -447,11 +447,15 @@ impl WorkQueue {
     pub(super) fn mark_reserved(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
         let mut inner = self.lock();
         let bytes = inner.state.mark_reserved(None, heights);
-        inner.funding.merge(
-            self.budget
-                .charge_owned(bytes)
-                .expect("fixture charges fit the budget counter"),
-        );
+        inner
+            .funding
+            .merge(
+                &mut self
+                    .budget
+                    .charge_owned(bytes)
+                    .expect("fixture charges fit the budget counter"),
+            )
+            .expect("fixture funding matches the queue");
         bytes
     }
 
@@ -463,11 +467,15 @@ impl WorkQueue {
     ) -> u64 {
         let mut inner = self.lock();
         let bytes = inner.state.mark_reserved(Some(owner), heights);
-        inner.funding.merge(
-            self.budget
-                .charge_owned(bytes)
-                .expect("fixture charges fit the budget counter"),
-        );
+        inner
+            .funding
+            .merge(
+                &mut self
+                    .budget
+                    .charge_owned(bytes)
+                    .expect("fixture charges fit the budget counter"),
+            )
+            .expect("fixture funding matches the queue");
         bytes
     }
 
@@ -475,6 +483,7 @@ impl WorkQueue {
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
         self.release_active_reserved_height_matching(None, height, false)
+            .expect("fixture funding matches the queue")
             .map(|settlement| settlement.funding.bytes())
     }
 
@@ -484,7 +493,7 @@ impl WorkQueue {
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> Option<EndedReservation> {
+    ) -> Result<Option<EndedReservation>, ReservationError> {
         self.release_active_reserved_height_matching(Some(owner), height, false)
     }
 
@@ -493,46 +502,66 @@ impl WorkQueue {
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> Option<EndedReservation> {
+    ) -> Result<Option<EndedReservation>, ReservationError> {
         self.release_active_reserved_height_matching(Some(owner), height, true)
     }
 
-    // Overflow violates funded ownership; returning None would hide a completed transition.
-    #[allow(clippy::unwrap_in_result)]
     fn release_active_reserved_height_matching(
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
         answered_elsewhere: bool,
-    ) -> Option<EndedReservation> {
+    ) -> Result<Option<EndedReservation>, ReservationError> {
         let (ended, claim) = {
             let mut inner = self.lock();
-            let ended =
+            let Some(ended) =
                 inner
                     .state
-                    .end_reservation_at_receipt(owner, height, answered_elsewhere)?;
+                    .end_reservation_at_receipt(owner, height, answered_elsewhere)
+            else {
+                return Ok(None);
+            };
             let (outcome, claim) = self.return_items_locked(&mut inner, ended.owner, []);
+            let funding = self.split_receipt_funding(
+                &mut inner,
+                ended.released_bytes,
+                outcome.released_bytes,
+            );
             (
-                EndedReservation {
+                funding.map(|funding| EndedReservation {
                     charge: ended.released_bytes,
-                    funding: inner.funding.split(
-                        ended
-                            .released_bytes
-                            .checked_add(outcome.released_bytes)
-                            .expect("receipt releases owned charges"),
-                    ),
-                },
+                    funding,
+                }),
                 claim,
             )
         };
         drop(claim);
-        Some(ended)
+        ended.map(Some)
+    }
+
+    fn split_receipt_funding(
+        &self,
+        inner: &mut WorkQueueInner,
+        receipt: u64,
+        retired: u64,
+    ) -> Result<ByteReservation, ReservationError> {
+        let funding = receipt
+            .checked_add(retired)
+            .ok_or(ReservationError::Amount)
+            .and_then(|bytes| inner.funding.split(bytes));
+        if funding.is_err() {
+            inner.admission_closed = true;
+            self.budget.close();
+        }
+        funding
     }
 
     /// Claim a received height and end any request reservation it owned.
     #[cfg(test)]
     pub(super) fn claim_received(&self, height: block::Height) -> u64 {
-        self.claim_received_matching(None, height).bytes()
+        self.claim_received_matching(None, height)
+            .expect("fixture funding matches the queue")
+            .bytes()
     }
 
     /// Claim a received height and transfer its funding into the handoff.
@@ -540,7 +569,7 @@ impl WorkQueue {
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> ByteReservation {
+    ) -> Result<ByteReservation, ReservationError> {
         self.claim_received_matching(Some(owner), height)
     }
 
@@ -548,7 +577,7 @@ impl WorkQueue {
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
-    ) -> ByteReservation {
+    ) -> Result<ByteReservation, ReservationError> {
         let (released, claim) = {
             let mut inner = self.lock();
             let Some(ended) = inner.state.claim_received(owner, height) else {
@@ -556,9 +585,11 @@ impl WorkQueue {
             };
             let (outcome, claim) = self.return_items_locked(&mut inner, ended.owner, []);
             (
-                inner
-                    .funding
-                    .split(ended.released_bytes.saturating_add(outcome.released_bytes)),
+                self.split_receipt_funding(
+                    &mut inner,
+                    ended.released_bytes,
+                    outcome.released_bytes,
+                ),
                 claim,
             )
         };
@@ -575,7 +606,9 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let bytes = inner.state.release_reserved_heights(None, heights);
-        inner.funding.settle_into(&mut release, bytes);
+        if inner.funding.settle_into(&mut release, bytes).is_err() {
+            inner.admission_closed = true;
+        }
         drop(inner);
         drop(release);
         bytes
@@ -589,7 +622,9 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let bytes = inner.state.release_reserved_heights(Some(owner), heights);
-        inner.funding.settle_into(&mut release, bytes);
+        if inner.funding.settle_into(&mut release, bytes).is_err() {
+            inner.admission_closed = true;
+        }
         drop(inner);
         drop(release);
     }
@@ -603,9 +638,13 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let delta = inner.state.release_and_return_items(heights);
-        inner
+        if inner
             .funding
-            .settle_into(&mut release, delta.released_bytes);
+            .settle_into(&mut release, delta.released_bytes)
+            .is_err()
+        {
+            inner.admission_closed = true;
+        }
         drop(inner);
         drop(release);
         self.wake(delta.wake);
@@ -651,9 +690,13 @@ impl WorkQueue {
         let (outcome, claim) = {
             let mut inner = self.lock();
             let result = self.return_items_locked(&mut inner, owner, heights);
-            inner
+            if inner
                 .funding
-                .settle_into(&mut release, result.0.released_bytes);
+                .settle_into(&mut release, result.0.released_bytes)
+                .is_err()
+            {
+                inner.admission_closed = true;
+            }
             result
         };
         drop(release);
@@ -724,9 +767,13 @@ impl WorkQueue {
         let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         let delta = inner.state.advance_floor(floor);
-        inner
+        if inner
             .funding
-            .settle_into(&mut release, delta.released_bytes);
+            .settle_into(&mut release, delta.released_bytes)
+            .is_err()
+        {
+            inner.admission_closed = true;
+        }
         drop(inner);
         drop(release);
         self.wake(delta.wake);
@@ -752,9 +799,13 @@ impl WorkQueue {
             inner.request_writes.remove(&claim.owner());
         }
         let delta = inner.state.reset_above(floor);
-        inner
+        if inner
             .funding
-            .settle_into(&mut release, delta.released_bytes);
+            .settle_into(&mut release, delta.released_bytes)
+            .is_err()
+        {
+            inner.admission_closed = true;
+        }
         drop(inner);
         drop(release);
         drop(claims);

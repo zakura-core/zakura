@@ -90,6 +90,7 @@ async fn funded_receipt_survives_reset_and_replacement() {
     let receipt = f
         .work
         .begin_receipt_for_owner(owner, block::Height(1))
+        .unwrap()
         .unwrap();
     assert_eq!(receipt.funding.bytes(), 100);
     assert_eq!(f.work.reserved_bytes(), 100);
@@ -277,6 +278,7 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
     drop(
         f.work
             .begin_receipt_for_owner(owner, block::Height(1))
+            .unwrap()
             .unwrap(),
     );
     assert_eq!(
@@ -493,6 +495,7 @@ fn queue_failure_after_receipt_preserves_the_received_height() {
     drop(
         f.work
             .begin_receipt_for_owner(claim.owner(), block::Height(1))
+            .unwrap()
             .unwrap(),
     );
     drop(receiver);
@@ -682,12 +685,14 @@ fn receipt_retires_only_unwritten_requests_and_preserves_the_body() {
             if claim_received {
                 drop(
                     f.work
-                        .claim_receipt_for_owner(claim.owner(), block::Height(1)),
+                        .claim_receipt_for_owner(claim.owner(), block::Height(1))
+                        .unwrap(),
                 );
             } else {
                 drop(
                     f.work
                         .begin_receipt_for_owner(claim.owner(), block::Height(1))
+                        .unwrap()
                         .unwrap(),
                 );
             }
@@ -769,6 +774,7 @@ fn expiry_after_forward_reset_discards_committed_heights() {
             drop(
                 f.work
                     .begin_receipt_for_owner(claim.owner(), block::Height(1))
+                    .unwrap()
                     .unwrap(),
             );
         }
@@ -889,6 +895,7 @@ fn budget_ledger_gauges_follow_work_owners() {
     drop(
         f.work
             .begin_receipt_for_owner(claim.owner(), block::Height(1))
+            .unwrap()
             .unwrap(),
     );
     assert!(check(&f, "receipt").0 < 200);
@@ -950,6 +957,7 @@ fn answered_elsewhere_returns_the_settled_requests_charge() {
     let replacement = take(2, 1_500);
     let ended = work
         .begin_competing_receipt(replacement.owner(), height)
+        .unwrap()
         .expect("replacement owns the reserved height");
     assert_eq!(ended.charge, 1_500);
     assert_eq!(ended.funding.bytes(), 1_500);
@@ -1345,14 +1353,17 @@ fn funding_drift_closes_publication_and_survives_reset() {
     {
         let mut inner = f.work.lock();
         // Inject an untracked owner without changing the logical ledger.
-        inner.funding.merge(f.budget.reserve_owned(1).unwrap());
+        inner
+            .funding
+            .merge(&mut f.budget.reserve_owned(1).unwrap())
+            .unwrap();
     }
     assert!(!f.work.audit_funding());
     assert!(request
         .publish(|_| panic!("closed queue published"))
         .is_none());
     // Remove the injected owner so reset exercises a consistent drained queue.
-    let funding = f.work.lock().funding.split(1);
+    let funding = f.work.lock().funding.split(1).unwrap();
     drop(funding);
     f.work.reset_above(block::Height(0));
     assert_eq!(f.budget.reserved(), 0);
@@ -1374,10 +1385,158 @@ fn funding_drift_refuses_normal_and_floor_admission() {
         f.work
             .lock()
             .funding
-            .merge(f.budget.reserve_owned(1).unwrap());
+            .merge(&mut f.budget.reserve_owned(1).unwrap())
+            .unwrap();
         assert!(!f.work.audit_funding());
         assert!(taken.admit(floor, f.cancel.clone()).is_none());
         assert_eq!(f.budget.reserved(), 1);
         assert_eq!(f.work.pending_len(), 2);
+    }
+}
+
+#[test]
+fn failed_receipt_transfer_preserves_funding_and_reports_error() {
+    let mut f = Fixture::new();
+    let claim = f.take(1).publish(|_| {}).unwrap();
+    let retained = f.work.lock().funding.split(150).unwrap();
+    let outcome = f
+        .work
+        .begin_receipt_for_owner(claim.owner(), block::Height(1));
+    assert!(matches!(
+        outcome,
+        Err(crate::zakura::transport::ReservationError::Amount)
+    ));
+    assert!(f.work.lock().admission_closed);
+    assert!(f.budget.is_closed());
+    assert_eq!(f.work.lock().funding.bytes(), 50);
+    assert_eq!(f.budget.reserved(), 200);
+    assert!(!claim.try_start());
+    drop(claim);
+    f.work.reset_above(block::Height(0));
+    assert_eq!(
+        f.budget.reserved(),
+        200,
+        "reset retains quarantined funding"
+    );
+    let budget = f.budget.clone();
+    drop(f);
+    assert_eq!(budget.reserved(), 150);
+    drop(retained);
+    assert_eq!(budget.reserved(), 0);
+    assert!(budget.is_closed());
+}
+
+#[test]
+fn failed_settlement_retains_pool_without_poisoning_queue() {
+    for operation in 0..3 {
+        let mut f = Fixture::new();
+        let claim = f.take(1).publish(|_| {}).unwrap();
+        assert!(claim.try_start());
+        claim.written();
+        let retained = f.work.lock().funding.split(150).unwrap();
+        match operation {
+            0 => f.work.reset_above(block::Height(0)),
+            1 => f.work.advance_floor(block::Height(2)),
+            2 => f
+                .work
+                .release_reserved_heights_for_owner(claim.owner(), [block::Height(1)]),
+            _ => unreachable!(),
+        }
+        assert!(f.work.lock().admission_closed);
+        assert!(f.budget.is_closed());
+        assert_eq!(f.work.lock().funding.bytes(), 50);
+        assert_eq!(f.budget.reserved(), 200);
+        drop(claim);
+        drop(retained);
+        assert_eq!(f.budget.reserved(), 50);
+    }
+}
+
+#[test]
+fn rejected_publication_releases_wrong_budget_after_unlock() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+    struct Probe(Arc<WorkQueue>, AtomicBool);
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            self.1
+                .store(self.0.inner.try_lock().is_ok(), Ordering::SeqCst);
+        }
+    }
+    let mut f = Fixture::new();
+    let mut request = f.take(1);
+    let other = ByteBudget::new(1_000);
+    let original = std::mem::replace(&mut request.funding, other.reserve_owned(200).unwrap());
+    let probe = Arc::new(Probe(f.work.clone(), AtomicBool::new(false)));
+    let waker = Waker::from(probe.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut released = Box::pin(other.subscribe_capacity().notified());
+    assert!(released.as_mut().poll(&mut context).is_pending());
+    assert!(request
+        .publish(|_| panic!("wrong-budget request published"))
+        .is_none());
+    assert!(f.work.lock().admission_closed);
+    assert!(f.budget.is_closed());
+    assert!(other.is_closed());
+    assert_eq!(other.reserved(), 0);
+    assert!(
+        probe.1.load(Ordering::SeqCst),
+        "rejected funding woke under the queue lock"
+    );
+    assert_eq!(f.budget.reserved(), 200);
+    assert_eq!(f.work.reserved_bytes(), 0);
+    assert_eq!(f.work.pending_len(), 2);
+    drop(original);
+    assert_eq!(f.budget.reserved(), 0);
+}
+
+#[test]
+fn publication_amount_mismatch_quarantines_funding() {
+    let mut f = Fixture::new();
+    let mut request = f.take(1);
+    let retained = request.funding.split(1).unwrap();
+    assert!(request
+        .publish(|_| panic!("underfunded request published"))
+        .is_none());
+    assert!(f.work.lock().admission_closed);
+    assert!(f.budget.is_closed());
+    assert_eq!(f.work.lock().funding.bytes(), 199);
+    assert_eq!(f.budget.reserved(), 200);
+    f.work.reset_above(block::Height(0));
+    assert_eq!(f.budget.reserved(), 200);
+    drop(retained);
+    assert_eq!(f.budget.reserved(), 199);
+}
+
+#[test]
+fn closed_queue_never_starts_previously_published_request() {
+    for close_budget in [false, true] {
+        let mut f = Fixture::new();
+        let claim = f.take(1).publish(|_| {}).unwrap();
+        if close_budget {
+            f.budget.close();
+        } else {
+            f.work
+                .lock()
+                .funding
+                .merge(&mut f.budget.reserve_owned(1).unwrap())
+                .unwrap();
+            assert!(!f.work.audit_funding());
+        }
+        assert!(!claim.try_start(), "closed owner authorized a writer");
+        drop(claim);
+        assert_eq!(f.budget.reserved(), if close_budget { 0 } else { 1 });
+    }
+}
+
+impl WorkQueue {
+    pub(in crate::zakura::block_sync) fn retain_funding_for_test(
+        &self,
+        bytes: u64,
+    ) -> crate::zakura::transport::ByteReservation {
+        self.lock().funding.split(bytes).unwrap()
     }
 }

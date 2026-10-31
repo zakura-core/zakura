@@ -742,6 +742,7 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     let released = routine
         .work
         .begin_competing_receipt(owner, height)
+        .unwrap()
         .expect("the request still owns its reserved height");
     drop(released);
     assert!(routine

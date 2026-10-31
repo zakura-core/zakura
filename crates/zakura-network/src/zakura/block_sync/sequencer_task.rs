@@ -1831,6 +1831,7 @@ mod tests {
         drop(
             task.work
                 .begin_receipt_for_owner(owner, height)
+                .unwrap()
                 .expect("the test published this owner's reservation"),
         );
         let mut body = SequencedBody::new_queued(

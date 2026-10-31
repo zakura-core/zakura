@@ -277,7 +277,7 @@ impl UnpublishedRequest {
         let Self {
             mut taken,
             owner,
-            funding,
+            mut funding,
             cancel,
             ..
         } = self;
@@ -304,13 +304,17 @@ impl UnpublishedRequest {
             {
                 return None;
             }
+            let funded_bytes = funding.bytes();
+            if inner.funding.merge(&mut funding).is_err() {
+                inner.admission_closed = true;
+                return None;
+            }
             let transferred = inner.state.publish_claim(&claim.items);
-            debug_assert_eq!(
-                transferred,
-                funding.bytes(),
-                "an in-flight estimate never changes between take and publication"
-            );
-            inner.funding.merge(funding);
+            if transferred != funded_bytes {
+                inner.admission_closed = true;
+                claim.work.budget.close();
+                return None;
+            }
             inner.request_writes.insert(
                 claim.owner,
                 RequestWriteRegistration {
@@ -399,7 +403,9 @@ impl RequestWrite {
 impl FrameWriteClaim for RequestWrite {
     fn try_start(&self) -> bool {
         let inner = self.work.lock();
-        let current = !self.cancel.is_cancelled()
+        let current = !inner.admission_closed
+            && !self.work.budget.is_closed()
+            && !self.cancel.is_cancelled()
             && inner.state.is_published_claim(self.owner, self.heights());
         if !current {
             self.expire_unwritten();

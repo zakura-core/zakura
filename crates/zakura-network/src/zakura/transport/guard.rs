@@ -113,6 +113,15 @@ impl Drop for ByteRelease<'_> {
     }
 }
 
+/// A rejected ownership transfer leaves both owners unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum ReservationError {
+    #[error("reservation belongs to another budget")]
+    Budget,
+    #[error("transfer amount exceeds owned funding")]
+    Amount,
+}
+
 impl ByteReservation {
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn release_then(mut self, released: impl FnOnce()) {
@@ -128,47 +137,57 @@ impl ByteReservation {
         Arc::ptr_eq(&self.budget.inner, &other.budget.inner)
     }
 
-    /// Transfer an admitted charge into this owner.
-    pub(crate) fn merge(&mut self, mut other: Self) {
-        assert!(
-            self.same_budget(&other),
-            "reservation funding must match its owner"
-        );
-        self.bytes = self
-            .bytes
-            .checked_add(other.bytes)
-            .expect("owned charges fit the budget counter");
+    /// Transfer an admitted charge. Rejection preserves both owners and closes admission.
+    pub(crate) fn merge(&mut self, other: &mut Self) -> Result<(), ReservationError> {
+        if !self.same_budget(other) {
+            self.budget.close();
+            other.budget.close();
+            return Err(ReservationError::Budget);
+        }
+        let Some(total) = self.bytes.checked_add(other.bytes) else {
+            self.budget.close();
+            return Err(ReservationError::Amount);
+        };
+        self.bytes = total;
         other.bytes = 0;
+        Ok(())
     }
 
-    /// Transfer an owned charge into a deferred release for the same budget.
-    pub(crate) fn settle_into(&mut self, release: &mut ByteRelease<'_>, bytes: u64) {
-        assert!(
-            Arc::ptr_eq(&self.budget.inner, &release.budget.inner),
-            "settlement must retain the admission budget"
-        );
-        let remaining = self
+    /// Transfer funding to a deferred release. Rejection preserves both owners.
+    pub(crate) fn settle_into(
+        &mut self,
+        release: &mut ByteRelease<'_>,
+        bytes: u64,
+    ) -> Result<(), ReservationError> {
+        if !Arc::ptr_eq(&self.budget.inner, &release.budget.inner) {
+            self.budget.close();
+            release.budget.close();
+            return Err(ReservationError::Budget);
+        }
+        let amounts = self
             .bytes
             .checked_sub(bytes)
-            .expect("settlement cannot exceed its owned charge");
-        let released = release
-            .bytes
-            .checked_add(bytes)
-            .expect("aggregate settlement fits the budget counter");
+            .zip(release.bytes.checked_add(bytes));
+        let Some((remaining, released)) = amounts else {
+            self.budget.close();
+            return Err(ReservationError::Amount);
+        };
         self.bytes = remaining;
         release.bytes = released;
+        Ok(())
     }
 
-    /// Transfer part of this charge without returning capacity to the budget.
-    pub(crate) fn split(&mut self, bytes: u64) -> Self {
-        self.bytes = self
-            .bytes
-            .checked_sub(bytes)
-            .expect("a transfer cannot exceed its owned charge");
-        Self {
+    /// Transfer part of this charge. Rejection preserves funding and closes admission.
+    pub(crate) fn split(&mut self, bytes: u64) -> Result<Self, ReservationError> {
+        let Some(remaining) = self.bytes.checked_sub(bytes) else {
+            self.budget.close();
+            return Err(ReservationError::Amount);
+        };
+        self.bytes = remaining;
+        Ok(Self {
             budget: self.budget.clone(),
             bytes,
-        }
+        })
     }
 }
 
@@ -272,7 +291,7 @@ impl ByteBudget {
         self.inner.closed.load(Ordering::Acquire)
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             metrics::counter!("sync.block.budget.closed").increment(1);
         }
@@ -601,8 +620,8 @@ mod tests {
         let unrelated = budget.reserve_owned(17).unwrap();
         let mut funding = budget.reserve_owned(400).unwrap();
         let mut release = budget.deferred_release();
-        funding.settle_into(&mut release, 100);
-        funding.settle_into(&mut release, 50);
+        funding.settle_into(&mut release, 100).unwrap();
+        funding.settle_into(&mut release, 50).unwrap();
         assert_eq!(funding.bytes(), 250);
         assert_eq!(budget.reserved(), 417);
         drop(funding);
@@ -618,10 +637,12 @@ mod tests {
         let other = ByteBudget::new(1000);
         let mut funding = budget.reserve_owned(200).unwrap();
         let mut release = other.deferred_release();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            funding.settle_into(&mut release, 200);
-        }));
-        assert!(result.is_err());
+        assert_eq!(
+            funding.settle_into(&mut release, 200),
+            Err(ReservationError::Budget)
+        );
+        assert!(budget.is_closed());
+        assert!(other.is_closed());
         assert_eq!(funding.bytes(), 200);
         drop(release);
         assert_eq!(other.reserved(), 0);
@@ -637,12 +658,55 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut funding = budget.reserve_owned(200).unwrap();
             let mut release = budget.deferred_release();
-            funding.settle_into(&mut release, 100);
+            funding.settle_into(&mut release, 100).unwrap();
             panic!("transition interrupted after funding transfer");
         }));
         assert!(result.is_err());
         assert_eq!(budget.reserved(), 17);
         drop(unrelated);
+    }
+
+    #[test]
+    fn rejected_merge_preserves_equal_charges_in_both_budgets() {
+        let first = ByteBudget::new(400);
+        let second = ByteBudget::new(400);
+        let mut destination = first.reserve_owned(200).unwrap();
+        let mut source = second.reserve_owned(200).unwrap();
+        assert_eq!(
+            destination.merge(&mut source),
+            Err(ReservationError::Budget),
+            "equal charges do not authorize cross-budget transfer"
+        );
+        assert_eq!((destination.bytes(), source.bytes()), (200, 200));
+        assert_eq!((first.reserved(), second.reserved()), (200, 200));
+        assert!(first.is_closed() && second.is_closed());
+        drop(source);
+        assert_eq!((first.reserved(), second.reserved()), (200, 0));
+        drop(destination);
+        assert_eq!(first.reserved(), 0);
+    }
+
+    #[test]
+    fn rejected_transfer_preserves_pool_and_deferred_release() {
+        let budget = ByteBudget::new(400);
+        let mut funding = budget.reserve_owned(200).unwrap();
+        let mut release = budget.deferred_release();
+        funding.settle_into(&mut release, 50).unwrap();
+        assert_eq!(
+            funding.settle_into(&mut release, 151),
+            Err(ReservationError::Amount)
+        );
+        assert_eq!(funding.bytes(), 150);
+        assert_eq!(release.bytes, 50);
+        assert!(matches!(funding.split(151), Err(ReservationError::Amount)));
+        assert_eq!(funding.bytes(), 150);
+        assert_eq!(budget.reserved(), 200);
+        assert!(budget.is_closed());
+        drop(funding);
+        assert_eq!(budget.reserved(), 50);
+        drop(release);
+        assert_eq!(budget.reserved(), 0);
+        assert!(budget.is_closed());
     }
 
     #[test]

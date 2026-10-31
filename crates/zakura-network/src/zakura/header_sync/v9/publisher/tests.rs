@@ -11,11 +11,7 @@ use std::{
 
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
-use zakura_chain::work::difficulty::U256;
-use zakura_header_chain::{
-    AlarmSet, BodyWorkOwner, ChainScore, EngineMode, FrontierSet, HeaderLocator, StateVersion,
-    SuffixWork, VerifiedGeneration,
-};
+use zakura_header_chain::{BodyWorkOwner, HeaderLocator};
 use zakura_node_services::header_chain::{
     AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture, PortError, PrepareHeaderTarget,
     PrepareHeaderTargetReply, PreparedHeaderTarget, VctRepairContextReply,
@@ -36,7 +32,7 @@ use crate::zakura::{
 };
 
 mod load;
-mod state_machine;
+use super::model::snapshot;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -64,24 +60,6 @@ fn serve_limits() -> ServeLimits {
         node_output_responses: 16,
         peer_output_bytes: 1 << 20,
         node_output_bytes: 1 << 22,
-    }
-}
-
-/// A selected chain ending at `tip`.
-fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot {
-    EngineSnapshot {
-        mode: EngineMode::Integrated,
-        state_version: StateVersion::new(generation),
-        header_generation: HeaderGeneration::new(generation),
-        verified_generation: VerifiedGeneration::new(1),
-        frontiers: FrontierSet {
-            finalized: genesis,
-            header_best: tip,
-            verified_best: genesis,
-        },
-        header_best_score: ChainScore::new(SuffixWork::new(U256::from(tip.height.0)), tip.hash),
-        oldest_retained_height: block::Height(0),
-        alarms: AlarmSet::default(),
     }
 }
 
@@ -776,14 +754,19 @@ impl Publisher {
     fn tally(&self) -> (usize, usize) {
         let shared = lock(&self.shared);
         (
-            shared.publications.keys().count(),
-            shared.publications.tombstones(),
+            shared.state.publications.keys().count(),
+            shared.state.publications.tombstones(),
         )
+    }
+
+    /// Slots held by live subscriptions and unwritten terminal outcomes.
+    fn slots_held(&self) -> usize {
+        lock(&self.shared).slots.held()
     }
 
     /// Unacknowledged pages of `id`, if it is live.
     fn unacknowledged(&self, id: u64) -> Option<usize> {
-        lock(&self.shared).publications.unacknowledged(&id)
+        lock(&self.shared).state.publications.unacknowledged(&id)
     }
 }
 
@@ -1274,12 +1257,17 @@ async fn a_queued_outcome_wins_over_a_later_close() {
     // The task has not run between these, so both reach `end_due` together.
     let frame = {
         let mut shared = lock(&harness.publisher.shared);
-        shared.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
+        shared
+            .state
+            .queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
         assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
-        let ended = shared.end_due::<HB>();
+        let ended = shared.state.end_due();
         assert_eq!(ended, [HeadersOutcomeCode::SubscriptionSuperseded]);
-        let terminal = shared.next_terminal().expect("one subscription ends");
-        assert!(shared.next_terminal().is_none(), "one write at a time");
+        let terminal = shared.next_terminal::<HB>().expect("one subscription ends");
+        assert!(
+            shared.next_terminal::<HB>().is_none(),
+            "one write at a time"
+        );
         terminal.frame
     };
     assert!(matches!(
@@ -1992,22 +1980,23 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
 fn close_wins_over_an_outcome_found_after_it() {
     let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
     let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
-    let mut state = PublisherState::new();
+    let mut owner = PublisherOwner::new(PublisherState::new());
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(target.hash, vec![genesis], credit(), AuxSchema::None);
-    assert_eq!(state.apply(&open, limits()), Ok(Applied::Live));
-    let job = state
+    assert_eq!(owner.apply(&open, limits()), Ok(Applied::Live));
+    let job = owner
+        .state
         .next_job::<HB>(None, limits())
         .expect("the path has a page to read");
     let close = subscriber.close().expect("the subscription is live");
-    assert_eq!(state.apply(&close, limits()), Ok(Applied::Live));
+    assert_eq!(owner.apply(&close, limits()), Ok(Applied::Live));
     let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
-    state.finish(job.key, found, None);
+    owner.state.finish(job.key, found, None);
     assert_eq!(
-        state.end_due::<HB>(),
+        owner.state.end_due(),
         [HeadersOutcomeCode::SubscriptionClosed]
     );
-    let Terminal { frame, .. } = state.next_terminal().expect("one subscription ends");
+    let OwnedTerminal { frame, .. } = owner.next_terminal::<HB>().expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {
@@ -2210,6 +2199,97 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(harness.capacity.node_execution_held(), 0);
     assert!(port.store().leases.is_empty());
+}
+
+/// A page abandoned by `Close`, then by cancellation, leaves its worker holding
+/// its lease and its budgets until storage answers. The worker's end releases
+/// them, and the subscription's slot ended with its terminal write.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_read_keeps_its_lease_and_budgets_until_storage_answers() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None)
+        .await;
+    harness.drain().await;
+    assert_eq!(port.store().reads_running, 1);
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    assert_eq!(harness.apply(close).await, Ok(Applied::Live));
+    harness.drain().await;
+    assert_eq!(
+        harness.publisher.slots_held(),
+        0,
+        "the terminal write freed the slot before the read ended"
+    );
+
+    harness.cancel.cancel();
+    drop(harness.publisher);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(port.store().leases.len(), 1, "the worker holds its lease");
+    assert!(harness.capacity.node_execution_held() > 0);
+    assert!(harness.capacity.node_output_held() > 0);
+
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert!(port.store().leases.is_empty());
+    assert_eq!(harness.capacity.node_execution_held(), 0);
+    assert_eq!(harness.capacity.node_output_held(), 0);
+}
+
+/// A terminal outcome holds its slot while it waits for a full queue and
+/// through the queue, after its subscription's key is free. Only the writer
+/// taking its frame frees the slot. Cancellation drops a waiting outcome and
+/// frees its slot too.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_keeps_its_slot_through_the_output_path() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    // One slot, which the first page fills because nobody reads it.
+    let (publisher, mut recv, _cancel, _task) = session(&port, &capacity, &peer(7), 1, 1);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(publisher.tally().0, 0, "the subscription ended");
+    assert_eq!(publisher.slots_held(), 1, "the waiting outcome holds it");
+
+    // Read until the outcome, keeping the frame in the writer's hands.
+    loop {
+        let frame = tokio::time::timeout(QUIET, recv.recv())
+            .await
+            .expect("the outcome follows the pages")
+            .expect("the session is open");
+        if let Received::Ended(_) = subscriber.receive(&frame) {
+            break;
+        }
+    }
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(publisher.slots_held(), 0, "the writer took the frame");
+
+    // A new subscription's terminal waits on a queue a page fills again.
+    let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
+    let (other, _other_recv, cancel, task) = session(&port, &capacity, &peer(8), 2, 1);
+    other.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    other.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(other.slots_held(), 1);
+    cancel.cancel();
+    tokio::time::timeout(QUIET, task)
+        .await
+        .expect("cancel stops the publisher")
+        .expect("the publisher task does not panic");
+    assert_eq!(other.slots_held(), 0, "the dropped write freed its slot");
 }
 
 /// A burst of conformant grants yields to another peer's task.

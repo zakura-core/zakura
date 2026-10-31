@@ -10,10 +10,15 @@
 //! a job that state abandoned changes nothing and spends no credit.
 //!
 //! Terminal outcomes queue in state until the task takes them one at a time,
-//! writes each, and reports whether the stream took it. No job starts while
-//! an outcome waits, but the job in progress keeps settling. Cancellation, a
-//! closed stream, or a refused terminal write stops the publisher: state
-//! records the [`Exit`] and starts nothing more.
+//! writes each, and reports whether the stream took it under the outcome's
+//! [`SlotId`]. No job starts while an outcome waits, but the job in progress
+//! keeps settling. Cancellation, a closed stream, or a refused terminal write
+//! stops the publisher: state records the [`Exit`] and starts nothing more.
+//!
+//! State holds values only. The runtime owner holds each permit, frame, and
+//! capacity signal, and tells state about them by identity: a [`SlotOffer`]
+//! for an `Open`, a [`CapacityWait`] for a capacity refusal, and a [`Page`]'s
+//! facts for a page. Dropping this state releases nothing and wakes nobody.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -22,20 +27,17 @@ use std::{
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
-use zakura_node_services::header_chain::ServingCapacitySignal;
 
 use super::{
     super::{
-        entry_bytes, Cursor, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
-        SubscribeHeaders, HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
+        entry_bytes, Cursor, HeadersOutcomeCode, Operation, SubscribeHeaders,
+        HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
     },
     PageLimits, PublisherFault,
 };
 use crate::zakura::{
     header_sync::wire::{AuxSchema, MAX_HS_RANGE},
-    regulation::{Applied, Publications, SubscriptionLimits, TerminalPermit, Totals},
-    wire_codec::encode_frame,
-    Frame,
+    regulation::{Applied, PublicationLedger, SlotId, SlotOffer, SubscriptionLimits, Totals},
 };
 
 /// The fields an update must repeat from its `Open`.
@@ -45,13 +47,18 @@ struct Fixed {
     schema: AuxSchema,
 }
 
+/// The identity of one capacity release a stalled subscription waits for. The
+/// runtime owner holds the signal behind it and assigns the identity.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct CapacityWait(pub(super) u64);
+
 /// Why a subscription waits without a page in progress. Either kind retries
 /// after a `Grant` or a selected-chain change.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum Stall {
-    /// State refused a lease for capacity. Also retry when the signal is
-    /// released, because state may release it only on a later lease.
-    Capacity(ServingCapacitySignal),
+    /// Storage refused a lease for capacity. Also retry when this release
+    /// arrives, because storage may release it only on a later lease.
+    Capacity(CapacityWait),
     /// A local failure.
     Local,
 }
@@ -148,8 +155,9 @@ pub(super) struct Job {
     pub(super) selected: Option<EngineSnapshot>,
 }
 
-/// An encoded page and where it leaves its subscription.
-#[derive(Debug)]
+/// The facts of an encoded page: where it leaves its subscription and what
+/// it spends. The runtime owner holds the frame.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct Page {
     pub(super) parent: Frontier,
     pub(super) last: Frontier,
@@ -157,13 +165,12 @@ pub(super) struct Page {
     pub(super) target: Frontier,
     pub(super) count: u32,
     pub(super) reaches_target: bool,
-    pub(super) frame: Frame,
+    pub(super) payload_len: usize,
 }
 
-/// What a job found.
-#[derive(Debug)]
+/// What a job found, other than a page.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum Output {
-    Page(Page),
     /// A locator was the initial target, so there is no path to serve.
     ReachedAtOpen(Frontier),
     End(HeadersOutcomeCode),
@@ -175,11 +182,15 @@ pub(super) enum Output {
     Extends(block::Hash),
 }
 
-/// A subscription's terminal outcome, ready to write.
-#[derive(Debug)]
+/// A subscription's terminal outcome, ready to encode and write.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct Terminal {
-    pub(super) frame: Frame,
-    pub(super) permit: TerminalPermit,
+    pub(super) id: u64,
+    pub(super) target: block::Hash,
+    pub(super) outcome: HeadersOutcomeCode,
+    /// The ended subscription's slot, which holds this outcome's reserved
+    /// output.
+    pub(super) slot: SlotId,
     /// The job in progress for this subscription, which state abandoned.
     /// Drop its page when this outcome is written; a running job keeps its
     /// permit until storage answers.
@@ -212,7 +223,7 @@ pub(super) enum Recheck {
 /// and the publisher task.
 #[derive(Debug)]
 pub(super) struct PublisherState {
-    pub(super) publications: Publications<u64, Cursor>,
+    pub(super) publications: PublicationLedger<u64, Cursor>,
     /// Live and closing subscriptions, in the same set as `publications`.
     subscriptions: BTreeMap<u64, Subscription>,
     /// The subscription served last, so two subscriptions take turns.
@@ -223,8 +234,8 @@ pub(super) struct PublisherState {
     jobs_started: u64,
     /// Terminal outcomes to write, in order.
     terminals: VecDeque<Terminal>,
-    /// Whether the task is writing a terminal outcome.
-    writing: bool,
+    /// The slot of the terminal outcome the task is writing.
+    writing: Option<SlotId>,
     exit: Option<Exit>,
 }
 
@@ -234,13 +245,13 @@ impl PublisherState {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         Self {
-            publications: Publications::new(limits),
+            publications: PublicationLedger::new(limits),
             subscriptions: BTreeMap::new(),
             last_served: None,
             in_progress: None,
             jobs_started: 0,
             terminals: VecDeque::new(),
-            writing: false,
+            writing: None,
             exit: None,
         }
     }
@@ -253,68 +264,74 @@ impl PublisherState {
         self
     }
 
-    /// Check `update` and apply it to the subscription tools. A refused
-    /// update changes nothing.
-    pub(super) fn apply(
+    /// Check an `Open` and apply it to the ledger under the slot `offer`. A
+    /// refused `Open` changes nothing and leaves the offer with its owner.
+    pub(super) fn open(
         &mut self,
         update: &SubscribeHeaders,
         limits: PageLimits,
-    ) -> Result<Applied, PublisherFault> {
+        offer: SlotOffer,
+    ) -> Result<(), PublisherFault> {
+        let id = update.subscription_id;
+        let schema = update.tree_aux_schema;
+        if (limits.aux_schema_mask & schema.mask_bit()) != schema.mask_bit() {
+            return Err(PublisherFault::UnadvertisedSchema);
+        }
+        self.publications.open(
+            id,
+            update.update_sequence,
+            update.added_credit,
+            update.acknowledged,
+            offer,
+        )?;
+        self.subscriptions.insert(
+            id,
+            Subscription {
+                fixed: Fixed {
+                    target: update.initial_target_tip_hash,
+                    schema,
+                },
+                locators: update.locator_hashes.clone(),
+                position: Position::Path(None),
+                pin: None,
+                checked_tip: None,
+                end: None,
+                stall: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Check a `Grant` or `Close` and apply it to the ledger. A refused update
+    /// changes nothing.
+    pub(super) fn update(&mut self, update: &SubscribeHeaders) -> Result<Applied, PublisherFault> {
         let id = update.subscription_id;
         let fixed = Fixed {
             target: update.initial_target_tip_hash,
             schema: update.tree_aux_schema,
         };
-        match update.operation {
-            Operation::Open => {
-                if (limits.aux_schema_mask & fixed.schema.mask_bit()) != fixed.schema.mask_bit() {
-                    return Err(PublisherFault::UnadvertisedSchema);
-                }
-                self.publications.open(
-                    id,
-                    update.update_sequence,
-                    update.added_credit,
-                    update.acknowledged,
-                )?;
-                self.subscriptions.insert(
-                    id,
-                    Subscription {
-                        fixed,
-                        locators: update.locator_hashes.clone(),
-                        position: Position::Path(None),
-                        pin: None,
-                        checked_tip: None,
-                        end: None,
-                        stall: None,
-                    },
-                );
-                Ok(Applied::Live)
-            }
-            Operation::Grant | Operation::Close => {
-                // A tombstone matches by ID and sequence only, so only a
-                // live subscription checks the fixed fields.
-                let live = self.subscriptions.get(&id);
-                if live.is_some_and(|subscription| subscription.fixed != fixed) {
-                    return Err(PublisherFault::ChangedFields);
-                }
-                let applied = if update.operation == Operation::Close {
-                    self.publications
-                        .close(&id, update.update_sequence, &update.acknowledged)?
-                } else {
-                    self.publications.grant(
-                        &id,
-                        update.update_sequence,
-                        &update.acknowledged,
-                        update.added_credit,
-                    )?
-                };
-                // New credit lets a stalled subscription retry.
-                if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    subscription.stall = None;
-                }
-                Ok(applied)
-            }
+        // A tombstone matches by ID and sequence only, so only a live
+        // subscription checks the fixed fields.
+        let live = self.subscriptions.get(&id);
+        if live.is_some_and(|subscription| subscription.fixed != fixed) {
+            return Err(PublisherFault::ChangedFields);
         }
+        let applied = if update.operation == Operation::Close {
+            self.publications
+                .close(&id, update.update_sequence, &update.acknowledged)?
+        } else {
+            self.publications.grant(
+                &id,
+                update.update_sequence,
+                &update.acknowledged,
+                update.added_credit,
+            )?
+        };
+        // New credit lets a stalled subscription retry.
+        if let Some(subscription) = self.subscriptions.get_mut(&id) {
+            subscription.stall = None;
+        }
+        Ok(applied)
     }
 
     /// End every subscription that is closing or has an outcome queued, in
@@ -324,7 +341,7 @@ impl PublisherState {
     /// An outcome this node already queued wins over `SubscriptionClosed`,
     /// as the specification requires. Ending the subscription of the job in
     /// progress abandons that job.
-    pub(super) fn end_due<const HEADER_BYTES: usize>(&mut self) -> Vec<HeadersOutcomeCode> {
+    pub(super) fn end_due(&mut self) -> Vec<HeadersOutcomeCode> {
         let due: Vec<(u64, HeadersOutcomeCode)> = self
             .subscriptions
             .iter()
@@ -348,21 +365,16 @@ impl PublisherState {
                     ),
                     "the publisher queued {outcome:?} outside its window"
                 );
-                let permit = self.publications.end(&id)?;
+                let slot = self.publications.end(&id)?;
                 let abandons = self
                     .in_progress
                     .take_if(|job| job.subscription == id)
                     .map(|job| job.key);
-                let frame =
-                    encode_frame(&Message::<HEADER_BYTES>::HeadersOutcome(HeadersOutcome {
-                        subscription_id: id,
-                        initial_target_tip_hash: subscription.fixed.target,
-                        outcome,
-                    }))
-                    .expect("an outcome for a nonzero subscription ID always encodes");
                 self.terminals.push_back(Terminal {
-                    frame,
-                    permit,
+                    id,
+                    target: subscription.fixed.target,
+                    outcome,
+                    slot,
                     abandons,
                 });
                 Some(outcome)
@@ -373,19 +385,22 @@ impl PublisherState {
     /// Take the next terminal outcome to write, unless one is being written
     /// or the publisher stopped.
     pub(super) fn next_terminal(&mut self) -> Option<Terminal> {
-        if self.writing || self.exit.is_some() {
+        if self.writing.is_some() || self.exit.is_some() {
             return None;
         }
         let terminal = self.terminals.pop_front()?;
-        self.writing = true;
+        self.writing = Some(terminal.slot);
         Some(terminal)
     }
 
-    /// Record whether the stream took the terminal outcome being written. A
-    /// refusal stops the publisher.
-    pub(super) fn terminal_written(&mut self, written: bool) -> ControlFlow<Exit> {
-        debug_assert!(self.writing, "a terminal outcome was being written");
-        self.writing = false;
+    /// Record whether the stream took the terminal outcome being written
+    /// under `slot`. A refusal stops the publisher. A report for any other
+    /// slot changes nothing.
+    pub(super) fn terminal_written(&mut self, slot: SlotId, written: bool) -> ControlFlow<Exit> {
+        if self.writing != Some(slot) {
+            return ControlFlow::Continue(());
+        }
+        self.writing = None;
         if written {
             ControlFlow::Continue(())
         } else {
@@ -450,7 +465,7 @@ impl PublisherState {
         limits: PageLimits,
     ) -> Option<Job> {
         if self.in_progress.is_some()
-            || self.writing
+            || self.writing.is_some()
             || !self.terminals.is_empty()
             || self.exit.is_some()
         {
@@ -602,7 +617,6 @@ impl PublisherState {
                     subscription.stall = Some(stall);
                 }
             }
-            Output::Page(_) => unreachable!("pages commit through `commit`"),
         }
     }
 
@@ -638,7 +652,7 @@ impl PublisherState {
             return false;
         };
         // Widening usize to u64 is lossless on supported targets.
-        let bytes = page.frame.payload.len() as u64;
+        let bytes = page.payload_len as u64;
         let cursor = Cursor {
             height: page.last.height,
             hash: page.last.hash,
@@ -647,7 +661,7 @@ impl PublisherState {
         };
         if self
             .publications
-            .reserve_page(&id, page.count, page.frame.payload.len(), cursor)
+            .reserve_page(&id, page.count, page.payload_len, cursor)
             .is_err()
         {
             return false;
@@ -670,22 +684,22 @@ impl PublisherState {
         }
     }
 
-    /// Clear the capacity stalls that wait on any of the `released` signals.
-    pub(super) fn capacity_released(&mut self, released: &[ServingCapacitySignal]) {
+    /// Clear the capacity stalls that wait on any of the `released` waits.
+    pub(super) fn capacity_released(&mut self, released: &[CapacityWait]) {
         for subscription in self.subscriptions.values_mut() {
-            if matches!(&subscription.stall, Some(Stall::Capacity(signal)) if released.contains(signal))
+            if matches!(subscription.stall, Some(Stall::Capacity(wait)) if released.contains(&wait))
             {
                 subscription.stall = None;
             }
         }
     }
 
-    /// The capacity signals stalled subscriptions wait on.
-    pub(super) fn capacity_signals(&self) -> Vec<ServingCapacitySignal> {
+    /// The capacity releases stalled subscriptions wait for.
+    pub(super) fn capacity_waits(&self) -> Vec<CapacityWait> {
         self.subscriptions
             .values()
-            .filter_map(|subscription| match &subscription.stall {
-                Some(Stall::Capacity(signal)) => Some(signal.clone()),
+            .filter_map(|subscription| match subscription.stall {
+                Some(Stall::Capacity(wait)) => Some(wait),
                 _ => None,
             })
             .collect()

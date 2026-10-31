@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use futures::StreamExt as _;
 use indexmap::IndexSet;
 use tokio::sync::{mpsc, oneshot, watch};
 use tower::{service_fn, util::BoxCloneService};
@@ -48,6 +49,34 @@ fn block_1() -> Arc<Block> {
 
 fn block_2() -> Arc<Block> {
     block_from(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES)
+}
+
+fn block_3() -> Arc<Block> {
+    block_from(&zakura_test::vectors::BLOCK_MAINNET_3_BYTES)
+}
+
+/// Returns `block` with its parent replaced by `parent`, keeping its coinbase height.
+///
+/// The harness never checks proof of work, so the new hash only needs to be distinct.
+fn with_parent(block: &Block, parent: block::Hash) -> Arc<Block> {
+    let mut header = *block.header;
+    header.previous_block_hash = parent;
+
+    Arc::new(Block {
+        header: Arc::new(header),
+        transactions: block.transactions.clone(),
+    })
+}
+
+/// Returns `block` with a different nonce, so it is a distinct sibling with the same parent.
+fn sibling_of(block: &Block, nonce_byte: u8) -> Arc<Block> {
+    let mut header = *block.header;
+    header.nonce = [nonce_byte; 32].into();
+
+    Arc::new(Block {
+        header: Arc::new(header),
+        transactions: block.transactions.clone(),
+    })
 }
 
 fn legacy(last_octet: u8) -> zn::PeerSource {
@@ -240,13 +269,34 @@ impl Harness {
     }
 }
 
-/// Reproducer: a gossiped child arrives, and its parent was never requested.
+fn unavailable(byte: u8) -> block::Hash {
+    block::Hash([byte; 32])
+}
+
+impl Harness {
+    /// Returns every block request sent until the downloads go idle.
+    async fn drain_requests(&mut self) -> Vec<zn::Request> {
+        let mut requests = Vec::new();
+        while let Ok(Some(request)) = tokio::time::timeout(ABSENT_WAIT, self.requests.recv()).await
+        {
+            requests.push(request);
+        }
+        requests
+    }
+
+    fn parent_recoveries(&self) -> usize {
+        self.downloads.spawner.admission().parent_recoveries.len()
+    }
+}
+
+/// A gossiped child arrives, and its parent was never requested.
 ///
-/// Today nothing requests the parent. The child reaches the verifier and waits there, holding
-/// its global queue slot and its advertiser's only legacy slot, so even an `inv` for the parent
-/// from the child's advertiser is refused.
+/// The child's advertiser has the parent, so the parent is requested from it as soon as the
+/// downloaded child shows the parent is missing. The recovery is not charged to that
+/// advertiser's legacy slot, which the waiting child holds. Both blocks then commit in order,
+/// through the normal verifier path, and the recovery's bookkeeping is released.
 #[tokio::test(start_paused = true)]
-async fn child_before_unrequested_parent_never_requests_the_parent() {
+async fn child_before_unrequested_parent_requests_the_parent_from_the_childs_advertiser() {
     let parent = block_1();
     let child = block_2();
     let mut harness = Harness::new([parent.clone(), child.clone()]);
@@ -261,34 +311,38 @@ async fn child_before_unrequested_parent_never_requests_the_parent() {
         harness.next_request().await,
         request_from(child.hash(), legacy(2))
     );
-
-    harness
-        .assert_no_request("nothing requests the missing parent")
-        .await;
-    harness
-        .assert_no_commit("the child waits for a parent that never arrives")
-        .await;
-
     assert_eq!(
-        harness.downloads.queue_len(),
-        1,
-        "the waiting child keeps its inbound queue slot"
+        harness.next_request().await,
+        request_from(parent.hash(), legacy(2)),
+        "the missing parent is requested from the child's advertiser"
     );
-    assert_eq!(
-        harness
-            .downloads
-            .download_and_verify(parent.hash(), Some(legacy(2))),
-        DownloadAction::FullQueue,
-        "the waiting child holds its advertiser's only legacy slot, so that peer's parent inv is refused"
-    );
+
+    assert_eq!(harness.next_commit().await, parent.hash());
+    assert_eq!(harness.next_commit().await, child.hash());
+    harness
+        .assert_no_request("one recovery request per missing parent")
+        .await;
+
+    let mut results = HashSet::new();
+    for _ in 0..2 {
+        let hash = tokio::time::timeout(EXPECTED_WAIT, harness.downloads.next())
+            .await
+            .expect("a finished download is yielded")
+            .expect("the downloads stream is open")
+            .expect("the download succeeds");
+        results.insert(hash);
+    }
+    assert_eq!(results, HashSet::from([parent.hash(), child.hash()]));
+    assert_eq!(harness.downloads.spawner.admission().queue_len(), 0);
+    assert_eq!(harness.parent_recoveries(), 0);
 }
 
-/// Reproducer: a gossiped child arrives while its parent is downloading from a slow source.
+/// A gossiped child arrives while its parent is downloading from a slow source.
 ///
-/// The child waits for the existing parent download, and commits as soon as the parent does.
-/// No second request is made, so the child's latency is the slow source's latency.
+/// The child attaches to the existing parent download instead of starting a second one, and
+/// commits as soon as the parent does. Hedging a slow source is a separate, measured policy.
 #[tokio::test(start_paused = true)]
-async fn child_before_slow_parent_waits_for_the_parent_download() {
+async fn child_before_slow_parent_attaches_to_the_parent_download() {
     let parent = block_1();
     let child = block_2();
     let mut harness = Harness::new([parent.clone(), child.clone()]);
@@ -319,11 +373,12 @@ async fn child_before_slow_parent_waits_for_the_parent_download() {
     }
 
     harness
-        .assert_no_request("the existing parent download is the only parent request")
+        .assert_no_request("the child attaches to the existing parent download")
         .await;
     harness
         .assert_no_commit("the child waits for the slow parent")
         .await;
+    assert_eq!(harness.parent_recoveries(), 0);
 
     release_parent
         .send(())
@@ -331,4 +386,200 @@ async fn child_before_slow_parent_waits_for_the_parent_download() {
 
     assert_eq!(harness.next_commit().await, parent.hash());
     assert_eq!(harness.next_commit().await, child.hash());
+}
+
+/// Two children of the same missing parent share one parent download.
+#[tokio::test(start_paused = true)]
+async fn concurrent_children_share_one_parent_download() {
+    let parent = block_1();
+    let child = block_2();
+    let sibling = sibling_of(&child, 7);
+    assert_ne!(child.hash(), sibling.hash());
+    let mut harness = Harness::new([parent.clone(), child.clone(), sibling.clone()]);
+    let release_parent = harness.hold(parent.hash());
+
+    for (block, source) in [(&child, legacy(2)), (&sibling, legacy(3))] {
+        assert_eq!(
+            harness
+                .downloads
+                .download_and_verify(block.hash(), Some(source)),
+            DownloadAction::AddedToQueue
+        );
+    }
+
+    let requests = harness.drain_requests().await;
+    let parent_requests = requests
+        .iter()
+        .filter(|request| requested_hash(request) == parent.hash())
+        .count();
+    assert_eq!(
+        requests.len(),
+        3,
+        "two children and one parent: {requests:?}"
+    );
+    assert_eq!(parent_requests, 1, "children share the parent download");
+    assert_eq!(harness.parent_recoveries(), 1);
+
+    release_parent
+        .send(())
+        .expect("the parent request is waiting for release");
+
+    assert_eq!(harness.next_commit().await, parent.hash());
+    let children = HashSet::from([harness.next_commit().await, harness.next_commit().await]);
+    assert_eq!(children, HashSet::from([child.hash(), sibling.hash()]));
+}
+
+/// A parent that no peer delivers does not stop an unrelated block whose parent is known.
+#[tokio::test(start_paused = true)]
+async fn unavailable_parent_does_not_block_unrelated_ready_blocks() {
+    let orphan = with_parent(&block_2(), unavailable(0x42));
+    let ready = block_1();
+    let mut harness = Harness::new([orphan.clone(), ready.clone()]);
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(orphan.hash(), Some(legacy(2))),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(orphan.hash(), legacy(2))
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(unavailable(0x42), legacy(2))
+    );
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(ready.hash(), Some(legacy(3))),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(ready.hash(), legacy(3))
+    );
+    assert_eq!(harness.next_commit().await, ready.hash());
+
+    harness
+        .assert_no_commit("the orphan still waits for its unavailable parent")
+        .await;
+}
+
+/// A recovered parent whose own parent is missing does not start another recovery.
+#[tokio::test(start_paused = true)]
+async fn recovered_parent_does_not_recover_its_own_parent() {
+    let parent = with_parent(&block_1(), unavailable(0x77));
+    let child = with_parent(&block_2(), parent.hash());
+    let mut harness = Harness::new([parent.clone(), child.clone()]);
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(legacy(2))),
+        DownloadAction::AddedToQueue
+    );
+
+    let requests = harness.drain_requests().await;
+    assert_eq!(
+        requests,
+        vec![
+            request_from(child.hash(), legacy(2)),
+            request_from(parent.hash(), legacy(2)),
+        ],
+        "recovery stops after one hop"
+    );
+}
+
+/// A child more than one block beyond the tip's child leaves the gap to the syncer.
+#[tokio::test(start_paused = true)]
+async fn child_beyond_one_hop_from_the_tip_does_not_recover_its_parent() {
+    // The tip is at height 0, so block 3 is missing two blocks.
+    let child = block_3();
+    let mut harness = Harness::new([block_2(), child.clone()]);
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(legacy(2))),
+        DownloadAction::AddedToQueue
+    );
+
+    assert_eq!(
+        harness.drain_requests().await,
+        vec![request_from(child.hash(), legacy(2))]
+    );
+}
+
+/// One advertiser can have only one recovery in flight, however many orphans it sends.
+#[tokio::test(start_paused = true)]
+async fn one_parent_recovery_per_advertiser() {
+    let peer = zn::PeerSource::Zakura(
+        zn::zakura::ZakuraPeerId::new(vec![9; 32]).expect("test peer id is within bounds"),
+    );
+    let orphans = [
+        with_parent(&block_2(), unavailable(0x51)),
+        with_parent(&block_2(), unavailable(0x52)),
+    ];
+    let mut harness = Harness::new(orphans.clone());
+
+    for orphan in &orphans {
+        assert_eq!(
+            harness
+                .downloads
+                .download_and_verify(orphan.hash(), Some(peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+    }
+
+    let requests = harness.drain_requests().await;
+    let recoveries = requests
+        .iter()
+        .filter(|request| [unavailable(0x51), unavailable(0x52)].contains(&requested_hash(request)))
+        .count();
+    assert_eq!(
+        requests.len(),
+        3,
+        "two orphans and one recovery: {requests:?}"
+    );
+    assert_eq!(recoveries, 1);
+    assert_eq!(harness.parent_recoveries(), 1);
+}
+
+/// A flood of orphans with unavailable parents, from many advertisers, starts at most
+/// [`MAX_PARENT_RECOVERIES`] recoveries.
+#[tokio::test(start_paused = true)]
+async fn orphan_flood_with_unavailable_parents_is_bounded() {
+    const ORPHANS: u8 = 40;
+
+    let orphans: Vec<_> = (0..ORPHANS)
+        .map(|index| with_parent(&block_2(), unavailable(100 + index)))
+        .collect();
+    let mut harness = Harness::new(orphans.clone());
+
+    for (index, orphan) in (0..ORPHANS).zip(&orphans) {
+        assert_eq!(
+            harness
+                .downloads
+                .download_and_verify(orphan.hash(), Some(legacy(100 + index))),
+            DownloadAction::AddedToQueue
+        );
+    }
+
+    let requests = harness.drain_requests().await;
+    let orphan_hashes: HashSet<_> = orphans.iter().map(|orphan| orphan.hash()).collect();
+    let recoveries = requests
+        .iter()
+        .filter(|request| !orphan_hashes.contains(&requested_hash(request)))
+        .count();
+
+    assert_eq!(requests.len() - recoveries, usize::from(ORPHANS));
+    assert_eq!(recoveries, MAX_PARENT_RECOVERIES);
+    assert_eq!(harness.parent_recoveries(), MAX_PARENT_RECOVERIES);
+    assert_eq!(
+        harness.downloads.spawner.admission().queue_len(),
+        usize::from(ORPHANS) + MAX_PARENT_RECOVERIES
+    );
 }

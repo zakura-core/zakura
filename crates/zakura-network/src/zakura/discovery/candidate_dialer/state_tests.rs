@@ -15,6 +15,8 @@ use proptest::prelude::*;
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::time::Instant;
 
+#[cfg(test)]
+use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration};
 use super::state::{CandidateAddress, CandidateDialerState, DialAttemptKey};
 use super::DiscoveryDialResult;
 #[cfg(test)]
@@ -811,4 +813,97 @@ fn candidate_witness_rejects_lost_backoff() {
     run(decode(WITNESS), |state, _, now| {
         state.begin_round(now + Duration::from_secs(120));
     });
+}
+
+/// Every observation against the outcome the attempt's identity earns. A
+/// registration without this attempt's authentication never credits or charges
+/// the attempt.
+#[test]
+fn registrations_credit_only_the_attempt_that_authenticated() {
+    use DiscoveryDialResult as Result;
+    use PeerRegistration::{Absent, Ended, Live};
+    let dial = DialObservation::DialEnded;
+    for (observation, authenticated, expected) in [
+        (
+            dial(DialFinish::Served, Live),
+            true,
+            Some(Result::ConnectedElsewhere),
+        ),
+        (
+            dial(DialFinish::Failed, Live),
+            false,
+            Some(Result::ConnectedElsewhere),
+        ),
+        (
+            dial(DialFinish::LocalLimit, Live),
+            false,
+            Some(Result::ConnectedElsewhere),
+        ),
+        (
+            dial(DialFinish::Served, Ended),
+            true,
+            Some(Result::ShortLivedRegistered),
+        ),
+        (
+            dial(DialFinish::Failed, Ended),
+            true,
+            Some(Result::ShortLivedRegistered),
+        ),
+        (dial(DialFinish::Failed, Ended), false, Some(Result::Failed)),
+        (
+            dial(DialFinish::LocalLimit, Ended),
+            false,
+            Some(Result::LocalResourceLimit),
+        ),
+        (
+            dial(DialFinish::AlpnMismatch, Ended),
+            false,
+            Some(Result::AlpnMismatch),
+        ),
+        (
+            dial(DialFinish::Served, Absent),
+            true,
+            Some(Result::ShortLivedRegistered),
+        ),
+        (
+            dial(DialFinish::Served, Absent),
+            false,
+            Some(Result::Failed),
+        ),
+        (dial(DialFinish::Failed, Absent), true, Some(Result::Failed)),
+        (
+            dial(DialFinish::LocalLimit, Absent),
+            true,
+            Some(Result::LocalResourceLimit),
+        ),
+        (
+            dial(DialFinish::AlpnMismatch, Absent),
+            false,
+            Some(Result::AlpnMismatch),
+        ),
+        (
+            DialObservation::RegistrationHealthy,
+            true,
+            Some(Result::Registered),
+        ),
+        (
+            DialObservation::RegistrationHealthy,
+            false,
+            Some(Result::ConnectedElsewhere),
+        ),
+        (
+            DialObservation::RegistrationEnded,
+            true,
+            Some(Result::ShortLivedRegistered),
+        ),
+        (DialObservation::RegistrationEnded, false, None),
+        (DialObservation::WatchClosed, true, Some(Result::Failed)),
+        (DialObservation::WatchClosed, false, Some(Result::Failed)),
+    ] {
+        assert_eq!(
+            classify_dial(observation, authenticated),
+            expected,
+            "{observation:?} authenticated={authenticated}"
+        );
+    }
 }

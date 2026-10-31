@@ -12,6 +12,60 @@ use crate::{
     BoxError,
 };
 
+/// How far one candidate dial attempt got.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DialPhase {
+    /// The dialer recorded the attempt and reserved its IPs.
+    Recorded,
+    /// The peer appeared in the registrations during the attempt.
+    RegistrationSeen,
+    /// The peer left the registrations during the attempt.
+    RegistrationEnded,
+    /// The attempt's worker returned its classified result.
+    WorkerFinished,
+    /// Shutdown aborted the attempt's worker.
+    WorkerCancelled,
+    /// The attempt's worker panicked.
+    WorkerPanicked,
+}
+
+impl DialPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::RegistrationSeen => "registration_seen",
+            Self::RegistrationEnded => "registration_ended",
+            Self::WorkerFinished => "worker_finished",
+            Self::WorkerCancelled => "worker_cancelled",
+            Self::WorkerPanicked => "worker_panicked",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct DiscoveryDialPhaseEvent {
+    event: &'static str,
+    peer: Option<String>,
+    attempt: u64,
+    phase: &'static str,
+}
+
+impl DiscoveryDialPhaseEvent {
+    pub(super) fn new(node_id: &[u8], attempt: u64, phase: DialPhase) -> Self {
+        let peer = ZakuraPeerId::new(node_id.to_vec())
+            .map(|peer| peer_label(&peer))
+            .ok();
+        Self {
+            event: d_trace::DISCOVERY_DIAL_PHASE,
+            peer,
+            attempt,
+            phase: phase.label(),
+        }
+    }
+}
+
+zakura_jsonl_trace::impl_jsonl_trace_event!(DiscoveryDialPhaseEvent, DISCOVERY_TABLE);
+
 #[derive(Debug, Serialize)]
 pub(super) struct DiscoveryDialResultEvent {
     event: &'static str,
@@ -155,6 +209,21 @@ mod tests {
                 "event": "discovery_dial_result",
                 "result": "failed",
                 "peer": null,
+            })
+        );
+    }
+
+    #[test]
+    fn dial_phase_schema_carries_the_attempt_identity() {
+        let peer = ZakuraPeerId::new(vec![7; 32]).expect("a 32-byte id is a valid peer id");
+        let event = DiscoveryDialPhaseEvent::new(&[7; 32], 5, DialPhase::WorkerCancelled);
+        assert_eq!(
+            serde_json::to_value(event).expect("event serializes"),
+            json!({
+                "event": "discovery_dial_phase",
+                "peer": peer_label(&peer),
+                "attempt": 5,
+                "phase": "worker_cancelled",
             })
         );
     }

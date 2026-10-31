@@ -33,6 +33,85 @@ pub(super) struct DialAttemptKey {
     sequence: u64,
 }
 
+impl DialAttemptKey {
+    /// The attempt's number, which trace rows carry.
+    pub(super) fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+/// How one attempt's own dial ended.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum DialFinish {
+    /// The dial finished serving its connection.
+    Served,
+    /// This node hit a local limit.
+    LocalLimit,
+    /// The peer speaks another ALPN.
+    AlpnMismatch,
+    /// The dial failed, or its task ended without a result.
+    Failed,
+}
+
+/// What the supervisor's registrations showed for the attempt's peer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum PeerRegistration {
+    /// The peer has not been registered during this attempt.
+    Absent,
+    /// The peer is registered now.
+    Live,
+    /// The peer was registered during this attempt, and no longer is.
+    Ended,
+}
+
+/// What ended the dial worker's wait.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum DialObservation {
+    /// The attempt's own dial ended.
+    DialEnded(DialFinish, PeerRegistration),
+    /// A registration lasted [`ZAKURA_REDIAL_HEALTHY_CONNECTION`](
+    /// super::ZAKURA_REDIAL_HEALTHY_CONNECTION).
+    RegistrationHealthy,
+    /// A registration ended while the attempt's own dial still ran.
+    RegistrationEnded,
+    /// The registration watch closed.
+    WatchClosed,
+}
+
+/// Classifies `observation` for one attempt, or returns `None` if the attempt
+/// goes on waiting for its own dial.
+///
+/// A registration is keyed by peer, so it cannot say which connection it came
+/// from. `authenticated` says whether this attempt's dial passed TLS, which the
+/// dial reports before it registers the peer. A registration without it belongs
+/// to another connection, so it earns this attempt no success and no failure.
+pub(super) fn classify_dial(
+    observation: DialObservation,
+    authenticated: bool,
+) -> Option<DiscoveryDialResult> {
+    use DiscoveryDialResult as Result;
+    Some(match observation {
+        DialObservation::DialEnded(_, PeerRegistration::Live) => Result::ConnectedElsewhere,
+        // The registration watch can lag a dial that already finished serving.
+        DialObservation::DialEnded(_, PeerRegistration::Ended)
+        | DialObservation::DialEnded(DialFinish::Served, PeerRegistration::Absent)
+            if authenticated =>
+        {
+            Result::ShortLivedRegistered
+        }
+        DialObservation::DialEnded(finish, _) => match finish {
+            DialFinish::LocalLimit => Result::LocalResourceLimit,
+            DialFinish::AlpnMismatch => Result::AlpnMismatch,
+            DialFinish::Served | DialFinish::Failed => Result::Failed,
+        },
+        DialObservation::RegistrationHealthy if authenticated => Result::Registered,
+        DialObservation::RegistrationHealthy => Result::ConnectedElsewhere,
+        DialObservation::RegistrationEnded if authenticated => Result::ShortLivedRegistered,
+        DialObservation::RegistrationEnded => return None,
+        DialObservation::WatchClosed => Result::Failed,
+    })
+}
+
 /// A candidate address the dialer may reserve: the first address of its IP
 /// in record order, with that IP canonicalised.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

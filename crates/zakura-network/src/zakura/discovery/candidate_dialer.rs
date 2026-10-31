@@ -30,7 +30,7 @@ use zakura_rt::{
 use super::dialer::native_discovery_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
-use super::trace::DiscoveryDialResultEvent;
+use super::trace::{DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
     ZakuraTrace,
@@ -42,7 +42,10 @@ mod state_tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state_tests::{replay_candidate_dial_bytes, CandidateDialReplaySummary};
 
-use state::{CandidateDialerState, DialAttemptKey};
+use state::{
+    classify_dial, CandidateDialerState, DialAttemptKey, DialFinish, DialObservation,
+    PeerRegistration,
+};
 
 /// How often the discovery dialer wakes to look for new candidates.
 const ZAKURA_DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(1);
@@ -70,11 +73,23 @@ impl DiscoveryDialResult {
     }
 }
 
+/// How one dial worker's task ended.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WorkerEnd {
+    /// The task returned its classified result.
+    Finished,
+    /// Shutdown aborted the task, possibly before its first poll.
+    Cancelled,
+    /// The task panicked.
+    Panicked,
+}
+
 #[derive(Debug)]
 struct DiscoveryDialOutcome {
     /// The IP whose handshake TLS authenticated, if this worker's dial got that far.
     admitted_ip: Option<IpAddr>,
     result: DiscoveryDialResult,
+    worker: WorkerEnd,
 }
 
 /// Spawn the long-lived discovery candidate dialer for `endpoint`.
@@ -210,13 +225,14 @@ impl CandidateDialerIO {
 
             self.discovery.mark_dial_attempt(&attempt.node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
+            trace_dial_phase(&self.trace, attempt, DialPhase::Recorded);
             self.workers.push(DiscoveryDialWorker::spawn(
                 attempt,
                 run_discovery_dial_once(
                     self.endpoint.clone(),
                     node_addr,
                     self.limits.clone(),
-                    attempt.node_id,
+                    attempt,
                 ),
             ));
         }
@@ -230,6 +246,7 @@ impl CandidateDialerIO {
         attempt: DialAttemptKey,
         outcome: DiscoveryDialOutcome,
     ) {
+        trace_dial_phase(&self.trace, attempt, outcome.worker.phase());
         if !state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()) {
             return;
         }
@@ -249,6 +266,7 @@ impl CandidateDialerIO {
             worker.task.abort();
         }
         while let Some((attempt, outcome)) = self.workers.next().await {
+            trace_dial_phase(&self.trace, attempt, outcome.worker.phase());
             state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now());
         }
     }
@@ -282,13 +300,17 @@ impl Future for DiscoveryDialWorker {
             Err(error) => {
                 debug!(?error, attempt = ?self.attempt, "Zakura discovery dial worker failed");
                 metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
-                if error.is_panic() {
+                let worker = if error.is_panic() {
                     metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
                     tracing::error!(attempt = ?self.attempt, "Zakura discovery dial worker panicked");
-                }
+                    WorkerEnd::Panicked
+                } else {
+                    WorkerEnd::Cancelled
+                };
                 DiscoveryDialOutcome {
                     admitted_ip: None,
                     result: DiscoveryDialResult::Failed,
+                    worker,
                 }
             }
         };
@@ -338,13 +360,15 @@ async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
-    node_id: NodeId,
+    attempt: DialAttemptKey,
 ) -> DiscoveryDialOutcome {
-    let Ok(peer_id) = ZakuraPeerId::new(node_id.as_bytes().to_vec()) else {
-        return DiscoveryDialOutcome {
-            admitted_ip: None,
-            result: DiscoveryDialResult::Failed,
-        };
+    let finished = |result| DiscoveryDialOutcome {
+        admitted_ip: None,
+        result,
+        worker: WorkerEnd::Finished,
+    };
+    let Ok(peer_id) = ZakuraPeerId::new(attempt.node_id.as_bytes().to_vec()) else {
+        return finished(DiscoveryDialResult::Failed);
     };
     let mut registered = endpoint.supervisor().subscribe();
     if registered
@@ -352,111 +376,195 @@ async fn run_discovery_dial_once(
         .iter()
         .any(|id| id == &peer_id)
     {
-        return DiscoveryDialOutcome {
-            admitted_ip: None,
-            result: DiscoveryDialResult::ConnectedElsewhere,
-        };
+        return finished(DiscoveryDialResult::ConnectedElsewhere);
     }
 
-    let (admitted_ip_tx, mut admitted_ip_rx) = oneshot::channel();
-    let mut dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
+    let trace = endpoint.trace();
+    let (admitted_ip_tx, admitted_ip_rx) = oneshot::channel();
+    let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
     }));
+    DialWatch {
+        attempt,
+        peer_id,
+        registered,
+        dial,
+        admitted_ip_rx,
+        admitted_ip: None,
+        registration: PeerRegistration::Absent,
+        trace,
+    }
+    .run()
+    .await
+}
 
-    let result = loop {
-        if registered
+/// One attempt's own dial and what the registrations show for its peer.
+struct DialWatch {
+    attempt: DialAttemptKey,
+    peer_id: ZakuraPeerId,
+    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    dial: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
+    /// Carries the IP whose handshake TLS authenticated. The dial task sends it
+    /// before it registers the peer.
+    admitted_ip_rx: oneshot::Receiver<IpAddr>,
+    admitted_ip: Option<IpAddr>,
+    registration: PeerRegistration,
+    trace: ZakuraTrace,
+}
+
+impl DialWatch {
+    /// Waits until the observations classify the attempt, then gives the dial
+    /// to its owner.
+    ///
+    /// A dial that authenticated its peer hands its serving task to the
+    /// connection's lifetime. Any other dial ends with its attempt, so its
+    /// handshake cannot outlive the per-IP reservation that this attempt's
+    /// settlement releases. Cancellation before this point drops the guard and
+    /// aborts the dial.
+    async fn run(mut self) -> DiscoveryDialOutcome {
+        let result = self.classified().await;
+        let admitted_ip = self.admitted_ip();
+        if admitted_ip.is_some() {
+            drop(self.dial.detach());
+        }
+        DiscoveryDialOutcome {
+            admitted_ip,
+            result,
+            worker: WorkerEnd::Finished,
+        }
+    }
+
+    async fn classified(&mut self) -> DiscoveryDialResult {
+        loop {
+            let observation = if self.peer_is_registered() {
+                self.registration_began();
+                self.observe_registered().await
+            } else {
+                self.observe_unregistered().await
+            };
+            let Some(observation) = observation else {
+                continue;
+            };
+            if observation == DialObservation::RegistrationEnded {
+                self.registration = PeerRegistration::Ended;
+                trace_dial_phase(&self.trace, self.attempt, DialPhase::RegistrationEnded);
+            }
+            if let Some(result) = classify_dial(observation, self.admitted_ip().is_some()) {
+                return result;
+            }
+        }
+    }
+
+    /// Waits while the peer is unregistered. Returns `None` once the
+    /// registrations change.
+    async fn observe_unregistered(&mut self) -> Option<DialObservation> {
+        zakura_rt::select! {
+            dial = &mut self.dial => Some(self.dial_ended(dial)),
+            changed = self.registered.changed() => {
+                changed.is_err().then_some(DialObservation::WatchClosed)
+            }
+        }
+    }
+
+    /// Waits while the peer is registered, for at most the time that makes a
+    /// registration healthy.
+    async fn observe_registered(&mut self) -> Option<DialObservation> {
+        let healthy = zakura_rt::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
+        zakura_rt::pin!(healthy);
+        loop {
+            if !self.peer_is_registered() {
+                return Some(DialObservation::RegistrationEnded);
+            }
+            zakura_rt::select! {
+                dial = &mut self.dial => return Some(self.dial_ended(dial)),
+                changed = self.registered.changed() => {
+                    if changed.is_err() {
+                        return Some(DialObservation::WatchClosed);
+                    }
+                }
+                _ = &mut healthy => return Some(DialObservation::RegistrationHealthy),
+            }
+        }
+    }
+
+    /// Whether the peer is registered now, marking the watch seen.
+    fn peer_is_registered(&mut self) -> bool {
+        self.registered
             .borrow_and_update()
             .iter()
-            .any(|id| id == &peer_id)
-        {
-            break wait_for_discovery_registration_to_settle(&mut registered, &peer_id, &mut dial)
-                .await;
-        }
+            .any(|id| id == &self.peer_id)
+    }
 
-        zakura_rt::select! {
-            dial_result = &mut dial => {
-                break match dial_result {
-                    // `native_bootstrap_dial` returns `Ok(())` only after the connection
-                    // finishes; discovery success is the peer appearing in the registration watch.
-                    Ok(Ok(())) => {
-                        if registered.borrow_and_update().iter().any(|id| id == &peer_id) {
-                            DiscoveryDialResult::ConnectedElsewhere
-                        } else {
-                            DiscoveryDialResult::Failed
-                        }
-                    }
-                    Ok(Err(ZakuraHandlerError::ResourceLimit(_))) => {
-                        DiscoveryDialResult::LocalResourceLimit
-                    }
-                    Ok(Err(error)) if error.is_alpn_mismatch() => {
-                        debug!(?error, "Zakura discovery peer speaks another protocol version");
-                        DiscoveryDialResult::AlpnMismatch
-                    }
-                    Ok(Err(error)) => {
-                        debug!(?error, "Zakura discovery dial failed");
-                        DiscoveryDialResult::Failed
-                    }
-                    Err(error) => {
-                        debug!(?error, "Zakura discovery dial task failed");
-                        DiscoveryDialResult::Failed
-                    }
-                };
-            }
-            changed = registered.changed() => {
-                if changed.is_err() {
-                    break DiscoveryDialResult::Failed;
-                }
-            }
-        }
-    };
+    fn registration_began(&mut self) {
+        self.registration = PeerRegistration::Live;
+        trace_dial_phase(&self.trace, self.attempt, DialPhase::RegistrationSeen);
+    }
 
-    // A completed registration hands the serving task to the connection lifetime.
-    // Cancellation before this point drops the guard and aborts the dial.
-    drop(dial.detach());
-    DiscoveryDialOutcome {
-        // The dial task sends the admitted IP before it registers the peer. An
-        // empty channel means this dial never authenticated the peer itself.
-        admitted_ip: admitted_ip_rx.try_recv().ok(),
-        result,
+    /// The observation for a dial that ended with `dial`, which reads the
+    /// registrations once more.
+    fn dial_ended(
+        &mut self,
+        dial: Result<Result<(), ZakuraHandlerError>, zakura_rt::task::JoinError>,
+    ) -> DialObservation {
+        let registration = if self.peer_is_registered() {
+            PeerRegistration::Live
+        } else if self.registration == PeerRegistration::Absent {
+            PeerRegistration::Absent
+        } else {
+            PeerRegistration::Ended
+        };
+        DialObservation::DialEnded(dial_finish(dial), registration)
+    }
+
+    /// The IP this attempt's dial authenticated, once the dial reported it.
+    fn admitted_ip(&mut self) -> Option<IpAddr> {
+        if self.admitted_ip.is_none() {
+            self.admitted_ip = self.admitted_ip_rx.try_recv().ok();
+        }
+        self.admitted_ip
     }
 }
 
-async fn wait_for_discovery_registration_to_settle(
-    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
-    peer_id: &ZakuraPeerId,
-    dial: &mut AbortOnDropHandle<Result<(), crate::zakura::ZakuraHandlerError>>,
-) -> DiscoveryDialResult {
-    let healthy = zakura_rt::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
-    zakura_rt::pin!(healthy);
-
-    loop {
-        if !registered
-            .borrow_and_update()
-            .iter()
-            .any(|id| id == peer_id)
-        {
-            return DiscoveryDialResult::ShortLivedRegistered;
+/// How a finished dial task ended.
+fn dial_finish(
+    dial: Result<Result<(), ZakuraHandlerError>, zakura_rt::task::JoinError>,
+) -> DialFinish {
+    match dial {
+        // `native_bootstrap_dial` returns `Ok(())` only after the connection
+        // finishes.
+        Ok(Ok(())) => DialFinish::Served,
+        Ok(Err(ZakuraHandlerError::ResourceLimit(_))) => DialFinish::LocalLimit,
+        Ok(Err(error)) if error.is_alpn_mismatch() => {
+            debug!(
+                ?error,
+                "Zakura discovery peer speaks another protocol version"
+            );
+            DialFinish::AlpnMismatch
         }
+        Ok(Err(error)) => {
+            debug!(?error, "Zakura discovery dial failed");
+            DialFinish::Failed
+        }
+        Err(error) => {
+            debug!(?error, "Zakura discovery dial task failed");
+            DialFinish::Failed
+        }
+    }
+}
 
-        zakura_rt::select! {
-            _dial_result = &mut *dial => {
-                let still_registered = registered
-                    .borrow_and_update()
-                    .iter()
-                    .any(|id| id == peer_id);
-                return if still_registered {
-                    DiscoveryDialResult::ConnectedElsewhere
-                } else {
-                    DiscoveryDialResult::ShortLivedRegistered
-                };
-            }
-            changed = registered.changed() => {
-                if changed.is_err() {
-                    return DiscoveryDialResult::Failed;
-                }
-            }
-            _ = &mut healthy => return DiscoveryDialResult::Registered,
+fn trace_dial_phase(trace: &ZakuraTrace, attempt: DialAttemptKey, phase: DialPhase) {
+    trace.emit_event(|| {
+        DiscoveryDialPhaseEvent::new(attempt.node_id.as_bytes(), attempt.sequence(), phase)
+    });
+}
+
+impl WorkerEnd {
+    fn phase(self) -> DialPhase {
+        match self {
+            Self::Finished => DialPhase::WorkerFinished,
+            Self::Cancelled => DialPhase::WorkerCancelled,
+            Self::Panicked => DialPhase::WorkerPanicked,
         }
     }
 }
@@ -631,7 +739,7 @@ mod tests {
                         endpoint.clone(),
                         NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                         limits.clone(),
-                        target,
+                        attempt,
                     ),
                 );
                 let mut packet = [0; 2048];
@@ -689,39 +797,149 @@ mod tests {
         assert_eq!(state.in_flight_dials_to(ip), 0);
     }
 
+    const DIAL_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
+
+    /// One attempt's watch of a dial that runs `dial`, with the registration
+    /// watch's sender and the sender that reports the authenticated IP.
+    fn dial_watch(
+        byte: u8,
+        registered: Vec<ZakuraPeerId>,
+        dial: impl Future<Output = Result<(), ZakuraHandlerError>> + Send + 'static,
+    ) -> (
+        DialWatch,
+        watch::Sender<Vec<ZakuraPeerId>>,
+        oneshot::Sender<IpAddr>,
+    ) {
+        let (registered_tx, registered_rx) = watch::channel(registered);
+        let (admitted_tx, admitted_ip_rx) = oneshot::channel();
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        let watch = DialWatch {
+            attempt: state
+                .record_attempt(node_id(byte), vec![DIAL_IP])
+                .expect("a fresh dialer records the attempt"),
+            peer_id: peer_id(byte),
+            registered: registered_rx,
+            dial: AbortOnDropHandle::new(zakura_rt::task::spawn(dial)),
+            admitted_ip_rx,
+            admitted_ip: None,
+            registration: PeerRegistration::Absent,
+            trace: ZakuraTrace::default(),
+        };
+        (watch, registered_tx, admitted_tx)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn registration_drop_before_healthy_threshold_is_short_lived() {
-        let peer_id = peer_id(7);
-        let (registered_tx, mut registered_rx) = tokio::sync::watch::channel(vec![peer_id.clone()]);
-        let mut dial = AbortOnDropHandle::new(zakura_rt::task::spawn(async {
-            std::future::pending::<Result<(), crate::zakura::ZakuraHandlerError>>().await
-        }));
+        let peer = peer_id(7);
+        let (watch, registered_tx, admitted_tx) = dial_watch(7, vec![peer], std::future::pending());
+        admitted_tx.send(DIAL_IP).unwrap();
 
-        let settled =
-            wait_for_discovery_registration_to_settle(&mut registered_rx, &peer_id, &mut dial);
-        tokio::pin!(settled);
-        tokio::select! {
-            biased;
-            result = &mut settled => panic!("settled before registration dropped: {result:?}"),
-            _ = tokio::task::yield_now() => {}
-        }
+        let settled = tokio::spawn(watch.run());
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "the registration is live");
 
         registered_tx.send_replace(Vec::new());
-        assert_eq!(settled.await, DiscoveryDialResult::ShortLivedRegistered);
+        let outcome = settled.await.unwrap();
+        assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
+        assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
     }
 
     #[tokio::test(start_paused = true)]
     async fn dial_completion_with_live_registration_is_connected_elsewhere() {
-        let peer_id = peer_id(9);
-        let (_registered_tx, mut registered_rx) =
-            tokio::sync::watch::channel(vec![peer_id.clone()]);
-        let mut dial = AbortOnDropHandle::new(zakura_rt::task::spawn(async { Ok(()) }));
-
+        let (watch, _registered_tx, _admitted_tx) =
+            dial_watch(9, vec![peer_id(9)], std::future::ready(Ok(())));
         assert_eq!(
-            wait_for_discovery_registration_to_settle(&mut registered_rx, &peer_id, &mut dial)
-                .await,
+            watch.run().await.result,
             DiscoveryDialResult::ConnectedElsewhere
         );
+    }
+
+    /// A dial that served its connection before the watch showed the peer ran
+    /// a real, short connection, not a failed dial.
+    #[tokio::test(start_paused = true)]
+    async fn a_served_dial_with_a_delayed_registration_is_short_lived() {
+        let (watch, _registered_tx, admitted_tx) =
+            dial_watch(10, Vec::new(), std::future::ready(Ok(())));
+        admitted_tx.send(DIAL_IP).unwrap();
+        let outcome = watch.run().await;
+        assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
+        assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+    }
+
+    /// Another connection's registration ending says nothing about this
+    /// attempt, which goes on to report its own dial's failure.
+    #[tokio::test(start_paused = true)]
+    async fn another_connections_registration_ending_keeps_the_attempt_waiting() {
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+        let (watch, registered_tx, _admitted_tx) = dial_watch(11, vec![peer_id(11)], async move {
+            let _ = fail_rx.await;
+            Err(ZakuraHandlerError::ResourceLimit(
+                "the test dial hit a limit",
+            ))
+        });
+        let settled = tokio::spawn(watch.run());
+        tokio::task::yield_now().await;
+
+        registered_tx.send_replace(Vec::new());
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "the attempt's own dial still runs");
+
+        fail_tx.send(()).unwrap();
+        let outcome = settled.await.unwrap();
+        assert_eq!(outcome.result, DiscoveryDialResult::LocalResourceLimit);
+        assert_eq!(outcome.admitted_ip, None);
+    }
+
+    /// A registration that lasts on another connection does not credit this
+    /// attempt, and the attempt's own handshake ends with it.
+    #[tokio::test(start_paused = true)]
+    async fn another_connections_healthy_registration_ends_the_unfinished_dial() {
+        let retained = std::sync::Arc::new(());
+        let observed = std::sync::Arc::downgrade(&retained);
+        let (watch, _registered_tx, _admitted_tx) = dial_watch(12, vec![peer_id(12)], async move {
+            let _retained = retained;
+            std::future::pending().await
+        });
+        let outcome = watch.run().await;
+        assert_eq!(outcome.result, DiscoveryDialResult::ConnectedElsewhere);
+        assert_eq!(outcome.admitted_ip, None);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(observed.upgrade().is_none(), "the dial was aborted");
+    }
+
+    /// This attempt's healthy connection keeps serving past its attempt.
+    #[tokio::test(start_paused = true)]
+    async fn an_authenticated_healthy_registration_hands_the_dial_to_its_connection() {
+        let retained = std::sync::Arc::new(());
+        let observed = std::sync::Arc::downgrade(&retained);
+        let (watch, _registered_tx, admitted_tx) = dial_watch(13, vec![peer_id(13)], async move {
+            let _retained = retained;
+            std::future::pending().await
+        });
+        admitted_tx.send(DIAL_IP).unwrap();
+        let outcome = watch.run().await;
+        assert_eq!(outcome.result, DiscoveryDialResult::Registered);
+        assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(observed.upgrade().is_some(), "the dial keeps serving");
+    }
+
+    /// A cancelled worker reports its identity and its end.
+    #[tokio::test]
+    async fn a_cancelled_worker_reports_how_it_ended() {
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        let attempt = state.record_attempt(node_id(14), vec![DIAL_IP]).unwrap();
+        let worker = DiscoveryDialWorker::spawn(attempt, std::future::pending());
+        worker.task.abort();
+        let (settled, outcome) = worker.await;
+        assert_eq!(settled, attempt);
+        assert_eq!(outcome.worker, WorkerEnd::Cancelled);
     }
 
     // V12 F-71: the reservation counts one dial per IP, and the endpoint

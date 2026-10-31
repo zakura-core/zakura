@@ -166,8 +166,80 @@ fn the_envelope_doubles_each_window_and_stays_within_the_node_budget() {
         envelope.retained_bytes_bound(100, 16, 1 << 20),
         u128::from(envelope.node_raw_bytes)
             + u128::from(envelope.node_output_bytes)
+            + u128::from(envelope.compat_response_bytes)
+            + 200 * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u128
             + 2 * 100 * 16 * (1 << 20),
     );
+}
+
+/// A saturated stream's floor funds one frame. A multi-frame result waits for the
+/// shared budgets, and a one-frame result still finishes through the floor.
+#[test]
+fn only_a_one_frame_result_uses_the_floor() {
+    let (gate, connection, _node) = gate(10, 200);
+    let saturating = gate.try_admit(10).unwrap();
+    assert!(
+        gate.admit_result(2, 10).now_or_never().is_none(),
+        "the floor does not fund a multi-frame result"
+    );
+    let floor = gate
+        .admit_result(1, 10)
+        .now_or_never()
+        .expect("the floor funds one frame");
+    assert_eq!(connection.granted(), 10, "the floor charges no shared bytes");
+    drop((floor, saturating));
+    let shared = gate
+        .admit_result(2, 10)
+        .now_or_never()
+        .expect("released shared bytes fund the result");
+    assert_eq!(connection.granted(), 10);
+    drop(shared);
+    assert_eq!(connection.granted(), 0);
+}
+
+/// The compatibility partition never charges or waits for native raw or output
+/// bytes, and a waiter that gives up takes nothing.
+#[test]
+fn compat_exchanges_use_their_own_partition() {
+    let node = NodeResources::new(ResourceEnvelope::new(10, 10, 4));
+    let connection = node.connection();
+    let partition = connection.compat_responses().clone();
+    let capacity = ResourceEnvelope::new(10, 10, 4).compat_response_bytes;
+
+    // Native budgets of ten bytes do not limit a whole exchange.
+    let held = connection
+        .admit_compat_response(capacity)
+        .now_or_never()
+        .expect("an idle partition funds one exchange");
+    assert_eq!(partition.granted(), capacity);
+    assert_eq!(node.owners().counts().installed, 1);
+
+    assert!(connection
+        .admit_compat_response(1)
+        .now_or_never()
+        .is_none());
+    assert_eq!(partition.granted(), capacity, "the waiter took nothing");
+
+    drop(held);
+    assert_eq!(partition.granted(), 0);
+    assert_eq!(node.owners().counts().total(), 0);
+
+    // A request larger than the partition clamps to it, so it can still finish.
+    let clamped = connection
+        .admit_compat_response(u64::MAX)
+        .now_or_never()
+        .expect("the grant clamps to the partition");
+    assert_eq!(partition.granted(), capacity);
+    drop(clamped);
+}
+
+/// The partition funds at least one worst-case exchange on every configuration.
+#[test]
+fn the_compat_partition_funds_a_worst_case_exchange() {
+    for (window, connections) in [(1, 1), (32 << 20, 100), (1 << 40, 1 << 16)] {
+        let envelope = ResourceEnvelope::new(window, window, connections);
+        assert!(envelope.compat_response_bytes >= COMPAT_EXCHANGE_MAX_BYTES);
+    }
 }
 
 #[derive(Debug, Clone)]

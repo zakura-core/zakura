@@ -58,7 +58,7 @@ use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
-    ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources, OrderedStreamFailure,
+    CompatResponseGrant, ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources, OrderedStreamFailure,
     OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout, StreamResources,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -243,8 +243,7 @@ const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 /// (`legacy_gossip::LEGACY_RESPONSE_MAX_AGGREGATE_BYTES`), so an honest peer
 /// never sends more than this; clamping the requester budget to the same
 /// operational aggregate is the symmetric requester-side mirror.
-const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
-    8 * zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
+const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize = super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -1344,7 +1343,8 @@ impl ZakuraPeerHandle {
 
     /// Open a request stream, write one frame, then return the response frames from the same stream.
     ///
-    /// `started` is described on [`ZakuraOutboundFrame::Request`].
+    /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned value
+    /// funds its frames until it drops.
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -1353,7 +1353,7 @@ impl ZakuraPeerHandle {
         flags: u16,
         payload: Vec<u8>,
         started: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<Vec<Frame>, BoxError> {
+    ) -> Result<ResponseFrames, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
             stream_kind,
@@ -1371,6 +1371,33 @@ impl ZakuraPeerHandle {
         completed
             .await
             .map_err(|_| -> BoxError { "Zakura outbound completion dropped".into() })?
+    }
+}
+
+/// A compatibility response's validated frames and the grant that funds them.
+///
+/// The grant funds the frames and their decoder's reassembly copy, so a requester
+/// keeps this value until its decoder returns.
+#[derive(Debug)]
+pub struct ResponseFrames {
+    frames: Vec<Frame>,
+    grant: Option<CompatResponseGrant>,
+}
+
+impl ResponseFrames {
+    /// Split the frames from the grant that funds them.
+    pub(crate) fn into_parts(self) -> (Vec<Frame>, Option<CompatResponseGrant>) {
+        (self.frames, self.grant)
+    }
+}
+
+impl From<Vec<Frame>> for ResponseFrames {
+    /// Frames that another owner funds, such as a scripted peer's fixed answer.
+    fn from(frames: Vec<Frame>) -> Self {
+        Self {
+            frames,
+            grant: None,
+        }
     }
 }
 
@@ -1395,8 +1422,8 @@ pub enum ZakuraOutboundFrame {
         /// Only legacy gossip sets it, and legacy code stays on tokio, so this
         /// is tokio's sender in both builds.
         started: Option<tokio::sync::oneshot::Sender<()>>,
-        /// Completion sent with decoded raw response frames or an error.
-        completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
+        /// Completion sent with validated response frames or an error.
+        completion: oneshot::Sender<Result<ResponseFrames, BoxError>>,
     },
 }
 
@@ -3326,6 +3353,7 @@ impl ZakuraProtocolHandler {
                                 }
                                 result = write_outbound_request_frame(
                                     &connection,
+                                    &connection_resources,
                                     limits,
                                     stream,
                                     request_id,
@@ -5363,7 +5391,6 @@ async fn request_stream_worker(
             frame,
         ) => response,
     };
-    drop(execution);
     drop(raw_grant);
     let response_frames = match response {
         Ok(frames) => frames,
@@ -5388,15 +5415,17 @@ async fn request_stream_worker(
     };
 
     // The result is the worker's own retained memory. Fund it through the write,
-    // and stop at this owner when the output budgets are saturated.
+    // and stop at this owner when the output budgets are saturated. The execution
+    // slot stays held until then, so request workers bound the unfunded results.
     let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
         bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
     });
     let _result = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        result = context.resources.output.admit(result_bytes) => result,
+        result = context.resources.output.admit_result(response_frames.len(), result_bytes) => result,
     };
+    drop(execution);
     for frame in response_frames {
         if let Err(error) =
             write_response_frame(&mut send, frame, context.limits, response_frame_cap).await
@@ -5771,17 +5800,19 @@ async fn write_encoded_ordered_frame(
 #[allow(clippy::too_many_arguments)]
 async fn write_outbound_request_frame(
     connection: &Connection,
+    resources: &ConnectionResources,
     limits: ZakuraConnectionLimits,
     stream: Stream,
     request_id: u64,
     message_type: u16,
     flags: u16,
     payload: Vec<u8>,
-) -> Result<Vec<Frame>, OutboundRequestError> {
+) -> Result<ResponseFrames, OutboundRequestError> {
     timeout(
         OUTBOUND_REQUEST_RESPONSE_TIMEOUT,
         write_outbound_request_frame_inner(
             connection,
+            resources,
             limits,
             stream,
             request_id,
@@ -5797,19 +5828,22 @@ async fn write_outbound_request_frame(
 #[allow(clippy::too_many_arguments)]
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
+    resources: &ConnectionResources,
     limits: ZakuraConnectionLimits,
     stream: Stream,
     request_id: u64,
     message_type: u16,
     flags: u16,
     payload: Vec<u8>,
-) -> Result<Vec<Frame>, OutboundRequestError> {
+) -> Result<ResponseFrames, OutboundRequestError> {
     // The legacy request stream validates responses with a legacy-message-specific budget.
-    let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
-        message_type,
-        &payload,
-        limits,
-    )?);
+    let budget = LegacyResponseBudget::from_request(message_type, &payload, limits)?;
+    // Fund the whole response before the stream opens. The read state's precheck
+    // keeps each frame within this budget before the reader allocates its payload.
+    let grant = resources
+        .admit_compat_response(budget.retained_bytes())
+        .await;
+    let mut legacy_state = LegacyResponseReadState::new(budget);
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -5871,7 +5905,10 @@ async fn write_outbound_request_frame_inner(
             }
             Err(ZakuraHandlerError::Closed) => {
                 legacy_state.finish()?;
-                return Ok(frames);
+                return Ok(ResponseFrames {
+                    frames,
+                    grant: Some(grant),
+                });
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
                 return Err(OutboundRequestError::Local(Box::new(
@@ -6000,6 +6037,26 @@ impl LegacyResponseBudget {
             max_bytes,
             max_message_bytes,
         })
+    }
+}
+
+impl LegacyResponseBudget {
+    /// The bytes one exchange under this budget retains at its peak: its frames,
+    /// plus the validator's and the decoder's reassembly copies of one object.
+    fn retained_bytes(&self) -> u64 {
+        let copies = match self.kind {
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => self
+                .max_bytes
+                .min(self.max_message_bytes)
+                .saturating_mul(2),
+            LegacyResponseKind::BlockHashes
+            | LegacyResponseKind::BlockHeaders
+            | LegacyResponseKind::TransactionIds
+            | LegacyResponseKind::Pong
+            | LegacyResponseKind::Nil => 0,
+        };
+        // Widening usize to u64 is lossless on supported targets.
+        self.max_bytes.saturating_add(copies) as u64
     }
 }
 

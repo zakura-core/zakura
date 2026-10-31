@@ -168,7 +168,8 @@ const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 /// per-response cap (`LegacyResponseBudget`); this is the responder-side mirror.
 /// Sized well above any single response the local service emits (zakurad caps
 /// `getdata` at ~1 MiB) yet far below memory-risk thresholds.
-const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
+const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
+    super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
@@ -2390,10 +2391,13 @@ impl ZakuraRequestClient {
                 return Err(error);
             }
         };
+        // The grant funds the frames and the decoder's reassembly copy. It ends when
+        // the raw response does. The caller's pipeline owns the decoded payloads.
+        let (frames, _grant) = response.into_parts();
         let mut response = match LegacyResponseCodec::decode_response(
             request_id,
             request_kind,
-            response,
+            frames,
             requested.as_ref(),
         ) {
             Ok(response) => response,
@@ -3351,6 +3355,7 @@ pub(super) mod bounded_decoding;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zakura::ResponseFrames;
     use std::{
         collections::HashSet,
         sync::{
@@ -3639,6 +3644,7 @@ mod tests {
                     let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)
                         .expect("the protocol message limit fits in u32");
                     LegacyResponseCodec::encode_response(request_id, answer, cap, cap)
+                        .map(ResponseFrames::from)
                         .map_err(BoxError::from)
                 };
                 let frames = tokio::select! {

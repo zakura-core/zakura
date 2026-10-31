@@ -1316,28 +1316,29 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
     Ok(())
 }
 
+const PING: MessageRule = MessageRule {
+    name: "ping",
+    message_type: LEGACY_REQUEST_PING,
+    payload: PayloadLen::exact(8),
+    role: MessageRole::Request {
+        max_in_flight: 1,
+        cadence: None,
+    },
+};
+const PONG: MessageRule = MessageRule {
+    name: "pong",
+    message_type: LEGACY_RESPONSE_PONG,
+    payload: PayloadLen::exact(8),
+    role: MessageRole::Response {
+        request: PING.message_type,
+        ends_exchange: true,
+    },
+};
+
 /// Each end of a request/response stream admits only its role: the responder
 /// reads requests, and the requester reads responses.
 #[tokio::test]
 async fn request_response_tables_reject_the_other_role_before_payloads() -> Result<(), BoxError> {
-    const PING: MessageRule = MessageRule {
-        name: "ping",
-        message_type: LEGACY_REQUEST_PING,
-        payload: PayloadLen::exact(8),
-        role: MessageRole::Request {
-            max_in_flight: 1,
-            cadence: None,
-        },
-    };
-    const PONG: MessageRule = MessageRule {
-        name: "pong",
-        message_type: LEGACY_RESPONSE_PONG,
-        payload: PayloadLen::exact(8),
-        role: MessageRole::Response {
-            request: PING.message_type,
-            ends_exchange: true,
-        },
-    };
     let _guard = zakura_test::init();
     let (server, client, connection, remote) = raw_connection().await?;
     let stream = Stream {
@@ -1380,8 +1381,10 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
     .expect("the request header is rejected without waiting for its absent payload");
     assert!(cancel.is_cancelled());
 
+    let resources = ConnectionResources::unconstrained();
     let response = write_outbound_request_frame(
         &connection,
+        &resources,
         limits,
         stream,
         42,
@@ -1423,6 +1426,105 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
                 )
         )
     );
+    connection.close(0u32.into(), b"done");
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
+    Ok(())
+}
+
+/// The requester funds a response before it opens the stream, keeps that funding
+/// through a complete response, and returns it when the frames' owner drops. A
+/// failed exchange returns it at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), BoxError> {
+    use crate::zakura::{transport::NodeResources, transport::ResourceEnvelope};
+    let _guard = zakura_test::init();
+    let (server, client, connection, remote) = raw_connection().await?;
+    let stream = Stream {
+        kind: LEGACY_REQUEST_STREAM_KIND,
+        mode: StreamMode::RequestResponse,
+        messages: Some(&[PING, PONG]),
+        ..DATA
+    };
+    Stream::check_layout(&[stream])?;
+    let limits = raw_worker_context(&client, Arc::new(Semaphore::new(1))).limits;
+    let node = NodeResources::new(ResourceEnvelope::new(1 << 20, 1 << 20, 1));
+    let resources = node.connection();
+
+    // A saturated partition holds the exchange back before its stream opens.
+    let capacity = ResourceEnvelope::new(1 << 20, 1 << 20, 1).compat_response_bytes;
+    let saturated = resources.admit_compat_response(capacity).await;
+    let blocked = write_outbound_request_frame(
+        &connection,
+        &resources,
+        limits,
+        stream,
+        41,
+        PING.message_type,
+        0,
+        vec![0; 8],
+    );
+    assert!(timeout(Duration::from_millis(50), blocked).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(50), remote.accept_bi())
+            .await
+            .is_err(),
+        "an unfunded exchange opens no stream"
+    );
+    drop(saturated);
+    assert_eq!(resources.compat_responses().granted(), 0);
+
+    let response = write_outbound_request_frame(
+        &connection,
+        &resources,
+        limits,
+        stream,
+        42,
+        PING.message_type,
+        0,
+        vec![0; 8],
+    );
+    let responder = async {
+        let (mut send, mut recv) = remote.accept_bi().await?;
+        read_stream_prelude(&mut recv, TEST_TIMEOUT).await?;
+        read_frame(
+            &mut recv,
+            stream.frame_cap,
+            FrameFilter::new(stream.messages, InboundReader::Responder),
+            TEST_TIMEOUT,
+            Some(TEST_TIMEOUT),
+        )
+        .await?;
+        assert!(
+            resources.compat_responses().granted() > 0,
+            "the requester funded the response before the responder saw the request"
+        );
+        let frame = Frame {
+            message_type: PONG.message_type,
+            flags: 0,
+            payload: 42u64.to_le_bytes().to_vec(),
+        };
+        send.write_all(&frame.encode(stream.frame_cap)?).await?;
+        send.finish()?;
+        Ok::<_, BoxError>((send, recv))
+    };
+    let (result, held_stream) = tokio::join!(timeout(TEST_TIMEOUT, response), responder);
+    let _held_stream = held_stream?;
+    let frames = match result? {
+        Ok(frames) => frames,
+        Err(_) => panic!("the peer sent a valid response"),
+    };
+    assert_eq!(node.owners().counts().installed, 1);
+    let (frames, grant) = frames.into_parts();
+    assert_eq!(frames.len(), 1);
+    assert!(
+        resources.compat_responses().granted() > 0,
+        "the grant funds the frames until the decoder finishes"
+    );
+    drop(grant);
+    assert_eq!(resources.compat_responses().granted(), 0);
+    assert_eq!(node.owners().counts().total(), 0);
+
     connection.close(0u32.into(), b"done");
     timeout(TEST_TIMEOUT, client.shutdown()).await?;
     timeout(TEST_TIMEOUT, server.shutdown()).await?;

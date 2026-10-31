@@ -18,6 +18,11 @@
 //!   a reader of [`OwnerLedger`] sees setup, installed, and retiring owners
 //!   together across reconnects.
 //!
+//! - A [`CompatResponseGrant`] funds one outbound compatibility exchange from a
+//!   partition of its own. The requester holds it from before it opens the stream
+//!   until its decoder finishes, so a response's frames and reassembly copies never
+//!   compete with native traffic for raw frame bytes.
+//!
 //! Waiting here is local backpressure. It never faults a peer. A paused reader
 //! stops granting QUIC credit, and the peer memory budget already funds that
 //! unspent credit. Reading a frame moves its bytes out of QUIC's buffers, so a
@@ -35,6 +40,23 @@ use crate::zakura::{
     regulation::{sizing, OutputByteBudget, OutputGrant, SlotBudget, SlotPermit},
     FRAME_HEADER_BYTES,
 };
+use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
+
+/// The most response frame bytes one compatibility exchange may retain.
+///
+/// The responder caps a response at the same value, so an honest peer never
+/// exceeds it.
+pub(crate) const COMPAT_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
+
+/// The most bytes one compatibility exchange may charge: its frames, plus the
+/// validator's and the decoder's reassembly copies of one object.
+pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
+    (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES + 2 * MAX_PROTOCOL_MESSAGE_LEN) as u64;
+
+/// Worst-case exchanges the compatibility partition funds at once. A connection
+/// runs one exchange at a time, and a one-object exchange charges about a fifth of
+/// the worst case, so this partition funds about 80 peers' object fetches at once.
+const COMPAT_RESPONSE_EXCHANGES: u64 = 16;
 
 #[cfg(test)]
 mod tests;
@@ -52,6 +74,8 @@ pub(crate) struct ResourceEnvelope {
     pub(crate) node_output_bytes: u64,
     /// Request-stream executions that may run at once across the node.
     pub(crate) request_workers: usize,
+    /// Outbound compatibility exchange bytes that the node may retain.
+    pub(crate) compat_response_bytes: u64,
 }
 
 impl ResourceEnvelope {
@@ -68,11 +92,14 @@ impl ResourceEnvelope {
             connection_output_bytes,
             node_output_bytes: sizing::node_output_bytes().max(connection_output_bytes),
             request_workers: max_connections.saturating_mul(2).max(1),
+            compat_response_bytes: COMPAT_RESPONSE_EXCHANGES * COMPAT_EXCHANGE_MAX_BYTES,
         }
     }
 
     /// The most frame bytes these bounds allow this module's owners to retain:
-    /// the node budgets, plus each stream's raw and output floor frame.
+    /// the node budgets, the compatibility partition, each stream's raw and output
+    /// floor frame, and the compatibility results that wait for output admission
+    /// while they hold an execution slot.
     ///
     /// QUIC's own buffers come on top; the peer memory budget funds those.
     pub(crate) fn retained_bytes_bound(
@@ -82,8 +109,13 @@ impl ResourceEnvelope {
         max_frame_bytes: u32,
     ) -> u128 {
         let floor_frames = 2 * max_connections as u128 * u128::from(max_open_streams);
+        // Widening usize to u128 is lossless on supported targets.
+        let waiting_results =
+            self.request_workers as u128 * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u128;
         u128::from(self.node_raw_bytes)
             + u128::from(self.node_output_bytes)
+            + u128::from(self.compat_response_bytes)
+            + waiting_results
             + floor_frames * u128::from(max_frame_bytes)
     }
 }
@@ -95,6 +127,7 @@ pub(crate) struct NodeResources {
     raw: OutputByteBudget,
     output: OutputByteBudget,
     request_workers: SlotBudget,
+    compat_responses: OutputByteBudget,
     owners: OwnerLedger,
 }
 
@@ -107,6 +140,7 @@ impl NodeResources {
             output: byte_budget(envelope.node_output_bytes),
             request_workers: SlotBudget::new(envelope.request_workers)
                 .expect("the envelope keeps at least one worker within a semaphore's range"),
+            compat_responses: byte_budget(envelope.compat_response_bytes),
             owners: OwnerLedger::default(),
         }
     }
@@ -150,6 +184,36 @@ impl ConnectionResources {
             owner: self.node.owners.enter(OwnerPhase::Setup),
         }
     }
+
+    /// Fund one outbound compatibility exchange of at most `bytes` from the node's
+    /// partition. Cancelling the wait takes nothing.
+    ///
+    /// The exchange counts as an installed stream until its grant drops. A response
+    /// cannot wait for bytes that it already holds, because this single grant covers
+    /// the whole response before the stream opens.
+    pub(crate) async fn admit_compat_response(&self, bytes: u64) -> CompatResponseGrant {
+        let budget = &self.node.compat_responses;
+        let bytes = budget.grant(budget.clamp(bytes)).await;
+        CompatResponseGrant {
+            _bytes: bytes,
+            _owner: self.node.owners.enter(OwnerPhase::Installed),
+        }
+    }
+
+    /// The node's compatibility partition.
+    #[cfg(test)]
+    pub(crate) fn compat_responses(&self) -> &OutputByteBudget {
+        &self.node.compat_responses
+    }
+}
+
+/// The funding of one outbound compatibility exchange. Dropping it returns the
+/// exchange's bytes and ends its owner count.
+#[derive(Debug)]
+#[must_use = "dropping a compatibility grant releases its capacity"]
+pub(crate) struct CompatResponseGrant {
+    _bytes: OutputGrant,
+    _owner: OwnerGuard,
 }
 
 /// One stream's admission gates and its place in the owner count.
@@ -223,6 +287,23 @@ impl FrameGate {
             floor = self.floor.reserve() => FrameCharge::floor(floor),
             shared = self.shared(bytes) => FrameCharge::shared(shared),
         };
+        FrameGrant {
+            _charge: charge,
+            waited: started.elapsed(),
+        }
+    }
+
+    /// Wait for a materialized result of `frames` frames and `bytes` bytes.
+    ///
+    /// A one-frame result may use the floor slot, because the floor funds one frame.
+    /// A larger result waits for the shared budgets, so a saturated node cannot hide
+    /// a whole multi-frame response behind one floor slot.
+    pub(crate) async fn admit_result(&self, frames: usize, bytes: u64) -> FrameGrant {
+        if frames <= 1 {
+            return self.admit(bytes).await;
+        }
+        let started = Instant::now();
+        let charge = FrameCharge::shared(self.shared(bytes).await);
         FrameGrant {
             _charge: charge,
             waited: started.elapsed(),

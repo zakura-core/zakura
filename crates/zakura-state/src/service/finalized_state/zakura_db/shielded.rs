@@ -705,7 +705,7 @@ impl DiskWriteBatch {
 
         // Index each transaction's shielded data
         #[cfg(feature = "indexer")]
-        for (tx_index, transaction) in block.transactions.iter().enumerate() {
+        for (tx_index, transaction) in block.view().transactions().enumerate() {
             let tx_loc = TransactionLocation::from_usize(*height, tx_index);
             self.prepare_nullifier_batch(zakura_db, transaction, tx_loc);
         }

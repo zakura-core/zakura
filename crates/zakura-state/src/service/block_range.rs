@@ -33,9 +33,12 @@ impl BlockRangeSnapshot {
         &self,
         db: &ZakuraDb,
         height: block::Height,
-    ) -> Option<(zakura_node_services::block_memory::BlockHandle, usize)> {
-        if height > self.tip? {
-            return None;
+    ) -> Result<
+        Option<(zakura_node_services::block_memory::BlockHandle, usize)>,
+        zakura_node_services::block_memory::AdmissionFailure,
+    > {
+        if self.tip.is_none_or(|tip| height > tip) {
+            return Ok(None);
         }
         read::block_and_size(self.chain.clone(), db, height.into())
     }
@@ -75,7 +78,13 @@ impl BlockRangeSnapshot {
                 return (bytes.len() <= max_bytes).then_some(bytes);
             }
         }
-        db.raw_block_bytes_within(height.into(), max_bytes)
+        // Each worker reads one block at a time, so the worker partition bounds this parser.
+        db.raw_block_bytes_within(
+            height.into(),
+            max_bytes,
+            &mut zakura_node_services::block_memory::ParseScope::statically_bounded(),
+        )
+        .expect("a statically bounded parser scope never refuses a charge")
     }
 }
 
@@ -173,6 +182,7 @@ impl ReadStateService {
         ReadRequest::BlocksByHeightRange { start, count }.count_metric();
         let state = self.clone();
         spawn_owned_block_range(
+            self.db.read_worker_capacity(),
             start,
             count,
             max_response_bytes,
@@ -196,6 +206,7 @@ impl ReadStateService {
 /// cannot release reservations still needed by the read. Move them into
 /// [`OwnedBlockRange`] on completion so they remain with the returned blocks.
 fn spawn_owned_block_range<R, G>(
+    workers: crate::request::ReadWorkerPool,
     start: block::Height,
     count: u32,
     max_response_bytes: u32,
@@ -211,7 +222,7 @@ where
         CodeTimer::start_desc("blocks_by_height_range"),
         Span::current(),
     );
-    timed_span.spawn_blocking(move || {
+    timed_span.spawn_blocking(workers, move || {
         if is_cancelled(&resources) {
             return Ok(OwnedBlockRange {
                 blocks: Vec::new(),

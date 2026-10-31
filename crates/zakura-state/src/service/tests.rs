@@ -327,6 +327,121 @@ async fn wait_for_decoded_payload_release(
     );
 }
 
+/// Cloned service reads and native range reads share the database's live worker cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
+    use crate::{request::TimedSpan, ReadRequest, ReadResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zakura_chain::{diagnostic::CodeTimer, serialization::ZcashSerialize};
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let config = Config {
+        read_concurrency_limit: std::num::NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let workers = read.db.read_worker_capacity();
+    let active = Arc::new(AtomicBool::new(false));
+    let running = active.clone();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let first = TimedSpan::new(
+        CodeTimer::start_desc("blocked_state_read"),
+        tracing::Span::none(),
+    )
+    .spawn_blocking(workers.clone(), move || {
+        running.store(true, Ordering::SeqCst);
+        started.send(()).unwrap();
+        release_rx.recv_timeout(limit).unwrap();
+        running.store(false, Ordering::SeqCst);
+        Ok(())
+    });
+    timeout(limit, started_rx).await.unwrap().unwrap();
+    drop(first);
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(
+        workers.slots.available_permits(),
+        0,
+        "the cancelled caller leaves its worker charged"
+    );
+
+    let ReadResponse::Tip(Some((height, hash))) = timeout(
+        Duration::from_secs(1),
+        read.clone().oneshot(ReadRequest::Tip),
+    )
+    .await
+    .expect("control read must progress while the data worker stays occupied")
+    .unwrap() else {
+        panic!("the control read returns the stored tip")
+    };
+    assert_eq!((height, hash), (Height(0), genesis.hash()));
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(workers.slots.available_permits(), 0);
+
+    let mut block_reader = read.clone();
+    let mut block_read = block_reader
+        .ready()
+        .await
+        .unwrap()
+        .call(ReadRequest::Block(Height(0).into()));
+    assert!(
+        timeout(Duration::from_millis(100), &mut block_read)
+            .await
+            .is_err(),
+        "ordinary state reads must wait for the shared worker slot"
+    );
+    let mut range_reader = read.clone();
+    let range_read = range_reader.read_owned_block_range(Height(0), 1, u32::MAX, (), |_| false);
+    tokio::pin!(range_read);
+    assert!(
+        timeout(Duration::from_millis(100), &mut range_read)
+            .await
+            .is_err(),
+        "owned range reads must wait for the shared worker slot"
+    );
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(workers.slots.available_permits(), 0);
+
+    release.send(()).unwrap();
+    let ReadResponse::Block(Some(block)) = timeout(limit, block_read).await.unwrap().unwrap()
+    else {
+        panic!("the admitted read returns the stored genesis block")
+    };
+    assert_eq!(block.hash(), genesis.hash());
+    let (blocks, ()) = timeout(limit, range_read)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts();
+    assert_eq!(
+        blocks,
+        vec![(Height(0), genesis.zcash_serialize_to_vec().unwrap())]
+    );
+    assert!(!active.load(Ordering::SeqCst));
+    assert_eq!(
+        workers.slots.available_permits(),
+        1,
+        "completed workers release their slots"
+    );
+}
+
 /// Each real state snapshot or read result keeps its allocation charged after
 /// invalidation and writer shutdown. The final drop releases the actual payloads.
 #[tokio::test(flavor = "multi_thread")]
@@ -380,6 +495,7 @@ async fn retired_state_snapshots_and_read_results_keep_decoded_ownership() {
                 .as_ref()
                 .unwrap()
                 .block_and_size(&read.db, Height(2))
+                .unwrap()
                 .unwrap()
                 .0
                 .hash(),
@@ -508,6 +624,63 @@ async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
         assert!(matches!(result, Ok(Ok(_))), "checkpoint commit: {result:?}");
     }
     state
+}
+
+/// Capacity refusal must precede the writer's logical and durable operator change.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_tip_capacity_refuses_invalidation_before_changing_the_writer() {
+    use zakura_node_services::block_memory::AdmissionFailure;
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+    let child = chain.last().unwrap().clone();
+    let hash = child.hash();
+    timeout(
+        deadline,
+        state.queue_and_commit_to_non_finalized_state(SemanticallyVerifiedBlock::from(child), None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    wait_for_idle_writer(&state, deadline).await;
+    let read = state.read_service.clone();
+    let mut tips: Vec<_> = (0..crate::constants::CHAIN_TIP_BLOCK_RETENTION)
+        .map(|_| super::finalized_chain_tip(&read.db).unwrap().unwrap())
+        .collect();
+
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    let error = timeout(deadline, state.call(Request::InvalidateBlock(hash)))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::error::InvalidateError>(),
+        Some(crate::error::InvalidateError::BlockAdmission(
+            AdmissionFailure::Capacity
+        ))
+    ));
+
+    // This request reads the writer's actual chain set, not its last published snapshot.
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    timeout(deadline, state.call(Request::PreciousBlock(hash)))
+        .await
+        .unwrap()
+        .expect("capacity refusal must leave the writer's block eligible");
+    assert_eq!(
+        read.best_tip().unwrap().1,
+        hash,
+        "capacity refusal must preserve the writer selected tip"
+    );
+
+    drop(tips.pop());
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    timeout(deadline, state.call(Request::InvalidateBlock(hash)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.best_tip().unwrap().1, chain[1].hash());
 }
 
 fn await_block_info_error(result: Result<Response, BoxError>) -> crate::AwaitBlockInfoError {
@@ -900,6 +1073,7 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
             .take(11)
             .last()
             .expect("the context has a median-time window")
+            .unwrap()
             .view()
             .header()
             .time;
@@ -908,6 +1082,7 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
         super::any_ancestor_blocks(&fixture.non_finalized, &fixture.finalized.db, parent_hash)
             .take(POW_ADJUSTMENT_BLOCK_SPAN)
             .map(|block| {
+                let block = block.unwrap();
                 (
                     block.view().header().difficulty_threshold,
                     block.view().header().time,
@@ -2433,7 +2608,7 @@ proptest! {
     fn some_block_less_than_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(4, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));
@@ -2450,7 +2625,7 @@ proptest! {
             .coinbase_height()
             .expect("chain contains valid blocks");
 
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(
@@ -2488,7 +2663,7 @@ proptest! {
 
         let response = crate::service::check::legacy_chain(
             nu_activation_height,
-            chain.clone().into_iter().rev().map(Into::into),
+            chain.clone().into_iter().rev().map(|block| Ok(block.into())),
             &network,
             TEST_LEGACY_CHAIN_LIMIT,
         ).map_err(|error| error.to_string());
@@ -2507,7 +2682,7 @@ proptest! {
     fn at_least_one_transaction_with_valid_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Nu5)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));

@@ -1,14 +1,11 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator as _};
 use std::sync::mpsc::TryRecvError;
 use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NonNegative},
-    block::{Block, Height},
+    block::Height,
     block_info::BlockInfo,
     parameters::subsidy::{
         block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
@@ -38,7 +35,7 @@ pub struct Upgrade;
 enum LoadResult {
     HasInfo(ValueBalance<NonNegative>),
     LoadedInfo {
-        block: Arc<Block>,
+        block: zakura_node_services::block_memory::BlockHandle,
         size: usize,
         utxos: HashMap<OutPoint, Utxo>,
         address_balance_changes: HashMap<transparent::Address, AddressBalanceLocationChange>,
@@ -69,7 +66,10 @@ impl DiskFormatUpgrade for Upgrade {
         // A database without transparent indexes has no address balances to add received
         // amounts to. Block info is still added.
         let skip_transparent_indexes = db.skips_transparent_indexes();
-        let chunk_size = rayon::current_num_threads();
+        // Each parallel result retains one block until the batch consumes it.
+        let chunk_size = rayon::current_num_threads()
+            .min(usize::from(db.config().read_block_limit.get()))
+            .min(usize::from(db.config().read_transaction_limit.get()));
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
         let chunks = (0..=initial_finalized_tip_height.0).chunks(chunk_size);
@@ -98,7 +98,7 @@ impl DiskFormatUpgrade for Upgrade {
                     // Load the block. This is slow since transaction
                     // parsing is slow.
                     let (block, size) = db
-                        .block_and_size(HashOrHeight::Height(height))
+                        .block_and_size(HashOrHeight::Height(height))?
                         .expect("block info should be in the database");
 
                     // Load the utxos for all the transactions inputs in the block.
@@ -106,11 +106,11 @@ impl DiskFormatUpgrade for Upgrade {
                     // This is slow because transaction parsing is slow.
                     let mut utxos = HashMap::new();
                     let mut address_balance_changes = HashMap::new();
-                    for tx in &block.transactions {
+                    for tx in block.view().transactions() {
                         for input in tx.inputs() {
                             if let Some(outpoint) = input.outpoint() {
                                 let (tx, h, _) = db
-                                    .transaction(outpoint.hash)
+                                    .transaction(outpoint.hash)?
                                     .expect("transaction should be in the database");
                                 let output = tx
                                     .outputs()
@@ -218,6 +218,7 @@ impl DiskFormatUpgrade for Upgrade {
 
             // Add this block's value pool changes to the total value pool.
             value_pool = block
+                .view()
                 .chain_value_pool_change(
                     &network,
                     &utxos,
@@ -305,17 +306,17 @@ impl DiskFormatUpgrade for Upgrade {
 
         // Collect the set of addresses that received transparent funds in the last query range (last 1000 blocks).
         let tx_loc_range = TransactionLocation::min_for_height(start_height)..;
-        let addresses: HashSet<_> = db
-            .transactions_by_location_range(tx_loc_range)
-            .flat_map(|(_, tx)| tx.outputs().to_vec())
-            .filter_map(|output| {
+        let mut addresses = HashSet::new();
+        for transaction in db.transactions_by_location_range(tx_loc_range) {
+            let (_, transaction) = transaction?;
+            addresses.extend(transaction.outputs().iter().filter_map(|output| {
                 if output.value != 0 {
                     output.address(&network)
                 } else {
                     None
                 }
-            })
-            .collect();
+            }));
+        }
 
         // Check that no address balances for that set of addresses have a received field of `0`.
         for address in addresses {

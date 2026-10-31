@@ -575,7 +575,12 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::RawBlocksByHeightRange`], with each block's
     /// raw Zcash consensus serialization.
     #[cfg(feature = "indexer")]
-    RawBlocks(Vec<(block::Height, Vec<u8>)>),
+    RawBlocks(
+        Vec<(
+            block::Height,
+            zakura_node_services::block_memory::OwnedRawBlock,
+        )>,
+    ),
 
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.

@@ -832,6 +832,7 @@ mod tests {
         let item_at = |h: u32| -> CommitmentRootVerification {
             let block = archive_db
                 .block(Height(h).into())
+                .unwrap()
                 .expect("archive fork has the block");
             let sapling_root = archive_db
                 .sapling_tree_by_height(&Height(h))
@@ -841,11 +842,7 @@ mod tests {
                 .orchard_tree_by_height(&Height(h))
                 .expect("archive fork has the per-height Orchard tree")
                 .root();
-            verification_item(
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
-                sapling_root,
-                orchard_root,
-            )
+            verification_item(block, sapling_root, orchard_root)
         };
         let items: Vec<_> = (start..=end + 1).map(item_at).collect();
 
@@ -962,6 +959,7 @@ mod tests {
 
         let root_at = |height: Height| {
             serve_block_roots(&archive_db, height..=height)
+                .unwrap()
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| panic!("served root is missing at {height:?}"))
@@ -971,20 +969,21 @@ mod tests {
             assert_eq!(roots.height, height, "served root height at {height:?}");
             let block = archive_db
                 .block(height.into())
+                .unwrap()
                 .unwrap_or_else(|| panic!("archive body is missing at {height:?}"));
             assert_eq!(
                 roots.sapling_tx,
-                block.sapling_transactions_count(),
+                block.view().sapling_transactions_count(),
                 "Sapling transaction count at {height:?}"
             );
             assert_eq!(
                 roots.orchard_tx,
-                block.orchard_transactions_count(),
+                block.view().orchard_transactions_count(),
                 "Orchard transaction count at {height:?}"
             );
             assert_eq!(
                 roots.ironwood_tx,
-                block.ironwood_transactions_count(),
+                block.view().ironwood_transactions_count(),
                 "Ironwood transaction count at {height:?}"
             );
             assert_eq!(
@@ -993,7 +992,7 @@ mod tests {
                 "auth-data root at {height:?}"
             );
             CommitmentRootVerification::with_roots(
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
+                block,
                 roots.sapling_root,
                 roots.orchard_root,
                 roots.ironwood_root,
@@ -1005,7 +1004,7 @@ mod tests {
         let mut checked = 0usize;
         for &(start, end) in &ranges {
             let range = format!("{start}-{end}");
-            let roots = serve_block_roots(&archive_db, Height(start)..=Height(end));
+            let roots = serve_block_roots(&archive_db, Height(start)..=Height(end)).unwrap();
             let expected_len = usize::try_from(end - start + 1)
                 .expect("a u32 range length fits in usize on supported targets");
             assert_eq!(
@@ -1029,6 +1028,7 @@ mod tests {
 
                 let block = archive_db
                     .block(height.into())
+                    .unwrap()
                     .unwrap_or_else(|| panic!("archive body is missing at {height:?}"));
                 let sapling = archive_db
                     .sapling_tree_by_height(&height)
@@ -1054,17 +1054,17 @@ mod tests {
                 assert_eq!(roots.ironwood_root, ironwood, "Ironwood root at {height:?}");
                 assert_eq!(
                     roots.sapling_tx,
-                    block.sapling_transactions_count(),
+                    block.view().sapling_transactions_count(),
                     "Sapling transaction count at {height:?}"
                 );
                 assert_eq!(
                     roots.orchard_tx,
-                    block.orchard_transactions_count(),
+                    block.view().orchard_transactions_count(),
                     "Orchard transaction count at {height:?}"
                 );
                 assert_eq!(
                     roots.ironwood_tx,
-                    block.ironwood_transactions_count(),
+                    block.view().ironwood_transactions_count(),
                     "Ironwood transaction count at {height:?}"
                 );
                 assert_eq!(

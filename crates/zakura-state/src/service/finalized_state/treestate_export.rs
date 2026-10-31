@@ -610,6 +610,10 @@ pub enum GridSpacing {
 /// Why frontier grid generation could not complete.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum FrontierGridExportError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The database has no finalized tip, so it holds nothing to generate from.
     #[error("this database has no finalized tip to generate a frontier grid from")]
     NoFinalizedTip,
@@ -691,31 +695,31 @@ fn next_grid_target(
     next: Height,
     last: Height,
     accrued_cost: &mut u64,
-    mut block_commitments: impl FnMut(Height) -> usize,
-) -> Option<Height> {
+    mut block_commitments: impl FnMut(Height) -> Result<usize, FrontierGridExportError>,
+) -> Result<Option<Height>, FrontierGridExportError> {
     match spacing {
         GridSpacing::Uniform { blocks } => {
             let target = Height(next.0.saturating_add(blocks));
-            (target <= last).then_some(target)
+            Ok((target <= last).then_some(target))
         }
         GridSpacing::Adaptive { budget_us } => {
             let mut candidate = next;
             while candidate <= last {
-                let counts = block_commitments(candidate);
+                let counts = block_commitments(candidate)?;
                 *accrued_cost = accrued_cost
                     .saturating_add(COST_PER_BLOCK_US)
                     // The count is bounded by a block's own commitments, so it fits in u64.
                     .saturating_add(COST_PER_COMMITMENT_US.saturating_mul(counts as u64));
                 if *accrued_cost >= budget_us {
                     *accrued_cost = 0;
-                    return Some(candidate);
+                    return Ok(Some(candidate));
                 }
                 if candidate == last {
-                    return None;
+                    return Ok(None);
                 }
                 candidate = Height(candidate.0 + 1);
             }
-            None
+            Ok(None)
         }
     }
 }
@@ -845,29 +849,19 @@ pub fn export_frontier_grid_to(
     // block and space entries far too widely. The artifact would still be valid — every entry is
     // root-checked — but it would not bound cold requests, which is the only reason it exists.
     // Record the first such height and fail instead.
-    let mut unretained: Option<Height> = None;
 
     // Under a uniform grid the next entry is a fixed number of blocks ahead. Under an adaptive
     // one it is wherever the estimated cost budget runs out, which needs a block-by-block scan
     // of the commitment counts to find. Either way, a target past `last` is a partial cell and
     // is not published.
     while let Some(target) = next_grid_target(spacing, next, last, &mut accrued_cost, |height| {
-        match db.block(height.into()) {
-            Some(block) => {
-                block.sapling_note_commitments().count()
-                    + block.orchard_note_commitments().count()
-                    + block.ironwood_note_commitments().count()
-            }
-            None => {
-                unretained.get_or_insert(height);
-                0
-            }
-        }
-    }) {
-        if let Some(missing) = unretained {
-            return Err(FrontierGridExportError::UnretainedBlockBody { missing });
-        }
-
+        let block = db
+            .block(height.into())?
+            .ok_or(FrontierGridExportError::UnretainedBlockBody { missing: height })?;
+        Ok(block.view().sapling_note_commitments().count()
+            + block.view().orchard_note_commitments().count()
+            + block.view().ironwood_note_commitments().count())
+    })? {
         let in_absent_band =
             absent_band.is_some_and(|(upgrade, handoff)| target >= upgrade && target < handoff);
 
@@ -935,10 +929,6 @@ pub fn export_frontier_grid_to(
         next = Height(target.0 + 1);
     }
 
-    if let Some(missing) = unretained {
-        return Err(FrontierGridExportError::UnretainedBlockBody { missing });
-    }
-
     Ok(FrontierGridExport {
         frontiers: FrontierArtifact {
             spacing: match spacing {
@@ -968,7 +958,10 @@ mod grid_target_tests {
         let mut next = start;
         let mut accrued_cost = 0;
         while let Some(target) =
-            next_grid_target(spacing, next, last, &mut accrued_cost, &mut commitments)
+            next_grid_target(spacing, next, last, &mut accrued_cost, |height| {
+                Ok(commitments(height))
+            })
+            .unwrap()
         {
             heights.push(target.0);
             if target == last {

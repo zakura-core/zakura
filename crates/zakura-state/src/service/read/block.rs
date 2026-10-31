@@ -13,7 +13,9 @@
 //! - the shared finalized [`ZakuraDb`] reference.
 
 use std::sync::Arc;
-use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
+use zakura_node_services::block_memory::{
+    AdmissionFailure, BlockHandle, HeaderHandle, PayloadAdmissionFailure, TransactionHandle,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -44,16 +46,16 @@ pub fn any_block<'a, C: AsRef<Chain> + 'a>(
     mut chains: impl Iterator<Item = &'a C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<BlockHandle> {
+) -> Result<Option<BlockHandle>, AdmissionFailure> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
     // check the most efficient alternative first. (`chain` is always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chains
-        .find_map(|c| c.as_ref().block(hash_or_height))
-        .map(|contextual| contextual.block.clone())
-        .or_else(|| db.block(hash_or_height).map(Into::into))
+    if let Some(contextual) = chains.find_map(|c| c.as_ref().block(hash_or_height)) {
+        return Ok(Some(contextual.block.clone()));
+    }
+    db.block(hash_or_height)
 }
 
 /// Returns the [`Block`] with [`block::Hash`] or
@@ -62,7 +64,7 @@ pub fn block<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<BlockHandle>
+) -> Result<Option<BlockHandle>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -75,7 +77,7 @@ pub fn block_and_size<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<(BlockHandle, usize)>
+) -> Result<Option<(BlockHandle, usize)>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -84,21 +86,21 @@ where
     // Since blocks are the same in the finalized and non-finalized state, we
     // check the most efficient alternative first. (`chain` is always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chain
+    if let Some(contextual) = chain
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
-        .map(|contextual| {
-            let size = contextual.block.zcash_serialize_to_vec().unwrap().len();
-            (contextual.block.clone(), size)
-        })
-        .or_else(|| {
-            db.block_and_size(hash_or_height)
-                .map(|(block, size)| (block.into(), size))
-        })
+    {
+        let size = contextual.block.zcash_serialized_size();
+        return Ok(Some((contextual.block.clone(), size)));
+    }
+    db.block_and_size(hash_or_height)
 }
 
 /// Returns the [`block::Header`] with [`block::Hash`] or
 /// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
+///
+/// Finalized reads take no admission slot, so chain-context work cannot starve.
+/// Use [`block_header_result`] for a header that leaves its read job.
 pub fn block_header<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -119,13 +121,32 @@ where
         .or_else(|| db.block_header(hash_or_height).map(Into::into))
 }
 
+/// Reads a header that leaves its read job. A finalized header retains admission
+/// through its final holder. Capacity refusal is separate from missing data.
+pub fn block_header_result<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<HeaderHandle>, PayloadAdmissionFailure>
+where
+    C: AsRef<Chain>,
+{
+    if let Some(contextual) = chain
+        .as_ref()
+        .and_then(|chain| chain.as_ref().block(hash_or_height))
+    {
+        return Ok(Some(contextual.block.retained_header()));
+    }
+    db.block_header_result(hash_or_height)
+}
+
 /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in the
 /// non-finalized `chain` or finalized `db`.
 fn transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<(TransactionHandle, Height, DateTime<Utc>)>
+) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -134,17 +155,15 @@ where
     // Since transactions are the same in the finalized and non-finalized state,
     // we check the most efficient alternative first. (`chain` is always in
     // memory, but `db` stores transactions on disk, with a memory cache.)
-    chain
-        .and_then(|chain| {
-            chain
-                .as_ref()
-                .transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time))
-        })
-        .or_else(|| {
-            db.transaction(hash)
-                .map(|(tx, height, time)| (tx.into(), height, time))
-        })
+    if let Some(transaction) = chain.and_then(|chain| {
+        chain
+            .as_ref()
+            .transaction(hash)
+            .map(|(tx, height, time)| (tx.clone(), height, time))
+    }) {
+        return Ok(Some(transaction));
+    }
+    db.transaction(hash)
 }
 
 /// Returns a [`MinedTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -153,7 +172,7 @@ pub fn mined_transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<MinedTx>
+) -> Result<Option<MinedTx>, PayloadAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -163,10 +182,10 @@ where
     // can only add overlapping blocks, and hashes are unique.
     let chain = chain.as_ref();
 
-    let (tx, height, time) = transaction(chain, db, hash)?;
-    let confirmations = 1 + tip_height(chain, db)?.0 - height.0;
-
-    Some(MinedTx::new(tx, height, confirmations, time))
+    let Some((tx, height, time)) = transaction(chain, db, hash)? else {
+        return Ok(None);
+    };
+    Ok(tip_height(chain, db).map(|tip| MinedTx::new(tx, height, 1 + tip.0 - height.0, time)))
 }
 
 /// Returns a [`AnyTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -176,7 +195,7 @@ pub fn any_transaction<'a>(
     chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<AnyTx> {
+) -> Result<Option<AnyTx>, PayloadAdmissionFailure> {
     // # Correctness
     //
     // It is ok to do this lookup in multiple different calls. Finalized state updates
@@ -191,25 +210,29 @@ pub fn any_transaction<'a>(
     // still be used in find_map below.
     let mut chains = chains.peekable();
     let best_chain = chains.peek().copied();
-    let (tx, height, time, in_best_chain, containing_chain) = chains
-        .enumerate()
-        .find_map(|(i, chain)| {
-            chain
-                .as_ref()
-                .transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
-        })
-        .or_else(|| {
-            db.transaction(hash)
-                .map(|(tx, height, time)| (tx.into(), height, time, true, None))
-        })?;
+    let in_memory = chains.enumerate().find_map(|(i, chain)| {
+        chain
+            .as_ref()
+            .transaction(hash)
+            .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
+    });
+    let transaction = match in_memory {
+        Some(transaction) => Some(transaction),
+        None => db
+            .transaction(hash)?
+            .map(|(tx, height, time)| (tx, height, time, true, None)),
+    };
+    let Some((tx, height, time, in_best_chain, containing_chain)) = transaction else {
+        return Ok(None);
+    };
 
     if in_best_chain {
-        let confirmations = 1 + tip_height(best_chain, db)?.0 - height.0;
-        Some(AnyTx::Mined(MinedTx::new(tx, height, confirmations, time)))
+        Ok(tip_height(best_chain, db)
+            .map(|tip| AnyTx::Mined(MinedTx::new(tx, height, 1 + tip.0 - height.0, time))))
     } else {
-        let block_hash = containing_chain?.block(height.into())?.hash;
-        Some(AnyTx::Side((tx, block_hash)))
+        Ok(containing_chain
+            .and_then(|chain| chain.block(height.into()))
+            .map(|block| AnyTx::Side((tx, block.hash))))
     }
 }
 

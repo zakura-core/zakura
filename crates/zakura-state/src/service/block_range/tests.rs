@@ -220,6 +220,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
         earlier_snapshot
             .block_and_size(&read_state.db, block::Height(2))
             .unwrap()
+            .unwrap()
             .0
             .hash(),
         selected.hash(),
@@ -227,6 +228,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
     );
     assert!(earlier_snapshot
         .block_and_size(&read_state.db, block::Height(3))
+        .unwrap()
         .is_none());
 
     if header_runtime {
@@ -386,6 +388,7 @@ async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
+            crate::request::ReadWorkerPool::new(1, 16),
             block::Height(1),
             3,
             5,
@@ -430,6 +433,7 @@ async fn cancellation_before_the_first_lookup_skips_the_range() {
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
+            crate::request::ReadWorkerPool::new(1, 16),
             block::Height(1),
             2,
             10,
@@ -456,6 +460,7 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
+            crate::request::ReadWorkerPool::new(1, 16),
             block::Height(1),
             2,
             10,
@@ -510,6 +515,7 @@ fn blocked_read() -> (
     let mut started_tx = Some(started_tx);
     let (resume, blocked) = mpsc::sync_channel(1);
     let job = spawn_owned_block_range(
+        crate::request::ReadWorkerPool::new(1, 16),
         block::Height(1),
         1,
         10,
@@ -563,6 +569,7 @@ async fn a_panicking_read_releases_resources_once() {
     let _guard = zakura_test::init();
     let (resources, drops, finished) = resources();
     let job = spawn_owned_block_range(
+        crate::request::ReadWorkerPool::new(1, 16),
         block::Height(1),
         1,
         10,

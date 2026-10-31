@@ -4,6 +4,7 @@ use std::{
     fmt,
     fs::{self, canonicalize, remove_dir_all, DirEntry, ReadDir},
     io::ErrorKind,
+    num::{NonZeroU16, NonZeroU64},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -16,7 +17,7 @@ use serde::{
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::Span;
 
-use zakura_chain::{common::default_cache_dir, parameters::Network};
+use zakura_chain::{block::MAX_BLOCK_BYTES, common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{
@@ -31,6 +32,67 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Maximum standalone headers being decoded from disk or retained by read results.
+    /// Database clones share the default 16384 slots. Exhaustion returns a capacity
+    /// error. Headers have a fixed maximum size, so this count also bounds their bytes.
+    /// Short-lived chain-context reads inside a read job do not take a slot.
+    pub read_header_limit: NonZeroU16,
+
+    /// Maximum serialized blocks being copied from disk or retained by read results.
+    /// Database clones share the default 128 slots. Exhaustion returns a capacity
+    /// error. [`Self::read_result_byte_limit`] charges each result's bytes.
+    pub read_raw_block_limit: NonZeroU16,
+
+    /// Maximum standalone transactions being decoded from disk or retained by readers.
+    /// Database clones and decoded transaction iterators share the default 4096 slots.
+    /// Exhaustion returns a capacity error. [`Self::read_result_byte_limit`] charges
+    /// each result's decoded bytes.
+    pub read_transaction_limit: NonZeroU16,
+
+    /// Maximum full blocks being decoded from disk or retained by disk-read results.
+    ///
+    /// The default is 1024. Database clones share this count limit. A result keeps
+    /// its slot through its last block, header, or transaction handle. Exhaustion
+    /// returns a capacity error; it does not report a stored block as missing.
+    /// [`Self::read_result_byte_limit`] charges each result's decoded bytes.
+    pub read_block_limit: NonZeroU16,
+
+    /// Maximum decoded bytes retained by disk-read blocks, transactions, and serialized
+    /// blocks until each result's final holder drops it.
+    ///
+    /// The default is 4 GiB. Database clones share this limit. Exhaustion returns a
+    /// capacity error. One reader can exceed this limit by one result when no other
+    /// result is retained, so one legal block always remains readable.
+    /// This limit excludes parser memory, which has its own limit, and all disk usage.
+    pub read_result_byte_limit: NonZeroU64,
+
+    /// Maximum bytes held by active disk-read parsers: raw rows, partial decoded
+    /// results, and output buffers.
+    ///
+    /// The default is 1 GiB. Database clones share this limit. Exhaustion returns a
+    /// capacity error. One parser can exceed this limit by one result when no other
+    /// parser is active. Startup rejects a limit that cannot fund
+    /// [`Self::read_concurrency_limit`] workers each reading one maximum-size block.
+    pub read_parser_byte_limit: NonZeroU64,
+
+    /// Maximum callers waiting for a blocking data-read worker.
+    ///
+    /// The default is 16384. Cloned read services share this limit. An excess caller
+    /// receives an error before it waits. Waiting holds no lock and no memory charge.
+    pub read_waiter_limit: NonZeroU16,
+
+    /// Maximum blocking data-read jobs admitted by one database instance.
+    ///
+    /// The default is 64. Cloned read services share this limit. Excess reads wait
+    /// asynchronously before entering Tokio's blocking queue. Cancelling a caller
+    /// does not release a slot while its admitted job still runs.
+    ///
+    /// This limit covers read-service jobs, including owned block-range reads and
+    /// retained header-path acquisition. A separate fixed pool admits bounded
+    /// chain-tip and depth queries. This limit does not bound returned payloads,
+    /// direct synchronous database users, or the writer thread.
+    pub read_concurrency_limit: NonZeroU16,
+
     /// The root directory for storing cached block data.
     ///
     /// If you change this directory, you might also want to change `network.cache_dir`.
@@ -463,9 +525,152 @@ impl Default for PruningConfig {
     }
 }
 
+/// The largest serialized block a reader can load, as bytes of parser memory.
+const MAX_BLOCK_PARSER_BYTES: u64 = 2 * MAX_BLOCK_BYTES;
+
+/// Decoded memory per serialized byte in a legal block, rounded up.
+///
+/// Small transactions have the largest ratio. Consensus requires an input and an
+/// output, which take about 60 wire bytes and a few hundred decoded bytes.
+pub(crate) const MAX_DECODED_BYTES_PER_WIRE_BYTE: u64 = 12;
+
+/// The tokio default blocking thread limit, which the node runtime does not change.
+/// A larger worker allowance would queue jobs inside tokio, past their admission.
+const MAX_BLOCKING_READ_WORKERS: u64 = 512;
+
+/// Why a configuration cannot fund its read workers and one legal result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReadCapacityError {
+    /// Tokio would queue admitted jobs behind its own thread limit.
+    #[error("{workers} read workers exceed the {MAX_BLOCKING_READ_WORKERS} blocking threads")]
+    TooManyWorkers {
+        /// Data and control workers.
+        workers: u64,
+    },
+    /// Admitted workers could exceed the parser limit with one block each.
+    #[error("read_parser_byte_limit {limit} is below the {required} bytes its workers need")]
+    ParserLimitTooSmall {
+        /// Configured limit.
+        limit: u64,
+        /// Bytes that fund every worker.
+        required: u64,
+    },
+    /// The retained limit cannot hold one decoded maximum-size block.
+    #[error("read_result_byte_limit {limit} is below the {required} bytes of one block")]
+    ResultLimitTooSmall {
+        /// Configured limit.
+        limit: u64,
+        /// Bytes of one decoded maximum-size block.
+        required: u64,
+    },
+    /// The sum of the partitions does not fit a byte count.
+    #[error("read capacity partitions overflow")]
+    Overflow,
+}
+
+/// Memory partitions behind one database's read services. Each partition has its own
+/// owner, so their sum bounds read memory. Durable disk limits are not part of this plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadCapacityPlan {
+    /// Retained blocks, transactions, and serialized blocks, under a shared gauge.
+    pub result_bytes: u64,
+    /// Active parsers for those results, under a shared gauge.
+    pub parser_bytes: u64,
+    /// Fixed-size headers: their count limit multiplied by their size.
+    pub header_result_bytes: u64,
+    /// Chain-tip blocks in their fixed count partition, including their parsers.
+    pub chain_tip_bytes: u64,
+    /// Block-range parsers, which each worker bounds to one block at a time.
+    pub block_range_parser_bytes: u64,
+}
+
+impl ReadCapacityPlan {
+    /// Sum every partition. The constructor proved that this cannot overflow.
+    pub fn total_bytes(&self) -> u64 {
+        self.result_bytes
+            + self.parser_bytes
+            + self.header_result_bytes
+            + self.chain_tip_bytes
+            + self.block_range_parser_bytes
+    }
+}
+
+impl Config {
+    /// Check that the read limits fund their workers and one legal result, then
+    /// return the partitions. Opening a database requires this check to pass.
+    pub fn read_capacity_plan(&self) -> Result<ReadCapacityPlan, ReadCapacityError> {
+        let workers = u64::from(self.read_concurrency_limit.get())
+            + u64::try_from(crate::constants::CONTROL_READ_CONCURRENCY)
+                .map_err(|_| ReadCapacityError::Overflow)?;
+        if workers > MAX_BLOCKING_READ_WORKERS {
+            return Err(ReadCapacityError::TooManyWorkers { workers });
+        }
+
+        let block_range_parser_bytes = workers
+            .checked_mul(MAX_BLOCK_PARSER_BYTES)
+            .ok_or(ReadCapacityError::Overflow)?;
+        let parser_bytes = self.read_parser_byte_limit.get();
+        if parser_bytes < block_range_parser_bytes {
+            return Err(ReadCapacityError::ParserLimitTooSmall {
+                limit: parser_bytes,
+                required: block_range_parser_bytes,
+            });
+        }
+
+        let decoded_block_bytes = MAX_BLOCK_BYTES
+            .checked_mul(MAX_DECODED_BYTES_PER_WIRE_BYTE)
+            .ok_or(ReadCapacityError::Overflow)?;
+        let result_bytes = self.read_result_byte_limit.get();
+        if result_bytes < decoded_block_bytes {
+            return Err(ReadCapacityError::ResultLimitTooSmall {
+                limit: result_bytes,
+                required: decoded_block_bytes,
+            });
+        }
+
+        let header_size = u64::try_from(std::mem::size_of::<zakura_chain::block::Header>())
+            .map_err(|_| ReadCapacityError::Overflow)?;
+        let header_result_bytes = u64::from(self.read_header_limit.get())
+            .checked_mul(header_size)
+            .ok_or(ReadCapacityError::Overflow)?;
+        let chain_tip_bytes = crate::constants::CHAIN_TIP_BLOCK_RETENTION
+            .checked_mul(decoded_block_bytes.saturating_add(MAX_BLOCK_PARSER_BYTES))
+            .ok_or(ReadCapacityError::Overflow)?;
+
+        [
+            result_bytes,
+            parser_bytes,
+            header_result_bytes,
+            chain_tip_bytes,
+            block_range_parser_bytes,
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or(ReadCapacityError::Overflow)?;
+
+        Ok(ReadCapacityPlan {
+            result_bytes,
+            parser_bytes,
+            header_result_bytes,
+            chain_tip_bytes,
+            block_range_parser_bytes,
+        })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            read_header_limit: NonZeroU16::new(16384).expect("the default limit is nonzero"),
+            read_raw_block_limit: NonZeroU16::new(128).expect("the default limit is nonzero"),
+            read_transaction_limit: NonZeroU16::new(4096).expect("the default limit is nonzero"),
+            read_block_limit: NonZeroU16::new(1024).expect("the default limit is nonzero"),
+            read_result_byte_limit: NonZeroU64::new(4 * 1024 * 1024 * 1024)
+                .expect("the default limit is nonzero"),
+            read_parser_byte_limit: NonZeroU64::new(1024 * 1024 * 1024)
+                .expect("the default limit is nonzero"),
+            read_waiter_limit: NonZeroU16::new(16384).expect("the default limit is nonzero"),
+            read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
             cache_dir: default_cache_dir(),
             ephemeral: false,
             should_backup_non_finalized_state: true,
@@ -486,6 +691,94 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_read_capacity_plan_funds_its_workers_and_one_legal_result() {
+        let plan = Config::default().read_capacity_plan().unwrap();
+        assert_eq!(plan.result_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(plan.parser_bytes, 1024 * 1024 * 1024);
+        assert_eq!(plan.block_range_parser_bytes, 68 * 4_000_000);
+        assert!(plan.total_bytes() > plan.result_bytes + plan.parser_bytes);
+    }
+
+    #[test]
+    fn read_capacity_plan_rejects_limits_that_cannot_fund_progress() {
+        let workers = Config {
+            read_concurrency_limit: NonZeroU16::new(509).unwrap(),
+            ..Config::default()
+        };
+        assert_eq!(
+            workers.read_capacity_plan(),
+            Err(ReadCapacityError::TooManyWorkers { workers: 513 })
+        );
+        let parser = Config {
+            read_parser_byte_limit: NonZeroU64::new(68 * 4_000_000 - 1).unwrap(),
+            ..Config::default()
+        };
+        assert_eq!(
+            parser.read_capacity_plan(),
+            Err(ReadCapacityError::ParserLimitTooSmall {
+                limit: 68 * 4_000_000 - 1,
+                required: 68 * 4_000_000,
+            })
+        );
+        let result = Config {
+            read_result_byte_limit: NonZeroU64::MIN,
+            ..Config::default()
+        };
+        assert!(matches!(
+            result.read_capacity_plan(),
+            Err(ReadCapacityError::ResultLimitTooSmall { limit: 1, .. })
+        ));
+        let overflow = Config {
+            read_result_byte_limit: NonZeroU64::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            overflow.read_capacity_plan(),
+            Err(ReadCapacityError::Overflow)
+        );
+    }
+
+    #[test]
+    fn read_concurrency_limit_requires_positive_bounded_capacity() {
+        assert_eq!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .read_concurrency_limit
+                .get(),
+            64
+        );
+        assert_eq!(
+            toml::from_str::<Config>("read_concurrency_limit = 1")
+                .unwrap()
+                .read_concurrency_limit
+                .get(),
+            1
+        );
+        assert!(toml::from_str::<Config>("read_concurrency_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_concurrency_limit = 65536").is_err());
+        assert_eq!(
+            toml::from_str::<Config>("").unwrap().read_block_limit.get(),
+            1024
+        );
+        assert!(toml::from_str::<Config>("read_block_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_block_limit = 65536").is_err());
+        assert_eq!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .read_transaction_limit
+                .get(),
+            4096
+        );
+        assert!(toml::from_str::<Config>("read_transaction_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_transaction_limit = 65536").is_err());
+        let config = toml::from_str::<Config>("").unwrap();
+        assert_eq!(config.read_header_limit.get(), 16384);
+        assert_eq!(config.read_raw_block_limit.get(), 128);
+        assert!(toml::from_str::<Config>("read_header_limit = 0").is_err());
+        assert!(toml::from_str::<Config>("read_raw_block_limit = 0").is_err());
+    }
 
     #[test]
     fn optional_duration_preserves_config_toml() {

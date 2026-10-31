@@ -1226,7 +1226,7 @@ fn transparent_index_marker_does_not_mark_a_database_pruned() {
     assert!(state.db.transparent_indexes_skipped_from().is_some());
     assert_eq!(state.db.lowest_retained_height(), None);
     assert!(!state.db.is_pruned());
-    assert!(state.db.block(Height(1).into()).is_some());
+    assert!(state.db.block(Height(1).into()).unwrap().is_some());
     assert_eq!(
         state
             .db

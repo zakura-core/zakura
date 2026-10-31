@@ -22,9 +22,9 @@ use crate::zakura::{canonical_ip, discovery::ZakuraDiscoveryDialCandidate};
 
 /// The identity of one candidate dial attempt.
 ///
-/// The worker returns it on completion and on panic, so settlement releases
-/// exactly the IPs this attempt reserved. A later attempt to the same node
-/// gets a new key, so a duplicate completion cannot settle it.
+/// The runtime join owner attaches this key to completion, panic, and cancellation.
+/// Settlement releases exactly the IPs this attempt reserved.
+/// A later attempt to the same node gets a new key, so a duplicate completion cannot settle it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct DialAttemptKey {
     /// The dialed node.

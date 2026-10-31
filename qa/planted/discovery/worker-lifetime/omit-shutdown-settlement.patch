@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/discovery/candidate_dialer.rs
++++ b/crates/zakura-network/src/zakura/discovery/candidate_dialer.rs
+@@ -247,7 +247,7 @@
+             worker.task.abort();
+         }
+         while let Some((attempt, outcome)) = self.workers.next().await {
+-            state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now());
++            let _ = (attempt, outcome, &state);
+         }
+     }
+ }

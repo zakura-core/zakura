@@ -9,15 +9,21 @@
 //! [`CandidateDialerState`] owns the dial policy. [`CandidateDialerIO`] owns
 //! the endpoint, the discovery handle, and the dial workers.
 
-use std::{net::IpAddr, panic::AssertUnwindSafe, time::Duration};
+use std::{
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, StreamExt};
 use tracing::debug;
-use zakura_node_services::task::{erased, spawn_erased_named};
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
     sync::{oneshot, watch},
-    task::{JoinHandle, JoinSet},
+    task::{AbortOnDropHandle, JoinHandle},
     time::Instant,
 };
 
@@ -63,8 +69,7 @@ impl DiscoveryDialResult {
 }
 
 #[derive(Debug)]
-struct DiscoveryDialWorkerResult {
-    attempt: DialAttemptKey,
+struct DiscoveryDialOutcome {
     /// The IP whose handshake TLS authenticated, if this worker's dial got that far.
     admitted_ip: Option<IpAddr>,
     result: DiscoveryDialResult,
@@ -123,12 +128,12 @@ pub(crate) async fn run_native_discovery_dialer(
         limits,
         sought_services,
         trace,
-        workers: JoinSet::new(),
+        workers: FuturesUnordered::new(),
     };
 
     loop {
         if shutdown.is_cancelled() {
-            return;
+            break;
         }
         if state.begin_round(Instant::now()) {
             io.spawn_dial_round(&mut state).await;
@@ -139,25 +144,21 @@ pub(crate) async fn run_native_discovery_dialer(
             // Endpoint shutdown cancels this token. The dialer holds an endpoint
             // clone, so the supervisor registration watch never closes on its
             // own; this is the only reliable teardown signal.
-            _ = shutdown.cancelled() => return,
-            joined = io.workers.join_next(), if !io.workers.is_empty() => {
-                match joined {
-                    Some(Ok(worker_result)) => io.settle(&mut state, worker_result).await,
-                    Some(Err(error)) => {
-                        debug!(?error, "Zakura discovery dial worker failed");
-                        metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
-                    }
-                    None => {}
+            _ = shutdown.cancelled() => break,
+            joined = io.workers.next(), if !io.workers.is_empty() => {
+                if let Some((attempt, outcome)) = joined {
+                    io.settle(&mut state, attempt, outcome).await;
                 }
             }
             changed = registered.changed() => {
                 if changed.is_err() {
-                    return;
+                    break;
                 }
             }
             _ = zakura_rt::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
         }
     }
+    io.shutdown(&mut state).await;
 }
 
 /// The candidate dialer's runtime resources: the endpoint, the discovery
@@ -168,7 +169,7 @@ struct CandidateDialerIO {
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
     trace: ZakuraTrace,
-    workers: JoinSet<DiscoveryDialWorkerResult>,
+    workers: FuturesUnordered<DiscoveryDialWorker>,
 }
 
 impl CandidateDialerIO {
@@ -207,56 +208,90 @@ impl CandidateDialerIO {
 
             self.discovery.mark_dial_attempt(&attempt.node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-            self.workers.spawn(erased(
-                AssertUnwindSafe(run_discovery_dial_once(
+            self.workers.push(DiscoveryDialWorker::spawn(
+                attempt,
+                run_discovery_dial_once(
                     self.endpoint.clone(),
                     node_addr,
                     self.limits.clone(),
-                    attempt,
-                ))
-                .catch_unwind()
-                .map(move |result| recover_discovery_dial_worker_panic(attempt, result)),
+                    attempt.node_id,
+                ),
             ));
         }
     }
 
     /// Settles a finished worker's attempt in `state`, then records its
     /// result in the discovery book, the trace, and the metrics.
-    async fn settle(&self, state: &mut CandidateDialerState, worker: DiscoveryDialWorkerResult) {
-        if !state.complete(
-            worker.attempt,
-            worker.result,
-            worker.admitted_ip,
-            Instant::now(),
-        ) {
+    async fn settle(
+        &self,
+        state: &mut CandidateDialerState,
+        attempt: DialAttemptKey,
+        outcome: DiscoveryDialOutcome,
+    ) {
+        if !state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()) {
             return;
         }
         apply_discovery_dial_result(
             &self.discovery,
-            &worker.attempt.node_id,
-            worker.result,
+            &attempt.node_id,
+            outcome.result,
             &self.trace,
         )
         .await;
     }
+
+    /// Join cancelled workers before discarding their logical reservations.
+    /// Local shutdown does not record remote dial failures in the discovery book.
+    async fn shutdown(&mut self, state: &mut CandidateDialerState) {
+        for worker in &self.workers {
+            worker.task.abort();
+        }
+        while let Some((attempt, outcome)) = self.workers.next().await {
+            state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now());
+        }
+    }
 }
 
-/// Turns a panicked worker into a failed result for its `attempt`, so the
-/// dialer still settles the attempt's reservations.
-fn recover_discovery_dial_worker_panic(
+/// The join owner keeps the attempt identity even if the task never starts.
+/// Dropping the owner also cancels its task.
+struct DiscoveryDialWorker {
     attempt: DialAttemptKey,
-    result: std::thread::Result<DiscoveryDialWorkerResult>,
-) -> DiscoveryDialWorkerResult {
-    result.unwrap_or_else(|_| {
-        metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
-        let node_id = attempt.node_id;
-        tracing::error!(?node_id, "Zakura discovery dial worker panicked");
-        DiscoveryDialWorkerResult {
+    task: AbortOnDropHandle<DiscoveryDialOutcome>,
+}
+
+impl DiscoveryDialWorker {
+    fn spawn(
+        attempt: DialAttemptKey,
+        future: impl Future<Output = DiscoveryDialOutcome> + Send + 'static,
+    ) -> Self {
+        Self {
             attempt,
-            admitted_ip: None,
-            result: DiscoveryDialResult::Failed,
+            task: AbortOnDropHandle::new(spawn_erased_named("discovery_worker", future)),
         }
-    })
+    }
+}
+
+impl Future for DiscoveryDialWorker {
+    type Output = (DialAttemptKey, DiscoveryDialOutcome);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = match std::task::ready!(Pin::new(&mut self.task).poll(cx)) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                debug!(?error, attempt = ?self.attempt, "Zakura discovery dial worker failed");
+                metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
+                if error.is_panic() {
+                    metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
+                    tracing::error!(attempt = ?self.attempt, "Zakura discovery dial worker panicked");
+                }
+                DiscoveryDialOutcome {
+                    admitted_ip: None,
+                    result: DiscoveryDialResult::Failed,
+                }
+            }
+        };
+        Poll::Ready((self.attempt, outcome))
+    }
 }
 
 /// Returns the addresses of `candidate` to dial and the canonical IPs they
@@ -301,11 +336,10 @@ async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
-    attempt: DialAttemptKey,
-) -> DiscoveryDialWorkerResult {
-    let Ok(peer_id) = ZakuraPeerId::new(attempt.node_id.as_bytes().to_vec()) else {
-        return DiscoveryDialWorkerResult {
-            attempt,
+    node_id: NodeId,
+) -> DiscoveryDialOutcome {
+    let Ok(peer_id) = ZakuraPeerId::new(node_id.as_bytes().to_vec()) else {
+        return DiscoveryDialOutcome {
             admitted_ip: None,
             result: DiscoveryDialResult::Failed,
         };
@@ -316,19 +350,17 @@ async fn run_discovery_dial_once(
         .iter()
         .any(|id| id == &peer_id)
     {
-        return DiscoveryDialWorkerResult {
-            attempt,
+        return DiscoveryDialOutcome {
             admitted_ip: None,
             result: DiscoveryDialResult::ConnectedElsewhere,
         };
     }
 
     let (admitted_ip_tx, mut admitted_ip_rx) = oneshot::channel();
-    let dial = spawn_erased_named("discovery_dial", {
+    let mut dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
-    });
-    zakura_rt::pin!(dial);
+    }));
 
     let result = loop {
         if registered
@@ -377,8 +409,10 @@ async fn run_discovery_dial_once(
         }
     };
 
-    DiscoveryDialWorkerResult {
-        attempt,
+    // A completed registration hands the serving task to the connection lifetime.
+    // Cancellation before this point drops the guard and aborts the dial.
+    drop(dial.detach());
+    DiscoveryDialOutcome {
         // The dial task sends the admitted IP before it registers the peer. An
         // empty channel means this dial never authenticated the peer itself.
         admitted_ip: admitted_ip_rx.try_recv().ok(),
@@ -389,7 +423,7 @@ async fn run_discovery_dial_once(
 async fn wait_for_discovery_registration_to_settle(
     registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
-    dial: &mut std::pin::Pin<&mut JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>>,
+    dial: &mut AbortOnDropHandle<Result<(), crate::zakura::ZakuraHandlerError>>,
 ) -> DiscoveryDialResult {
     let healthy = zakura_rt::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
     zakura_rt::pin!(healthy);
@@ -472,26 +506,182 @@ mod tests {
         zakura_quic::NodeSecretKey::from_bytes(&[byte; 32]).public()
     }
 
-    #[test]
-    fn panicked_worker_returns_metadata_needed_to_release_reservations() {
-        let node_id = zakura_quic::NodeSecretKey::from_bytes(&[3; 32]).public();
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_unpolled_worker_settles_only_its_attempt() {
         let ip = IpAddr::from([93, 184, 216, 34]);
         let mut state =
             CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
-        let attempt = state
-            .record_attempt(node_id, vec![ip])
-            .expect("an idle dialer records the first attempt");
-
-        let worker_result =
-            recover_discovery_dial_worker_panic(attempt, Err(Box::new("test worker panic")));
-        assert_eq!(worker_result.attempt, attempt);
-        assert_eq!(worker_result.result, DiscoveryDialResult::Failed);
-
+        let first = state.record_attempt(node_id(3), vec![ip]).unwrap();
+        let second = state.record_attempt(node_id(4), vec![ip]).unwrap();
+        let retained = std::sync::Arc::new(());
+        let observed = std::sync::Arc::downgrade(&retained);
+        let worker = DiscoveryDialWorker::spawn(first, async move {
+            let _retained = retained;
+            std::future::pending().await
+        });
+        worker.task.abort();
+        assert!(
+            observed.upgrade().is_some(),
+            "abort requests cancellation before task destruction"
+        );
+        assert_eq!(state.in_flight_dials_to(ip), 2);
+        let (attempt, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap();
+        assert!(
+            observed.upgrade().is_none(),
+            "joining observes destruction of the task payload"
+        );
+        assert_eq!(attempt, first);
+        assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+        assert!(state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()));
+        assert_eq!(state.in_flight_dials_to(ip), 1);
+        assert_eq!(state.in_flight_node_ids(), vec![second.node_id]);
+        let replacement = state.record_attempt(first.node_id, vec![ip]).unwrap();
+        assert!(!state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()));
+        assert_eq!(state.in_flight_dials_to(ip), 2);
         assert!(state.complete(
-            worker_result.attempt,
-            worker_result.result,
-            worker_result.admitted_ip,
-            Instant::now(),
+            replacement,
+            DiscoveryDialResult::ConnectedElsewhere,
+            None,
+            Instant::now()
+        ));
+        assert_eq!(state.in_flight_node_ids(), vec![second.node_id]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_started_and_unpolled_workers_before_discarding_reservations() {
+        let node = crate::zakura::testkit::ZakuraTestNode::builder(9212)
+            .spawn()
+            .await
+            .unwrap();
+        let mut io = CandidateDialerIO {
+            endpoint: node.endpoint(),
+            discovery: node.discovery(),
+            limits: node.limits().clone(),
+            sought_services: Vec::new(),
+            trace: node.endpoint().trace(),
+            workers: FuturesUnordered::new(),
+        };
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        let ip = IpAddr::from([93, 184, 216, 34]);
+        let mut probes = Vec::new();
+        for index in 0..2 {
+            let attempt = state.record_attempt(node_id(index + 3), vec![ip]).unwrap();
+            let retained = std::sync::Arc::new(());
+            probes.push(std::sync::Arc::downgrade(&retained));
+            let (started_tx, started_rx) = oneshot::channel();
+            io.workers
+                .push(DiscoveryDialWorker::spawn(attempt, async move {
+                    let _retained = retained;
+                    let _ = started_tx.send(());
+                    std::future::pending().await
+                }));
+            if index == 0 {
+                zakura_rt::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        assert_eq!(state.in_flight_dials_to(ip), 2);
+        zakura_rt::time::timeout(Duration::from_secs(5), io.shutdown(&mut state))
+            .await
+            .unwrap();
+        assert!(io.workers.is_empty());
+        assert!(state.in_flight_node_ids().is_empty());
+        assert_eq!(state.in_flight_dials_to(ip), 0);
+        assert!(probes.iter().all(|probe| probe.upgrade().is_none()));
+        drop(io);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
+        zakura_rt::time::timeout(Duration::from_secs(15), async {
+            let limits = ZakuraLocalLimits {
+                max_connections: 2,
+                max_pending_handshakes: 1,
+                ..ZakuraLocalLimits::from_config(&crate::Config::default())
+            };
+            let node = crate::zakura::testkit::ZakuraTestNode::builder(9213)
+                .limits(limits.clone())
+                .quic_config(zakura_quic::QuicConfig {
+                    handshake_timeout_secs: Some(30),
+                    ..Default::default()
+                })
+                .spawn()
+                .await
+                .unwrap();
+            let endpoint = node.endpoint();
+            let ip = IpAddr::from([127, 0, 0, 1]);
+            let target = node_id(6);
+            let mut state =
+                CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+            for _ in 0..2 {
+                let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                assert!(endpoint.has_discovery_admission_capacity());
+                let attempt = state.record_attempt(target, vec![ip]).unwrap();
+                let worker = DiscoveryDialWorker::spawn(
+                    attempt,
+                    run_discovery_dial_once(
+                        endpoint.clone(),
+                        NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
+                        limits.clone(),
+                        target,
+                    ),
+                );
+                let mut packet = [0; 2048];
+                silent.recv_from(&mut packet).await.unwrap();
+                assert!(
+                    !endpoint.has_discovery_admission_capacity(),
+                    "the real transport holds the sole discovery slot"
+                );
+                worker.task.abort();
+                let (completed, outcome) = worker.await;
+                assert_eq!(completed, attempt);
+                assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+                assert!(state.complete(
+                    completed,
+                    outcome.result,
+                    outcome.admitted_ip,
+                    Instant::now()
+                ));
+                zakura_rt::time::timeout(Duration::from_secs(2), async {
+                    while !endpoint.has_discovery_admission_capacity() {
+                        zakura_rt::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect(
+                    "worker cancellation releases transport capacity before the handshake timeout",
+                );
+                assert_eq!(state.in_flight_dials_to(ip), 0);
+            }
+            node.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn panicked_worker_returns_metadata_needed_to_release_reservations() {
+        let ip = IpAddr::from([93, 184, 216, 34]);
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        let attempt = state.record_attempt(node_id(3), vec![ip]).unwrap();
+        let worker = DiscoveryDialWorker::spawn(attempt, async { panic!("test worker panic") });
+        let (completed, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap();
+        assert_eq!(completed, attempt);
+        assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+        assert!(state.complete(
+            completed,
+            outcome.result,
+            outcome.admitted_ip,
+            Instant::now()
         ));
         assert!(state.in_flight_node_ids().is_empty());
         assert_eq!(state.in_flight_dials_to(ip), 0);
@@ -501,10 +691,9 @@ mod tests {
     async fn registration_drop_before_healthy_threshold_is_short_lived() {
         let peer_id = peer_id(7);
         let (registered_tx, mut registered_rx) = tokio::sync::watch::channel(vec![peer_id.clone()]);
-        let dial = tokio::spawn(async {
+        let mut dial = AbortOnDropHandle::new(zakura_rt::task::spawn(async {
             std::future::pending::<Result<(), crate::zakura::ZakuraHandlerError>>().await
-        });
-        tokio::pin!(dial);
+        }));
 
         let settled =
             wait_for_discovery_registration_to_settle(&mut registered_rx, &peer_id, &mut dial);
@@ -524,8 +713,7 @@ mod tests {
         let peer_id = peer_id(9);
         let (_registered_tx, mut registered_rx) =
             tokio::sync::watch::channel(vec![peer_id.clone()]);
-        let dial = tokio::spawn(async { Ok(()) });
-        tokio::pin!(dial);
+        let mut dial = AbortOnDropHandle::new(zakura_rt::task::spawn(async { Ok(()) }));
 
         assert_eq!(
             wait_for_discovery_registration_to_settle(&mut registered_rx, &peer_id, &mut dial)

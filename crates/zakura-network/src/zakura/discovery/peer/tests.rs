@@ -719,6 +719,7 @@ fn ownership_changes_during_answer_wait_prevent_close() {
     }
 }
 
+#[cfg(test)]
 #[tokio::test]
 async fn completion_wait_observes_progress_before_and_after_polling() {
     use super::SharedPeerState;

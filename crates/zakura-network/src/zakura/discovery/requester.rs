@@ -587,9 +587,10 @@ pub use tests::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests {
-    use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
+    use std::collections::VecDeque;
 
     use futures::FutureExt;
+    use zakura_rt::collections::{hash_map::Entry, HashMap, HashSet};
 
     use super::*;
     use crate::zakura::{
@@ -669,6 +670,7 @@ mod tests {
 
     /// A query is sent only once its previous answer arrives, and each
     /// answer claims its reservation exactly once.
+    #[cfg(test)]
     #[tokio::test]
     async fn one_get_peers_is_live_and_its_answer_claims_it_once() {
         let Session {
@@ -728,6 +730,7 @@ mod tests {
     /// A `GetServices` reservation is independent of the `GetPeers` one. Its
     /// answer claims it once, returns the query, and stays within
     /// `42 + min(n, 8) × 294` bytes.
+    #[cfg(test)]
     #[tokio::test]
     async fn get_services_is_reserved_beside_get_peers_and_claimed_once() {
         let Session {
@@ -831,6 +834,7 @@ mod tests {
     /// The transport reader queues a `Services` only while a `GetServices`
     /// is owed, and refuses one above its reservation. A live `GetPeers`
     /// lends it no credit.
+    #[cfg(test)]
     #[tokio::test]
     async fn the_transport_reader_queues_only_owed_services() {
         let slot = PrecheckSlot::default();
@@ -873,6 +877,7 @@ mod tests {
     /// The transport reader queues at most the one `Peers` this node is owed,
     /// even while a `GetServices` is owed too. Its claim releases the queued
     /// answer.
+    #[cfg(test)]
     #[tokio::test]
     async fn the_transport_reader_queues_at_most_the_owed_peers() {
         let slot = PrecheckSlot::default();
@@ -929,6 +934,7 @@ mod tests {
 
     /// A query that is never written gives its reservation and pool entry
     /// back, so the next exchange can send one.
+    #[cfg(test)]
     #[tokio::test]
     async fn an_unwritten_query_gives_its_reservation_back() {
         let pool = reservation_pool();
@@ -957,6 +963,7 @@ mod tests {
     }
 
     /// A full node-wide pool defers the query to the next exchange.
+    #[cfg(test)]
     #[tokio::test]
     async fn a_full_pool_defers_the_query() {
         let pool = ReservationPool::new(1).expect("one entry is a valid pool");
@@ -970,6 +977,7 @@ mod tests {
 
     /// Retiring the queries closes the connection only when a written query
     /// is unanswered, and returns every reservation to the pool.
+    #[cfg(test)]
     #[tokio::test]
     async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
         let pool = reservation_pool();
@@ -1051,6 +1059,7 @@ mod tests {
     /// A claim ends the query's protocol authority. The answer keeps the pool
     /// entry and its kind until it settles, so a refresh cannot stack a second
     /// answer behind one that waits for verification.
+    #[cfg(test)]
     #[tokio::test]
     async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
         let pool = reservation_pool();
@@ -1094,6 +1103,7 @@ mod tests {
 
     /// A `Hello` in verification holds the settled wait, and it takes no pool
     /// entry and blocks no query.
+    #[cfg(test)]
     #[tokio::test]
     async fn a_hello_in_verification_holds_only_the_settled_wait() {
         let pool = reservation_pool();
@@ -1110,8 +1120,8 @@ mod tests {
             .await
             .expect("a Hello in verification blocks no query");
         let waiting = queries.clone();
-        let settled = tokio::spawn(async move { waiting.answers_settled().await });
-        tokio::task::yield_now().await;
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the Hello holds the wait");
         drop(hello);
         zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
@@ -1122,6 +1132,7 @@ mod tests {
 
     /// `answers_settled` waits for a claimed answer and ignores a query the
     /// peer has not answered.
+    #[cfg(test)]
     #[tokio::test]
     async fn answers_settled_waits_for_a_claimed_answer_only() {
         let Session {
@@ -1140,8 +1151,8 @@ mod tests {
 
         let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
         let waiting = queries.clone();
-        let settled = tokio::spawn(async move { waiting.answers_settled().await });
-        tokio::task::yield_now().await;
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the claimed answer holds the wait");
         drop(answer);
         zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
@@ -1152,6 +1163,7 @@ mod tests {
 
     /// A queued answer holds the wait until its claim and settlement, on the
     /// real transport precheck.
+    #[cfg(test)]
     #[tokio::test]
     async fn answers_settled_waits_for_a_frame_the_transport_queued() {
         let slot = PrecheckSlot::default();
@@ -1169,11 +1181,11 @@ mod tests {
             .expect("the transport admits the owed answer");
 
         let waiting = queries.clone();
-        let settled = tokio::spawn(async move { waiting.answers_settled().await });
-        tokio::task::yield_now().await;
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the queued answer holds the wait");
         let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
-        tokio::task::yield_now().await;
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the claimed answer holds the wait");
         drop(answer);
         zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)

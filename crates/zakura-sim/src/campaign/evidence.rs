@@ -8,10 +8,14 @@
 //! its process ID and started while the attempt ran, so a reused process ID
 //! or a stale copy matches no attempt. It lists each gap as an
 //! [`Incomplete`]: a worker that didn't spend its budget, a process that
-//! left no file, a file whose process didn't exit cleanly, and a file no
-//! logged process wrote. Only complete files that a logged process wrote
-//! count toward [`Evidence::complete_totals`], and so toward
-//! [`Evidence::unapplied`].
+//! left no file, a file its process never marked complete, a complete file
+//! whose process didn't exit cleanly, and a file no logged process wrote.
+//! Only complete files that a logged process wrote, and whose attempt
+//! exited cleanly, count toward [`Evidence::complete_totals`], and so
+//! toward [`Evidence::unapplied`]. A process exits cleanly if its attempt
+//! logged exit code 0 and no failure. The supervisor logs an attempt only
+//! once its process has exited, so a running process, or one whose
+//! supervisor stopped first, has no attempt, and its file is unlogged.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -44,8 +48,8 @@ pub struct Evidence {
     pub workers: Vec<WorkerEvidence>,
     /// Every stats file's counts, summed.
     pub totals: Counts,
-    /// The counts of the complete stats files that logged processes wrote,
-    /// summed.
+    /// The counts of the complete stats files that logged processes wrote
+    /// before they exited cleanly, summed.
     pub complete_totals: Counts,
     /// The properties, of the harness's and of any stats file, that no file
     /// in [`Evidence::complete_totals`] saw apply: none of their runs held
@@ -96,11 +100,25 @@ pub enum Incomplete {
         /// Its process ID, if the log names it.
         pid: Option<u32>,
     },
-    /// A process didn't exit cleanly, or still runs: its stats file lacks
-    /// the runs since its last checkpoint.
+    /// A stats file its process never marked complete: the process stopped
+    /// inside a run or without its exit handlers, or still runs. The file
+    /// lacks the runs since its last checkpoint.
     PartialStats {
         /// The worker.
         worker: usize,
+        /// Its process ID.
+        pid: u32,
+    },
+    /// A logged process marked its stats file complete, but its attempt
+    /// didn't exit cleanly: it exited with a code other than 0, a signal
+    /// or the supervisor's deadline kill ended it, or the supervisor found
+    /// a failure in its output. Its counts stay out of the complete
+    /// totals.
+    UncleanExit {
+        /// The worker.
+        worker: usize,
+        /// The attempt.
+        attempt: u32,
         /// Its process ID.
         pid: u32,
     },
@@ -174,18 +192,18 @@ pub fn evidence(store: &Store, digest: &Digest) -> Result<Evidence, CampaignErro
         let mut ends = BTreeMap::new();
         // The latest attempt claims a file first, so a file whose process
         // ID an earlier attempt also had counts once.
-        let mut logged = BTreeSet::new();
+        let mut logged = BTreeMap::new();
         for attempt in attempts.iter().rev() {
             *ends.entry(attempt.end).or_default() += 1;
             let wrote = attempt.pid.filter(|pid| {
-                !logged.contains(pid)
+                !logged.contains_key(pid)
                     && stats
                         .get(pid)
                         .is_some_and(|process| started_during(process, attempt))
             });
             match wrote {
                 Some(pid) => {
-                    logged.insert(pid);
+                    logged.insert(pid, attempt);
                 }
                 None => evidence.incomplete.push(Incomplete::MissingStats {
                     worker: plan.index,
@@ -197,8 +215,8 @@ pub fn evidence(store: &Store, digest: &Digest) -> Result<Evidence, CampaignErro
         let mut counts = Counts::default();
         let processes = stats.len();
         for (pid, process) in &stats {
-            let logged = logged.contains(pid);
-            if !logged {
+            let attempt = logged.get(pid);
+            if attempt.is_none() {
                 evidence.incomplete.push(Incomplete::UnloggedProcess {
                     worker: plan.index,
                     pid: *pid,
@@ -209,8 +227,16 @@ pub fn evidence(store: &Store, digest: &Digest) -> Result<Evidence, CampaignErro
                     worker: plan.index,
                     pid: *pid,
                 });
-            } else if logged {
-                evidence.complete_totals.add(&process.counts);
+            } else if let Some(attempt) = attempt {
+                if exited_cleanly(attempt) {
+                    evidence.complete_totals.add(&process.counts);
+                } else {
+                    evidence.incomplete.push(Incomplete::UncleanExit {
+                        worker: plan.index,
+                        attempt: attempt.attempt,
+                        pid: *pid,
+                    });
+                }
             }
             counts.add(&process.counts);
         }
@@ -250,6 +276,13 @@ fn started_during(process: &ProcessStats, attempt: &Attempt) -> bool {
         .started_unix
         .saturating_add(attempt.millis.div_ceil(1000));
     (attempt.started_unix..=ended).contains(&process.started_unix)
+}
+
+/// True if `attempt`'s process exited with code 0, and the supervisor
+/// found no failure in its output. A signal or the supervisor's deadline
+/// kill leaves no code.
+fn exited_cleanly(attempt: &Attempt) -> bool {
+    attempt.code == Some(0) && attempt.failure.is_none()
 }
 
 /// Worker directory `dir`'s outcome record, if it wrote one.

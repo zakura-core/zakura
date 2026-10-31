@@ -7,8 +7,9 @@
 //! the supervisor passes, writes a corpus file every 50 ms until its
 //! `-max_total_time`, and does what the files in its control directory
 //! say: crash once or always, end at the abandonment limit, exit 0 early,
-//! log 8 MiB, log a feedback line, hang in a merge, or leave a merge process behind
-//! that writes a crash file later. With a `stats` control file, it writes
+//! exit 1 once after its stats file is complete, log 8 MiB, log a feedback
+//! line, hang in a merge, or leave a merge process behind that writes a
+//! crash file later. With a `stats` control file, it writes
 //! that file to `$ZAKURA_SIM_STATS` as its stats file, incomplete at start
 //! and complete at a clean exit, as a real target does. It exits when its
 //! parent does, as a real fuzzer does when a terminal's interrupt reaches
@@ -139,6 +140,9 @@ while [ "$(date +%s%N)" -lt "$end" ]; do
 done
 echo "Done $i runs in $time second(s)" >&2
 stats true
+if mv "$control/fail-after-stats" "$control/fail-after-stats-taken-$$" 2>/dev/null; then
+  exit 1
+fi
 exit 0
 "#;
 
@@ -1699,6 +1703,60 @@ fn evidence_matches_each_file_to_the_process_that_wrote_it() {
     assert!(error.contains("stats-<pid>.json"), "{error}");
     assert_eq!(evidence.incomplete.len(), 2, "{:?}", evidence.incomplete);
     assert_eq!(evidence.totals, template);
+}
+
+/// E4b-min: a complete stats file counts only if its process exited
+/// cleanly: with code 0 and no failure in its output. A process that marks
+/// its file complete and then exits 1, or exits 0 after a sanitizer
+/// report, lists its attempt as an unclean exit, and its file stays out of
+/// the complete totals.
+#[test]
+fn evidence_counts_a_complete_file_only_after_a_clean_exit() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    fixture.set("fail-after-stats");
+    let (run, end) = start(&fixture.store, fixture.options(1, 1));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let mut attempts = read_attempts(&fixture.store, &run, 0);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].code, Some(1));
+    assert_eq!(attempts[0].end, AttemptEnd::Failure);
+    let pid = attempts[0].pid.unwrap();
+    let file = fixture
+        .store
+        .run_dir(&run)
+        .join(format!("workers/0/stats/stats-{pid}.json"));
+    assert!(ProcessStats::read(&file).unwrap().complete);
+    let template = template_counts();
+    let unclean = [Incomplete::UncleanExit {
+        worker: 0,
+        attempt: 0,
+        pid,
+    }];
+
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, unclean);
+    assert_eq!(evidence.totals, template);
+    assert_eq!(evidence.complete_totals, Counts::default());
+    assert_eq!(evidence.unapplied, unapplied(false));
+
+    // Exit code 0 with a failure in the output is still unclean.
+    attempts[0].code = Some(0);
+    attempts[0].failure = Some(ProcessFailure::Sanitizer {
+        report: "==1==ERROR: AddressSanitizer: heap-use-after-free".to_owned(),
+    });
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, unclean);
+    assert_eq!(evidence.complete_totals, Counts::default());
+
+    attempts[0].failure = None;
+    attempts[0].end = AttemptEnd::Finished;
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, []);
+    assert_eq!(evidence.complete_totals, template);
+    assert_eq!(evidence.unapplied, unapplied(true));
 }
 
 /// E4b-min: a run whose processes wrote no stats files, and an attempts

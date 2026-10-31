@@ -340,12 +340,14 @@ The compaction's merge writes no stats.
 whose process has the file's process ID and started while the attempt ran.
 It reports each worker's outcome, its processes by how they ended, and its
 counts; the run's totals; the totals of the complete files that logged
-processes wrote; each property's assumption losses
+processes wrote and whose attempts exited cleanly, with code 0 and no
+failure in their output; each property's assumption losses
 (`assumptions-never-held` and `assumption-lost`); the features reached, by
 family; and the properties, the harness's and any file's, that none of
 those complete files saw apply. It lists every gap: a worker that didn't
-spend its budget, a process that left no file, a file whose process didn't
-exit cleanly, a file no logged process wrote (a reused process ID or a
+spend its budget, a process that left no file, a file its process never
+marked complete, a complete file whose attempt didn't exit cleanly, a file
+no logged process wrote (a reused process ID or a
 stale copy among them), and a file that can't be read, that another
 harness wrote, or that isn't named `stats-<pid>.json`. Feature counts come
 only from a target with a collector.

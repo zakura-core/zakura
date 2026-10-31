@@ -13,7 +13,7 @@ use zakura_header_chain::{
     VerifiedGeneration,
 };
 
-use super::{QueryPlan, QueryRequest, QueryStart, QueryState, WorkFacts};
+use super::{ActionRefusal, QueryPlan, QueryRequest, QueryStart, QueryState, WorkFacts};
 
 const DISPATCH: &str = "block/query-dispatch";
 const COMPLETION: &str = "block/query-completion";
@@ -113,7 +113,11 @@ fn replay(data: &[u8], mut after_step: impl FnMut(&mut QueryState, u8)) -> Block
                         retry_at = None;
                         summary.accepted += 1;
                     } else {
-                        state.refused(proposal, origin + Duration::from_millis(now));
+                        state.refused(
+                            proposal,
+                            ActionRefusal::Full,
+                            origin + Duration::from_millis(now),
+                        );
                         retry_at = Some(now + 250);
                         summary.refused_replacements += usize::from(pending.is_some());
                     }

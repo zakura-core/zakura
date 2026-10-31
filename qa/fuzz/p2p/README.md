@@ -10,7 +10,7 @@ simulator step loop.
 | `block_peer_registry` | `block/peer-registry` | 1 |
 | `block_retry_authority` | `block/retry-authority` | 1 |
 | `block_query` | `block/query-dispatch`, `block/query-completion` | 1 |
-| `block_reactor` | `block/reactor-policy` | 1 |
+| `block_reactor` | `block/reactor-policy` | 2 |
 
 Each decoder reads at most 512 bytes. Each model checks the state after every
 operation. The colocated tests retain nonzero witnesses and planted failures.
@@ -32,7 +32,9 @@ reactor model from PR #1683. `block_query` generates accepted and refused
 proposals, exact and stale replies, resets, authority changes, and retry expiry.
 Its identity ledger calls no production policy helper. `block_reactor` shares the
 reactor policy model with proptest and covers view mirrors, reaction epochs, reset
-refills, query refusal, retry expiry, and authority changes. Both decide pure
+refills, query refusal, retry expiry, and authority changes. Decoder 2 of
+`block_reactor` adds a closed-channel refusal to bit 16 of the refill byte. No
+committed corpus uses decoder 1. Both decide pure
 transitions. Runtime witnesses cover the action channel and storage waits.
 
 The request-lifecycle target follows the B4 pure-state port. Other machine

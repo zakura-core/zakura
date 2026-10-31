@@ -294,7 +294,7 @@ fn only_misbehavior_reports_are_optional_actions() {
         reason: crate::zakura::block_sync::BlockSyncMisbehavior::InvalidBlock,
     };
     assert_eq!(ActionClass::of(&misbehavior), ActionClass::Optional);
-    state.queries.refused(query, now);
+    state.queries.refused(query, ActionRefusal::Full, now);
 }
 
 // ---- model ----

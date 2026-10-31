@@ -83,14 +83,32 @@ enum Refill {
     Refused(PendingNeededQuery),
 }
 
-/// Run one refill the way the reactor does. `accept` is the action channel's
-/// answer, which reaches the state before anything else happens.
+/// Run one refill the way the reactor does. `accept` selects between an accepted
+/// dispatch and a full action channel.
 fn refill(
     state: &mut ReactorState,
     force: bool,
     facts: WorkFacts,
     scope: Option<BodyWorkAuthority>,
     accept: bool,
+    now: Instant,
+) -> Refill {
+    let answer = if accept {
+        Ok(())
+    } else {
+        Err(ActionRefusal::Full)
+    };
+    refill_answered(state, force, facts, scope, answer, now)
+}
+
+/// Run one refill with the action channel's exact `answer`, which reaches the
+/// state before anything else happens.
+fn refill_answered(
+    state: &mut ReactorState,
+    force: bool,
+    facts: WorkFacts,
+    scope: Option<BodyWorkAuthority>,
+    answer: Result<(), ActionRefusal>,
     now: Instant,
 ) -> Refill {
     let start = match state.open_query(force) {
@@ -102,12 +120,15 @@ fn refill(
         return Refill::Held;
     };
     let query = proposal.query();
-    if accept {
-        state.queries.accepted(proposal);
-        Refill::Accepted(query)
-    } else {
-        state.queries.refused(proposal, now);
-        Refill::Refused(query)
+    match answer {
+        Ok(()) => {
+            state.queries.accepted(proposal);
+            Refill::Accepted(query)
+        }
+        Err(refusal) => {
+            state.queries.refused(proposal, refusal, now);
+            Refill::Refused(query)
+        }
     }
 }
 
@@ -343,6 +364,185 @@ fn view_with_unchanged_reaction_epoch_only_refreshes_mirrors() {
     );
 }
 
+/// A forced refill that the full channel refuses must not lose its force: a
+/// stale outstanding snapshot above the low-water target would otherwise hold
+/// the retry until an external wake.
+#[test]
+fn refused_forced_refill_retries_past_low_water() {
+    let now = Instant::now();
+    let mut state = reactor_state(0, 100);
+    let refused = refill(
+        &mut state,
+        true,
+        work(Some(1), 50, 10),
+        Some(authority(0)),
+        false,
+        now,
+    );
+    assert!(matches!(refused, Refill::Refused(query) if query.forced));
+    assert!(state.queries.retry_forced());
+
+    state.queries.retry_elapsed();
+    let retried = expect_accepted(refill(
+        &mut state,
+        false,
+        work(Some(1), 50, 10),
+        Some(authority(0)),
+        true,
+        now,
+    ));
+    assert!(retried.forced);
+    assert!(!state.queries.retry_forced());
+
+    // The accepted retry settled the debt, so the low-water gate applies again.
+    state
+        .queries
+        .complete(retried.query_id, retried.scope)
+        .expect("the retry is pending");
+    assert_eq!(
+        refill(
+            &mut state,
+            false,
+            work(Some(1), 50, 10),
+            Some(authority(0)),
+            true,
+            now,
+        ),
+        Refill::Held
+    );
+}
+
+/// A forced query that state fails after acceptance owes the same retry.
+#[test]
+fn failed_forced_query_retries_past_low_water() {
+    let now = Instant::now();
+    let mut state = reactor_state(0, 100);
+    let query = expect_accepted(refill(
+        &mut state,
+        true,
+        work(Some(1), 50, 10),
+        Some(authority(0)),
+        true,
+        now,
+    ));
+
+    assert!(state.queries.fail(query.query_id, query.scope, now));
+    state.queries.retry_elapsed();
+
+    assert!(
+        expect_accepted(refill(
+            &mut state,
+            false,
+            work(Some(1), 50, 10),
+            Some(authority(0)),
+            true,
+            now,
+        ))
+        .forced
+    );
+}
+
+/// The old query's reply lifts a refused replacement's retry gate. The refused
+/// force stays for the next proposal.
+#[test]
+fn old_reply_keeps_the_force_a_refused_replacement_owes() {
+    let now = Instant::now();
+    let mut state = reactor_state(0, 100);
+    let old = expect_accepted(refill(
+        &mut state,
+        false,
+        work(Some(1), 0, 10),
+        Some(authority(0)),
+        true,
+        now,
+    ));
+    state
+        .progress
+        .observe_header_tip(block::Height(120), header_hash(120));
+    assert!(matches!(
+        refill(
+            &mut state,
+            true,
+            work(Some(1), 0, 10),
+            Some(authority(0)),
+            false,
+            now,
+        ),
+        Refill::Refused(_)
+    ));
+
+    assert_eq!(state.queries.complete(old.query_id, old.scope), Some(old));
+    assert_eq!(state.queries.retry_at(), None);
+    assert!(state.queries.retry_forced());
+}
+
+/// A reset supersedes the refused query and the force it owed.
+#[test]
+fn reset_clears_the_owed_force() {
+    let now = Instant::now();
+    let mut state = reactor_state(0, 100);
+    assert!(matches!(
+        refill(
+            &mut state,
+            true,
+            work(Some(1), 0, 10),
+            Some(authority(0)),
+            false,
+            now,
+        ),
+        Refill::Refused(_)
+    ));
+
+    assert!(matches!(
+        state.observe_view(view(0, 1, 1)),
+        ViewReaction::React { reset: true, .. }
+    ));
+    assert_eq!(state.queries.retry_at(), None);
+    assert!(!state.queries.retry_forced());
+}
+
+/// A closed action channel cannot accept a retry, so no timer spins during
+/// shutdown. The accepted query stays pending: the driver may still answer it.
+#[test]
+fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
+    let now = Instant::now();
+    let mut state = reactor_state(0, 100);
+    let accepted = expect_accepted(refill(
+        &mut state,
+        false,
+        work(Some(1), 0, 10),
+        Some(authority(0)),
+        true,
+        now,
+    ));
+    let next_id = state.queries.next_id();
+    state
+        .progress
+        .observe_header_tip(block::Height(120), header_hash(120));
+
+    let refused = refill_answered(
+        &mut state,
+        false,
+        work(Some(1), 0, 10),
+        Some(authority(0)),
+        Err(ActionRefusal::Closed),
+        now,
+    );
+
+    assert!(matches!(refused, Refill::Refused(_)));
+    assert_eq!(state.queries.pending(), Some(accepted));
+    assert_eq!(state.queries.next_id(), next_id);
+    assert_eq!(state.queries.retry_at(), None);
+    assert!(state.queries.dispatch_closed());
+    assert_eq!(state.open_query(true), QueryOpening::Closed);
+
+    assert_eq!(
+        state.queries.complete(accepted.query_id, accepted.scope),
+        Some(accepted)
+    );
+    assert_eq!(state.open_query(true), QueryOpening::Closed);
+}
+
 #[test]
 fn reset_view_forces_refill_past_retry_and_low_water() {
     let now = Instant::now();
@@ -504,7 +704,7 @@ enum Input {
         backlog: usize,
         low_water: usize,
         has_authority: bool,
-        accept: bool,
+        answer: Result<(), ActionRefusal>,
     },
     Reply {
         target: Target,
@@ -557,17 +757,21 @@ fn input() -> impl Strategy<Value = Input> {
             0..20_usize,
             0..20_usize,
             prop::bool::weighted(0.9),
-            prop::bool::weighted(0.6),
+            prop_oneof![
+                12 => Just(Ok(())),
+                7 => Just(Err(ActionRefusal::Full)),
+                1 => Just(Err(ActionRefusal::Closed)),
+            ],
         )
             .prop_map(
-                |(force, first_unclaimed, backlog, low_water, has_authority, accept)| {
+                |(force, first_unclaimed, backlog, low_water, has_authority, answer)| {
                     Input::Refill {
                         force,
                         first_unclaimed,
                         backlog,
                         low_water,
                         has_authority,
-                        accept,
+                        answer,
                     }
                 }
             ),
@@ -610,6 +814,7 @@ struct ModelQuery {
     from: u32,
     limit: u32,
     header_tip: u32,
+    forced: bool,
 }
 
 /// The reply the model expects.
@@ -631,6 +836,10 @@ struct Model {
     accepted: Vec<ModelQuery>,
     next_id: u64,
     retry_until_ms: Option<u64>,
+    /// A refused or failed forced query owes the next proposal its force.
+    retry_forced: bool,
+    /// The action channel reported closed.
+    closed: bool,
     authority: u8,
     header_tip: u32,
     verified_tip: u32,
@@ -653,6 +862,8 @@ impl Model {
             accepted: Vec::new(),
             next_id: 1,
             retry_until_ms: None,
+            retry_forced: false,
+            closed: false,
             authority: 0,
             header_tip,
             verified_tip: 0,
@@ -673,8 +884,11 @@ impl Model {
         backlog: usize,
         low_water: usize,
         has_authority: bool,
-        accept: bool,
+        answer: Result<(), ActionRefusal>,
     ) -> Option<(ModelQuery, bool)> {
+        if self.closed {
+            return None;
+        }
         if force {
             self.retry_until_ms = None;
         }
@@ -684,10 +898,12 @@ impl Model {
         if self.floor >= self.header_tip {
             self.pending = None;
             self.retry_until_ms = None;
+            self.retry_forced = false;
             return None;
         }
         let from = first_unclaimed.filter(|from| *from <= self.header_tip)?;
-        if !force && backlog >= low_water {
+        let forced = force || self.retry_forced;
+        if !forced && backlog >= low_water {
             return None;
         }
         if !has_authority {
@@ -700,6 +916,7 @@ impl Model {
             from,
             limit: (self.header_tip - from + 1).min(window).min(READ_LIMIT),
             header_tip: self.header_tip,
+            forced,
         };
         let same_request = self.pending.is_some_and(|pending| {
             (
@@ -712,15 +929,25 @@ impl Model {
         if same_request {
             return None;
         }
-        if accept {
-            self.pending = Some(query);
-            self.accepted.push(query);
-            self.next_id += 1;
-            self.retry_until_ms = None;
-        } else {
-            self.retry_until_ms = Some(self.now_ms + RETRY_MS);
+        match answer {
+            Ok(()) => {
+                self.pending = Some(query);
+                self.accepted.push(query);
+                self.next_id += 1;
+                self.retry_until_ms = None;
+                self.retry_forced = false;
+            }
+            Err(ActionRefusal::Closed) => {
+                self.closed = true;
+                self.retry_until_ms = None;
+                self.retry_forced = false;
+            }
+            Err(_) => {
+                self.retry_until_ms = Some(self.now_ms + RETRY_MS);
+                self.retry_forced = forced;
+            }
         }
-        Some((query, accept))
+        Some((query, answer.is_ok()))
     }
 
     fn named(&self, target: Target) -> Option<u64> {
@@ -759,11 +986,12 @@ impl Model {
     }
 
     fn fail(&mut self, id: u64, scope: u8) -> bool {
-        if self.matching(id, scope).is_none() {
+        let Some(query) = self.matching(id, scope) else {
             return false;
-        }
+        };
         self.pending = None;
         self.retry_until_ms = Some(self.now_ms + RETRY_MS);
+        self.retry_forced |= query.forced;
         true
     }
 
@@ -787,6 +1015,7 @@ impl Model {
             self.seen_reset_epoch = self.reset_epoch;
             self.pending = None;
             self.retry_until_ms = None;
+            self.retry_forced = false;
         }
         Some((reset, tip_advanced))
     }
@@ -802,6 +1031,7 @@ fn model_query(query: PendingNeededQuery) -> ModelQuery {
         from: query.from.0,
         limit: query.limit,
         header_tip: query.best_header_tip.0,
+        forced: query.forced,
     }
 }
 
@@ -843,6 +1073,12 @@ fn check(state: &ReactorState, model: &Model, base: Instant) {
         state.progress.verified_block_tip.0, model.verified_tip,
         "{PROPERTY}"
     );
+    assert_eq!(
+        state.queries.retry_forced(),
+        model.retry_forced,
+        "{PROPERTY}"
+    );
+    assert_eq!(state.queries.dispatch_closed(), model.closed, "{PROPERTY}");
     assert_eq!(state.progress.request_floor.0, model.floor, "{PROPERTY}");
     assert_eq!(
         state.progress.best_header_tip.0, model.header_tip,
@@ -852,7 +1088,7 @@ fn check(state: &ReactorState, model: &Model, base: Instant) {
 
 const PROPERTY: &str = "block/reactor-policy";
 
-/// Applicable transitions in a decoder-v1 reactor history.
+/// Applicable transitions in a decoder-v2 reactor history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct BlockReactorReplaySummary {
     /// Inputs decoded.
@@ -894,15 +1130,15 @@ fn run(
                 backlog,
                 low_water,
                 has_authority,
-                accept,
+                answer,
             } => {
                 let scope = has_authority.then(|| authority(model.authority));
-                let actual = refill(
+                let actual = refill_answered(
                     &mut state,
                     force,
                     work(first_unclaimed, backlog, low_water),
                     scope,
-                    accept,
+                    answer,
                     now,
                 );
                 let expected = model.refill(
@@ -911,7 +1147,7 @@ fn run(
                     backlog,
                     low_water,
                     has_authority,
-                    accept,
+                    answer,
                 );
                 let actual = match actual {
                     Refill::Held => None,
@@ -1034,9 +1270,13 @@ fn run(
                             refill_backlog,
                             10,
                             true,
-                            refill_accept,
+                            if refill_accept {
+                                Ok(())
+                            } else {
+                                Err(ActionRefusal::Full)
+                            },
                         );
-                        if reset && floor < model.header_tip {
+                        if reset && floor < model.header_tip && !model.closed {
                             assert!(
                                 expected.is_some(),
                                 "{PROPERTY}: a reset refill always dispatches"
@@ -1084,7 +1324,7 @@ mod committed;
 #[cfg(test)]
 mod status;
 
-/// Replay decoder-v1 quadruples against the existing reactor policy model.
+/// Replay decoder-v2 quadruples against the existing reactor policy model.
 /// Read at most 512 bytes and express deadlines relative to one clock origin.
 pub fn replay_block_reactor_bytes(data: &[u8]) -> BlockReactorReplaySummary {
     run(decode(data), |_| {})
@@ -1108,7 +1348,13 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Input> + '_ {
                 backlog: usize::from(d % 20),
                 low_water: usize::from(d / 20) + 1,
                 has_authority: b & 4 == 0,
-                accept: b & 8 == 0,
+                answer: if b & 8 == 0 {
+                    Ok(())
+                } else if b & 16 == 0 {
+                    Err(ActionRefusal::Full)
+                } else {
+                    Err(ActionRefusal::Closed)
+                },
             },
             1 => Input::Reply {
                 target,
@@ -1171,7 +1417,23 @@ fn reactor_witness_exercises_refusal_retry_reset_and_authority() {
         replay_block_reactor_bytes(&[]),
         BlockReactorReplaySummary::default()
     );
-    println!("tier=Machine target=block_reactor decoder=1 {summary:?}");
+    println!("tier=Machine target=block_reactor decoder=2 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "block/reactor-policy")]
+fn reactor_witness_rejects_lost_forced_retry() {
+    run(decode(&[0, 9, 1, 200]), |state| {
+        state.queries.retry_forced = false;
+    });
+}
+
+#[test]
+#[should_panic(expected = "block/reactor-policy")]
+fn reactor_witness_rejects_reopened_dispatch_after_close() {
+    run(decode(&[0, 24, 1, 200]), |state| {
+        state.queries.dispatch_closed = false;
+    });
 }
 
 #[test]

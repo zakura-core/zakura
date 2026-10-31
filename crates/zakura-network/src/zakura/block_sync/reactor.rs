@@ -652,6 +652,7 @@ impl ReactorIO {
                     .state
                     .body_work_scope()
                     .expect("test reactors start with a committed view");
+                self.state.queries.clear();
                 self.handle_needed_blocks(scope, blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
@@ -1069,7 +1070,6 @@ impl ReactorIO {
         scope: zakura_header_chain::BodyWorkAuthority,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        self.state.queries.clear();
         // The state reports every header-known, body-missing height above the
         // download floor, but it has no visibility into our in-memory buffers.
         // Heights already at or below the body download floor, held in the
@@ -1382,11 +1382,16 @@ impl ReactorIO {
             }
             QueryPlan::Dispatch(proposal) => proposal,
         };
-        if self.dispatch_action(proposal.action()).is_ok() {
-            self.state.queries.accepted(proposal);
-        } else {
-            self.state.queries.refused(proposal, Instant::now());
-            metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+        match self.dispatch_action(proposal.action()) {
+            Ok(()) => self.state.queries.accepted(proposal),
+            Err(refusal) => {
+                self.state
+                    .queries
+                    .refused(proposal, refusal, Instant::now());
+                if refusal != ActionRefusal::Closed {
+                    metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+                }
+            }
         }
     }
 
@@ -1747,27 +1752,38 @@ impl ReactorIO {
             .actions
             .max_capacity()
             .saturating_sub(self.actions.capacity());
-        let optional_permits = match ActionClass::of(&action) {
-            ActionClass::Required => None,
-            // Acquire the optional slot and protected control capacity in one
-            // semaphore operation. The Sequencer sends concurrently, so a
-            // separate capacity check followed by `try_send` has a race.
-            ActionClass::Optional => {
-                match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
-                    Ok(permits) => Some(permits),
-                    Err(mpsc::error::TrySendError::Full(())) => {
+        // Reserve before reporting, so a refused action never traces as
+        // dispatched. An optional action acquires its slot and the protected
+        // control capacity in one semaphore operation. The Sequencer sends
+        // concurrently, so a separate capacity check has a race.
+        let class = ActionClass::of(&action);
+        let permits = match class {
+            ActionClass::Required => 1,
+            ActionClass::Optional => BS_ACTION_CONTROL_RESERVE + 1,
+        };
+        let mut permits = match self.actions.try_reserve_many(permits) {
+            Ok(permits) => permits,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(match class {
+                    ActionClass::Required => {
+                        metrics::counter!(
+                            "sync.block.action.send_queue_full",
+                            "action" => action_label
+                        )
+                        .increment(1);
+                        ActionRefusal::Full
+                    }
+                    ActionClass::Optional => {
                         metrics::counter!(
                             "sync.block.action.control_capacity_reserved",
                             "action" => action_label
                         )
                         .increment(1);
-                        return Err(ActionRefusal::ControlReserve);
+                        ActionRefusal::ControlReserve
                     }
-                    Err(mpsc::error::TrySendError::Closed(())) => {
-                        return Err(ActionRefusal::Closed)
-                    }
-                }
+                });
             }
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(ActionRefusal::Closed),
         };
         // Metrics accepts f64 samples; this lossy conversion is observability-only.
         metrics::histogram!(
@@ -1778,25 +1794,11 @@ impl ReactorIO {
         self.startup
             .trace
             .emit_event(|| BlockActionDispatched::new(&action));
-        if let Some(mut permits) = optional_permits {
-            permits
-                .next()
-                .expect("the atomic reservation includes one optional-action permit")
-                .send(action);
-            return Ok(());
-        }
-        match self.actions.try_send(action) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!(
-                    "sync.block.action.send_queue_full",
-                    "action" => action_label
-                )
-                .increment(1);
-                Err(ActionRefusal::Full)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(ActionRefusal::Closed),
-        }
+        permits
+            .next()
+            .expect("the reservation holds at least one permit for this action")
+            .send(action);
+        Ok(())
     }
 
     async fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: BlockSyncMisbehavior) {

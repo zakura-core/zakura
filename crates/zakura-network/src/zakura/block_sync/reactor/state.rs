@@ -15,6 +15,9 @@
 //!    [`QueryState::refused`] before it reads another input.
 //!
 //! Only an accepted proposal replaces the pending query and consumes a query ID.
+//! A full channel keeps the pending query and retries with the refused query's
+//! force. A closed channel ends dispatch; a reply to an accepted query still
+//! completes it.
 //! Body-availability requests follow the same rule: only an accepted request
 //! records its deduplication key.
 
@@ -241,6 +244,9 @@ pub(super) struct PendingNeededQuery {
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
     pub(super) hint_revision: Option<u64>,
+    /// The query bypassed the low-water gate. Its refusal or failure carries
+    /// that bypass into the retry.
+    pub(super) forced: bool,
 }
 
 impl PendingNeededQuery {
@@ -372,6 +378,11 @@ pub(super) struct QueryState {
     next_id: Option<NonZeroU64>,
     /// Earliest time to retry the last refused or failed query.
     retry_at: Option<Instant>,
+    /// The next proposal bypasses the low-water gate, because a forced query
+    /// was refused or failed before state answered it.
+    retry_forced: bool,
+    /// The action channel reported closed. The reactor proposes no more queries.
+    dispatch_closed: bool,
     hint_refresh: Option<HintRefresh>,
 }
 
@@ -381,6 +392,8 @@ impl QueryState {
             pending: None,
             next_id: NonZeroU64::new(1),
             retry_at: None,
+            retry_forced: false,
+            dispatch_closed: false,
             hint_refresh: None,
         }
     }
@@ -402,11 +415,26 @@ impl QueryState {
         self.hint_refresh
     }
 
-    /// Apply the retry, quiet-period, and floor gates.
+    /// Whether a refused or failed forced query still owes a forced retry.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn retry_forced(&self) -> bool {
+        self.retry_forced
+    }
+
+    /// Whether the action channel reported closed.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn dispatch_closed(&self) -> bool {
+        self.dispatch_closed
+    }
+
+    /// Apply the closed-channel, retry, quiet-period, and floor gates.
     ///
     /// A forced query lifts the retry gate. A floor at the header tip retires
     /// the pending query. A hint refresh that the floor passed ends.
     pub(super) fn open(&mut self, gate: QueryGate) -> QueryOpening {
+        if self.dispatch_closed {
+            return QueryOpening::Closed;
+        }
         if gate.force {
             self.retry_at = None;
         } else if self.retry_at.is_some() {
@@ -432,7 +460,10 @@ impl QueryState {
     }
 
     /// Choose the next query without changing state.
+    ///
+    /// An owed forced retry bypasses the low-water gate like `request.force`.
     pub(super) fn propose(&self, request: QueryRequest) -> QueryPlan {
+        let force = request.force || self.retry_forced;
         let (from, limit, hint_revision) = match request.start {
             QueryStart::Refresh(refresh) => (
                 refresh.from,
@@ -452,7 +483,7 @@ impl QueryState {
                 else {
                     return QueryPlan::Idle;
                 };
-                if !request.force && work.backlog >= work.low_water {
+                if !force && work.backlog >= work.low_water {
                     return QueryPlan::Idle;
                 }
                 (
@@ -476,6 +507,7 @@ impl QueryState {
             best_header_tip: request.best_header_tip,
             best_header_hash: request.best_header_hash,
             hint_revision,
+            forced: force,
         };
         if self.pending.is_some_and(|pending| pending.covers(&query)) {
             return QueryPlan::Covered;
@@ -489,16 +521,37 @@ impl QueryState {
         let query_id = proposal.query.query_id;
         self.pending = Some(proposal.query);
         self.retry_at = None;
+        self.retry_forced = false;
         self.next_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
     }
 
     /// The action channel refused `proposal`. The pending query and the next
-    /// query ID stay; the query retries after [`NEEDED_BLOCK_QUERY_RETRY_DELAY`].
-    pub(super) fn refused(&mut self, _proposal: QueryProposal, now: Instant) {
-        self.schedule_retry(now);
+    /// query ID stay.
+    ///
+    /// A full channel retries after [`NEEDED_BLOCK_QUERY_RETRY_DELAY`], with the
+    /// refused query's force. A closed channel can never accept a retry, so it
+    /// ends dispatch and arms no wake.
+    pub(super) fn refused(
+        &mut self,
+        proposal: QueryProposal,
+        refusal: ActionRefusal,
+        now: Instant,
+    ) {
+        match refusal {
+            ActionRefusal::Closed => {
+                self.dispatch_closed = true;
+                self.retry_at = None;
+                self.retry_forced = false;
+            }
+            ActionRefusal::ControlReserve | ActionRefusal::Full => {
+                self.retry_forced |= proposal.query.forced;
+                self.schedule_retry(now);
+            }
+        }
     }
 
-    /// Take the pending query when `(query_id, scope)` identifies it.
+    /// Take the pending query when `(query_id, scope)` identifies it, and lift
+    /// the retry gate. An owed forced retry survives for the next proposal.
     pub(super) fn complete(
         &mut self,
         query_id: NonZeroU64,
@@ -507,7 +560,8 @@ impl QueryState {
         let query = self
             .pending
             .filter(|pending| pending.query_id == query_id && pending.scope == scope)?;
-        self.clear();
+        self.pending = None;
+        self.retry_at = None;
         Some(query)
     }
 
@@ -520,13 +574,14 @@ impl QueryState {
         scope: BodyWorkAuthority,
         now: Instant,
     ) -> bool {
-        if self
+        let Some(query) = self
             .pending
-            .is_none_or(|pending| pending.query_id != query_id || pending.scope != scope)
-        {
+            .filter(|pending| pending.query_id == query_id && pending.scope == scope)
+        else {
             return false;
-        }
+        };
         self.pending = None;
+        self.retry_forced |= query.forced;
         self.schedule_retry(now);
         true
     }
@@ -536,10 +591,13 @@ impl QueryState {
         self.retry_at = None;
     }
 
-    /// Retire the pending query and lift the retry gate.
+    /// Retire the pending query and lift the retry gate and any owed forced retry.
+    ///
+    /// The caller's reset, authority change, or empty range supersedes both.
     pub(super) fn clear(&mut self) {
         self.pending = None;
         self.retry_at = None;
+        self.retry_forced = false;
     }
 
     /// End the hint refresh, for example after a body-work epoch change.

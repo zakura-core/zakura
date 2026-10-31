@@ -1006,23 +1006,32 @@ fn ensure_block_locator_count(count: usize) -> Result<(), LegacyGossipError> {
 
 fn write_header_list(
     out: &mut Vec<u8>,
-    headers: &[block::CountedHeader],
+    headers: &[zakura_node_services::block_memory::HeaderHandle],
 ) -> Result<(), LegacyGossipError> {
     ensure_header_count(headers.len())?;
     CompactSizeMessage::try_from(headers.len())?.zcash_serialize(&mut *out)?;
     for header in headers {
+        // The wire form of a counted header: the header, then a zero transaction count.
         header.zcash_serialize(&mut *out)?;
+        CompactSizeMessage::try_from(0usize)?.zcash_serialize(&mut *out)?;
     }
     Ok(())
 }
 
+/// Reads a header list. These headers come from a peer, so they have no read
+/// admission. The exchange's grant funds them while it decodes, and the requester's
+/// pipeline owns them after that.
 fn read_header_list(
     reader: &mut Cursor<&[u8]>,
-) -> Result<Vec<block::CountedHeader>, LegacyGossipError> {
+) -> Result<Vec<zakura_node_services::block_memory::HeaderHandle>, LegacyGossipError> {
     let count = bounded_header_count(reader)?;
     let mut headers = Vec::with_capacity(count);
     for _ in 0..count {
-        headers.push(block::CountedHeader::zcash_deserialize(&mut *reader)?);
+        headers.push(
+            block::CountedHeader::zcash_deserialize(&mut *reader)?
+                .header
+                .into(),
+        );
     }
     Ok(headers)
 }
@@ -1240,7 +1249,7 @@ fn block_hashes_frame(
 
 fn block_headers_frame(
     request_id: u64,
-    headers: Vec<block::CountedHeader>,
+    headers: Vec<zakura_node_services::block_memory::HeaderHandle>,
 ) -> Result<Frame, LegacyGossipError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&request_id.to_le_bytes());
@@ -1319,7 +1328,7 @@ fn decode_tx_ids_response(
 fn decode_block_headers(
     request_id: u64,
     payload: Vec<u8>,
-) -> Result<Vec<block::CountedHeader>, LegacyGossipError> {
+) -> Result<Vec<zakura_node_services::block_memory::HeaderHandle>, LegacyGossipError> {
     let payload = verify_response_id(request_id, &payload)?;
     let mut reader = Cursor::new(payload);
     let headers = read_header_list(&mut reader)?;
@@ -3926,7 +3935,9 @@ mod tests {
         fn call(&mut self, request: Request) -> Self::Future {
             let response = match request {
                 Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
-                Request::FindHeaders { .. } => Response::BlockHeaders(vec![self.header()]),
+                Request::FindHeaders { .. } => {
+                    Response::BlockHeaders(vec![self.header().header.into()])
+                }
                 Request::MempoolTransactionIds => {
                     Response::TransactionIds(vec![self.transaction.id()])
                 }
@@ -4557,7 +4568,7 @@ mod tests {
         };
         assert!(matches!(
             headers.as_slice(),
-            [header] if header.header == block.header
+            [header] if *header == block.header.clone().into()
         ));
 
         let find_blocks = adapter
@@ -4661,7 +4672,7 @@ mod tests {
             headers,
             Response::BlockHeaders(headers) if matches!(
                 headers.as_slice(),
-                [header] if header.header == block.header
+                [header] if *header == block.header.clone().into()
             )
         ));
 
@@ -6732,7 +6743,7 @@ mod tests {
             block_hash_response
         );
 
-        let header_response = Response::BlockHeaders(vec![header]);
+        let header_response = Response::BlockHeaders(vec![header.header.clone().into()]);
         let frames = LegacyResponseCodec::encode_response(
             9,
             header_response.clone(),

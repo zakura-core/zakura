@@ -11367,7 +11367,7 @@ mod tests {
                 stop: None,
             },
             LegacyRequestKind::FindHeaders,
-            Response::BlockHeaders(vec![header]),
+            Response::BlockHeaders(vec![header.header.clone().into()]),
         )?;
         assert_codec_frames_validate_at_transport(
             LegacyRequestFrame::MempoolTransactionIds,

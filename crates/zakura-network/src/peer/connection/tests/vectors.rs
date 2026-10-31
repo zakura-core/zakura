@@ -1235,6 +1235,63 @@ async fn block_gossip_slot_tracks_connection_write() {
     connection_task.abort();
 }
 
+/// A `headers` response keeps its state read slots until the wire send finishes.
+#[tokio::test(start_paused = true)]
+async fn tcp_headers_response_holds_read_admission_through_the_send() {
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_node_services::block_memory::{DecodedPayloadPool, HeaderHandle};
+
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let pool = DecodedPayloadPool::new(std::num::NonZeroU16::MIN);
+    let header = pool
+        .try_decode(|| Some(*block.header))
+        .unwrap()
+        .expect("the decoder returned a header");
+
+    let known_blocks = vec![block.hash()];
+    peer_tx
+        .send(Ok(Message::GetHeaders {
+            known_blocks: known_blocks.clone(),
+            stop: None,
+        }))
+        .await
+        .unwrap();
+    inbound
+        .expect_request(Request::FindHeaders {
+            known_blocks,
+            stop: None,
+        })
+        .await
+        .respond(Response::BlockHeaders(vec![HeaderHandle::from(header)]));
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pool.available_slots(),
+        0,
+        "the zero-capacity sink cannot flush until the test reads it"
+    );
+    let Message::Headers(sent) = outbound.next().await.unwrap() else {
+        panic!("a headers response becomes a headers message")
+    };
+    assert_eq!(sent[0].header, block.header);
+    // The connection task finishes its flush and drops the handles on a later turn.
+    for _ in 0..16 {
+        if pool.available_slots() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(pool.available_slots(), 1);
+    connection_task.abort();
+}
+
 /// A block the inbound service leaves out of its response cannot hold a gossip slot.
 #[tokio::test(start_paused = true)]
 async fn truncated_block_request_releases_gossip_slot() {

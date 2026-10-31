@@ -1407,7 +1407,7 @@ where
             let mut ahead: HeightDiff = 0;
             let mut run_parent: Option<block::Hash> = None;
             for counted in headers {
-                let hash = counted.header.hash();
+                let hash = counted.hash();
                 // `state_contains` errs only if the state service is gone; treat
                 // an error as "known" so a failing probe never forces a fallback.
                 if self.state_contains(hash).await.unwrap_or(true) {
@@ -1415,7 +1415,7 @@ where
                     run_parent = Some(hash);
                     continue;
                 }
-                let parent = counted.header.previous_block_hash;
+                let parent = counted.previous_block_hash;
                 let anchored = match run_parent {
                     Some(run_parent) => parent == run_parent,
                     None => self.state_contains(parent).await.unwrap_or(false),

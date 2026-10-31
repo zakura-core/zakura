@@ -59,7 +59,15 @@ pub enum Response {
     /// The list contains zero or more block headers.
     //
     // TODO: make this into an IndexMap - an ordered unique list of headers (#2244)
-    BlockHeaders(Vec<block::CountedHeader>),
+    ///
+    /// A header read from state keeps its read admission through each holder.
+    BlockHeaders(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "header_responses()")
+        )]
+        Vec<zakura_node_services::block_memory::HeaderHandle>,
+    ),
 
     /// A list of unmined transaction IDs.
     ///
@@ -172,6 +180,17 @@ impl Response {
     pub fn is_inventory_download(&self) -> bool {
         matches!(self, Response::Blocks(_) | Response::Transactions(_))
     }
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
+fn header_responses() -> impl Strategy<Value = Vec<zakura_node_services::block_memory::HeaderHandle>>
+{
+    any::<Vec<block::CountedHeader>>().prop_map(|headers| {
+        headers
+            .into_iter()
+            .map(|counted| counted.header.into())
+            .collect()
+    })
 }
 
 #[cfg(any(test, feature = "proptest-impl"))]

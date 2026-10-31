@@ -10,7 +10,7 @@ use tokio::{runtime::Runtime, time::timeout};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{
-    block::{self, Block, CountedHeader, Height},
+    block::{self, Block, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
     parameters::{Network, NetworkUpgrade},
@@ -2006,11 +2006,9 @@ async fn test_populated_state_responds_correctly(
         .collect();
 
     let block_hashes: Vec<block::Hash> = blocks.iter().map(|block| block.hash()).collect();
-    let block_headers: Vec<CountedHeader> = blocks
+    let block_headers: Vec<zakura_node_services::block_memory::HeaderHandle> = blocks
         .iter()
-        .map(|block| CountedHeader {
-            header: block.header.clone(),
-        })
+        .map(|block| block.header.clone().into())
         .collect();
 
     for (ind, block) in blocks.into_iter().enumerate() {

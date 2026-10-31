@@ -1199,8 +1199,14 @@ async fn block_gossip_slot_tracks_connection_write() {
         .zcash_deserialize_into()
         .unwrap();
     let hash = block.hash();
-    let scheduler = crate::peer::block_gossip::BlockGossipScheduler::new(1);
-    let advertisement = tokio::spawn(gossip.advertise(scheduler.start(hash)));
+    let scheduler = crate::peer::block_gossip::BlockGossipScheduler::new(
+        1,
+        crate::peer::advert_fanout::AdvertFanout::from_config(
+            &crate::Config::default(),
+            crate::peer::advert_fanout::UploadBandwidth::unmeasured(),
+        ),
+    );
+    let advertisement = tokio::spawn(gossip.advertise(scheduler.start(hash.into())));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])
@@ -1254,8 +1260,14 @@ async fn truncated_block_request_releases_gossip_slot() {
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let decoy = block::Hash([1; 32]);
     let hash = block::Hash([2; 32]);
-    let scheduler = crate::peer::block_gossip::BlockGossipScheduler::new(1);
-    let advertisement = tokio::spawn(gossip.advertise(scheduler.start(hash)));
+    let scheduler = crate::peer::block_gossip::BlockGossipScheduler::new(
+        1,
+        crate::peer::advert_fanout::AdvertFanout::from_config(
+            &crate::Config::default(),
+            crate::peer::advert_fanout::UploadBandwidth::unmeasured(),
+        ),
+    );
+    let advertisement = tokio::spawn(gossip.advertise(scheduler.start(hash.into())));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])

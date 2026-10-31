@@ -29,6 +29,7 @@ use crate::{
     },
     meta_addr::MetaAddr,
     peer::{
+        advert_fanout::BodyUploadWatcher,
         block_gossip::{BlockAdvert, BlockAdvertError},
         connection::peer_tx::PeerTx,
         error::AlreadyErrored,
@@ -698,6 +699,15 @@ where
             last_metrics_state: None,
             last_overload_time: None,
         }
+    }
+
+    /// Measures the delivery of every block body this connection sends with `watcher`.
+    ///
+    /// The connection becomes the only owner of `watcher` and its socket handle, which close
+    /// when the connection's message sender drops.
+    pub(crate) fn with_body_upload_watcher(mut self, watcher: Option<BodyUploadWatcher>) -> Self {
+        self.peer_tx.set_body_upload_watcher(watcher);
+        self
     }
 }
 
@@ -1373,7 +1383,7 @@ where
                 // We don't expect to be advertised multiple blocks at a time,
                 // so we ignore any advertisements of multiple blocks.
                 [InventoryHash::Block(hash)] => Request::AdvertiseBlock(
-                    *hash,
+                    (*hash).into(),
                     self.connection_info
                         .connected_addr
                         .get_transient_addr()

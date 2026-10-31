@@ -5,16 +5,20 @@
 use std::{sync::Arc, time::Duration};
 
 use tokio::{task::JoinHandle, time::timeout};
-use tower::{builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
+use tower::{
+    builder::ServiceBuilder,
+    util::{BoxCloneService, BoxService},
+    Service, ServiceExt,
+};
 use tracing::Instrument;
 
 use zakura_chain::{
-    block::{self, Block, Height},
+    block::{Block, Height},
     fmt::humantime_seconds,
     parameters::Network::Mainnet,
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
-use zakura_network::{Request, Response};
+use zakura_network::{AdvertisedBlock, Request, Response};
 use zakura_rpc::{MinedBlockEvent, PendingBlockSignal, SubmitBlockChannel};
 use zakura_state::{
     ChainTipChange, ChainTipSender, CheckpointVerifiedBlock, Config as StateConfig,
@@ -25,6 +29,41 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::components::sync::{self, gossip::BLOCK_GOSSIP_TIMEOUT, BlockGossipError, SyncStatus};
 
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
+
+/// The advertisement of `block` with its height and serialized size, as mined-block events and
+/// committed tips that the state can size carry it.
+fn with_size(block: &Block) -> AdvertisedBlock {
+    AdvertisedBlock::new(
+        block.hash(),
+        block
+            .coinbase_height()
+            .expect("test vectors have a coinbase height"),
+        block.zcash_serialized_size(),
+    )
+}
+
+/// The advertisement of a committed tip whose size the state does not have.
+fn without_size(block: &Block) -> AdvertisedBlock {
+    AdvertisedBlock {
+        size: None,
+        ..with_size(block)
+    }
+}
+
+/// A read state that has no block sizes, for tests that publish tips without a state.
+fn read_state_without_sizes() -> ReadState {
+    BoxCloneService::new(tower::service_fn(|request| async move {
+        match request {
+            zakura_state::ReadRequest::BlockInfo(_) => {
+                Ok(zakura_state::ReadResponse::BlockInfo(None))
+            }
+            request => unreachable!("gossip only reads block sizes, not {request:?}"),
+        }
+    }))
+}
+
+type ReadState =
+    BoxCloneService<zakura_state::ReadRequest, zakura_state::ReadResponse, crate::BoxError>;
 
 struct GossipTestSetup {
     peer_set: MockService<Request, Response, PanicAssertion>,
@@ -42,7 +81,12 @@ async fn setup_gossip_test() -> (ChainTipSender, GossipTestSetup) {
     let tip = CheckpointVerifiedBlock::from(block_one.clone()).into();
     let (chain_tip_sender, _latest_chain_tip, chain_tip_change) =
         ChainTipSender::new(Some(tip), &Mainnet);
-    let setup = start_gossip_test(chain_tip_change, block_one.hash()).await;
+    let setup = start_gossip_test(
+        chain_tip_change,
+        read_state_without_sizes(),
+        without_size(&block_one),
+    )
+    .await;
     (chain_tip_sender, setup)
 }
 
@@ -54,7 +98,7 @@ async fn setup_state_gossip_test() -> (
 
     let network = Mainnet;
     let state_config = StateConfig::ephemeral();
-    let (state, _read_only_state, _latest_chain_tip, mut chain_tip_change) =
+    let (state, read_only_state, _latest_chain_tip, mut chain_tip_change) =
         zakura_state::init(state_config, &network, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -98,13 +142,19 @@ async fn setup_state_gossip_test() -> (
         .await
         .unwrap();
 
-    let setup = start_gossip_test(chain_tip_change, block_one.hash()).await;
+    let setup = start_gossip_test(
+        chain_tip_change,
+        BoxCloneService::new(read_only_state),
+        with_size(&block_one),
+    )
+    .await;
     (BoxService::new(state_service), setup)
 }
 
 async fn start_gossip_test(
     chain_tip_change: ChainTipChange,
-    initial_tip_hash: block::Hash,
+    read_state: ReadState,
+    initial_tip: AdvertisedBlock,
 ) -> GossipTestSetup {
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
@@ -120,6 +170,7 @@ async fn start_gossip_test(
             sync_status,
             chain_tip_change,
             peer_set.clone(),
+            read_state,
             Some(submitblock_channel.receiver()),
         )
         .in_current_span(),
@@ -127,7 +178,7 @@ async fn start_gossip_test(
 
     // Block 1 is the initial tip when the task starts.
     peer_set
-        .expect_request(Request::AdvertiseBlock(initial_tip_hash, None))
+        .expect_request(Request::AdvertiseBlock(initial_tip, None))
         .await
         .respond(Response::Nil);
 
@@ -163,11 +214,12 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         .send(MinedBlockEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
+            size: block_two.zcash_serialized_size(),
         })
         .expect("mined block notification should be accepted");
 
     peer_set
-        .expect_request(Request::AdvertiseMinedBlock(block_two.hash()))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
 
@@ -200,24 +252,32 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
     // Hold the first mined broadcast response open.
     submitblock_sender
-        .send(MinedBlockEvent::Committed { hash, height })
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            size: block_two.zcash_serialized_size(),
+        })
         .expect("mined block notification should be accepted");
 
     let first_broadcast = peer_set
-        .expect_request(Request::AdvertiseMinedBlock(hash))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await;
 
     // Queue a second notification while the first broadcast is still in flight so the
     // submit-block channel is nonempty when the first mark arrives.
     submitblock_sender
-        .send(MinedBlockEvent::Committed { hash, height })
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            size: block_two.zcash_serialized_size(),
+        })
         .expect("second mined block notification should be accepted");
 
     first_broadcast.respond(Response::Nil);
 
     // The queued mined notification starts another broadcast.
     peer_set
-        .expect_request(Request::AdvertiseMinedBlock(hash))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
 
@@ -251,11 +311,12 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         .send(MinedBlockEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
+            size: block_two.zcash_serialized_size(),
         })
         .expect("mined block notification should be accepted");
 
     let slow_broadcast = peer_set
-        .expect_request(Request::AdvertiseMinedBlock(block_two.hash()))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await;
 
     // Hold the mined block broadcast open past the gossip timeout so it fails without marking.
@@ -264,7 +325,7 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
 
     // The committed tip gossip path should advertise the same hash as a fallback.
     peer_set
-        .expect_request(Request::AdvertiseMinedBlock(block_two.hash()))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
 }
@@ -293,6 +354,7 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         .send(MinedBlockEvent::Early {
             hash,
             height,
+            size: block_two.zcash_serialized_size(),
             submitted_at: tokio::time::Instant::now().into_std(),
             submission: zakura_rpc::MinedBlockSubmission::FullBlock,
             pending: PendingBlockSignal::valid_for_tests(),
@@ -300,7 +362,7 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         .expect("the early mined block notification is accepted");
 
     peer_set
-        .expect_request(Request::AdvertiseMinedBlock(hash))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
 
@@ -312,19 +374,23 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
     ));
 
     submitblock_sender
-        .send(MinedBlockEvent::Committed { hash, height })
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            size: block_two.zcash_serialized_size(),
+        })
         .expect("the committed mined block notification is accepted");
 
     // Hold the committed broadcast open past the gossip timeout so it fails without marking.
     let slow_broadcast = peer_set
-        .expect_request(Request::AdvertiseMinedBlock(hash))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await;
     tokio::time::sleep(BLOCK_GOSSIP_TIMEOUT + Duration::from_secs(1)).await;
     drop(slow_broadcast);
 
     // Nothing has advertised a body this node can serve, so the fallback must still run.
     peer_set
-        .expect_request(Request::AdvertiseMinedBlock(hash))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
 }
@@ -365,7 +431,7 @@ async fn consecutive_committed_blocks_are_gossiped_without_delay() {
         let committed_at = tokio::time::Instant::now();
 
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(with_size(&block), None))
             .await
             .respond(Response::Nil);
 
@@ -402,11 +468,12 @@ async fn in_flight_mined_block_broadcast_suppresses_committed_tip_gossip() {
         .send(MinedBlockEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
+            size: block_two.zcash_serialized_size(),
         })
         .expect("mined block notification should be accepted");
 
     let in_flight_broadcast = peer_set
-        .expect_request(Request::AdvertiseMinedBlock(block_two.hash()))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await;
 
     // Hold the broadcast open for less than its timeout, so it is still in flight when the
@@ -439,10 +506,11 @@ async fn in_flight_mined_block_broadcast_handles_delayed_tip_notification() {
         .send(MinedBlockEvent::Committed {
             hash,
             height: block_two.coinbase_height().unwrap(),
+            size: block_two.zcash_serialized_size(),
         })
         .expect("mined block notification should be accepted");
     let in_flight_broadcast = peer_set
-        .expect_request(Request::AdvertiseMinedBlock(hash))
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await;
 
     // Publish the tip only after the mined notification has started its broadcast.
@@ -460,7 +528,7 @@ async fn in_flight_mined_block_broadcast_handles_delayed_tip_notification() {
         CheckpointVerifiedBlock::from(block_three.clone()).into(),
     ));
     peer_set
-        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
+        .expect_request(Request::AdvertiseBlock(without_size(&block_three), None))
         .await
         .respond(Response::Nil);
 }

@@ -46,8 +46,8 @@ use crate::{
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
-        self, address_is_valid_for_inbound_listeners, HandshakeRequest, MinimumPeerVersion,
-        OutboundConnectorRequest, PeerPreference,
+        self, address_is_valid_for_inbound_listeners, advert_fanout::UploadBandwidth,
+        HandshakeRequest, MinimumPeerVersion, OutboundConnectorRequest, PeerPreference,
     },
     peer_cache_updater::peer_cache_updater,
     peer_registry::PeerRegistry,
@@ -315,6 +315,10 @@ where
             .collect(),
     );
 
+    // Connections measure block uploads into this, and block broadcasts size their adverts
+    // from it.
+    let upload_bandwidth = UploadBandwidth::from_config(&config);
+
     let (listen_handshaker, outbound_connector) = {
         use tower::timeout::TimeoutLayer;
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
@@ -333,6 +337,7 @@ where
             .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
+            .with_upload_bandwidth(upload_bandwidth.clone())
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {
@@ -379,6 +384,7 @@ where
         bans.clone(),
         address_metrics,
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
+        upload_bandwidth,
         None,
     );
     let shutdown = zakura_endpoint

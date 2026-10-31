@@ -845,7 +845,7 @@ impl Service<zn::Request> for Inbound {
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
-            zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+            zn::Request::AdvertiseBlock(zn::AdvertisedBlock { hash, .. }, Some(zn::PeerSource::Zakura(peer_id))) => {
                 debug!(
                     ?hash,
                     ?peer_id,
@@ -854,8 +854,8 @@ impl Service<zn::Request> for Inbound {
                 metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::AdvertiseBlock(hash, advertiser) => {
-                block_downloads.download_and_verify(hash, advertiser);
+            zn::Request::AdvertiseBlock(block, advertiser) => {
+                block_downloads.download_and_verify(block.hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             // The size of this response is limited by the `Connection` state machine in the network layer

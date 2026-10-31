@@ -414,8 +414,9 @@ fn block_gossip_skips_busy_outdated_peers() {
         );
 
         let hash = block::Hash([6; 32]);
-        let _broadcast =
-            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        let _broadcast = tokio::spawn(
+            peer_set.route_block_broadcast(Request::AdvertiseBlock(hash.into(), None)),
+        );
         tokio::task::yield_now().await;
         let advert = handles[0]
             .try_to_receive_block_advert()
@@ -1442,8 +1443,9 @@ fn unready_sidecar_block_gossip_is_delivered() {
         let sidecar = peer_set.take_ready_service(&sidecar_addr).unwrap();
         peer_set.push_unready(sidecar_addr, sidecar);
         let hash = block::Hash([7; 32]);
-        let broadcast =
-            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        let broadcast = tokio::spawn(
+            peer_set.route_block_broadcast(Request::AdvertiseBlock(hash.into(), None)),
+        );
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1482,7 +1484,8 @@ fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
         assert!(peer_set.ready_services.is_empty());
 
         let hash = block::Hash([8; 32]);
-        let broadcast = tokio::spawn(advertiser.advertise(Request::AdvertiseMinedBlock(hash)));
+        let broadcast =
+            tokio::spawn(advertiser.advertise(Request::AdvertiseMinedBlock(hash.into())));
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1544,7 +1547,8 @@ fn block_advertiser_waits_for_a_connected_peer() {
             .with_minimum_peer_version(minimum_peer_version)
             .build();
         let mut advertiser = peer_set.block_advertiser();
-        let broadcast = advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32])));
+        let broadcast =
+            advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32]).into()));
         assert!(
             tokio::time::timeout(Duration::from_secs(60), broadcast)
                 .await

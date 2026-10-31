@@ -1652,3 +1652,87 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
         assert!(error.contains("at most 3,633"), "unexpected error: {error}");
     }
 }
+
+#[test]
+fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str("").expect("empty config parses");
+    assert_eq!(config.advert_target, Duration::from_secs(1));
+    assert_eq!(config.advert_window_initial, 32);
+    assert_eq!(config.advert_window_min, 16);
+    assert_eq!(config.advert_window_max, 264);
+    assert_eq!(config.advert_window_fixed, None);
+
+    let config: Config = toml::from_str(
+        "advert_target_secs = 0.5\n\
+         advert_window_initial = 12\n\
+         advert_window_min = 2\n\
+         advert_window_max = 16\n\
+         advert_window_fixed = 8\n",
+    )
+    .expect("configured fan-out parses");
+    assert_eq!(config.advert_target, Duration::from_millis(500));
+    assert_eq!(config.advert_window_initial, 12);
+    assert_eq!(config.advert_window_min, 2);
+    assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_fixed, Some(8));
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains("advert_target_secs = 0.5"),
+        "{serialized}"
+    );
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip, config);
+
+    // Equal bounds are a fixed range, and an integer target is whole seconds.
+    let config: Config = toml::from_str(
+        "advert_target_secs = 2\n\
+         advert_window_initial = 9\n\
+         advert_window_min = 9\n\
+         advert_window_max = 9",
+    )
+    .expect("equal bounds parse");
+    assert_eq!(config.advert_target, Duration::from_secs(2));
+    assert_eq!(
+        (
+            config.advert_window_min,
+            config.advert_window_initial,
+            config.advert_window_max
+        ),
+        (9, 9, 9)
+    );
+}
+
+#[test]
+fn invalid_advert_fanout_config_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    for (config, field) in [
+        ("advert_window_min = 0", "advert_window_min"),
+        (
+            "advert_window_min = 10\nadvert_window_initial = 10\nadvert_window_max = 9",
+            "advert_window_min",
+        ),
+        // The default initial window of 32 is outside these bounds.
+        ("advert_window_max = 31", "advert_window_initial"),
+        ("advert_window_min = 33", "advert_window_initial"),
+        ("advert_window_initial = 15", "advert_window_initial"),
+        ("advert_window_initial = 265", "advert_window_initial"),
+        ("advert_window_fixed = 0", "advert_window_fixed"),
+        ("advert_target_secs = 0", "advert_target_secs"),
+        ("advert_target_secs = -1.0", "advert_target_secs"),
+        ("advert_target_secs = nan", "advert_target_secs"),
+        ("advert_target_secs = inf", "advert_target_secs"),
+        (
+            "advert_bandwidth_bytes_per_sec = 12500000",
+            "advert_bandwidth_bytes_per_sec",
+        ),
+    ] {
+        let error = toml::from_str::<Config>(config)
+            .expect_err("invalid fan-out config is rejected")
+            .to_string();
+        assert!(error.contains(field), "{config:?} gave {error}");
+    }
+}

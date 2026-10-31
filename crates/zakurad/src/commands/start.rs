@@ -836,6 +836,7 @@ impl StartCmd {
                 sync_status.clone(),
                 chain_tip_change.clone(),
                 peer_set.clone(),
+                read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
             )
             .in_current_span(),

@@ -14,7 +14,7 @@ use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network as zn;
 use zakura_node_services::task::spawn_erased;
 use zakura_rpc::MinedBlockEvent;
-use zakura_state::ChainTipChange;
+use zakura_state::{self as zs, ChainTipChange};
 
 use crate::{components::sync::SyncStatus, BoxError};
 
@@ -23,10 +23,14 @@ use BlockGossipError::*;
 /// Bounds a full paced broadcast, including several upload waves.
 pub(super) const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Bounds the state read of a committed tip's size. A tip block is in memory, so this read is
+/// fast; if it is slow, the broadcast proceeds without the size rather than waiting.
+const BLOCK_SIZE_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// A spawned committed mined-block broadcast finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MinedBlockBroadcastCompleted {
-    hash: block::Hash,
+    block: zn::AdvertisedBlock,
     succeeded: bool,
 }
 
@@ -95,16 +99,25 @@ pub enum BlockGossipError {
 /// In particular, if a lot of blocks are committed at the same time,
 /// gossips will be disabled or skipped until the state reaches the latest tip.
 ///
+/// Each advertisement carries the block's height and serialized size, which size the legacy
+/// broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
+///
 /// [`block::Hash`]: zakura_chain::block::Hash
-pub async fn gossip_best_tip_block_hashes<ZN>(
+pub async fn gossip_best_tip_block_hashes<ZN, RS>(
     sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
+    read_state: RS,
     mut mined_block_receiver: Option<mpsc::UnboundedReceiver<MinedBlockEvent>>,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
+    RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    RS::Future: Send,
 {
     info!("initializing block gossip task");
 
@@ -173,7 +186,7 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early) =
+        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early, size) =
             match next_gossip_event(
                 mined_block_receiver.as_mut(),
                 &mut mined_block_completion_receiver,
@@ -193,6 +206,7 @@ where
                 GossipEvent::MinedBlock(MinedBlockEvent::Early {
                     hash,
                     height,
+                    size,
                     submitted_at,
                     submission,
                     pending,
@@ -204,8 +218,9 @@ where
                     ),
                     true,
                     Some((pending, submitted_at, submission)),
+                    Some(size),
                 ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height, size }) => (
                     (
                         (hash, height),
                         "sending committed mined block broadcast",
@@ -213,9 +228,10 @@ where
                     ),
                     true,
                     None,
+                    Some(size),
                 ),
                 GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false, None)
+                    (tip_change_close_to_network_tip?, false, None, None)
                 }
             };
 
@@ -235,18 +251,11 @@ where
 
         // TODO: Move logic for calling the peer set to its own method.
 
-        // block broadcasts inform other nodes about new blocks,
-        // so our internal Grow or Reset state doesn't matter to them
-        let request = if is_block_submission {
-            zn::Request::AdvertiseMinedBlock(hash)
-        } else {
-            zn::Request::AdvertiseBlock(hash, None)
-        };
-
-        info!(?height, ?request, log_msg);
+        info!(?height, ?hash, ?size, is_block_submission, log_msg);
         // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip
         // events when the peer set has no ready service.
         let network = broadcast_network.clone();
+        let read_state = read_state.clone();
         // Keep the committed-tip fallback until the committed broadcast succeeds. An admitted
         // body can be served immediately, but contextual failure still cancels early inventory.
         let completion_tx = (is_block_submission && early.is_none()).then(|| {
@@ -254,6 +263,21 @@ where
             mined_block_completion_sender.clone()
         });
         tokio::spawn(async move {
+            let block = match size {
+                Some(size) => zn::AdvertisedBlock::new(hash, height, size),
+                None => zn::AdvertisedBlock {
+                    height: Some(height),
+                    size: committed_block_size(read_state, hash).await,
+                    ..hash.into()
+                },
+            };
+            // block broadcasts inform other nodes about new blocks,
+            // so our internal Grow or Reset state doesn't matter to them
+            let request = if is_block_submission {
+                zn::Request::AdvertiseMinedBlock(block)
+            } else {
+                zn::Request::AdvertiseBlock(block, None)
+            };
             let broadcast = broadcast_with_timeout(network, request);
             let succeeded = match early {
                 Some((mut pending, submitted_at, submission)) => {
@@ -278,10 +302,34 @@ where
             };
 
             if let Some(completion_tx) = completion_tx {
-                let _ = completion_tx.send(MinedBlockBroadcastCompleted { hash, succeeded });
+                let _ = completion_tx.send(MinedBlockBroadcastCompleted { block, succeeded });
             }
         });
     }
+}
+
+/// Reads the serialized size of the committed block `hash` from the state.
+///
+/// Returns `None` if the block is not found, or the read fails or takes longer than
+/// [`BLOCK_SIZE_READ_TIMEOUT`]. The broadcast then uses its widest advert window.
+async fn committed_block_size<RS>(read_state: RS, hash: block::Hash) -> Option<u32>
+where
+    RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,
+{
+    let read = read_state.oneshot(zs::ReadRequest::BlockInfo(hash.into()));
+    let size = match tokio::time::timeout(BLOCK_SIZE_READ_TIMEOUT, read).await {
+        Ok(Ok(zs::ReadResponse::BlockInfo(info))) => info.map(|info| info.size()),
+        Ok(Ok(_)) => unreachable!("the state responds to BlockInfo with BlockInfo"),
+        Ok(Err(error)) => {
+            debug!(?hash, ?error, "could not read the committed block's size");
+            None
+        }
+        Err(_elapsed) => None,
+    };
+    if size.is_none() {
+        metrics::counter!("sync.gossip.block_size_unknown").increment(1);
+    }
+    size
 }
 
 /// Sends a block broadcast, returning `true` if it succeeded within [`BLOCK_GOSSIP_TIMEOUT`].
@@ -305,7 +353,7 @@ fn finish_mined_block_broadcast<ZN>(
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
-    let hash = completed.hash;
+    let hash = completed.block.hash;
     let needs_fallback = mined_block_broadcasts.finish(completed);
 
     if completed.succeeded {
@@ -318,7 +366,7 @@ fn finish_mined_block_broadcast<ZN>(
         return;
     }
 
-    let request = zn::Request::AdvertiseMinedBlock(hash);
+    let request = zn::Request::AdvertiseMinedBlock(completed.block);
     info!(
         ?request,
         "sending committed block broadcast after the mined block broadcast failed",
@@ -354,7 +402,8 @@ impl MinedBlockBroadcasts {
     /// Returns `true` if the hash now needs the committed-tip fallback: this broadcast failed, no
     /// other broadcast of the hash is in flight, and none has succeeded.
     fn finish(&mut self, completed: MinedBlockBroadcastCompleted) -> bool {
-        let MinedBlockBroadcastCompleted { hash, succeeded } = completed;
+        let MinedBlockBroadcastCompleted { block, succeeded } = completed;
+        let hash = block.hash;
 
         if let Some(count) = self.in_flight.get_mut(&hash) {
             *count = count.saturating_sub(1);
@@ -400,10 +449,11 @@ mod tests {
                 .send(MinedBlockEvent::Committed {
                     hash: submitted_hash,
                     height: block::Height(1),
+                    size: 1_000,
                 })
                 .unwrap();
             let completed = MinedBlockBroadcastCompleted {
-                hash: submitted_hash,
+                block: submitted_hash.into(),
                 succeeded: true,
             };
             mark_sender.send(completed).unwrap();
@@ -432,6 +482,7 @@ mod tests {
                 GossipEvent::MinedBlock(MinedBlockEvent::Committed {
                     hash,
                     height: block::Height(1),
+                    ..
                 }) if hash == submitted_hash
             ));
 
@@ -450,7 +501,7 @@ mod tests {
     fn failed_mined_block_broadcast_needs_fallback_once_nothing_is_in_flight() {
         let hash = block::Hash([2; 32]);
         let failed = MinedBlockBroadcastCompleted {
-            hash,
+            block: hash.into(),
             succeeded: false,
         };
         let mut broadcasts = MinedBlockBroadcasts::default();
@@ -478,11 +529,11 @@ mod tests {
         broadcasts.start(hash);
 
         assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
-            hash,
+            block: hash.into(),
             succeeded: true,
         }));
         assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
-            hash,
+            block: hash.into(),
             succeeded: false,
         }));
         assert!(!broadcasts.is_in_flight(&hash));

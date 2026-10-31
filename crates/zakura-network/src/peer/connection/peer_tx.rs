@@ -2,14 +2,19 @@
 
 use futures::{FutureExt, Sink, SinkExt};
 
-use zakura_chain::serialization::SerializationError;
+use zakura_chain::serialization::{SerializationError, ZcashSerialize};
 
-use crate::{constants::REQUEST_TIMEOUT, protocol::external::Message, PeerError};
+use crate::{
+    constants::REQUEST_TIMEOUT,
+    peer::advert_fanout::BodyUploadWatcher,
+    protocol::external::{codec::HEADER_LEN, Message},
+    PeerError,
+};
 
 /// A wrapper type for a peer connection message sender.
 ///
 /// Used to apply a timeout to send messages.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PeerTx<Tx>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
@@ -18,14 +23,30 @@ where
     ///
     /// This channel accepts [`Message`]s.
     inner: Tx,
+
+    /// Measures the delivery of block bodies for the shared upload bandwidth, when it is
+    /// measured and the platform supports it.
+    body_upload_watcher: Option<BodyUploadWatcher>,
 }
 
 impl<Tx> PeerTx<Tx>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
+    /// Measures the delivery of every block body sent on this connection with `watcher`.
+    ///
+    /// `watcher` must be the only owner of the connection's socket handle, so that the handle
+    /// closes with this sender.
+    pub(crate) fn set_body_upload_watcher(&mut self, watcher: Option<BodyUploadWatcher>) {
+        self.body_upload_watcher = watcher;
+    }
+
     /// Sends `msg` on `self.inner`, returning a timeout error if it takes too long.
     pub async fn send(&mut self, msg: Message) -> Result<(), PeerError> {
+        if let (Some(watcher), Message::Block(block)) = (&self.body_upload_watcher, &msg) {
+            // A block's encoded size is far below `u64::MAX`.
+            watcher.watch_body((block.zcash_serialized_size() + HEADER_LEN) as u64);
+        }
         tokio::time::timeout(REQUEST_TIMEOUT, self.inner.send(msg))
             .await
             .map_err(|_| PeerError::ConnectionSendTimeout)?
@@ -72,7 +93,10 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn from(tx: Tx) -> Self {
-        PeerTx { inner: tx }
+        PeerTx {
+            inner: tx,
+            body_upload_watcher: None,
+        }
     }
 }
 

@@ -265,6 +265,7 @@ where
             bans,
             address_metrics,
             minimum_peer_version,
+            crate::peer::advert_fanout::UploadBandwidth::from_config(&config),
             max_conns_per_ip,
         );
 

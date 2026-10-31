@@ -1,5 +1,6 @@
 //! Peer connection handling.
 
+pub(crate) mod advert_fanout;
 pub(crate) mod block_gossip;
 mod client;
 mod connection;
@@ -9,6 +10,9 @@ mod handshake;
 mod load_tracked_client;
 mod minimum_peer_version;
 mod priority;
+// Copied from #1880, whose trace reads the report fields that bandwidth estimates do not.
+#[allow(dead_code, reason = "shared verbatim with the TCP progress trace")]
+pub(crate) mod tcp_progress;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(unused_imports)]

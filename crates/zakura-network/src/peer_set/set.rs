@@ -128,6 +128,7 @@ use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
+        advert_fanout::{AdvertFanout, UploadBandwidth},
         block_gossip::{BlockGossipPeer, BlockGossipScheduler, BLOCK_UPLOAD_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
     },
@@ -346,6 +347,8 @@ where
     /// - `bans`: a map of banned IP addresses that should be dropped;
     /// - `address_book`: when peer set is busy, it logs address book diagnostics.
     /// - `minimum_peer_version`: endpoint to see the minimum peer protocol version in real time.
+    /// - `upload_bandwidth`: the block upload bandwidth that sizes block broadcasts, shared with
+    ///   the connections that measure it.
     /// - `max_conns_per_ip`: configured maximum number of peers that can be in the
     ///   peer set per IP, defaults to the config value or to
     ///   [`crate::constants::DEFAULT_MAX_CONNS_PER_IP`].
@@ -359,6 +362,7 @@ where
         bans: BannedIps,
         address_metrics: watch::Receiver<AddressMetrics>,
         minimum_peer_version: MinimumPeerVersion<C>,
+        upload_bandwidth: UploadBandwidth,
         max_conns_per_ip: Option<usize>,
     ) -> Self {
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
@@ -381,7 +385,10 @@ where
             block_gossip_peers: HashMap::new(),
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
-            block_gossip_scheduler: BlockGossipScheduler::new(BLOCK_UPLOAD_CONCURRENCY),
+            block_gossip_scheduler: BlockGossipScheduler::new(
+                BLOCK_UPLOAD_CONCURRENCY,
+                AdvertFanout::from_config(config, upload_bandwidth),
+            ),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
 
@@ -1345,9 +1352,11 @@ where
 
     /// Pace legacy inventory through the corresponding uploads, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (hash, mined) = match req {
-            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => (hash, false),
-            Request::AdvertiseMinedBlock(hash) => (hash, true),
+        let (block, mined) = match req {
+            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
+                (block, false)
+            }
+            Request::AdvertiseMinedBlock(block) => (block, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
         self.block_gossip_peers.retain(|key, _| {
@@ -1364,7 +1373,7 @@ where
         crate::peer::block_gossip::broadcast_block(
             peers,
             mined,
-            self.block_gossip_scheduler.start(hash),
+            self.block_gossip_scheduler.start(block),
         )
     }
 

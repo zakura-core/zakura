@@ -83,6 +83,21 @@ pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 ///       connections to an IP.
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
+/// The default target time for a block broadcast's first wave of uploads to finish.
+///
+/// This will be used as `Config.advert_target_secs` if it is not configured.
+pub const DEFAULT_ADVERT_TARGET: Duration = Duration::from_secs(1);
+
+/// The default number of peers that one block broadcast advertises to at once before the upload
+/// bandwidth is measured, and whenever it cannot be measured.
+pub const DEFAULT_ADVERT_WINDOW_INITIAL: usize = 32;
+
+/// The default fewest peers that one block broadcast advertises to at once.
+pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 16;
+
+/// The default most peers that one block broadcast advertises to at once.
+pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 264;
+
 /// The default peerset target size.
 ///
 /// This will be used as `Config.peerset_initial_target_size` if no valid value is provided.

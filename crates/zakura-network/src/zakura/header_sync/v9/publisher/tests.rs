@@ -2237,10 +2237,10 @@ async fn a_cancelled_read_keeps_its_lease_and_budgets_until_storage_answers() {
     assert_eq!(harness.capacity.node_output_held(), 0);
 }
 
-/// A terminal outcome holds its slot while it waits for a full queue and
-/// through the queue, after its subscription's key is free. Only the writer
-/// taking its frame frees the slot. Cancellation drops a waiting outcome and
-/// frees its slot too.
+/// A terminal outcome holds its slot through a full queue, after its
+/// subscription's key is free. Only the writer taking its frame frees the slot.
+/// A cancelled session's queued outcome holds its slot until the writer's queue
+/// drops.
 #[tokio::test(start_paused = true)]
 async fn a_terminal_keeps_its_slot_through_the_output_path() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
@@ -2272,9 +2272,9 @@ async fn a_terminal_keeps_its_slot_through_the_output_path() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(publisher.slots_held(), 0, "the writer took the frame");
 
-    // A new subscription's terminal waits on a queue a page fills again.
+    // A new subscription's terminal queues behind a page that fills the queue.
     let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
-    let (other, _other_recv, cancel, task) = session(&port, &capacity, &peer(8), 2, 1);
+    let (other, other_recv, cancel, task) = session(&port, &capacity, &peer(8), 2, 1);
     other.apply(&open).await.expect("the Open applies");
     tokio::time::sleep(QUIET).await;
     let close = subscriber.close().expect("the subscription is live");
@@ -2286,7 +2286,9 @@ async fn a_terminal_keeps_its_slot_through_the_output_path() {
         .await
         .expect("cancel stops the publisher")
         .expect("the publisher task does not panic");
-    assert_eq!(other.slots_held(), 0, "the dropped write freed its slot");
+    assert_eq!(other.slots_held(), 1, "the queued outcome keeps its slot");
+    drop(other_recv);
+    assert_eq!(other.slots_held(), 0, "the dropped queue freed its slot");
 }
 
 /// A burst of conformant grants yields to another peer's task.

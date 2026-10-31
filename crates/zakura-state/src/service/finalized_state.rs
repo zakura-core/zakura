@@ -1218,7 +1218,7 @@ impl FinalizedState {
                         // tree. They are independent; the history push below joins them.
                         #[cfg(feature = "commit-metrics")]
                         metrics::histogram!("zakura.state.write.block_tx_count")
-                            .record(block.transactions.len() as f64);
+                            .record(block.transactions().len() as f64);
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
                         let mut commitment_result = None;

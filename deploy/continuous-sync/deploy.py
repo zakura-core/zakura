@@ -579,8 +579,10 @@ def slack_webhook_url() -> str:
     )
 
 
-def post_slack(text: str) -> bool:
-    webhook = slack_webhook_url()
+def post_slack(text: str, *, webhook: str | None = None) -> bool:
+    """Post to an explicit destination, or use the alert webhook when omitted."""
+    if webhook is None:
+        webhook = slack_webhook_url()
     if not webhook:
         print(f"SLACK_WEB_HOOK missing; would post:\n{text}", file=sys.stderr)
         return False

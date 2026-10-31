@@ -23,16 +23,18 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use zakura_chain::block;
 use zakura_rt::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex as StdMutex, MutexGuard, Notify,
     },
+    time::Instant,
 };
 
 use super::{
@@ -64,6 +66,10 @@ pub(super) struct Entry {
     /// floor-bias decisions. Updated whenever the routine issues/finishes/times out
     /// a request.
     pub(super) slots: SlotDiagnostics,
+    /// Set by this generation's routine while it is blocked on its sequencer
+    /// handoff. The routine stores it without the registry lock, and other
+    /// routines skip the peer as a floor carrier while it is set.
+    pub(super) handoff_blocked: Arc<AtomicBool>,
     /// Heights this peer may not re-take after a floor-watchdog cancellation.
     pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
@@ -97,6 +103,7 @@ impl Entry {
             max_response_bytes: config.advertised_max_response_bytes(),
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
+            handoff_blocked: Arc::new(AtomicBool::new(false)),
             floor_watchdog_avoid: BTreeMap::new(),
             generation,
             conn_id: None,
@@ -194,10 +201,15 @@ impl BodyRetryKey {
     }
 }
 
-pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
+/// The monotonic instant at which UTC `deadline` arrives by `clock`, or now if
+/// it has passed. `clock` must be the one that dated `deadline`.
+pub(super) fn retry_deadline_instant(
+    deadline: chrono::DateTime<chrono::Utc>,
+    clock: &dyn zakura_header_chain::Clock,
+) -> Instant {
     let monotonic_now = Instant::now();
     let delay = deadline
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(clock.now())
         .to_std()
         .unwrap_or(Duration::ZERO);
     monotonic_now
@@ -877,6 +889,26 @@ impl PeerRegistry {
         &self.floor_ranking_changed
     }
 
+    /// The handoff flag of `generation`'s entry, which its routine sets while
+    /// it is blocked on its sequencer handoff. A superseded generation gets a
+    /// flag no entry reads.
+    pub(super) fn handoff_blocked_flag(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+    ) -> Arc<AtomicBool> {
+        self.lock()
+            .get(peer)
+            .filter(|entry| entry.generation == generation)
+            .map_or_else(Default::default, |entry| Arc::clone(&entry.handoff_blocked))
+    }
+
+    /// Wake routines that may defer the floor to a routine that just blocked
+    /// on its sequencer handoff.
+    pub(super) fn notify_floor_ranking_changed(&self) {
+        self.floor_ranking_changed.notify_waiters();
+    }
+
     /// Aggregate the routines' slot diagnostics for the periodic trace row.
     pub(super) fn slot_summary(&self) -> SlotSummary {
         let peers = self.lock();
@@ -1071,6 +1103,8 @@ impl PeerRegistry {
     /// never preferred over (nothing beats it), and if every servable peer is
     /// saturated this returns false and the floor still moves. Unknown RTprop is
     /// treated as worst, so a measured peer is never deferred to an unmeasured one.
+    /// A peer whose routine is blocked on its sequencer handoff can't take the
+    /// floor until the handoff completes, so no peer defers to it meanwhile.
     pub(super) fn floor_has_preferred_unsaturated_server(
         &self,
         height: block::Height,
@@ -1091,12 +1125,34 @@ impl PeerRegistry {
                 return false;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
-            if allow_equal_score {
+            let preferred = if allow_equal_score {
                 other_score <= self_score
             } else {
                 other_score < self_score
-            }
+            };
+            preferred && !entry.handoff_blocked.load(Ordering::Relaxed)
         })
+    }
+
+    /// `peer`'s published outstanding claims, by height, read from its entry.
+    /// Empty for a peer with no entry, or whose entry belongs to a generation
+    /// other than `generation`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn outstanding_snapshot(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+    ) -> Vec<(block::Height, OutstandingMeta)> {
+        self.lock()
+            .get(peer)
+            .filter(|entry| entry.generation == generation)
+            .map_or_else(Vec::new, |entry| {
+                entry
+                    .outstanding
+                    .iter()
+                    .map(|(height, meta)| (*height, *meta))
+                    .collect()
+            })
     }
 
     /// Snapshot all peer claims for one height.
@@ -1222,7 +1278,8 @@ mod floor_bias_tests {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte test peer id is valid")
     }
 
-    /// Register `peer` as servable for `[low, high]` with `available` free slots.
+    /// Register `peer` as servable for `[low, high]` with `available` free
+    /// slots, and return its generation.
     fn register_with_rtprop(
         reg: &PeerRegistry,
         config: &super::super::ZakuraBlockSyncConfig,
@@ -1231,7 +1288,7 @@ mod floor_bias_tests {
         high: u32,
         available: usize,
         bbr_rtprop_ms: Option<u64>,
-    ) {
+    ) -> u64 {
         let generation = reg
             .admit_session(
                 peer,
@@ -1259,6 +1316,7 @@ mod floor_bias_tests {
                 ..SlotDiagnostics::default()
             },
         );
+        generation
     }
 
     fn register(
@@ -1960,6 +2018,57 @@ mod floor_bias_tests {
 
         reg.upsert_status(&a, new_generation, status);
         assert!(reg.has_received_status(&a));
+    }
+
+    /// #1812: an unmeasured peer defers the floor to a measured peer with a
+    /// free slot only while that peer's routine isn't blocked on its
+    /// sequencer handoff.
+    #[test]
+    fn no_peer_defers_the_floor_to_a_routine_blocked_on_its_handoff() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (unmeasured, parked) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &unmeasured, 0, 1000, 3, None);
+        let generation = register_with_rtprop(&reg, &config, &parked, 0, 1000, 3, Some(40));
+        let height = block::Height(100);
+        assert!(reg.floor_has_preferred_unsaturated_server(height, &unmeasured, None, false));
+
+        let blocked = reg.handoff_blocked_flag(&parked, generation);
+        blocked.store(true, Ordering::Relaxed);
+        for allow_equal_score in [false, true] {
+            assert!(!reg.floor_has_preferred_unsaturated_server(
+                height,
+                &unmeasured,
+                None,
+                allow_equal_score
+            ));
+        }
+
+        blocked.store(false, Ordering::Relaxed);
+        assert!(reg.floor_has_preferred_unsaturated_server(height, &unmeasured, None, false));
+    }
+
+    /// A superseded routine's flag belongs to its own generation, so it can't
+    /// hide the replacement session from the floor ranking.
+    #[test]
+    fn a_superseded_routine_cannot_block_the_replacement_session() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (unmeasured, fast) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &unmeasured, 0, 1000, 3, None);
+        let old = register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+        let stale = reg.handoff_blocked_flag(&fast, old);
+        stale.store(true, Ordering::Relaxed);
+        let new = register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+
+        assert!(stale.load(Ordering::Relaxed));
+        assert!(!reg.handoff_blocked_flag(&fast, new).load(Ordering::Relaxed));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &unmeasured,
+            None,
+            false
+        ));
     }
 
     #[test]

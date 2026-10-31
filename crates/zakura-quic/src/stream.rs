@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use bytes::{Buf as _, Bytes};
 use quinn_proto::{StreamId, VarInt};
-use tokio::sync::oneshot::{self, error::TryRecvError};
+use zakura_rt::sync::oneshot::{self, error::TryRecvError};
 
 use crate::{
     driver::{ConnCmd, ConnRef, ReadReply},
@@ -61,6 +61,11 @@ impl SendStream {
             pending: VecDeque::new(),
             pending_bytes: 0,
         }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
     }
 
     /// Writes all of `buf`. Returns once at most [`WRITE_AHEAD_BYTES`] of this
@@ -200,6 +205,11 @@ impl RecvStream {
             stopped: false,
             pending: None,
         }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
     }
 
     /// Waits until data is buffered; returns `false` at the end of the stream.

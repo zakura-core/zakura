@@ -1,6 +1,14 @@
 name: 'Setup Zakura Build Environment'
-description: 'Install libclang and RocksDB as system libraries, and optionally protoc'
+description: 'Install RocksDB as a system library, and optionally libclang and protoc'
 inputs:
+  libclang:
+    description: >-
+      Also install clang and libclang. Current Zakura builds don't need them,
+      because zakura-librocksdb-sys 0.17.7 and later commit their bindings.
+      Builds of crates published before that, such as cargo-semver-checks
+      baselines, still run bindgen.
+    required: false
+    default: 'false'
   protoc:
     description: >-
       Also install protoc. Only `cargo xtask check-rpc-artifacts` and
@@ -11,10 +19,11 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install libclang and librocksdb-dev on Ubuntu
+    - name: Install librocksdb-dev on Ubuntu
       if: runner.os == 'Linux'
       shell: bash
       env:
+        INSTALL_LIBCLANG: ${{ inputs.libclang }}
         INSTALL_PROTOC: ${{ inputs.protoc }}
       run: bash "$GITHUB_ACTION_PATH/install-ubuntu-packages.sh"
 

@@ -70,7 +70,7 @@ Execution slots are 24 per node and 12 per peer. A slot is held until the blocki
 encode actually return, including after the session is cancelled, so connection churn cannot
 multiply running reads. Each job retains the blocks it read. These are decoded blocks from
 the node's own consensus-valid state. One job holds `blocks_per_response` blocks (always 1):
-at most about 53 MB decoded for the worst consensus-valid block, about 7 MB for real Mainnet
+at most about 53 MB decoded using the conservative pre-boxing bound, about 7 MB for sampled Mainnet
 blocks (≤ 3.45× wire). The encoder serializes one block at a time and the handler drops each
 frame right after encoding, so the transient copy is one block.
 
@@ -134,16 +134,18 @@ response beside requests and control.
 
 ### Decoded bodies
 
-A decoded block's heap is not a fixed multiple of its wire size:
+A decoded block's heap is not a fixed multiple of its wire size. Boxing Sprout, Sapling,
+and Orchard bundles reduces the measured payloads on a 64-bit target:
 
-| Body | Wire | Decoded | Ratio |
+| Body | Wire | Decoded before | Decoded now |
 | --- | --- | --- | --- |
-| Real Mainnet blocks | — | — | ≤ 3.45×, about 2× in aggregate |
-| Worst consensus-valid block (smallest valid transactions) | 2 MB | about 53 MB | about 26× |
-| Junk body: 37,037 empty V1 transactions | 372 KB | 74.9 MB | about 200× |
+| 26,646 small transparent V5 transactions | 2 MB | 56.3 MB | 9.4 MB (4.7×) |
+| Junk body: 37,037 empty V1 transactions | 372 KB | 74.9 MB | 9.7 MB (26×) |
 
-`size_of::<Transaction>()` is 2,008 B, so per-transaction overhead dominates small
-transactions. `DESERIALIZED_MEM_FACTOR` = 4 is an average, not a bound.
+`size_of::<Transaction>()` drops from 2,008 B to 248 B. Ironwood remains inline, so
+transparent and Ironwood-only transactions need no additional bundle allocation. The V5
+example still exceeds `DESERIALIZED_MEM_FACTOR` = 4; the factor remains an average, not a
+bound. The pre-boxing Mainnet samples decoded at up to 3.45×, about 2× in aggregate.
 
 Two changes tie decoded memory to the blocks the node asked for:
 
@@ -170,19 +172,21 @@ B + R + L × W × (1 + r) + min(P, L) × J
 - `J` = one transient junk decode per connection before its rejection (≤ about 80 MB)
 
 At `r` ≈ 4 this is about 5.6 GB, of which about 3.2 GB is the decoded window. A deliberately
-built, proof-of-work-paid chain at `r` ≈ 26 raises the window term to about 21 GB; admission
-then charges the measured size and stops requesting ahead. The check costs one txid pass per
+built, proof-of-work-paid chain under the conservative pre-boxing estimate at `r` ≈ 26
+raises the window term to about 21 GB. The boxed V5 example at `r` ≈ 4.7 instead gives about
+3.8 GB; admission still charges the measured size and stops requesting ahead. The check costs one txid pass per
 body, about 11% of decode time on real blocks, on the per-peer routine tasks.
 
 Above the last checkpoint the sequencer also gates new decoded submissions on
 `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (512 MiB). Past the cap, bodies stay raw until earlier
 submissions finish, so in steady sync the window term there is 512 MiB plus about one block of
-estimate error. The cap is an admission target, not a hard ceiling. Submissions detached by a
-failure or reset stay charged but never block the next submission, since they can be successors
-waiting for that very block. While they hold the cap, the window advances one body at a time,
-so repeated resets can push it past 512 MiB, bounded by the submission count limit. That rules
-out the 21 GB case for steady sync, because below the last checkpoint the window holds fixed
-Mainnet blocks of about 7 MB decoded at most, about 2.8 GB in total.
+estimate error. Submissions detached by a failure or reset stay charged until their exact
+completions, and they block the next submission like attached ones. Only an empty window admits
+a body past the cap, so one oversized block still progresses. Repeated resets therefore can't
+push the window past 512 MiB. While storage never completes the detached submissions,
+submission stops once they fill the cap. That rules out the pre-boxing 21 GB case for steady
+sync, because below the last checkpoint the window holds fixed Mainnet blocks of about 7 MB
+decoded at most, about 2.8 GB in total.
 
 The Merkle check departs from the Block section's SHOULD to reuse downstream validation
 rather than add a duplicate ingress check. The downstream check runs only after the junk body

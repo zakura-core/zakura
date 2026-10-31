@@ -162,6 +162,7 @@ mod tests {
         sync::{mpsc, Mutex},
         task::JoinHandle,
     };
+    use zakura_rt::sync::CancellationToken;
     use zakura_chain::{
         block,
         parameters::{
@@ -799,10 +800,19 @@ mod tests {
     #[derive(Debug, Default)]
     struct CustomFrameCapProbeService {
         senders: Arc<StdMutex<HashMap<ZakuraPeerId, FramedSend>>>,
+        sessions: Arc<StdMutex<HashMap<ZakuraPeerId, CancellationToken>>>,
         received: Arc<StdMutex<Vec<(ZakuraPeerId, Vec<u8>)>>>,
     }
 
     impl CustomFrameCapProbeService {
+        fn session_retired(&self, peer: &ZakuraPeerId) -> bool {
+            self.sessions
+                .lock()
+                .expect("custom frame-cap session map is never poisoned")
+                .get(peer)
+                .is_some_and(CancellationToken::is_cancelled)
+        }
+
         fn contains_peer(&self, peer: &ZakuraPeerId) -> bool {
             self.senders
                 .lock()
@@ -860,6 +870,10 @@ mod tests {
                 .lock()
                 .expect("custom frame-cap sender map is never poisoned")
                 .insert(peer_id.clone(), send);
+            self.sessions
+                .lock()
+                .expect("custom frame-cap session map is never poisoned")
+                .insert(peer_id.clone(), peer.service_cancel_token());
 
             let cancel_token = peer.cancel_token();
             let received = self.received.clone();
@@ -2276,15 +2290,18 @@ mod tests {
         let over_cap = vec![0xff; max_payload_bytes + 1];
         service_b.send_payload(&peer_a, over_cap.clone()).await?;
 
+        // The sender's own over-cap frame retires only that stream's session.
         await_until(
-            "over-cap custom frame disconnects the peer",
+            "over-cap custom frame retires the session on both peers",
             Duration::from_secs(5),
-            || {
-                !contains_peer(&peers_a.borrow(), peer_b.as_bytes())
-                    && !contains_peer(&peers_b.borrow(), peer_a.as_bytes())
-            },
+            || service_a.session_retired(&peer_b) && service_b.session_retired(&peer_a),
         )
         .await?;
+        assert!(
+            contains_peer(&peers_a.borrow(), peer_b.as_bytes())
+                && contains_peer(&peers_b.borrow(), peer_a.as_bytes()),
+            "a local over-cap frame must keep the connection"
+        );
         assert!(
             !service_a.contains_payload(&peer_b, &over_cap),
             "a custom frame over the declared cap must not reach the peer service"

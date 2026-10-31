@@ -207,6 +207,7 @@ impl RollingSummary {
 
     /// Adds a sample recorded at `now`.
     ///
+    /// Timestamps may arrive out of order when a writer waits for the histogram lock.
     /// Every sample is counted and summed, but only finite samples are used for quantiles.
     pub(super) fn add(&mut self, value: f64, now: Instant) {
         self.count += 1;
@@ -216,12 +217,14 @@ impl RollingSummary {
         }
 
         let index = self.window_index(now);
-        match self.windows.back_mut() {
-            Some((last, sketch)) if *last == index => sketch.add(value),
+        // Keep one sketch per index, in order, even if an older writer acquired the lock last.
+        let position = self.windows.partition_point(|(window, _)| *window < index);
+        match self.windows.get_mut(position) {
+            Some((window, sketch)) if *window == index => sketch.add(value),
             _ => {
                 let mut sketch = Sketch::default();
                 sketch.add(value);
-                self.windows.push_back((index, sketch));
+                self.windows.insert(position, (index, sketch));
                 while self.windows.len() > WINDOW_COUNT as usize {
                     self.windows.pop_front();
                 }

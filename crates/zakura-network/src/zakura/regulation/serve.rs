@@ -106,6 +106,8 @@ use zakura_rt::sync::{
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
+#[cfg(any(test, zakura_sim))]
+pub(crate) use lease::ReleaseReport;
 pub(crate) use lease::{ExecutionSlots, WorkLease};
 pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
@@ -145,6 +147,26 @@ pub(crate) trait Produce: Send + Sync + 'static {
     /// It must be a legal ending for `request` after `sent`. Serve reserves
     /// room for the largest ending, so it always fits.
     fn local_failure(&self, request: &Self::Request, sent: SinkProgress) -> Self::Message;
+
+    /// Reports one serving step for `request`, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, _request: &Self::Request, _step: ServeStep<'_, Self::Message>) {}
+
+    /// Reports that `request` holds its execution slots, in test and
+    /// simulator builds. Dispatch calls this once it took the slots and
+    /// before it spawns the request's task. The returned report runs once the
+    /// slots return, after the last lease clone drops.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_lease(&self, _request: &Self::Request) -> Option<ReleaseReport> {
+        None
+    }
+}
+
+/// One step of a response's task, as [`Produce::observe`] sees it.
+#[cfg(any(test, zakura_sim))]
+pub(crate) enum ServeStep<'a, M> {
+    /// Serve queued `ending` after a local failure cut the response short.
+    FailureEnding(&'a M),
 }
 
 /// Why `produce` returned without an ending.
@@ -467,7 +489,7 @@ impl<P: Produce> Serve<P> {
     }
 
     /// Open requests on this session.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(crate) fn open(&self) -> u32 {
         self.commitments.open.load(Ordering::Acquire)
     }
@@ -589,6 +611,8 @@ impl<P: Produce> Dispatch<P> {
                 Arc::new(grants),
                 job.commitment,
             );
+            #[cfg(any(test, zakura_sim))]
+            let slots = slots.reporting_release(self.produce.observe_lease(&job.request));
             self.tasks.spawn(task.run(job.request, core, slots));
         }
     }
@@ -694,6 +718,12 @@ impl<P: Produce> Task<P> {
             // The exchange cannot end, so the session cannot stay usable.
             tracing::warn!(%error, "serving could not queue a failure ending; retiring the session");
             self.cancel.cancel();
+        }
+        // Only a queued ending ends the sink.
+        #[cfg(any(test, zakura_sim))]
+        if core.ended() {
+            self.produce
+                .observe(&request, ServeStep::FailureEnding(&ending));
         }
     }
 }

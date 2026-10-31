@@ -34,6 +34,8 @@ use crate::{
 };
 
 #[cfg(test)]
+pub(crate) mod connected;
+#[cfg(test)]
 mod vectors;
 
 /// The maximum time a mocked peer connection should be alive during a test.

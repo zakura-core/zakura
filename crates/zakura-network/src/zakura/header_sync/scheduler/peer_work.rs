@@ -19,13 +19,16 @@ mod policy;
 
 pub use policy::{
     ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase, HeaderTargetPurpose,
+    HeaderWorkEnd, StorageCallKind, WorkIncarnation,
 };
 use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
 pub(in crate::zakura::header_sync) use policy::{
-    PeerWorkPriority, QueueWorkResult, HEADER_CHUNK_BUDGET_CAPACITY_V1,
+    PeerWorkPriority, QueueWorkResult, StorageCall, WorkCall, HEADER_CHUNK_BUDGET_CAPACITY_V1,
     MAX_HEADER_CHUNK_RESERVATION_V1,
 };
 
+#[cfg(any(test, zakura_sim))]
+use super::super::observe::{ObserverSlot, ReactorEvent};
 use super::super::ZakuraPeerId;
 
 #[derive(Debug)]
@@ -180,6 +183,113 @@ impl Eq for HeaderCapacityLease {}
 impl Drop for HeaderCapacityLeaseInner {
     fn drop(&mut self) {
         self.budget.release_owned(self.count);
+    }
+}
+
+/// The header capacity one storage call holds for one round of work.
+///
+/// Its leases keep the headers charged until the call's result is handled, even
+/// after the queue retires the round. A prepare's retained headers move to its
+/// apply without a release, so no other work can claim their capacity between
+/// the two. Dropping this value ends the call's ownership once.
+#[derive(Debug)]
+pub(in crate::zakura::header_sync) struct RetainedHeaders {
+    peer: ZakuraPeerId,
+    incarnation: WorkIncarnation,
+    /// The call that holds the headers, once one does.
+    call: Option<StorageCall>,
+    leases: Vec<HeaderCapacityLease>,
+    end: HeaderWorkEnd,
+    #[cfg(any(test, zakura_sim))]
+    observer: ObserverSlot,
+}
+
+impl RetainedHeaders {
+    /// The peer whose work these headers belong to.
+    pub(in crate::zakura::header_sync) fn peer(&self) -> &ZakuraPeerId {
+        &self.peer
+    }
+
+    /// The round and call holding these headers, once a call does.
+    pub(in crate::zakura::header_sync) fn work(&self) -> Option<WorkCall> {
+        self.call.map(|call| WorkCall {
+            incarnation: self.incarnation,
+            call,
+        })
+    }
+
+    /// The number of headers retained.
+    pub(in crate::zakura::header_sync) fn headers(&self) -> usize {
+        self.leases
+            .iter()
+            .map(|lease| lease.0.count)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Report this ownership's events to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn observed_by(&mut self, observer: &ObserverSlot) {
+        self.observer = observer.clone();
+    }
+
+    /// Record how this ownership will end when it drops.
+    pub(in crate::zakura::header_sync) fn end_as(&mut self, end: HeaderWorkEnd) {
+        self.end = end;
+    }
+
+    /// Move these headers to `call`. A call that already holds them is a prepare,
+    /// and `call` is its apply.
+    pub(in crate::zakura::header_sync) fn enter_call(&mut self, call: StorageCall) {
+        if let Some(previous) = self.call {
+            debug_assert!(
+                previous.kind == StorageCallKind::Prepare && call.kind == StorageCallKind::Apply,
+                "retained headers move only from a prepare to its apply"
+            );
+            self.end = HeaderWorkEnd::HandedToApply { apply: call.number };
+            self.record_end();
+        }
+        self.call = Some(call);
+        self.end = HeaderWorkEnd::Dropped;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observer) = &self.observer.0 {
+            observer.observe(ReactorEvent::HeadersHeld {
+                call: call.number,
+                kind: call.kind,
+                peer: self.peer.clone(),
+                incarnation: self.incarnation.get(),
+                headers: self.headers(),
+            });
+        }
+    }
+
+    /// Count this ownership's end and report it before any lease can release.
+    fn record_end(&self) {
+        let Some(call) = self.call else {
+            return;
+        };
+        metrics::counter!("sync.header.work.retained_end", "end" => self.end.label()).increment(1);
+        metrics::counter!("sync.header.work.retained_end_headers", "end" => self.end.label())
+            .increment(u64::try_from(self.headers()).unwrap_or(u64::MAX));
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observer) = &self.observer.0 {
+            // An unwinding reactor reports nothing, as `HeaderSyncObserver` says.
+            if !std::thread::panicking() {
+                observer.observe(ReactorEvent::HeadersEnded {
+                    call: call.number,
+                    incarnation: self.incarnation.get(),
+                    headers: self.headers(),
+                    end: self.end,
+                });
+            }
+        }
+        #[cfg(not(any(test, zakura_sim)))]
+        let _ = call;
+    }
+}
+
+impl Drop for RetainedHeaders {
+    fn drop(&mut self) {
+        self.record_end();
     }
 }
 
@@ -492,12 +602,52 @@ impl PeerWorkQueue {
         true
     }
 
-    /// Keep local work charged after its peer slot retires.
+    /// Keep the headers of `peer`'s current round charged after its peer slot
+    /// retires, or `None` when `peer` has no started round.
+    ///
+    /// The round comes from the same work that names the leases, so no caller
+    /// can attribute them to another peer or an older round.
+    pub(in crate::zakura::header_sync) fn retain_headers(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<RetainedHeaders> {
+        let incarnation = self.policy.active(peer)?.incarnation;
+        Some(RetainedHeaders {
+            peer: peer.clone(),
+            incarnation,
+            call: None,
+            leases: self.staged_capacity.get(peer).cloned().unwrap_or_default(),
+            end: HeaderWorkEnd::Dropped,
+            #[cfg(any(test, zakura_sim))]
+            observer: ObserverSlot::default(),
+        })
+    }
+
+    /// The queue's lease clones for `peer`, without any call's ownership.
+    #[cfg(test)]
     pub(in crate::zakura::header_sync) fn retain_header_capacity(
         &self,
         peer: &ZakuraPeerId,
     ) -> Vec<HeaderCapacityLease> {
         self.staged_capacity.get(peer).cloned().unwrap_or_default()
+    }
+
+    /// Record that `peer`'s current round waits for `work`'s call.
+    pub(in crate::zakura::header_sync) fn bind_call(
+        &mut self,
+        peer: &ZakuraPeerId,
+        work: WorkCall,
+    ) {
+        self.policy.bind_call(peer, work);
+    }
+
+    /// Settle `work` on `peer`, and return whether `peer`'s current round waited for it.
+    pub(in crate::zakura::header_sync) fn settle_call(
+        &mut self,
+        peer: &ZakuraPeerId,
+        work: WorkCall,
+    ) -> bool {
+        self.policy.settle_call(peer, work)
     }
 
     pub(in crate::zakura::header_sync) fn owned_header_count(&self, peer: &ZakuraPeerId) -> usize {
@@ -665,6 +815,7 @@ mod tests {
             common_ancestor: Some(local.frontiers.finalized),
             entries,
             phase: HeaderTargetPhase::Receiving,
+            incarnation: WorkIncarnation::UNSTARTED,
             cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
@@ -797,13 +948,15 @@ mod tests {
             common_ancestor: None,
             entries: Vec::new(),
             phase: HeaderTargetPhase::Receiving,
+            incarnation: WorkIncarnation::UNSTARTED,
             cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         };
         assert!(queue.reserve_request(&peer(1), 1));
         assert!(queue.start(request.clone()));
-        assert_eq!(queue.active(&peer(1)), Some(&request));
+        let request = queue.active(&peer(1)).expect("the request started").clone();
+        assert_ne!(request.incarnation, WorkIncarnation::UNSTARTED);
         assert_eq!(
             queue.stage(
                 peer(1),

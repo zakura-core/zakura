@@ -30,6 +30,98 @@ pub(in crate::zakura::header_sync) const HEADER_CHUNK_BUDGET_CAPACITY_V1: usize 
 pub(in crate::zakura::header_sync) const MAX_HEADER_CHUNK_RESERVATION_V1: usize =
     HEADER_CHUNK_BUDGET_CAPACITY_V1 / MAX_STAGED_TARGETS_V1;
 
+/// One started round of a peer's header work, from 1 per queue.
+///
+/// A resumed subscription can reuse its request ID, so the owner alone cannot tell
+/// two rounds apart. No two starts share an incarnation.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WorkIncarnation(u64);
+
+impl WorkIncarnation {
+    /// The value of a request that no queue has started.
+    pub const UNSTARTED: Self = Self(0);
+
+    /// The incarnation's number.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// What one header storage call asks storage for.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum StorageCallKind {
+    /// A continuation-locator read.
+    Locator,
+    /// A VCT repair context read.
+    VctRepairContext,
+    /// A target preparation.
+    Prepare,
+    /// A prepared target's application.
+    Apply,
+}
+
+/// One header storage call's exact identity.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(in crate::zakura::header_sync) struct StorageCall {
+    /// Counts from 1 per reactor, across accepted and refused calls.
+    pub(in crate::zakura::header_sync) number: u64,
+    pub(in crate::zakura::header_sync) kind: StorageCallKind,
+}
+
+/// The exact round and storage call that one prepare or apply belongs to.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) struct WorkCall {
+    pub(in crate::zakura::header_sync) incarnation: WorkIncarnation,
+    pub(in crate::zakura::header_sync) call: StorageCall,
+}
+
+/// How retained headers left one storage call.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderWorkEnd {
+    /// The call's future dropped before it finished, at shutdown or cancellation.
+    Dropped,
+    /// The reactor refused the call that would have taken the headers.
+    Refused,
+    /// The call's future panicked.
+    Panicked,
+    /// The completion no longer matched its peer's work, phase, source, owner,
+    /// round, or call.
+    Stale,
+    /// The prepared target lost its completion authority.
+    NoAuthority,
+    /// The prepared target named another owner or source.
+    OwnerMismatch,
+    /// The prepared repair did not satisfy its repair context.
+    RepairInvalid,
+    /// Preparation failed.
+    PrepareFailed,
+    /// The same headers moved to this apply call.
+    HandedToApply {
+        /// The apply call's number.
+        apply: u64,
+    },
+    /// The apply's result retired its work.
+    Settled,
+}
+
+impl HeaderWorkEnd {
+    /// The end's metric label.
+    pub(in crate::zakura::header_sync) fn label(self) -> &'static str {
+        match self {
+            Self::Dropped => "dropped",
+            Self::Refused => "refused",
+            Self::Panicked => "panicked",
+            Self::Stale => "stale",
+            Self::NoAuthority => "no_authority",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::RepairInvalid => "repair_invalid",
+            Self::PrepareFailed => "prepare_failed",
+            Self::HandedToApply { .. } => "handed_to_apply",
+            Self::Settled => "settled",
+        }
+    }
+}
+
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedHeaderTarget {
@@ -98,6 +190,8 @@ pub struct ActiveHeaderRequest {
     pub entries: Vec<HeaderEntry>,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
+    /// The round the queue assigned at start, or [`WorkIncarnation::UNSTARTED`] before it.
+    pub incarnation: WorkIncarnation,
     /// The subscription cursor of the last staged page.
     pub cursor: Option<Cursor>,
     /// Negotiated page bound before temporary credit limits.
@@ -194,7 +288,11 @@ enum PeerWorkState {
         target: Box<AdvertisedHeaderTarget>,
         priority: PeerWorkPriority,
     },
-    Active(Box<ActiveHeaderRequest>),
+    Active {
+        request: Box<ActiveHeaderRequest>,
+        /// The prepare or apply call this round waits for.
+        call: Option<StorageCall>,
+    },
 }
 
 /// Advisory discovery priority.
@@ -338,6 +436,7 @@ pub(super) struct WorkPolicy {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
     scheduling_revision: u64,
     repair_episodes: HashMap<HeaderSyncWorkOwner, AuxiliaryRequirementEpisode>,
+    last_incarnation: u64,
 }
 
 impl WorkPolicy {
@@ -375,7 +474,9 @@ impl WorkPolicy {
                     PeerWorkState::AwaitingLocator { target, .. } => {
                         target.status.selected_tip_hash
                     }
-                    PeerWorkState::Active(request) => request.target.status.selected_tip_hash,
+                    PeerWorkState::Active { request, .. } => {
+                        request.target.status.selected_tip_hash
+                    }
                 };
                 owned_target == target_tip_hash
             })
@@ -390,7 +491,7 @@ impl WorkPolicy {
             .iter()
             .filter_map(|(peer, work)| match work {
                 PeerWorkState::AwaitingLocator { target, .. } => Some((peer, target.as_ref())),
-                PeerWorkState::Active(_) => None,
+                PeerWorkState::Active { .. } => None,
             })
     }
 
@@ -415,7 +516,7 @@ impl WorkPolicy {
         self.work_by_peer
             .iter()
             .filter_map(|(peer, work)| match work {
-                PeerWorkState::Active(request) => {
+                PeerWorkState::Active { request, .. } => {
                     let header = request.owner.header_authority();
                     let obsolete = request.owner.body_authority().map_or_else(
                         || {
@@ -462,7 +563,7 @@ impl WorkPolicy {
                     }
                     StageDecision::new(QueueWorkResult::NeedsLocator, Some(peer))
                 }
-                PeerWorkState::Active(_) => {
+                PeerWorkState::Active { .. } => {
                     StageDecision::new(QueueWorkResult::AlreadyActive, None)
                 }
             };
@@ -548,7 +649,7 @@ impl WorkPolicy {
 
     /// Start `request` if its peer awaits exactly its target and `reserved`
     /// holds, meaning the runtime owner holds its peer's reservation.
-    pub(super) fn start(&mut self, request: ActiveHeaderRequest, reserved: bool) -> bool {
+    pub(super) fn start(&mut self, mut request: ActiveHeaderRequest, reserved: bool) -> bool {
         let peer = request.peer.clone();
         let matches = self.awaiting(
             &peer,
@@ -558,8 +659,15 @@ impl WorkPolicy {
         ) == Some(&request.target);
         if matches && reserved {
             self.bump_revision();
-            self.work_by_peer
-                .insert(peer, PeerWorkState::Active(Box::new(request)));
+            self.last_incarnation = self.last_incarnation.wrapping_add(1);
+            request.incarnation = WorkIncarnation(self.last_incarnation);
+            self.work_by_peer.insert(
+                peer,
+                PeerWorkState::Active {
+                    request: Box::new(request),
+                    call: None,
+                },
+            );
             true
         } else {
             false
@@ -607,7 +715,7 @@ impl WorkPolicy {
             self.bump_revision();
         }
         match removed {
-            Some(PeerWorkState::Active(request)) => {
+            Some(PeerWorkState::Active { request, .. }) => {
                 self.repair_episodes.remove(&request.owner);
                 Some(*request)
             }
@@ -620,7 +728,9 @@ impl WorkPolicy {
         self.work_by_peer
             .iter()
             .find_map(|(peer, work)| match work {
-                PeerWorkState::Active(request) if request.owner == owner => Some(peer.clone()),
+                PeerWorkState::Active { request, .. } if request.owner == owner => {
+                    Some(peer.clone())
+                }
                 _ => None,
             })
     }
@@ -628,7 +738,9 @@ impl WorkPolicy {
     /// Return the active target carrying one exact durable owner.
     pub(super) fn active_owner(&self, owner: HeaderSyncWorkOwner) -> Option<&ActiveHeaderRequest> {
         self.work_by_peer.values().find_map(|work| match work {
-            PeerWorkState::Active(request) if request.owner == owner => Some(request.as_ref()),
+            PeerWorkState::Active { request, .. } if request.owner == owner => {
+                Some(request.as_ref())
+            }
             _ => None,
         })
     }
@@ -647,15 +759,39 @@ impl WorkPolicy {
 
     pub(super) fn active(&self, peer: &ZakuraPeerId) -> Option<&ActiveHeaderRequest> {
         match self.work_by_peer.get(peer) {
-            Some(PeerWorkState::Active(request)) => Some(request),
+            Some(PeerWorkState::Active { request, .. }) => Some(request),
             _ => None,
         }
     }
 
     pub(super) fn active_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
         match self.work_by_peer.get_mut(peer) {
-            Some(PeerWorkState::Active(request)) => Some(request),
+            Some(PeerWorkState::Active { request, .. }) => Some(request),
             _ => None,
+        }
+    }
+
+    /// Record that `work`'s round on `peer` waits for its call. Another round's
+    /// call records nothing.
+    pub(super) fn bind_call(&mut self, peer: &ZakuraPeerId, work: WorkCall) {
+        if let Some(PeerWorkState::Active { request, call }) = self.work_by_peer.get_mut(peer) {
+            if request.incarnation == work.incarnation {
+                *call = Some(work.call);
+            }
+        }
+    }
+
+    /// Settle `work` on `peer`, and return whether it is exactly the call that
+    /// `peer`'s current round waits for.
+    pub(super) fn settle_call(&mut self, peer: &ZakuraPeerId, work: WorkCall) -> bool {
+        match self.work_by_peer.get_mut(peer) {
+            Some(PeerWorkState::Active { request, call })
+                if request.incarnation == work.incarnation && *call == Some(work.call) =>
+            {
+                *call = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -663,7 +799,7 @@ impl WorkPolicy {
     pub(super) fn phase_counts(&self, owned: impl Fn(&ZakuraPeerId) -> usize) -> PhaseCounts {
         let mut counts = PhaseCounts::default();
         for (peer, work) in &self.work_by_peer {
-            let PeerWorkState::Active(request) = work else {
+            let PeerWorkState::Active { request, .. } = work else {
                 continue;
             };
             let count = owned(peer);

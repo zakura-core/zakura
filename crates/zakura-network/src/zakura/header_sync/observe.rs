@@ -14,8 +14,8 @@ use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
 };
 pub use super::{
-    reactor::{HeaderRequestTerminal, StorageCallKind},
-    scheduler::peer_work::HeaderTargetPhase,
+    reactor::HeaderRequestTerminal,
+    scheduler::peer_work::{HeaderTargetPhase, HeaderWorkEnd, StorageCallKind},
 };
 use crate::zakura::ZakuraPeerId;
 
@@ -90,6 +90,30 @@ pub enum ReactorEvent {
         kind: StorageCallKind,
         /// Why the reactor refused it.
         cause: RefusalCause,
+    },
+    /// A prepare or apply call took ownership of a round's retained headers.
+    HeadersHeld {
+        /// The call's number. Its `Dispatched` came first.
+        call: u64,
+        /// What the call asks storage for.
+        kind: StorageCallKind,
+        /// The peer whose work the headers belong to.
+        peer: ZakuraPeerId,
+        /// The round the headers belong to.
+        incarnation: u64,
+        /// How many headers the call holds.
+        headers: usize,
+    },
+    /// A call's ownership of retained headers ended, before any lease released.
+    HeadersEnded {
+        /// The call's number.
+        call: u64,
+        /// The round the headers belong to.
+        incarnation: u64,
+        /// How many headers the call held.
+        headers: usize,
+        /// How the ownership ended.
+        end: HeaderWorkEnd,
     },
     /// An active request started.
     Started {
@@ -285,6 +309,8 @@ pub struct RequestRef {
     pub session_id: u64,
     /// The request's correlation ID.
     pub request_id: u64,
+    /// The round the queue assigned at start.
+    pub incarnation: u64,
     /// The request's work owner.
     pub owner: HeaderSyncWorkOwner,
     /// The advertised target the request pursues.
@@ -298,6 +324,7 @@ impl RequestRef {
             peer: active.peer.clone(),
             session_id: active.owner.session_id(),
             request_id: active.request_id.get(),
+            incarnation: active.incarnation.get(),
             owner: active.owner,
             target_tip_hash: active.target.status.selected_tip_hash,
         }

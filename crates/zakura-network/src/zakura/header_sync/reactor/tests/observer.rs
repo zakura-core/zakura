@@ -34,8 +34,21 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call.
+    /// The events recorded since the last call, without retained-header ownership.
     fn take(&self) -> Vec<ReactorEvent> {
+        self.take_all()
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Every event recorded since the last call.
+    fn take_all(&self) -> Vec<ReactorEvent> {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
     }
 }
@@ -239,6 +252,7 @@ fn request_ref(active: &ActiveHeaderRequest) -> RequestRef {
         peer: active.peer.clone(),
         session_id: active.owner.session_id(),
         request_id: active.request_id.get(),
+        incarnation: active.incarnation.get(),
         owner: active.owner,
         target_tip_hash: active.target.status.selected_tip_hash,
     }
@@ -410,6 +424,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
                     peer: peer.clone(),
                     session_id: 7,
                     request_id: 9,
+                    incarnation: seeded.incarnation.get(),
                     owner: seeded.owner,
                     target_tip_hash: seeded.target.status.selected_tip_hash,
                 },

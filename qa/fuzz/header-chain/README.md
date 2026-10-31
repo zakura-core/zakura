@@ -28,5 +28,17 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . header_codec_v9 path/to/crash-ar
 cargo xtask minimize-header-fuzz qa/fuzz/header-chain/artifacts/<target>/crash-…
 ```
 
+`header-fuzz.yml` runs each target nightly and for longer on Sunday, or on a manual
+dispatch. It caches `corpus/<target>/` under the target's name and decoder version,
+and replays that corpus in a fresh process before fuzzing:
+
+```console
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> corpus/<target> -- -runs=0
+```
+
+The `[package.metadata.zakura-machine.targets]` table in `Cargo.toml` registers each
+target's properties and decoder version. `scripts/check-fuzz-campaign.py` fails a pull
+request whose target has no entry or no campaign.
+
 Turn every confirmed bug into a normal deterministic test in the owning crate.
 Do not commit raw or minimized corpus files.

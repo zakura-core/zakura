@@ -54,11 +54,28 @@ cadence_witness -- --nocapture` from the repository root. Their printed counters
 are witness evidence; they do not claim applicability for every fuzz input.
 An empty input has zero applicability.
 
-No CI workflow schedules this target or the machine targets below. Run them
-with `cargo fuzz run` as shown above.
+`p2p-fuzz.yml` schedules this target and the machine targets below. It runs each
+one nightly and for longer on Sunday, or on a manual dispatch. No fuzz campaign
+blocks PR CI.
 Machine bytes are compatible with their target and decoder version. They are
-not portable simulator traces. The planned P1 registry will index these local
-property IDs and their witness paths.
+not portable simulator traces. The `[package.metadata.zakura-machine.targets]`
+table in `Cargo.toml` registers each target's property IDs and decoder version.
+`cargo xtask sim-suite` generates its coverage rows from that table, and
+`scripts/check-fuzz-campaign.py` fails a pull request whose target has no entry or
+no campaign.
+
+## Corpus and replay
+
+The campaign caches `corpus/<target>/` under the target's name and decoder version,
+so a new decoder starts an empty corpus. Before fuzzing, the campaign replays that
+corpus in a fresh process with `-runs=0`. After a failure, it replays each file in
+`artifacts/<target>/` the same way and uploads them. Reproduce both from this
+directory:
+
+```console
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> corpus/<target> -- -runs=0
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> path/to/artifact -- -runs=1
+```
 
 ## Block machine targets
 
@@ -110,8 +127,7 @@ items, which the one-block production cap does not reach.
 transport-start facts, and no-progress charges. Its witness expires one written
 request and one unwritten request, matches a replacement request, and resets the
 remaining window. Other machine
-targets follow their owning delivery packets. Shared replay integration and
-campaign scheduling remain open. No fuzz campaign blocks PR CI.
+targets follow their owning delivery packets.
 
 ## Sequencer targets
 

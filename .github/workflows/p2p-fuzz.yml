@@ -33,10 +33,112 @@ jobs:
       matrix:
         include:
           - target: service_session
+            decoder: 1
             seconds: 900
             weekly_seconds: 3600
             rss_mb: 2048
-            # The replay reads at most 512 input bytes.
+            max_len: 512
+          - target: cadence
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_work_ownership
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_peer_registry
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_retry_authority
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_query
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_reactor
+            decoder: 2
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_fill
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_request_lifecycle
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_sequencer_order
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_sequencer_reset
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: block_sequencer_evidence
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: discovery_book
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: discovery_state
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: discovery_session
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: discovery_redial
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: discovery_query
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+          - target: discovery_candidate
+            decoder: 1
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
             max_len: 512
 
     steps:
@@ -51,6 +153,24 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Restore the target's corpus
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 #v4.2.3
+        with:
+          path: qa/fuzz/p2p/corpus/${{ matrix.target }}
+          # Bytes mean something only to their decoder, so a new decoder starts a new corpus.
+          key: p2p-fuzz-corpus-${{ matrix.target }}-d${{ matrix.decoder }}-${{ github.run_id }}
+          restore-keys: |
+            p2p-fuzz-corpus-${{ matrix.target }}-d${{ matrix.decoder }}-
+      - name: Replay the corpus in a fresh process
+        working-directory: qa/fuzz/p2p
+        env:
+          TARGET: ${{ matrix.target }}
+          RSS_MB: ${{ matrix.rss_mb }}
+        run: |
+          mkdir -p "corpus/${TARGET}"
+          cargo fuzz run --fuzz-dir . "${TARGET}" "corpus/${TARGET}" -- \
+            -runs=0 \
+            -rss_limit_mb="${RSS_MB}"
       - name: Run bounded campaign
         working-directory: qa/fuzz/p2p
         env:
@@ -70,6 +190,17 @@ jobs:
             -max_total_time="${seconds}" \
             -rss_limit_mb="${RSS_MB}" \
             -max_len="${MAX_LEN}"
+      - name: Replay crash artifacts in a fresh process
+        if: failure()
+        working-directory: qa/fuzz/p2p
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          for artifact in artifacts/"${TARGET}"/*; do
+            [ -f "${artifact}" ] || continue
+            # A second failure confirms the artifact; the campaign already failed the job.
+            cargo fuzz run --fuzz-dir . "${TARGET}" "${artifact}" -- -runs=1 || true
+          done
       - name: Upload crash artifacts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2

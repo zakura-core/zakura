@@ -21,6 +21,12 @@ a sanitizer must turn the feature off:
 RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s none --no-default-features race_fixtures
 ```
 
+`sim-fuzz.yml` runs each mapped target nightly and for longer on Sunday, or on a
+manual dispatch. It caches `corpus/<target>/` under the target's name and a digest of
+the trace format, adds the harness's committed seeds, and replays that corpus in a
+fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
+whose target has no harness or no campaign.
+
 ## Targets
 
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.

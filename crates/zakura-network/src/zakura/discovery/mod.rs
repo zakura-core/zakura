@@ -48,3 +48,9 @@ pub(crate) use runtime::{
     build_discovery_handle, default_advertised_services, effective_discovery_connection_headroom,
 };
 pub use service::{DiscoveryPeerSession, DiscoveryService};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use requester::{replay_discovery_query_bytes, DiscoveryQueryReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use candidate_dialer::{replay_candidate_dial_bytes, CandidateDialReplaySummary};

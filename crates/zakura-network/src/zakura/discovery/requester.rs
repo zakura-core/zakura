@@ -252,7 +252,7 @@ impl QueryState {
     }
 
     /// Live queries.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     fn len(&self) -> usize {
         self.live.len()
     }
@@ -431,22 +431,27 @@ impl ResponsePrecheck for QueriesPrecheck {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{replay_discovery_query_bytes, DiscoveryQueryReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests {
     use std::collections::{hash_map::Entry, HashMap, HashSet};
 
     use super::*;
+    use crate::zakura::discovery::protocol::ZakuraServiceId;
+    #[cfg(test)]
     use crate::zakura::{
-        discovery::protocol::{
-            DiscoveryServiceSummary, ServiceSummaryEnvelope, Services, ZakuraServiceId,
-        },
+        discovery::protocol::{DiscoveryServiceSummary, ServiceSummaryEnvelope, Services},
         framed_channel,
         regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
         CloseCause,
     };
 
+    #[cfg(test)]
     const PEERS: u16 = MSG_DISCOVERY_PEERS as u16;
 
+    #[cfg(test)]
     impl Queries {
         /// Claims as [`Queries::claim`] does, and returns what the admitted
         /// answer's query asked.
@@ -460,6 +465,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     fn get_peers(limit: u16) -> GetPeers {
         GetPeers {
             limit,
@@ -469,10 +475,12 @@ mod tests {
     }
 
     /// The payload length of a `Peers` with `records` maximal records.
+    #[cfg(test)]
     fn peers_len(records: u16) -> usize {
         usize::try_from(peers_cap(records).bytes).expect("a small cap fits usize")
     }
 
+    #[cfg(test)]
     struct Session {
         queries: Queries,
         /// The peer's end of the stream that carries this node's queries.
@@ -483,6 +491,7 @@ mod tests {
     }
 
     /// One session's queries, answered on `recv`.
+    #[cfg(test)]
     fn session_with(pool: ReservationPool, recv: &FramedRecv) -> Session {
         let (send, written) = framed_channel(4);
         let connection = CancellationToken::new();
@@ -500,6 +509,7 @@ mod tests {
 
     /// One session's queries on an in-process channel, which has no
     /// transport reader.
+    #[cfg(test)]
     fn session(pool: &ReservationPool) -> Session {
         let (_send, recv) = framed_channel(1);
         session_with(pool.clone(), &recv)
@@ -555,10 +565,12 @@ mod tests {
 
     /// The payload length of a `Services` with the most summaries that a
     /// `GetServices` wanting `wanted_len` services allows.
+    #[cfg(test)]
     fn services_len(wanted_len: usize) -> usize {
         usize::try_from(services_cap(wanted_len).bytes).expect("a small cap fits usize")
     }
 
+    #[cfg(test)]
     const SERVICES: u16 = MSG_DISCOVERY_SERVICES as u16;
 
     /// A `GetServices` reservation is independent of the `GetPeers` one. Its
@@ -884,10 +896,12 @@ mod tests {
         },
     }
 
+    #[cfg(test)]
     fn query_kind() -> impl proptest::strategy::Strategy<Value = QueryKind> {
         proptest::sample::select(QUERY_KINDS.to_vec())
     }
 
+    #[cfg(test)]
     fn query_op() -> impl proptest::strategy::Strategy<Value = QueryOp> {
         use proptest::prelude::*;
         prop_oneof![
@@ -928,100 +942,222 @@ mod tests {
     /// wire caps.
     fn model_cap(asked: &Asked) -> u64 {
         match asked {
-            Asked::Peers { limit } => peers_cap(*limit).bytes,
-            Asked::Services(query) => services_cap(query.wanted_services.len()).bytes,
+            Asked::Peers { limit } => 2 + u64::from(*limit) * 648,
+            Asked::Services(query) => {
+                let wanted = query.wanted_services.len();
+                let count = if wanted == 0 { 8 } else { wanted.min(8) };
+                42 + u64::try_from(count).expect("eight summaries fit u64") * 294
+            }
         }
     }
 
-    proptest::proptest! {
-        /// After every step the live queries match an independent model: one
-        /// live query of each kind, a failed write releases only an unsent
-        /// query, and each reservation admits at most one answer, which
-        /// carries what its own query asked.
-        #[test]
-        fn live_queries_match_independent_model(
-            ops in proptest::collection::vec(query_op(), 1..96),
-        ) {
-            let mut state = QueryState::default();
-            let mut model: HashMap<QueryKind, QueryModel> = HashMap::new();
-            let mut reservations = 0usize;
-            let mut admitted = HashSet::new();
-            for op in ops {
-                match op {
-                    QueryOp::Reserve { kind, size } => {
-                        let asked = asked_for(kind, size);
-                        let expected = match model.entry(kind) {
-                            Entry::Occupied(_) => Err(QueryLive),
-                            Entry::Vacant(slot) => {
-                                reservations += 1;
-                                slot.insert(QueryModel {
-                                    asked: asked.clone(),
-                                    queued: false,
-                                    reservation: reservations,
-                                });
-                                Ok(())
-                            }
-                        };
-                        proptest::prop_assert_eq!(state.reserve(asked), expected);
-                    }
-                    QueryOp::Queued(kind) => {
-                        state.queued(kind);
-                        if let Some(query) = model.get_mut(&kind) {
-                            query.queued = true;
+    const PROPERTY: &str = "discovery/query-ownership";
+
+    /// Applicable operations in a decoder-v1 query history.
+    #[derive(Debug, Default, Eq, PartialEq)]
+    pub struct DiscoveryQueryReplaySummary {
+        /// Operations checked against the model.
+        pub transitions: usize,
+        /// Fresh reservations.
+        pub reserved: usize,
+        /// Reservations refused because the kind is live.
+        pub refused: usize,
+        /// Unsent reservations released.
+        pub released: usize,
+        /// Answers admitted by their own reservation.
+        pub admitted: usize,
+        /// Answers rejected above their reservation's cap.
+        pub oversized: usize,
+        /// Claims without a live reservation.
+        pub stale: usize,
+    }
+
+    /// Replay decoder-v1 bytes against the query ownership model.
+    /// Each byte chooses a kind, operation and bounded size. Read at most 512 bytes.
+    pub fn replay_discovery_query_bytes(data: &[u8]) -> DiscoveryQueryReplaySummary {
+        run(decode(data), |_| {})
+    }
+
+    fn decode(data: &[u8]) -> impl Iterator<Item = QueryOp> + '_ {
+        data.iter().take(512).map(|byte| {
+            let kind = if byte & 1 == 0 {
+                QueryKind::Peers
+            } else {
+                QueryKind::Services
+            };
+            match (byte >> 1) % 4 {
+                0 => QueryOp::Reserve {
+                    kind,
+                    size: usize::from(byte >> 3) % 4,
+                },
+                1 => QueryOp::Queued(kind),
+                2 => QueryOp::ReleaseUnsent(kind),
+                _ => QueryOp::Claim {
+                    kind,
+                    excess: match (byte >> 3) % 3 {
+                        0 => None,
+                        1 => Some(0),
+                        _ => Some(1),
+                    },
+                },
+            }
+        })
+    }
+
+    fn run(
+        ops: impl IntoIterator<Item = QueryOp>,
+        mut after_step: impl FnMut(&mut QueryState),
+    ) -> DiscoveryQueryReplaySummary {
+        let mut state = QueryState::default();
+        let mut model: HashMap<QueryKind, QueryModel> = HashMap::new();
+        let mut reservations = 0usize;
+        let mut admitted = HashSet::new();
+        let mut summary = DiscoveryQueryReplaySummary::default();
+        for op in ops {
+            summary.transitions += 1;
+            match op {
+                QueryOp::Reserve { kind, size } => {
+                    let asked = asked_for(kind, size);
+                    let expected = match model.entry(kind) {
+                        Entry::Occupied(_) => Err(QueryLive),
+                        Entry::Vacant(slot) => {
+                            reservations += 1;
+                            slot.insert(QueryModel {
+                                asked: asked.clone(),
+                                queued: false,
+                                reservation: reservations,
+                            });
+                            Ok(())
                         }
-                    }
-                    QueryOp::ReleaseUnsent(kind) => {
-                        let expected = model.get(&kind).is_some_and(|query| !query.queued);
-                        if expected {
-                            model.remove(&kind);
-                        }
-                        proptest::prop_assert_eq!(state.release_unsent(kind), expected);
-                    }
-                    QueryOp::Claim { kind, excess } => {
-                        let expected = model.remove(&kind);
-                        let payload_len = match (&expected, excess) {
-                            (Some(query), Some(excess)) => model_cap(&query.asked) + excess,
-                            _ => 0,
-                        };
-                        let claimed = state.claim(
-                            kind,
-                            usize::try_from(payload_len).expect("test caps fit usize"),
-                        );
-                        match (expected, claimed) {
-                            (None, None) => {}
-                            (Some(query), Some(Ok(answer))) => {
-                                proptest::prop_assert!(payload_len <= model_cap(&query.asked));
-                                proptest::prop_assert_eq!(answer.kind(), kind);
-                                proptest::prop_assert_eq!(&answer.asked, &query.asked);
-                                proptest::prop_assert!(
-                                    admitted.insert(query.reservation),
-                                    "a reservation admits at most one answer"
-                                );
-                            }
-                            (Some(query), Some(Err(refused))) => {
-                                let cap = model_cap(&query.asked);
-                                proptest::prop_assert!(payload_len > cap);
-                                proptest::prop_assert_eq!(
-                                    refused,
-                                    ClaimRefused::OverBytes { bytes: cap }
-                                );
-                            }
-                            (expected, claimed) => proptest::prop_assert!(
-                                false,
-                                "model {expected:?} disagrees with claim {claimed:?}"
-                            ),
-                        }
+                    };
+                    summary.reserved += usize::from(expected.is_ok());
+                    summary.refused += usize::from(expected.is_err());
+                    assert_eq!(state.reserve(asked), expected, "{PROPERTY}");
+                }
+                QueryOp::Queued(kind) => {
+                    state.queued(kind);
+                    if let Some(query) = model.get_mut(&kind) {
+                        query.queued = true;
                     }
                 }
-
-                proptest::prop_assert_eq!(state.len(), model.len());
-                proptest::prop_assert!(state.len() <= QUERY_KINDS.len());
-                for (kind, query) in &model {
-                    let live = state.live.get(kind).expect("the model's live query is live");
-                    proptest::prop_assert_eq!(&live.asked, &query.asked);
-                    proptest::prop_assert_eq!(live.phase == QueryPhase::Queued, query.queued);
+                QueryOp::ReleaseUnsent(kind) => {
+                    let expected = model.get(&kind).is_some_and(|query| !query.queued);
+                    if expected {
+                        model.remove(&kind);
+                    }
+                    summary.released += usize::from(expected);
+                    assert_eq!(state.release_unsent(kind), expected, "{PROPERTY}");
+                }
+                QueryOp::Claim { kind, excess } => {
+                    let expected = model.remove(&kind);
+                    let payload_len = match (&expected, excess) {
+                        (Some(query), Some(excess)) => model_cap(&query.asked) + excess,
+                        _ => 0,
+                    };
+                    let claimed = state.claim(
+                        kind,
+                        usize::try_from(payload_len).expect("test caps fit usize"),
+                    );
+                    match (expected, claimed) {
+                        (None, None) => {
+                            summary.stale += 1;
+                        }
+                        (Some(query), Some(Ok(answer))) => {
+                            summary.admitted += 1;
+                            assert!(payload_len <= model_cap(&query.asked), "{PROPERTY}");
+                            assert_eq!(answer.kind(), kind, "{PROPERTY}");
+                            assert_eq!(&answer.asked, &query.asked, "{PROPERTY}");
+                            assert!(
+                                admitted.insert(query.reservation),
+                                "{PROPERTY}: duplicate admission"
+                            );
+                        }
+                        (Some(query), Some(Err(refused))) => {
+                            summary.oversized += 1;
+                            let cap = model_cap(&query.asked);
+                            assert!(payload_len > cap, "{PROPERTY}");
+                            assert_eq!(
+                                refused,
+                                ClaimRefused::OverBytes { bytes: cap },
+                                "{PROPERTY}"
+                            );
+                        }
+                        (expected, claimed) => panic!(
+                            "{PROPERTY}: model {expected:?} disagrees with claim {claimed:?}"
+                        ),
+                    }
                 }
             }
+
+            after_step(&mut state);
+            assert_eq!(state.len(), model.len(), "{PROPERTY}");
+            assert!(state.len() <= QUERY_KINDS.len(), "{PROPERTY}");
+            for (kind, query) in &model {
+                let live = state
+                    .live
+                    .get(kind)
+                    .expect("the model's live query is live");
+                assert_eq!(&live.asked, &query.asked, "{PROPERTY}");
+                assert_eq!(live.phase == QueryPhase::Queued, query.queued, "{PROPERTY}");
+            }
         }
+        summary
+    }
+
+    #[cfg(test)]
+    proptest::proptest! {
+        #[test]
+        fn live_queries_match_independent_model(ops in proptest::collection::vec(query_op(), 1..96)) {
+            run(ops, |_| {});
+        }
+
+        #[test]
+        fn query_bytes_match_the_same_model(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=512)) {
+            replay_discovery_query_bytes(&bytes);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "CI retains these applicability counters"
+    )]
+    fn query_witness_exercises_ownership_and_caps() {
+        let summary = replay_discovery_query_bytes(&[8, 24, 2, 4, 14, 6, 1, 23, 0, 4]);
+        assert_eq!(
+            summary,
+            DiscoveryQueryReplaySummary {
+                transitions: 10,
+                reserved: 3,
+                refused: 1,
+                released: 1,
+                admitted: 1,
+                oversized: 1,
+                stale: 1,
+            }
+        );
+        assert_eq!(
+            replay_discovery_query_bytes(&[]),
+            DiscoveryQueryReplaySummary::default()
+        );
+        println!("tier=Machine target=discovery_query decoder=1 {summary:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "discovery/query-ownership")]
+    fn query_witness_rejects_losing_a_reservation() {
+        run(decode(&[0]), |state| {
+            state.live.clear();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "discovery/query-ownership")]
+    fn query_witness_rejects_releasing_a_queued_query() {
+        run(decode(&[0, 2]), |state| {
+            state
+                .live
+                .retain(|_, query| query.phase != QueryPhase::Queued);
+        });
     }
 }

@@ -17,7 +17,7 @@
 //! # Cost
 //!
 //! Each sample is one `getsockopt(TCP_INFO)` call, a few hundred nanoseconds with no
-//! allocation beyond the report's sample list. Starting a watch adds one `ioctl(SIOCOUTQ)`.
+//! allocation beyond the report's sample list. Starting a watch reads `TCP_INFO` around `SIOCOUTQ` and retries up to three times.
 //! Sampling runs only while a watched upload is unacknowledged: at most
 //! [`MAX_WATCHED_UPLOADS`] watches per connection, each sampling every [`SAMPLE_INTERVAL`] for
 //! at most [`ACK_TIMEOUT`]. That bounds the cost to 80 system calls per second per connection
@@ -187,7 +187,10 @@ impl UploadProgress {
     }
 
     /// The number of uploads being watched.
-    #[allow(dead_code, reason = "kept for upload bandwidth estimates; nothing consumes it yet")]
+    #[allow(
+        dead_code,
+        reason = "kept for upload bandwidth estimates; nothing consumes it yet"
+    )]
     pub fn watching(&self) -> usize {
         MAX_WATCHED_UPLOADS.saturating_sub(self.watches.available_permits())
     }
@@ -200,8 +203,8 @@ impl UploadProgress {
     pub fn start(&self, message_len: u64) -> Option<UploadWatch> {
         let permit = self.watches.clone().try_acquire_owned().ok()?;
         let started_at = Instant::now();
-        let start = self.socket.sample()?;
-        let queued_ahead = self.socket.send_queue_bytes()?;
+        let (start, queued_ahead) =
+            upload_start_snapshot(|| self.socket.sample(), || self.socket.send_queue_bytes())?;
         Some(UploadWatch {
             socket: self.socket.downgrade(),
             started_at,
@@ -214,6 +217,26 @@ impl UploadProgress {
             _permit: permit,
         })
     }
+}
+
+/// Reads a consistent ACK counter and send queue before the writer publishes new bytes.
+///
+/// ACKs can arrive between syscalls. Retry a changed counter so bytes acknowledged between
+/// reads cannot lower the delivery target. Skip sampling if the counter never stabilizes.
+fn upload_start_snapshot(
+    mut sample: impl FnMut() -> Option<TcpInfo>,
+    mut send_queue_bytes: impl FnMut() -> Option<u64>,
+) -> Option<(TcpInfo, u64)> {
+    let mut before = sample()?;
+    for _ in 0..3 {
+        let queued = send_queue_bytes()?;
+        let after = sample()?;
+        if before.bytes_acked == after.bytes_acked {
+            return Some((after, queued));
+        }
+        before = after;
+    }
+    None
 }
 
 /// An upload whose acknowledgement is being watched, started by [`UploadProgress::start`].

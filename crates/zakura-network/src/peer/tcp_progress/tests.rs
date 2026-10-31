@@ -273,3 +273,37 @@ mod linux {
         assert!(progress.start(1_000).is_some());
     }
 }
+
+#[test]
+fn upload_target_retries_acknowledgements_between_socket_reads() {
+    let mut acknowledgements = [100, 150, 150].into_iter();
+    let mut queues = [50, 50].into_iter();
+    let (info, queued) = upload_start_snapshot(
+        || {
+            Some(TcpInfo {
+                bytes_acked: acknowledgements.next().unwrap(),
+                ..TcpInfo::default()
+            })
+        },
+        || queues.next(),
+    )
+    .expect("the second snapshot has a stable ACK counter");
+    assert_eq!(info.bytes_acked + queued, 200);
+}
+
+#[test]
+fn upload_target_skips_continuously_changing_acknowledgements() {
+    let mut bytes_acked = 0;
+    let result = upload_start_snapshot(
+        || {
+            bytes_acked += 1;
+            Some(TcpInfo {
+                bytes_acked,
+                ..TcpInfo::default()
+            })
+        },
+        || Some(100),
+    );
+    assert!(result.is_none());
+    assert_eq!(bytes_acked, 4);
+}

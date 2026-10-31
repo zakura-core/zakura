@@ -20,7 +20,10 @@ use super::{
     },
 };
 use crate::{
-    explore::ProcessFailure,
+    explore::{
+        feedback::{FEEDBACK_LINE, FEEDBACK_VAR},
+        ProcessFailure,
+    },
     harness::HarnessEntry,
     seed,
     trace::{
@@ -28,14 +31,6 @@ use crate::{
         BuildInfo,
     },
 };
-
-/// The variable that turns a fuzz target's semantic feedback `on` or
-/// `off`, as the fuzz package reads it.
-pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
-
-/// The start of the line a fuzz target with semantic feedback logs at
-/// startup, followed by `key=value` pairs.
-pub const FEEDBACK_LINE: &str = "zakura-sim feedback: ";
 
 /// The sanitizer variables a run's fuzzer processes get from its
 /// manifest, and from nowhere else.

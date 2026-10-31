@@ -1465,8 +1465,11 @@ pub const REQUIRED: &[RequiredState] = &[
     waiting(
         Family::CompetingForks,
         "stronger, weaker or equal work",
-        "G1 and G2a",
-        "no observation carries chain work; G1's fixture DAG records each branch's work",
+        "O2 and G2a",
+        "no observation carries chain work, and every fixture header has the Regtest genesis \
+         difficulty, so competing branches differ only in length; an observation must report \
+         each prepared target's suffix work, and G2a's controls must offer branches of more, \
+         less and equal work",
     ),
     collected(
         Family::CompetingForks,

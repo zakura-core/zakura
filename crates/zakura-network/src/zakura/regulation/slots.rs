@@ -160,6 +160,15 @@ impl OutputByteBudget {
         OutputGrant { _permit: permit }
     }
 
+    /// Take `bytes` now, or nothing. Pass a value from [`Self::clamp`].
+    pub(crate) fn try_grant(&self, bytes: u32) -> Option<OutputGrant> {
+        self.bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .ok()
+            .map(|permit| OutputGrant { _permit: permit })
+    }
+
     /// Take every free byte, up to 4 GiB.
     #[cfg(test)]
     pub(crate) fn hold_free(&self) -> Option<OutputGrant> {

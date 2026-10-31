@@ -702,6 +702,7 @@ impl StartCmd {
             latest_chain_tip: latest_chain_tip.clone(),
             network: config.network.network.clone(),
             misbehavior_sender,
+            block_verify_trace: syncer.block_verify_trace(),
         };
         setup_tx
             .send(setup_data)

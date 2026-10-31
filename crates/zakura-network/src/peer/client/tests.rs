@@ -321,6 +321,7 @@ where
             error_slot: error_slot.clone(),
             connection_task,
             heartbeat_task,
+            connection_trace: crate::lifecycle_trace::ConnectionTrace::untraced(),
         };
 
         let harness = ClientTestHarness {

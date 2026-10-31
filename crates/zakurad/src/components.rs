@@ -1,6 +1,7 @@
 //! Holds components of a Zebra node.
 
 pub(crate) mod auth_download_height;
+pub mod block_verify_trace;
 pub mod health;
 pub mod inbound;
 #[allow(missing_docs)]

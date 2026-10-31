@@ -17,8 +17,12 @@ use tokio::{
 use zakura_chain::block;
 
 use crate::{
-    constants::REQUEST_TIMEOUT, peer::ClientRequest, peer_registry::PeerRegistryUpdater,
-    protocol::external::types::Version, Request,
+    constants::REQUEST_TIMEOUT,
+    lifecycle_trace::{AdvertTrace, ConnectionTrace, SlotRelease},
+    peer::ClientRequest,
+    peer_registry::PeerRegistryUpdater,
+    protocol::external::types::Version,
+    Request,
 };
 
 /// Maximum outstanding legacy block advertisements across broadcasts.
@@ -167,6 +171,8 @@ pub(crate) struct BlockGossipPeer {
     pub(crate) version: Version,
     /// Configured sidecars may wait for a busy connection to write inventory.
     pub(crate) sidecar: bool,
+    /// The connection's identifier and lifecycle trace context.
+    pub(crate) trace: ConnectionTrace,
 }
 
 impl BlockGossipPeer {
@@ -175,13 +181,22 @@ impl BlockGossipPeer {
     }
 
     /// Keep the permit through getdata, the block write, and the drain allowance.
-    pub(crate) async fn advertise(mut self, hash: block::Hash, slots: Arc<Semaphore>) -> bool {
+    ///
+    /// `advert` records the slot wait, the inventory write, and why the slot was released.
+    pub(crate) async fn advertise(
+        mut self,
+        hash: block::Hash,
+        slots: Arc<Semaphore>,
+        mut advert: AdvertTrace,
+    ) -> bool {
+        advert.started();
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
             if let Some(claim) = claim {
                 break (progress, claim);
             }
+            advert.joined();
             // Early and committed announcements join an existing upload for this peer.
             let succeeded = loop {
                 if let UploadState::Finished(succeeded) = *progress.borrow_and_update() {
@@ -192,6 +207,7 @@ impl BlockGossipPeer {
                 }
             };
             if succeeded || retried || self.sender.is_closed() {
+                advert.finished(succeeded);
                 return succeeded;
             }
             // The joined upload can fail without reaching this peer, for example when early
@@ -199,16 +215,42 @@ impl BlockGossipPeer {
             while progress.changed().await.is_ok() {}
             retried = true;
         };
-        let Ok(_permit) = slots.acquire().await else {
+        advert.waiting_for_slot();
+        let Ok(permit) = slots.acquire().await else {
+            advert.finished(false);
             return false;
         };
+        advert.slot_acquired(slots.available_permits());
+        let (succeeded, release) = self
+            .advertise_holding_slot(hash, &mut progress, &claim, &mut advert)
+            .await;
+        claim.0.send_replace(UploadState::Finished(succeeded));
+        drop(permit);
+        advert.slot_released(release);
+        advert.finished(succeeded);
+        succeeded
+    }
+
+    /// Writes the inventory, then waits for the peer's upload or a deadline.
+    ///
+    /// Returns whether the advertisement succeeded and why the caller should release its slot.
+    async fn advertise_holding_slot(
+        &mut self,
+        hash: block::Hash,
+        progress: &mut watch::Receiver<UploadState>,
+        claim: &UploadClaim,
+        advert: &mut AdvertTrace,
+    ) -> (bool, SlotRelease) {
         let (tx, rx) = oneshot::channel();
+        let request = Request::AdvertiseBlock(hash, None);
+        let request_trace = self.trace.stamp(None, &request);
         let request = ClientRequest {
-            request: Request::AdvertiseBlock(hash, None),
+            request,
             tx,
             inv_collector: None,
             transient_addr: None,
             span: tracing::Span::current(),
+            trace: request_trace,
         };
         // A sidecar learns the tip only from inventory, so it waits for its busy connection.
         // Other connections that cannot write inventory promptly must not hold the slot.
@@ -217,43 +259,57 @@ impl BlockGossipPeer {
         } else {
             BLOCK_REQUEST_WAIT
         };
+        let (sender, connection) = (&mut self.sender, &self.trace);
         let advertised = timeout(inventory_wait, async {
-            self.sender.send(request).await.ok()?;
+            sender.send(request).await.ok()?;
+            connection.enqueued(&request_trace);
+            advert.inv_enqueued();
             rx.await.ok()?.ok()
         })
         .await;
         if !matches!(advertised, Ok(Some(_))) {
-            return false;
+            return (false, SlotRelease::InventoryNotWritten);
         }
+        advert.inv_written();
         // The connection usually marks the write first; senders without a connection rely on this.
         claim.0.send_if_modified(UploadState::start_waiting);
 
         let request_deadline = Instant::now() + BLOCK_REQUEST_WAIT;
-        let succeeded = loop {
+        loop {
             let state = *progress.borrow_and_update();
             let deadline = match state {
                 UploadState::Queued => unreachable!("written inventory leaves the queued state"),
                 UploadState::Waiting => request_deadline,
-                UploadState::Requested(started) => started + BLOCK_UPLOAD_WAIT,
-                UploadState::Written(written) => {
-                    sleep_until(written + BLOCK_WRITE_GRACE).await;
-                    break true;
+                UploadState::Requested(started) => {
+                    advert.upload_requested(started);
+                    started + BLOCK_UPLOAD_WAIT
                 }
-                UploadState::Finished(succeeded) => break succeeded,
+                UploadState::Written(written) => {
+                    advert.upload_written(written);
+                    sleep_until(written + BLOCK_WRITE_GRACE).await;
+                    return (true, SlotRelease::WriteGrace);
+                }
+                // Other tasks only finish this task's claimed upload when it fails.
+                UploadState::Finished(succeeded) => return (succeeded, SlotRelease::UploadFailed),
             };
             tokio::select! {
                 biased;
-                changed = progress.changed() => if changed.is_err() { break false; },
+                changed = progress.changed() => if changed.is_err() {
+                    return (false, SlotRelease::UploadFailed);
+                },
                 _ = sleep_until(deadline) => {
-                    let reason = if matches!(state, UploadState::Waiting) { "no_request" } else { "upload_timeout" };
-                    metrics::counter!("peer.block_gossip.slot_timeout", "reason" => reason).increment(1);
+                    let release = if matches!(state, UploadState::Waiting) {
+                        SlotRelease::NoRequest
+                    } else {
+                        SlotRelease::UploadTimeout
+                    };
+                    metrics::counter!("peer.block_gossip.slot_timeout", "reason" => release.label())
+                        .increment(1);
                     // Advertisement completion does not promise that the peer requested the block.
-                    break true;
+                    return (true, release);
                 }
             }
-        };
-        claim.0.send_replace(UploadState::Finished(succeeded));
-        succeeded
+        }
     }
 }
 
@@ -311,6 +367,7 @@ mod tests {
                 registry: None,
                 version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
                 sidecar: false,
+                trace: ConnectionTrace::untraced(),
             },
             receiver,
         )
@@ -333,9 +390,10 @@ mod tests {
         let (first, mut first_rx) = peer();
         let uploads = first.uploads.clone();
         let (second, mut second_rx) = peer();
-        let first_task = tokio::spawn(first.advertise(hash, slots.clone()));
+        let first_task = tokio::spawn(first.advertise(hash, slots.clone(), AdvertTrace::default()));
         accept(&mut first_rx, hash).await;
-        let second_task = tokio::spawn(second.advertise(hash, slots.clone()));
+        let second_task =
+            tokio::spawn(second.advertise(hash, slots.clone(), AdvertTrace::default()));
         tokio::task::yield_now().await;
         assert!(second_rx.next().now_or_never().is_none());
         uploads.requested(hash);
@@ -362,7 +420,7 @@ mod tests {
         let hash = block::Hash([2; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (first, mut first_rx) = peer();
-        let task = tokio::spawn(first.advertise(hash, slots.clone()));
+        let task = tokio::spawn(first.advertise(hash, slots.clone(), AdvertTrace::default()));
         accept(&mut first_rx, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
@@ -378,9 +436,17 @@ mod tests {
         let hash = block::Hash([3; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let first = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
-        let second = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let second = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         tokio::task::yield_now().await;
         assert!(receiver.next().now_or_never().is_none());
         peer.uploads.requested(hash);
@@ -396,9 +462,17 @@ mod tests {
         let hash = block::Hash([4; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let first = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let duplicate = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         tokio::task::yield_now().await;
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
@@ -415,9 +489,17 @@ mod tests {
         let hash = block::Hash([7; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let early = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
-        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let committed = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         tokio::task::yield_now().await;
         peer.uploads.requested(hash);
         peer.uploads.unavailable(hash);
@@ -434,9 +516,17 @@ mod tests {
         let hash = block::Hash([8; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let first = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let duplicate = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         tokio::task::yield_now().await;
         drop(receiver);
         peer.uploads.disconnected();
@@ -452,7 +542,7 @@ mod tests {
             let slots = Arc::new(Semaphore::new(1));
             let (peer, mut receiver) = peer();
             let uploads = peer.uploads.clone();
-            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+            let task = tokio::spawn(peer.advertise(hash, slots.clone(), AdvertTrace::default()));
             accept(&mut receiver, hash).await;
             uploads.requested(hash);
             tokio::task::yield_now().await;
@@ -476,6 +566,7 @@ mod tests {
             tasks.push(tokio::spawn(peer.advertise(
                 block::Hash([u8::try_from(i).unwrap(); 32]),
                 slots.clone(),
+                AdvertTrace::default(),
             )));
             receivers.push(receiver);
         }
@@ -504,12 +595,20 @@ mod tests {
         let hash = block::Hash([6; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let early = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.unavailable(hash);
         assert!(!early.await.unwrap());
-        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let committed = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
@@ -522,7 +621,11 @@ mod tests {
         let hash = block::Hash([9; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let task = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         tokio::task::yield_now().await;
         // A getdata that follows an earlier inventory resolves before this inventory is written.
         peer.uploads.requested(hash);
@@ -541,7 +644,11 @@ mod tests {
         let hash = block::Hash([10; 32]);
         let slots = Arc::new(Semaphore::new(1));
         let (peer, mut receiver) = peer();
-        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let task = tokio::spawn(peer.clone().advertise(
+            hash,
+            slots.clone(),
+            AdvertTrace::default(),
+        ));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         // The inbound service truncated the request before reaching this hash.
@@ -557,7 +664,7 @@ mod tests {
             let slots = Arc::new(Semaphore::new(1));
             let (mut peer, mut receiver) = peer();
             peer.sidecar = sidecar;
-            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+            let task = tokio::spawn(peer.advertise(hash, slots.clone(), AdvertTrace::default()));
             tokio::task::yield_now().await;
             tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_millis(1)).await;
             tokio::task::yield_now().await;

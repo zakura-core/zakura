@@ -44,6 +44,7 @@ use zakura_node_services::task::{erased, spawn_buffer};
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
     constants,
+    lifecycle_trace::LifecycleTrace,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
         self, address_is_valid_for_inbound_listeners, HandshakeRequest, MinimumPeerVersion,
@@ -315,6 +316,10 @@ where
             .collect(),
     );
 
+    // One writer serves the `p2p`, `p2p_request`, and `block_gossip` tables, which the
+    // connections and the peer set share.
+    let lifecycle_trace = LifecycleTrace::new(config.zakura.spawn_tracer());
+
     let (listen_handshaker, outbound_connector) = {
         use tower::timeout::TimeoutLayer;
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
@@ -332,6 +337,7 @@ where
             .with_latest_chain_tip(latest_chain_tip.clone())
             .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
+            .with_lifecycle_trace(lifecycle_trace.clone())
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {
@@ -379,7 +385,8 @@ where
         address_metrics,
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
-    );
+    )
+    .with_lifecycle_trace(lifecycle_trace);
     let shutdown = zakura_endpoint
         .as_ref()
         .map(ZakuraEndpoint::background_shutdown_token)

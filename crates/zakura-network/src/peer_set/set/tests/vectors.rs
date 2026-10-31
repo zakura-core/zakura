@@ -811,6 +811,7 @@ fn block_gossip_skips_busy_outdated_peers() {
                 registry: None,
                 version: Version(1),
                 sidecar: false,
+                trace: crate::lifecycle_trace::ConnectionTrace::untraced(),
             },
         );
 

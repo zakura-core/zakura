@@ -173,6 +173,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
         latest_chain_tip,
         network,
         misbehavior_sender,
+        block_verify_trace: crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     };
     assert!(
         setup_tx.send(setup).is_ok(),

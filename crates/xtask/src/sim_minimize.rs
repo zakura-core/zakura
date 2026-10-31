@@ -365,10 +365,17 @@ fn minimize(
     request: &Request,
     interrupt: &AtomicBool,
 ) -> Result<Report, BoxError> {
-    with_tools(repo_root, request, interrupt, minimize_with)
+    with_tools(
+        repo_root,
+        &repo_root.join("target"),
+        request,
+        interrupt,
+        minimize_with,
+    )
 }
 
-/// Builds and pins the tools in the checkout at `repo_root`, then confirms
+/// Builds and pins the tools in the checkout at `repo_root`, into the
+/// `sim` and `sim-fuzz` target directories under `builds`, then confirms
 /// the request's input in fresh processes, as [`minimize`] confirms an
 /// original before `tmin`, and writes the report. Its status is
 /// [`Status::Confirmed`] if every check passed. `cargo xtask planted
@@ -376,10 +383,11 @@ fn minimize(
 /// The request's `runs` and `wall` limits don't apply.
 pub(super) fn confirm(
     repo_root: &Path,
+    builds: &Path,
     request: &Request,
     interrupt: &AtomicBool,
 ) -> Result<Report, BoxError> {
-    with_tools(repo_root, request, interrupt, confirm_with)
+    with_tools(repo_root, builds, request, interrupt, confirm_with)
 }
 
 /// Confirms the original with `tools`, as [`minimize_with`] does before
@@ -405,17 +413,19 @@ pub(super) fn confirm_with(
 /// preserved original, the start and the interrupt flag.
 type WithTools = fn(&Request, &Tools, Original, Instant, &AtomicBool) -> Result<Report, BoxError>;
 
-/// Preserves the original, builds and pins the tools, and runs `then` with
-/// them. A build that fails or is interrupted writes its own report.
+/// Preserves the original, builds and pins the tools under `builds`, and
+/// runs `then` with them. A build that fails or is interrupted writes its
+/// own report.
 fn with_tools(
     repo_root: &Path,
+    builds: &Path,
     request: &Request,
     interrupt: &AtomicBool,
     then: WithTools,
 ) -> Result<Report, BoxError> {
     let started = Instant::now();
     let original = preserve_original(request)?;
-    let built = match build_tools(repo_root, request, interrupt) {
+    let built = match build_tools(repo_root, builds, request, interrupt) {
         Ok(Ok(tools)) => tools,
         Ok(Err(Stop::Failed(reason))) => {
             let report =
@@ -462,17 +472,19 @@ fn interrupted_before_start(request: &Request, original: Original, started: Inst
         .with_reason("interrupted while building the tools")
 }
 
-/// Builds `zakura-sim` and the fuzz target, logging into `<out>/logs/`, and
-/// copies both into `<out>/bin/`.
+/// Builds `zakura-sim` and the fuzz target into `<builds>/sim` and
+/// `<builds>/sim-fuzz`, logging into `<out>/logs/`, and copies both into
+/// `<out>/bin/`.
 fn build_tools(
     repo_root: &Path,
+    builds: &Path,
     request: &Request,
     interrupt: &AtomicBool,
 ) -> Result<Result<Tools, Stop>, BoxError> {
     let logs = request.out.join(LOGS_DIR);
     fs::create_dir_all(&logs)?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let sim_target = repo_root.join("target").join("sim");
+    let sim_target = builds.join("sim");
     let mut build_sim = Command::new(&cargo);
     build_sim
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
@@ -486,7 +498,7 @@ fn build_tools(
         return Ok(Err(stop));
     }
 
-    let fuzz_target = repo_root.join("target").join("sim-fuzz");
+    let fuzz_target = builds.join("sim-fuzz");
     let fuzz_build = FuzzBuild {
         fuzz_dir: fuzz_dir(repo_root),
         target_dir: fuzz_target.clone(),
@@ -579,6 +591,12 @@ fn build(
             log.display()
         ))),
     })
+}
+
+/// The directory under `<out>` that holds the pinned copies of `zakura-sim`
+/// and the fuzz target.
+pub(super) fn bin_dir(out: &Path) -> PathBuf {
+    out.join(BIN_DIR)
 }
 
 /// The fuzz target binary cargo-fuzz built under `target_dir`, in its one

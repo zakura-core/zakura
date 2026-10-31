@@ -301,8 +301,10 @@ on a target's harness, and also confirms the patched input through that
 target in fresh processes, as `sim-minimize` confirms an original: the
 patched target must crash with the property alone and name the harness,
 `zakura-sim confirm` must find the property's trigger history, and a fresh
-replay must match Exact. It prints each target's bypasses, or that it has
-none.
+replay must match Exact. It builds the patched `zakura-sim` and target in
+`target/planted/confirm-builds/`, outside the scratch worktree, so later
+runs reuse the builds, and both binaries must embed the patched checkout's
+source digest. It prints each target's bypasses, or that it has none.
 
 The nightly `zakura_sim targets` job in `tests-unit.yml` runs both
 commands. It also runs on manual dispatch, never on pull requests.

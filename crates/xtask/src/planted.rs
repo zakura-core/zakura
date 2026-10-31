@@ -9,8 +9,8 @@
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
-//! build uses the workspace's `planted` profile in `target/planted/target`,
-//! apart from the checkout's own target directory. Then for each case it:
+//! recording build uses the workspace's `planted` profile in
+//! `target/planted/target`, apart from the checkout's own target directory. Then for each case it:
 //!
 //! 1. records the input with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
@@ -52,8 +52,11 @@
 //! `cargo xtask sim-minimize` confirms an original: the patched target must
 //! crash with the case's property alone and name the harness,
 //! `zakura-sim confirm` must find the property's trigger history, and a
-//! fresh `zakura-sim replay` must match the trace Exact. A check that fails
-//! is its own failure, never a catch.
+//! fresh `zakura-sim replay` must match the trace Exact. It builds
+//! `zakura-sim` and the target in `target/planted/confirm-builds/`, outside
+//! the scratch worktree, so later cases and runs reuse the builds, and both
+//! binaries must embed the patched checkout's source digest. A check that
+//! fails is its own failure, never a catch.
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
@@ -83,6 +86,10 @@ use crate::{
     sim_minimize::{self, Sanitizer, Status},
     BoxError,
 };
+
+#[allow(dead_code)]
+#[path = "../../zakura-sim/build/provenance.rs"]
+mod provenance;
 
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
@@ -116,6 +123,12 @@ const CAMPAIGN_INPUT_BYTES: usize = 64;
 
 /// The longest one child of a confirmation through a fuzz target may run.
 const TARGET_CHILD: Duration = Duration::from_secs(300);
+
+/// The directory under the planted work directory where a confirmation
+/// through a fuzz target builds `zakura-sim` and the target. It sits
+/// outside the scratch worktree, which each run removes, so later cases,
+/// later runs and CI's cache of `target/` reuse the builds.
+const CONFIRM_BUILDS: &str = "confirm-builds";
 
 /// One retained bypass patch.
 #[derive(Clone, Debug)]
@@ -547,6 +560,13 @@ fn find_patches(dir: &Path, patches: &mut Vec<PathBuf>) -> Result<(), BoxError> 
     Ok(())
 }
 
+/// Where confirmations through a fuzz target build, in the planted work
+/// directory `work`: [`CONFIRM_BUILDS`], beside the scratch worktree rather
+/// than in it.
+fn confirm_builds(work: &Path) -> PathBuf {
+    work.join(CONFIRM_BUILDS)
+}
+
 /// Removes the scratch worktree at `worktree`, if there is one.
 fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), BoxError> {
     if worktree.exists() {
@@ -573,7 +593,8 @@ fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxE
     for (index, case) in cases.iter().enumerate() {
         let scratch = work.join(format!("case-{index}"));
         fs::create_dir_all(&scratch)?;
-        let verdict = check_case(worktree, &scratch, &target, &baseline, case);
+        let builds = confirm_builds(work);
+        let verdict = check_case(worktree, &scratch, &target, &builds, &baseline, case);
         run_command(git(worktree).args(["reset", "--hard", "--quiet", "HEAD"]))?;
         run_command(git(worktree).args(["clean", "-fdq"]))?;
         let verdict = verdict?;
@@ -587,11 +608,13 @@ fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxE
 
 /// Runs the input on the unpatched `baseline` binary, then patches
 /// `worktree` and runs it again, building in `target` and writing both
-/// traces under `scratch`.
+/// traces under `scratch`. A confirmation through a fuzz target builds
+/// under `builds`.
 fn check_case(
     worktree: &Path,
     scratch: &Path,
     target: &Path,
+    builds: &Path,
     baseline: &Path,
     case: &Case,
 ) -> Result<Verdict, BoxError> {
@@ -627,7 +650,7 @@ fn check_case(
     };
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
-            Ok(through_target(worktree, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
+            Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
         }
         _ => Ok(verdict),
     }
@@ -647,10 +670,16 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
 /// fuzz target `target`, which runs `harness`, in fresh processes, with
 /// [`sim_minimize::confirm`]: the target must crash with the case's
 /// property alone and name `harness`, `zakura-sim confirm` must find the
-/// property's trigger history, and a fresh replay must match Exact. Writes
-/// under `scratch`. `None` if every check passed.
+/// property's trigger history, and a fresh replay must match Exact. Builds
+/// under `builds`, which outlives the worktree, and writes under `scratch`.
+///
+/// The builds are reused, so both pinned binaries must also name the
+/// patched source: each embeds the source digest that `zakura-sim`'s build
+/// script computed, and the digest must be the patched worktree's
+/// ([`names_source`]). `None` if every check passed.
 fn through_target(
     worktree: &Path,
+    builds: &Path,
     scratch: &Path,
     case: &Case,
     target: &str,
@@ -673,25 +702,62 @@ fn through_target(
         },
         sanitizer: Sanitizer::Address,
     };
-    let report = sim_minimize::confirm(worktree, &request, &AtomicBool::new(false))?;
-    if report.status == Status::Confirmed {
-        println!(
-            "{} {}: confirmed through {target}; see {}",
-            case.property,
-            case.patch.display(),
-            out.join(sim_minimize::REPORT_FILE).display()
-        );
-        return Ok(None);
-    }
-    Ok(Some(Verdict::TargetMisses {
-        target: target.to_owned(),
-        why: format!(
-            "{}: {}; see {}",
+    let report = sim_minimize::confirm(
+        worktree,
+        &path::absolute(builds)?,
+        &request,
+        &AtomicBool::new(false),
+    )?;
+    let misses = |why: String| {
+        Ok(Some(Verdict::TargetMisses {
+            target: target.to_owned(),
+            why: format!(
+                "{why}; see {}",
+                out.join(sim_minimize::REPORT_FILE).display()
+            ),
+        }))
+    };
+    if report.status != Status::Confirmed {
+        return misses(format!(
+            "{}: {}",
             report.status,
-            report.reason.as_deref().unwrap_or("no reason given"),
-            out.join(sim_minimize::REPORT_FILE).display()
-        ),
-    }))
+            report.reason.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    let source = provenance::Provenance::read(worktree, provenance::SOURCE_PATHS).source;
+    let bin = sim_minimize::bin_dir(&out);
+    for binary in [bin.join("zakura-sim"), bin.join(target)] {
+        if let Err(why) = names_source(&fs::read(&binary)?, &source) {
+            return misses(format!("{}: {why}", binary.display()));
+        }
+    }
+    println!(
+        "{} {}: confirmed through {target}; see {}",
+        case.property,
+        case.patch.display(),
+        out.join(sim_minimize::REPORT_FILE).display()
+    );
+    Ok(None)
+}
+
+/// Checks that `binary` embeds `source`, the patched checkout's source
+/// digest as `zakura-sim`'s build script computes it, so it was built from
+/// that source and not reused from an earlier one. A digest git couldn't
+/// compute names no source.
+fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
+    if source == provenance::UNKNOWN {
+        return Err("git couldn't compute the patched checkout's source digest".to_owned());
+    }
+    if binary
+        .windows(source.len())
+        .any(|window| window == source.as_bytes())
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "the build doesn't embed the patched checkout's source digest {source}"
+        ))
+    }
 }
 
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
@@ -1267,6 +1333,53 @@ mod tests {
         assert_eq!(target_of(&harnesses, "h/one").as_deref(), Some("b_target"));
         assert_eq!(target_of(&harnesses, "h/two").as_deref(), Some("d_target"));
         assert_eq!(target_of(&harnesses, "h/three"), None);
+    }
+
+    /// The builds a confirmation through a fuzz target makes outlive the
+    /// scratch worktree, which every run removes, so the next case, the
+    /// next run and CI's cache of `target/` reuse them.
+    #[test]
+    fn confirm_builds_outlive_the_worktree() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        fs::write(root.join("file"), "file").expect("the file is written");
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+        let work = root.join("target").join("planted");
+        let worktree = work.join("worktree");
+        git_ok(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                "target/planted/worktree",
+            ],
+        );
+        let built = confirm_builds(&work)
+            .join("sim")
+            .join("debug")
+            .join("zakura-sim");
+        fs::create_dir_all(built.parent().expect("a parent")).expect("the directory is created");
+        fs::write(&built, "binary").expect("the build is written");
+
+        remove_worktree(root, &worktree).expect("the worktree is removed");
+        assert!(!worktree.exists());
+        assert_eq!(fs::read(&built).expect("the build is kept"), b"binary");
+    }
+
+    /// A confirmation's binaries must embed the patched checkout's source
+    /// digest, so a reused build of other source doesn't pass.
+    #[test]
+    fn a_build_names_its_source() {
+        let source = "ab".repeat(32);
+        let binary = [b"head".as_slice(), source.as_bytes(), b"tail"].concat();
+        assert_eq!(names_source(&binary, &source), Ok(()));
+        let other = "cd".repeat(32);
+        assert!(names_source(&binary, &other).unwrap_err().contains(&other));
+        assert!(names_source(provenance::UNKNOWN.as_bytes(), provenance::UNKNOWN).is_err());
     }
 
     /// Runs `git` in `dir` with a fixed identity, and expects it to pass.

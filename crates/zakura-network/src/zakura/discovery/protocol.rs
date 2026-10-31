@@ -7356,6 +7356,35 @@ mod tests {
         assert_eq!(outcome.rejected, 1);
     }
 
+    /// Peer record verification has its own slots, so a transport saturated by another
+    /// family delays no verification, and a verification holds no transport bytes.
+    #[tokio::test]
+    async fn verification_capacity_is_independent_of_transport_saturation() {
+        use crate::zakura::transport::{NodeResources, ResourceEnvelope};
+
+        let (_connected, connected_rx) = watch::channel(Vec::new());
+        let mut handle = discovery_handle_with_connected(connected_rx);
+        handle.verify_slots = SlotBudget::new(1).unwrap();
+        let node = NodeResources::new(ResourceEnvelope::new(64, 64, 1));
+        let stream = node.connection().stream();
+        let _transport_hold = node.hold_node_budgets();
+        let frame_bytes = node.usage().raw_bytes;
+
+        let verified = zakura_rt::time::timeout(
+            Duration::from_secs(5),
+            handle.verify_off_lock(|_| Arc::new(vec![0u8; 8])),
+        )
+        .await
+        .expect("verification waits on its own free slot")
+        .unwrap();
+
+        assert_eq!(handle.verify_slots.available(), 0);
+        assert_eq!(node.usage().raw_bytes, frame_bytes);
+        assert!(stream.raw.try_admit(64).is_some(), "the stream's floor stays free");
+        drop(verified);
+        assert_eq!(handle.verify_slots.available(), 1);
+    }
+
     #[tokio::test]
     async fn verification_result_retains_capacity_until_its_payload_drops() {
         let (_connected, connected_rx) = watch::channel(Vec::new());

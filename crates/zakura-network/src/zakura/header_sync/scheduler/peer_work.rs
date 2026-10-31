@@ -737,8 +737,9 @@ mod tests {
     use std::{cmp::Ordering, sync::Arc};
 
     use super::*;
-    use crate::zakura::header_sync::{
-        wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, MAX_HS_RANGE,
+    use crate::zakura::{
+        header_sync::{wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, MAX_HS_RANGE},
+        transport::{NodeResources, ResourceEnvelope},
     };
     use zakura_chain::{block, block::genesis::regtest_genesis_block, work::difficulty::U256};
     use zakura_header_chain::{
@@ -748,6 +749,30 @@ mod tests {
 
     fn hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
+    }
+
+    /// The header chunk budget and the transport budgets fund different things, so
+    /// saturating either leaves the other's capacity free.
+    #[test]
+    fn header_chunk_capacity_is_independent_of_transport_saturation() {
+        let node = NodeResources::new(ResourceEnvelope::new(64, 64, 1));
+        let stream = node.connection().stream();
+        let budget = HeaderChunkBudget::default();
+
+        let transport_hold = node.hold_node_budgets();
+        let reservation = budget
+            .reserve(HEADER_CHUNK_BUDGET_CAPACITY_V1)
+            .expect("saturated frame budgets hold no header chunks");
+        assert_eq!(budget.remaining(), 0);
+        assert!(budget.reserve(1).is_none());
+
+        drop(transport_hold);
+        let frame = stream.raw.try_admit(64);
+        assert!(frame.is_some(), "saturated header chunks hold no frame bytes");
+        assert!(node.usage().raw_bytes > 0);
+
+        drop(reservation);
+        assert_eq!(budget.remaining(), HEADER_CHUNK_BUDGET_CAPACITY_V1);
     }
 
     fn snapshot() -> EngineSnapshot {

@@ -1173,6 +1173,20 @@ pub enum ReactorFact {
         /// Whether the call's future was caught panicking.
         panicked: bool,
     },
+    /// A request joined a locator call in flight.
+    StorageJoined {
+        /// The call in flight.
+        call: u64,
+    },
+    /// The reactor refused a storage call before it started.
+    StorageRefused {
+        /// The refused call's number.
+        call: u64,
+        /// `locator`, `vct-context`, `prepare` or `apply`.
+        kind: String,
+        /// `locator-capacity`, `local-operation-busy` or `external-queue`.
+        cause: String,
+    },
     /// An active request started.
     Started {
         /// The request.

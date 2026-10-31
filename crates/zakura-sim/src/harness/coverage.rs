@@ -211,6 +211,14 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "header/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("locator-call-settles-without-removal"),
+    },
+    Coverage {
         property: super::NO_TASK_PANIC,
         passing: passes("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
         bypass: Bypass::Test(sim_test(

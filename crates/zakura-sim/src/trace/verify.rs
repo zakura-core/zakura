@@ -180,78 +180,25 @@ mod machine_tests {
     };
 
     #[test]
-    fn runtime_funding_evidence_preserves_retained_owners_and_drain() {
-        let history = zakura_network::zakura::trace_work_funding_bytes(&[
-            0, 0, 1, 99, 1, 0, 9, 3, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0,
-            17, 0, 0, 0,
-        ]);
-        let mut retained_after_reset = false;
-        let mut drained = false;
-        for step in history.steps {
-            assert!(step.failure.is_none());
-            assert_eq!(step.actual, step.expected);
-            retained_after_reset |= step.actual.queue.items.is_empty()
-                && step.actual.receipts.iter().any(|receipt| receipt.bytes > 0);
-            drained |= step.drain && step.actual.reserved == 0;
-            let record = StepRecord {
-                step: step.step as u64,
-                pick: format!("machine:block-work-funding:{}", step.step),
-                key: None,
-                options: 1,
-                by: By::Forced,
-                offset: None,
-                draws: Vec::new(),
-                obs: None,
-                machine: Some(Box::new(MachineStep::WorkFunding(step.into()))),
-            };
-            let json = Record::Step(record.clone()).to_line();
-            assert_eq!(
-                serde_json::from_str::<Record>(&json).unwrap(),
-                Record::Step(record.clone())
-            );
-            let mut changed = record.clone();
-            let MachineStep::WorkFunding(work) = changed.machine.as_deref_mut().unwrap() else {
-                panic!("expected funding evidence");
-            };
-            work.actual.reserved += 1;
-            assert_eq!(step_difference(&record, &changed), Some("machine"));
-            let mut changed = record.clone();
-            let MachineStep::WorkFunding(work) = changed.machine.as_deref_mut().unwrap() else {
-                panic!("expected funding evidence");
-            };
-            work.drain = !work.drain;
-            assert_eq!(step_difference(&record, &changed), Some("machine"));
-        }
-        assert!(
-            retained_after_reset,
-            "history retains a receipt after reset"
-        );
-        assert!(
-            drained,
-            "history observes settlement before queue destruction"
-        );
-    }
-
-    #[test]
     fn machine_evidence_round_trips_and_changes_exact_replay() {
-        let input = [0, 0, 0, 9, 1, 0, 0, 1, 2, 0, 0, 0];
-        let history = zakura_network::zakura::trace_work_ownership_bytes(&input);
-        assert!(history.summary.as_ref().unwrap().charged > 0);
+        let input = [0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0];
+        let history = zakura_network::zakura::trace_header_reactor_bytes(&input);
+        assert_eq!(history.steps.len(), 3);
         for step in history.steps {
             let record = StepRecord {
                 step: step.step as u64,
-                pick: format!("machine:block-work:{}", step.step),
+                pick: format!("machine:header-reactor:{}", step.step),
                 key: None,
                 options: 1,
                 by: By::Forced,
                 offset: None,
                 draws: Vec::new(),
                 obs: None,
-                machine: Some(Box::new(MachineStep::Work(step.into()))),
+                machine: Some(Box::new(MachineStep::HeaderReactor(step.into()))),
             };
             let json = Record::Step(record.clone()).to_line();
             let mut encoded: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(encoded["machine"]["kind"], "work");
+            assert_eq!(encoded["machine"]["kind"], "header-reactor");
             assert!(encoded["machine"]["step"]["input"].is_array());
             encoded["machine"]["kind"] = serde_json::json!("unsupported-machine");
             assert!(serde_json::from_value::<Record>(encoded).is_err());
@@ -259,32 +206,21 @@ mod machine_tests {
             assert_eq!(decoded, Record::Step(record.clone()));
             assert_eq!(step_difference(&record, &record), None);
             let mut changed = record.clone();
-            let MachineStep::Work(work) = changed.machine.as_deref_mut().unwrap() else {
-                panic!("expected work evidence");
-            };
-            work.actual.reserved += 1;
+            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            work.actual.revision += 1;
             assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            let MachineStep::Work(work) = changed.machine.as_deref_mut().unwrap() else {
-                panic!("expected work evidence");
-            };
+            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
             work.input[0] ^= 1;
             assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            let MachineStep::Work(work) = changed.machine.as_deref_mut().unwrap() else {
-                panic!("expected work evidence");
-            };
+            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
             work.failure = Some(MachineFailure {
                 property_failure: true,
                 phase: FailurePhase::Invariant,
-                message: "block/work-ownership: changed owner".into(),
+                message: "header/reactor-policy: changed owner".into(),
             });
             assert_eq!(step_difference(&record, &changed), Some("machine"));
-            let json = Record::Step(changed.clone()).to_line();
-            assert_eq!(
-                serde_json::from_str::<Record>(&json).unwrap(),
-                Record::Step(changed)
-            );
         }
     }
 }

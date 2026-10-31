@@ -833,6 +833,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Dispatched { .. } => "dispatched",
                 ReactorFact::CallEnded { .. } => "call-ended",
                 ReactorFact::Handled { .. } => "handled",
+                ReactorFact::StorageJoined { .. } => "storage-joined",
+                ReactorFact::StorageRefused { .. } => "storage-refused",
                 ReactorFact::Started { .. } => "started",
                 ReactorFact::Retired { .. } => "retired",
                 ReactorFact::OfferWaiting { .. } => "offer-waiting",

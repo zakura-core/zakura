@@ -27,8 +27,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, PortCall, ReactorEvent, RequestRef,
-        WaitCause,
+        CallEnd, HeaderSyncObserver, HeaderTargetPhase, PortCall, ReactorEvent, RefusalCause,
+        RequestRef, StorageCallKind, WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
@@ -292,6 +292,25 @@ fn call(call: PortCall) -> ReactorCall {
     }
 }
 
+/// `kind`'s name.
+fn call_kind(kind: StorageCallKind) -> &'static str {
+    match kind {
+        StorageCallKind::Locator => "locator",
+        StorageCallKind::VctRepairContext => "vct-context",
+        StorageCallKind::Prepare => "prepare",
+        StorageCallKind::Apply => "apply",
+    }
+}
+
+/// `cause`'s name.
+fn refusal_cause(cause: RefusalCause) -> &'static str {
+    match cause {
+        RefusalCause::LocatorCapacity => "locator-capacity",
+        RefusalCause::LocalOperationBusy => "local-operation-busy",
+        RefusalCause::ExternalQueue => "external-queue",
+    }
+}
+
 /// `end`'s name.
 fn end(end: CallEnd) -> &'static str {
     match end {
@@ -333,6 +352,12 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             op: None,
         },
         ReactorEvent::Handled { call, panicked } => ReactorFact::Handled { call, panicked },
+        ReactorEvent::StorageJoined { call } => ReactorFact::StorageJoined { call },
+        ReactorEvent::StorageRefused { call, kind, cause } => ReactorFact::StorageRefused {
+            call,
+            kind: call_kind(kind).to_owned(),
+            cause: refusal_cause(cause).to_owned(),
+        },
         ReactorEvent::Started {
             request: started,
             purpose: why,

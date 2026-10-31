@@ -13,12 +13,12 @@
 pub mod block_node;
 pub mod block_semantic;
 pub mod block_sync;
-pub mod block_work;
 pub mod coverage;
 pub mod discovery;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod header_work;
 pub mod policy;
 mod record;
 pub mod scenario;
@@ -437,8 +437,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 
 /// Every harness, by name.
 pub static HARNESSES: &[HarnessEntry] = &[
-    block_work::ENTRY,
-    block_work::FUNDING_ENTRY,
+    header_work::REACTOR_ENTRY,
     entry::<fixtures::Race<fixtures::LostUpdate>>(),
     entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
     entry::<fixtures::Race<fixtures::MissedNotify>>(),

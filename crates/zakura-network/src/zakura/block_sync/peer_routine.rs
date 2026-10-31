@@ -338,7 +338,9 @@ enum Disposition {
 }
 
 /// Keeps a receipt charge live until the synchronous send finishes or unwinds.
-struct ReceiptSettlement {
+/// Other peers can serve the floor while this peer transfers and settles its body.
+struct ReceiptSettlement<'a> {
+    _blocked: HandoffBlocked<'a>,
     funding: Option<crate::zakura::transport::ByteReservation>,
     #[cfg(any(test, zakura_sim))]
     observer: super::block_sync_observe::ObserverSlot,
@@ -350,18 +352,23 @@ struct ReceiptSettlement {
     height: block::Height,
 }
 
-impl ReceiptSettlement {
+impl<'a> ReceiptSettlement<'a> {
     fn new(
-        routine: &PeerRoutine,
+        routine: &'a PeerRoutine,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
         funding: crate::zakura::transport::ByteReservation,
     ) -> Self {
+        // A concurrent ranker must skip this peer if the transfer is preempted.
+        // The synchronous transfer does not need to wake parked rankers.
+        routine.handoff_blocked.store(true, Ordering::Relaxed);
+        let blocked = HandoffBlocked(&routine.handoff_blocked);
         #[cfg(any(test, zakura_sim))]
         routine.observe_handoff_started(owner, height, funding.bytes());
         #[cfg(not(any(test, zakura_sim)))]
         let _ = (routine, owner, height);
         Self {
+            _blocked: blocked,
             funding: Some(funding),
             #[cfg(any(test, zakura_sim))]
             observer: routine.observer.clone(),
@@ -375,7 +382,7 @@ impl ReceiptSettlement {
     }
 }
 
-impl Drop for ReceiptSettlement {
+impl Drop for ReceiptSettlement<'_> {
     fn drop(&mut self) {
         let funding = self
             .funding

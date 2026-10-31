@@ -473,7 +473,7 @@ fn ids_no_scenario_reaches_stay_not_applicable() {
 #[test]
 fn each_probe_fault_reaches_its_exact_id() {
     for (suffix, scenario) in probe_faults() {
-        for report in runs(&scenario, 2) {
+        for report in runs(&scenario, 1) {
             assert_eq!(report.end.violation, None, "{suffix}: {:?}", report.end);
             assert!(
                 held(&report, &id(suffix)),

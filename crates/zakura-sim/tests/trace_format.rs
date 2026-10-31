@@ -9,6 +9,7 @@ mod support;
 mod provenance;
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -39,8 +40,8 @@ use zakura_sim::{
         TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES,
         MAX_TRACE_BYTES, TRACE_FILE,
     },
-    Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RecordSink, RunConfig,
-    RunReport, Sim, Violation,
+    Checker, HexU64, MemorySink, NoChecks, Observation, Outcome, PlanInput, Record, RecordSink,
+    RunConfig, RunReport, Sim, Violation,
 };
 
 /// Three tasks that share a lock, sleep and yield, so runs take time
@@ -186,6 +187,40 @@ fn real_run_round_trips() {
     let bytes = fs::read(dir.path().join(TRACE_FILE)).unwrap();
     assert_eq!(trace.id, sha256(&bytes));
     assert!(bytes.ends_with(b"\n"));
+}
+
+/// Every lock and release point names the workload's one lock: its first
+/// locker's first object. Other points name none.
+#[test]
+fn lock_points_name_their_lock() {
+    let dir = TempDir::new().unwrap();
+    let report = record_to(dir.path(), &meta(), plan(), &mut NoChecks);
+    let mut named = Vec::new();
+    for entry in report.log.entries() {
+        if let Observation::TaskReached {
+            task, at, object, ..
+        } = &entry.obs
+        {
+            match at.split('#').next() {
+                Some("lock" | "release") => named.push((
+                    task.as_str(),
+                    object
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{task} at {at} names no object")),
+                )),
+                _ => assert_eq!(*object, None, "{task} at {at}"),
+            }
+        }
+    }
+    let (first, _) = named.first().expect("the run takes the lock");
+    let lock = format!("{first}:object#1");
+    assert!(named.iter().all(|(_, object)| *object == lock), "{named:?}");
+    let tasks: BTreeSet<&str> = named.iter().map(|(task, _)| *task).collect();
+    assert_eq!(
+        tasks.len(),
+        3,
+        "each task's points name the lock: {named:?}"
+    );
 }
 
 #[test]

@@ -3818,6 +3818,7 @@ async fn setup_with_mempool_config(
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancel_handles_drained_after_verification_timeout() {
     use futures::stream::StreamExt;
+    use tokio::sync::Notify;
     use tower::timeout::Timeout;
     use zakura_node_services::mempool::Gossip;
 
@@ -3841,6 +3842,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         false,
         u64::MAX,
         PeerCooldowns::default(),
+        Arc::new(Notify::new()),
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

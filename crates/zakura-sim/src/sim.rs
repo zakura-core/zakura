@@ -13,7 +13,7 @@ use std::{
 };
 
 use zakura_scheduler::{
-    At, CleanupReport, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
+    At, CleanupReport, ObjectId, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
 };
 
 use crate::{
@@ -107,6 +107,14 @@ pub struct RunReport {
     pub picks: Vec<Pick>,
     /// The real choices the run made, as a script that replays them.
     pub resolved: Plan,
+}
+
+impl RunReport {
+    /// The `end` record the run wrote, or would have written to a sink that
+    /// keeps records.
+    pub(crate) fn end_record(&self) -> EndRecord {
+        end_record(&self.end, &self.properties, self.cleanup, &self.picks)
+    }
 }
 
 /// One simulated run.
@@ -670,6 +678,7 @@ impl Sim {
                     RunOutcome::Reached(at) => Observation::TaskReached {
                         task: name,
                         at: at.to_string(),
+                        object: at.object.map(|object| self.object_name(st, object)),
                         site: at.site.map(|s| format!("{}:{}", s.file(), s.line())),
                     },
                     RunOutcome::Waiting => Observation::TaskWaiting { task: name },
@@ -691,6 +700,23 @@ impl Sim {
             Action::Source { source, local } => self.sources[source.0].execute(local, &mut st.log),
         }
         Ok(())
+    }
+
+    /// `object` as `<creator>:object#<n>`. The creator is the creating task's
+    /// name, or `setup` outside any task. A name survives unrelated code
+    /// changes, and a `TaskId` doesn't.
+    fn object_name(&self, st: &State, object: ObjectId) -> String {
+        let creator = match object.creator {
+            // A task makes objects only while it runs, so it was offered and
+            // named first.
+            Some(task) => st
+                .names
+                .get(&task)
+                .cloned()
+                .unwrap_or_else(|| self.sched().task_name(task)),
+            None => "setup".to_owned(),
+        };
+        format!("{creator}:object#{}", object.ordinal)
     }
 
     /// The scheduler's ready tasks with their identities. Records each task

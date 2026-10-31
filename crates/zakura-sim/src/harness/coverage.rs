@@ -1,9 +1,10 @@
 //! The coverage manifest: one row per property a harness reports, naming
-//! the tests that show its check works and the CI job that runs them.
+//! the tests that show its check works and where they run.
 //!
 //! `tests/harness.rs` compares the manifest with the harnesses' properties,
 //! so a property without a row, or a row no harness reports, fails CI. It
-//! also checks that each named test or patch exists, and that CI runs it.
+//! also checks that each named test or patch exists, and that CI runs each
+//! test that isn't on demand.
 
 /// One property's coverage.
 #[derive(Clone, Copy, Debug)]
@@ -54,16 +55,27 @@ pub enum Bypass {
     Pending(&'static str),
 }
 
-/// A test that runs a property, and the CI job that runs the test.
+/// A test that runs a property, and where the test runs.
 #[derive(Clone, Copy, Debug)]
 pub struct Witness {
     /// The test's file, relative to the crate.
     pub file: &'static str,
     /// The test's name.
     pub test: &'static str,
-    /// The `tests-unit.yml` job that runs it. An ignored test also needs
+    /// Where the test runs.
+    pub ci: Ci,
+}
+
+/// Where a witness test runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ci {
+    /// The `tests-unit.yml` job with this name. An ignored test also needs
     /// its name in that workflow.
-    pub ci: &'static str,
+    Job(&'static str),
+    /// No CI job. The test is ignored, because one run takes minutes, and
+    /// runs only on demand, with `--ignored` and the `planted` profile. CI
+    /// keeps no expensive test in its blocking path.
+    OnDemand,
 }
 
 /// The job that runs every `zakura-sim` test under `--cfg zakura_sim`.
@@ -74,20 +86,16 @@ const fn sim_test(file: &'static str, test: &'static str) -> Witness {
     Witness {
         file,
         test,
-        ci: SIM_BUILD,
+        ci: Ci::Job(SIM_BUILD),
     }
 }
 
-/// The job that runs the ignored `zakura-sim` witness tests whose runs
-/// take minutes, in a release build under `--cfg zakura_sim`.
-const SLOW_WITNESSES: &str = "zakura_sim slow witnesses";
-
-/// An ignored test in [`SLOW_WITNESSES`].
-const fn slow_test(file: &'static str, test: &'static str) -> Witness {
+/// An ignored test that runs only on demand. See [`Ci::OnDemand`].
+const fn on_demand_test(file: &'static str, test: &'static str) -> Witness {
     Witness {
         file,
         test,
-        ci: SLOW_WITNESSES,
+        ci: Ci::OnDemand,
     }
 }
 
@@ -147,6 +155,58 @@ const EXCHANGE_FAULT: &str = "faults_inside_the_nodes_exchange_reach_their_exact
 const OVER_MARGIN: &str = "requests_past_twice_the_serving_limit_reach_over_margin";
 /// The witness that no scenario reaches an [`unreachable`] row.
 const UNREACHED: &str = "ids_no_scenario_reaches_stay_not_applicable";
+
+/// The file of `header-sync/wire`'s witness tests (P3d).
+const HEADER_WITNESSES: &str = "tests/header_wire_witness.rs";
+
+/// A header-sync generated property's row: its witness test in
+/// [`HEADER_WITNESSES`], and the scripted bypass there that violates every
+/// generated header-sync ID.
+const fn header(property: &'static str, passing: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(HEADER_WITNESSES, passing),
+        bypass: HEADER_BYPASS,
+    }
+}
+
+/// A header-sync generated property no scenario reaches, for `reason`:
+/// `witness` shows it stays `NotApplicable`, and the scripted bypass still
+/// violates it.
+const fn header_unreachable(
+    property: &'static str,
+    reason: &'static str,
+    witness: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test(HEADER_WITNESSES, witness),
+        },
+        bypass: HEADER_BYPASS,
+    }
+}
+
+/// The scripted bypass that violates every header-sync generated ID.
+const HEADER_BYPASS: Bypass = Bypass::Test(sim_test(
+    HEADER_WITNESSES,
+    "scripted_bypasses_violate_every_generated_header_id",
+));
+
+/// The honest witness, and the check that the witnesses list every ID.
+const EVERY: &str = "every_generated_property_applies_in_its_witness";
+/// The `undeclared-type` and `status` fault witnesses.
+const STATUS: &str = "status_faults_apply_in_their_witnesses";
+/// The `subscribe-headers` fault witnesses.
+const SUBSCRIBE: &str = "subscribe_headers_faults_apply_in_their_witnesses";
+/// The `headers` fault witnesses.
+const HEADERS: &str = "headers_faults_apply_in_their_witnesses";
+/// The `headers-outcome` fault witnesses.
+const OUTCOME: &str = "headers_outcome_faults_apply_in_their_witnesses";
+/// Why no header-sync scenario reaches an `over-owed-closes` ID.
+const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
+                        so the models label an overrun over-credit, never over-owed";
 
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
@@ -309,6 +369,103 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
         "an ending carries no body, so the node admits no work from it",
     ),
+    header("header-sync/s5v9/conformant-never-closes", EVERY),
+    header("header-sync/s5v9/status/sender-cadence", EVERY),
+    header(
+        "header-sync/s5v9/subscribe-headers/sender-within-live",
+        EVERY,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/sender-within-credit",
+        EVERY,
+    ),
+    header("header-sync/s5v9/headers/sender-answers-open", EVERY),
+    header("header-sync/s5v9/headers-outcome/sender-ends-once", EVERY),
+    header("header-sync/s5v9/undeclared-type-closes", STATUS),
+    header("header-sync/s5v9/status/reserved-flags-closes", STATUS),
+    header("header-sync/s5v9/status/short-payload-closes", STATUS),
+    header("header-sync/s5v9/status/long-payload-closes", STATUS),
+    header("header-sync/s5v9/status/bad-content-closes", STATUS),
+    header("header-sync/s5v9/status/cadence-never-closes", STATUS),
+    header(
+        "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/short-payload-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/long-payload-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/over-live-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/over-credit-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/after-close-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/bad-cursor-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/bad-content-closes",
+        SUBSCRIBE,
+    ),
+    header("header-sync/s5v9/headers/reserved-flags-closes", HEADERS),
+    header("header-sync/s5v9/headers/short-payload-closes", HEADERS),
+    header("header-sync/s5v9/headers/long-payload-closes", HEADERS),
+    header("header-sync/s5v9/headers/unsolicited-closes", HEADERS),
+    header("header-sync/s5v9/headers/bad-content-closes", HEADERS),
+    header(
+        "header-sync/s5v9/headers-outcome/reserved-flags-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/short-payload-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/long-payload-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/unsolicited-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/bad-content-closes",
+        OUTCOME,
+    ),
+    header_unreachable(
+        "header-sync/s5v9/headers/over-owed-closes",
+        NOT_OWED,
+        HEADERS,
+    ),
+    header_unreachable(
+        "header-sync/s5v9/headers-outcome/over-owed-closes",
+        NOT_OWED,
+        OUTCOME,
+    ),
+    // Any production change that punishes an honest header-sync peer also
+    // violates `conformant-never-closes`, and a planted case's input must
+    // violate its property alone. The scripted bypass punishes an honest
+    // peer whose frame a label excuses.
+    Coverage {
+        property: crate::domain::session::HONEST_NEVER_PUNISHED,
+        passing: passes(HEADER_WITNESSES, "honest_peer_never_punished"),
+        bypass: Bypass::Test(sim_test(
+            HEADER_WITNESSES,
+            "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
+        )),
+    },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its committed input unpatched as a
     // witness test that expects a hold, before it runs the patch.
@@ -316,7 +473,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "honest_runs_hold_every_resource_bound_a_a_and_a_b_a",
+            "honest_runs_hold_every_resource_bound_a_b_a",
         ),
         bypass: Bypass::Planted("wide-commit-window"),
     },
@@ -337,14 +494,15 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("handoff-keeps-charge"),
     },
     // The above-window witness test is ignored, since one debug run takes
-    // about 100 s. `cargo xtask planted` runs its committed input unpatched
-    // as a witness test that expects a hold, before it runs the patch.
+    // over a minute, and runs only on demand. `cargo xtask planted` runs its
+    // committed input unpatched as a witness test that expects a hold, before
+    // it runs the patch.
     Coverage {
         property: crate::domain::block_sync::LOOKAHEAD_OVERSHOOT_BOUND,
-        passing: passes(
+        passing: Passing::Test(on_demand_test(
             "tests/block_resource_properties.rs",
             "the_above_window_input_holds_lookahead_overshoot_bound",
-        ),
+        )),
         bypass: Bypass::Planted("omit-outstanding-estimates"),
     },
     Coverage {
@@ -371,19 +529,15 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("release-by-height"),
     },
-    // Both capacity tests are ignored, since each debug run takes about
-    // eight minutes. The `zakura_sim slow witnesses` job runs them. Main's
-    // sequencer is the bypass: the frontier-first input violates it (#1523).
+    // The capacity test is ignored, since a debug run takes about eight
+    // minutes, and runs only on demand.
     Coverage {
         property: crate::domain::block_sync_semantic::CAPACITY_RELEASE_WAKES,
-        passing: Passing::Test(slow_test(
+        passing: Passing::Test(on_demand_test(
             "tests/block_semantic_properties.rs",
-            "the_reply_first_input_holds_capacity_release_wakes",
+            "the_frontier_first_input_holds_capacity_release_wakes",
         )),
-        bypass: Bypass::Test(slow_test(
-            "tests/block_semantic_properties.rs",
-            "the_frontier_first_input_violates_capacity_release_wakes",
-        )),
+        bypass: Bypass::Planted("stale-completion-no-wake"),
     },
     Coverage {
         property: crate::domain::block_sync_semantic::DETACHED_SUBMISSION_BOUNDED,
@@ -393,17 +547,15 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("forget-on-reset"),
     },
+    // The decoded-input-stall test is ignored, since its debug run takes
+    // minutes, and runs only on demand. The planted case runs the same
+    // input.
     Coverage {
         property: crate::domain::block_sync_semantic::INPUT_DECODED_BOUND,
-        passing: Passing::Unreachable {
-            reason: "no observation says whether a queued body is decoded",
-            witness: sim_test(
-                "tests/block_semantic_properties.rs",
-                "the_stalled_reset_input_leaves_input_decoded_bound_not_applicable",
-            ),
-        },
-        bypass: Bypass::Pending(
-            "the decoded bytes each queued body holds, which block sync doesn't observe",
-        ),
+        passing: Passing::Test(on_demand_test(
+            "tests/block_semantic_properties.rs",
+            "the_decoded_input_stall_input_holds_input_decoded_bound",
+        )),
+        bypass: Bypass::Planted("no-room-check"),
     },
 ];

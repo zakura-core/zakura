@@ -125,6 +125,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             bytes: BLOCK_MAINNET_5_BYTES.len() as u64,
             admitted_estimate_bytes: Some(estimate(5)),
             allocation: allocations[&block::Height(5)],
+            decoded_attributed_memory_bytes: 0,
         }]
     );
     let applying: Vec<_> = owners
@@ -261,6 +262,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
     let allocation = Arc::as_ptr(&raw).cast::<u8>().addr();
     let bytes = raw.len() as u64;
+    let decoded_attributed_memory_bytes = block.attributed_memory_size_bytes();
     body_tx
         .try_send(SequencedBody::new_queued(
             super::super::test_work_owner(),
@@ -294,7 +296,10 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
                     owner: super::super::test_work_owner(),
                     bytes,
                 },
-                holder: Holder::Queued { allocation },
+                holder: Holder::Queued {
+                    allocation,
+                    decoded_attributed_memory_bytes,
+                },
                 change: HolderChange::Released,
             },
         ]

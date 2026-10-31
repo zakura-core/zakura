@@ -5,7 +5,9 @@
 //! only on a complete run whose report fits, and whose trigger history,
 //! the property's [`Property::witness`], shows the run reached the steps
 //! the property's bug needs. A run that reaches the right verdict along a
-//! harmless path proves nothing, so it fails.
+//! harmless path proves nothing, so it fails. An `Applicable` witness
+//! claims no bug, so it needs a trigger history only if the property has
+//! one.
 
 use std::{fmt, str::FromStr};
 
@@ -27,7 +29,8 @@ pub enum Expect {
     /// [`WitnessError::Fixed`].
     Violated,
     /// The property applies and holds. Other `Known` or `Draft` properties
-    /// may report violations, as long as none stopped the run.
+    /// may report violations, as long as none stopped the run. A property
+    /// with no trigger-history check passes on its outcome alone.
     Applicable,
 }
 
@@ -69,7 +72,7 @@ pub enum WitnessError {
     /// The harness doesn't register the property.
     Unregistered,
     /// The property has no trigger-history check, so no run can show it
-    /// reached its trigger.
+    /// reached its trigger. Only `Applicable` does without one.
     NoTriggerHistory,
     /// The harness couldn't run the scenario.
     UnsupportedScenario(String),
@@ -182,15 +185,7 @@ pub fn witness_prepared<S: Subsystem>(
     expect: Expect,
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    let registered = harness::registry::<S>();
-    let registered = registered
-        .properties()
-        .iter()
-        .find(|p| p.id.as_str() == property)
-        .ok_or(WitnessError::Unregistered)?;
-    let trigger_history = registered.witness.ok_or(WitnessError::NoTriggerHistory)?;
-    let status = registered.status;
-
+    let registered = Registered::of::<S>(property, expect)?;
     let mut sink = EndSeen { sink, ended: false };
     let report = match run_prepared::<S>(scenario, prepared, input, &mut sink, None) {
         Ok(report) => report,
@@ -202,11 +197,57 @@ pub fn witness_prepared<S: Subsystem>(
     if !sink.ended {
         return Err(WitnessError::NoEnd);
     }
-    judge(&report, property, status, expect)?;
-    if trigger_history(&report.log) {
-        Ok(())
-    } else {
-        Err(WitnessError::LostTriggerHistory)
+    registered.judge(&report, property, expect)
+}
+
+/// Checks `report`, a complete run of `S`, against `expect` for
+/// `property`, with the rule [`witness`] applies after its run. A test that
+/// judges several properties on one run calls it once for each.
+pub fn judge_report<S: Subsystem>(
+    report: &RunReport,
+    property: &str,
+    expect: Expect,
+) -> Result<(), WitnessError> {
+    Registered::of::<S>(property, expect)?.judge(report, property, expect)
+}
+
+/// What a witness test reads from a property's registration.
+struct Registered {
+    status: Status,
+    trigger_history: Option<fn(&crate::ObservationLog) -> bool>,
+}
+
+impl Registered {
+    /// `property`'s registration in `S`, if `expect` can judge it.
+    fn of<S: Subsystem>(property: &str, expect: Expect) -> Result<Self, WitnessError> {
+        let registry = harness::registry::<S>();
+        let registered = registry
+            .properties()
+            .iter()
+            .find(|p| p.id.as_str() == property)
+            .ok_or(WitnessError::Unregistered)?;
+        if registered.witness.is_none() && expect != Expect::Applicable {
+            return Err(WitnessError::NoTriggerHistory);
+        }
+        Ok(Registered {
+            status: registered.status,
+            trigger_history: registered.witness,
+        })
+    }
+
+    /// Checks `report` against `expect`, then the trigger history, if the
+    /// property has one.
+    fn judge(
+        &self,
+        report: &RunReport,
+        property: &str,
+        expect: Expect,
+    ) -> Result<(), WitnessError> {
+        judge(report, property, self.status, expect)?;
+        match self.trigger_history {
+            Some(history) if !history(&report.log) => Err(WitnessError::LostTriggerHistory),
+            _ => Ok(()),
+        }
     }
 }
 

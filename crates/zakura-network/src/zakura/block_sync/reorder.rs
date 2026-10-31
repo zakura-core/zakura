@@ -54,6 +54,9 @@ impl ReorderBuffer {
                 bytes: buffered.bytes,
                 admitted_estimate_bytes: buffered.admitted_estimate_bytes,
                 allocation: buffered.body.allocation(),
+                decoded_attributed_memory_bytes: buffered
+                    .body
+                    .measured_decoded_attributed_memory_bytes(),
             })
             .collect()
     }
@@ -257,6 +260,9 @@ pub struct RetainedBody {
     /// payload when one is kept, else its decoded block. Two holders that
     /// share one allocation report the same address.
     pub allocation: usize,
+    /// The attributed size of the decoded block the body holds, measured
+    /// from the block. 0 for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +285,8 @@ struct BufferedBlock {
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
+    // Only tests hand the sequencer a decoded body without its raw bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
     Decoded {
         block: Arc<block::Block>,
         decoded_attributed_memory_size_bytes: u64,
@@ -291,24 +299,12 @@ pub(super) enum BufferedBlockBody {
 }
 
 impl BufferedBlockBody {
-    #[cfg(any(test, feature = "internal-bench"))]
+    #[cfg(test)]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
         raw_frame_payload: Option<Arc<[u8]>>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
-        Self::from_measured_decoded_block(
-            block,
-            raw_frame_payload,
-            decoded_attributed_memory_size_bytes,
-        )
-    }
-
-    pub(super) fn from_measured_decoded_block(
-        block: Arc<block::Block>,
-        raw_frame_payload: Option<Arc<[u8]>>,
-        decoded_attributed_memory_size_bytes: u64,
-    ) -> Self {
         match raw_frame_payload {
             Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
@@ -319,6 +315,33 @@ impl BufferedBlockBody {
                 block,
                 decoded_attributed_memory_size_bytes,
             },
+        }
+    }
+
+    /// The body a peer routine hands the sequencer for `block`, which it
+    /// decoded from `raw_frame_payload`. The body keeps the decoded block only
+    /// when `charged`, that is when
+    /// [`charge_decoded_handoff`](super::sequencer_task::charge_decoded_handoff)
+    /// found room for it under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
+    /// Otherwise the body keeps the raw frame payload alone, and the sequencer
+    /// decodes it when it submits it (#1522).
+    ///
+    /// One cap holds at every height, because the input queue is not the
+    /// checkpoint window.
+    pub(super) fn for_handoff(
+        block: Arc<block::Block>,
+        raw_frame_payload: Arc<[u8]>,
+        decoded_attributed_memory_size_bytes: u64,
+        charged: bool,
+    ) -> Self {
+        if charged {
+            BufferedBlockBody::DecodedWithRawFramePayload {
+                block,
+                raw_frame_payload,
+                decoded_attributed_memory_size_bytes,
+            }
+        } else {
+            BufferedBlockBody::RawFramePayload(raw_frame_payload)
         }
     }
 
@@ -373,6 +396,19 @@ impl BufferedBlockBody {
                 raw_frame_payload, ..
             } => Arc::as_ptr(raw_frame_payload).cast::<u8>().addr(),
             BufferedBlockBody::Decoded { block, .. } => Arc::as_ptr(block).addr(),
+        }
+    }
+
+    /// The attributed size of the decoded block this body holds, measured
+    /// from the block rather than read from the stored size. 0 for raw bytes.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn measured_decoded_attributed_memory_bytes(&self) -> u64 {
+        match self {
+            BufferedBlockBody::RawFramePayload(_) => 0,
+            BufferedBlockBody::Decoded { block, .. }
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => {
+                block.attributed_memory_size_bytes()
+            }
         }
     }
 

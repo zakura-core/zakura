@@ -233,6 +233,9 @@ pub enum Holder {
     Queued {
         /// See [`RetainedBody::allocation`].
         allocation: usize,
+        /// The attributed size of the decoded block the queued body holds,
+        /// measured from the block itself. 0 for raw bytes.
+        decoded_attributed_memory_bytes: u64,
     },
     /// The reorder buffer.
     Reorder {

@@ -20,6 +20,7 @@ pub mod header_node;
 pub mod header_sync;
 pub mod policy;
 mod record;
+pub mod scenario;
 pub mod wire_node;
 pub mod wire_plans;
 
@@ -35,6 +36,7 @@ pub use record::{record, record_witness, RecordError, RecordInput, WITNESS_FILE}
 use crate::{
     check::{Checker, Phase, PropertyReport, StepCtx, Violation},
     end::{HarnessFailure, Outcome, RunEnd},
+    explore::{self, ExploreRun},
     net::Net,
     observe::Exit,
     property::{
@@ -74,6 +76,16 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// The length of the scenario prefix in fuzz input. Bump `GENERATOR`
     /// when it changes. A harness with a fixed scenario sets 0.
     const SCENARIO_BYTES: usize;
+
+    /// The harnesses whose runs this harness's runs include, by name, such
+    /// as each race fixture's for `fixtures/all`. A fuzz target that runs
+    /// this harness can cover only these. None by default.
+    const COMPOSES: &'static [&'static str] = &[];
+
+    /// Whether the harness plants the bugs its `Active` properties catch,
+    /// as the race fixtures do, so its runs must violate them. `false` by
+    /// default.
+    const PLANTED: bool = false;
 
     /// Everything that varies between runs of this harness, written in full
     /// to `meta.scenario`. It must hold no floats.
@@ -340,6 +352,10 @@ pub struct HarnessEntry {
     pub generator: u32,
     /// [`Subsystem::SCENARIO_BYTES`].
     pub scenario_bytes: usize,
+    /// [`Subsystem::COMPOSES`].
+    pub composes: &'static [&'static str],
+    /// [`Subsystem::PLANTED`].
+    pub planted: bool,
     /// [`run_harness`] on a serialized scenario, with no extra checker.
     pub run: fn(&Value, PlanInput, &mut dyn RecordSink) -> Result<RunReport, HarnessError>,
     /// [`meta`] for a serialized scenario.
@@ -353,6 +369,9 @@ pub struct HarnessEntry {
     pub properties: fn() -> Vec<PropertyRef>,
     /// [`witness_into`] on a serialized scenario.
     pub witness: WitnessFn,
+    /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
+    /// checker.
+    pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
 }
 
 /// [`HarnessEntry::witness`]: the serialized scenario, the input, the
@@ -388,12 +407,15 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         name: S::NAME,
         generator: S::GENERATOR,
         scenario_bytes: S::SCENARIO_BYTES,
+        composes: S::COMPOSES,
+        planted: S::PLANTED,
         run: run_value::<S>,
         meta: meta_value::<S>,
         config: config_value::<S>,
         draw: draw_value::<S>,
         properties: registered::<S>,
         witness: witness_value::<S>,
+        run_bytes: explore::run_bytes::<S>,
     }
 }
 
@@ -405,6 +427,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<fixtures::Race<fixtures::TimerCancel>>(),
     entry::<fixtures::Race<fixtures::AbBa>>(),
     entry::<fixtures::Race<fixtures::AbortWithoutJoin>>(),
+    entry::<fixtures::All>(),
+    entry::<fixtures::Fixed>(),
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),

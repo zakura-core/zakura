@@ -46,6 +46,7 @@ fn submitted(id: u64, session: u64) -> StorageFact {
             hash: "11".to_owned(),
             parent: "00".to_owned(),
             class: "full".to_owned(),
+            decoded_bytes: 2_000,
         },
         stage: Some("queued".to_owned()),
     }

@@ -24,6 +24,11 @@ pub enum Observation {
         task: String,
         /// The point, such as `lock#2`.
         at: String,
+        /// The runtime object the point touches, if the primitive reports
+        /// one, as `<creator>:object#<n>`: the creating task's name, or
+        /// `setup`, and the creator's `n`-th object.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        object: Option<String>,
         /// The point's source location, as `file:line`.
         #[serde(skip_serializing_if = "Option::is_none")]
         site: Option<String>,
@@ -848,6 +853,9 @@ pub enum StorageRequest {
         parent: String,
         /// Its apply class, `checkpoint` or `full`.
         class: String,
+        /// The decoded size of the block storage took,
+        /// `Block::attributed_memory_size_bytes`.
+        decoded_bytes: u64,
     },
     /// One of the body evidence records.
     RecordBody {
@@ -1465,6 +1473,9 @@ pub enum BlockSyncHolder {
     Queued {
         /// The tap's number for the body's allocation.
         allocation: u64,
+        /// The attributed size of the decoded block the queued body holds,
+        /// measured from the block itself. 0 for raw bytes.
+        decoded_attributed_memory_bytes: u64,
     },
     /// The reorder buffer.
     Reorder {
@@ -1559,6 +1570,9 @@ pub struct BlockSyncRetained {
     pub admitted_estimate_bytes: Option<u64>,
     /// The tap's number for its allocation.
     pub allocation: u64,
+    /// The attributed size of the decoded block it holds, measured from the
+    /// block. 0 for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
 }
 
 /// A submission in the sequencer's snapshot.
@@ -1569,6 +1583,9 @@ pub struct BlockSyncSubmission {
     pub body: BlockSyncBody,
     /// Its token.
     pub token: u64,
+    /// The attributed size of the decoded block the driver can retain. An
+    /// attached submission shares its block with its `applying` body.
+    pub decoded_attributed_memory_bytes: u64,
     /// Whether it left `applying` while the driver can still retain it.
     pub detached: bool,
 }

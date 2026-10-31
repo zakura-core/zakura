@@ -156,7 +156,7 @@ pub enum RegistryError {
         /// The shared ID.
         id: PropertyId,
     },
-    /// An `Ops` bound names an object, which needs zakura#1643.
+    /// An `Ops` bound names an object, which needs object creation labels.
     OpsObject {
         /// The property.
         id: PropertyId,
@@ -175,7 +175,7 @@ impl fmt::Display for RegistryError {
             RegistryError::DuplicateId { id } => write!(f, "two properties are both {id}"),
             RegistryError::OpsObject { id } => write!(
                 f,
-                "{id} has an Ops bound that names an object, which waits for zakura#1643"
+                "{id} has an Ops bound that names an object, which waits for object creation labels"
             ),
             RegistryError::OpsPoll { id } => {
                 write!(f, "{id} has an Ops bound on polls, which nothing observes")

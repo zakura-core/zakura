@@ -17,7 +17,7 @@ it:
 ```text
 WorkQueue (pending heights)
   → in-flight request (reserved bytes, outstanding)
-    → sequencer input channel (wire payload plus transient peer-decoded block)
+    → sequencer input channel (wire payload, plus the peer-decoded block while the decoded cap has room)
       → reorder buffer (out-of-order arrivals, wire-retained)
         → applying pool (contiguous; backlog wire-retained)
           → bounded submission window (decoded Arc<Block>)
@@ -132,8 +132,10 @@ height is just another gated height.
 
 where `remaining_wire = effective_budget − estimated_resident`. Admitted bodies remain
 serialized until they enter the bounded submission window, so one byte of remaining
-headroom funds one wire byte. The transient decoded input copy is bounded by the
-sequencer channel and appears in the next resident snapshot.
+headroom funds one wire byte. The peer routine keeps its decoded copy in the handoff only
+while the input queue's and `applying`'s decoded bytes leave room for it under
+`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (#1522). Otherwise it hands over the wire payload
+alone. The decoded copy appears in the next resident snapshot.
 
 **Takes never span the window boundary.** An exempt (in-window) grant is clamped at the
 window top, so a single multi-block request can never carry both exempt in-window blocks
@@ -154,7 +156,7 @@ window. Accounting therefore follows each pool's actual representation:
 | --- | --- | --- |
 | `reorder_buffered_bytes` | serialized | wire bytes |
 | unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
-| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus the decoded charge below |
+| `sequencer_input_queued_bytes` | serialized payload, plus the decoded block while the decoded cap had room at the handoff | wire bytes plus the decoded charge below |
 | `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | the decoded charge below, plus the applying wire charge while attached |
 | `decoded_resident_bytes` | measured heap of every decoded body in the input queue, reorder buffer and apply window | decoded charge = `max((input + submissions) × DESERIALIZED_MEM_FACTOR, decoded_resident_bytes)` |
 | `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
@@ -206,7 +208,7 @@ a chain that decodes at about four times its wire size, the decoded contribution
 approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. Above the
 last checkpoint the window is also capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`
 (512 MiB) of decoded blocks: past the cap, bodies stay raw until earlier submissions finish,
-and the next body is always allowed when none of the window's bodies is submitted. The peer
+and the next body is always allowed when no submission is in flight, attached or detached. The peer
 routine rejects a body whose transactions do not match its header's Merkle root, so the
 decoded window holds the real chain's blocks; a chain that decodes larger is charged its
 measured size. The [resource ledger](../../../../../docs/design/block-sync-resource-ledger.md)

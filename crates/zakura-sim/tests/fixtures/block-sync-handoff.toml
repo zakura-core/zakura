@@ -4,3 +4,9 @@
 harness = "block-sync/storage"
 generator = 2
 sha256 = "a97337bfc72d0b50d601701e5981dc6d0b80053e7ed50f74393c2aa4e9a9ccde"
+scenario_sha256 = "102156f9ef1e9065a6ec2aaa4cabc72e8e27d1daec1995cebf1e7980e963f291"
+source = "crates/zakura-sim/tests/block_resource_properties.rs"
+
+[[witness]]
+property = "block-sync/budget-ledgers-agree"
+expect = "holds"

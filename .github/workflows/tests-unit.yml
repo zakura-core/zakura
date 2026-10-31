@@ -630,6 +630,53 @@ jobs:
       - name: Check libFuzzer reads semantic features
         run: cargo +nightly-2026-07-15 xtask sim-feedback
 
+  # Each simulator fuzz target in qa/suite.toml must build, run its harness's
+  # curated seeds, and run the harness its manifest maps it to.
+  # `cargo xtask sim-targets` reports one status per target. Each retained
+  # bypass on a target's harness must also fail through that target: the
+  # patched target crashes with the property alone, `zakura-sim confirm`
+  # finds its trigger history, and a fresh replay matches Exact. The ASan
+  # fuzz builds take minutes, so the job runs nightly and on manual
+  # dispatch, never on pull requests or pushes. It checks readiness, not
+  # how well a target searches.
+  sim-targets:
+    name: zakura_sim targets
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_FUZZ_VERSION: 0.13.2
+      CXXFLAGS: -include cstdint
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          # The nightly `header-fuzz.yml` and the simulator fuzz package pin.
+          toolchain: nightly-2026-07-15
+          cache-shared-key: zakura-sim-targets
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Check each fuzz target on its seeds
+        run: cargo +nightly-2026-07-15 xtask sim-targets --out target/sim-targets
+      - name: Check each retained bypass through its fuzz target
+        run: cargo +nightly-2026-07-15 xtask planted --targets
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+      - name: Upload the readiness report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: sim-targets-readiness
+          path: target/sim-targets/readiness.json
+          if-no-files-found: ignore
+
   # Semver-checks compares rustdoc APIs and cannot see a dependency's major
   # bump underneath an unchanged type name. This job is the gate that can:
   # it dry-run-publishes the real publish set against the live crates.io
@@ -706,6 +753,7 @@ jobs:
       - sim-planted
       - sim-sanitizers
       - sim-feedback
+      - sim-targets
       - zakura-testkit
     timeout-minutes: 30
     steps:
@@ -719,11 +767,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build, sim-planted, sim-sanitizers and sim-feedback run only on the nightly
+          # sim-build, sim-planted, sim-sanitizers, sim-feedback and sim-targets run only on the nightly
           # schedule and manual dispatch, so a nightly failure still fails
           # this status and reaches report-nightly-result.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-sanitizers, sim-feedback, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

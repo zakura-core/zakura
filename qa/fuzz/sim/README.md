@@ -289,12 +289,12 @@ must name the harness the table maps it to, so a target whose
 It prints each target's status, the harness's own properties that applied
 and those that didn't, the optional seeds it quarantined, and the retained
 bypasses under `qa/planted/` whose input runs on the harness, or that there
-are none. `<dir>/readiness.json`
-holds the same report, with each built target's commit, dirty state and
-toolchain from its build identity, and `<dir>/<target>/` holds the
-binary, the seeds, the log and the stats. The command exits 0 only if
-every target is `ready`. A seed run shows that a target builds and runs its harness. It
-says nothing about how well the target searches.
+are none. `<dir>/readiness.json` holds the same report, with each built
+target's commit, dirty state and toolchain from its build identity, and
+`<dir>/<target>/` holds the binary, the seeds, the log and the stats. The
+command exits 0 only if every target is `ready`. A seed run shows that a
+target builds and runs its harness. It says nothing about how well the
+target searches.
 
 `cargo xtask planted --targets` runs each retained bypass whose input runs
 on a target's harness, and also confirms the patched input through that

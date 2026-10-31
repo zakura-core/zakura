@@ -61,6 +61,8 @@ impl ReorderBuffer {
         self.blocks
             .iter()
             .map(|(height, buffered)| RetainedBody {
+                payload_id: buffered.body.id.0,
+                policy_decoded_bytes: buffered.body.decoded_bytes,
                 height: *height,
                 owner: buffered.owner,
                 bytes: buffered.bytes,
@@ -264,6 +266,10 @@ pub(super) struct DrainedBlock {
 #[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RetainedBody {
+    /// Runtime identity of this body.
+    pub payload_id: u64,
+    /// Decoded size recorded by policy at its last materialization or demotion.
+    pub policy_decoded_bytes: u64,
     /// The body's height.
     pub height: block::Height,
     /// The request the body answered.

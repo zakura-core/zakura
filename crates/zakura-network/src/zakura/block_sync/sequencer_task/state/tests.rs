@@ -650,15 +650,15 @@ enum ExpectedEvidence {
     TamperedBody(block::Hash),
 }
 
-fn observed_evidence(action: &BlockSyncAction) -> Option<ExpectedEvidence> {
+fn observed_evidence(action: &SequencerEvidence) -> Option<ExpectedEvidence> {
     match action {
-        BlockSyncAction::RecordBodyInvalid { invalid, .. } => {
+        SequencerEvidence::RecordBodyInvalid { invalid, .. } => {
             Some(ExpectedEvidence::BodyInvalid(invalid.hash))
         }
-        BlockSyncAction::RecordBodyUnavailable { failure, .. } => {
+        SequencerEvidence::RecordBodyUnavailable { failure, .. } => {
             Some(ExpectedEvidence::BodyUnavailable(failure.hash))
         }
-        BlockSyncAction::Misbehavior {
+        SequencerEvidence::Misbehavior {
             reason: BlockSyncMisbehavior::BodyPayloadMismatch(mismatch),
             ..
         } => Some(ExpectedEvidence::TamperedBody(mismatch.requested)),
@@ -781,7 +781,7 @@ fn run_required_evidence(
                     assert!(
                         matches!(
                             action,
-                            BlockSyncAction::Misbehavior {
+                            SequencerEvidence::Misbehavior {
                                 reason: BlockSyncMisbehavior::ConsensusBodyInvalid(invalid),
                                 ..
                             } if invalid.hash == accepted.hash

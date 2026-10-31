@@ -116,12 +116,24 @@ struct InFlightSubmission {
 #[cfg(any(test, zakura_sim))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SequencerOwnership {
+    /// Every payload in runtime storage, including entries absent from policy.
+    pub payloads: Vec<PayloadOwnership>,
     /// Each reorder-buffer body.
     pub reorder: Vec<RetainedBody>,
     /// Each `applying` body.
     pub applying: Vec<RetainedBody>,
     /// Each decoded submission the driver can still retain.
     pub submissions: Vec<SubmissionOwnership>,
+}
+
+/// One runtime payload, read independently of policy membership.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PayloadOwnership {
+    /// Runtime identity assigned before policy acceptance.
+    pub id: u64,
+    /// Attributed decoded size read from the actual block, or zero for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
 }
 
 /// One decoded submission and its wire bytes.
@@ -411,11 +423,21 @@ impl Sequencer {
         payloads: &BTreeMap<BodyId, BufferedBlockBody>,
     ) -> SequencerOwnership {
         SequencerOwnership {
+            payloads: payloads
+                .iter()
+                .map(|(id, body)| PayloadOwnership {
+                    id: id.0,
+                    decoded_attributed_memory_bytes: body
+                        .measured_decoded_attributed_memory_bytes(),
+                })
+                .collect(),
             reorder: self.reorder.ownership(payloads),
             applying: self
                 .applying
                 .iter()
                 .map(|(height, applying)| RetainedBody {
+                    payload_id: applying.body.id.0,
+                    policy_decoded_bytes: applying.body.decoded_bytes,
                     height: *height,
                     owner: applying.owner,
                     bytes: applying.bytes,

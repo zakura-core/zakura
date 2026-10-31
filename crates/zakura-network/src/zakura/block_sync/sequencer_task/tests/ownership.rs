@@ -48,6 +48,10 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             .state
             .sequencer
             .ownership_snapshot(&task.payloads.entries);
+        assert!(
+            owners.payloads_match_policy(),
+            "runtime inventory after {label}"
+        );
         let reorder: u64 = owners.reorder.iter().map(|body| body.bytes).sum();
         let applying: u64 = owners.applying.iter().map(|body| body.bytes).sum();
         let submissions: u64 = owners.submissions.iter().map(|owner| owner.bytes).sum();
@@ -123,6 +127,8 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     assert_eq!(
         owners.reorder,
         [RetainedBody {
+            payload_id: 2,
+            policy_decoded_bytes: 0,
             height: block::Height(5),
             owner: super::super::test_work_owner(),
             bytes: BLOCK_MAINNET_5_BYTES.len() as u64,
@@ -229,11 +235,21 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
         SequencerOwnership,
     };
 
-    #[derive(Debug, Default)]
-    struct Log(std::sync::Mutex<Vec<BlockEvent>>);
+    #[derive(Debug)]
+    struct Log {
+        events: std::sync::Mutex<Vec<BlockEvent>>,
+        retained: std::sync::Weak<block::Block>,
+    }
     impl BlockSyncObserver for Log {
         fn observe(&self, event: BlockEvent) {
-            self.0.lock().unwrap().push(event);
+            if matches!(&event, BlockEvent::Sequencer(owners) if *owners == SequencerOwnership::default())
+            {
+                assert!(
+                    self.retained.upgrade().is_none(),
+                    "empty teardown snapshot must follow actual payload release"
+                );
+            }
+            self.events.lock().unwrap().push(event);
         }
     }
 
@@ -244,9 +260,13 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions, _actions_rx) = mpsc::channel(8);
     let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-    let log = Arc::new(Log::default());
+    let retained = test_block();
+    let log = Arc::new(Log {
+        events: std::sync::Mutex::new(Vec::new()),
+        retained: Arc::downgrade(&retained),
+    });
     let budget = ByteBudget::new(1);
-    let task = SequencerIO::new(
+    let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
         Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
@@ -265,6 +285,24 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
         ZakuraTrace::noop(),
     )
     .with_observer(ObserverSlot(Some(log.clone())));
+
+    let mut accepted = SequencedBody::new_queued(
+        super::super::test_work_owner(),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        block::Height(1),
+        retained.hash(),
+        retained.header.previous_block_hash,
+        BufferedBlockBody::from_decoded_block(retained, None),
+        1_000,
+        None,
+        ZakuraPeerId::new(vec![1; 32]).unwrap(),
+        Instant::now(),
+        input_bytes.clone(),
+        input_decoded_bytes.clone(),
+    );
+    accepted.leave_queue();
+    task.handle_accept_body(accepted);
+    assert!(log.retained.upgrade().is_some());
 
     let block: Arc<block::Block> =
         Arc::new(BLOCK_MAINNET_2_BYTES.zcash_deserialize_into().unwrap());
@@ -290,7 +328,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
         .unwrap_or_else(|_| panic!("the input has room"));
     drop(task);
 
-    let events = std::mem::take(&mut *log.0.lock().unwrap());
+    let events = std::mem::take(&mut *log.events.lock().unwrap());
     assert_eq!(
         events.last(),
         Some(&BlockEvent::Sequencer(SequencerOwnership::default()))
@@ -399,5 +437,49 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
         policy_snapshot.applying_len(),
         1,
         "the policy snapshot still holds only facts"
+    );
+}
+
+#[test]
+fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
+    let (mut policy, mut payloads, _) = runtime_payload(block::Height(1), test_block());
+    assert!(policy
+        .ownership_snapshot(&payloads.entries)
+        .payloads_match_policy());
+    let retained = payloads.entries.values().next().unwrap().clone();
+    let untracked = payloads.insert(retained);
+    let snapshot = policy.ownership_snapshot(&payloads.entries);
+    assert_eq!(snapshot.payloads.len(), 2);
+    assert_eq!(snapshot.applying.len(), 1);
+    assert!(
+        !snapshot.payloads_match_policy(),
+        "capture must see an untracked shared allocation"
+    );
+    payloads.release(untracked.id);
+    assert!(policy
+        .ownership_snapshot(&payloads.entries)
+        .payloads_match_policy());
+    policy.reset_to(block::Height(0), false);
+    payloads.apply(&mut policy);
+    assert!(
+        policy
+            .ownership_snapshot(&payloads.entries)
+            .payloads_match_policy(),
+        "capture must detect runtime retention after policy reset"
+    );
+}
+
+#[test]
+fn runtime_payload_inventory_compares_actual_size_with_policy_size() {
+    let (mut policy, payloads, _) = runtime_payload(block::Height(1), test_block());
+    let facts = policy.submission_body(block::Height(1)).unwrap();
+    policy
+        .prepare_submit(block::Height(1), facts.id, facts.decoded_bytes + 1)
+        .unwrap();
+    assert!(
+        !policy
+            .ownership_snapshot(&payloads.entries)
+            .payloads_match_policy(),
+        "capture must measure the actual payload independently of policy size"
     );
 }

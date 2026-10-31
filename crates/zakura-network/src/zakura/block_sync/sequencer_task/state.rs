@@ -30,6 +30,23 @@ pub use tests::{
 /// action channel.
 const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// Payload-free evidence that sequencing policy asks IO to deliver.
+#[derive(Debug)]
+pub(super) enum SequencerEvidence {
+    RecordBodyUnavailable {
+        expected_version: zakura_header_chain::StateVersion,
+        failure: zakura_header_chain::TransientBodyFailure,
+    },
+    RecordBodyInvalid {
+        expected_version: zakura_header_chain::StateVersion,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    },
+    Misbehavior {
+        peer: ZakuraPeerId,
+        reason: BlockSyncMisbehavior,
+    },
+}
+
 /// One shared-resource effect of a sequencer transition.
 ///
 /// IO runs the operations of one transition in order. Required evidence stays in
@@ -61,7 +78,7 @@ pub(super) enum SequencerOperation {
     /// Wait for action capacity, then deliver the oldest pending required evidence.
     DeliverEvidence,
     /// Send a replaceable action under the bounded action-send timeout.
-    SendAction(BlockSyncAction),
+    SendAction(SequencerEvidence),
     /// Run one verifier submission pass.
     SubmitPending,
 }
@@ -204,7 +221,7 @@ pub(super) struct SequencerState {
     retry_jitter: SeededRetryJitter,
     submission_retry: SubmissionRetry,
     /// Required actions the driver has not accepted yet, oldest first.
-    pending_evidence: VecDeque<BlockSyncAction>,
+    pending_evidence: VecDeque<SequencerEvidence>,
 }
 
 impl SequencerState {
@@ -285,7 +302,7 @@ impl SequencerState {
     }
 
     /// The oldest required action the driver has not accepted.
-    pub(super) fn pending_evidence(&self) -> Option<&BlockSyncAction> {
+    pub(super) fn pending_evidence(&self) -> Option<&SequencerEvidence> {
         self.pending_evidence.front()
     }
 
@@ -813,7 +830,7 @@ impl SequencerState {
                 outcome.verification()
             {
                 self.require_evidence(
-                    BlockSyncAction::RecordBodyInvalid {
+                    SequencerEvidence::RecordBodyInvalid {
                         expected_version: semantic_state_version,
                         invalid: invalid.clone(),
                     },
@@ -835,7 +852,7 @@ impl SequencerState {
             outcome.verification()
         {
             self.require_evidence(
-                BlockSyncAction::RecordBodyUnavailable {
+                SequencerEvidence::RecordBodyUnavailable {
                     expected_version: semantic_state_version,
                     failure: *failure,
                 },
@@ -894,7 +911,7 @@ impl SequencerState {
                         }
                     };
                     let disconnects = reason.proves_tampered_body();
-                    let action = BlockSyncAction::Misbehavior {
+                    let action = SequencerEvidence::Misbehavior {
                         peer: applying.source_peer.clone(),
                         reason,
                     };
@@ -1008,7 +1025,7 @@ impl SequencerState {
     /// Keep `action` pending until IO delivers it at the returned operation.
     fn require_evidence(
         &mut self,
-        action: BlockSyncAction,
+        action: SequencerEvidence,
         operations: &mut Vec<SequencerOperation>,
     ) {
         self.pending_evidence.push_back(action);
@@ -1019,7 +1036,7 @@ impl SequencerState {
     ///
     /// IO calls this only while it holds a reserved action-channel permit, so the
     /// driver accepts the returned action.
-    pub(super) fn take_pending_evidence(&mut self) -> Option<BlockSyncAction> {
+    pub(super) fn take_pending_evidence(&mut self) -> Option<SequencerEvidence> {
         self.pending_evidence.pop_front()
     }
 

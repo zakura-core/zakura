@@ -394,6 +394,36 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     }
 }
 
+impl state::SequencerEvidence {
+    fn metric_label(&self) -> &'static str {
+        match self {
+            Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
+            Self::RecordBodyInvalid { .. } => "record_body_invalid",
+            Self::Misbehavior { .. } => "misbehavior",
+        }
+    }
+
+    fn into_action(self) -> BlockSyncAction {
+        match self {
+            Self::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            } => BlockSyncAction::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            },
+            Self::RecordBodyInvalid {
+                expected_version,
+                invalid,
+            } => BlockSyncAction::RecordBodyInvalid {
+                expected_version,
+                invalid,
+            },
+            Self::Misbehavior { peer, reason } => BlockSyncAction::Misbehavior { peer, reason },
+        }
+    }
+}
+
 /// Runtime payload storage. Policy receives only identities and measured facts.
 #[derive(Debug, Default)]
 pub(super) struct SequencerPayloads {
@@ -543,9 +573,12 @@ impl Drop for SequencerIO {
             while let Ok(body) = self.body_input_rx.try_recv() {
                 self.observe_dequeued(&body);
             }
-            self.observe_teardown();
+            self.observe_holders();
         }
         while self.body_input_rx.try_recv().is_ok() {}
+        self.payloads.entries.clear();
+        #[cfg(any(test, zakura_sim))]
+        self.observe_teardown();
 
         self.view_tx.send_modify(|view| {
             view.reorder_decoded_attributed_memory_bytes = 0;
@@ -668,8 +701,7 @@ impl SequencerIO {
         observe!(self.observer, BlockEvent::Sequencer(ownership));
     }
 
-    /// Reports every holder's release and an empty snapshot, because the
-    /// sequencer's ledgers drop with the task. A driver that still runs a
+    /// Reports releases after IO drops its payload storage. A driver that still runs a
     /// submission keeps its own copy of the decoded block; the block service
     /// reports that copy, not the sequencer.
     #[cfg(any(test, zakura_sim))]
@@ -678,7 +710,6 @@ impl SequencerIO {
         if self.observer.0.is_none() {
             return;
         }
-        self.observe_holders();
         for (holder, body) in std::mem::take(&mut self.observed_holders) {
             observe!(
                 self.observer,
@@ -870,7 +901,7 @@ impl SequencerIO {
                 }
                 SequencerOperation::DeliverEvidence => self.deliver_required_evidence().await,
                 SequencerOperation::SendAction(action) => {
-                    let _ = self.send_action(action).await;
+                    let _ = self.send_action(action.into_action()).await;
                 }
                 SequencerOperation::SubmitPending => self.submit_pending_blocks().await,
             }
@@ -995,7 +1026,7 @@ impl SequencerIO {
         let Some(action_label) = self
             .state
             .pending_evidence()
-            .map(BlockSyncAction::metric_label)
+            .map(state::SequencerEvidence::metric_label)
         else {
             return;
         };
@@ -1005,7 +1036,7 @@ impl SequencerIO {
                     .state
                     .take_pending_evidence()
                     .expect("pending evidence exists because it was just observed");
-                permit.send(action);
+                permit.send(action.into_action());
             }
             Err(_) => {
                 metrics::counter!(

@@ -1742,6 +1742,68 @@ async fn multi_block_inv_during_getblocks_is_only_the_reply() {
     .expect("the reply is delivered without a block advert");
 }
 
+/// The `getblocks` reply still arrives when the inbound service fails the block advert that the
+/// same one-hash `inv` produced, and the connection stays open.
+#[tokio::test]
+async fn single_block_inv_during_getblocks_survives_inbound_error() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let announced_hash = block::Hash([2; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
+            .unwrap();
+
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::AdvertiseBlock(announced_hash, None))
+                    .await
+                    .respond(Err("synthetic inbound service error"));
+            },
+            async {
+                assert_eq!(
+                    request_rx.await.unwrap().unwrap(),
+                    Response::BlockHashes(vec![announced_hash])
+                );
+            }
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        // The connection still serves requests after the failed advert.
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+        let hashes = vec![block::Hash([3; 32]), block::Hash([4; 32])];
+        peer_tx
+            .try_send(Ok(Message::Inv(
+                hashes.iter().copied().map(InventoryHash::Block).collect(),
+            )))
+            .unwrap();
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(hashes)
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the reply is delivered although the advert failed");
+}
+
 /// A connection rechecks bans while a request is awaiting its response, and does not write an
 /// advert to a banned peer. The pending request and the connection are unaffected.
 #[tokio::test]

@@ -412,6 +412,9 @@ impl Handler {
             // either way, and it is also returned so the run loop handles it as a block
             // advert: the gossip downloader then fetches the block right away, instead of
             // the syncer fetching it only once its whole discovery round has finished.
+            // A genuine one-hash reply takes the same path, so it also counts as an inbound
+            // `AdvertiseBlock` request in the metrics and starts one extra block download,
+            // which the inbound downloader drops when the block is already in the state.
             (Handler::FindBlocks, Message::Inv(items))
                 if !items.is_empty()
                     && items

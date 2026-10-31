@@ -7380,7 +7380,10 @@ mod tests {
 
         assert_eq!(handle.verify_slots.available(), 0);
         assert_eq!(node.usage().raw_bytes, frame_bytes);
-        assert!(stream.raw.try_admit(64).is_some(), "the stream's floor stays free");
+        assert!(
+            stream.raw.try_admit(64).is_some(),
+            "the stream's floor stays free"
+        );
         drop(verified);
         assert_eq!(handle.verify_slots.available(), 1);
     }

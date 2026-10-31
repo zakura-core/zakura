@@ -768,7 +768,10 @@ mod tests {
 
         drop(transport_hold);
         let frame = stream.raw.try_admit(64);
-        assert!(frame.is_some(), "saturated header chunks hold no frame bytes");
+        assert!(
+            frame.is_some(),
+            "saturated header chunks hold no frame bytes"
+        );
         assert!(node.usage().raw_bytes > 0);
 
         drop(reservation);

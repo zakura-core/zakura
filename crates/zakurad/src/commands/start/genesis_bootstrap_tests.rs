@@ -44,7 +44,7 @@ async fn genesis_bootstrap_reopens_with_readiness_before_and_after_coordinator()
     // In the early case, runtime readiness cannot have been published yet: state
     // has not even started. The late case waits explicitly for Ready below.
     let early = (phase != "ready-before").then(|| new_sync_coordinator(&config.network));
-    let (mut state, read_state, tip, _tip_change, _authority) =
+    let (mut state, read_state, mut tip, _tip_change, _authority) =
         zakura_state::init_with_header_chain_body_evidence(
             config.state.clone(),
             &config.network.network,
@@ -83,6 +83,15 @@ async fn genesis_bootstrap_reopens_with_readiness_before_and_after_coordinator()
     })
     .await
     .expect("persisted genesis attaches the runtime");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while tip.best_tip_height().is_none() {
+            tip.best_tip_changed()
+                .await
+                .expect("tip publisher stays live");
+        }
+    })
+    .await
+    .expect("the genesis tip is published");
     assert_eq!(tip.best_tip_height(), Some(Height(0)));
     let coordinator = early.unwrap_or_else(|| new_sync_coordinator(&config.network));
 

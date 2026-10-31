@@ -5,7 +5,8 @@
 //!
 //! - `p2p`: every wire message on a legacy connection. Sends record both the attempt
 //!   (`send_start`) and the completed framed write and flush (`send_done`); receives record the
-//!   decoded message (`recv`). Inventory rows list every block hash in the batch.
+//!   decoded message (`recv`). Inventory rows list every block hash in the batch. On Linux, block
+//!   body sends also record when the peer acknowledged the body (`body_acked`).
 //! - `p2p_request`: an outbound request's path through the peer set and the connection: peer
 //!   selection (`dispatch`), the connection channel (`enqueue`, `dequeue`), the request write
 //!   (`write`), and its completion (`finish`).
@@ -36,6 +37,7 @@ mod request;
 pub(crate) mod tests;
 
 pub(crate) use gossip::{AdvertTrace, SlotRelease};
+pub(crate) use p2p::SendTrace;
 pub(crate) use request::RequestTrace;
 
 /// The next process-local connection identifier.
@@ -66,6 +68,14 @@ impl LifecycleTrace {
     /// Creates a lifecycle trace that writes nothing.
     pub(crate) fn noop() -> Self {
         Self::default()
+    }
+
+    /// Returns whether this trace writes the `p2p` table, the only consumer of TCP upload
+    /// progress samples.
+    pub(crate) fn records_p2p(&self) -> bool {
+        self.emitter
+            .as_ref()
+            .is_some_and(|emitter| emitter.tracer().is_table_enabled(tables::P2P.table()))
     }
 
     /// Allocates an identifier for a new legacy connection and its trace context.

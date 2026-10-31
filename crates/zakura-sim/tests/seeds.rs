@@ -65,6 +65,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     }
     match stem {
         "discovery-wait-complete" => value(discovery::Scenario::default()),
+        "discovery-verification-capacity" => value(discovery::CapacityScenario::default()),
         "discovery-record-book" => value(zakura_sim::harness::discovery_machine::Scenario {
             input: include_bytes!("fixtures/discovery-record-book.bin").to_vec(),
         }),

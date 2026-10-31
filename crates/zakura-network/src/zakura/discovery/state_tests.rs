@@ -1864,15 +1864,10 @@ fn successive_responses_cannot_grow_one_peers_live_summaries() {
 #[test]
 fn production_books_draw_distinct_disclosure_keys() {
     let requester = relay(0);
-    let sample = |book: &ZakuraDiscoveryBook| book.clone();
-    let books: Vec<_> = (0..4)
-        .map(|_| sample(&ZakuraDiscoveryBook::default()))
+    let hashes: HashSet<u64> = (0..4)
+        .map(|_| ZakuraDiscoveryBook::default().window_hash(requester, 1))
         .collect();
-    let hashes: HashSet<u64> = books
-        .iter()
-        .map(|book| book.window_hash(requester, 1))
-        .collect();
-    assert_eq!(hashes.len(), books.len(), "each book draws a random key");
+    assert_eq!(hashes.len(), 4, "each book draws a random key");
 }
 
 #[test]
@@ -1925,8 +1920,9 @@ const BOOK_TRACE_WITNESS: &[u8] = &[
 
 /// Installs a current result, rejects a stale result, retains a hint, and reads it.
 const STATE_TRACE_WITNESS: &[u8] = &[
-    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
-    7, 0, 0, 40, 8, 0, 0, 0, 3, 0, 1, 0, 8, 0, 0, 0,
+    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1,
+    1, 7, 0, 0, 40, 8, 0, 0, 0, // Peer 0 disconnects while peer 1's `Hello` installs.
+    3, 0, 1, 0, 0, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0,
 ];
 
 /// Replay decoder-v1 quadruples against the record-book model.

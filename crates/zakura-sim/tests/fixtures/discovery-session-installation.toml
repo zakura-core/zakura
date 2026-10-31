@@ -1,7 +1,7 @@
 harness = "discovery/session-installation"
 generator = 2
-sha256 = "014e2a850ecbd291594fc1280f353d39f4ad79f1aa8846da79f34b9a4cf60219"
-scenario_sha256 = "854ce0f714d82546f894f817b89b639636dd2baa4feffa3d07e0dcad1aca032e"
+sha256 = "d96653a697e5e59373da80db04a6c6cc082dd3e853da38b137f209f543608b12"
+scenario_sha256 = "036a5f09a9f769914ae09858739de195cab13acfe8f75c393516127351118876"
 source = "crates/zakura-sim/tests/replay_exact.rs"
 
 [[witness]]

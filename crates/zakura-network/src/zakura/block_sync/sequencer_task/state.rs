@@ -28,8 +28,13 @@ use crate::zakura::header_sync::{
     BodyRetryEpisode, BodyRetryQueue, RetryUpdate, SeededRetryJitter,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
+};
 
 /// Delay before retrying a verifier submission that could not enter the shared
 /// action channel.
@@ -255,12 +260,12 @@ impl SequencerState {
         &self.sequencer
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn reset_epoch(&self) -> u64 {
         self.reset_epoch
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn reaction_epoch(&self) -> u64 {
         self.reaction_epoch
     }
@@ -294,7 +299,7 @@ impl SequencerState {
         self.pending_evidence.front()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn pending_evidence_len(&self) -> usize {
         self.pending_evidence.len()
     }

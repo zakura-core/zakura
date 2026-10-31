@@ -38,6 +38,12 @@ use super::{
 use std::collections::BTreeSet;
 
 mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
+};
+
 mod trace;
 
 use state::{BodyAcceptance, ReceivedBody, SequencerOperation, SequencerState};

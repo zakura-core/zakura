@@ -6,20 +6,48 @@ use std::{
     time::Duration,
 };
 
-use futures::{
-    channel::{mpsc, oneshot},
-    SinkExt,
-};
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use tokio::{
-    sync::{watch, Semaphore},
+    sync::{mpsc, oneshot, watch, Semaphore},
     time::{sleep_until, timeout, Instant},
 };
-use zakura_chain::block;
+use zakura_chain::{block, chain_tip::ChainTip};
 
 use crate::{
-    constants::REQUEST_TIMEOUT, peer::ClientRequest, peer_registry::PeerRegistryUpdater,
-    protocol::external::types::Version, Request,
+    constants::REQUEST_TIMEOUT,
+    peer::{MinimumPeerVersion, SharedPeerError},
+    peer_registry::PeerRegistryUpdater,
+    protocol::external::types::Version,
+    BoxError, Request, Response,
 };
+
+/// Pending block adverts per connection. Slow peers can catch up through later tip gossip.
+pub(crate) const BLOCK_ADVERT_QUEUE: usize = 4;
+
+/// A block `inv` for one connection to write, separately from its ordinary requests.
+///
+/// The connection answers `result` once the local write completes, even while another request
+/// is awaiting its response. A successful result does not mean the peer received the `inv`.
+#[derive(Debug)]
+pub(crate) struct BlockAdvert {
+    /// The block to advertise.
+    pub(crate) hash: block::Hash,
+    /// Receives the outcome of the local write.
+    pub(crate) result: oneshot::Sender<Result<(), BlockAdvertError>>,
+}
+
+/// Why a connection did not write a block advert.
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum BlockAdvertError {
+    /// The peer was banned, or fell below the minimum protocol version, after the advert was
+    /// queued. Nothing was written.
+    #[error("peer authorization was revoked before advert delivery")]
+    AuthorizationRevoked,
+
+    /// The local write failed, and the connection was closed.
+    #[error(transparent)]
+    Connection(#[from] SharedPeerError),
+}
 
 /// Maximum outstanding legacy block advertisements across broadcasts.
 pub(crate) const BLOCK_GOSSIP_CONCURRENCY: usize = 32;
@@ -158,10 +186,10 @@ impl Drop for UploadClaim {
     }
 }
 
-/// A bounded request sender that remains usable while the peer set marks a client busy.
+/// A connection's block advert queue, which remains usable while the connection is busy.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockGossipPeer {
-    pub(crate) sender: mpsc::Sender<ClientRequest>,
+    pub(crate) sender: mpsc::Sender<BlockAdvert>,
     pub(crate) uploads: BlockUploads,
     pub(crate) registry: Option<PeerRegistryUpdater>,
     pub(crate) version: Version,
@@ -175,7 +203,7 @@ impl BlockGossipPeer {
     }
 
     /// Keep the permit through getdata, the block write, and the drain allowance.
-    pub(crate) async fn advertise(mut self, hash: block::Hash, slots: Arc<Semaphore>) -> bool {
+    pub(crate) async fn advertise(self, hash: block::Hash, slots: Arc<Semaphore>) -> bool {
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
@@ -202,14 +230,8 @@ impl BlockGossipPeer {
         let Ok(_permit) = slots.acquire().await else {
             return false;
         };
-        let (tx, rx) = oneshot::channel();
-        let request = ClientRequest {
-            request: Request::AdvertiseBlock(hash, None),
-            tx,
-            inv_collector: None,
-            transient_addr: None,
-            span: tracing::Span::current(),
-        };
+        let (result, written) = oneshot::channel();
+        let advert = BlockAdvert { hash, result };
         // A sidecar learns the tip only from inventory, so it waits for its busy connection.
         // Other connections that cannot write inventory promptly must not hold the slot.
         let inventory_wait = if self.sidecar {
@@ -218,8 +240,8 @@ impl BlockGossipPeer {
             BLOCK_REQUEST_WAIT
         };
         let advertised = timeout(inventory_wait, async {
-            self.sender.send(request).await.ok()?;
-            rx.await.ok()?.ok()
+            self.sender.send(advert).await.ok()?;
+            written.await.ok()?.ok()
         })
         .await;
         if !matches!(advertised, Ok(Some(_))) {
@@ -254,6 +276,112 @@ impl BlockGossipPeer {
         };
         claim.0.send_replace(UploadState::Finished(succeeded));
         succeeded
+    }
+}
+
+/// Advertises `hash` to `peers`, paced through their block uploads, sharing `slots` with every
+/// other block broadcast.
+///
+/// Succeeds if at least one peer was advertised to.
+pub(crate) fn broadcast_block(
+    peers: Vec<BlockGossipPeer>,
+    hash: block::Hash,
+    mined: bool,
+    slots: Arc<Semaphore>,
+) -> BoxFuture<'static, Result<Response, BoxError>> {
+    let peers = order_peers(peers, mined, &mut rand_10::rng());
+    async move {
+        let mut sends = futures::stream::iter(
+            peers
+                .into_iter()
+                .map(|peer| peer.advertise(hash, slots.clone())),
+        )
+        .buffer_unordered(BLOCK_GOSSIP_CONCURRENCY);
+        let mut succeeded = false;
+        while let Some(sent) = sends.next().await {
+            succeeded |= sent;
+        }
+        if succeeded {
+            Ok(Response::Nil)
+        } else {
+            Err(std::io::Error::other("block broadcast reached no peers").into())
+        }
+    }
+    .boxed()
+}
+
+/// Block advertisements that do not wait for the peer set to have an idle peer.
+///
+/// The peer set only accepts a request once one of its peers is ready, and a peer awaiting a
+/// response is not ready. This advertiser instead uses the block advert queue of every connected
+/// peer, including busy ones, which the peer set publishes whenever it changes.
+#[derive(Clone, Debug)]
+pub(crate) struct BlockAdvertiser<C> {
+    /// Every connected peer's block advert queue, as last published by the peer set.
+    pub(crate) peers: watch::Receiver<Vec<BlockGossipPeer>>,
+    /// Shared with the peer set's own block broadcasts.
+    pub(crate) slots: Arc<Semaphore>,
+    pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
+}
+
+/// Always ready: an advertisement waits inside its own future for a connected peer, never for
+/// an idle one. Requests other than block advertisements fail.
+impl<C: ChainTip> tower::Service<Request> for BlockAdvertiser<C> {
+    type Response = Response;
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<Response, BoxError>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        self.advertise(request)
+    }
+}
+
+impl<C: ChainTip> BlockAdvertiser<C> {
+    /// Advertises the block in `request` to every eligible connected peer.
+    ///
+    /// Waits until at least one connected peer meets the minimum protocol version, so the latest
+    /// block still reaches the first peer that connects.
+    pub(crate) fn advertise(
+        &mut self,
+        request: Request,
+    ) -> BoxFuture<'static, Result<Response, BoxError>> {
+        let (hash, mined) = match request {
+            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => (hash, false),
+            Request::AdvertiseMinedBlock(hash) => (hash, true),
+            other => {
+                return futures::future::ready(Err(format!(
+                    "block advertiser cannot send {}",
+                    other.command()
+                )
+                .into()))
+                .boxed()
+            }
+        };
+        let minimum_version = self.minimum_peer_version.current();
+        let eligible = move |peer: &BlockGossipPeer| {
+            peer.version >= minimum_version && !peer.sender.is_closed()
+        };
+        let mut peers = self.peers.clone();
+        let slots = self.slots.clone();
+        async move {
+            let peers: Vec<_> = peers
+                .wait_for(|peers| peers.iter().any(eligible))
+                .await
+                .map_err(|_| "peer set stopped")?
+                .iter()
+                .filter(|peer| eligible(peer))
+                .cloned()
+                .collect();
+            broadcast_block(peers, hash, mined, slots).await
+        }
+        .boxed()
     }
 }
 
@@ -298,12 +426,12 @@ pub(crate) fn order_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{peer_registry::PeerRegistry, ConnectedPeer, Response};
-    use futures::{FutureExt, StreamExt};
+    use crate::{peer_registry::PeerRegistry, ConnectedPeer};
+    use futures::FutureExt;
     use rand_10::{rngs::StdRng, SeedableRng};
 
-    fn peer() -> (BlockGossipPeer, mpsc::Receiver<ClientRequest>) {
-        let (sender, receiver) = mpsc::channel(0);
+    fn peer() -> (BlockGossipPeer, mpsc::Receiver<BlockAdvert>) {
+        let (sender, receiver) = mpsc::channel(BLOCK_ADVERT_QUEUE);
         (
             BlockGossipPeer {
                 sender,
@@ -316,13 +444,13 @@ mod tests {
         )
     }
 
-    async fn accept(receiver: &mut mpsc::Receiver<ClientRequest>, hash: block::Hash) {
-        let request = receiver
-            .next()
+    async fn accept(receiver: &mut mpsc::Receiver<BlockAdvert>, hash: block::Hash) {
+        let advert = receiver
+            .recv()
             .await
             .expect("peer receives an advertisement");
-        assert_eq!(request.request, Request::AdvertiseBlock(hash, None));
-        request.tx.send(Ok(Response::Nil)).unwrap();
+        assert_eq!(advert.hash, hash);
+        advert.result.send(Ok(())).unwrap();
         tokio::task::yield_now().await;
     }
 
@@ -337,19 +465,19 @@ mod tests {
         accept(&mut first_rx, hash).await;
         let second_task = tokio::spawn(second.advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
-        assert!(second_rx.next().now_or_never().is_none());
+        assert!(second_rx.recv().now_or_never().is_none());
         uploads.requested(hash);
         tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert!(
-            second_rx.next().now_or_never().is_none(),
+            second_rx.recv().now_or_never().is_none(),
             "getdata keeps the slot occupied beyond the no-request timeout"
         );
         uploads.written(hash);
         tokio::task::yield_now().await;
         tokio::time::advance(BLOCK_WRITE_GRACE - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
-        assert!(second_rx.next().now_or_never().is_none());
+        assert!(second_rx.recv().now_or_never().is_none());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(first_task.await.unwrap());
         accept(&mut second_rx, hash).await;
@@ -382,13 +510,13 @@ mod tests {
         accept(&mut receiver, hash).await;
         let second = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
-        assert!(receiver.next().now_or_never().is_none());
+        assert!(receiver.recv().now_or_never().is_none());
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(first.await.unwrap());
         assert!(second.await.unwrap());
         assert_eq!(slots.available_permits(), 1);
-        assert!(receiver.next().now_or_never().is_none());
+        assert!(receiver.recv().now_or_never().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -490,7 +618,7 @@ mod tests {
         assert!(receivers
             .last_mut()
             .unwrap()
-            .next()
+            .recv()
             .now_or_never()
             .is_none());
         assert_eq!(slots.available_permits(), 0);

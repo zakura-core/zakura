@@ -29,7 +29,7 @@ use crate::{
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
-    protocol::external::Message,
+    protocol::external::{InventoryHash, Message},
     types::Nonce,
     PeerError, PeerSource, Request, Response,
 };
@@ -1183,9 +1183,12 @@ async fn block_gossip_slot_tracks_connection_write() {
 
     let _init_guard = zakura_test::init();
     let (mut peer_tx, peer_rx) = mpsc::channel(1);
-    let (connection, client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (mut connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = block_advert_rx;
     let gossip = BlockGossipPeer {
-        sender: client_tx,
+        sender: block_advert_tx,
         uploads: connection.block_uploads.clone(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
@@ -1238,9 +1241,12 @@ async fn truncated_block_request_releases_gossip_slot() {
 
     let _init_guard = zakura_test::init();
     let (mut peer_tx, peer_rx) = mpsc::channel(1);
-    let (connection, client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (mut connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = block_advert_rx;
     let gossip = BlockGossipPeer {
-        sender: client_tx,
+        sender: block_advert_tx,
         uploads: connection.block_uploads.clone(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
@@ -1266,4 +1272,296 @@ async fn truncated_block_request_releases_gossip_slot() {
     assert!(!advertisement.await.unwrap());
     assert_eq!(slots.available_permits(), 1);
     connection_task.abort();
+}
+
+/// Returns a block advert for `hash`, and the receiver for its write result.
+fn block_advert(
+    hash: block::Hash,
+) -> (
+    crate::peer::block_gossip::BlockAdvert,
+    tokio::sync::oneshot::Receiver<Result<(), crate::peer::block_gossip::BlockAdvertError>>,
+) {
+    let (result, delivery) = tokio::sync::oneshot::channel();
+    (
+        crate::peer::block_gossip::BlockAdvert { hash, result },
+        delivery,
+    )
+}
+
+/// Block adverts bypass pending responses without replacing their handlers or closing the client.
+///
+/// A peer at our tip never answers `getblocks`, so an advert queued behind it would otherwise
+/// wait for the request to time out.
+#[tokio::test]
+async fn block_advert_while_awaiting_response() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            mut connection,
+            mut client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        // Exercise the idle path before leaving a getblocks request awaiting its response.
+        let idle_hash = block::Hash([1; 32]);
+        let (advert, idle_delivery) = block_advert(idle_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        assert_eq!(
+            peer_outbound_messages.next().await,
+            Some(Message::Inv(vec![InventoryHash::Block(idle_hash)]))
+        );
+        idle_delivery.await.unwrap().unwrap();
+
+        let (request_tx, mut request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::FindBlocks {
+                    known_blocks: vec![idle_hash],
+                    stop: None,
+                },
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        assert!(matches!(
+            peer_outbound_messages.next().await,
+            Some(Message::GetBlocks { .. })
+        ));
+
+        let busy_hash = block::Hash([2; 32]);
+        let (advert, busy_delivery) = block_advert(busy_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        assert_eq!(
+            peer_outbound_messages.next().await,
+            Some(Message::Inv(vec![InventoryHash::Block(busy_hash)]))
+        );
+        busy_delivery.await.unwrap().unwrap();
+        assert!(request_rx.try_recv().unwrap().is_none());
+
+        // Closing only the advert channel must leave the original request alive.
+        drop(block_advert_tx);
+        let next_hash = block::Hash([3; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(next_hash)])))
+            .unwrap();
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(vec![next_hash])
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("adverts and the original response finish before the request timeout");
+}
+
+/// A block advert sent as an ordinary client request is answered with an error, not written as
+/// an `inv`: only the advert queue writes adverts. The connection stays usable.
+#[tokio::test]
+async fn block_advert_as_ordinary_request_is_an_error() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let (request_tx, request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::AdvertiseBlock(block::Hash([5; 32]), None),
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        let error = request_rx
+            .await
+            .unwrap()
+            .expect_err("an advert sent as an ordinary request fails");
+        assert_eq!(error.inner_debug(), "AdvertRequiresDedicatedService");
+        assert!(peer_outbound_messages.next().now_or_never().is_none());
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the request is answered before the request timeout");
+}
+
+/// A pending GetBlocks response must not be displaced by a simultaneous unsolicited advert.
+#[tokio::test]
+async fn getblocks_response_precedes_ready_block_advert() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            mut connection,
+            client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let response_hash = block::Hash([3; 32]);
+        let advert_hash = block::Hash([4; 32]);
+
+        // Queue both inputs before starting the loop, making selection order deterministic.
+        peer_tx
+            .try_send(Ok(Message::GetBlocks {
+                known_blocks: Vec::new(),
+                stop: None,
+            }))
+            .unwrap();
+        let (advert, _delivery) = block_advert(advert_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::FindBlocks {
+                        known_blocks: Vec::new(),
+                        stop: None,
+                    })
+                    .await
+                    .respond(Response::BlockHashes(vec![response_hash]));
+            },
+            async {
+                assert_eq!(
+                    peer_outbound_messages.next().await,
+                    Some(Message::Inv(vec![InventoryHash::Block(response_hash)]))
+                );
+                assert_eq!(
+                    peer_outbound_messages.next().await,
+                    Some(Message::Inv(vec![InventoryHash::Block(advert_hash)]))
+                );
+            }
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the response and advert are both delivered");
+}
+
+/// A connection rechecks bans while a request is awaiting its response, and does not write an
+/// advert to a banned peer. The pending request and the connection are unaffected.
+#[tokio::test]
+async fn queued_block_advert_is_revoked_by_ban_while_awaiting_response() {
+    queued_block_advert_is_revoked_by_ban(BanAddressForm::Same).await;
+}
+
+/// A peer connected through its IPv4-mapped IPv6 address, as on a dual-stack listener, is
+/// still revoked by a ban recorded for its canonical IPv4 address.
+#[tokio::test]
+async fn queued_block_advert_is_revoked_by_canonical_ban_of_mapped_ipv6_peer() {
+    queued_block_advert_is_revoked_by_ban(BanAddressForm::MappedPeerCanonicalBan).await;
+}
+
+/// How the banned address relates to the connection's peer address.
+enum BanAddressForm {
+    /// The ban holds the connection's own peer address.
+    Same,
+    /// The peer connected as `::ffff:A.B.C.D`, and the ban holds `A.B.C.D`.
+    MappedPeerCanonicalBan,
+}
+
+async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        // The protected test connection has a real peer address that a ban can match.
+        let (
+            mut connection,
+            mut client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_protected_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let banned_ip = match form {
+            BanAddressForm::Same => connection
+                .connection_info
+                .connected_addr
+                .get_transient_addr()
+                .expect("the protected test connection has a peer address")
+                .ip(),
+            BanAddressForm::MappedPeerCanonicalBan => {
+                let canonical = std::net::Ipv4Addr::new(203, 0, 113, 7);
+                let mut info = (*connection.connection_info).clone();
+                info.connected_addr = crate::peer::ConnectedAddr::new_inbound_direct(
+                    std::net::SocketAddr::new(canonical.to_ipv6_mapped().into(), 8233).into(),
+                );
+                connection.connection_info = std::sync::Arc::new(info);
+                canonical.into()
+            }
+        };
+        connection.bans = crate::BannedIps::with_banned_ip(banned_ip);
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let (request_tx, mut request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::FindBlocks {
+                    known_blocks: vec![block::Hash([1; 32])],
+                    stop: None,
+                },
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        assert!(matches!(
+            peer_outbound_messages.next().await,
+            Some(Message::GetBlocks { .. })
+        ));
+
+        let (advert, delivery) = block_advert(block::Hash([2; 32]));
+        block_advert_tx.try_send(advert).unwrap();
+        assert!(matches!(
+            delivery.await.unwrap(),
+            Err(crate::peer::block_gossip::BlockAdvertError::AuthorizationRevoked)
+        ));
+        assert!(peer_outbound_messages.next().now_or_never().is_none());
+        assert!(request_rx.try_recv().unwrap().is_none());
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        connection_task.abort();
+    })
+    .await
+    .expect("the revoked advert is answered before the request timeout");
 }

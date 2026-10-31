@@ -34,6 +34,11 @@ pub struct LoadTrackedClient {
     /// A service representing a connected peer, wrapped in a load tracker.
     service: PeakEwma<Client>,
 
+    /// Reports whether the connection can write a request as soon as it is sent.
+    ///
+    /// A copy of the client's slot, because [`PeakEwma`] does not expose the inner client.
+    request_slot: super::client::RequestSlot,
+
     /// The metadata for the connected peer `service`.
     connection_info: Arc<ConnectionInfo>,
 
@@ -53,6 +58,8 @@ impl From<Client> for LoadTrackedClient {
             sidecar: false,
         };
 
+        let request_slot = client.request_slot.clone();
+
         let service = PeakEwma::new(
             client,
             EWMA_DEFAULT_RTT,
@@ -63,6 +70,7 @@ impl From<Client> for LoadTrackedClient {
         LoadTrackedClient {
             block_gossip,
             service,
+            request_slot,
             connection_info,
             // Wrap-around is unreachable for a process-local u64 counter.
             trace_id: NEXT_PEER_TRACE_ID.fetch_add(1, Ordering::Relaxed),
@@ -74,6 +82,20 @@ impl LoadTrackedClient {
     /// Retrieve the peer's reported protocol version.
     pub fn remote_version(&self) -> Version {
         self.connection_info.remote.version
+    }
+
+    /// Returns true if the connection would write a request sent now, rather than leave it queued
+    /// behind a response the connection is still awaiting.
+    ///
+    /// [`Service::poll_ready`] only reports space in the request channel. While the connection is
+    /// awaiting a response to an earlier request, it leaves new requests in that channel until the
+    /// response arrives, times out, or is cancelled.
+    ///
+    /// Only meaningful after `poll_ready` has returned ready, which means this client has no request
+    /// of its own still queued. Requests that the heartbeat or block gossip tasks have queued, but
+    /// the connection has not taken yet, are not visible here.
+    pub(crate) fn can_send_request_now(&self) -> bool {
+        self.request_slot.is_free()
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

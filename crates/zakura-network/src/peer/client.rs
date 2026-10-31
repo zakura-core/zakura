@@ -5,7 +5,10 @@ use std::{
     future::Future,
     iter,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -40,6 +43,9 @@ pub mod tests;
 pub struct Client {
     /// Tracks block writes for paced legacy advertisements.
     pub(crate) block_uploads: super::block_gossip::BlockUploads,
+    /// Reports whether the connection can write a request as soon as it is sent.
+    pub(crate) request_slot: RequestSlot,
+
     /// Reads heartbeat RTT for this exact connection generation.
     pub(crate) peer_registry_updater: Option<crate::peer_registry::PeerRegistryUpdater>,
 
@@ -67,6 +73,32 @@ pub struct Client {
 
     /// A handle to the task responsible for sending periodic heartbeats.
     pub(crate) heartbeat_task: JoinHandle<Result<(), BoxError>>,
+}
+
+/// Whether a legacy connection is free to write its next client request.
+///
+/// A connection handles one client request at a time. While it awaits a response, it reads peer
+/// messages but does not take requests from its client channel. So space in that channel, which is
+/// what [`Client::poll_ready`](Service::poll_ready) reports, does not mean a newly sent request will
+/// be written now.
+///
+/// The [`Connection`](super::Connection) task owns the writes. Clients and the peer set only read it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestSlot {
+    /// True while the connection is handling a client request, or after either half shuts down.
+    busy: Arc<AtomicBool>,
+}
+
+impl RequestSlot {
+    /// Records whether the connection is handling a client request (or can no longer take one).
+    pub(crate) fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Release);
+    }
+
+    /// Returns true if the connection is waiting for its next client request.
+    pub(crate) fn is_free(&self) -> bool {
+        !self.busy.load(Ordering::Acquire)
+    }
 }
 
 /// A signal sent by the [`Client`] half of a peer connection,
@@ -594,6 +626,7 @@ impl Client {
     fn shutdown(&mut self) {
         // Prevent any senders from sending more messages to this peer.
         self.server_tx.close_channel();
+        self.request_slot.set_busy(true);
 
         // Ask the heartbeat task to stop.
         if let Some(shutdown_tx) = self.shutdown_tx.take() {

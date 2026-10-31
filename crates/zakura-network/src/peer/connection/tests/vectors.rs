@@ -1267,3 +1267,209 @@ async fn truncated_block_request_releases_gossip_slot() {
     assert_eq!(slots.available_permits(), 1);
     connection_task.abort();
 }
+
+/// Lets spawned connection tasks run without advancing the paused clock.
+async fn settle() {
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Returns a client request for `request`, and the receiver for its response.
+fn client_request(
+    request: Request,
+) -> (
+    ClientRequest,
+    oneshot::Receiver<Result<Response, crate::SharedPeerError>>,
+) {
+    let (tx, rx) = oneshot::channel();
+    let request = ClientRequest {
+        request,
+        tx,
+        inv_collector: None,
+        transient_addr: None,
+        span: Span::none(),
+    };
+    (request, rx)
+}
+
+/// Returns a transaction and a block to use as peer responses.
+fn response_vectors() -> (
+    zakura_chain::transaction::UnminedTx,
+    std::sync::Arc<block::Block>,
+) {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    let block: std::sync::Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    (block.transactions[0].clone().into(), block)
+}
+
+/// The request slot is busy exactly while a client request is outstanding, and responses,
+/// `notfound`, unsolicited messages and late responses still reach the right handler.
+#[tokio::test(start_paused = true)]
+async fn request_slot_tracks_responses_and_notfound() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (tx, block) = response_vectors();
+    let txid = tx.id();
+
+    settle().await;
+    assert!(slot.is_free(), "a new connection can write a request");
+
+    // A transaction response holds the slot until it arrives.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    settle().await;
+    assert!(!slot.is_free(), "awaiting a transaction response");
+
+    // An unsolicited block advert goes to the inbound service and keeps the request outstanding.
+    peer_tx
+        .send(Ok(Message::Inv(vec![block.hash().into()])))
+        .await
+        .expect("connection is open");
+    inbound
+        .expect_request_that(
+            |request| matches!(request, Request::AdvertiseBlock(hash, _) if *hash == block.hash()),
+        )
+        .await
+        .respond(Response::Nil);
+    settle().await;
+    assert!(
+        !slot.is_free(),
+        "unsolicited messages do not end the request"
+    );
+
+    peer_tx
+        .send(Ok(Message::Tx(tx.clone())))
+        .await
+        .expect("connection is open");
+    let response = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the transaction");
+    assert!(matches!(response, Response::Transactions(ref txs) if txs.len() == 1));
+    settle().await;
+    assert!(slot.is_free(), "the response frees the slot");
+
+    // A `notfound` for the outstanding transaction ends the request with an error.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    peer_tx
+        .send(Ok(Message::NotFound(vec![txid.into()])))
+        .await
+        .expect("connection is open");
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("peer does not have the transaction");
+    assert!(error.inner_debug().contains("NotFoundResponse"));
+    settle().await;
+    assert!(slot.is_free(), "a notfound frees the slot");
+
+    // A late transaction response that arrives during a block request is handled as a pushed
+    // transaction, and does not complete the block request.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![block.hash().into()]))
+    );
+    peer_tx
+        .send(Ok(Message::Tx(tx.clone())))
+        .await
+        .expect("connection is open");
+    inbound
+        .expect_request_that(|request| matches!(request, Request::PushTransaction(..)))
+        .await
+        .respond(Response::Nil);
+    settle().await;
+    assert!(!slot.is_free(), "still awaiting the block");
+
+    peer_tx
+        .send(Ok(Message::Block(block.clone())))
+        .await
+        .expect("connection is open");
+    let response = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    assert!(matches!(response, Response::Blocks(ref blocks) if blocks.len() == 1));
+    settle().await;
+    assert!(slot.is_free(), "the block response frees the slot");
+
+    connection_task.abort();
+}
+
+/// Cancellation and timeouts free the request slot, and a disconnect leaves it busy.
+#[tokio::test(start_paused = true)]
+async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, error_slot) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (tx, _block) = response_vectors();
+    let txid = tx.id();
+
+    // Cancelling the request frees the slot.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    settle().await;
+    assert!(!slot.is_free());
+    drop(response);
+    settle().await;
+    assert!(slot.is_free(), "cancellation frees the slot");
+
+    // A response timeout fails the request and frees the slot.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("request timed out");
+    assert_eq!(error.inner_debug(), "ConnectionReceiveTimeout");
+    settle().await;
+    assert!(slot.is_free(), "a timeout frees the slot");
+
+    // A disconnect fails the outstanding request and leaves the slot busy.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    peer_tx.close_channel();
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("connection closed");
+    assert_eq!(error.inner_debug(), "ConnectionClosed");
+    assert!(error_slot.try_get_error().is_some());
+    assert!(!slot.is_free(), "a failed connection cannot write requests");
+
+    let _ = connection_task.await;
+}

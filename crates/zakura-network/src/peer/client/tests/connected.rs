@@ -95,6 +95,7 @@ impl ConnectedClient {
             Vec::new(),
         );
         let block_uploads = connection.block_uploads.clone();
+        let request_slot = connection.request_slot.clone();
         let connection_task = tokio::spawn(connection.run(peer_rx));
 
         // The client shuts down if the heartbeat task drops its shutdown receiver,
@@ -107,6 +108,7 @@ impl ConnectedClient {
 
         let client = Client {
             block_uploads,
+            request_slot,
             peer_registry_updater: None,
             connection_info,
             shutdown_tx: Some(shutdown_tx),

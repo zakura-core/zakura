@@ -6,26 +6,32 @@
 
 use std::{collections::HashSet, iter, sync::Arc, time::Duration};
 
-use futures::{channel::mpsc, stream, SinkExt, Stream, StreamExt};
+use futures::{
+    channel::mpsc,
+    future::BoxFuture,
+    stream::{self, BoxStream},
+    FutureExt, SinkExt, StreamExt,
+};
 use tower::{discover::Change, Service, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block},
+    chain_tip::mock::MockChainTip,
     parameters::Network,
     serialization::ZcashDeserializeInto,
-    transaction::UnminedTx,
+    transaction::{self, UnminedTx, UnminedTxId},
 };
 
 use crate::{
     peer::{ConnectedClient, LoadTrackedClient, MinimumPeerVersion},
-    peer_set::inventory_registry::InventoryStatus,
+    peer_set::{inventory_registry::InventoryStatus, PeerSet},
     protocol::external::{InventoryHash, Message},
     BoxError, PeerSocketAddr, Request, Response,
 };
 
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use super::PeerSetBuilder;
+use super::{PeerSetBuilder, PeerSetGuard};
 
 /// The block that peers advertise in these tests.
 const BLOCK_HASH: block::Hash = block::Hash([0x77; 32]);
@@ -111,22 +117,25 @@ fn test_transaction() -> UnminedTx {
 }
 
 /// Puts `peers` in a discovery stream for the peer set.
-fn discover(
-    peers: Vec<(PeerSocketAddr, LoadTrackedClient)>,
-) -> impl Stream<Item = Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>> {
+fn discover(peers: Vec<(PeerSocketAddr, LoadTrackedClient)>) -> TestDiscover {
     stream::iter(
         peers
             .into_iter()
             .map(|(addr, client)| Ok(Change::Insert(addr, client))),
     )
     .chain(stream::pending())
+    .boxed()
 }
+
+/// The peer discovery stream used by these tests.
+type TestDiscover = BoxStream<'static, Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>;
 
 /// One source: the only advertiser of a block is awaiting a transaction response.
 ///
 /// The peer set treats that client as ready, because its request channel has capacity. The block
 /// request is routed to it, but the connection cannot write the `getdata` until the transaction
-/// response arrives. Routing cannot avoid this wait, because no other peer advertised the block.
+/// response arrives. Routing cannot avoid this wait, because no other peer advertised the block,
+/// so the peer set falls back to the busy advertiser.
 #[tokio::test(start_paused = true)]
 async fn block_getdata_waits_behind_tx_response_on_only_advertiser() {
     let _init_guard = zakura_test::init();
@@ -174,6 +183,10 @@ async fn block_getdata_waits_behind_tx_response_on_only_advertiser() {
         peer_set.ready_services.contains_key(&source.addr),
         "a client awaiting a response still reports ready",
     );
+    assert!(
+        !peer_set.ready_services[&source.addr].can_send_request_now(),
+        "but its connection cannot write a request now",
+    );
 
     let _block_response = peer_set.call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()));
 
@@ -199,16 +212,23 @@ async fn block_getdata_waits_behind_tx_response_on_only_advertiser() {
     );
 }
 
-/// Alternate source: the nearest advertiser is awaiting a transaction response, and a second
-/// advertiser is idle.
+/// Peers that both advertised `inventory`: one awaiting a transaction response, one idle.
+struct BusyAndIdleAdvertisers {
+    peer_set: PeerSet<TestDiscover, MockChainTip>,
+    _guard: PeerSetGuard,
+    busy: TestPeer,
+    idle: TestPeer,
+    /// The transaction the busy peer has not answered yet.
+    tx: UnminedTx,
+    tx_response: BoxFuture<'static, Result<Response, crate::SharedPeerError>>,
+}
+
+/// Connects a busy and an idle advertiser of `inventory`, and adds them to a peer set.
 ///
 /// Both peers have been connected for a while. The idle peer's last response took one second, so
 /// its peak-EWMA load is higher than the busy peer's load, even though the busy peer has one request
-/// outstanding. Load-based selection then picks the busy peer.
-#[tokio::test(start_paused = true)]
-async fn block_getdata_routing_with_idle_alternate_advertiser() {
-    let _init_guard = zakura_test::init();
-
+/// outstanding. Load alone therefore selects the busy peer.
+async fn busy_and_idle_advertisers(inventory: InventoryHash) -> BusyAndIdleAdvertisers {
     let mut busy = TestPeer::spawn(1);
     let mut idle = TestPeer::spawn(2);
     let tx = test_transaction();
@@ -236,25 +256,22 @@ async fn block_getdata_routing_with_idle_alternate_advertiser() {
         .with_minimum_peer_version(minimum_peer_version)
         .max_conns_per_ip(2)
         .build();
+
     // The test inventory channel holds one change, so register each advert before the next.
     for addr in [busy.addr, idle.addr] {
         guard
             .inventory_sender()
             .as_mut()
             .expect("guard has an inventory sender")
-            .send(InventoryStatus::new_available(
-                InventoryHash::Block(BLOCK_HASH),
-                addr,
-            ))
+            .send(InventoryStatus::new_available(inventory, addr))
             .expect("peer set receives inventory");
         peer_set.ready().await.expect("peer set is ready");
     }
 
-    let peer_set = peer_set.ready().await.expect("peer set is ready");
     assert_eq!(
         peer_set
             .inventory_registry
-            .advertising_peers(InventoryHash::Block(BLOCK_HASH))
+            .advertising_peers(inventory)
             .copied()
             .collect::<HashSet<_>>(),
         HashSet::from([busy.addr, idle.addr]),
@@ -266,14 +283,53 @@ async fn block_getdata_routing_with_idle_alternate_advertiser() {
             .copied()
             .collect::<HashSet<_>>(),
         HashSet::from([busy.addr, idle.addr]),
+        "a client awaiting a response still reports ready",
     );
+    assert!(
+        peer_set.query_load(&busy.addr) < peer_set.query_load(&idle.addr),
+        "load alone prefers the busy peer",
+    );
+    assert!(!peer_set.ready_services[&busy.addr].can_send_request_now());
+    assert!(peer_set.ready_services[&idle.addr].can_send_request_now());
 
-    let _block_response = peer_set.call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()));
+    BusyAndIdleAdvertisers {
+        peer_set,
+        _guard: guard,
+        busy,
+        idle,
+        tx,
+        tx_response: tx_response.boxed(),
+    }
+}
 
-    // Current behavior: the request goes to the busy advertiser and waits there.
-    assert_eq!(idle.written_now().await, None);
-    tokio::time::advance(Duration::from_millis(300)).await;
-    assert_eq!(busy.written_now().await, None);
+/// Alternate source: one advertiser is awaiting a transaction response, and another is idle.
+///
+/// The block `getdata` leaves immediately through the idle advertiser, and the busy peer's
+/// transaction response still completes.
+#[tokio::test(start_paused = true)]
+async fn block_getdata_routes_to_idle_alternate_advertiser() {
+    let _init_guard = zakura_test::init();
+
+    let BusyAndIdleAdvertisers {
+        mut peer_set,
+        _guard,
+        mut busy,
+        mut idle,
+        tx,
+        tx_response,
+    } = busy_and_idle_advertisers(InventoryHash::Block(BLOCK_HASH)).await;
+
+    let _block_response = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()));
+
+    assert_eq!(
+        idle.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "block getdata leaves through the idle advertiser without waiting",
+    );
 
     busy.peer_inbound
         .send(Ok(Message::Tx(tx.clone())))
@@ -282,6 +338,45 @@ async fn block_getdata_routing_with_idle_alternate_advertiser() {
     assert!(matches!(tx_response.await, Ok(Response::Transactions(_))));
     assert_eq!(
         busy.written_now().await,
-        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        None,
+        "the busy advertiser never receives the block request",
+    );
+}
+
+/// Transaction requests keep today's load-based routing, so they still use a busy advertiser.
+///
+/// Only block requests avoid connections that are awaiting a response, so transaction downloads
+/// are not pushed onto a smaller set of peers.
+#[tokio::test(start_paused = true)]
+async fn tx_getdata_routing_ignores_request_slot() {
+    let _init_guard = zakura_test::init();
+
+    let other_txid = UnminedTxId::Legacy(transaction::Hash([0x55; 32]));
+    let BusyAndIdleAdvertisers {
+        mut peer_set,
+        _guard,
+        mut busy,
+        mut idle,
+        tx,
+        tx_response,
+    } = busy_and_idle_advertisers(other_txid.into()).await;
+
+    let _other_tx_response = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::TransactionsById(iter::once(other_txid).collect()));
+
+    assert_eq!(idle.written_now().await, None);
+
+    busy.peer_inbound
+        .send(Ok(Message::Tx(tx.clone())))
+        .await
+        .expect("connection is open");
+    assert!(matches!(tx_response.await, Ok(Response::Transactions(_))));
+    assert_eq!(
+        busy.written_now().await,
+        Some(Message::GetData(vec![other_txid.into()])),
+        "the transaction request is written after the earlier response",
     );
 }

@@ -1091,6 +1091,8 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 tokio::select! {
                     biased;
                     completed = &mut apply => {
+                        // Holders that remain belong to the backend, whatever the outcome.
+                        transfer_block.leave_pipeline();
                         let terminal = match completed.result {
                             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
                                 super::BlockApplyTerminal::Committed
@@ -1111,6 +1113,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                         // arrives, and state queues a full commit until its parent commits.
                         // Legacy fallback uses the same verifier and state, so it can complete
                         // that work after this driver transfers completion responsibility.
+                        transfer_block.leave_pipeline();
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,

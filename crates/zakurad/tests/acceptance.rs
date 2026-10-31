@@ -3528,7 +3528,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
         let block = block.expect("should have block with latest_chain_tip hash");
 
-        let spends_with_spending_tx_hashes = block.transactions.iter().cloned().flat_map(|tx| {
+        let spends_with_spending_tx_hashes = block.transactions().flat_map(|tx| {
             let tx_hash = tx.hash();
             tx.inputs()
                 .iter()
@@ -3578,7 +3578,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
             );
         }
 
-        tip_hash = block.header.previous_block_hash;
+        tip_hash = block.view().header().previous_block_hash;
     }
 
     assert!(

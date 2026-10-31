@@ -336,7 +336,7 @@ async fn test_get_block_range(
                 expected_height,
             ))))
             .await
-            .respond(ReadResponse::Block(Some(expected_block.clone())));
+            .respond(ReadResponse::Block(Some(expected_block.clone().into())));
 
         let get_block_response = get_block_task
             .await?

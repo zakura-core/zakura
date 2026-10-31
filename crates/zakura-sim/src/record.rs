@@ -40,7 +40,8 @@ use crate::{
 /// touches. Version 20 adds causal inputs and independent state views for
 /// block ownership machine steps. Version 21 tags each machine step by its kind.
 /// Version 22 adds runtime queue funding and retained-owner evidence.
-pub const FORMAT_VERSION: u32 = 22;
+/// Version 23 adds block reactor machine steps and reactor transition facts.
+pub const FORMAT_VERSION: u32 = 23;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -1253,8 +1254,9 @@ mod tests {
     fn block_sync_observation_encoding_is_pinned() {
         use crate::observe::{
             BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncRange,
-            BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission,
-            BlockSyncWorkItem, StorageBranch, WorkOwner, WorkScope,
+            BlockSyncReactorState, BlockSyncReactorTransition, BlockSyncRequest,
+            BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission, BlockSyncWorkItem,
+            StorageBranch, WorkOwner, WorkScope,
         };
 
         let owner = || WorkOwner {
@@ -1414,6 +1416,21 @@ mod tests {
                     decoded_attributed_memory_bytes: 2_000,
                     detached: false,
                 }],
+            },
+            BlockSyncFact::Reactor {
+                transition: BlockSyncReactorTransition::RetryElapsed,
+                state: BlockSyncReactorState {
+                    pending: None,
+                    next_query_id: Some(2),
+                    retry_armed: false,
+                    retry_forced: false,
+                    dispatch_closed: false,
+                    verified_tip: 1,
+                    request_floor: 1,
+                    header_tip: 4,
+                    reset_epoch: 0,
+                    reaction_epoch: 1,
+                },
             },
             BlockSyncFact::SequencerClosed,
         ];

@@ -17,7 +17,10 @@ use crate::{
         Assumptions, Capture, CheckCtx, HasView, Kind, Property, PropertyId, Registry,
         RegistryChecker, Source, Sources, Status, Verdict,
     },
-    record::{machine::MachineStep, InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION},
+    record::{
+        machine::{MachineStep, ReactorAction},
+        InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION,
+    },
     sim::Pick,
     trace::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, RNG},
@@ -31,6 +34,7 @@ use crate::{
 enum Target {
     Ownership,
     Funding,
+    Reactor,
 }
 
 impl Target {
@@ -38,6 +42,7 @@ impl Target {
         match self {
             Self::Ownership => "block/work-ownership",
             Self::Funding => "block/work-funding",
+            Self::Reactor => "block/reactor-policy",
         }
     }
 
@@ -45,6 +50,7 @@ impl Target {
         match self {
             Self::Ownership => "block-work",
             Self::Funding => "block-work-funding",
+            Self::Reactor => "block-reactor",
         }
     }
 
@@ -59,6 +65,11 @@ impl Target {
                 .steps
                 .into_iter()
                 .map(|step| (step.step, MachineStep::WorkFunding(step.into())))
+                .collect(),
+            Self::Reactor => zakura_network::zakura::trace_block_reactor_bytes(input)
+                .steps
+                .into_iter()
+                .map(|step| (step.step, MachineStep::Reactor(step.into())))
                 .collect(),
         }
     }
@@ -98,6 +109,7 @@ fn properties(target: Target) -> Vec<Property<Handle>> {
         claim: match target {
             Target::Ownership => "The block work owner agrees with the independent ownership model after every input.",
             Target::Funding => "At each completed driver operation and before queue destruction, actual queue funding and retained request/receipt reservations agree with the independent model.",
+            Target::Reactor => "After every input, the reactor's pending query, next query ID, retry gate, owed force, closed dispatch, and progress mirrors agree with the independent model, and every accepted or refused query carries the model's exact identity.",
         },
         kind: Kind::Safety,
         assumes: &[],
@@ -106,6 +118,7 @@ fn properties(target: Target) -> Vec<Property<Handle>> {
         check: match target {
             Target::Ownership => |cx| check(Target::Ownership, cx),
             Target::Funding => |cx| check(Target::Funding, cx),
+            Target::Reactor => |cx| check(Target::Reactor, cx),
         },
         witness: None,
     }]
@@ -126,6 +139,15 @@ fn check(target: Target, cx: &mut CheckCtx<'_, Handle>) -> Verdict {
             &work.failure,
             (work.actual != work.expected)
                 .then(|| (format!("{:?}", work.expected), format!("{:?}", work.actual))),
+        ),
+        (Target::Reactor, MachineStep::Reactor(reactor)) => (
+            &reactor.failure,
+            (reactor.actual != reactor.expected).then(|| {
+                (
+                    format!("{:?}", reactor.expected),
+                    format!("{:?}", reactor.actual),
+                )
+            }),
         ),
         _ => {
             cx.missing_evidence("machine transition has the wrong evidence kind");
@@ -177,6 +199,7 @@ fn config(target: Target, value: &Value) -> Result<RunConfig, HarnessError> {
         budget: match target {
             Target::Ownership => 128,
             Target::Funding => 129,
+            Target::Reactor => 128,
         },
         drain_bound: 0,
         ..RunConfig::default()
@@ -427,6 +450,16 @@ impl RecordSink for WitnessSink<'_> {
                     self.drained |=
                         work.drain && work.actual.reserved == 0 && work.expected.reserved == 0;
                 }
+                // The reactor's trigger is an offered query, not a byte charge.
+                Some(MachineStep::Reactor(reactor)) => {
+                    self.charged_work |= reactor.actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            ReactorAction::QueryAccepted { .. }
+                                | ReactorAction::QueryRefused { .. }
+                        )
+                    });
+                }
                 None => {}
             }
         }
@@ -451,6 +484,27 @@ pub const ENTRY: HarnessEntry = HarnessEntry {
         witness(Target::Ownership, value, input, property, expect, sink)
     },
     run_bytes: |bytes, sink, extra| run_bytes(Target::Ownership, bytes, sink, extra),
+};
+
+/// Reactor query and view policy uses reactor decoder-v2 and the same evidence
+/// loop. It decides pure transitions: the real reactor's action channel, reply
+/// routes, and shutdown have their witnesses in zakura-network.
+pub const REACTOR_ENTRY: HarnessEntry = HarnessEntry {
+    name: Target::Reactor.name(),
+    generator: 1,
+    scenario_bytes: 512,
+    pad_scenario: false,
+    composes: &[],
+    planted: false,
+    run: |value, input, sink| run(Target::Reactor, value, input, sink),
+    meta: |value| meta(Target::Reactor, value),
+    config: |value| config(Target::Reactor, value),
+    draw,
+    properties: || registered(Target::Reactor),
+    witness: |value, input, property, expect, sink| {
+        witness(Target::Reactor, value, input, property, expect, sink)
+    },
+    run_bytes: |bytes, sink, extra| run_bytes(Target::Reactor, bytes, sink, extra),
 };
 
 /// Real queue owners use funding decoder-v1 and the same execution/evidence loop.

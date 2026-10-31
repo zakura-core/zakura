@@ -502,6 +502,20 @@ args = ["-max_len=512"]
 timeout-secs = 1800
 
 [[target]]
+package = "p2p"
+name = "block_query"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_reactor"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
 package = "sim"
 name = "block_work_ownership"
 smoke-secs = 60
@@ -511,6 +525,13 @@ timeout-secs = 1800
 [[target]]
 package = "sim"
 name = "block_work_funding"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_reactor_policy"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800

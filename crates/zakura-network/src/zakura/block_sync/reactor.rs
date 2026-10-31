@@ -1,3 +1,4 @@
+use super::work_queue::{WorkQueue, WorkReturnOutcome};
 use super::{
     config::*, events::*, peer_registry::*, regulated::status_sender::StatusSend, sequencer::*,
     sequencer_task::*, state::*, trace::*, wire::*, *,
@@ -7,11 +8,29 @@ use crate::zakura::{
     ZakuraBlockSyncCandidateState,
 };
 use rand_10::Rng;
+use state::{
+    admission_decision, block_sync_frontiers, body_completion_authority,
+    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
+    AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply, QueryOpening,
+    QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts,
+};
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
+mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{
+    replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
+    BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
+    ReactorMachineAction, ReactorMachineQuery, ReactorMachineView,
+};
+pub use state::{
+    ActionRefusal, QueryIdentity, QueryReplyOutcome, ReactorSnapshot, ReactorTransition,
+};
+#[cfg(test)]
+mod tests;
 mod trace;
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
@@ -81,17 +100,6 @@ struct FloorGapDiagnostics {
     next_deadline_ms: Option<u64>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct PendingNeededQuery {
-    query_id: NonZeroU64,
-    scope: zakura_header_chain::BodyWorkAuthority,
-    from: block::Height,
-    limit: u32,
-    best_header_tip: block::Height,
-    best_header_hash: block::Hash,
-    hint_revision: Option<u64>,
-}
-
 fn synchronize_persisted_body_alarm(
     registry: &PeerRegistry,
     view: Option<&zakura_header_chain::CommittedHeaderChainView>,
@@ -109,14 +117,6 @@ fn synchronize_persisted_body_alarm(
             })
     });
     registry.set_persisted_body_alarm(alarm);
-}
-
-fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> BlockSyncFrontiers {
-    BlockSyncFrontiers {
-        finalized_height: snapshot.frontiers.finalized.height,
-        verified_block_tip: snapshot.frontiers.verified_best.height,
-        verified_block_hash: snapshot.frontiers.verified_best.hash,
-    }
 }
 
 /// Spawn a block-sync reactor and return its handle plus action stream.
@@ -160,7 +160,12 @@ pub fn spawn_block_sync_reactor(
     }
 
     let state = BlockSyncState::new(&startup);
-    let mut local_status = state.local_status(&startup.config);
+    let progress = ReactorProgress::new(
+        startup.frontiers,
+        startup.best_header_tip,
+        initial_view(startup.frontiers),
+    );
+    let mut local_status = progress.local_status(&startup.config);
     if let Some(retention) = &body_retention {
         local_status = retention.apply(local_status);
     }
@@ -213,13 +218,6 @@ pub fn spawn_block_sync_reactor(
     let initial_state_version = committed_view
         .as_ref()
         .map(|snapshot| snapshot.state_version);
-    #[cfg(test)]
-    let initial_state_version = initial_state_version.or_else(|| {
-        startup
-            .committed_views
-            .is_none()
-            .then_some(zakura_header_chain::StateVersion::default())
-    });
     let sequencer_input_bytes = Arc::new(AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
@@ -306,30 +304,25 @@ pub fn spawn_block_sync_reactor(
         candidates: candidates_rx,
         routine_wiring: Some(routine_wiring),
     };
-    let reactor = BlockSyncReactor {
-        body_retention,
-        status_refresh_at: None,
-        verified_block_tip: startup.frontiers.verified_block_tip,
-        request_floor: startup.frontiers.verified_block_tip,
-        pending_needed_query: None,
-        hint_refresh: None,
-        needed_query_retry_at: None,
-        pending_body_supplier_restart: None,
-        pending_operator_body_retry: None,
-        next_needed_query_id: NonZeroU64::new(1),
-        last_reset_epoch: 0,
-        last_reaction_epoch: 0,
-        last_view: initial_view(startup.frontiers),
-        published_body_alarm: None,
-        empty_state_body_sync_started: startup.committed_views.is_none()
+    let bootstrap = BootstrapGate::new(
+        startup.committed_views.is_none()
             || startup.frontiers.verified_block_tip > block::Height(0),
-        empty_state_header_quiet_until: committed_view.as_ref().and_then(|snapshot| {
+        committed_view.as_ref().and_then(|snapshot| {
             empty_state_header_quiet_required(snapshot)
                 .then(|| time::Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD)
         }),
-        committed_view,
+    );
+    let reactor = ReactorIO {
+        state: ReactorState::new(
+            startup.state_queries_enabled,
+            progress,
+            bootstrap,
+            committed_view,
+        ),
+        body_retention,
+        published_body_alarm: None,
         startup,
-        state,
+        resources: state,
         registry,
         events: events_rx,
         _events_keepalive: events_keepalive,
@@ -353,15 +346,20 @@ pub fn spawn_block_sync_reactor(
     Ok((handle, actions_rx, task))
 }
 
+/// The block-sync reactor task's runtime half.
+///
+/// It owns the channels, watches, timers, peer sessions, and shared-state
+/// handles. It reads inputs, feeds them to [`ReactorState`], and runs the
+/// operations that state chooses. A synchronous dispatch result reaches
+/// [`ReactorState`] before the next input.
 #[derive(Debug)]
-pub(super) struct BlockSyncReactor {
+pub(super) struct ReactorIO {
+    /// The reactor's logical state.
+    state: ReactorState,
     body_retention: Option<BodyRetention>,
-    /// Earliest pending status delivery, rebuilt after delivery state changes.
-    status_refresh_at: Option<Instant>,
     startup: BlockSyncStartup,
-    state: BlockSyncState,
-    /// Latest atomic header-engine view used to stamp body-work ownership.
-    committed_view: Option<zakura_header_chain::CommittedHeaderChainView>,
+    /// Peer sessions and handles to the shared download owners.
+    resources: BlockSyncState,
     /// Shared per-peer fact table: servable/caps/outstanding written by the
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
@@ -402,57 +400,11 @@ pub(super) struct BlockSyncReactor {
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
     /// Latest-wins progress view published by the Sequencer task.
     sequencer_view: watch::Receiver<SequencerView>,
-    /// Reactor-side mirror of the Sequencer's verified tip (it no longer lives
-    /// in `state`). Updated from the progress view; initialized from startup.
-    verified_block_tip: block::Height,
-    /// Reactor-side scheduler/query lower bound. It follows the Sequencer's
-    /// download floor, but it is not verified state and must not be used for
-    /// serving/status advertisement.
-    request_floor: block::Height,
-    /// Identity and scope of the state query awaiting a response.
-    pending_needed_query: Option<PendingNeededQuery>,
-    /// Revision and bounded height interval of queued hints being refreshed.
-    hint_refresh: Option<(u64, block::Height, block::Height)>,
-    /// Earliest time to retry the last failed body-missing metadata query.
-    needed_query_retry_at: Option<Instant>,
-    /// Supplier-set restart submitted against the current durable version.
-    pending_body_supplier_restart:
-        Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
-    /// Operator retry submitted against the current durable version.
-    pending_operator_body_retry: Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
-    /// Next reactor-local identity for a body-work state query.
-    /// `None` means the reactor exhausted the identifier space and stops scheduling.
-    next_needed_query_id: Option<NonZeroU64>,
-    /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
-    /// a destructive reset.
-    last_reset_epoch: u64,
-    /// Last `reaction_epoch` the reactor reacted to. The heavy serving/producer
-    /// reaction runs only when this advances (i.e. the view reflects a processed
-    /// frontier/reset/apply input, not a pure body buffer/submit).
-    last_reaction_epoch: u64,
-    /// Latest view snapshot, kept so the periodic trace tick can read the
-    /// (remote) Sequencer's reorder/applying/throughput counters.
-    last_view: SequencerView,
     /// Last labeled persistent alarm exported to metrics, for exact clearing.
     published_body_alarm: Option<zakura_header_chain::Frontier>,
-    /// True once this process releases the startup wait or observes body progress.
-    empty_state_body_sync_started: bool,
-    /// Body-query deadline set by the first far-ahead header bootstrap update.
-    empty_state_header_quiet_until: Option<time::Instant>,
 }
 
-fn empty_state_header_quiet_required(snapshot: &zakura_header_chain::EngineSnapshot) -> bool {
-    snapshot.frontiers.verified_best.height == block::Height(0)
-        && snapshot
-            .frontiers
-            .header_best
-            .height
-            .0
-            .saturating_sub(snapshot.frontiers.verified_best.height.0)
-            >= EMPTY_STATE_HEADER_QUIET_MIN_LAG
-}
-
-impl BlockSyncReactor {
+impl ReactorIO {
     async fn run(mut self) {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
@@ -462,7 +414,7 @@ impl BlockSyncReactor {
             .as_ref()
             .map(|retention| retention.retained_height.clone());
         let mut retention_open = retained_height.is_some();
-        set_block_reactor_active_connection_gauge(self.state.peers.len());
+        set_block_reactor_active_connection_gauge(self.resources.peers.len());
         // Per-peer request timeouts are owned by the routines. This local tick
         // also retries the level-triggered needed-body query, so a lost routine
         // notification or a full action queue cannot consume the refill need.
@@ -474,7 +426,7 @@ impl BlockSyncReactor {
         self.trace_sync_state(true);
         loop {
             #[cfg(any(test, zakura_sim))]
-            self.state.work_queue.observe_items();
+            self.resources.work_queue.observe_items();
             // Arm the floor watchdog to the earliest outstanding floor-claim
             // deadline (event-driven, like the per-peer routine's own-timeout
             // arm): force-cancel an expired floor request exactly when it expires
@@ -486,7 +438,7 @@ impl BlockSyncReactor {
             zakura_rt::pin!(empty_state_header_quiet);
             let needed_query_retry = self.needed_query_retry_sleep();
             zakura_rt::pin!(needed_query_retry);
-            let status_refresh_at = self.status_refresh_at;
+            let status_refresh_at = self.state.status.refresh_at();
             let status_refresh = async move {
                 match status_refresh_at {
                     Some(deadline) => time::sleep_until(deadline).await,
@@ -596,14 +548,14 @@ impl BlockSyncReactor {
                     self.publish_metrics();
                 }
                 _ = &mut empty_state_header_quiet,
-                    if self.empty_state_header_quiet_until.is_some() =>
+                    if self.state.bootstrap.is_header_quiet() =>
                 {
-                    self.empty_state_header_quiet_until = None;
-                    self.empty_state_body_sync_started = true;
+                    self.state.bootstrap.start_body_sync();
                     self.query_needed_blocks_with_options(true).await;
                 }
-                _ = &mut needed_query_retry, if self.needed_query_retry_at.is_some() => {
-                    self.needed_query_retry_at = None;
+                _ = &mut needed_query_retry, if self.state.queries.retry_at().is_some() => {
+                    self.state.queries.retry_elapsed();
+                    self.report_transition(ReactorTransition::RetryElapsed);
                     self.query_needed_blocks().await;
                 }
             }
@@ -611,14 +563,14 @@ impl BlockSyncReactor {
     }
 
     fn needed_query_retry_sleep(&self) -> time::Sleep {
-        match self.needed_query_retry_at {
+        match self.state.queries.retry_at() {
             Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
     }
 
     fn empty_state_header_quiet_sleep(&self) -> time::Sleep {
-        match self.empty_state_header_quiet_until {
+        match self.state.bootstrap.header_quiet_until() {
             Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
@@ -629,7 +581,10 @@ impl BlockSyncReactor {
     /// rather than on a fixed poll. Defaults to a long idle sleep when no floor
     /// claim is outstanding; any reactor event recomputes it on the next iteration.
     fn earliest_floor_deadline_sleep(&self) -> time::Sleep {
-        let earliest = next_height(self.request_floor)
+        let earliest = self
+            .state
+            .progress
+            .floor_watchdog_height()
             .and_then(|height| self.registry.earliest_outstanding_deadline_at(height));
         match earliest {
             Some(deadline) => time::sleep(deadline.saturating_duration_since(Instant::now())),
@@ -638,48 +593,29 @@ impl BlockSyncReactor {
     }
 
     fn run_floor_watchdog(&mut self, now: Instant) {
-        let Some(height) = next_height(self.request_floor) else {
+        let Some(height) = self.state.progress.floor_watchdog_height() else {
             return;
         };
-        let (servable_peers, _) = self.registry.floor_gap_servable(height);
-        let claims = self.registry.outstanding_claims_at(height);
-        for claim in claims {
-            if claim.meta.deadline > now {
-                continue;
-            }
-
-            if !self.registry.clear_outstanding_height_for_owner(
-                &claim.peer,
-                claim.height,
-                claim.meta.owner,
-            ) {
-                continue;
-            }
-            let released = self
-                .state
-                .work_queue
-                .revoke_for_owner(claim.meta.owner, [claim.height]);
-
-            // Settlement arbitrates against writer startup. Skipped frames and
-            // already-settled work must not count against the peer.
-            if servable_peers > 2 && released.returned_count > 0 && !released.request_was_unwritten
-            {
-                self.registry.avoid_floor_height_until(
-                    &claim.peer,
-                    claim.height,
-                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
+        let registry = self.registry.clone();
+        let work_queue = self.resources.work_queue.clone();
+        cancel_expired_floor_claims(
+            &registry,
+            &work_queue,
+            height,
+            now,
+            self.startup.config.effective_floor_peer_avoid_cooldown(),
+            |claim, released| {
+                self.trace_floor_watchdog_cancelled(claim, released);
+                metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
+                tracing::debug!(
+                    peer = ?claim.peer,
+                    height = ?claim.height,
+                    estimated_bytes = claim.meta.estimated_bytes,
+                    released = released.released_bytes,
+                    "force-cancelled expired Zakura block-sync floor request"
                 );
-            }
-            self.trace_floor_watchdog_cancelled(&claim, released);
-            metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
-            tracing::debug!(
-                peer = ?claim.peer,
-                height = ?claim.height,
-                estimated_bytes = claim.meta.estimated_bytes,
-                released = released.released_bytes,
-                "force-cancelled expired Zakura block-sync floor request"
-            );
-        }
+            },
+        );
     }
 
     async fn handle_event(&mut self, event: BlockSyncEvent) {
@@ -718,8 +654,10 @@ impl BlockSyncReactor {
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => {
                 let scope = self
+                    .state
                     .body_work_scope()
-                    .expect("test reactors synthesize a body-work scope");
+                    .expect("test reactors start with a committed view");
+                self.state.queries.clear();
                 self.handle_needed_blocks(scope, blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
@@ -753,26 +691,16 @@ impl BlockSyncReactor {
         peer: &ZakuraPeerId,
         direction: ServicePeerDirection,
     ) -> ServiceAdmissionDecision {
-        if self.state.peers.contains_key(peer) {
-            return ServiceAdmissionDecision::Admit;
-        }
-
-        let limits = self.startup.config.peer_limits;
-        let admitted = self.admitted_count(direction);
-        let cap = match direction {
-            ServicePeerDirection::Inbound => limits.max_inbound_peers,
-            ServicePeerDirection::Outbound => limits.max_outbound_peers,
-        };
-
-        if admitted >= cap {
-            ServiceAdmissionDecision::RejectFull
-        } else {
-            ServiceAdmissionDecision::Admit
-        }
+        admission_decision(
+            self.startup.config.peer_limits,
+            direction,
+            self.resources.peers.contains_key(peer),
+            self.admitted_count(direction),
+        )
     }
 
     fn admitted_count(&self, direction: ServicePeerDirection) -> usize {
-        self.state
+        self.resources
             .peers
             .values()
             .filter(|peer| peer.direction == direction)
@@ -780,9 +708,10 @@ impl BlockSyncReactor {
     }
 
     fn publish_peer_snapshot(&self) {
-        let _ = self
-            .peers
-            .send(self.state.peer_snapshot(self.startup.config.peer_limits));
+        let _ = self.peers.send(
+            self.resources
+                .peer_snapshot(self.startup.config.peer_limits),
+        );
     }
 
     fn publish_candidate_state(&self) {
@@ -835,24 +764,25 @@ impl BlockSyncReactor {
                 ?decision,
                 "locally parking Zakura block-sync service session"
             );
-            self.state.parked_peers.insert(peer.clone());
+            self.resources.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
             self.publish_peer_snapshot();
             self.publish_candidate_state();
             return;
         }
 
-        self.state.parked_peers.remove(&peer);
+        self.resources.parked_peers.remove(&peer);
         // inverted inbound flow: the per-peer pipe-routine was already spawned by
         // `service::add_peer` (the pipe spawn point), wired with the shared
         // primitives and its registry generation. The reactor keeps only a thin
         // serving handle (session + serving meters) — it neither spawns the
         // routine nor holds a per-peer inbound channel.
         let peer_state = PeerBlockState::new(session);
-        self.state.peers.insert(peer.clone(), peer_state);
-        set_block_reactor_active_connection_gauge(self.state.peers.len());
+        self.resources.peers.insert(peer.clone(), peer_state);
+        self.state.status.admit(&peer, Instant::now());
+        set_block_reactor_active_connection_gauge(self.resources.peers.len());
 
-        self.trace_peer_connected(&peer, direction, self.state.peers.len());
+        self.trace_peer_connected(&peer, direction, self.resources.peers.len());
         self.publish_peer_snapshot();
         self.publish_candidate_state();
         self.send_status(&peer, self.local_status(), Instant::now(), "peer_connected");
@@ -867,16 +797,17 @@ impl BlockSyncReactor {
         // `work.pending` and releases their budget. The reactor only drops its
         // thin serving handle and the closed registry entry. A replacement
         // admitted before this event keeps its entry.
-        if self.state.peers.remove(&peer).is_some() {
-            set_block_reactor_active_connection_gauge(self.state.peers.len());
+        if self.resources.peers.remove(&peer).is_some() {
+            self.state.status.remove(&peer);
+            set_block_reactor_active_connection_gauge(self.resources.peers.len());
             self.trace_peer_disconnected(
                 &peer,
                 self.registry_received_status(&peer),
-                self.state.peers.len(),
+                self.resources.peers.len(),
             );
         }
         self.registry.remove_closed_session(&peer);
-        self.state.parked_peers.remove(&peer);
+        self.resources.parked_peers.remove(&peer);
         self.flush_status_refresh();
         self.publish_peer_snapshot();
         self.publish_candidate_state();
@@ -887,166 +818,110 @@ impl BlockSyncReactor {
     }
 
     async fn handle_header_tip_changed(&mut self, height: block::Height, hash: block::Hash) {
-        self.state.best_header_tip = height;
-        self.state.best_header_hash = hash;
+        self.state.progress.observe_header_tip(height, hash);
         self.query_needed_blocks().await;
     }
 
+    /// Run the operations a new committed view asks for, in the order the
+    /// view's state chose them.
     async fn observe_committed_view(
         &mut self,
         view: zakura_header_chain::CommittedHeaderChainView,
     ) {
-        let previous = self.committed_view.clone();
-        let previous_scope = self.body_work_scope();
-        let body_work_epoch_changed = previous
-            .as_ref()
-            .is_some_and(|old| old.body_work_epoch != view.body_work_epoch);
-        let previous_body_alarm = previous.as_ref().and_then(|old| {
-            old.alarms
-                .header_best_body_unavailable
-                .filter(|summary| summary.alarmed)
-                .map(|_| {
-                    (
-                        zakura_header_chain::BodyWorkAuthority::for_view(old),
-                        old.frontiers.header_best.hash,
-                    )
-                })
-        });
-        let frontiers = block_sync_frontiers(&view);
-        let header_best = view.frontiers.header_best;
-        self.committed_view = Some(view.clone());
-        self.pending_body_supplier_restart = None;
-        self.pending_operator_body_retry = None;
         synchronize_persisted_body_alarm(&self.registry, Some(&view));
+        let update = self
+            .state
+            .observe_committed_view(view, time::Instant::now());
 
-        let current_alarm_hash = view
-            .alarms
-            .header_best_body_unavailable
-            .filter(|summary| summary.alarmed)
-            .map(|_| header_best.hash);
-        if let Some((scope, hash)) =
-            previous_body_alarm.filter(|(_, hash)| Some(*hash) != current_alarm_hash)
-        {
+        if let Some((scope, hash)) = update.alarm_cleared {
             let _ = self
                 .sequencer_control
                 .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
         }
-
-        let current_scope = self.body_work_scope();
-        if previous.as_ref().map(|old| old.state_version) != Some(view.state_version) {
+        if let Some(state_version) = update.state_version {
             let _ = self
                 .sequencer_control
-                .send(SequencerControlInput::StateVersionChanged(
-                    view.state_version,
-                ));
+                .send(SequencerControlInput::StateVersionChanged(state_version));
         }
-        if current_scope != previous_scope {
-            self.clear_pending_needed_query();
-            let authority =
-                current_scope.expect("a committed view always constructs current body authority");
-            if body_work_epoch_changed {
+        match update.authority {
+            None => {}
+            Some(AuthorityUpdate::EpochChanged {
+                authority,
+                frontiers,
+            }) => {
+                self.report_transition(ReactorTransition::AuthorityChanged {
+                    authority,
+                    epoch_changed: true,
+                });
                 let _ = self
                     .sequencer_control
                     .send(SequencerControlInput::BodyWorkEpochChanged {
                         authority,
                         frontiers,
                     });
-            } else {
-                self.state.work_queue.refresh_authority(authority);
+            }
+            Some(AuthorityUpdate::Refreshed(authority)) => {
+                self.report_transition(ReactorTransition::AuthorityChanged {
+                    authority,
+                    epoch_changed: false,
+                });
+                self.resources.work_queue.refresh_authority(authority);
                 let _ = self
                     .sequencer_control
                     .send(SequencerControlInput::WorkAuthorityRefreshed { authority });
             }
         }
-
-        let header_changed = previous
-            .as_ref()
-            .is_none_or(|old| old.frontiers.header_best != header_best);
-        if header_changed {
-            self.state.best_header_tip = header_best.height;
-            self.state.best_header_hash = header_best.hash;
-            if !self.empty_state_body_sync_started && empty_state_header_quiet_required(&view) {
-                self.empty_state_header_quiet_until
-                    .get_or_insert_with(|| time::Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
+        match update.frontiers {
+            FrontierUpdate::Unchanged => {}
+            FrontierUpdate::Initial(frontiers) => {
+                self.handle_chain_tip_reset(frontiers, false).await
+            }
+            FrontierUpdate::Advanced(frontiers) => {
+                self.handle_state_frontiers_changed(frontiers).await
             }
         }
-
-        match previous.as_ref() {
-            None => self.handle_chain_tip_reset(frontiers, false).await,
-            Some(_) if body_work_epoch_changed => {}
-            Some(old)
-                if old.frontiers.verified_best != view.frontiers.verified_best
-                    || old.frontiers.finalized != view.frontiers.finalized =>
-            {
-                debug_assert!(
-                    view.frontiers.verified_best.height >= old.frontiers.verified_best.height,
-                    "same-epoch verified authority cannot retreat"
-                );
-                debug_assert!(
-                    view.frontiers.verified_best.height != old.frontiers.verified_best.height
-                        || view.frontiers.verified_best.hash == old.frontiers.verified_best.hash,
-                    "same-epoch verified authority cannot replace a hash at the same height"
-                );
-                self.handle_state_frontiers_changed(frontiers).await;
-            }
-            Some(_) => {}
+        match update.hints {
+            HintUpdate::Unchanged => {}
+            HintUpdate::Apply { after_revision } => self.apply_body_size_hints(after_revision),
+            HintUpdate::Restart { revision } => self
+                .state
+                .queries
+                .start_hint_refresh(revision, self.resources.work_queue.queued_bounds()),
         }
-
-        if body_work_epoch_changed {
-            self.hint_refresh = None;
-        }
-        let hints_changed = previous
-            .as_ref()
-            .is_some_and(|old| old.body_size_hint_revision != view.body_size_hint_revision);
-        let refresh_pending_query = hints_changed && self.pending_needed_query.is_some();
-        if hints_changed {
-            // An older query can carry sizes from before this correction.
-            self.clear_pending_needed_query();
-            let old_revision = previous
-                .as_ref()
-                .expect("a hint change has a previous view")
-                .body_size_hint_revision;
-            let batches = view.body_size_hint_batches.as_deref().unwrap_or_default();
-            let first_revision = batches.first().map(|batch| batch.revision);
-            if first_revision.is_some_and(|first| first <= old_revision.saturating_add(1)) {
-                if let Some(scope) = current_scope {
-                    self.state.work_queue.refresh_size_estimates(
-                        scope,
-                        batches
-                            .iter()
-                            .filter(|batch| batch.revision > old_revision)
-                            .flat_map(|batch| batch.updates.iter().copied())
-                            .map(|(height, hash, hint)| {
-                                (
-                                    height,
-                                    hash,
-                                    match hint {
-                                        zakura_header_chain::BodySizeHint::Known(size) => {
-                                            BlockSizeEstimate::Advertised(size.get())
-                                        }
-                                        zakura_header_chain::BodySizeHint::Unknown => {
-                                            BlockSizeEstimate::Unknown
-                                        }
-                                    },
-                                )
-                            }),
-                    );
-                }
-            } else {
-                self.hint_refresh = self
-                    .state
-                    .work_queue
-                    .queued_bounds()
-                    .map(|(from, through)| (view.body_size_hint_revision, from, through));
-            }
-        }
-        if header_changed
-            || current_scope != previous_scope
-            || refresh_pending_query
-            || (hints_changed && self.hint_refresh.is_some())
-        {
+        if update.forces_refill(self.state.queries.hint_refresh().is_some()) {
             self.query_needed_blocks_with_options(true).await;
         }
+    }
+
+    /// Apply the committed view's body-size hint batches newer than
+    /// `after_revision` to queued work.
+    fn apply_body_size_hints(&self, after_revision: u64) {
+        let Some(view) = self.state.committed_view() else {
+            return;
+        };
+        let scope = zakura_header_chain::BodyWorkAuthority::for_view(view);
+        let batches = view.body_size_hint_batches.as_deref().unwrap_or_default();
+        self.resources.work_queue.refresh_size_estimates(
+            scope,
+            batches
+                .iter()
+                .filter(|batch| batch.revision > after_revision)
+                .flat_map(|batch| batch.updates.iter().copied())
+                .map(|(height, hash, hint)| {
+                    (
+                        height,
+                        hash,
+                        match hint {
+                            zakura_header_chain::BodySizeHint::Known(size) => {
+                                BlockSizeEstimate::Advertised(size.get())
+                            }
+                            zakura_header_chain::BodySizeHint::Unknown => {
+                                BlockSizeEstimate::Unknown
+                            }
+                        },
+                    )
+                }),
+        );
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
@@ -1055,10 +930,9 @@ impl BlockSyncReactor {
         // window before the view comes back), then forward the Sequencer-side
         // advance. The stale-frontier guard reads the verified-tip mirror; a
         // genuinely stale update is dropped here so we do not forward a no-op.
-        self.state.finalized_height = self.state.finalized_height.max(frontiers.finalized_height);
-        if frontiers.verified_block_tip < self.verified_block_tip {
+        if !self.state.progress.observe_frontiers(frontiers) {
             tracing::debug!(
-                current = ?self.verified_block_tip,
+                current = ?self.state.progress.verified_block_tip,
                 stale = ?frontiers.verified_block_tip,
                 "ignoring stale Zakura block-sync frontier update"
             );
@@ -1099,10 +973,7 @@ impl BlockSyncReactor {
     /// Reads the `request_floor` mirror (the Sequencer's download floor now lives
     /// on the task); this is a GC/candidate use, never a fetch throttle.
     fn prune_needed_below_floor(&mut self) {
-        let floor = self.request_floor;
-        let before = self.state.needed_heights.len();
-        self.state.needed_heights.retain(|height| *height > floor);
-        if self.state.needed_heights.len() != before {
+        if self.state.prune_needed_below_floor() {
             self.publish_candidate_state();
         }
     }
@@ -1112,7 +983,10 @@ impl BlockSyncReactor {
         frontiers: BlockSyncFrontiers,
         preserve_active_successors: bool,
     ) {
-        self.clear_pending_needed_query();
+        self.state.queries.clear();
+        self.report_transition(ReactorTransition::TipReset {
+            tip: frontiers.verified_block_tip,
+        });
         // Reactor-owned prep: precompute the two peer-outstanding-derived halves
         // of the reset decision (the reactor owns peer state; the task ORs them
         // with its Sequencer-internal predicates). The `verified_tip()`/`floor()`
@@ -1166,72 +1040,49 @@ impl BlockSyncReactor {
     /// reactor's mirrors, then run the serving/peer/candidate/producer half
     /// (status refresh, candidate prune, drop-outstanding, re-query, re-schedule).
     async fn on_sequencer_view_changed(&mut self, view: SequencerView) {
-        // Always update the mirrors so the producer lower bound,
-        // candidate prune, and trace read the latest floor/tip — even on a
-        // view change that only reflects buffering/submission. The mirrors are
-        // read-only control inputs; updating them is cheap and idempotent.
-        let reset_advanced = view.reset_epoch != self.last_reset_epoch;
-        let reaction_advanced = view.reaction_epoch != self.last_reaction_epoch;
-        let tip_advanced = view.verified_tip > self.verified_block_tip;
-
-        if view.verified_tip > block::Height(0) {
-            self.empty_state_body_sync_started = true;
-            self.empty_state_header_quiet_until = None;
-        }
-
-        self.last_view = view;
-        self.state.finalized_height = self.state.finalized_height.max(view.finalized);
-        self.verified_block_tip = view.verified_tip;
-        self.request_floor = view.download_floor;
-        self.state.verified_block_hash = view.verified_hash;
-        self.state.servable_high = view.verified_tip;
-        self.state.servable_hash = view.verified_hash;
-
-        // The heavy serving/peer/candidate/producer reaction (drop-outstanding,
-        // prune, status, query, schedule) runs only for a frontier advance, reset,
-        // or apply-finished — never for a pure body buffer/submit, which only
-        // reschedules the forwarding peer (the reactor already did that after
-        // forwarding `AcceptBody`). The `reaction_epoch` advances exactly for those
-        // inputs.
-        if !reaction_advanced {
+        // The mirrors update on every view, even one that only reflects
+        // buffering or submission, so the producer lower bound, candidate
+        // prune, and trace read the latest floor and tip.
+        //
+        // The heavy serving, candidate, and producer reaction runs only when
+        // `reaction_epoch` advances: for a frontier advance, reset, or
+        // apply-finished. A pure body buffer or submit needs no reaction.
+        let ViewReaction::React {
+            reset,
+            tip_advanced,
+        } = self.state.observe_view(view)
+        else {
             return;
-        }
-        self.last_reaction_epoch = view.reaction_epoch;
+        };
+        self.report_transition(ReactorTransition::View {
+            reset,
+            tip_advanced,
+        });
 
-        if reset_advanced {
-            // A destructive reset (reset = in-place clear in each routine). The
-            // Sequencer already pinned its floor/tip and `work.reset_above`'d the
-            // dropped successor heights, then bumped `reset_epoch`. Each per-peer
-            // pipe-routine watches the same `view`: on the `reset_epoch` bump it
-            // clears its own outstanding in place (returns unreceived heights to
-            // `work.pending`, releases their budget) and re-fans — no task teardown,
-            // so the transport is never torn down and there is no respawn
-            // double-claim race. The reactor only re-runs the producer/serving tail
-            // below; the routines self-reset off the view.
-            self.last_reset_epoch = view.reset_epoch;
+        if reset {
+            // A destructive reset. The Sequencer already pinned its floor and
+            // tip, ran `work.reset_above` on the dropped successor heights, and
+            // bumped `reset_epoch`. Each pipe-routine watches the same view and
+            // clears its own outstanding requests in place on that bump, so the
+            // transport stays up and no respawn can double-claim work. The state
+            // already dropped the pending query: its bounds predate the reset
+            // and must not suppress the post-reset refill through deduplication.
             self.trace_chain_tip_reset(view.verified_tip);
-            // Drop any in-flight producer query: its `(from, limit, tip)` was
-            // computed against the pre-reset frontier and must not suppress the
-            // post-reset refill via the pending-query dedupe.
-            self.clear_pending_needed_query();
         } else if tip_advanced {
-            // A non-destructive frontier advance does NOT respawn and does NOT
-            // proactively drop outstanding through the tip: a still-open request
-            // for a now-committed height releases its reservation on delivery or
-            // on its own timeout, so there is no leak, only a slightly later
-            // release. Trace the change only when the tip actually moved.
+            // A non-destructive frontier advance drops no outstanding request.
+            // A still-open request for a now-committed height releases its
+            // reservation on delivery or on its own timeout.
             self.trace_frontiers_changed(view.verified_tip);
         }
         self.prune_needed_below_floor();
 
         self.flush_status_refresh();
-        // After a destructive reset the WorkQueue is empty above the new floor, but
-        // peer routines clear their registry outstanding asynchronously. A plain query can see the pre-reset outstanding amount, decide the
-        // pipeline is "full", and skip the refill, leaving `pending` empty and
-        // `max_outstanding = 0` until an external wake.
-        // Therefore, we force the post-reset
-        // producer query so header reanchors / tip resets cannot stall that way.
-        self.query_needed_blocks_with_options(reset_advanced).await;
+        // After a destructive reset the WorkQueue is empty above the new floor,
+        // but peer routines clear their registry outstanding asynchronously. A
+        // plain query can see the pre-reset outstanding amount, decide the
+        // pipeline is full, and skip the refill until an external wake. The
+        // forced post-reset query prevents that stall.
+        self.query_needed_blocks_with_options(reset).await;
     }
 
     async fn handle_needed_blocks(
@@ -1239,7 +1090,6 @@ impl BlockSyncReactor {
         scope: zakura_header_chain::BodyWorkAuthority,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        self.clear_pending_needed_query();
         // The state reports every header-known, body-missing height above the
         // download floor, but it has no visibility into our in-memory buffers.
         // Heights already at or below the body download floor, held in the
@@ -1282,17 +1132,16 @@ impl BlockSyncReactor {
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
-                block.height > self.request_floor
-                    && !self.state.work_queue.in_flight_contains(block.height)
+                block.height > self.state.progress.request_floor
+                    && !self.resources.work_queue.in_flight_contains(block.height)
                     && !self
                         .registry
                         .has_outstanding_request(block.height, block.hash)
             })
             .collect();
 
-        self.state.needed_heights = blocks.iter().map(|block| block.height).collect();
-        self.state.needed_heights.sort_unstable();
-        self.state.needed_heights.dedup();
+        self.state
+            .set_needed_heights(blocks.iter().map(|block| block.height));
 
         // The WorkQueue producer is additive and idempotent: `extend` inserts only
         // heights above the floor that are not already pending or in flight, so a
@@ -1309,7 +1158,7 @@ impl BlockSyncReactor {
         // candidate set grow (or any observer of the candidate watch) can rely on
         // the matching heights already being takeable, with no extend-vs-observe
         // race.
-        let count = self.state.work_queue.extend(
+        let count = self.resources.work_queue.extend(
             scope,
             blocks
                 .into_iter()
@@ -1326,43 +1175,38 @@ impl BlockSyncReactor {
         body_anchor: zakura_header_chain::Frontier,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        let completion = (query_id, scope);
-        let pending = self
-            .pending_needed_query
-            .map(|pending| (pending.query_id, pending.scope));
-        if pending != Some(completion) {
-            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
-                .increment(1);
-            return;
-        }
-        let completed_query = self
-            .pending_needed_query
-            .expect("the completion matched above");
-        self.clear_pending_needed_query();
-
-        if self.body_work_scope() != Some(scope) {
-            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
-                .increment(1);
-            self.query_needed_blocks().await;
-            return;
-        }
-        let anchor_changed = body_anchor.height != self.verified_block_tip
-            || body_anchor.hash != self.state.verified_block_hash;
-        if anchor_changed {
-            let frontiers = BlockSyncFrontiers {
-                finalized_height: self.state.finalized_height,
-                verified_block_tip: body_anchor.height,
-                verified_block_hash: body_anchor.hash,
-            };
-            if body_anchor.height > self.verified_block_tip {
-                self.handle_state_frontiers_changed(frontiers).await;
-            } else {
-                self.handle_chain_tip_reset(frontiers, false).await;
+        let reply = self
+            .state
+            .complete_needed_query(query_id, scope, body_anchor);
+        self.report_transition(ReactorTransition::QueryReply {
+            query_id,
+            scope,
+            outcome: reply.outcome(),
+        });
+        let completed_query = match reply {
+            NeededReply::Stale => {
+                metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
+                    .increment(1);
+                return;
             }
-            return;
-        }
+            NeededReply::StaleAuthority => {
+                metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
+                    .increment(1);
+                self.query_needed_blocks().await;
+                return;
+            }
+            NeededReply::AnchorAdvanced(frontiers) => {
+                self.handle_state_frontiers_changed(frontiers).await;
+                return;
+            }
+            NeededReply::AnchorReset(frontiers) => {
+                self.handle_chain_tip_reset(frontiers, false).await;
+                return;
+            }
+            NeededReply::Accept(query) => query,
+        };
         if completed_query.hint_revision.is_some() {
-            self.state.work_queue.refresh_size_estimates(
+            self.resources.work_queue.refresh_size_estimates(
                 scope,
                 blocks
                     .iter()
@@ -1370,14 +1214,8 @@ impl BlockSyncReactor {
             );
         }
         self.handle_needed_blocks(scope, blocks).await;
-        if let Some((revision, from, through)) = self.hint_refresh {
-            if completed_query.hint_revision == Some(revision) && completed_query.from == from {
-                let next = block::Height(from.0.saturating_add(completed_query.limit));
-                self.hint_refresh = (next <= through).then_some((revision, next, through));
-            }
-            if self.hint_refresh.is_some() {
-                self.query_needed_blocks_with_options(true).await;
-            }
+        if self.state.queries.advance_hint_refresh(&completed_query) {
+            self.query_needed_blocks_with_options(true).await;
         }
     }
 
@@ -1386,28 +1224,25 @@ impl BlockSyncReactor {
         query_id: NonZeroU64,
         scope: zakura_header_chain::BodyWorkAuthority,
     ) {
-        let completion = (query_id, scope);
-        let pending = self
-            .pending_needed_query
-            .map(|pending| (pending.query_id, pending.scope));
-        if pending != Some(completion) {
+        let matched = self.state.queries.fail(query_id, scope, Instant::now());
+        self.report_transition(ReactorTransition::QueryFailed {
+            query_id,
+            scope,
+            matched,
+        });
+        if !matched {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query_failed")
                 .increment(1);
             return;
         }
-
-        self.pending_needed_query = None;
-        self.schedule_needed_query_retry();
+        metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
     }
 
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
     /// only. Downloads gate on byte budget + per-peer slots — never on this lag
     /// (no near-tip pause).
     fn body_lag(&self) -> u32 {
-        self.state
-            .best_header_tip
-            .0
-            .saturating_sub(self.verified_block_tip.0)
+        self.state.progress.body_lag()
     }
 
     /// Handle one shared routine→reactor message (inverted inbound flow). The per-peer
@@ -1432,7 +1267,7 @@ impl BlockSyncReactor {
     /// `Status` reply if the routine's rate meter allowed it and republishes the
     /// candidate set.
     fn handle_status_received(&mut self, peer: ZakuraPeerId, send_reply: bool) {
-        if !self.state.peers.contains_key(&peer) {
+        if !self.resources.peers.contains_key(&peer) {
             return;
         }
         self.publish_candidate_state();
@@ -1444,131 +1279,39 @@ impl BlockSyncReactor {
     }
 
     fn restart_body_alarm_for_new_supplier(&mut self) {
-        let Some(snapshot) = self.committed_view.as_ref() else {
+        let Some(header) = self.state.alarmed_header() else {
             return;
         };
-        let Some(previous) = snapshot
-            .alarms
-            .header_best_body_unavailable
-            .filter(|summary| summary.alarmed)
+        let eligible_sources = self.registry.eligible_sources(header.height);
+        let Some(request) = self
+            .state
+            .propose_supplier_restart(&eligible_sources, utc_now())
         else {
             return;
         };
-        let header = snapshot.frontiers.header_best;
-        let eligible_sources = self.registry.eligible_sources(header.height);
-        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
-        let supplier_set_digest =
-            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
-        let has_new_supplier = suppliers > previous.suppliers
-            || (suppliers == previous.suppliers
-                && supplier_set_digest != previous.supplier_set_digest);
-        if !has_new_supplier
-            || self.pending_body_supplier_restart
-                == Some((snapshot.state_version, header.hash, supplier_set_digest))
-        {
-            return;
+        if self.dispatch_action(request.action()).is_ok() {
+            self.state.alarm_request_accepted(request);
         }
-
-        let now = utc_now();
-        let availability = zakura_header_chain::BodyUnavailableSummary {
-            started_at: previous.started_at,
-            attempts: previous.attempts,
-            suppliers,
-            supplier_set_digest,
-            alarmed: true,
-            next_probe_at: now,
-        };
-        let mut hasher = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"ZkBodyDiscover1_")
-            .to_state();
-        hasher.update(&snapshot.state_version.get().to_le_bytes());
-        hasher.update(&header.height.0.to_le_bytes());
-        hasher.update(&header.hash.0);
-        hasher.update(&supplier_set_digest);
-        let discovery = zakura_header_chain::BodySupplierDiscovered {
-            hash: header.hash,
-            evidence: zakura_header_chain::EvidenceId::from_digest(
-                hasher
-                    .finalize()
-                    .as_bytes()
-                    .try_into()
-                    .expect("the configured discovery digest is exactly 32 bytes"),
-            ),
-            availability,
-        };
-        if !self.dispatch_action(BlockSyncAction::RestartBodyAvailability {
-            expected_version: snapshot.state_version,
-            discovery,
-        }) {
-            return;
-        }
-        self.pending_body_supplier_restart =
-            Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
     fn retry_body_availability(&mut self, hash: block::Hash) {
-        let Some(snapshot) = self.committed_view.as_ref() else {
+        let Some(header) = self
+            .state
+            .alarmed_header()
+            .filter(|header| header.hash == hash)
+        else {
             return;
         };
-        let header = snapshot.frontiers.header_best;
-        if header.hash != hash
-            || !snapshot
-                .alarms
-                .header_best_body_unavailable
-                .is_some_and(|summary| summary.alarmed)
-        {
-            return;
-        }
         let eligible_sources = self.registry.eligible_sources(header.height);
-        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
-        if suppliers == 0 {
+        let Some(request) = self
+            .state
+            .propose_operator_retry(hash, &eligible_sources, utc_now())
+        else {
             return;
-        }
-        let supplier_set_digest =
-            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
-        if self.pending_operator_body_retry
-            == Some((snapshot.state_version, header.hash, supplier_set_digest))
-        {
-            return;
-        }
-
-        let now = utc_now();
-        let availability = zakura_header_chain::BodyUnavailableSummary {
-            started_at: now,
-            attempts: 0,
-            suppliers,
-            supplier_set_digest,
-            alarmed: false,
-            next_probe_at: now,
         };
-        let mut hasher = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"ZkBodyOperator1_")
-            .to_state();
-        hasher.update(&snapshot.state_version.get().to_le_bytes());
-        hasher.update(&header.height.0.to_le_bytes());
-        hasher.update(&header.hash.0);
-        hasher.update(&supplier_set_digest);
-        let retry = zakura_header_chain::OperatorBodyRetry {
-            hash: header.hash,
-            evidence: zakura_header_chain::EvidenceId::from_digest(
-                hasher
-                    .finalize()
-                    .as_bytes()
-                    .try_into()
-                    .expect("the configured operator-retry digest is exactly 32 bytes"),
-            ),
-            availability,
-        };
-        if !self.dispatch_action(BlockSyncAction::RetryBodyAvailability {
-            expected_version: snapshot.state_version,
-            retry,
-        }) {
-            return;
+        if self.dispatch_action(request.action()).is_ok() {
+            self.state.alarm_request_accepted(request);
         }
-        self.pending_operator_body_retry =
-            Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1595,9 +1338,9 @@ impl BlockSyncReactor {
             height,
             token,
             outcome.result(),
-            self.state.work_queue.budget().reserved(),
+            self.resources.work_queue.budget().reserved(),
         );
-        let persisted_availability = self.committed_view.as_ref().and_then(|snapshot| {
+        let persisted_availability = self.state.committed_view().and_then(|snapshot| {
             (snapshot.frontiers.header_best.hash == hash)
                 .then_some(snapshot.alarms.header_best_body_unavailable)
                 .flatten()
@@ -1634,148 +1377,63 @@ impl BlockSyncReactor {
         );
     }
 
-    async fn query_needed_blocks(&mut self) -> bool {
+    async fn query_needed_blocks(&mut self) {
         self.query_needed_blocks_with_options(false).await
-    }
-
-    fn clear_pending_needed_query(&mut self) {
-        self.pending_needed_query = None;
-        self.needed_query_retry_at = None;
-    }
-
-    fn schedule_needed_query_retry(&mut self) {
-        self.needed_query_retry_at = Some(Instant::now() + NEEDED_BLOCK_QUERY_RETRY_DELAY);
-        metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
     }
 
     /// Producer refill. When `force` is set (destructive reset), skip the
     /// low-water gate so a still-uncleared registry outstanding snapshot cannot
     /// suppress the post-`reset_above` re-query.
-    async fn query_needed_blocks_with_options(&mut self, force: bool) -> bool {
-        if !self.startup.state_queries_enabled {
-            return false;
-        }
-        if force {
-            self.needed_query_retry_at = None;
-        } else if self.needed_query_retry_at.is_some() {
-            return true;
-        }
-        if self.empty_state_header_quiet_until.is_some() {
-            return true;
-        }
-        // A committed verified tip off the selected chain at or above its tip
-        // leaves no selected height above the floor, yet only the state's
-        // answer names the common ancestor block sync must reset to.
-        let diverged = self.committed_view.as_ref().is_some_and(|view| {
-            let frontiers = view.frontiers;
-            frontiers.verified_best.height > frontiers.header_best.height
-                || (frontiers.verified_best.height == frontiers.header_best.height
-                    && frontiers.verified_best.hash != frontiers.header_best.hash)
-        });
-        if self.request_floor >= self.state.best_header_tip && !diverged {
-            self.clear_pending_needed_query();
-            return true;
-        }
-        if self
-            .hint_refresh
-            .is_some_and(|(_, _, through)| through <= self.request_floor)
-        {
-            self.hint_refresh = None;
-        }
-        let refresh = self.hint_refresh;
-        let Some(from) = refresh
-            .map(|(_, from, _)| from)
-            .or_else(|| self.next_needed_block_query_start())
-            .or_else(|| diverged.then_some(self.state.best_header_tip))
-        else {
-            return true;
+    ///
+    /// The action channel's answer reaches [`ReactorState`] before this
+    /// returns, so no other input observes the proposal.
+    async fn query_needed_blocks_with_options(&mut self, force: bool) {
+        let start = match self.state.open_query(force) {
+            QueryOpening::Closed => return,
+            QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
+            QueryOpening::NeedsWork => QueryStart::Work(self.query_work_facts()),
         };
-        if !force
-            && refresh.is_none()
-            && self.local_body_work_blocks() >= self.refill_low_water_blocks()
-        {
-            return true;
-        }
-        let limit = refresh.map_or_else(
-            || self.refill_query_limit_blocks(from),
-            |(_, _, through)| {
-                through
-                    .0
-                    .saturating_sub(from.0)
-                    .saturating_add(1)
-                    .min(NEEDED_BLOCK_REFILL_LIMIT)
-            },
-        );
-        let Some(scope) = self.body_work_scope() else {
-            tracing::error!("cannot schedule Zakura body work without a committed engine snapshot");
-            return false;
+        let proposal = match self.state.propose_query(force, start) {
+            QueryPlan::Idle | QueryPlan::Covered => return,
+            QueryPlan::NoAuthority => {
+                tracing::error!(
+                    "cannot schedule Zakura body work without a committed engine snapshot"
+                );
+                return;
+            }
+            QueryPlan::IdsExhausted => {
+                tracing::error!("exhausted Zakura body-work state-query identifiers");
+                return;
+            }
+            QueryPlan::Dispatch(proposal) => proposal,
         };
-        let Some(query_id) = self.next_needed_query_id else {
-            tracing::error!("exhausted Zakura body-work state-query identifiers");
-            return false;
-        };
-        let query = PendingNeededQuery {
-            query_id,
-            scope,
-            from,
-            limit,
-            best_header_tip: self.state.best_header_tip,
-            best_header_hash: self.state.best_header_hash,
-            hint_revision: refresh.map(|(revision, _, _)| revision),
-        };
-        if self.pending_needed_query.is_some_and(|pending| {
-            pending.hint_revision == query.hint_revision
-                && pending.scope == query.scope
-                && pending.from == query.from
-                && pending.limit == query.limit
-                && pending.best_header_tip == query.best_header_tip
-                && pending.best_header_hash == query.best_header_hash
-        }) {
-            return true;
+        let query = QueryIdentity::from(proposal.query());
+        match self.dispatch_action(proposal.action()) {
+            Ok(()) => {
+                self.state.queries.accepted(proposal);
+                self.report_transition(ReactorTransition::QueryAccepted(query));
+            }
+            Err(refusal) => {
+                self.state
+                    .queries
+                    .refused(proposal, refusal, Instant::now());
+                self.report_transition(ReactorTransition::QueryRefused { query, refusal });
+                if refusal != ActionRefusal::Closed {
+                    metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+                }
+            }
         }
-        let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
-            query_id,
-            from,
-            limit,
-            best_header_tip: self.state.best_header_tip,
-            scope,
-        });
-        if dispatched {
-            self.pending_needed_query = Some(query);
-            self.needed_query_retry_at = None;
-            self.next_needed_query_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
-        } else {
-            self.schedule_needed_query_retry();
-        }
-        dispatched
     }
 
-    fn body_work_scope(&self) -> Option<zakura_header_chain::BodyWorkAuthority> {
-        let scope = self
-            .committed_view
-            .as_ref()
-            .map(zakura_header_chain::BodyWorkAuthority::for_view);
-        #[cfg(not(test))]
-        {
-            scope
-        }
-        #[cfg(test)]
-        {
-            scope.or_else(|| {
-                self.startup.committed_views.is_none().then_some(
-                    zakura_header_chain::BodyWorkAuthority {
-                        header: zakura_header_chain::HeaderWorkAuthority {
-                            header_generation: zakura_header_chain::HeaderGeneration::new(0),
-                            branch: zakura_header_chain::BranchId::new(
-                                self.startup.frontiers.verified_block_hash,
-                                self.state.best_header_hash,
-                            ),
-                        },
-                        verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
-                        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
-                    },
-                )
-            })
+    /// Read the shared-owner facts an ordinary refill query needs.
+    fn query_work_facts(&self) -> WorkFacts {
+        WorkFacts {
+            first_unclaimed: self
+                .resources
+                .work_queue
+                .first_unclaimed_above(self.state.progress.request_floor),
+            backlog: self.local_body_work_blocks(),
+            low_water: self.refill_low_water_blocks(),
         }
     }
 
@@ -1798,64 +1456,19 @@ impl BlockSyncReactor {
             .committed_views
             .as_ref()
             .and_then(|snapshots| snapshots.borrow().clone());
-        #[cfg(test)]
-        if current.is_none() {
-            let scope = self.body_work_scope();
-            return (
-                (scope == Some(owner.authority()))
-                    .then_some((*owner, zakura_header_chain::StateVersion::default())),
-                scope.map(|scope| scope.body_work_epoch),
-            );
-        }
         let Some(current) = current else {
             return (None, None);
         };
-        let mut pending = zakura_header_chain::PendingOwners::default();
-        pending.insert(source, *owner);
-        let semantic_completion =
-            match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
-                zakura_header_chain::BodyCompletionDecision::Current => {
-                    Some((*owner, current.state_version))
-                }
-                zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
-                    Some((owner, current.state_version))
-                }
-                zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
-                    metrics::counter!(
-                        "sync.header_chain.stale_completion.total",
-                        "kind" => format!("body_{reason:?}")
-                    )
-                    .increment(1);
-                    None
-                }
-            };
+        let semantic_completion = body_completion_authority(&current, source, owner)
+            .inspect_err(|reason| {
+                metrics::counter!(
+                    "sync.header_chain.stale_completion.total",
+                    "kind" => format!("body_{reason:?}")
+                )
+                .increment(1);
+            })
+            .ok();
         (semantic_completion, Some(current.body_work_epoch))
-    }
-
-    fn next_needed_block_query_start(&self) -> Option<block::Height> {
-        let from = self
-            .state
-            .work_queue
-            .first_unclaimed_above(self.request_floor)?;
-
-        if from > self.state.best_header_tip {
-            return None;
-        }
-
-        Some(from)
-    }
-
-    fn refill_query_limit_blocks(&self, from: block::Height) -> u32 {
-        let remaining = self
-            .state
-            .best_header_tip
-            .0
-            .saturating_sub(from.0)
-            .saturating_add(1);
-        let fanout_window = self.refill_low_water_blocks().saturating_mul(2).max(1);
-        let fanout_window = u32::try_from(fanout_window).unwrap_or(u32::MAX);
-
-        remaining.min(fanout_window).min(NEEDED_BLOCK_REFILL_LIMIT)
     }
 
     fn local_body_work_blocks(&self) -> usize {
@@ -1878,7 +1491,7 @@ impl BlockSyncReactor {
         // already bounded because the resident look-ahead gate counts retained
         // reorder/applying bodies, so downloads may legitimately run far ahead of
         // commit up to that budget.
-        self.state
+        self.resources
             .work_queue
             .pending_len()
             .saturating_add(outstanding)
@@ -1895,7 +1508,10 @@ impl BlockSyncReactor {
         now: Instant,
         reason: &'static str,
     ) -> bool {
-        let Some(peer_state) = self.state.peers.get_mut(peer) else {
+        let (Some(peer_state), Some(delivery)) = (
+            self.resources.peers.get(peer),
+            self.state.status.delivery_mut(peer),
+        ) else {
             return false;
         };
         let session = peer_state.session.clone();
@@ -1905,7 +1521,7 @@ impl BlockSyncReactor {
         let started = Instant::now();
         let error = match session.offer_status(status) {
             Ok(StatusSend::Queued) => {
-                peer_state.status_delivery.queued(status);
+                delivery.queued(status);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, sent);
                 return true;
@@ -1913,20 +1529,20 @@ impl BlockSyncReactor {
             // The connection's cadence allows the next Status later.
             // Legal pacing is not queue pressure.
             Ok(StatusSend::Deferred(at)) => {
-                peer_state.status_delivery.deferred_until(at);
+                delivery.deferred_until(at);
                 self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
                 return false;
             }
             // The previous Status frame is still waiting for its transport
             // write. The queue may have free slots, so this is not a queue failure.
             Ok(StatusSend::Unwritten) => {
-                peer_state.status_delivery.queue_full(now);
+                delivery.queue_full(now);
                 tracing::debug!(?peer, "previous Zakura block-sync Status is unwritten");
                 self.trace_message_sent(peer, &msg, "unwritten", started.elapsed());
                 return false;
             }
             Ok(StatusSend::QueueFull) => {
-                peer_state.status_delivery.queue_full(now);
+                delivery.queue_full(now);
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
                 self.trace_queue_send_failed(
@@ -1972,38 +1588,34 @@ impl BlockSyncReactor {
             .filter_map(|(peer, received_status, _, _)| (!received_status).then_some(peer))
             .collect();
         let now = Instant::now();
-        let due: Vec<_> = self
-            .state
-            .peers
-            .iter()
-            .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
-            .filter_map(|(id, peer)| {
-                peer.status_delivery
-                    .next_deadline(status, !unready.contains(id))
-                    .filter(|deadline| *deadline <= now)
-                    .map(|_| id.clone())
-            })
-            .collect();
+        let due = self.state.status.due(
+            status,
+            Self::live_status_peers(&self.resources, &unready),
+            now,
+        );
         for peer in due {
             self.send_status(&peer, status, now, "refresh");
         }
-        // The same delivery rules choose both sends and wakes. A full queue
-        // cannot lose its retry when another peer accepts the new range.
-        self.status_refresh_at = self
-            .state
+        // A send can cancel its session, so rearm from the sessions still live.
+        let live = Self::live_status_peers(&self.resources, &unready);
+        self.state.status.rearm(status, live);
+    }
+
+    /// The uncancelled peer sessions, each with whether the peer supplied its status.
+    fn live_status_peers<'a>(
+        resources: &'a BlockSyncState,
+        unready: &'a HashSet<ZakuraPeerId>,
+    ) -> impl Iterator<Item = (&'a ZakuraPeerId, bool)> {
+        resources
             .peers
             .iter()
             .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
-            .filter_map(|(id, peer)| {
-                peer.status_delivery
-                    .next_deadline(status, !unready.contains(id))
-            })
-            .min();
+            .map(|(id, _)| (id, !unready.contains(id)))
     }
 
     fn floor_gap_diagnostics(&self, now: Instant) -> Option<FloorGapDiagnostics> {
-        let height = next_height(self.request_floor)?;
-        if height > self.state.best_header_tip {
+        let height = next_height(self.state.progress.request_floor)?;
+        if height > self.state.progress.best_header_tip {
             return None;
         }
 
@@ -2029,9 +1641,9 @@ impl BlockSyncReactor {
         // counts from the view.
         let state = if outstanding_peers > 0 {
             "outstanding"
-        } else if self.state.work_queue.pending_contains(height) {
+        } else if self.resources.work_queue.pending_contains(height) {
             "queued"
-        } else if self.state.work_queue.in_flight_contains(height) {
+        } else if self.resources.work_queue.in_flight_contains(height) {
             // Held in `in_flight` but no peer has an outstanding request for it:
             // a taken-then-buffered/applying height (or one whose holder dropped).
             "in_flight_without_outstanding"
@@ -2060,8 +1672,9 @@ impl BlockSyncReactor {
             .sequencer_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);
         metrics::gauge!("sync.block.best_header_tip.height")
-            .set(self.state.best_header_tip.0 as f64);
-        metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
+            .set(self.state.progress.best_header_tip.0 as f64);
+        metrics::gauge!("sync.block.verified_tip.height")
+            .set(self.state.progress.verified_block_tip.0 as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
         metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
             .set(sequencer_input_decoded_attributed_memory_bytes as f64);
@@ -2074,7 +1687,8 @@ impl BlockSyncReactor {
                 .saturating_add(view.reorder_decoded_attributed_memory_bytes)
                 .saturating_add(view.applying_decoded_attributed_memory_bytes) as f64,
         );
-        metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
+        metrics::gauge!("sync.block.applying")
+            .set(self.state.progress.last_view.applying_len as f64);
         metrics::gauge!("sync.block.applying.unsubmitted")
             .set(view.unsubmitted_applying_count as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
@@ -2084,7 +1698,7 @@ impl BlockSyncReactor {
     }
 
     fn publish_body_unavailable_metrics(&mut self) {
-        let current = self.committed_view.as_ref().and_then(|snapshot| {
+        let current = self.state.committed_view().and_then(|snapshot| {
             snapshot
                 .alarms
                 .header_best_body_unavailable
@@ -2151,39 +1765,55 @@ impl BlockSyncReactor {
     }
 
     fn local_status(&self) -> BlockSyncStatus {
-        let status = self.state.local_status(&self.startup.config);
+        let status = self.state.progress.local_status(&self.startup.config);
         self.body_retention
             .as_ref()
             .map_or(status, |retention| retention.apply(status))
     }
 
     /// Hand a data-plane action to the action driver without letting a slow or
-    /// stalled driver wedge the reactor. Returns `true` only if the action was
-    /// accepted.
-    fn dispatch_action(&self, action: BlockSyncAction) -> bool {
+    /// stalled driver wedge the reactor.
+    ///
+    /// A [`ActionClass::Required`] action may use the protected control
+    /// reserve. A [`ActionClass::Optional`] action must leave it free.
+    fn dispatch_action(&self, action: BlockSyncAction) -> Result<(), ActionRefusal> {
         let action_label = action.metric_label();
         let queue_depth = self
             .actions
             .max_capacity()
             .saturating_sub(self.actions.capacity());
-        let peer_action_permits = if matches!(action, BlockSyncAction::Misbehavior { .. }) {
-            // Acquire the peer-action slot and protected control capacity in one
-            // semaphore operation. The Sequencer sends concurrently, so a
-            // separate capacity check followed by `try_send` has a race.
-            match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
-                Ok(permits) => Some(permits),
-                Err(mpsc::error::TrySendError::Full(())) => {
-                    metrics::counter!(
-                        "sync.block.action.control_capacity_reserved",
-                        "action" => action_label
-                    )
-                    .increment(1);
-                    return false;
-                }
-                Err(mpsc::error::TrySendError::Closed(())) => return false,
+        // Reserve before reporting, so a refused action never traces as
+        // dispatched. An optional action acquires its slot and the protected
+        // control capacity in one semaphore operation. The Sequencer sends
+        // concurrently, so a separate capacity check has a race.
+        let class = ActionClass::of(&action);
+        let permits = match class {
+            ActionClass::Required => 1,
+            ActionClass::Optional => BS_ACTION_CONTROL_RESERVE + 1,
+        };
+        let mut permits = match self.actions.try_reserve_many(permits) {
+            Ok(permits) => permits,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(match class {
+                    ActionClass::Required => {
+                        metrics::counter!(
+                            "sync.block.action.send_queue_full",
+                            "action" => action_label
+                        )
+                        .increment(1);
+                        ActionRefusal::Full
+                    }
+                    ActionClass::Optional => {
+                        metrics::counter!(
+                            "sync.block.action.control_capacity_reserved",
+                            "action" => action_label
+                        )
+                        .increment(1);
+                        ActionRefusal::ControlReserve
+                    }
+                });
             }
-        } else {
-            None
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(ActionRefusal::Closed),
         };
         // Metrics accepts f64 samples; this lossy conversion is observability-only.
         metrics::histogram!(
@@ -2194,25 +1824,11 @@ impl BlockSyncReactor {
         self.startup
             .trace
             .emit_event(|| BlockActionDispatched::new(&action));
-        if let Some(mut permits) = peer_action_permits {
-            permits
-                .next()
-                .expect("the atomic reservation includes one peer-action permit")
-                .send(action);
-            return true;
-        }
-        match self.actions.try_send(action) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!(
-                    "sync.block.action.send_queue_full",
-                    "action" => action_label
-                )
-                .increment(1);
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
+        permits
+            .next()
+            .expect("the reservation holds at least one permit for this action")
+            .send(action);
+        Ok(())
     }
 
     async fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: BlockSyncMisbehavior) {
@@ -2226,9 +1842,43 @@ impl BlockSyncReactor {
         // lifecycle draining whenever the action driver was slow. `try_send` keeps
         // the reactor live.
         let action = BlockSyncAction::Misbehavior { peer, reason };
-        if !self.dispatch_action(action) {
+        if self.dispatch_action(action).is_err() {
             metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
         }
+    }
+}
+
+/// Cancel every expired claim at the floor `height`.
+///
+/// Each cancellation settles in a fixed order: clear the matching registry
+/// owner, then revoke that owner's work, which settles its funding. A claim
+/// whose owner the registry no longer holds, such as one a replacement session
+/// superseded, changes nothing. `cancelled` observes each settled claim before
+/// the next one settles.
+fn cancel_expired_floor_claims(
+    registry: &PeerRegistry,
+    work_queue: &WorkQueue,
+    height: block::Height,
+    now: Instant,
+    avoid_cooldown: Duration,
+    mut cancelled: impl FnMut(&OutstandingClaim, WorkReturnOutcome),
+) {
+    let (servable_peers, _) = registry.floor_gap_servable(height);
+    for claim in registry.outstanding_claims_at(height) {
+        if !floor_claim_expired(&claim, now) {
+            continue;
+        }
+        if !registry.clear_outstanding_height_for_owner(&claim.peer, claim.height, claim.meta.owner)
+        {
+            continue;
+        }
+        let released = work_queue.revoke_for_owner(claim.meta.owner, [claim.height]);
+        // Settlement arbitrates against writer startup, so `released` says
+        // whether this owner had started writing.
+        if floor_cancel_avoids_peer(servable_peers, &released) {
+            registry.avoid_floor_height_until(&claim.peer, claim.height, now + avoid_cooldown);
+        }
+        cancelled(&claim, released);
     }
 }
 

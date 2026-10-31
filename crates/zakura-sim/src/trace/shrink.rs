@@ -384,7 +384,10 @@ pub fn shrink_with(
 
 /// The direct machine decoder owns these bytes; scheduler inputs stay separate.
 fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
-    if !matches!(name, "block/work-ownership" | "block/work-funding") {
+    if !matches!(
+        name,
+        "block/work-ownership" | "block/work-funding" | "block/reactor-policy"
+    ) {
         return None;
     }
     serde_json::from_value::<crate::harness::block_work::Scenario>(scenario.clone())
@@ -407,6 +410,7 @@ fn machine_failure<'a>(
         let failure = match step {
             crate::record::machine::MachineStep::Work(work) => &work.failure,
             crate::record::machine::MachineStep::WorkFunding(work) => &work.failure,
+            crate::record::machine::MachineStep::Reactor(reactor) => &reactor.failure,
         };
         machine = true;
         if let Some(failure) = failure {

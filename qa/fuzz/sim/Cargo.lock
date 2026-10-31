@@ -1961,6 +1961,7 @@ dependencies = [
 name = "zakura-node-services"
 version = "5.0.1"
 dependencies = [
+ "serde",
  "tokio",
  "tower",
  "zakura-chain",

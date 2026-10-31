@@ -1,0 +1,2 @@
+input = "crates/zakura-sim/tests/fixtures/block-sync-handoff.bin"
+checks = ["crates/zakura-sim/src/domain/block_sync.rs"]

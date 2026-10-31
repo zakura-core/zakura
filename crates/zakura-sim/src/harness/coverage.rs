@@ -211,6 +211,22 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_handoff_input_holds_payload_inventory_agrees",
+        ),
+        bypass: Bypass::Planted("lost-payload-release"),
+    },
+    Coverage {
+        property: "block/decoded-retention",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "decoded_retention_replays_final_holders_in_a_fresh_process",
+        ),
+        bypass: Bypass::Planted("raw-transaction-escape"),
+    },
+    Coverage {
         property: "block/work-funding",
         passing: passes(
             "tests/replay_exact.rs",

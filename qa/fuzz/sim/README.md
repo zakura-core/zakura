@@ -43,6 +43,23 @@ requests, writer owners and receipts. It observes retained funding across reset
 and drains these owners before queue destruction. Its last record contains that
 drain. Operation 24 injects a funding discrepancy to test containment.
 
+`block_decoded_retention` runs `block/decoded-retention` through the same pipeline.
+Its decoder-v1 reads at most 512 causal bytes in four-byte operations: action,
+source slot, destination slot, and pool. Actions modulo seven admit a block,
+clone a handle, retain a header, retain a transaction, drop a handle, transfer a
+charge, or close a pool. Eight slots hold production handles. Two pools enforce
+equal byte limits, and a third pool enforces a count limit. The fixture uses the
+Regtest genesis payload. Each history drains its handles before pool destruction.
+
+The independent model derives charges from its handle graph. Weak probes read
+actual header and transaction references, the allocation's current pool, and a
+fresh attributed-size traversal. They detect raw handles that escape the owner.
+These checks cover completed owner operations. They do not establish asynchronous
+worker retention, allocator RSS, or safety between operations. The committed
+seed exercises final-part retention, transfer, capacity refusal, and closure.
+The retained production patches challenge raw-handle escape, missing admission,
+wrong-pool transfer, and incorrect release. Campaigns run outside blocking PR CI.
+
 The funding property compares actual retention with the independent model at
 completed operations. It does not establish asynchronous cancellation races,
 decoded-body retention, or backend-worker retention. Run long campaigns manually

@@ -31,6 +31,7 @@ use crate::{
 enum Target {
     Ownership,
     Funding,
+    DecodedRetention,
 }
 
 impl Target {
@@ -38,6 +39,7 @@ impl Target {
         match self {
             Self::Ownership => "block/work-ownership",
             Self::Funding => "block/work-funding",
+            Self::DecodedRetention => "block/decoded-retention",
         }
     }
 
@@ -45,6 +47,7 @@ impl Target {
         match self {
             Self::Ownership => "block-work",
             Self::Funding => "block-work-funding",
+            Self::DecodedRetention => "block-decoded-retention",
         }
     }
 
@@ -60,14 +63,20 @@ impl Target {
                 .into_iter()
                 .map(|step| (step.step, MachineStep::WorkFunding(step.into())))
                 .collect(),
+            Self::DecodedRetention => {
+                zakura_node_services::block_memory::model::trace_retention_bytes(input)
+                    .into_iter()
+                    .map(|step| (step.step, MachineStep::DecodedRetention(step.into())))
+                    .collect()
+            }
         }
     }
 }
 
 /// Causal input for the selected harness's decoder-v1.
 ///
-/// Each harness has its own decoder identity. Both consume at most 512 bytes;
-/// the funding harness also observes an explicit drain after the final input.
+/// Each harness has its own decoder identity and consumes at most 512 bytes.
+/// The runtime-owner targets observe an explicit drain after the final input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
@@ -98,6 +107,7 @@ fn properties(target: Target) -> Vec<Property<Handle>> {
         claim: match target {
             Target::Ownership => "The block work owner agrees with the independent ownership model after every input.",
             Target::Funding => "At each completed driver operation and before queue destruction, actual queue funding and retained request/receipt reservations agree with the independent model.",
+            Target::DecodedRetention => "At each completed owner operation and before pool destruction, independently read block/header/transaction allocations and exact pool charges agree with the model's handle graph. Transfers and closed generations preserve final-holder settlement. This target excludes asynchronous backend-worker coverage.",
         },
         kind: Kind::Safety,
         assumes: &[],
@@ -106,6 +116,7 @@ fn properties(target: Target) -> Vec<Property<Handle>> {
         check: match target {
             Target::Ownership => |cx| check(Target::Ownership, cx),
             Target::Funding => |cx| check(Target::Funding, cx),
+            Target::DecodedRetention => |cx| check(Target::DecodedRetention, cx),
         },
         witness: None,
     }]
@@ -127,6 +138,20 @@ fn check(target: Target, cx: &mut CheckCtx<'_, Handle>) -> Verdict {
             (work.actual != work.expected)
                 .then(|| (format!("{:?}", work.expected), format!("{:?}", work.actual))),
         ),
+        (Target::DecodedRetention, MachineStep::DecodedRetention(work)) => {
+            let Some(actual) = &work.actual else {
+                cx.missing_evidence(work.failure.as_ref().map_or_else(
+                    || "decoded owner allocation capture is missing".to_owned(),
+                    |failure| failure.message.clone(),
+                ));
+                return Verdict::NotApplicable;
+            };
+            (
+                &work.failure,
+                (actual != &work.expected)
+                    .then(|| (format!("{:?}", work.expected), format!("{actual:?}"))),
+            )
+        }
         _ => {
             cx.missing_evidence("machine transition has the wrong evidence kind");
             return Verdict::NotApplicable;
@@ -176,7 +201,7 @@ fn config(target: Target, value: &Value) -> Result<RunConfig, HarnessError> {
     Ok(RunConfig {
         budget: match target {
             Target::Ownership => 128,
-            Target::Funding => 129,
+            Target::Funding | Target::DecodedRetention => 129,
         },
         drain_bound: 0,
         ..RunConfig::default()
@@ -396,7 +421,10 @@ fn witness(
     if expect != Expect::Applicable && !evidence.charged_work {
         return Err(WitnessError::LostTriggerHistory);
     }
-    if matches!(target, Target::Funding) && expect == Expect::Holds && !evidence.drained {
+    if matches!(target, Target::Funding | Target::DecodedRetention)
+        && expect == Expect::Holds
+        && !evidence.drained
+    {
         return Err(WitnessError::LostTriggerHistory);
     }
     Ok(())
@@ -426,6 +454,22 @@ impl RecordSink for WitnessSink<'_> {
                     self.charged_work |= work.expected.reserved > 0;
                     self.drained |=
                         work.drain && work.actual.reserved == 0 && work.expected.reserved == 0;
+                }
+                Some(MachineStep::DecodedRetention(work)) => {
+                    self.charged_work |= work.expected.pools.iter().any(|pool| pool.bytes > 0);
+                    self.drained |= work.drain
+                        && work.actual.as_ref().is_some_and(|actual| {
+                            actual.pools.iter().all(|pool| pool.bytes == 0)
+                                && actual.allocations.iter().all(|allocation| {
+                                    allocation.holders == 0
+                                        && allocation.header_holders == 0
+                                        && allocation
+                                            .transaction_holders
+                                            .iter()
+                                            .all(|&count| count == 0)
+                                })
+                        })
+                        && work.expected.pools.iter().all(|pool| pool.bytes == 0);
                 }
                 None => {}
             }
@@ -473,3 +517,64 @@ pub const FUNDING_ENTRY: HarnessEntry = HarnessEntry {
     },
     run_bytes: |bytes, sink, extra| run_bytes(Target::Funding, bytes, sink, extra),
 };
+
+/// Decoded owners share the registry and exact replay path, without QUIC.
+pub const DECODED_RETENTION_ENTRY: HarnessEntry = HarnessEntry {
+    name: Target::DecodedRetention.name(),
+    generator: 1,
+    scenario_bytes: 512,
+    pad_scenario: false,
+    composes: &[],
+    planted: false,
+    run: |value, input, sink| run(Target::DecodedRetention, value, input, sink),
+    meta: |value| meta(Target::DecodedRetention, value),
+    config: |value| config(Target::DecodedRetention, value),
+    draw,
+    properties: || registered(Target::DecodedRetention),
+    witness: |value, input, property, expect, sink| {
+        witness(
+            Target::DecodedRetention,
+            value,
+            input,
+            property,
+            expect,
+            sink,
+        )
+    },
+    run_bytes: |bytes, sink, extra| run_bytes(Target::DecodedRetention, bytes, sink, extra),
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_allocation_capture_is_not_a_resource_violation() {
+        let step = zakura_node_services::block_memory::model::trace_retention_bytes(&[0, 0, 0, 0])
+            .remove(0);
+        let mut view: crate::record::machine::DecodedRetentionStep = step.into();
+        view.actual = None;
+        let handle = Handle(RefCell::new(Some((1, MachineStep::DecodedRetention(view)))));
+        let registered = properties(Target::DecodedRetention);
+        let identity = Identity::machine(Target::DecodedRetention.identity(), 1);
+        let log = ObservationLog::default();
+        let step = StepCtx {
+            step: 1,
+            pick: &identity,
+            enabled: &[],
+            phase: Phase::Live,
+            now: SimInstant::ZERO,
+            status: SchedulerStatus::Quiescent,
+            log: &log,
+        };
+        let mut cx = CheckCtx::new(&step, &handle, &registered[0], &registered);
+        assert!(matches!(
+            check(Target::DecodedRetention, &mut cx),
+            Verdict::NotApplicable
+        ));
+        assert_eq!(
+            cx.into_parts().missing.as_deref(),
+            Some("decoded owner allocation capture is missing")
+        );
+    }
+}

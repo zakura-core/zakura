@@ -17,6 +17,9 @@ use zakura_rt::sync::{
     Mutex, Notify,
 };
 
+#[cfg(any(test, zakura_sim))]
+pub mod model;
+
 /// Capacity for decoded blocks, including references retained outside their store.
 #[derive(Clone, Debug)]
 pub struct DecodedBlockPool(Arc<Pool>);

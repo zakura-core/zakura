@@ -1,0 +1,7 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -451,3 +451,3 @@
+             Self::Shared(block) => block.transactions.get(index).cloned().map(Into::into),
+-            Self::Owned(block) => block.transaction(index).map(Into::into),
++            Self::Owned(block) => block.0.block.transactions.get(index).cloned().map(Into::into),
+         }

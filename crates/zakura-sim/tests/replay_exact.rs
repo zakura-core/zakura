@@ -1276,6 +1276,106 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
 
 const FUNDING_INPUT: &[u8] = include_bytes!("fixtures/block-work-funding.bin");
 
+const RETENTION_INPUT: &[u8] = include_bytes!("fixtures/block-decoded-retention.bin");
+
+#[test]
+fn decoded_retention_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_DECODED_RETENTION_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(
+            report.end.unwrap().steps,
+            RETENTION_INPUT.len() as u64 / 4 + 1
+        );
+    }
+}
+
+#[test]
+fn decoded_retention_replays_final_holders_in_a_fresh_process() {
+    use zakura_sim::record::machine::MachineStep;
+    let entry = harness::find("block/decoded-retention").unwrap();
+    let dir = record(entry, RETENTION_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/decoded-retention",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.meta.scenario["input"], json!(RETENTION_INPUT));
+    assert_eq!(trace.meta.generator, 1);
+    assert_eq!(trace.steps.len(), RETENTION_INPUT.len() / 4 + 1);
+    let Some(MachineStep::DecodedRetention(parts)) = trace.steps[5].machine.as_deref() else {
+        panic!("missing allocation reads")
+    };
+    let actual = parts.actual.as_ref().unwrap();
+    assert_eq!(actual.allocations[0].holders, 3);
+    assert_eq!(actual.allocations[0].transaction_holders, vec![1]);
+    let Some(MachineStep::DecodedRetention(closed)) = trace.steps[9].machine.as_deref() else {
+        panic!("missing closed-pool read")
+    };
+    assert!(closed.actual.as_ref().unwrap().pools[2].closed);
+    assert_eq!(closed.actual.as_ref().unwrap().pools[2].blocks, Some(1));
+    let Some(MachineStep::DecodedRetention(drain)) = trace.steps.last().unwrap().machine.as_deref()
+    else {
+        panic!("missing pre-destruction drain")
+    };
+    assert!(drain.drain);
+    assert!(drain
+        .actual
+        .as_ref()
+        .unwrap()
+        .pools
+        .iter()
+        .all(|pool| pool.bytes == 0));
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "decoded_retention_replay_child"])
+        .env("ZAKURA_DECODED_RETENTION_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+    edit(dir.path(), |lines| {
+        step(lines, 6)["machine"]["step"]["actual"]["allocations"][0]["transaction_holders"][0] =
+            json!(2);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 6,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
+    let entry = harness::find("block/decoded-retention").unwrap();
+    for input in [&[][..], &[0, 0][..], RETENTION_INPUT] {
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        assert_eq!(trace.steps.len(), input.len().div_ceil(4) + 1);
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+    assert!(matches!(
+        (entry.witness)(
+            &json!({"input": []}),
+            PlanInput::Bytes(Vec::new()),
+            "block/decoded-retention",
+            zakura_sim::witness::Expect::Holds,
+            &mut zakura_sim::NullSink,
+        ),
+        Err(zakura_sim::witness::WitnessError::LostTriggerHistory)
+    ));
+}
+
 #[test]
 fn work_funding_replay_child() {
     if let Some(dir) = std::env::var_os("ZAKURA_WORK_FUNDING_CHILD") {

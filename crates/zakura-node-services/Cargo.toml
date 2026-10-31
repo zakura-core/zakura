@@ -70,5 +70,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
+[target.'cfg(zakura_sim)'.dependencies]
+serde = { workspace = true, features = ["derive"] }
+
 [lints]
 workspace = true

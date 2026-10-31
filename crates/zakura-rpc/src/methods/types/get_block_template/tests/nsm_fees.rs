@@ -20,8 +20,9 @@ use zakura_state::GetBlockTemplateChainInfo;
 use zcash_address::{ToAddress, ZcashAddress};
 use zcash_protocol::consensus::NetworkType;
 
-use super::super::{BlockTemplateResponse, MinerParams};
+use super::super::{BlockTemplateResponse, CoinbaseCache, MinerParams};
 use crate::config::mining;
+use crate::methods::types::transaction::TransactionTemplate;
 
 #[test]
 fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
@@ -99,9 +100,23 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                     zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
                 ),
             };
+            let cache = CoinbaseCache::default();
+            if height >= Height(10) {
+                // An equal-height parent can have a different NSM balance.
+                let fees = Amount::try_from(i64::from(transaction_count) * 10_001).unwrap();
+                let stale = TransactionTemplate::new_coinbase(
+                    &network,
+                    height,
+                    &miner,
+                    fees,
+                    Some(Amount::zero()),
+                )
+                .unwrap();
+                cache.store(height, fees, Some(Amount::zero()), stale);
+            }
             let template = BlockTemplateResponse::new_internal(
                 &network,
-                None,
+                &cache,
                 &miner,
                 &chain_info,
                 "0".repeat(46).parse().unwrap(),
@@ -178,4 +193,80 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
             );
         }
     }
+}
+
+/// Requests that wait for construction capacity after ZIP 234 must reuse the coinbase of the
+/// request before them, instead of proving an identical coinbase each.
+#[test]
+fn zip234_coinbases_are_reused_for_the_same_parent_balance() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            nu7: Some(5),
+            ..Default::default()
+        },
+        test_nsm_reissuance_height: Some(Height(10)),
+        ..Default::default()
+    });
+    let miner = MinerParams::new(
+        &network,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Regtest,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let height = Height(11);
+    let balance = Amount::try_from(400_000_000).unwrap();
+    let chain_info = |balance: Amount<NonNegative>| {
+        let mut pools = ValueBalance::zero();
+        pools.set_nsm_value_balance_amount(balance.constrain().unwrap());
+        GetBlockTemplateChainInfo {
+            value_pools: pools,
+            expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+            tip_height: height.previous().unwrap(),
+            tip_hash: Hash([1; 32]),
+            cur_time: DateTime32::from(1_654_008_617),
+            min_time: DateTime32::from(1_654_008_606),
+            max_time: DateTime32::from(1_654_008_728),
+            chain_history_root: Some(zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()),
+        }
+    };
+    let build = |cache: &CoinbaseCache, balance| {
+        BlockTemplateResponse::new_internal(
+            &network,
+            cache,
+            &miner,
+            &chain_info(balance),
+            "0".repeat(46).parse().unwrap(),
+            vec![],
+            None,
+        )
+        .unwrap()
+    };
+
+    let cache = CoinbaseCache::default();
+    let first = build(&cache, balance);
+    let cached = cache
+        .get(height, Amount::zero(), Some(balance))
+        .expect("a ZIP 234 coinbase is cached under its parent balance");
+    assert_eq!(cached, first.coinbase_txn);
+    assert_eq!(build(&cache, balance).coinbase_txn, first.coinbase_txn);
+
+    // An equal-height parent with another balance pays another subsidy.
+    let other_balance = Amount::try_from(100_000_000).unwrap();
+    let other = build(&cache, other_balance);
+    assert_ne!(other.coinbase_txn, first.coinbase_txn);
+    assert_eq!(
+        cache.get(height, Amount::zero(), Some(other_balance)),
+        Some(other.coinbase_txn),
+    );
+    assert_eq!(
+        cache.get(height, Amount::zero(), Some(balance)),
+        Some(first.coinbase_txn),
+    );
 }

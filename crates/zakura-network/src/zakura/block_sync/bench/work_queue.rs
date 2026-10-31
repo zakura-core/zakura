@@ -5,7 +5,10 @@ use std::{num::NonZeroU64, sync::Arc};
 use zakura_chain::block;
 use zakura_rt::sync::CancellationToken;
 
-use super::super::{request::BlockSizeEstimate, work_queue::WorkQueue};
+use super::super::{
+    request::BlockSizeEstimate,
+    work_queue::{AdmitRefusal, WorkQueue},
+};
 use crate::zakura::transport::{ByteBudget, ByteReservation, FrameWriteClaim};
 
 /// The endpoint of a benchmark request's lifetime.
@@ -28,7 +31,7 @@ pub enum WorkRequestEnd {
 /// This workload allocates queue metadata but no block payloads. It does not
 /// measure decoding, QUIC, storage or asynchronous peer scheduling.
 pub fn bench_work_request(count: u32, bytes: u32, end: WorkRequestEnd) {
-    let (work, budget) = pending_work(count, bytes);
+    let (work, budget) = pending_work(count, bytes, u64::from(count) * u64::from(bytes));
     let total = u64::from(count) * u64::from(bytes);
     let taken = work.take_request(
         block::Height(1),
@@ -88,10 +91,9 @@ pub fn bench_work_request(count: u32, bytes: u32, end: WorkRequestEnd) {
     std::hint::black_box(&work);
 }
 
-fn pending_work(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget) {
+fn pending_work(count: u32, bytes: u32, limit: u64) -> (Arc<WorkQueue>, ByteBudget) {
     assert!(count > 0 && bytes >= 1024);
-    let total = u64::from(count) * u64::from(bytes);
-    let budget = ByteBudget::new(total);
+    let budget = ByteBudget::new(limit);
     let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
     let authority = zakura_header_chain::BodyWorkAuthority {
         header: zakura_header_chain::HeaderWorkAuthority {
@@ -127,7 +129,7 @@ pub struct BenchReceiptBatch {
 impl BenchReceiptBatch {
     /// Admit, publish and complete the writer before measuring receipts.
     pub fn new(count: u32, bytes: u32) -> Self {
-        let (work, budget) = pending_work(count, bytes);
+        let (work, budget) = pending_work(count, bytes, u64::from(count) * u64::from(bytes));
         let total = u64::from(count) * u64::from(bytes);
         let taken = work.take_request(
             block::Height(1),
@@ -212,5 +214,90 @@ impl BenchBudgetReceipts {
             drop(receipt);
         }
         assert_eq!(self.budget.reserved(), 0);
+    }
+}
+
+/// Repeated peer requests over one queue and one capacity budget.
+#[derive(Clone)]
+pub struct BenchWorkChurn {
+    work: Arc<WorkQueue>,
+    budget: ByteBudget,
+    peers: u32,
+    count: u32,
+    bytes: u32,
+}
+
+impl BenchWorkChurn {
+    /// Retain the actual budget's capacity signal independently of a peer handle.
+    pub fn capacity_reader(&self) -> BenchWorkCapacity {
+        BenchWorkCapacity(self.budget.clone())
+    }
+
+    /// Give each peer a disjoint range above the floor request.
+    pub fn new(peers: u32, count: u32, bytes: u32, active_slots: u32) -> Self {
+        assert!((1..=128).contains(&peers) && (1..=128).contains(&count));
+        assert!((1..=peers).contains(&active_slots));
+        let limit = u64::from(active_slots) * u64::from(count) * u64::from(bytes);
+        let (work, budget) = pending_work(peers * count + 1, bytes, limit);
+        Self {
+            work,
+            budget,
+            peers,
+            count,
+            bytes,
+        }
+    }
+
+    /// Publish and drop one queued request, or return its take on capacity refusal.
+    /// The caller can hold the published owner to exercise overlapping requests.
+    pub fn cycle(&mut self, peer: u32, attempt: NonZeroU64, held: impl FnOnce()) -> bool {
+        assert!(peer < self.peers);
+        let low = peer * self.count + 2;
+        let taken = self.work.take_request(
+            block::Height(low),
+            block::Height(low + self.count - 1),
+            usize::try_from(self.count).expect("request count fits usize"),
+            u64::from(self.count) * u64::from(self.bytes),
+            u64::from(peer) + 1,
+            attempt,
+        );
+        assert_eq!(taken.items().len(), usize::try_from(self.count).unwrap());
+        let admitted = match taken.admit(block::Height(0), CancellationToken::new()) {
+            Ok(admitted) => admitted,
+            Err(AdmitRefusal::Capacity) => return false,
+            Err(other) => panic!("churn admission failed unexpectedly: {other:?}"),
+        };
+        let claim = admitted
+            .publish(|_| {})
+            .expect("the peer owns its request range");
+        held();
+        drop(claim);
+        true
+    }
+
+    /// Inspect all obligations before destroying the shared queue.
+    pub fn assert_settled(&self) {
+        assert_eq!(self.budget.reserved(), 0);
+        assert_eq!(self.work.in_flight_len(), 0);
+        assert_eq!(
+            self.work.pending_len(),
+            usize::try_from(self.peers * self.count + 1).unwrap()
+        );
+        assert!(!self.budget.is_closed());
+    }
+}
+
+/// Capacity observations for the benchmark's production admission budget.
+pub struct BenchWorkCapacity(ByteBudget);
+
+impl BenchWorkCapacity {
+    /// Register before admission so a concurrent release cannot be missed.
+    pub fn subscribe(&self) -> &zakura_rt::sync::Notify {
+        self.0.subscribe_capacity()
+    }
+
+    /// Observe capacity after a refusal; this observation grants no reservation.
+    pub fn available(&self) -> u64 {
+        self.0.available()
     }
 }

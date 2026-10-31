@@ -20,7 +20,10 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 mod work_queue;
-pub use work_queue::{bench_work_request, BenchBudgetReceipts, BenchReceiptBatch, WorkRequestEnd};
+pub use work_queue::{
+    bench_work_request, BenchBudgetReceipts, BenchReceiptBatch, BenchWorkCapacity, BenchWorkChurn,
+    WorkRequestEnd,
+};
 
 use zakura_chain::block::{self, Block};
 use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};

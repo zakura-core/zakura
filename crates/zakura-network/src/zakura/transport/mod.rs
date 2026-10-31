@@ -7,6 +7,7 @@ mod clock;
 mod frame;
 mod guard;
 mod io;
+mod lifetime;
 mod message_rule;
 #[cfg(any(test, zakura_sim))]
 mod observe;
@@ -34,6 +35,14 @@ pub(crate) use io::{
     worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedFrameSlot,
     GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
     ResponseFrameSlot,
+};
+#[allow(unused_imports)] // the next commit connects these owners to the stream workers
+#[cfg(test)]
+pub(crate) use lifetime::OwnerCounts;
+#[allow(unused_imports)] // the next commit connects these owners to the stream workers
+pub(crate) use lifetime::{
+    frame_wire_bytes, ConnectionResources, FrameGate, NodeResources, OwnerPhase, ResourceEnvelope,
+    StreamResources,
 };
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]

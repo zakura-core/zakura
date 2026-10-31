@@ -315,9 +315,9 @@ fn p2p_rows_record_every_inventory_block_hash_and_the_write_completion() {
     let inv = Message::Inv(items);
 
     let send = conn.p2p_send_start(&inv);
-    conn.p2p_send_done(send, &Ok(()));
+    conn.p2p_send_done(send, &Ok(()), None);
     let send = conn.p2p_send_start(&Message::GetAddr);
-    conn.p2p_send_done(send, &Err(crate::PeerError::ConnectionSendTimeout));
+    conn.p2p_send_done(send, &Err(crate::PeerError::ConnectionSendTimeout), None);
     conn.p2p_recv(&inv);
 
     let rows = rows(&drain(&mut rx), tables::P2P);
@@ -408,4 +408,61 @@ fn connection_ids_are_unique_without_tracing() {
     let second = ConnectionTrace::untraced();
     assert_ne!(first.id(), second.id());
     assert!(first.p2p_send_start(&Message::GetAddr).is_none());
+}
+
+#[test]
+fn p2p_body_upload_rows_record_acknowledgement_or_its_absence() {
+    use std::time::Instant;
+
+    use crate::peer::tcp_progress::{TcpInfo, UploadOutcome, UploadReport, UploadSample};
+
+    let (trace, mut rx) = capture(JsonlTraceTables::from_names(["p2p"]).unwrap());
+    let conn = trace.connection(false, "uploader");
+    let start = TcpInfo {
+        total_retrans: 2,
+        ..TcpInfo::default()
+    };
+    let last = TcpInfo {
+        bytes_acked: 1_000,
+        notsent_bytes: Some(0),
+        unacked: 0,
+        total_retrans: 5,
+        snd_cwnd: 10,
+        rtt_us: 1_500,
+        rttvar_us: 100,
+        delivery_rate: Some(2_000_000),
+        snd_mss: 1_448,
+    };
+    let report = |outcome, acked_message_bytes| UploadReport {
+        outcome,
+        started_at: Instant::now(),
+        elapsed: Duration::from_millis(250),
+        message_len: 1_000,
+        start,
+        samples: vec![UploadSample {
+            elapsed: Duration::from_millis(250),
+            info: last,
+            acked_message_bytes,
+        }],
+    };
+
+    conn.p2p_body_upload(3, &report(UploadOutcome::Acked, 1_000));
+    conn.p2p_body_upload(4, &report(UploadOutcome::Closed, 400));
+
+    let rows = rows(&drain(&mut rx), tables::P2P);
+    assert_eq!(rows[0]["event"], "body_acked");
+    assert_eq!(rows[0]["seq"], "3");
+    assert_eq!(rows[0]["msg"], "block");
+    assert_eq!(rows[0]["ack_us"], "250000");
+    assert_eq!(rows[0]["acked_bytes"], "1000");
+    assert_eq!(rows[0]["tcp_retrans"], "3");
+    assert_eq!(rows[0]["tcp_total_retrans"], "5");
+    assert_eq!(rows[0]["tcp_delivery_rate"], "2000000");
+    assert_eq!(rows[0]["samples"], "1");
+    assert_eq!(rows[0]["result"], "acked");
+
+    assert_eq!(rows[1]["event"], "body_ack_timeout");
+    assert_eq!(rows[1]["result"], "closed");
+    assert!(rows[1]["ack_us"].is_empty());
+    assert_eq!(rows[1]["acked_bytes"], "400");
 }

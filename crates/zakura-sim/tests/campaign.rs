@@ -976,6 +976,90 @@ fn incompatible_runs_start_a_new_segment() {
     assert!(inputs(&fixture.store, &end.snapshot).len() > 1);
 }
 
+/// A run whose harness had another generator version, here one the test
+/// records by starting it on a copy of the registry entry with the version
+/// bumped, can't be resumed or carried: its inputs can mean other
+/// scenarios. A new segment starts from the seeds alone, and only after its
+/// parent's last snapshot verifies against its input digests.
+#[test]
+fn a_changed_generator_starts_a_new_segment() {
+    let fixture = Fixture::new();
+    let real = harness::find(SIM).unwrap();
+    let bumped: &'static harness::HarnessEntry = Box::leak(Box::new(harness::HarnessEntry {
+        generator: real.generator + 1,
+        ..*real
+    }));
+    // The committed seed fits only the real generator.
+    let no_seeds = fixture.dir.path().join("no-seeds");
+    fs::create_dir(&no_seeds).unwrap();
+    let mut options = fixture.options(1, 1);
+    options.harness = bumped;
+    options.fixtures = vec![no_seeds];
+    let prepared = campaign::prepare_start(&fixture.store, options).unwrap();
+    let run = prepared.manifest().clone();
+    let end = prepared.run(&fixture.store).unwrap();
+    let head = fixture.store.verify_snapshot(&end.snapshot).unwrap();
+    assert!(!head.index.inputs.is_empty(), "the run added inputs");
+
+    fixture.unset("ran");
+    let refused = campaign::prepare_resume(&fixture.store, ResumeOptions::default()).unwrap_err();
+    assert!(refused.to_string().contains("harness differ"), "{refused}");
+    assert!(
+        !fixture.control.join("ran").exists(),
+        "resume refuses the harness without running the fuzzer"
+    );
+
+    let mut options = fixture.options(1, 1);
+    options.parent = Some((run.clone(), Migration::Carry));
+    let refused = campaign::prepare_start(&fixture.store, options).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("the harness's versions changed"),
+        "{refused}"
+    );
+    assert_eq!(
+        fixture.store.manifests().unwrap().len(),
+        1,
+        "nothing written"
+    );
+
+    // The parent's last snapshot must match its input digests before a new
+    // segment follows it.
+    let input = fixture
+        .store
+        .snapshot_inputs(&end.snapshot)
+        .join(head.index.inputs[0].sha256.as_str());
+    let kept = fs::read(&input).unwrap();
+    fs::write(&input, b"changed").unwrap();
+    let mut options = fixture.options(1, 1);
+    options.parent = Some((run.clone(), Migration::Seeds));
+    assert!(matches!(
+        campaign::prepare_start(&fixture.store, options),
+        Err(CampaignError::Corrupt { .. })
+    ));
+    fs::write(&input, kept).unwrap();
+
+    let mut options = fixture.options(1, 1);
+    options.parent = Some((run.clone(), Migration::Seeds));
+    let fresh = campaign::prepare_start(&fixture.store, options).unwrap();
+    let manifest = fixture.store.read_manifest(fresh.manifest()).unwrap();
+    assert_eq!(manifest.segment, 2);
+    assert_eq!(manifest.previous_segment.as_ref(), Some(&run));
+    assert_eq!(manifest.migration, Some(Migration::Seeds));
+    assert_ne!(
+        manifest.harness,
+        fixture.store.read_manifest(&run).unwrap().harness
+    );
+    let seeds: BTreeSet<Digest> = zakura_sim::seed::load(&[fixtures()], Some(SIM))
+        .unwrap()
+        .admitted
+        .iter()
+        .map(|seed| Digest::of(&seed.input))
+        .collect();
+    assert_eq!(inputs(&fixture.store, &manifest.initial_snapshot), seeds);
+}
+
 /// A run's manifest names the harness its fuzzer runs: `start` refuses a
 /// build whose target runs another harness than `--sim`.
 #[test]

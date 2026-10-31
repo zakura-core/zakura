@@ -69,6 +69,10 @@ fn missing_pasta_assembly_features() -> Vec<&'static str> {
 /// generation elsewhere doesn't run before it.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
+#[allow(
+    clippy::print_stderr,
+    reason = "this runs before tracing is initialized, so stderr is the only output"
+)]
 fn exit_if_cpu_lacks_pasta_assembly_features() {
     let missing = missing_pasta_assembly_features();
     if missing.is_empty() {

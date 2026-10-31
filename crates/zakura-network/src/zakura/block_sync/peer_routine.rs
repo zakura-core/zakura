@@ -58,6 +58,8 @@ mod fill;
 pub use fill::{replay_block_fill_bytes, BlockFillReplaySummary};
 mod io;
 #[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
 mod requester_tests;
 #[cfg(test)]
 mod scaling_tests;
@@ -2794,7 +2796,7 @@ mod tests {
     /// A routine for peer `[id; 32]` that shares `work` and `registry`
     /// and reads the download floor from `view`. It has received a `Status`
     /// that makes heights 1 to 10 servable.
-    fn shared_floor_routine(
+    pub(super) fn shared_floor_routine(
         id: u8,
         work: &Arc<WorkQueue>,
         registry: &Arc<PeerRegistry>,

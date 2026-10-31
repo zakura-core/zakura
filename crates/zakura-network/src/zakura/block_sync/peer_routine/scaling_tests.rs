@@ -17,7 +17,9 @@ pub(super) struct Probe {
     pub(super) budget: ByteBudget,
     pub(super) outbound: FramedRecv,
     pub(super) blocks: Vec<Arc<block::Block>>,
-    _bodies: mpsc::Receiver<SequencedBody>,
+    /// The peer's end of the routine's inbound stream.
+    pub(super) inbound: crate::zakura::FramedSend,
+    pub(super) bodies: mpsc::Receiver<SequencedBody>,
     _events: mpsc::Receiver<RoutineToReactor>,
 }
 
@@ -46,7 +48,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     let cancel = CancellationToken::new();
     let capacity = usize::try_from(window).unwrap() + 16;
     let (out_send, outbound) = crate::zakura::framed_channel(capacity);
-    let (_in_send, in_recv) = crate::zakura::framed_channel(16);
+    let (inbound, in_recv) = crate::zakura::framed_channel(16);
     let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
     let registry = Arc::new(PeerRegistry::new());
     let generation = registry
@@ -124,7 +126,8 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         routine,
         outbound,
         blocks,
-        _bodies: bodies,
+        inbound,
+        bodies,
         _events: events,
     }
 }
@@ -146,7 +149,8 @@ async fn receipt_waits_for_admission_before_settlement() {
             mut routine,
             mut outbound,
             blocks,
-            _bodies,
+            bodies: _bodies,
+            inbound: _inbound,
             _events,
         } = probe(1);
         routine.try_fill();
@@ -231,7 +235,8 @@ async fn synchronous_receipts_do_not_wake_floor_rankers() {
             mut routine,
             mut outbound,
             blocks,
-            _bodies: mut bodies,
+            mut bodies,
+            inbound: _inbound,
             _events,
         } = probe(3);
         routine.handle_status(BlockSyncStatus {
@@ -333,7 +338,8 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
             mut routine,
             mut outbound,
             blocks,
-            _bodies,
+            bodies: _bodies,
+            inbound: _inbound,
             _events,
         } = probe(1);
         routine.try_fill();
@@ -404,7 +410,8 @@ async fn request_bookkeeping_scaling() {
             mut routine,
             mut outbound,
             blocks,
-            _bodies,
+            bodies: _bodies,
+            inbound: _inbound,
             _events,
         } = probe(window);
 
@@ -459,7 +466,8 @@ async fn accounting_failure_cancels_production_receipt() {
             mut routine,
             mut outbound,
             blocks,
-            _bodies: mut bodies,
+            mut bodies,
+            inbound: _inbound,
             _events,
         } = probe(1);
         routine.try_fill();

@@ -5,13 +5,14 @@
 //! height and a per-owner charge ledger. It never calls the state's helpers.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
 };
 
 #[cfg(test)]
 use proptest::prelude::*;
 use zakura_header_chain::{BodyWorkAuthority, HeaderGeneration, HeaderWorkAuthority};
+use zakura_rt::collections::HashMap;
 
 use super::*;
 use crate::zakura::block_sync::test_work_scope;

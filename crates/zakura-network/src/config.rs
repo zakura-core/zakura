@@ -402,6 +402,19 @@ impl Config {
         self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
     }
 
+    /// The most bytes that TCP decoders can hold for incomplete messages across every
+    /// allowed connection.
+    ///
+    /// This partition follows from the connection limit, because each connection's
+    /// decoder holds at most one incomplete message. The decoder cannot wait for
+    /// shared capacity, so the connection limit is the enforced bound. Handshaking
+    /// connections have a smaller body limit, so this also covers them.
+    pub fn tcp_ingress_bound_bytes(&self) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        (self.peerset_total_connection_limit() as u64)
+            .saturating_mul(crate::protocol::external::MAX_INCOMPLETE_MESSAGE_BYTES as u64)
+    }
+
     /// Returns the initial seed peer hostnames for the configured network.
     pub fn initial_peer_hostnames(&self) -> IndexSet<String> {
         match &self.network {

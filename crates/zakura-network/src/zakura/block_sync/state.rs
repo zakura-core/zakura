@@ -1,7 +1,4 @@
-use zakura_rt::{
-    sync::{atomic::AtomicU64, Mutex},
-    time,
-};
+use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
 use super::{
     bbr::{rounded_usize, BbrState},
@@ -15,7 +12,10 @@ use std::num::NonZeroU64;
 
 mod outstanding;
 
-pub(super) use outstanding::{OutstandingRequests, RequestKey};
+pub(super) use outstanding::OutstandingRequests;
+pub use outstanding::RequestKey;
+#[cfg(any(test, zakura_sim))]
+pub use outstanding::{RequestOwnership, RequestedHeight};
 
 /// Hard ceiling on outbound block-range requests kept in flight to one peer.
 ///
@@ -69,6 +69,9 @@ pub struct BlockSyncStartup {
     /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
     /// decoded blocks. `None` keeps the count-only window.
     pub max_checkpoint_height: Option<block::Height>,
+    /// Receives block sync's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl BlockSyncStartup {
@@ -93,6 +96,8 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
@@ -117,6 +122,8 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
@@ -161,6 +168,8 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 }
@@ -193,6 +202,7 @@ impl BodyRetention {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
+    pub(super) accounting: crate::zakura::transport::BudgetClosureReader,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
@@ -205,6 +215,88 @@ pub struct BlockSyncHandle {
     pub(super) routine_wiring: Option<RoutineWiring>,
 }
 
+/// What a detached [`BlockSyncHandle`] sends, for a test that stands in for
+/// the reactor. Control events and query failures arrive on separate
+/// channels, as they do at the reactor.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+#[derive(Debug)]
+pub struct DetachedHandleEvents {
+    accounting: ByteBudget,
+    lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
+    // Held so the handle's bounded queue and watches stay open.
+    _events: mpsc::Receiver<BlockSyncEvent>,
+    _peers: watch::Sender<ServicePeerSnapshot>,
+    _status: watch::Sender<BlockSyncStatus>,
+    _candidates: watch::Sender<ZakuraBlockSyncCandidateState>,
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl DetachedHandleEvents {
+    /// Inject a local accounting failure through the real budget closure signal.
+    pub fn fail_accounting(&self) {
+        let _notification = self.accounting.defer_closure_notification();
+        self.accounting
+            .close(crate::zakura::transport::BudgetClosure::Funding {
+                logical: 1,
+                funded: 0,
+            });
+    }
+
+    /// The next control event sent with [`BlockSyncHandle::send_control`],
+    /// if one is waiting.
+    pub fn try_next_control(&mut self) -> Option<BlockSyncEvent> {
+        self.lifecycle.try_recv().ok()
+    }
+
+    /// The next needed-blocks query failure, with its query and scope, if
+    /// one is waiting.
+    pub fn try_next_query_failure(
+        &mut self,
+    ) -> Option<(NonZeroU64, zakura_header_chain::BodyWorkAuthority)> {
+        self.needed_query_failures
+            .try_recv()
+            .ok()
+            .map(|failure| (failure.query_id, failure.scope))
+    }
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl BlockSyncHandle {
+    /// A handle with no reactor behind it, and the receiver of what it
+    /// sends. Peers added through it get no routines.
+    pub fn detached() -> (Self, DetachedHandleEvents) {
+        let config = ZakuraBlockSyncConfig::default();
+        let (events, events_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (needed_query_failures, needed_query_failures_rx) = mpsc::unbounded_channel();
+        let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+        let (status_tx, status) = watch::channel(config.initial_status());
+        let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+        let accounting = ByteBudget::new(config.max_inflight_block_bytes);
+        let handle = BlockSyncHandle {
+            accounting: accounting.closure_reader(),
+            events,
+            lifecycle,
+            needed_query_failures,
+            peers,
+            status,
+            candidates,
+            routine_wiring: None,
+        };
+        let receiver = DetachedHandleEvents {
+            accounting,
+            lifecycle: lifecycle_rx,
+            needed_query_failures: needed_query_failures_rx,
+            _events: events_rx,
+            _peers: peers_tx,
+            _status: status_tx,
+            _candidates: candidates_tx,
+        };
+        (handle, receiver)
+    }
+}
+
 /// The shared download primitives a per-peer pipe-routine is constructed with.
 /// Created once in `spawn_block_sync_reactor` and threaded through the handle to
 /// `service::add_peer`.
@@ -213,7 +305,6 @@ pub(super) struct RoutineWiring {
     pub(super) request_pool: crate::zakura::regulation::ReservationPool,
     pub(super) serving: Arc<super::regulated::session::Serving>,
     pub(super) config: ZakuraBlockSyncConfig,
-    pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
     pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -225,9 +316,22 @@ pub(super) struct RoutineWiring {
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
     pub(super) trace: ZakuraTrace,
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl BlockSyncHandle {
+    /// Wait for a local request-accounting failure. The driver must stop rather
+    /// than replace this budget while old owners can still retain resources.
+    pub async fn accounting_closed(&self) {
+        self.accounting.closed().await;
+    }
+
+    /// Whether a local accounting failure has closed request admission.
+    pub fn is_accounting_closed(&self) -> bool {
+        self.accounting.is_closed()
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,
@@ -301,7 +405,7 @@ impl BlockSyncHandle {
             .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
         wiring
             .registry
-            .park_peer_until(peer, std::time::Instant::now() + cooldown);
+            .park_peer_until(peer, Instant::now() + cooldown);
     }
 
     /// Park this connection's session exactly as its no-progress routine does.
@@ -318,7 +422,7 @@ impl BlockSyncHandle {
             .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
         wiring
             .registry
-            .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
+            .park_session_for_test(peer, conn_id, Instant::now() + cooldown);
     }
 
     /// Return the reactor's current local serving status, independent of peer delivery.
@@ -357,7 +461,6 @@ pub(super) struct BlockSyncState {
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
     pub(super) work_queue: Arc<WorkQueue>,
-    pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
@@ -368,6 +471,13 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
+        let budget = ByteBudget::new(startup.config.max_inflight_block_bytes);
+        #[cfg(any(test, zakura_sim))]
+        let budget = budget.with_observer(startup.observer.budget_observer());
+        let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget);
+        #[cfg(any(test, zakura_sim))]
+        let work_queue = work_queue.with_observer(startup.observer.clone());
+        let work_queue = Arc::new(work_queue);
         Self {
             finalized_height: startup.frontiers.finalized_height,
             verified_block_hash: startup.frontiers.verified_block_hash,
@@ -377,8 +487,7 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
-            budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
+            work_queue,
             needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
         }
@@ -1056,7 +1165,7 @@ pub(super) struct RateMeter {
 impl RateMeter {
     pub(super) fn new(interval: Duration) -> Self {
         Self {
-            next_allowed: time::Instant::now().into_std(),
+            next_allowed: Instant::now(),
             interval,
         }
     }

@@ -9,11 +9,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use proptest::prelude::*;
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::{
     super::super::{

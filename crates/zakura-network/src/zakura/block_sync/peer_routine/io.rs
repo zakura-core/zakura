@@ -3,18 +3,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Instant,
 };
 
-use zakura_rt::sync::{atomic::AtomicU64, mpsc, watch, CancellationToken, Mutex};
+use zakura_rt::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        mpsc, watch, CancellationToken, Mutex,
+    },
+    time::Instant,
+};
 
 use super::super::{
     events::RoutineToReactor,
     peer_registry::PeerRegistry,
     regulated::{live_requester::LiveRequester, session::ServingSession},
     sequencer_task::{SequencedBody, SequencerView},
-    state::{ByteBudget, RequestKey, ThroughputMeter, WriteOutcome},
-    work_queue::{RequestWriteStatus, WorkQueue},
+    state::{RequestKey, ThroughputMeter, WriteOutcome},
+    work_queue::{BudgetReader, RequestWriteStatus, WorkQueue},
     BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
 };
 use crate::zakura::{FramedRecv, ZakuraConnId};
@@ -43,7 +48,8 @@ pub(super) struct PeerIO {
     /// its `Drop`) so a superseded routine (e.g. a session replacement before the
     /// old task's async Drop runs) cannot corrupt the live entry.
     pub(super) generation: u64,
-    pub(super) budget: ByteBudget,
+    /// Reads the budget that `work` owns. Only queue transitions change it.
+    pub(super) budget: BudgetReader,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<PeerRegistry>,
     pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -51,6 +57,9 @@ pub(super) struct PeerIO {
     pub(super) sequencer_input: mpsc::Sender<SequencedBody>,
     pub(super) sequencer_input_bytes: Arc<AtomicU64>,
     pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    /// This generation's registry flag, set while the routine is blocked on
+    /// its sequencer handoff (see [`HandoffBlocked`](super::HandoffBlocked)).
+    pub(super) handoff_blocked: Arc<AtomicBool>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     pub(super) routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -60,6 +69,13 @@ pub(super) struct PeerIO {
     /// The routine then exits and its `Drop` guard returns work.
     pub(super) cancel: CancellationToken,
     pub(super) trace: ZakuraTrace,
+    /// Receives the routine's events and snapshots, in test and simulator
+    /// builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::super::block_sync_observe::ObserverSlot,
+    /// Frames taken from `recv` so far.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) frames_judged: u64,
 }
 
 /// Live write handles of this session's outstanding requests, under the keys
@@ -80,6 +96,15 @@ impl RequestWrites {
     pub(super) fn insert(&mut self, key: RequestKey, status: RequestWriteStatus) {
         self.unstarted.insert(key);
         self.statuses.insert(key, status);
+    }
+
+    /// Where the write of `key` stands now.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn phase(
+        &self,
+        key: RequestKey,
+    ) -> Option<super::super::work_queue::RequestWritePhase> {
+        self.statuses.get(&key).map(RequestWriteStatus::phase)
     }
 
     /// Requests whose frame transport skipped, in issue order. Forget requests

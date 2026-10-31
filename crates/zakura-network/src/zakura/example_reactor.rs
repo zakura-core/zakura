@@ -81,6 +81,7 @@ mod message_type {
 /// The receiver refills twice as fast, and holds the 20 messages a sender
 /// can queue during a 10-minute outage plus two.
 const STATUS: MessageRule = MessageRule {
+    name: "status",
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
     role: MessageRole::Announcement {
@@ -94,6 +95,7 @@ const STATUS: MessageRule = MessageRule {
 
 /// Asks for a range of items. A peer may have four ranges in flight.
 const GET_ITEMS: MessageRule = MessageRule {
+    name: "get-items",
     message_type: message_type::GET_ITEMS,
     payload: PayloadLen::of::<RangePayload>(),
     role: MessageRole::Request {
@@ -104,6 +106,7 @@ const GET_ITEMS: MessageRule = MessageRule {
 
 /// One item of a range. Items do not end the exchange.
 const ITEM: MessageRule = MessageRule {
+    name: "item",
     message_type: message_type::ITEM,
     payload: PayloadLen::of::<ItemPayload>(),
     role: MessageRole::Response {
@@ -114,6 +117,7 @@ const ITEM: MessageRule = MessageRule {
 
 /// Ends a range after at least one item.
 const ITEMS_DONE: MessageRule = MessageRule {
+    name: "items-done",
     message_type: message_type::ITEMS_DONE,
     payload: PayloadLen::of::<RangePayload>(),
     role: MessageRole::Response {
@@ -124,6 +128,7 @@ const ITEMS_DONE: MessageRule = MessageRule {
 
 /// Ends a range that the sender cannot serve.
 const RANGE_UNAVAILABLE: MessageRule = MessageRule {
+    name: "range-unavailable",
     message_type: message_type::RANGE_UNAVAILABLE,
     payload: PayloadLen::of::<RangePayload>(),
     role: MessageRole::Response {
@@ -135,6 +140,7 @@ const RANGE_UNAVAILABLE: MessageRule = MessageRule {
 /// Opens, renews, and closes a watch on new items. A peer may hold one live
 /// watch with a window of 16 items and their bytes.
 const WATCH: MessageRule = MessageRule {
+    name: "watch",
     message_type: message_type::WATCH,
     payload: PayloadLen::of::<WatchPayload>(),
     role: MessageRole::Subscription {
@@ -151,6 +157,7 @@ const WATCH: MessageRule = MessageRule {
 
 /// One watched item, the next height after the previous one.
 const PUSHED: MessageRule = MessageRule {
+    name: "pushed",
     message_type: message_type::PUSHED,
     payload: PayloadLen::of::<PushedPayload>(),
     role: MessageRole::Response {
@@ -161,6 +168,7 @@ const PUSHED: MessageRule = MessageRule {
 
 /// Ends a watch.
 const WATCH_ENDED: MessageRule = MessageRule {
+    name: "watch-ended",
     message_type: message_type::WATCH_ENDED,
     payload: PayloadLen::of::<WatchEndedPayload>(),
     role: MessageRole::Response {

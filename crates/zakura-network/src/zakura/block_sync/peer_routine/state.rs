@@ -1,12 +1,9 @@
 //! Peer-local request policy for one block-sync session.
 
-use std::{
-    collections::BTreeMap,
-    num::NonZeroU64,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::{
     super::state::RateMeter,
@@ -23,7 +20,11 @@ mod tests;
 #[cfg(test)]
 pub(super) use liveness::{liveness_grace_allowed, no_progress_response};
 pub(super) use liveness::{LivenessDecision, NoProgressResponse};
-pub(super) use requests::{unreceived_heights, BodyMatch, Disposition, SharedDeadlines};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub(super) use requests::check_requested_hash;
+pub(super) use requests::{
+    unreceived_heights, BodyMatch, Disposition, MatchedBody, SharedDeadlines,
+};
 pub(super) use status::StatusUpdate;
 
 /// One block-sync session's download, status, and liveness facts.
@@ -61,6 +62,9 @@ pub(super) struct PeerState {
     pub(super) published_limits: (u32, u32, u32),
     /// Whether the last slot publication showed a requester that refuses work.
     pub(super) published_requester_stopped: bool,
+    /// Whether the last slot publication showed a free slot, so other
+    /// routines may defer the floor to this one.
+    pub(super) published_free_slots: bool,
     /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
     pub(super) pending_status: Option<BlockSyncStatus>,
     /// Last `reset_epoch` that this routine processed.
@@ -115,6 +119,7 @@ impl PeerState {
             ),
             status_range_bypass_available: false,
             published_requester_stopped: false,
+            published_free_slots: false,
             pending_status: None,
             last_reset_epoch: reset_epoch,
             checked_revocations: revocations,

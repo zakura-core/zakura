@@ -58,6 +58,14 @@ impl Completions {
         }
     }
 
+    /// The completion records not yet consumed, oldest first. Reads the
+    /// queue without draining it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn recorded(&self) -> Vec<CompletionId> {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.completed.to_vec()
+    }
+
     /// Consume completed admissions under the publication lock.
     /// The callback must not admit, drop, or complete a request on this queue.
     pub(crate) fn drain(&self, mut consume: impl FnMut(CompletionId)) {

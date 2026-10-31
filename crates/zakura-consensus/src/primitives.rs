@@ -2,10 +2,9 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
-use once_cell::sync::Lazy;
 use tokio::sync::oneshot::error::RecvError;
 
 use crate::BoxError;
@@ -28,8 +27,9 @@ const MAX_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(
 
 /// Registered block transaction-verification batches waiting for an explicit
 /// cryptographic flush.
-static BLOCK_VERIFIER_BATCH_FLUSHES: Lazy<Mutex<HashMap<BlockVerifierBatchFlushKey, BlockFlush>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static BLOCK_VERIFIER_BATCH_FLUSHES: LazyLock<
+    Mutex<HashMap<BlockVerifierBatchFlushKey, BlockFlush>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Opaque identity for a semantic block verifier's transaction batch.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -136,23 +136,23 @@ fn block_verifier_batch_flush_ready(key: BlockVerifierBatchFlushKey) -> bool {
 /// is already flushing batches on size, and waiting for capacity would couple
 /// block latency to unrelated verifier traffic.
 fn flush_block_verifier_batches() {
-    if let Some(verifier) = Lazy::get(&ed25519::VERIFIER) {
+    if let Some(verifier) = LazyLock::get(&ed25519::VERIFIER) {
         queue_batch_flush("ed25519", verifier.primary().clone().try_flush());
     }
 
-    if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
+    if let Some(verifier) = LazyLock::get(&sapling::VERIFIER) {
         queue_batch_flush(sapling::VERIFIER_NAME, sapling::try_flush(verifier));
     }
 
-    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {
+    if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_PRE_NU6_2) {
         queue_batch_flush("halo2_pre_nu6_2", halo2::try_flush(verifier));
     }
 
-    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_2) {
+    if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_NU6_2) {
         queue_batch_flush("halo2_nu6_2", halo2::try_flush(verifier));
     }
 
-    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_3_ONWARD) {
+    if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_NU6_3_ONWARD) {
         queue_batch_flush("halo2_nu6_3_onward", halo2::try_flush(verifier));
     }
 }
@@ -188,19 +188,19 @@ fn queue_batch_flush(verifier: &'static str, result: Result<bool, BoxError>) {
 /// bundle that was not verified.
 #[doc(hidden)]
 pub fn clear_shielded_verification_caches() {
-    if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
+    if let Some(verifier) = LazyLock::get(&sapling::VERIFIER) {
         verifier.clear();
     }
 
-    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {
+    if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_PRE_NU6_2) {
         verifier.clear();
     }
 
-    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_2) {
+    if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_NU6_2) {
         verifier.clear();
     }
 
-    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_3_ONWARD) {
+    if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_NU6_3_ONWARD) {
         verifier.clear();
     }
 }

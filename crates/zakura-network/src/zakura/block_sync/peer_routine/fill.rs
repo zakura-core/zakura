@@ -6,10 +6,10 @@
 //! the decisions. The methods below read shared state, acquire resources, and
 //! publish at the existing synchronization points.
 
-use std::{num::NonZeroU64, sync::Arc, time::Instant};
+use std::{num::NonZeroU64, sync::Arc};
 
 use zakura_chain::block;
-use zakura_rt::time;
+use zakura_rt::time::Instant;
 
 use super::PeerRoutine;
 use crate::zakura::{
@@ -20,7 +20,7 @@ use crate::zakura::{
         regulated::live_requester::FencedRequest,
         request::{BlockRangeRequest, ExpectedBlock},
         state::{OutstandingBlockRange, ReceivedBlockTracker, RequestKey},
-        work_queue::{RequestWrite, WorkItem},
+        work_queue::{AdmitRefusal, RequestWrite, TakenRequest, UnpublishedRequest, WorkItem},
         BlockSyncMessage,
     },
     regulation::{Exchange, ExchangeWriter, PoolEntry},
@@ -32,7 +32,7 @@ mod plan;
 #[cfg(test)]
 mod tests;
 
-use plan::{Funding, RetryDeadlines, RetryFact, TakePlan};
+use plan::{RetryDeadlines, RetryFact, TakePlan};
 
 /// Why a fill pass stopped issuing requests. Typed so every admission refusal is
 /// attributed exhaustively; the `as_str` labels feed the `sync.block.fill_stop`
@@ -51,6 +51,13 @@ pub(super) enum FillStop {
     InflightBudget,
     RetryAvoid,
     Budget,
+    /// The byte budget closed after an accounting drift, so no request may
+    /// acquire funding or publish.
+    AccountingClosed,
+    /// The session's cancellation token fired before the attempt was funded.
+    Cancelled,
+    /// A reset or revocation retired the provisional take before funding.
+    StaleWork,
     Internal,
     OutboundFull,
     SendError,
@@ -76,6 +83,9 @@ impl FillStop {
             FillStop::InflightBudget => "inflight_budget",
             FillStop::RetryAvoid => "retry_avoid",
             FillStop::Budget => "budget",
+            FillStop::AccountingClosed => "accounting_closed",
+            FillStop::Cancelled => "cancelled",
+            FillStop::StaleWork => "stale_work",
             FillStop::Internal => "internal",
             FillStop::OutboundFull => "outbound_full",
             FillStop::SendError => "send_error",
@@ -154,16 +164,16 @@ struct RequestCapacity<'a> {
 }
 
 /// A contiguous run that the work queue holds provisionally for one attempt's
-/// exact owner. Every stop before funding returns it with `return_unpublished`;
-/// funding transfers it to a [`RequestWrite`].
+/// exact owner. Dropping the [`TakenRequest`] at any stop before funding returns
+/// the run; funding moves it into an [`UnpublishedRequest`].
 struct TakenWork {
     /// The download floor that both lanes planned against.
     download_floor: block::Height,
-    items: Vec<(block::Height, WorkItem)>,
+    request: TakenRequest,
 }
 
 /// How publication of one prepared request ended.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum PublishOutcome {
     /// The request entered the guarded transport queue. This means queue
     /// admission, not wire delivery.
@@ -172,9 +182,10 @@ enum PublishOutcome {
     FenceRefused,
     /// A reset or cancellation revoked the attempt's provisional work.
     ClaimRefused,
-    /// The transport queue closed during publication. The outstanding record
-    /// stays until the routine collects its skipped write.
-    TransportClosed,
+    /// The transport queue closed during publication. The caller settles the
+    /// claim, and the outstanding record stays until the routine collects its
+    /// skipped write.
+    TransportClosed(Arc<RequestWrite>),
 }
 
 /// The facts that a published request's diagnostics report.
@@ -211,7 +222,7 @@ impl PeerRoutine {
         self.gc_committed_outstanding();
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
-        let now = time::Instant::now().into_std();
+        let now = Instant::now();
         self.state.prune_retry_avoid(now);
         let mut pass = FillPass {
             now,
@@ -241,6 +252,10 @@ impl PeerRoutine {
         request_sender: &FramedSend,
         pass: &mut FillPass,
     ) -> Result<(), FillStop> {
+        // A closed budget refuses every later phase, so stop before acquiring anything.
+        if self.io.budget.is_closed() {
+            return Err(FillStop::AccountingClosed);
+        }
         // Local eligibility: status, the no-progress cap, and the congestion window.
         let limits = self.state.fill_limits(&self.config, pass.now)?;
         // Capacity: a requester pool entry, an exchange, and a transport slot.
@@ -248,34 +263,33 @@ impl PeerRoutine {
         // A later failure of this attempt still consumes its request ID.
         let request_id = self.state.allocate_request_id().ok_or(FillStop::Internal)?;
         // Selection: the floor lane, then the above-floor lane.
-        let taken = self.select_work(&limits, request_id, pass.now)?;
+        let TakenWork {
+            download_floor,
+            mut request,
+        } = self.select_work(&limits, request_id, pass.now)?;
         // Retry filter: keep the first allowed contiguous run.
-        let items = self.filter_retry(taken.items, pass)?;
-        self.trace_work_taken(limits.servable_low, limits.servable_high, items.len());
-        debug_assert!(
-            !items.is_empty(),
-            "retry filtering must retain a nonempty allowed run"
+        self.filter_retry(&mut request, pass)?;
+        self.trace_work_taken(
+            limits.servable_low,
+            limits.servable_high,
+            request.items().len(),
         );
-        let Some((first_height, first_item)) = items.first().copied() else {
-            return Err(FillStop::Internal);
-        };
-        debug_assert!(items.iter().all(|(_, item)| item.scope == first_item.scope));
 
-        // Funding: classify the retained run, never the probe's priority.
-        let funding = plan::funding_for(
-            taken.download_floor,
-            first_height,
-            items.iter().map(|(_, item)| item.estimated_bytes),
-        );
-        let owner = first_item.scope.bind(self.io.generation, request_id);
-        let claim = self.fund(owner, &items, funding)?;
+        // Funding: the queue derives the charge and floor exception from the
+        // retained run, never from the probe.
+        let unpublished = self.fund(request, download_floor)?;
+        let first_height = unpublished
+            .items()
+            .first()
+            .map(|(height, _)| *height)
+            .ok_or(FillStop::Internal)?;
 
         // Preparation: the request, its response authorization, and its frame.
-        let request = block_range_request(owner, &items, funding)?;
+        let request = block_range_request(&unpublished)?;
         let writer = self.authorize_response(&request, capacity.entry, capacity.exchange)?;
-        let queued_at = time::Instant::now().into_std();
+        let queued_at = Instant::now();
         let frame = self.encode_request(&request)?;
-        let deadline = self.request_deadline(funding, queued_at);
+        let deadline = self.request_deadline(&unpublished, queued_at);
 
         // Publication: writer fence, work claim, outstanding record, then send.
         let issued = IssuedRequest {
@@ -285,11 +299,11 @@ impl PeerRoutine {
             floor_bypass: limits.floor_bypass_only,
         };
         match self.publish_request(
+            unpublished,
             request,
             capacity.slot,
             frame,
             &writer,
-            &claim,
             queued_at,
             deadline,
         ) {
@@ -301,7 +315,7 @@ impl PeerRoutine {
                 self.io.requester.retire(first_height, true);
                 Err(FillStop::Internal)
             }
-            PublishOutcome::TransportClosed => {
+            PublishOutcome::TransportClosed(claim) => {
                 tracing::debug!(
                     peer = ?self.io.peer,
                     generation = self.io.generation,
@@ -333,7 +347,9 @@ impl PeerRoutine {
 
         // If pending work is running low, ping the reactor to re-query (the
         // producer self-gates on low-water, so this is idempotent/cheap).
-        if self.io.work.pending_len() < self.refill_low_water_blocks() {
+        if report.stop != FillStop::AccountingClosed
+            && self.io.work.pending_len() < self.refill_low_water_blocks()
+        {
             let _ = self
                 .io
                 .routine_to_reactor
@@ -395,11 +411,11 @@ impl PeerRoutine {
         let snapshot = self.admission_snapshot(&view);
         let floor_start = self.probe_floor(limits, view.download_floor, now);
         if let Some(take) = plan::plan_floor(&self.config, limits, snapshot, floor_start)? {
-            let items = self.take_work(take, request_id);
-            if !items.is_empty() {
+            let request = self.take_work(take, request_id);
+            if !request.items().is_empty() {
                 return Ok(TakenWork {
                     download_floor: view.download_floor,
-                    items,
+                    request,
                 });
             }
         }
@@ -415,13 +431,13 @@ impl PeerRoutine {
             Err(FillStop::LookaheadCap) => metrics::gauge!("sync.block.backlog.at_cap").set(1.0),
             Err(_) => {}
         }
-        let items = self.take_work(take?, request_id);
-        if items.is_empty() {
+        let request = self.take_work(take?, request_id);
+        if request.items().is_empty() {
             return Err(FillStop::NoWork);
         }
         Ok(TakenWork {
             download_floor: view.download_floor,
-            items,
+            request,
         })
     }
 
@@ -450,8 +466,8 @@ impl PeerRoutine {
     }
 
     /// Take `take` from the work queue for this attempt's exact owner.
-    fn take_work(&self, take: TakePlan, request_id: NonZeroU64) -> Vec<(block::Height, WorkItem)> {
-        self.io.work.take_for_request(
+    fn take_work(&self, take: TakePlan, request_id: NonZeroU64) -> TakenRequest {
+        self.io.work.take_request(
             take.low,
             take.high,
             take.max_count,
@@ -466,38 +482,27 @@ impl PeerRoutine {
     /// send-failure), quietly put those back so another peer can contest them
     /// first, and only keep the run this routine is allowed to re-take.
     ///
-    /// `return_unpublished` does NOT notify (the other peers were already woken
-    /// by the original failure return), so this cannot self-wake into a
-    /// take/return spin. If the whole chunk is still avoided, the pass stops; the
-    /// routine wakes to retry when the avoid window expires (see
-    /// `earliest_deadline_sleep`).
+    /// Returning unpublished items does NOT notify (the other peers were already
+    /// woken by the original failure return), so this cannot self-wake into a
+    /// take/return spin. If the whole chunk is still avoided, the pass stops and
+    /// dropping the take returns it; the routine wakes to retry when the avoid
+    /// window expires (see `earliest_deadline_sleep`).
     fn filter_retry(
         &self,
-        mut items: Vec<(block::Height, WorkItem)>,
+        request: &mut TakenRequest,
         pass: &mut FillPass,
-    ) -> Result<Vec<(block::Height, WorkItem)>, FillStop> {
+    ) -> Result<(), FillStop> {
         let now = pass.now;
-        let run =
-            plan::select_retry_run(&items, |(height, item)| self.retry_fact(*height, item, now));
+        let run = plan::select_retry_run(request.items(), |(height, item)| {
+            self.retry_fact(*height, item, now)
+        });
         let Some(keep) = run.keep else {
-            self.io.work.return_unpublished(&items);
             // The pass stops here, and this wake replaces any earlier attempt's.
             pass.retry_at = self.retry_filter_wake_deadline(now, run.timed_rejection);
             return Err(FillStop::RetryAvoid);
         };
-        let keep_len = keep.len();
-        let mut returned_avoided = false;
-        if keep.start > 0 {
-            let avoided: Vec<_> = items.drain(..keep.start).collect();
-            self.io.work.return_unpublished(&avoided);
-            returned_avoided = true;
-        }
-        if keep_len < items.len() {
-            let avoided = items.split_off(keep_len);
-            self.io.work.return_unpublished(&avoided);
-            returned_avoided = true;
-        }
-        if returned_avoided {
+        if keep.len() != request.items().len() {
+            request.retain_range(keep);
             pass.retry_at = [
                 pass.retry_at,
                 self.retry_filter_wake_deadline(now, run.timed_rejection),
@@ -506,7 +511,7 @@ impl PeerRoutine {
             .flatten()
             .min();
         }
-        Ok(items)
+        Ok(())
     }
 
     /// Read one taken item's retry facts from their owners.
@@ -557,40 +562,26 @@ impl PeerRoutine {
         )
     }
 
-    /// Charge the byte budget for the retained run, then transfer the run and
-    /// its charge to one exact write claim.
+    /// Fund the retained run. A refusal drops the take, which quietly returns
+    /// the run: the returning routine must not re-wake its own want-work arm
+    /// into a take/return spin, and any peer waiting on budget capacity wakes
+    /// when capacity actually returns.
     fn fund(
-        &mut self,
-        owner: zakura_header_chain::BodyWorkOwner,
-        items: &[(block::Height, WorkItem)],
-        funding: Funding,
-    ) -> Result<Arc<RequestWrite>, FillStop> {
-        if !self.reserve_request_budget(funding) {
-            // Quiet (no notify): the returning routine must not re-wake its own
-            // want-work arm into a take/return spin, and any other peer waiting
-            // on budget capacity is woken by the matching `budget.release`.
-            self.io.work.return_unpublished(items);
-            return Err(FillStop::Budget);
-        }
-        Ok(RequestWrite::new(
-            owner,
-            items.to_vec(),
-            self.io.work.clone(),
-            self.io.budget.clone(),
-            self.io.session.cancel_token(),
-        ))
-    }
-
-    fn reserve_request_budget(&mut self, funding: Funding) -> bool {
-        if self.io.budget.try_reserve(funding.reserved_bytes) {
-            return true;
-        }
-        if funding.allows_overdraft() {
-            self.io.budget.charge(funding.reserved_bytes);
-            metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
-            return true;
-        }
-        false
+        &self,
+        request: TakenRequest,
+        download_floor: block::Height,
+    ) -> Result<UnpublishedRequest, FillStop> {
+        request
+            .admit(download_floor, self.io.session.cancel_token())
+            .map_err(|refusal| match refusal {
+                AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
+                AdmitRefusal::Capacity => FillStop::Budget,
+                AdmitRefusal::Cancelled => FillStop::Cancelled,
+                AdmitRefusal::StaleClaim => FillStop::StaleWork,
+                AdmitRefusal::Empty | AdmitRefusal::MissingOwner | AdmitRefusal::AmountOverflow => {
+                    FillStop::Internal
+                }
+            })
     }
 
     /// Reserve response authorization for `request`. A valid scheduler request
@@ -639,14 +630,14 @@ impl PeerRoutine {
     }
 
     /// The request's deadline, from its queue time and this peer's delivery rate.
-    fn request_deadline(&self, funding: Funding, queued_at: Instant) -> Instant {
+    fn request_deadline(&self, funded: &UnpublishedRequest, queued_at: Instant) -> Instant {
         // A block-count delivery sample proves progress even though it cannot
         // supply a byte rate for estimating transfer time.
         let byte_rate = self.state.window.bbr_btlbw_bytes_per_sec(queued_at);
         let has_delivery_measurement =
             byte_rate.is_some() || self.state.window.bbr_btlbw_milliblocks(queued_at).is_some();
         request_deadline(
-            funding.priority,
+            funded.priority(),
             queued_at,
             self.config.request_timeout,
             self.config.effective_floor_rescue_timeout(),
@@ -655,7 +646,7 @@ impl PeerRoutine {
             self.state
                 .window
                 .outstanding_reserved_bytes()
-                .saturating_add(funding.reserved_bytes),
+                .saturating_add(funded.bytes()),
             // Filter BtlBw by the request's send time so a stale-high rate from a
             // now-slow peer cannot tighten the deadline below what it can meet.
             byte_rate,
@@ -666,26 +657,28 @@ impl PeerRoutine {
     /// Publish a prepared request. The writer fence admits publication, then the
     /// work claim admits it under the work-queue lock. Inside both, the routine
     /// records the outstanding request and then sends the frame, so a reset or
-    /// writer start cannot observe a published claim without its record.
+    /// writer start cannot observe a published claim without its record. A
+    /// refusal drops `unpublished`, which returns its run and releases its funding.
     #[allow(clippy::too_many_arguments)]
     fn publish_request(
         &mut self,
+        unpublished: UnpublishedRequest,
         request: BlockRangeRequest,
         slot: GuardedFrameSlot<'_>,
         frame: Frame,
         writer: &ExchangeWriter,
-        claim: &Arc<RequestWrite>,
         queued_at: Instant,
         deadline: Instant,
     ) -> PublishOutcome {
-        let write_claim: Arc<dyn FrameWriteClaim> = Arc::new(FencedRequest {
-            exchange: writer.clone(),
-            work: claim.clone(),
-        });
+        let mut claim = None;
         let mut issued = None;
         let mut delivered = false;
         let fenced = writer.publish(|| {
-            claim.publish(|| {
+            claim = unpublished.publish(|claim| {
+                let write_claim: Arc<dyn FrameWriteClaim> = Arc::new(FencedRequest {
+                    exchange: writer.clone(),
+                    work: claim.clone(),
+                });
                 let key = self.state.window.outstanding.push(OutstandingBlockRange {
                     request,
                     queued_at,
@@ -700,11 +693,11 @@ impl PeerRoutine {
             });
         });
         // The claim records the request only when it admits publication.
-        match (fenced, issued) {
-            (false, _) => PublishOutcome::FenceRefused,
-            (true, None) => PublishOutcome::ClaimRefused,
-            (true, Some(_)) if !delivered => PublishOutcome::TransportClosed,
-            (true, Some(key)) => PublishOutcome::Published(key),
+        match (fenced, claim, issued) {
+            (false, ..) => PublishOutcome::FenceRefused,
+            (true, Some(claim), Some(_)) if !delivered => PublishOutcome::TransportClosed(claim),
+            (true, Some(_), Some(key)) => PublishOutcome::Published(key),
+            (true, ..) => PublishOutcome::ClaimRefused,
         }
     }
 
@@ -749,25 +742,22 @@ impl PeerRoutine {
 
 /// Build the request for a funded run. The run's size estimates sum to the
 /// funded reservation.
-fn block_range_request(
-    owner: zakura_header_chain::BodyWorkOwner,
-    items: &[(block::Height, WorkItem)],
-    funding: Funding,
-) -> Result<BlockRangeRequest, FillStop> {
+fn block_range_request(funded: &UnpublishedRequest) -> Result<BlockRangeRequest, FillStop> {
+    let items = funded.items();
     let (Some((start_height, first_item)), Ok(count)) =
         (items.first().copied(), u32::try_from(items.len()))
     else {
         return Err(FillStop::Internal);
     };
     Ok(BlockRangeRequest {
-        owner,
+        owner: funded.owner(),
         start_height,
         count,
         anchor_hash: first_item.hash,
         // The summed size-estimate reservation for this request (released on a
         // send failure); equals the sum of the per-height `expected_blocks`
         // estimates.
-        estimated_bytes: funding.reserved_bytes,
+        estimated_bytes: funded.bytes(),
         expected_blocks: items
             .iter()
             .map(|(height, item)| ExpectedBlock {

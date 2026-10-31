@@ -114,20 +114,38 @@ where
 
 /// Runs `f` on tokio's blocking pool, as `tokio::task::spawn_blocking` does.
 ///
-/// # Panics
-///
-/// Inside a run. Blocking work isn't simulated yet.
+/// Inside a run, `f` runs as a task labeled `blocking`, in one poll, on the
+/// run's one thread, through [`sim::Executor::spawn_blocking`]. Use
+/// [`spawn_blocking_named`] for a stable label of its own.
 #[track_caller]
 pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    assert!(
-        sim::executor().is_none(),
-        "spawn_blocking isn't simulated yet, so it can't run inside a zakura-rt sim run"
-    );
-    JoinHandle::tokio(tokio::task::spawn_blocking(f))
+    spawn_blocking_named("blocking", f)
+}
+
+/// Runs `f` as [`spawn_blocking`] does, with `label` naming the task as in
+/// [`spawn_named`].
+#[track_caller]
+pub fn spawn_blocking_named<F, R>(label: &'static str, f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (Some(executor), Some(run)) = (sim::executor(), sim::run_id()) else {
+        return JoinHandle::tokio(tokio::task::spawn_blocking(f));
+    };
+    spawn_in_run(
+        executor,
+        run,
+        label,
+        Location::caller(),
+        async move { f() },
+        |label, task| Some(executor.spawn_blocking(label, task)),
+    )
+    .expect("the infallible executor spawn always returns a task")
 }
 
 /// Lets other tasks run, as `tokio::task::yield_now` does.
@@ -429,14 +447,19 @@ impl<T> JoinSet<T> {
         self.tasks.is_empty()
     }
 
-    /// Spawns `task` into the set.
+    /// Spawns `task` into the set. Like [`spawn`], it labels the task with
+    /// the caller's file. [`JoinSetExt::spawn_named`] takes a stable label.
     #[track_caller]
     pub fn spawn<F>(&mut self, task: F) -> AbortHandle
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let handle = spawn(task);
+        self.insert(spawn(task))
+    }
+
+    /// Adds the spawned `handle` to the set and returns its abort handle.
+    fn insert(&mut self, handle: JoinHandle<T>) -> AbortHandle {
         let abort = handle.abort_handle();
         self.tasks.push(handle);
         abort
@@ -480,6 +503,28 @@ impl<T> JoinSet<T> {
     pub async fn shutdown(&mut self) {
         self.abort_all();
         while self.join_next().await.is_some() {}
+    }
+}
+
+/// Adds a labeled spawn to [`JoinSet`].
+pub trait JoinSetExt<T> {
+    /// Spawns `task` into the set as [`JoinSet::spawn`] does, with `label`
+    /// naming the task as in [`spawn_named`].
+    #[track_caller]
+    fn spawn_named<F>(&mut self, label: &'static str, task: F) -> AbortHandle
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static;
+}
+
+impl<T: 'static> JoinSetExt<T> for JoinSet<T> {
+    #[track_caller]
+    fn spawn_named<F>(&mut self, label: &'static str, task: F) -> AbortHandle
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.insert(spawn_named(label, task))
     }
 }
 

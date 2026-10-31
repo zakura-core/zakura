@@ -11,7 +11,13 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::block_sync::config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+use crate::zakura::{
+    block_sync::{
+        config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES, request::BlockSizeEstimate,
+        test_work_scope, work_queue::WorkQueue,
+    },
+    transport::ByteBudget,
+};
 
 fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {
     let start = allowed.iter().position(|allowed| *allowed)?;
@@ -237,7 +243,62 @@ struct Attempt {
     selected: Result<(Lane, Vec<(u32, u64)>), FillStop>,
     retry: Option<RetryRun>,
     visits: Vec<u32>,
-    funding: Option<Funding>,
+    funding: Option<Funded>,
+}
+
+/// What the real queue charged a retained run.
+#[derive(Copy, Clone, Debug)]
+struct Funded {
+    priority: RequestPriority,
+    reserved_bytes: u64,
+    /// Whether the run would be funded by an already exhausted budget.
+    overdrafts: bool,
+}
+
+/// Take `kept` from a real queue and admit it against `budget_bytes`.
+fn admit_kept(
+    download_floor: block::Height,
+    kept: &[(block::Height, u64)],
+    budget_bytes: u64,
+) -> Option<Funded> {
+    let queue = std::sync::Arc::new(WorkQueue::new(
+        block::Height(0),
+        ByteBudget::new(budget_bytes),
+    ));
+    queue.set_estimate_floor_for_tests(1);
+    // The queue owns only heights above genesis, and raw scenario heights can be
+    // zero. Shifting the floor and the run together keeps their priority.
+    let shifted = |height: block::Height| block::Height(height.0 + 1);
+    queue.extend(
+        test_work_scope(),
+        kept.iter().map(|(height, estimate)| {
+            (
+                shifted(*height),
+                block::Hash([7; 32]),
+                BlockSizeEstimate::Confirmed(u32::try_from(*estimate).unwrap()),
+            )
+        }),
+    );
+    let (low, high) = (shifted(kept.first()?.0), shifted(kept.last()?.0));
+    let request_id = std::num::NonZeroU64::new(1).unwrap();
+    let take = queue.take_request(low, high, kept.len(), u64::MAX, 1, request_id);
+    let cancel = zakura_rt::sync::CancellationToken::new();
+    let funded = take.admit(shifted(download_floor), cancel).ok()?;
+    Some(Funded {
+        priority: funded.priority(),
+        reserved_bytes: funded.bytes(),
+        overdrafts: false,
+    })
+}
+
+/// Fund a retained run the way `PeerRoutine::fund` does.
+fn fund_retained(download_floor: block::Height, kept: &[(block::Height, u64)]) -> Funded {
+    let funded = admit_kept(download_floor, kept, u64::MAX / 2)
+        .expect("a run with an ample budget always funds");
+    Funded {
+        overdrafts: admit_kept(download_floor, kept, 0).is_some(),
+        ..funded
+    }
 }
 
 /// Run the planners in the order `PeerRoutine::select_work`, `filter_retry`,
@@ -299,11 +360,11 @@ fn attempt(config: &ZakuraBlockSyncConfig, scenario: &Scenario) -> Attempt {
     });
     if let Some(keep) = run.keep.clone() {
         let kept = &items[keep];
-        attempt.funding = Some(funding_for(
-            scenario.height(scenario.floor),
-            scenario.height(kept[0].0),
-            kept.iter().map(|(_, estimate)| *estimate),
-        ));
+        let kept: Vec<_> = kept
+            .iter()
+            .map(|(raw, estimate)| (scenario.height(*raw), *estimate))
+            .collect();
+        attempt.funding = Some(fund_retained(scenario.height(scenario.floor), &kept));
     }
     attempt.retry = Some(run);
     attempt
@@ -436,7 +497,7 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
             let kept = &items[keep.clone()];
             let floor_work = kept[0].0 <= floor_rescue_high;
             assert_eq!(funding.priority == RequestPriority::Floor, floor_work);
-            assert_eq!(funding.allows_overdraft(), floor_work);
+            assert_eq!(funding.overdrafts, floor_work);
             assert_eq!(
                 funding.reserved_bytes,
                 kept.iter().map(|(_, estimate)| estimate).sum::<u64>()
@@ -519,7 +580,7 @@ fn a_raced_floor_probe_funds_the_run_it_actually_took() {
     assert_eq!(items.first().map(|(raw, _)| *raw), Some(3));
     let funding = attempt.funding.unwrap();
     assert_eq!(funding.priority, RequestPriority::AboveFloor);
-    assert!(!funding.allows_overdraft());
+    assert!(!funding.overdrafts);
 }
 
 /// The retry filter removes the floor item, so the retained run starts above

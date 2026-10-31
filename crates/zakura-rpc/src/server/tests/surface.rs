@@ -364,7 +364,6 @@ async fn oversized_batches_are_rejected_before_dispatch() {
         None,
     );
 
-    crate::indexer::server::install_tls_crypto_provider();
     let restricted_task = RpcServer::start(rpc_impl.clone(), conf.clone())
         .await
         .expect("restricted RPC listener should start");

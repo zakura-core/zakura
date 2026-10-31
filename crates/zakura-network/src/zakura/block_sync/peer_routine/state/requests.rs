@@ -1,8 +1,9 @@
 //! Request lifecycle decisions: deadlines, expiry, and retry avoidance.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::{
     super::super::{
@@ -11,6 +12,30 @@ use super::{
     },
     PeerState,
 };
+
+/// Why a routine rejects a body whose hash isn't the one its outstanding
+/// request expects at the body's height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum RequestedHashReject {
+    /// The request expects this other hash.
+    Mismatch(block::Hash),
+    /// The request expects no body at that height.
+    Unrequested,
+}
+
+/// Checks a body's hash `delivered` against `expected`, the hash its
+/// outstanding request expects at the body's height, if any.
+#[inline]
+pub(in super::super) fn check_requested_hash(
+    expected: Option<block::Hash>,
+    delivered: block::Hash,
+) -> Result<(), RequestedHashReject> {
+    match expected {
+        Some(requested) if requested != delivered => Err(RequestedHashReject::Mismatch(requested)),
+        Some(_) => Ok(()),
+        None => Err(RequestedHashReject::Unrequested),
+    }
+}
 
 /// How a finished request returns its work.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -130,12 +155,12 @@ impl PeerState {
         if outstanding.has_received(height) {
             return BodyMatch::Duplicate;
         }
-        match outstanding.request.expected_hash(height) {
-            Some(requested) if requested != hash => BodyMatch::PayloadMismatch {
+        match check_requested_hash(outstanding.request.expected_hash(height), hash) {
+            Err(RequestedHashReject::Mismatch(requested)) => BodyMatch::PayloadMismatch {
                 owner: outstanding.request.owner,
                 requested,
             },
-            Some(_) => BodyMatch::Matched(MatchedBody {
+            Ok(()) => BodyMatch::Matched(MatchedBody {
                 key,
                 owner: outstanding.request.owner,
                 estimated_bytes: outstanding.estimated_bytes_for_height(height).unwrap_or(0),
@@ -144,7 +169,7 @@ impl PeerState {
                 queued_at: outstanding.queued_at,
                 delivery_snapshot: outstanding.delivery_snapshot,
             }),
-            None => BodyMatch::NotRequested,
+            Err(RequestedHashReject::Unrequested) => BodyMatch::NotRequested,
         }
     }
 

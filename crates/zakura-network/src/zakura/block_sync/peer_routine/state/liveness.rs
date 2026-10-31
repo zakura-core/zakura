@@ -1,7 +1,9 @@
 //! Liveness and exit decisions: no-progress stalls, write congestion, resets,
 //! and stream failure.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use zakura_rt::time::Instant;
 
 use super::{super::super::state::LivenessOutcome, super::OrderedStreamFailure, PeerState};
 

@@ -6,10 +6,10 @@
 //! outstanding record. Fence refusal and a transport close during publication
 //! need concurrent coverage when the simulator becomes available.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zakura_chain::block;
-use zakura_rt::sync::CancellationToken;
+use zakura_rt::{sync::CancellationToken, time::Instant};
 
 use super::{super::tests::status_test_routine_with, FillStop, PeerRoutine};
 use crate::zakura::{
@@ -179,9 +179,9 @@ async fn avoided_work_returns_quietly_with_its_retry_deadline() {
 async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
     let mut fixture = fixture(1, &[3]);
     // Admission funds 500 bytes, but the take always admits its first body.
-    let mut budget = fixture.routine.io.budget.clone();
+    let budget = fixture.routine.io.work.budget_for_tests();
     let reserved = budget.available() - 500;
-    assert!(budget.try_reserve(reserved));
+    let unrelated = budget.reserve_owned(reserved).unwrap();
     let before = fixture.next_request_id();
 
     let report = fixture.routine.try_fill();
@@ -189,17 +189,18 @@ async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
     assert_eq!(report.stop, FillStop::Budget);
     assert_eq!(fixture.next_request_id(), before + 1);
     fixture.assert_settled(reserved);
+    drop(unrelated);
 }
 
 #[tokio::test]
-async fn a_revoked_claim_retires_its_authorization_and_returns_its_funding() {
+async fn session_cancellation_before_funding_returns_the_take_without_a_charge() {
     let mut fixture = fixture(1, &[3]);
     fixture.routine.io.session.cancel_token().cancel();
     let before = fixture.next_request_id();
 
     let report = fixture.routine.try_fill();
 
-    assert_eq!(report.stop, FillStop::Internal);
+    assert_eq!(report.stop, FillStop::Cancelled);
     assert_eq!(fixture.next_request_id(), before + 1);
     fixture.assert_settled(0);
 }

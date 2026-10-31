@@ -4,22 +4,49 @@
 //! only the entries it touches, so filling or draining a window costs
 //! `O(N log N)` rather than `O(N²)`.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::OutstandingBlockRange;
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::block_sync::work_queue::RequestWritePhase;
 
 /// Identity of one outstanding request. Keys increase in issue order.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(in crate::zakura::block_sync) struct RequestKey(u64);
+pub struct RequestKey(u64);
 
 impl RequestKey {
     const MIN: Self = Self(0);
     const MAX: Self = Self(u64::MAX);
+}
+
+/// One outstanding request, as [`OutstandingRequests::ownership`] reads it.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestOwnership {
+    /// The request's key in its routine.
+    pub key: RequestKey,
+    /// The request.
+    pub owner: zakura_header_chain::BodyWorkOwner,
+    /// Where the request's frame write stands.
+    pub write: crate::zakura::block_sync::work_queue::RequestWritePhase,
+    /// Each requested height, in order.
+    pub heights: Vec<RequestedHeight>,
+}
+
+/// One height of an outstanding request.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RequestedHeight {
+    /// The height.
+    pub height: block::Height,
+    /// The size estimate the request reserved for this height at admission.
+    /// A received body's wire bytes minus this is the hint's error.
+    pub estimated_bytes: u64,
+    /// The body arrived, so the height no longer holds its estimate.
+    pub received: bool,
 }
 
 /// Outstanding requests in issue order with secondary indexes.
@@ -53,6 +80,36 @@ impl OutstandingRequests {
         &self,
     ) -> impl Iterator<Item = &OutstandingBlockRange> + '_ {
         self.requests.values()
+    }
+
+    /// Every outstanding request with its owner, write phase, and each
+    /// height's admission estimate, read from the request map rather than
+    /// from `reserved_bytes`. `write_phase` reads the live write handle, which
+    /// the routine holds beside these records.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::block_sync) fn ownership(
+        &self,
+        write_phase: impl Fn(RequestKey) -> Option<RequestWritePhase>,
+    ) -> Vec<RequestOwnership> {
+        self.requests
+            .iter()
+            .map(|(key, outstanding)| RequestOwnership {
+                key: *key,
+                owner: outstanding.request.owner,
+                write: write_phase(*key)
+                    .expect("every outstanding request keeps its write handle until it settles"),
+                heights: outstanding
+                    .request
+                    .expected_blocks
+                    .iter()
+                    .map(|expected| RequestedHeight {
+                        height: expected.height,
+                        estimated_bytes: expected.estimated_bytes,
+                        received: outstanding.has_received(expected.height),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Keyed requests in issue order.

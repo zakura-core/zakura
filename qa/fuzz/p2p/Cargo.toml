@@ -1,0 +1,35 @@
+[package]
+name = "zakura-p2p-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuzz"] }
+
+[workspace]
+
+[[bin]]
+name = "block_work_ownership"
+path = "fuzz_targets/block_work_ownership.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_peer_registry"
+path = "fuzz_targets/block_peer_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_retry_authority"
+path = "fuzz_targets/block_retry_authority.rs"
+test = false
+doc = false
+bench = false

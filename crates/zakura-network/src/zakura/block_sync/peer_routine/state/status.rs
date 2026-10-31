@@ -1,6 +1,6 @@
 //! Status decisions: request limits, publication cadence, and requester stops.
 
-use std::time::Instant;
+use zakura_rt::time::Instant;
 
 use super::{
     super::{

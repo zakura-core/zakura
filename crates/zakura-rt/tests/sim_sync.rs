@@ -14,7 +14,7 @@ use std::{
 
 use support::run;
 use zakura_rt::{
-    sim::Op,
+    sim::{self, Op, Peek},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         counter, mpsc, oneshot, watch, CancellationToken, Mutex, Notify, PoisonError, Semaphore,
@@ -396,4 +396,339 @@ fn points_are_skipped_while_a_watch_lock_is_held() {
         1,
         "only the load after the locks"
     );
+}
+
+/// A hook that counts its runs in `count`.
+fn counting_hook(count: &Arc<counter::AtomicUsize>) -> impl FnOnce() + Send + 'static {
+    let count = Arc::clone(count);
+    move || {
+        count.fetch_add(1, counter::Ordering::Relaxed);
+    }
+}
+
+/// A hook runs once, whether its own token or an ancestor is cancelled, and
+/// cancelling again runs nothing.
+#[test]
+fn on_cancel_runs_once_on_direct_and_parent_cancellation() {
+    let (runs, report) = run(async {
+        let direct = Arc::new(counter::AtomicUsize::new(0));
+        let inherited = Arc::new(counter::AtomicUsize::new(0));
+        let grandchild_runs = Arc::new(counter::AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let child = token.child_token();
+        let grandchild = child.child_token();
+        token.on_cancel(counting_hook(&direct));
+        child.on_cancel(counting_hook(&inherited));
+        grandchild.on_cancel(counting_hook(&grandchild_runs));
+        let before = (
+            direct.load(counter::Ordering::Relaxed),
+            inherited.load(counter::Ordering::Relaxed),
+        );
+        token.cancel();
+        let after_first = (
+            direct.load(counter::Ordering::Relaxed),
+            inherited.load(counter::Ordering::Relaxed),
+            grandchild_runs.load(counter::Ordering::Relaxed),
+        );
+        token.cancel();
+        child.cancel();
+        let after_second = (
+            direct.load(counter::Ordering::Relaxed),
+            inherited.load(counter::Ordering::Relaxed),
+            grandchild_runs.load(counter::Ordering::Relaxed),
+        );
+        (before, after_first, after_second)
+    });
+    assert_eq!(runs.0, (0, 0), "nothing runs before the cancel");
+    assert_eq!(runs.1, (1, 1, 1), "the cancel reaches the children");
+    assert_eq!(runs.2, (1, 1, 1), "cancelling again runs nothing");
+    assert_eq!(
+        report.count(Op::Cancel),
+        3,
+        "only the three cancels are points"
+    );
+}
+
+/// A hook added to a cancelled token, or to a child made after its parent
+/// was cancelled, runs when it's added.
+#[test]
+fn on_cancel_on_a_cancelled_token_runs_now() {
+    let (runs, report) = run(async {
+        let token = CancellationToken::new();
+        token.cancel();
+        let child = token.child_token();
+        let own = Arc::new(counter::AtomicUsize::new(0));
+        let late_child = Arc::new(counter::AtomicUsize::new(0));
+        token.on_cancel(counting_hook(&own));
+        child.on_cancel(counting_hook(&late_child));
+        (
+            own.load(counter::Ordering::Relaxed),
+            late_child.load(counter::Ordering::Relaxed),
+        )
+    });
+    assert_eq!(runs, (1, 1), "each hook runs when it's added");
+    assert_eq!(report.count(Op::Cancel), 1);
+    assert_eq!(
+        report.count(Op::Cancelled),
+        0,
+        "adding a hook reads no point"
+    );
+}
+
+/// A drop guard's cancel runs the token's hooks and its children's, and a
+/// dropped child's hooks never run.
+#[test]
+fn on_cancel_runs_from_a_drop_guard() {
+    let (runs, _) = run(async {
+        let own = Arc::new(counter::AtomicUsize::new(0));
+        let kept = Arc::new(counter::AtomicUsize::new(0));
+        let dropped = Arc::new(counter::AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let child = token.child_token();
+        let gone = token.child_token();
+        token.on_cancel(counting_hook(&own));
+        child.on_cancel(counting_hook(&kept));
+        gone.on_cancel(counting_hook(&dropped));
+        drop(gone);
+        drop(token.clone().drop_guard());
+        (
+            own.load(counter::Ordering::Relaxed),
+            kept.load(counter::Ordering::Relaxed),
+            dropped.load(counter::Ordering::Relaxed),
+        )
+    });
+    assert_eq!(runs, (1, 1, 0));
+}
+
+/// A grandchild's hook runs when the root is cancelled after the child
+/// between them was dropped, as tokio still cancels the grandchild. The
+/// dropped child's own hook never runs.
+#[test]
+fn on_cancel_survives_a_dropped_intermediate_token() {
+    let (runs, _) = run(async {
+        let middle_runs = Arc::new(counter::AtomicUsize::new(0));
+        let leaf_runs = Arc::new(counter::AtomicUsize::new(0));
+        let root = CancellationToken::new();
+        let middle = root.child_token();
+        let leaf = middle.child_token();
+        middle.on_cancel(counting_hook(&middle_runs));
+        leaf.on_cancel(counting_hook(&leaf_runs));
+        drop(middle);
+        root.cancel();
+        (
+            middle_runs.load(counter::Ordering::Relaxed),
+            leaf_runs.load(counter::Ordering::Relaxed),
+            leaf.is_cancelled(),
+        )
+    });
+    assert_eq!(runs, (0, 1, true));
+}
+
+/// A hook runs when the parent cancels a child whose last token became a
+/// `cancelled_owned` future, and that future still resolves.
+#[test]
+fn on_cancel_survives_cancelled_owned() {
+    let (runs, _) = run(async {
+        let count = Arc::new(counter::AtomicUsize::new(0));
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        child.on_cancel(counting_hook(&count));
+        let wait = child.cancelled_owned();
+        root.cancel();
+        let ran = count.load(counter::Ordering::Relaxed);
+        wait.await;
+        ran
+    });
+    assert_eq!(runs, 1);
+}
+
+/// Adding and running hooks adds no point and no draw.
+#[test]
+fn on_cancel_adds_no_point() {
+    let cancel_with = |hooked: bool| {
+        run(async move {
+            let token = CancellationToken::new();
+            let child = token.child_token();
+            if hooked {
+                token.on_cancel(|| {});
+                child.on_cancel(|| {});
+            }
+            token.cancel();
+        })
+        .1
+    };
+    let (hooked, plain) = (cancel_with(true), cancel_with(false));
+    assert_eq!(hooked.points, plain.points);
+    assert_eq!(hooked.draws, plain.draws);
+}
+
+/// A task holds a `Mutex` guard and peeks it in the same poll, which reads
+/// `Held` with the task as its holder, then drops the guard and peeks again,
+/// which reads `Current`. The atomics and the semaphore peek their values.
+/// The task reaches the same points as without the peeks: its own lock and
+/// release, and nothing else.
+///
+/// This fails if a peek reaches a point.
+#[test]
+fn peeks_add_no_point() {
+    let peeked = |peek: bool| {
+        run(async move {
+            let lock = Mutex::new(1_u64);
+            let (atomic, flag, semaphore) =
+                (AtomicU64::new(2), AtomicBool::new(true), Semaphore::new(3));
+            let mut seen = Vec::new();
+            let guard = lock.lock().unwrap();
+            if peek {
+                seen.push(lock.peek(|value| *value));
+                assert_eq!(atomic.peek(), 2);
+                assert!(flag.peek());
+                assert_eq!(semaphore.peek_available(), 3);
+            }
+            drop(guard);
+            if peek {
+                seen.push(lock.peek(|value| *value));
+            }
+            seen
+        })
+    };
+    let ((seen, with), (_, without)) = (peeked(true), peeked(false));
+    assert_eq!(
+        seen,
+        [
+            Peek::Held {
+                holder: Some(sim::TaskId::new(0))
+            },
+            Peek::Current(1)
+        ]
+    );
+    assert_eq!(
+        (with.count(Op::Lock), with.count(Op::Release)),
+        (1, 1),
+        "the task's own lock and release"
+    );
+    assert_eq!(with.points, without.points);
+}
+
+/// Outside a run, a peek is std's `try_lock` with no holder to name, and a
+/// panicked holder's value reads `Poisoned`.
+#[test]
+fn peeks_outside_a_run_behave_like_std() {
+    let lock = Arc::new(Mutex::new(5));
+    assert_eq!(lock.peek(|value| *value), Peek::Current(5));
+    let guard = lock.lock().unwrap();
+    assert_eq!(lock.peek(|value| *value), Peek::Held { holder: None });
+    drop(guard);
+    let poisoner = lock.clone();
+    std::thread::spawn(move || {
+        let _guard = poisoner.lock().unwrap();
+        panic!("poisons the lock");
+    })
+    .join()
+    .expect_err("the holder panicked");
+    assert_eq!(lock.peek(|value| *value), Peek::Poisoned(5));
+    assert_eq!(AtomicU64::new(7).peek(), 7);
+    assert_eq!(Semaphore::new(2).peek_available(), 2);
+}
+
+/// Inside a boundary read, a point, a `Mutex` lock, any use of the
+/// executor and a guard's release panic, and the mark clears when the read unwinds, so the task's own
+/// points work again. A peek inside one is fine.
+///
+/// This fails if the runtime doesn't check the mark.
+#[test]
+fn a_read_that_reaches_the_runtime_panics() {
+    let ((), report) = run(async {
+        let atomic = AtomicU64::new(0);
+        let lock = Mutex::new(0);
+        let refused = |read: &dyn Fn()| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim::boundary_read(read)))
+                .is_err()
+        };
+        assert!(refused(&|| {
+            atomic.load(Ordering::SeqCst);
+        }));
+        assert!(refused(&|| drop(lock.lock())));
+        assert!(refused(&|| {
+            let _ = sim::executor();
+        }));
+        let guard = std::cell::Cell::new(Some(lock.lock().unwrap()));
+        assert!(refused(&|| drop(guard.take())));
+        assert!(!sim::in_boundary_read(), "an unwound read clears its mark");
+        assert_eq!(sim::boundary_read(|| atomic.peek()), 0);
+        atomic.load(Ordering::SeqCst);
+    });
+    assert_eq!(
+        report.count(Op::AtomicLoad),
+        1,
+        "only the load outside any read reached its point"
+    );
+}
+
+#[test]
+fn caught_runtime_panics_still_invalidate_boundary_reads() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    run(async {
+        let atomic = AtomicU64::new(3);
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| atomic.store(4, Ordering::SeqCst))).is_err()
+                );
+                atomic.peek()
+            })
+        }));
+        assert!(failed.is_err());
+        assert_eq!(atomic.peek(), 3);
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(catch_unwind(AssertUnwindSafe(|| sim::boundary_read(|| {
+                    atomic.store(5, Ordering::SeqCst);
+                })))
+                .is_err());
+            })
+        }));
+        assert!(failed.is_err());
+        assert_eq!(sim::boundary_read(|| atomic.peek()), 3);
+    });
+}
+
+#[test]
+fn boundary_reads_reject_capacity_addition_before_it_changes_capacity() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    run(async {
+        let sem = Semaphore::new(2);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| sem.add_permits(4))
+        }));
+        assert!(result.is_err());
+        assert_eq!(sem.peek_available(), 2);
+    });
+}
+
+#[test]
+fn boundary_reads_cannot_hide_release_before_point() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    run(async {
+        let sem = Semaphore::new(1);
+        let permit = sem.try_acquire().unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(catch_unwind(AssertUnwindSafe(|| drop(permit))).is_err());
+                // The inner Tokio permit releases before the wrapper's point.
+                assert_eq!(sem.peek_available(), 1);
+            })
+        }));
+        assert!(
+            result.is_err(),
+            "a changed capacity cannot become a successful read"
+        );
+        let (sender, receiver) = watch::channel(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(catch_unwind(AssertUnwindSafe(|| drop(sender))).is_err());
+            })
+        }));
+        assert!(result.is_err());
+        assert!(receiver.has_changed().is_err());
+    });
 }

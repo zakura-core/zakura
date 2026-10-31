@@ -13,14 +13,11 @@
 //! the registry then wakes floor deferrers after unlocking. Removed entries and
 //! detached claims return to the registry, which drops them after unlocking.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, BodyWorkOwner, SourceId};
-use zakura_rt::collections::HashMap;
+use zakura_rt::{collections::HashMap, time::Instant};
 
 use super::{
     super::{
@@ -34,8 +31,13 @@ use super::{
 };
 use crate::zakura::ZakuraConnId;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};
 
 // ---- peer summaries ----
 
@@ -47,7 +49,6 @@ pub(super) struct PeerTable {
 }
 
 impl PeerTable {
-    #[cfg(test)]
     pub(super) fn get(&self, peer: &ZakuraPeerId) -> Option<&Entry> {
         self.peers.get(peer)
     }
@@ -432,32 +433,32 @@ impl PeerTable {
             .min()
     }
 
-    /// See [`PeerRegistry::floor_has_preferred_unsaturated_server`](super::PeerRegistry::floor_has_preferred_unsaturated_server).
-    pub(super) fn floor_has_preferred_unsaturated_server(
-        &self,
+    /// Rank candidates from one published snapshot. The runtime checks their
+    /// live handoff flags before deferring work to a candidate.
+    pub(super) fn preferred_floor_candidates<'a>(
+        &'a self,
         height: block::Height,
-        self_peer: &ZakuraPeerId,
+        self_peer: &'a ZakuraPeerId,
         self_rtprop_ms: Option<u64>,
         allow_equal_score: bool,
-    ) -> bool {
-        // Rank registered peers from the same published snapshot. Mixing a fresh
-        // local expiry with other peers' cached scores can make every peer defer.
+    ) -> impl Iterator<Item = &'a ZakuraPeerId> + 'a {
         let self_score = self
             .peers
             .get(self_peer)
             .map(|entry| entry.slots.bbr_rtprop_ms)
             .unwrap_or(self_rtprop_ms)
             .unwrap_or(u64::MAX);
-        self.peers.iter().any(|(peer, entry)| {
+        self.peers.iter().filter_map(move |(peer, entry)| {
             if peer == self_peer || !entry.can_serve_with_room(height) {
-                return false;
+                return None;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
-            if allow_equal_score {
+            let preferred = if allow_equal_score {
                 other_score <= self_score
             } else {
                 other_score < self_score
-            }
+            };
+            preferred.then_some(peer)
         })
     }
 

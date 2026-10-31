@@ -39,7 +39,8 @@ pub trait Executor {
     fn preempt(&self, point: Point);
 
     /// Parks the current task until [`Executor::unpark_all`] on `wait`. The
-    /// task keeps its simulated worker. Only synchronous waits, such as a
+    /// task keeps its simulated worker, if it holds one (see
+    /// [`Executor::spawn_blocking`]). Only synchronous waits, such as a
     /// contended `Mutex`, park. Async waits return `Pending` instead.
     ///
     /// `held_by` names the task holding `wait`, if known, so the scheduler can
@@ -58,6 +59,14 @@ pub trait Executor {
     /// it unpolled when the run can't take another task. Code that spawns
     /// from a `Drop` impl uses this, since a panic there could abort.
     fn try_spawn(&self, label: &'static str, task: BoxTask) -> Option<TaskId>;
+
+    /// Spawns `task` as a blocking job, with the parent and label
+    /// [`Executor::spawn`] would give it. The job runs without a simulated
+    /// worker, as on tokio's blocking pool, and an abort after its first poll
+    /// does nothing. Defaults to [`Executor::spawn`].
+    fn spawn_blocking(&self, label: &'static str, task: BoxTask) -> TaskId {
+        self.spawn(label, task)
+    }
 
     /// Requests cancellation. The task's future is dropped at its next poll
     /// boundary, as with tokio's abort. A no-op once the task has ended.
@@ -96,7 +105,22 @@ pub trait Executor {
     /// A random choice for `site`, taken from the run's `Plan`. Returns a
     /// value below `bound`, or any `u64` when `bound` is 0.
     fn draw(&self, site: DrawSite, bound: u64) -> u64;
+
+    /// UTC at virtual time zero. [`crate::time::utc_now`] adds virtual time
+    /// to it. The default, [`DEFAULT_UTC_ORIGIN_SINCE_EPOCH`] after the Unix
+    /// epoch, keeps a run that sets no origin deterministic.
+    ///
+    /// The executor must keep the origin plus [`Executor::now`] within what
+    /// `SystemTime` can hold, refusing to move time past it, so a task's
+    /// `utc_now` never overflows.
+    fn utc_origin(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + DEFAULT_UTC_ORIGIN_SINCE_EPOCH
+    }
 }
+
+/// [`Executor::utc_origin`]'s default, as time since the Unix epoch:
+/// 2026-01-01T00:00:00Z.
+pub const DEFAULT_UTC_ORIGIN_SINCE_EPOCH: Duration = Duration::from_secs(1_767_225_600);
 
 /// The run installed on a thread.
 #[derive(Clone, Copy)]
@@ -112,6 +136,10 @@ thread_local! {
     /// Points skipped in the current or last run because a `watch` lock was
     /// held.
     static SUPPRESSED: Cell<u64> = const { Cell::new(0) };
+    /// Set while a boundary read runs on this thread.
+    static BOUNDARY_READ: Cell<bool> = const { Cell::new(false) };
+    /// A runtime access invalidates the whole read, even if its panic is caught.
+    static BOUNDARY_READ_FAILED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The next [`RunId`]. Process-wide, so an id never repeats on any thread.
@@ -140,8 +168,17 @@ impl fmt::Display for RunId {
 }
 
 /// The executor of the run on this thread, or `None` outside a run.
+///
+/// # Panics
+///
+/// Inside a [`boundary_read`], since every executor call is a step toward
+/// changing the schedule: a timer, a draw, a spawn, a new object.
+#[track_caller]
 pub fn executor() -> Option<&'static dyn Executor> {
-    current().map(|run| run.executor)
+    current().map(|run| {
+        refuse_in_boundary_read("the executor");
+        run.executor
+    })
 }
 
 /// The run on this thread, or `None` outside a run.
@@ -153,10 +190,87 @@ pub fn run_id() -> Option<RunId> {
 /// thread. A handle from an earlier run then acts as if its task or timer
 /// ended with the run, instead of reaching a later run's task or timer with
 /// the same id.
+///
+/// # Panics
+///
+/// Inside a [`boundary_read`], as [`executor`] does.
+#[track_caller]
 pub fn executor_for(run: RunId) -> Option<&'static dyn Executor> {
     current()
         .filter(|current| current.id == run)
-        .map(|current| current.executor)
+        .map(|current| {
+            refuse_in_boundary_read("the executor");
+            current.executor
+        })
+}
+
+/// Runs `read` as a boundary read: harness code that looks at owners'
+/// state between steps, while every task is stopped. A read must not reach
+/// the runtime, since that would change the schedule it observes, so inside
+/// `read` any use of the executor ([`executor`], [`executor_for`]), and so
+/// every preemption point, park, unpark, timer change and draw, panics, and
+/// so does a simulated task's waker. Use the peeks ([`Peek`]) to read
+/// runtime objects.
+pub fn boundary_read<R>(read: impl FnOnce() -> R) -> R {
+    struct Reading {
+        outer: bool,
+        failed_before: bool,
+    }
+
+    impl Drop for Reading {
+        fn drop(&mut self) {
+            let failed = BOUNDARY_READ_FAILED.with(Cell::get);
+            BOUNDARY_READ.with(|cell| cell.set(self.outer));
+            BOUNDARY_READ_FAILED
+                .with(|cell| cell.set(self.failed_before || (self.outer && failed)));
+        }
+    }
+
+    let _reading = Reading {
+        outer: BOUNDARY_READ.with(|cell| cell.replace(true)),
+        failed_before: BOUNDARY_READ_FAILED.with(|cell| cell.replace(false)),
+    };
+    let value = read();
+    assert!(
+        !BOUNDARY_READ_FAILED.with(Cell::get),
+        "a boundary read caught a forbidden runtime access"
+    );
+    value
+}
+
+/// True while a [`boundary_read`] runs on this thread. A scheduler checks it
+/// before a waker changes its ready set, since a wake doesn't go through
+/// the runtime's points.
+pub fn in_boundary_read() -> bool {
+    BOUNDARY_READ.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Panics if a [`boundary_read`] runs on this thread, naming `what` it
+/// reached.
+#[track_caller]
+pub fn refuse_in_boundary_read(what: &str) {
+    if in_boundary_read() {
+        BOUNDARY_READ_FAILED.with(|cell| cell.set(true));
+    }
+    assert!(
+        !in_boundary_read(),
+        "a boundary read reached the runtime: {what}"
+    );
+}
+
+/// What a peek saw: a runtime object's value read with no preemption point,
+/// for a [`boundary_read`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Peek<R> {
+    /// The value, with nobody holding it.
+    Current(R),
+    /// A task holds the lock, so the value may be mid-change.
+    Held {
+        /// The holding task, if a sim task holds it.
+        holder: Option<TaskId>,
+    },
+    /// A holder panicked. Holds the value as it left it.
+    Poisoned(R),
 }
 
 /// The run on this thread, if any.
@@ -474,6 +588,7 @@ pub(crate) fn point(op: Op, site: &'static Location<'static>) {
 /// `send_modify` closure holds that lock, points are skipped and counted in
 /// [`suppressed_points`].
 pub(crate) fn preempt(executor: &dyn Executor, point: Point) {
+    refuse_in_boundary_read("a preemption point");
     if WATCH_LOCKS.try_with(Cell::get).unwrap_or(0) > 0 {
         let _ = SUPPRESSED.try_with(|cell| cell.set(cell.get().saturating_add(1)));
         return;

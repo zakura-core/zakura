@@ -4,7 +4,8 @@
 //!
 //! The driver reaches sockets only through [`UdpIo`] and binds them only
 //! through a [`SocketFactory`]. [`UdpFactory`] and [`TokioUdpIo`] are the
-//! production pair. A simulation injects its own, which never touch the OS.
+//! production pair. A simulation injects its own through
+//! [`crate::QuicEndpoint::bind_with`], and those never touch the OS.
 //!
 //! On Linux, sends and receives go through `sendmsg`/`recvmsg` with
 //! generic segmentation offload (`UDP_SEGMENT`), generic receive offload
@@ -18,16 +19,16 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, PoisonError, RwLock,
-    },
+    sync::Arc,
     time::Duration,
 };
 
 use quinn_proto::Transmit;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::watch;
+use zakura_rt::sync::{
+    atomic::{AtomicBool, Ordering},
+    watch, Mutex, PoisonError,
+};
 
 /// Receive buffer size: the largest UDP payload, and the largest batch GRO
 /// coalesces (SOCK-13).
@@ -49,17 +50,24 @@ pub struct SocketBuffers {
 }
 
 /// A freshly bound socket and its metadata.
-pub(crate) struct BoundSocket<S> {
-    pub(crate) io: S,
-    pub(crate) local_addr: SocketAddr,
+#[derive(Debug)]
+pub struct BoundSocket<S> {
+    /// The socket.
+    pub io: S,
+    /// The address the socket is bound to.
+    pub local_addr: SocketAddr,
     /// The SOCK-3 read-back, or `None` for an injected socket.
-    pub(crate) buffers: Option<SocketBuffers>,
+    pub buffers: Option<SocketBuffers>,
     /// The `/proc/net/udp` inode SOCK-7 polls, or `None` when there is none.
-    pub(crate) inode: Option<u64>,
+    pub inode: Option<u64>,
 }
 
 /// Binds an endpoint's sockets, at bind time and for each SOCK-9 rebind.
-pub(crate) trait SocketFactory: Send + Sync + 'static {
+///
+/// The endpoint calls [`SocketFactory::bind`] once per address in
+/// [`crate::QuicBindConfig::addrs`], then again with the same address
+/// whenever a socket fails (SOCK-9).
+pub trait SocketFactory: Send + Sync + 'static {
     /// The sockets this factory binds.
     type Socket: UdpIo;
 
@@ -179,15 +187,15 @@ fn warn_if_clamped(addr: SocketAddr, buffers: &SocketBuffers) {
 
 /// One received datagram, or one GRO batch of equal-size datagrams.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecvMeta {
+pub struct RecvMeta {
     /// The sender.
-    pub(crate) remote: SocketAddr,
+    pub remote: SocketAddr,
     /// Bytes received.
-    pub(crate) len: usize,
+    pub len: usize,
     /// The size of each datagram in the batch; equals `len` without GRO.
-    pub(crate) stride: usize,
+    pub stride: usize,
     /// The local address the datagram arrived on, for wildcard binds.
-    pub(crate) dst_ip: Option<IpAddr>,
+    pub dst_ip: Option<IpAddr>,
 }
 
 /// A bound datagram socket, as the driver uses it.
@@ -197,7 +205,7 @@ pub(crate) struct RecvMeta {
 /// is the only reader. The methods return `impl Future + Send` rather than
 /// being `async fn`, so the driver tasks stay `Send`, and the driver is
 /// generic over the socket because such a trait isn't dyn-compatible.
-pub(crate) trait UdpIo: fmt::Debug + Send + Sync + 'static {
+pub trait UdpIo: fmt::Debug + Send + Sync + 'static {
     /// Waits until a receive may succeed.
     fn readable(&self) -> impl Future<Output = io::Result<()>> + Send;
 
@@ -422,7 +430,7 @@ struct Caps {
 /// before it binds the same address again.
 #[derive(Debug)]
 pub(crate) struct SocketCell<S> {
-    current: RwLock<Option<Arc<S>>>,
+    current: Mutex<Option<Arc<S>>>,
     generation: watch::Sender<u64>,
 }
 
@@ -430,7 +438,7 @@ impl<S: UdpIo> SocketCell<S> {
     /// A cell that holds `io`.
     pub(crate) fn new(io: S) -> Self {
         Self {
-            current: RwLock::new(Some(Arc::new(io))),
+            current: Mutex::new(Some(Arc::new(io))),
             generation: watch::Sender::new(0),
         }
     }
@@ -438,7 +446,7 @@ impl<S: UdpIo> SocketCell<S> {
     /// The current socket, or `None` while a rebind runs.
     pub(crate) fn get(&self) -> Option<Arc<S>> {
         self.current
-            .read()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
@@ -446,7 +454,7 @@ impl<S: UdpIo> SocketCell<S> {
     /// Closes the socket for good once its last in-flight user lets go.
     pub(crate) fn close(&self) {
         self.current
-            .write()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         self.generation.send_modify(|generation| *generation += 1);
@@ -462,22 +470,22 @@ impl<S: UdpIo> SocketCell<S> {
     pub(crate) async fn replace(&self, rebind: impl FnOnce() -> io::Result<S>) -> io::Result<()> {
         let old = self
             .current
-            .write()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         self.generation.send_modify(|generation| *generation += 1);
         if let Some(old) = old {
-            let weak = Arc::downgrade(&old);
+            let weak = zakura_rt::sync::downgrade(&old);
             drop(old);
             for _ in 0..1000 {
                 if weak.strong_count() == 0 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                zakura_rt::time::sleep(Duration::from_millis(1)).await;
             }
         }
         let io = rebind()?;
-        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(io));
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(io));
         self.generation.send_modify(|generation| *generation += 1);
         Ok(())
     }

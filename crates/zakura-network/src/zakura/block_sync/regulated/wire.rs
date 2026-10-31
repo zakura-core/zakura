@@ -11,6 +11,7 @@ use crate::zakura::{
 };
 
 pub(in crate::zakura::block_sync) const GET_BLOCKS: MessageRule = MessageRule {
+    name: "get-blocks",
     message_type: 2,
     payload: PayloadLen::exact(9),
     role: MessageRole::Request {
@@ -19,8 +20,14 @@ pub(in crate::zakura::block_sync) const GET_BLOCKS: MessageRule = MessageRule {
     },
 };
 
-const fn response(message_type: u8, ends_exchange: bool, payload: PayloadLen) -> MessageRule {
+const fn response(
+    name: &'static str,
+    message_type: u8,
+    ends_exchange: bool,
+    payload: PayloadLen,
+) -> MessageRule {
     MessageRule {
+        name,
         // A u8 discriminator always fits in u16.
         message_type: message_type as u16,
         payload,
@@ -33,6 +40,7 @@ const fn response(message_type: u8, ends_exchange: bool, payload: PayloadLen) ->
 
 pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
     MessageRule {
+        name: "status",
         message_type: 1,
         payload: PayloadLen::exact(53),
         role: MessageRole::Announcement {
@@ -44,9 +52,24 @@ pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
         },
     },
     GET_BLOCKS,
-    response(MSG_BS_BLOCK, false, PayloadLen::between(2, 2_000_001)),
-    response(MSG_BS_BLOCKS_DONE, true, PayloadLen::exact(9)),
-    response(MSG_BS_RANGE_UNAVAILABLE, true, PayloadLen::exact(9)),
+    response(
+        "block",
+        MSG_BS_BLOCK,
+        false,
+        PayloadLen::between(2, 2_000_001),
+    ),
+    response(
+        "blocks-done",
+        MSG_BS_BLOCKS_DONE,
+        true,
+        PayloadLen::exact(9),
+    ),
+    response(
+        "range-unavailable",
+        MSG_BS_RANGE_UNAVAILABLE,
+        true,
+        PayloadLen::exact(9),
+    ),
 ];
 
 /// A range whose count and last height have passed the wire checks. Its

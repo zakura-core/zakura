@@ -1,16 +1,15 @@
-//! Pure decisions of one fill attempt: lane selection, retry filtering, and
-//! funding. Nothing here acquires a resource, reads a clock, or takes a lock;
-//! the routine passes in every observation.
+//! Pure decisions of one fill attempt: lane selection and retry filtering.
+//! Nothing here acquires a resource, reads a clock, or takes a lock; the routine
+//! passes in every observation. The work queue derives funding from the retained
+//! take ([`TakenRequest::admit`](crate::zakura::block_sync::work_queue::TakenRequest::admit)).
 
-use std::{ops::Range, time::Instant};
+use std::ops::Range;
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use crate::zakura::block_sync::{
-    admission::{
-        admit, floor_rescue_high, request_priority, AdmissionOutcome, AdmissionSnapshot,
-        RequestPriority,
-    },
+    admission::{admit, floor_rescue_high, AdmissionOutcome, AdmissionSnapshot, RequestPriority},
     ZakuraBlockSyncConfig,
 };
 
@@ -216,45 +215,4 @@ pub(super) fn retry_wake_deadline(
     .min()
     .or_else(|| timed_rejection.then_some(now));
     [timed, deadlines.retirement].into_iter().flatten().min()
-}
-
-/// How one attempt funds its retained run.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct Funding {
-    /// The retained run's priority, classified from its actual first height.
-    pub(super) priority: RequestPriority,
-    /// The summed size estimates of the retained run (not worst case), so the
-    /// budget admits far more typically-small bodies.
-    pub(super) reserved_bytes: u64,
-}
-
-impl Funding {
-    /// Whether a refused ordinary reservation may overdraft the byte budget.
-    ///
-    /// Only floor work may. The work queue owns each height once, so there can
-    /// only be one floor-priority overdraft globally. Its charge is released by
-    /// the normal reservation paths: receipt, timeout, watchdog, or reset.
-    pub(super) fn allows_overdraft(self) -> bool {
-        self.priority == RequestPriority::Floor
-    }
-}
-
-/// Classify funding from the run that the attempt actually retained.
-///
-/// Another routine can take the probed floor height between the probe and the
-/// take, and the retry filter can drop it after the take. So the retained run
-/// can begin above the floor-rescue window even when the floor lane planned
-/// the take. Its first height, never the lane or the probe, decides whether it
-/// may overdraft and whether it gets the short floor-rescue deadline.
-pub(super) fn funding_for(
-    download_floor: block::Height,
-    first_height: block::Height,
-    estimated_bytes: impl IntoIterator<Item = u64>,
-) -> Funding {
-    Funding {
-        priority: request_priority(download_floor, first_height),
-        reserved_bytes: estimated_bytes
-            .into_iter()
-            .fold(0u64, |acc, bytes| acc.saturating_add(bytes)),
-    }
 }

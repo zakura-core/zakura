@@ -30,9 +30,7 @@ impl PeerRoutine {
                 self.state.window.available_slots_at(Instant::now()),
             ));
             if let Some(last_block_at) = self.state.window.last_block_at {
-                row.last_block_age_ms = Some(elapsed_ms_u64(
-                    time::Instant::from_std(last_block_at).elapsed(),
-                ));
+                row.last_block_age_ms = Some(elapsed_ms_u64(last_block_at.elapsed()));
             }
         });
     }

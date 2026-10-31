@@ -34,6 +34,7 @@ const LIMIT: Credit = Credit {
 };
 
 const WATCH: MessageRule = MessageRule {
+    name: "watch",
     message_type: message_type::WATCH,
     payload: PayloadLen::exact(8),
     role: MessageRole::Subscription {
@@ -47,6 +48,7 @@ const WATCH: MessageRule = MessageRule {
 const RULES: &[MessageRule] = &[
     WATCH,
     MessageRule {
+        name: "page",
         message_type: message_type::PAGE,
         payload: PayloadLen::between(1, 64),
         role: MessageRole::Response {
@@ -55,6 +57,7 @@ const RULES: &[MessageRule] = &[
         },
     },
     MessageRule {
+        name: "ended",
         message_type: message_type::ENDED,
         payload: PayloadLen::exact(1),
         role: MessageRole::Response {

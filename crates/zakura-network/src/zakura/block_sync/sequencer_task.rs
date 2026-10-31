@@ -38,6 +38,11 @@ const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
 /// control events that release budget and drive the next scheduling reaction.
+///
+/// The body keeps its decoded block only while the decoded budget had room
+/// for it at the handoff (see [`BufferedBlockBody::for_handoff`]). Otherwise
+/// it holds the raw frame payload, so a slow verifier can't fill the queue
+/// with `submitted_apply_limit` decoded block graphs (#1522).
 #[derive(Debug)]
 pub(super) struct SequencedBody {
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -47,12 +52,46 @@ pub(super) struct SequencedBody {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    /// The size estimate this body's request reserved at admission. `None` for
+    /// a body admitted on its wire size with no request estimate.
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
     queue_accounting: SequencerInputAccounting,
 }
 
+/// Charges a handed-off body's `decoded_bytes` to the input queue when the
+/// queue, `applying` and the body fit under
+/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns whether it did.
+///
+/// The charge comes before the check, so routines that hand off at once each
+/// count the others' bodies, and no two take the same room. A routine whose
+/// check fails takes its charge back, and its body keeps only raw bytes.
+///
+/// The sequencer task publishes a body's decoded bytes in `applying` before it
+/// releases the body's input-queue charge, so a body that moves between the
+/// two is always counted.
+pub(super) fn charge_decoded_handoff(
+    input_decoded_attributed_memory_bytes: &AtomicU64,
+    view: &watch::Receiver<SequencerView>,
+    decoded_bytes: u64,
+) -> bool {
+    let queued = input_decoded_attributed_memory_bytes
+        .fetch_add(decoded_bytes, Ordering::AcqRel)
+        .saturating_add(decoded_bytes);
+    if queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+    {
+        return true;
+    }
+    release_atomic_bytes(input_decoded_attributed_memory_bytes, decoded_bytes);
+    false
+}
+
 impl SequencedBody {
+    /// Queue `body`, charging its wire bytes and decoded bytes to the input
+    /// queue.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_queued(
         owner: zakura_header_chain::BodyWorkOwner,
@@ -62,6 +101,44 @@ impl SequencedBody {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
+        peer: ZakuraPeerId,
+        received_at: Instant,
+        input_bytes: Arc<AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        add_atomic_bytes(
+            &input_decoded_attributed_memory_bytes,
+            body.decoded_attributed_memory_size_bytes(),
+        );
+        Self::new_handed_off(
+            owner,
+            source,
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            bytes,
+            admitted_estimate_bytes,
+            peer,
+            received_at,
+            input_bytes,
+            input_decoded_attributed_memory_bytes,
+        )
+    }
+
+    /// Queue `body`, whose decoded bytes [`charge_decoded_handoff`] already
+    /// charged to the input queue, and charge its wire bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_handed_off(
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        previous_block_hash: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         peer: ZakuraPeerId,
         received_at: Instant,
         input_bytes: Arc<AtomicU64>,
@@ -76,6 +153,7 @@ impl SequencedBody {
             previous_block_hash,
             body,
             bytes,
+            admitted_estimate_bytes,
             peer,
             received_at,
             queue_accounting: SequencerInputAccounting::new(
@@ -88,8 +166,26 @@ impl SequencedBody {
     }
 
     /// Transfer this body out of queue ownership before processing it.
+    #[cfg(test)]
     pub(super) fn leave_queue(&mut self) {
         self.queue_accounting.release();
+    }
+
+    /// Move this body's input-queue charge out of it, so the caller releases
+    /// the charge once the body's next holder is published.
+    fn take_queue_charge(&mut self) -> SequencerInputAccounting {
+        self.queue_accounting.take()
+    }
+
+    /// The wire bytes this body charges to the input-queue counter: its size
+    /// while queued, zero once it left the queue.
+    #[cfg(test)]
+    pub(super) fn queued_bytes(&self) -> u64 {
+        if self.queue_accounting.active {
+            self.queue_accounting.bytes
+        } else {
+            0
+        }
     }
 }
 
@@ -103,6 +199,9 @@ struct SequencerInputAccounting {
 }
 
 impl SequencerInputAccounting {
+    /// Charge `bytes` to the input queue's wire counter, and take over the
+    /// `decoded_attributed_memory_size_bytes` the caller already charged to its
+    /// decoded counter.
     fn new(
         input_bytes: Arc<AtomicU64>,
         bytes: u64,
@@ -110,10 +209,9 @@ impl SequencerInputAccounting {
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
-        add_atomic_bytes(
-            &input_decoded_attributed_memory_bytes,
-            decoded_attributed_memory_size_bytes,
-        );
+        // Gauge increments commute, so concurrent charges and releases leave the
+        // gauge equal to the counter. This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").increment(bytes as f64);
         Self {
             input_bytes,
             bytes,
@@ -123,11 +221,26 @@ impl SequencerInputAccounting {
         }
     }
 
+    /// Move the charge into the returned value, leaving this one released.
+    fn take(&mut self) -> Self {
+        Self {
+            input_bytes: self.input_bytes.clone(),
+            bytes: self.bytes,
+            input_decoded_attributed_memory_bytes: self
+                .input_decoded_attributed_memory_bytes
+                .clone(),
+            decoded_attributed_memory_size_bytes: self.decoded_attributed_memory_size_bytes,
+            active: std::mem::take(&mut self.active),
+        }
+    }
+
     fn release(&mut self) {
         if !std::mem::take(&mut self.active) {
             return;
         }
         release_atomic_bytes(&self.input_bytes, self.bytes);
+        // This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").decrement(self.bytes as f64);
         release_atomic_bytes(
             &self.input_decoded_attributed_memory_bytes,
             self.decoded_attributed_memory_size_bytes,
@@ -196,6 +309,9 @@ pub(super) enum SequencerControlInput {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        /// The body-work epoch of the committed view that judged
+        /// `semantic_completion`.
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     },
 }
 
@@ -204,6 +320,8 @@ pub(super) enum SequencerControlInput {
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SequencerView {
+    /// Accounting drift has permanently closed this request-budget generation.
+    pub(super) accounting_closed: bool,
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
     pub(super) download_floor: block::Height,
@@ -238,6 +356,7 @@ pub(super) struct SequencerView {
 /// Build the initial view from the startup frontiers, before the task runs.
 pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     SequencerView {
+        accounting_closed: false,
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
         download_floor: frontiers.verified_block_tip,
@@ -261,13 +380,12 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 }
 
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
-/// `ByteBudget` clone, an `Arc<WorkQueue>` clone, an action sender clone, and the
+/// work queue, an action sender, and the
 /// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
 /// `Misbehavior` on the same action channel the reactor uses.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
     retained_body_limit: u64,
-    budget: ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     actions: mpsc::Sender<BlockSyncAction>,
@@ -283,6 +401,10 @@ pub(super) struct SequencerTask {
     current_state_version: Option<zakura_header_chain::StateVersion>,
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
     retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
+    /// Dates body-retry episodes and converts their deadlines to `Instant`s.
+    /// Production passes [`BlockSyncClock`], so both
+    /// sides read the run's UTC.
+    retry_clock: Arc<dyn zakura_header_chain::Clock>,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
     _body_input_bytes: Arc<AtomicU64>,
@@ -293,11 +415,33 @@ pub(super) struct SequencerTask {
     submission_retry_started_at: Option<time::Instant>,
     submission_retry_attempt: u64,
     trace: ZakuraTrace,
+    /// Receives holder changes and snapshots, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: super::block_sync_observe::ObserverSlot,
+    /// The holders last reported to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    observed_holders: Vec<(
+        super::block_sync_observe::Holder,
+        super::block_sync_observe::HeldBody,
+    )>,
 }
 
 impl Drop for SequencerTask {
     fn drop(&mut self) {
+        #[cfg(any(test, zakura_sim))]
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::SequencerClosed
+        );
         self.body_input_rx.close();
+        #[cfg(any(test, zakura_sim))]
+        {
+            // Each body left in the input drops here, with no next holder.
+            while let Ok(body) = self.body_input_rx.try_recv() {
+                self.observe_dequeued(&body);
+            }
+            self.observe_teardown();
+        }
         while self.body_input_rx.try_recv().is_ok() {}
 
         self.view_tx.send_modify(|view| {
@@ -313,7 +457,6 @@ impl SequencerTask {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         sequencer: Sequencer,
-        budget: ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
         actions: mpsc::Sender<BlockSyncAction>,
@@ -321,6 +464,7 @@ impl SequencerTask {
         frontiers: BlockSyncFrontiers,
         current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
         retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
+        retry_clock: Arc<dyn zakura_header_chain::Clock>,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<AtomicU64>,
@@ -333,7 +477,6 @@ impl SequencerTask {
             sequencer,
             retained_body_limit: ZakuraBlockSyncConfig::default()
                 .effective_max_reorder_lookahead_bytes(),
-            budget,
             work,
             registry,
             actions,
@@ -347,6 +490,7 @@ impl SequencerTask {
                 .map(|_| zakura_header_chain::StateVersion::default()),
             body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
             retry_jitter,
+            retry_clock,
             body_input_rx,
             control_input_rx,
             _body_input_bytes: body_input_bytes,
@@ -357,7 +501,105 @@ impl SequencerTask {
             submission_retry_started_at: None,
             submission_retry_attempt: 0,
             trace,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
+            #[cfg(any(test, zakura_sim))]
+            observed_holders: Vec::new(),
         }
+    }
+
+    /// This task, reporting to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Reports that `body` left the input queue.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_dequeued(&self, body: &SequencedBody) {
+        use super::block_sync_observe::{BlockEvent, HeldBody, Holder, HolderChange};
+        observe!(
+            self.observer,
+            BlockEvent::Holder {
+                body: HeldBody {
+                    height: body.height,
+                    owner: body.owner,
+                    bytes: body.bytes,
+                },
+                holder: Holder::Queued {
+                    allocation: body.body.allocation(),
+                    decoded_attributed_memory_bytes: body
+                        .body
+                        .measured_decoded_attributed_memory_bytes(),
+                },
+                change: HolderChange::Released,
+            }
+        );
+    }
+
+    /// Reports every holder change since the last report, then the
+    /// sequencer's snapshot. Called before each point where another task can
+    /// see the sequencer's bodies: an action send, and the end of an input.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_holders(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        let ownership = self.sequencer.ownership_snapshot();
+        let current = ownership.holders();
+        let released = self
+            .observed_holders
+            .iter()
+            .filter(|held| !current.contains(held))
+            .map(|held| (*held, HolderChange::Released));
+        let retained = current
+            .iter()
+            .filter(|held| !self.observed_holders.contains(held))
+            .map(|held| (*held, HolderChange::Retained));
+        for ((holder, body), change) in released.chain(retained) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change,
+                }
+            );
+        }
+        self.observed_holders = current;
+        observe!(self.observer, BlockEvent::Sequencer(ownership));
+    }
+
+    /// Reports every holder's release and an empty snapshot, because the
+    /// sequencer's ledgers drop with the task. A driver that still runs a
+    /// submission keeps its own copy of the decoded block; the block service
+    /// reports that copy, not the sequencer.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_teardown(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        self.observe_holders();
+        for (holder, body) in std::mem::take(&mut self.observed_holders) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change: HolderChange::Released,
+                }
+            );
+        }
+        observe!(
+            self.observer,
+            BlockEvent::Sequencer(super::block_sync_observe::SequencerOwnership::default())
+        );
     }
 
     pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {
@@ -412,11 +654,20 @@ impl SequencerTask {
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
                         Some(mut body) => {
-                            body.leave_queue();
+                            // A routine's handoff room check reads the queue's charge,
+                            // then the view's `applying`. The charge outlives the view's
+                            // update, so the check never misses the body between them.
+                            let queue_charge = body.take_queue_charge();
+                            #[cfg(any(test, zakura_sim))]
+                            self.observe_dequeued(&body);
                             self.handle_accept_body(body);
+                            #[cfg(any(test, zakura_sim))]
+                            self.observe_holders();
                             // Publish the synchronous queue → reorder/applying ownership
                             // transfer before an action-channel send can await or time out.
                             // This updates observability without waking scheduling watchers.
+                            self.publish_decoded_ownership_view();
+                            drop(queue_charge);
                             self.publish_decoded_ownership_view();
                             self.submit_pending_blocks().await;
                             self.publish_view();
@@ -503,6 +754,7 @@ impl SequencerTask {
                 eligible_sources,
                 persisted_availability,
                 semantic_completion,
+                committed_epoch,
             } => {
                 let (needs_reaction, allow_submit) = self
                     .handle_apply_finished(
@@ -515,6 +767,7 @@ impl SequencerTask {
                         eligible_sources,
                         persisted_availability,
                         semantic_completion,
+                        committed_epoch,
                     )
                     .await;
                 if allow_submit {
@@ -580,6 +833,7 @@ impl SequencerTask {
             body.previous_block_hash,
             body.body,
             body.bytes,
+            body.admitted_estimate_bytes,
             body.peer,
         ) {
             AcceptOutcome::Buffered { .. } => "buffered",
@@ -592,8 +846,8 @@ impl SequencerTask {
     /// Reset the body pipeline and queued work above `tip` under one reset epoch.
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
-        let released = self.work.reset_above(tip);
-        self.budget.release(released);
+        self.work.reset_above(tip);
+
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
@@ -619,8 +873,8 @@ impl SequencerTask {
             .sequencer
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         if advance.changed {
-            let released = self.work.advance_floor(frontiers.verified_block_tip);
-            self.budget.release(released);
+            self.work.advance_floor(frontiers.verified_block_tip);
+
             self.release_contiguous_blocks().await;
         }
     }
@@ -735,8 +989,12 @@ impl SequencerTask {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     ) -> (bool, bool) {
         let result = outcome.result();
+        if matches!(result, BlockApplyResult::Rejected) {
+            self.sequencer.forget_measured_decoded_bytes(height, hash);
+        }
         // Frontier updates can remove applying entries before their completions.
         // Every committed exit below retires the exact submission, so a repeated
         // completion cannot count its cached wire size again.
@@ -763,7 +1021,24 @@ impl SequencerTask {
                 outcome.verification(),
                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
             );
-            return (false, released && verified && semantic_completion.is_some());
+            // A detached submission from an older epoch completes with no
+            // semantic owner, but its slot still frees room for waiting
+            // `applying` work. Without this wake that work waits for an
+            // unrelated event (#1523).
+            //
+            // The reactor can queue that completion before the epoch change
+            // that made it stale. Until this task holds the epoch the reactor
+            // judged against, the waiting work belongs to an older epoch, and
+            // the queued epoch change resets it and wakes submission itself.
+            let holds_committed_epoch =
+                self.current_scope.map(|scope| scope.body_work_epoch) == committed_epoch;
+            let room_for_waiting_work = released
+                && self.sequencer.unsubmitted_applying_count() > 0
+                && (semantic_completion.is_some() || holds_committed_epoch);
+            return (
+                false,
+                room_for_waiting_work || (released && verified && semantic_completion.is_some()),
+            );
         };
         if applying_owner != owner
             || applying_source != source
@@ -801,6 +1076,8 @@ impl SequencerTask {
             if let zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(invalid) =
                 outcome.verification()
             {
+                #[cfg(any(test, zakura_sim))]
+                self.observe_holders();
                 self.send_required_action(BlockSyncAction::RecordBodyInvalid {
                     expected_version: semantic_state_version,
                     invalid: invalid.clone(),
@@ -819,6 +1096,8 @@ impl SequencerTask {
         if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
             outcome.verification()
         {
+            #[cfg(any(test, zakura_sim))]
+            self.observe_holders();
             self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
                 expected_version: semantic_state_version,
                 failure: *failure,
@@ -858,8 +1137,8 @@ impl SequencerTask {
                 // re-requestable (the reactor's `query_needed_blocks` re-fills).
                 let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
-                let released = self.work.reset_above(self.sequencer.floor());
-                self.budget.release(released);
+                self.work.reset_above(self.sequencer.floor());
+
                 let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result identifies a bad body from a peer.
                 // Attribute it to the delivering peer.
@@ -884,6 +1163,8 @@ impl SequencerTask {
                     };
                     // The driver disconnects a proven tampering supplier, so that
                     // record must not be dropped when the action channel is busy.
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe_holders();
                     if disconnects {
                         self.send_required_action(action).await;
                     } else {
@@ -938,7 +1219,7 @@ impl SequencerTask {
                         owner.header_generation,
                         header,
                         eligible_sources.clone(),
-                        &zakura_header_chain::SystemClock,
+                        self.retry_clock.as_ref(),
                     )
                 });
             self.body_retries.insert(episode);
@@ -948,11 +1229,7 @@ impl SequencerTask {
             .get_mut(owner.header_generation, owner.branch, hash)
             .expect("the exact retry episode exists because it was inserted above");
         episode.refresh_suppliers(eligible_sources.clone());
-        let update = episode.record_failure(
-            source,
-            &zakura_header_chain::SystemClock,
-            &self.retry_jitter,
-        );
+        let update = episode.record_failure(source, self.retry_clock.as_ref(), &self.retry_jitter);
         let deferred_sources = if episode.alarmed {
             eligible_sources.clone()
         } else {
@@ -975,7 +1252,7 @@ impl SequencerTask {
             deferred_sources,
             owner.authority(),
             hash,
-            retry_deadline_instant(retry_at),
+            retry_deadline_instant(retry_at, self.retry_clock.as_ref()),
         );
     }
 
@@ -1008,7 +1285,15 @@ impl SequencerTask {
             if !self.sequencer.submission_fits_decoded_window(height) {
                 break;
             }
+            // A raw body is resident twice while it decodes. Publish its
+            // estimate first, so a routine's handoff room check counts the
+            // decode before `applying` holds its measured size.
+            let decode_charge = self.sequencer.submission_decode_charge_at(height);
+            if decode_charge > 0 {
+                self.publish_decoded_ownership_view_with(decode_charge);
+            }
             let Some(item) = self.sequencer.prepare_submit(height) else {
+                self.publish_decoded_ownership_view();
                 continue;
             };
 
@@ -1024,6 +1309,11 @@ impl SequencerTask {
             )
             .record(queue_depth as f64);
             let send_started = time::Instant::now();
+            // Publish the decode before the send can wait on a slow verifier, so
+            // a routine's handoff room check counts it.
+            self.publish_decoded_ownership_view();
+            #[cfg(any(test, zakura_sim))]
+            self.observe_holders();
             let sent = self
                 .send_action(BlockSyncAction::SubmitBlock {
                     owner: item.owner,
@@ -1053,7 +1343,7 @@ impl SequencerTask {
                 self.submission_retry_attempt = 0;
             }
             self.sequencer
-                .record_submitted_apply(item.height, item.hash);
+                .record_submitted_apply(item.height, item.hash, item.decoded_bytes);
             self.trace_body_submitted(item.height, item.token);
         }
     }
@@ -1168,6 +1458,11 @@ impl SequencerTask {
     }
 
     fn publish_view(&mut self) {
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.observe_holders();
+            self.work.observe_items();
+        }
         #[cfg(feature = "sync-metrics")]
         self.committed_throughput
             .sample_at_interval(Instant::now(), Duration::from_secs(1));
@@ -1187,9 +1482,9 @@ impl SequencerTask {
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
                 .saturating_add(applying_decoded_attributed_memory_bytes);
         // Retained bodies do not charge the request budget.
-        self.budget
-            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
+        let accounting_closed = !self.work.audit_funding();
         let next = SequencerView {
+            accounting_closed,
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
             download_floor: self.sequencer.floor(),
@@ -1224,13 +1519,21 @@ impl SequencerTask {
     }
 
     fn publish_decoded_ownership_view(&self) {
+        self.publish_decoded_ownership_view_with(0);
+    }
+
+    /// [`Self::publish_decoded_ownership_view`], with `decoding_bytes` added to
+    /// `applying` for a body about to be decoded.
+    fn publish_decoded_ownership_view_with(&self, decoding_bytes: u64) {
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);
         let reorder_decoded_attributed_memory_bytes =
             self.sequencer.reorder_decoded_attributed_memory_bytes();
-        let applying_decoded_attributed_memory_bytes =
-            self.sequencer.applying_decoded_attributed_memory_bytes();
+        let applying_decoded_attributed_memory_bytes = self
+            .sequencer
+            .applying_decoded_attributed_memory_bytes()
+            .saturating_add(decoding_bytes);
         let active_pipeline_decoded_attributed_memory_bytes =
             sequencer_input_decoded_attributed_memory_bytes
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
@@ -1259,11 +1562,14 @@ fn add_atomic_bytes(counter: &AtomicU64, bytes: u64) {
     }
 }
 
+/// Releases `bytes` from `counter`. The release orders after the caller's
+/// earlier writes, such as a published view, for a reader that loads
+/// `counter` with `Acquire`.
 fn release_atomic_bytes(counter: &AtomicU64, bytes: u64) {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_sub(bytes);
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+        match counter.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }
@@ -1306,6 +1612,7 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
+    mod ownership;
 
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
@@ -1330,6 +1637,7 @@ mod tests {
 
     fn test_view() -> SequencerView {
         SequencerView {
+            accounting_closed: false,
             verified_tip: block::Height(1),
             verified_hash: block::Hash([1; 32]),
             download_floor: block::Height(1),
@@ -1374,6 +1682,7 @@ mod tests {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             123,
+            None,
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
             Instant::now(),
             input_bytes,
@@ -1471,16 +1780,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(1_000_000);
         SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1_000_000),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1522,14 +1832,13 @@ mod tests {
             std::num::NonZeroU64::new(1).unwrap(),
         );
         let owner = taken[0].1.owner.unwrap();
-        let reserved = task.work.mark_reserved_for_owner(owner, [height]);
-        task.budget.charge(reserved);
-        assert_eq!(
+        task.work.mark_reserved_for_owner(owner, [height]);
+        drop(
             task.work
-                .release_active_reserved_height_for_owner(owner, height),
-            Some(reserved)
+                .begin_receipt_for_owner(owner, height)
+                .unwrap()
+                .expect("the test published this owner's reservation"),
         );
-        task.budget.release(reserved);
         let mut body = SequencedBody::new_queued(
             owner,
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -1538,6 +1847,7 @@ mod tests {
             block.header.previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, Some(raw)),
             bytes,
+            None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
             Instant::now(),
             task._body_input_bytes.clone(),
@@ -1558,7 +1868,7 @@ mod tests {
         task.handle_accept_body(body);
         assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
         assert_eq!(task.work.reserved_bytes(), 0);
-        assert_eq!(task.budget.reserved(), 0);
+        assert_eq!(task.work.budget().reserved(), 0);
         assert!(task.work.pending_contains(block::Height(500)));
         assert!(task
             .work
@@ -1622,16 +1932,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(scope),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1666,16 +1977,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(old_scope),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1712,7 +2024,7 @@ mod tests {
     async fn body_invalid_reselection_resets_block_pipeline() {
         let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
-        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX)));
         work.extend(
             old_authority,
             [(
@@ -1729,7 +2041,6 @@ mod tests {
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
             work.clone(),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -1737,6 +2048,7 @@ mod tests {
             frontiers,
             Some(old_authority),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1779,16 +2091,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1826,6 +2139,7 @@ mod tests {
                 BTreeSet::new(),
                 None,
                 None,
+                Some(owner.authority.body_work_epoch),
             )
             .await,
             (false, false),
@@ -1871,16 +2185,17 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1933,6 +2248,7 @@ mod tests {
                     BTreeSet::new(),
                     None,
                     Some((owner, zakura_header_chain::StateVersion::new(7))),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await;
             (task, result)
@@ -1984,16 +2300,17 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -2045,6 +2362,7 @@ mod tests {
                     BTreeSet::new(),
                     None,
                     Some((owner, zakura_header_chain::StateVersion::new(8))),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await;
             (task, result)
@@ -2083,6 +2401,100 @@ mod tests {
         );
     }
 
+    /// A wall clock a fixed offset from the host's, standing in for a
+    /// simulated run whose scenario UTC differs from the host.
+    struct OffsetClock(chrono::Duration);
+
+    impl zakura_header_chain::Clock for OffsetClock {
+        /// The host's UTC plus the offset.
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now() + self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_follows_the_sequencer_clock() {
+        let frontiers = genesis_frontiers();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let registry = Arc::new(PeerRegistry::new());
+        // A day ahead, so an episode or failure dated by the host clock lands a
+        // day early: the deadline collapses to now, or the episode alarms.
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            Arc::new(WorkQueue::new(block::Height(0), budget)),
+            registry.clone(),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            Arc::new(OffsetClock(chrono::Duration::days(1))),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        let mut outcome = BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xa3; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+            availability: zakura_header_chain::BodyUnavailableSummary::default(),
+        });
+
+        let before = Instant::now();
+        task.handle_apply_finished(
+            owner,
+            source,
+            token,
+            height,
+            hash,
+            &mut outcome,
+            BTreeSet::new(),
+            None,
+            Some((owner, zakura_header_chain::StateVersion::new(8))),
+            Some(owner.authority.body_work_epoch),
+        )
+        .await;
+        let after = Instant::now();
+
+        // The first retry backs off one second, give or take 10% jitter.
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid");
+        let deadline = registry
+            .next_body_retry_deadline(&peer, before)
+            .expect("the failed supplier is deferred");
+        assert!(
+            deadline >= before + Duration::from_millis(900)
+                && deadline <= after + Duration::from_millis(1_100),
+            "the retry is one backoff out, not {:?} after the failure",
+            deadline.saturating_duration_since(before),
+        );
+    }
+
     #[tokio::test]
     async fn closed_action_receiver_retains_exact_required_evidence() {
         let frontiers = genesis_frontiers();
@@ -2091,16 +2503,17 @@ mod tests {
         let (actions, actions_rx) = mpsc::channel(1);
         drop(actions_rx);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2163,16 +2576,17 @@ mod tests {
                 let (_control_tx, control_rx) = mpsc::unbounded_channel();
                 let (actions, mut actions_rx) = mpsc::channel(4);
                 let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+                let budget = ByteBudget::new(123);
                 let mut task = SequencerTask::new(
                     Sequencer::new(block::Height(0), 1),
-                    ByteBudget::new(123),
-                    Arc::new(WorkQueue::new(block::Height(0))),
+                    Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                     Arc::new(PeerRegistry::new()),
                     actions,
                     ThroughputMeter::new(Instant::now()),
                     frontiers,
                     Some(super::test_work_scope()),
                     crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                    std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                     body_rx,
                     control_rx,
                     input_bytes.clone(),
@@ -2225,6 +2639,7 @@ mod tests {
                         BTreeSet::new(),
                         None,
                         Some((owner, zakura_header_chain::StateVersion::default())),
+                        Some(owner.authority.body_work_epoch),
                     )
                     .await,
                     (true, true),
@@ -2263,16 +2678,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions.clone(),
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -2325,6 +2741,7 @@ mod tests {
                 BTreeSet::new(),
                 None,
                 Some((owner, zakura_header_chain::StateVersion::default())),
+                Some(owner.authority.body_work_epoch),
             );
             tokio::pin!(finish);
             assert!(
@@ -2370,16 +2787,17 @@ mod tests {
             let (_control_tx, control_rx) = mpsc::unbounded_channel();
             let (actions, mut actions_rx) = mpsc::channel(4);
             let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let budget = ByteBudget::new(123);
             let mut task = SequencerTask::new(
                 Sequencer::new(block::Height(0), 1),
-                ByteBudget::new(123),
-                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions,
                 ThroughputMeter::new(Instant::now()),
                 frontiers,
                 Some(super::test_work_scope()),
                 crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                 body_rx,
                 control_rx,
                 input_bytes.clone(),
@@ -2440,6 +2858,7 @@ mod tests {
                     BTreeSet::new(),
                     None,
                     Some((semantic_owner, zakura_header_chain::StateVersion::default(),)),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await,
                 (true, true)
@@ -2492,16 +2911,17 @@ mod tests {
             })
             .expect("test fills the action channel");
         let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -2550,6 +2970,22 @@ mod tests {
         task.abort();
     }
 
+    /// v12 F-313: two routines hand off at once into room for one body. The
+    /// second charge counts the first, so only one body keeps its decoded copy.
+    #[test]
+    fn simultaneous_handoffs_cannot_share_one_body_of_room() {
+        const BODY: u64 = 1_000;
+        let input_decoded = AtomicU64::new(0);
+        let mut view = initial_view(genesis_frontiers());
+        view.applying_decoded_attributed_memory_bytes =
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES - BODY;
+        let (_view_tx, view_rx) = watch::channel(view);
+
+        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY));
+        assert!(!charge_decoded_handoff(&input_decoded, &view_rx, BODY));
+        assert_eq!(input_decoded.load(Ordering::Relaxed), BODY);
+    }
+
     #[test]
     fn handoff_publishes_applying_decoded_bytes_before_submission() {
         let frontiers = genesis_frontiers();
@@ -2564,16 +3000,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes,
@@ -2620,16 +3057,17 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(30);
         let (view_tx, view_rx) = watch::channel(initial);
+        let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -2687,5 +3125,65 @@ mod tests {
             .await
             .expect("sequencer view sender is still live");
         assert_eq!(*view_rx.borrow(), schedulable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accounting_closure_is_published_and_wakes_view_watchers() {
+        let mut task = retention_test_task(u64::MAX);
+        let mut view = task.view_tx.subscribe();
+        assert!(!view.borrow_and_update().accounting_closed);
+        task.work.set_estimate_floor_for_tests(1);
+        task.work.extend(
+            super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                super::super::request::BlockSizeEstimate::Confirmed(100),
+            )],
+        );
+        let claim = task
+            .work
+            .take_request(
+                block::Height(1),
+                block::Height(1),
+                1,
+                100,
+                7,
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .admit(block::Height(0), zakura_rt::sync::CancellationToken::new())
+            .unwrap()
+            .publish(|_| {})
+            .unwrap();
+        let held = task.work.retain_funding_for_test(1);
+        assert!(!task.work.budget().is_closed());
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "the view must expose accounting closure"
+        );
+        time::timeout(Duration::from_secs(1), view.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(view.borrow_and_update().accounting_closed);
+        assert_eq!(task.work.budget().reserved(), 100);
+        drop(held);
+        drop(claim);
+        task.work.reset_above(block::Height(0));
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "reset does not reopen the generation"
+        );
+        assert_eq!(
+            task.work.budget().reserved(),
+            99,
+            "quarantine retains unmatched funding"
+        );
+        assert!(
+            !view.has_changed().unwrap(),
+            "unchanged closure does not create a wake loop"
+        );
     }
 }

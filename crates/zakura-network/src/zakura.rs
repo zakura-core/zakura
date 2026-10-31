@@ -546,6 +546,12 @@ fn resume_task_panic<T>(
     })
 }
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use discovery::{
+    replay_discovery_book_bytes, replay_discovery_state_bytes, DiscoveryBookReplaySummary,
+    DiscoveryStateReplaySummary,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

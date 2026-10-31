@@ -14,8 +14,13 @@ mod service;
 pub(crate) use service::discovery_streams;
 mod serving;
 mod state;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod state_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state_tests::{
+    replay_discovery_book_bytes, replay_discovery_state_bytes, DiscoveryBookReplaySummary,
+    DiscoveryStateReplaySummary,
+};
 mod trace;
 mod verified;
 pub(crate) mod wire;

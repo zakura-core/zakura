@@ -22,6 +22,10 @@
 //! [`ClaimedAnswer`] it returns keeps the query's pool entry and its kind
 //! through decode, verification, and import, so a session holds at most one
 //! answer of each kind from its query's first byte until that answer settles.
+//!
+//! A `Hello` holds no reservation and asks nothing of this ledger. The session
+//! counts one in verification beside its claimed answers, so a closing session
+//! waits for its own verdict on both.
 
 use std::sync::Arc;
 
@@ -271,11 +275,13 @@ impl QueryState {
     }
 }
 
-/// How many claimed answers of each kind one session has not settled.
+/// What one session delivered and has not settled: its claimed answers of each
+/// kind, and each `Hello` in verification.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct Settling {
     peers: usize,
     services: usize,
+    hellos: usize,
 }
 
 impl Settling {
@@ -321,6 +327,22 @@ impl Drop for SettlingAnswer {
     fn drop(&mut self) {
         self.settling
             .send_modify(|settling| *settling.of(self.kind) -= 1);
+    }
+}
+
+/// One `Hello` that a session's reader is verifying.
+///
+/// It holds a closing session's wait and nothing else: no reservation, no pool
+/// entry, and no query kind. Dropping it settles the `Hello` on every path.
+#[derive(Debug)]
+#[must_use = "dropping the hold settles the Hello"]
+pub(super) struct SettlingHello {
+    settling: Arc<watch::Sender<Settling>>,
+}
+
+impl Drop for SettlingHello {
+    fn drop(&mut self) {
+        self.settling.send_modify(|settling| settling.hellos -= 1);
     }
 }
 
@@ -499,10 +521,19 @@ impl Queries {
         }))
     }
 
-    /// Resolves once this session holds no answer that it was owed and has not
-    /// processed: nothing claimed and unsettled, and nothing the transport
+    /// Counts one `Hello` in verification until the returned hold drops.
+    pub(super) fn verifying_hello(&self) -> SettlingHello {
+        self.settling.send_modify(|settling| settling.hellos += 1);
+        SettlingHello {
+            settling: self.settling.clone(),
+        }
+    }
+
+    /// Resolves once this session holds nothing it read and has not processed:
+    /// no claimed answer, no `Hello` in verification, and no answer the transport
     /// reader queued. An unanswered query does not hold it, so a silent peer
-    /// costs no wait.
+    /// costs no wait. A `Hello` the reader has not reached holds no reservation,
+    /// so it does not hold this either.
     pub(super) async fn answers_settled(&self) {
         let mut settling = self.settling.subscribe();
         loop {
@@ -1055,6 +1086,34 @@ mod tests {
             .send_get_peers(get_peers(1))
             .await
             .expect("settlement frees the kind");
+    }
+
+    /// A `Hello` in verification holds the settled wait, and it takes no pool
+    /// entry and blocks no query.
+    #[tokio::test]
+    async fn a_hello_in_verification_holds_only_the_settled_wait() {
+        let pool = reservation_pool();
+        let Session {
+            queries,
+            written: _written,
+            ..
+        } = session(&pool);
+
+        let hello = queries.verifying_hello();
+        assert_eq!(pool.held(), 0);
+        queries
+            .send_get_peers(get_peers(1))
+            .await
+            .expect("a Hello in verification blocks no query");
+        let waiting = queries.clone();
+        let settled = tokio::spawn(async move { waiting.answers_settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "the Hello holds the wait");
+        drop(hello);
+        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
+            .await
+            .expect("settlement wakes the wait")
+            .unwrap();
     }
 
     /// `answers_settled` waits for a claimed answer and ignores a query the

@@ -2531,6 +2531,182 @@ mod tests {
         assert!(oversized.encode(16).is_err());
     }
 
+    /// T.upgrade.init: the prelude cap applies before any decode, an identity list
+    /// has its own cap, and pending slots refuse a new peer without growing.
+    #[test]
+    fn row_upgrade_init_bounds_its_pending_slot_and_prelude() {
+        assert!(matches!(
+            P2pV2Upgrade::decode(&vec![INIT_DISCRIMINATOR; MAX_PRELUDE_PAYLOAD_BYTES + 1]),
+            Err(ZakuraProtocolError::OversizedPayload { .. })
+        ));
+        let mut too_long = init();
+        too_long.iroh_relay_hint = Some(vec![1; MAX_IROH_RELAY_HINT_BYTES + 1]);
+        assert!(P2pV2Upgrade::Init(too_long).encode().is_err());
+
+        let now = Instant::now();
+        let pending = |byte| {
+            let peer_id = ZakuraPeerId::new(vec![byte; 32]).unwrap();
+            PendingUpgrade::new(peer_id, 1, [1; 32], [2; 32], [3; 32])
+        };
+        let mut registry = PendingUpgradeRegistry::new(1, Duration::from_secs(1));
+        registry.insert(now, pending(7)).expect("under cap");
+        registry
+            .insert(now, pending(7))
+            .expect("the same peer replaces its own slot");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.insert(now, pending(8)),
+            Err(ZakuraRejectReason::ResourceLimit)
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    /// T.upgrade.accept: an accept must echo this attempt's exact transcript before
+    /// it can install anything.
+    #[test]
+    fn row_upgrade_accept_validates_the_exact_transcript() {
+        let local = local_config();
+        let init = init();
+        assert!(accept(&init).validate(&local, nonces(), &init).is_ok());
+
+        let mut stale = accept(&init);
+        stale.initiator_upgrade_nonce = [9; 32];
+        assert_eq!(
+            stale.validate(&local, nonces(), &init),
+            Err(ZakuraValidationError::UpgradeNonceMismatch)
+        );
+    }
+
+    /// T.upgrade.reject: a reject is fixed-size, and settling its attempt consumes the
+    /// pending slot once.
+    #[test]
+    fn row_upgrade_reject_settles_its_attempt_once() {
+        let reject = P2pV2Upgrade::Reject(P2pV2UpgradeReject {
+            magic: init().magic,
+            prelude_version: init().prelude_version,
+            reason: ZakuraRejectReason::ResourceLimit,
+        });
+        let mut encoded = reject.encode().expect("a reject encodes");
+        assert_eq!(P2pV2Upgrade::decode(&encoded).unwrap(), reject);
+        encoded.push(0);
+        assert!(P2pV2Upgrade::decode(&encoded).is_err());
+
+        let now = Instant::now();
+        let peer_id = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let mut registry = PendingUpgradeRegistry::new(1, Duration::from_secs(1));
+        registry
+            .insert(
+                now,
+                PendingUpgrade::new(peer_id.clone(), 1, [1; 32], [2; 32], [3; 32]),
+            )
+            .expect("under cap");
+        assert!(registry.take(now, &peer_id).is_some());
+        assert!(registry.take(now, &peer_id).is_none());
+        assert!(registry.is_empty());
+    }
+
+    /// T.control.hello: the control cap applies before any decode, and an identity
+    /// above its cap has no encoding.
+    #[test]
+    fn row_control_hello_is_bounded_before_decoding() {
+        assert!(matches!(
+            ZakuraControlHello::decode(&vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1]),
+            Err(ZakuraProtocolError::OversizedPayload { .. })
+        ));
+        let mut oversized = control_hello();
+        oversized.iroh_node_id = vec![1; MAX_IROH_NODE_ID_BYTES + 1];
+        assert!(oversized.encode().is_err());
+        let encoded = control_hello().encode().expect("a hello encodes");
+        assert!(encoded.len() <= MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(ZakuraControlHello::decode(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    /// T.control.ack: the control cap applies before any decode, and an ack for
+    /// another handshake's nonces cannot validate.
+    #[test]
+    fn row_control_ack_is_bound_to_its_exact_handshake() {
+        assert!(matches!(
+            ZakuraControlAck::decode(&vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1]),
+            Err(ZakuraProtocolError::OversizedPayload { .. })
+        ));
+        let ack = control_ack();
+        let limits = ack.accepted_limits;
+        let requested = ZakuraInitialLimits {
+            max_frame_bytes: limits.max_frame_bytes,
+            max_message_bytes: limits.max_message_bytes,
+            max_open_streams: limits.max_open_streams,
+            max_inbound_queue_depth: limits.max_inbound_queue_depth,
+            idle_timeout_millis: limits.idle_timeout_millis,
+        };
+        assert_eq!(
+            ack.validate(
+                ack.selected_zakura_protocol,
+                [0xAB; 32],
+                [0xCD; 32],
+                ack.accepted_capabilities,
+                &requested,
+                &local_config(),
+            ),
+            Err(ZakuraValidationError::ControlNonceMismatch)
+        );
+    }
+
+    /// T.stream: a prelude has one fixed shape. A partial prelude, another magic, an
+    /// invalid request-id flag, and trailing bytes all fail without allocating.
+    #[test]
+    fn row_stream_prelude_decodes_one_fixed_shape() {
+        let encoded = stream_prelude().encode().expect("a prelude encodes");
+        assert_eq!(StreamPrelude::decode(&encoded).unwrap(), stream_prelude());
+        for len in 0..encoded.len() {
+            assert!(StreamPrelude::decode(&encoded[..len]).is_err());
+        }
+        let mut wrong_magic = encoded.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            StreamPrelude::decode(&wrong_magic),
+            Err(ZakuraProtocolError::InvalidMagic)
+        ));
+        let mut wrong_flag = encoded.clone();
+        wrong_flag[8] = 2;
+        assert!(matches!(
+            StreamPrelude::decode(&wrong_flag),
+            Err(ZakuraProtocolError::InvalidFlag(2))
+        ));
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(StreamPrelude::decode(&trailing).is_err());
+    }
+
+    /// T.frame: the cap applies to the buffer and to the claimed length before payload
+    /// allocation, and a claim above the arrived bytes fails.
+    #[test]
+    fn row_frame_validates_its_length_before_its_payload() {
+        let mut claim = Vec::new();
+        claim.extend_from_slice(&1u16.to_le_bytes());
+        claim.extend_from_slice(&0u16.to_le_bytes());
+        claim.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            Frame::decode(&claim, 16),
+            Err(ZakuraProtocolError::OversizedPayload { max: 8, .. })
+        ));
+
+        assert!(matches!(
+            Frame::decode(&[0; 17], 16),
+            Err(ZakuraProtocolError::OversizedPayload {
+                actual: 17,
+                max: 16
+            })
+        ));
+
+        let mut short = Vec::new();
+        short.extend_from_slice(&1u16.to_le_bytes());
+        short.extend_from_slice(&0u16.to_le_bytes());
+        short.extend_from_slice(&8u32.to_le_bytes());
+        assert!(Frame::decode(&short, 16).is_err());
+
+        assert!(Frame::decode(&frame_sample().encode(1024).unwrap(), 1024).is_ok());
+    }
+
     #[test]
     fn pending_upgrade_registry_matches_and_expires_by_peer_id() {
         let now = Instant::now();

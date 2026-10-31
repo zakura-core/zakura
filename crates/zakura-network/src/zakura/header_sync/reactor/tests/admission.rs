@@ -1012,7 +1012,7 @@ fn apply_completion_observes_committed_headers_before_reusing_capacity() {
             owner,
             result: HeaderTargetAdmissionResult::Applied,
         }),
-        capacity: Vec::new(),
+        retained: None,
     });
 
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);

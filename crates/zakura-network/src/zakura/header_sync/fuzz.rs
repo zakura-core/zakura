@@ -15,7 +15,9 @@ use zakura_header_chain::{
 use zakura_rt::collections::HashMap;
 
 use super::{
-    scheduler::peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
+    scheduler::peer_work::{
+        HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult, WorkIncarnation,
+    },
     ActiveHeaderRequest, AdvertisedHeaderTarget, AuxSchema, HeaderSyncRequestId,
     HeaderTargetPurpose, Status, ZakuraPeerId,
 };
@@ -1042,6 +1044,7 @@ fn request(
         common_ancestor: None,
         entries: Vec::new(),
         phase: HeaderTargetPhase::Receiving,
+        incarnation: WorkIncarnation::UNSTARTED,
         cursor: None,
         max_header_count: 1_000,
         tree_aux_schema: AuxSchema::None,

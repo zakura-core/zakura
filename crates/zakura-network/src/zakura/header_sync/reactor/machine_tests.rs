@@ -632,6 +632,11 @@ impl Harness {
                 }
                 if desired.is_none() || self.model.repair != desired {
                     self.model.stall = None;
+                    // The decoder can reinstall a generation, and that repair
+                    // starts a new report budget.
+                    if let Some((generation, _)) = self.model.repair {
+                        self.model.reports.remove(&generation);
+                    }
                 }
                 self.model.repair = desired;
             }

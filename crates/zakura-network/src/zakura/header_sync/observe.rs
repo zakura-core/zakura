@@ -14,10 +14,14 @@ use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
 };
 pub use super::{
-    reactor::{HeaderRequestTerminal, StorageCallKind},
-    scheduler::peer_work::HeaderTargetPhase,
+    reactor::HeaderRequestTerminal,
+    scheduler::peer_work::{HeaderTargetPhase, HeaderWorkEnd, StorageCallKind},
 };
 use crate::zakura::ZakuraPeerId;
+
+mod ledger;
+
+pub use ledger::HeaderWorkLedger;
 
 /// Receives reactor events as they happen.
 ///
@@ -45,9 +49,9 @@ impl fmt::Debug for ObserverSlot {
 
 /// One reactor event.
 ///
-/// Every `Dispatched { call }` is followed by exactly one `CallEnded { call }`
-/// and then one `Handled { call }`, unless the reactor task unwinds or stops
-/// with the call still pending. The events
+/// Every `Dispatched { call }` is followed by exactly one `CallEnded { call }`.
+/// `Handled { call }` follows unless that end is [`CallEnd::Dropped`] or the
+/// reactor task unwinds. The events
 /// strictly between `CallEnded { call }` and `Handled { call }` ran while the
 /// reactor processed that completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +94,30 @@ pub enum ReactorEvent {
         kind: StorageCallKind,
         /// Why the reactor refused it.
         cause: RefusalCause,
+    },
+    /// A prepare or apply call took ownership of a round's retained headers.
+    HeadersHeld {
+        /// The call's number. Its `Dispatched` came first.
+        call: u64,
+        /// What the call asks storage for.
+        kind: StorageCallKind,
+        /// The peer whose work the headers belong to.
+        peer: ZakuraPeerId,
+        /// The round the headers belong to.
+        incarnation: u64,
+        /// How many headers the call holds.
+        headers: usize,
+    },
+    /// A call's ownership of retained headers ended, before any lease released.
+    HeadersEnded {
+        /// The call's number.
+        call: u64,
+        /// The round the headers belong to.
+        incarnation: u64,
+        /// How many headers the call held.
+        headers: usize,
+        /// How the ownership ended.
+        end: HeaderWorkEnd,
     },
     /// An active request started.
     Started {
@@ -254,6 +282,8 @@ pub enum CallEnd {
     NotSubmitted,
     /// The future panicked, and the reactor caught it.
     PortPanicked,
+    /// The reactor dropped the future unfinished, as its teardown does.
+    Dropped,
 }
 
 /// Why the reactor refused a storage call.
@@ -285,6 +315,8 @@ pub struct RequestRef {
     pub session_id: u64,
     /// The request's correlation ID.
     pub request_id: u64,
+    /// The round the queue assigned at start.
+    pub incarnation: u64,
     /// The request's work owner.
     pub owner: HeaderSyncWorkOwner,
     /// The advertised target the request pursues.
@@ -298,6 +330,7 @@ impl RequestRef {
             peer: active.peer.clone(),
             session_id: active.owner.session_id(),
             request_id: active.request_id.get(),
+            incarnation: active.incarnation.get(),
             owner: active.owner,
             target_tip_hash: active.target.status.selected_tip_hash,
         }
@@ -343,6 +376,42 @@ impl PortTap {
                 call: self.call,
                 end,
             });
+        }
+    }
+}
+
+/// Reports the end of a port future that drops before it finishes.
+///
+/// The reactor keeps one beside each port future. A panicking thread reports
+/// nothing, as [`HeaderSyncObserver`] says.
+#[derive(Debug)]
+pub(crate) struct PendingCall {
+    tap: PortTap,
+    done: bool,
+}
+
+impl PendingCall {
+    /// A guard on the call `tap` reports for.
+    pub(crate) fn new(tap: PortTap) -> Self {
+        Self { tap, done: false }
+    }
+
+    /// The call's future finished, and reported its own end.
+    pub(crate) fn finished(mut self) {
+        self.done = true;
+    }
+
+    /// The reactor caught the call's future panicking.
+    pub(crate) fn panicked(mut self) {
+        self.done = true;
+        self.tap.end_after_catch(CallEnd::PortPanicked);
+    }
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if !self.done && !std::thread::panicking() {
+            self.tap.end_after_catch(CallEnd::Dropped);
         }
     }
 }

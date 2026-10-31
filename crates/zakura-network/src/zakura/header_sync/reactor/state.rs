@@ -10,6 +10,8 @@ use zakura_chain::block;
 use zakura_header_chain::HeaderWorkAuthority;
 use zakura_rt::{collections::HashMap, time::Instant};
 
+pub(super) use super::StorageCall;
+pub use super::StorageCallKind;
 use super::{
     source_id_from_peer, AdvertisedHeaderTarget, AuxSchema, CompletedHeaderTargets,
     HeaderPortOperation, HeaderRequestTerminal, HeaderTargetPhase, HeaderTargetPurpose,
@@ -787,19 +789,6 @@ pub(super) struct PeerSchedule {
     pub(super) unproductive_requests: u32,
 }
 
-/// What one header storage call asks storage for.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub enum StorageCallKind {
-    /// A continuation-locator read.
-    Locator,
-    /// A VCT repair context read.
-    VctRepairContext,
-    /// A target preparation.
-    Prepare,
-    /// A prepared target's application.
-    Apply,
-}
-
 impl StorageCallKind {
     /// The kind of storage call `action` makes, or `None` for an action that
     /// the reactor only records.
@@ -812,14 +801,6 @@ impl StorageCallKind {
             HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. } => None,
         }
     }
-}
-
-/// One header storage call's exact identity.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct StorageCall {
-    /// Counts from 1 per reactor, across accepted and refused calls.
-    pub(super) number: u64,
-    pub(super) kind: StorageCallKind,
 }
 
 /// Why a settlement names no accepted call.

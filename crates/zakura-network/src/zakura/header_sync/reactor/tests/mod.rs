@@ -23,6 +23,30 @@ use crate::zakura::{
     Frame, LOCAL_MAX_MESSAGE_BYTES,
 };
 
+/// Results that enter the handlers without a storage call, as an external
+/// driver's do.
+impl HeaderSyncReactor {
+    fn handle_header_target_prepared(
+        &mut self,
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        result: HeaderTargetPreparationResult,
+    ) {
+        self.handle_target_prepared(peer, source, owner, result, None);
+    }
+
+    fn handle_header_target_admission_ready(
+        &mut self,
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        result: HeaderTargetAdmissionResult,
+    ) {
+        self.handle_target_admission(peer, source, owner, result, None);
+    }
+}
+
 fn peer() -> ZakuraPeerId {
     ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length")
 }
@@ -256,6 +280,7 @@ fn seed_applying_request(
             tree_aux: None,
         }],
         phase: HeaderTargetPhase::Applying,
+        incarnation: WorkIncarnation::UNSTARTED,
         cursor: None,
         max_header_count: 1,
         tree_aux_schema: AuxSchema::None,

@@ -1116,8 +1116,11 @@ where
 
         let new_handler = match (&self.state, request) {
             (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
+            // Block adverts reach the connection through its advert queue, which the peer set's
+            // block advertiser fills. A `Client` caller that sends one as an ordinary request,
+            // such as an isolated connection, gets an error instead of an `inv`.
             (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
-                unreachable!("the peer set sends block adverts through the connection's advert queue")
+                Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService.into())))
             }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",

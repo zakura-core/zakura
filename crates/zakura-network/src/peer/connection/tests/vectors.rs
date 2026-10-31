@@ -1368,6 +1368,49 @@ async fn block_advert_while_awaiting_response() {
     .expect("adverts and the original response finish before the request timeout");
 }
 
+/// A block advert sent as an ordinary client request is answered with an error, not written as
+/// an `inv`: only the advert queue writes adverts. The connection stays usable.
+#[tokio::test]
+async fn block_advert_as_ordinary_request_is_an_error() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let (request_tx, request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::AdvertiseBlock(block::Hash([5; 32]), None),
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        let error = request_rx
+            .await
+            .unwrap()
+            .expect_err("an advert sent as an ordinary request fails");
+        assert_eq!(error.inner_debug(), "AdvertRequiresDedicatedService");
+        assert!(peer_outbound_messages.next().now_or_never().is_none());
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the request is answered before the request timeout");
+}
+
 /// A pending GetBlocks response must not be displaced by a simultaneous unsolicited advert.
 #[tokio::test]
 async fn getblocks_response_precedes_ready_block_advert() {

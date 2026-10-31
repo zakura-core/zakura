@@ -1850,6 +1850,9 @@ mod tests {
                 .await
                 .expect("block-sync driver exits cleanly");
             self.reactor_task.abort();
+            if let Err(error) = self.reactor_task.await {
+                assert!(error.is_cancelled(), "reactor shutdown failed: {error}");
+            }
         }
     }
 
@@ -2006,7 +2009,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn owned_checkpoint_releases_after_unadmitted_fallback() {
-        use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+        use zakura_node_services::block_memory::{model::Probe, Admission, DecodedBlockPool};
 
         let block: block::Block = BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
@@ -2014,6 +2017,7 @@ mod tests {
         let bytes = block.attributed_memory_size_bytes();
         let pool = DecodedBlockPool::new(bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&block);
         let ready_polls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
         let verifier = BackpressuredVerifier {
@@ -2048,6 +2052,10 @@ mod tests {
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         driver.shutdown().await;
+        let allocation = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+        assert_eq!(allocation.holders, 0, "no driver owner survives shutdown");
+        assert_eq!(allocation.header_holders, 0);
+        assert_eq!(allocation.transaction_holders, vec![0]);
         assert_eq!(
             pool.reserved_bytes(),
             0,
@@ -2058,7 +2066,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn owned_checkpoint_keeps_downstream_charge_after_driver_fallback() {
-        use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+        use zakura_node_services::block_memory::{model::Probe, Admission, DecodedBlockPool};
 
         let block: block::Block = BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
@@ -2067,6 +2075,7 @@ mod tests {
         let bytes = block.attributed_memory_size_bytes();
         let pool = DecodedBlockPool::new(bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&block);
         let (retained_tx, mut retained_rx) = mpsc::unbounded_channel();
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let retained_tx = retained_tx.clone();
@@ -2103,6 +2112,14 @@ mod tests {
         .unwrap()
         .unwrap();
         driver.shutdown().await;
+        let allocation = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+        assert!(
+            allocation.holders > 0,
+            "the downstream payload retains its owner"
+        );
+        assert_eq!(allocation.header_holders, 1);
+        assert_eq!(allocation.transaction_holders, vec![1]);
+        assert_eq!(allocation.measured_bytes, Some(bytes));
         assert_eq!(
             transaction.hash(),
             transaction_hash,
@@ -2114,6 +2131,10 @@ mod tests {
             "driver fallback must not release downstream retention"
         );
         drop(transaction);
+        let allocation = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+        assert_eq!(allocation.holders, 0);
+        assert_eq!(allocation.header_holders, 0);
+        assert_eq!(allocation.transaction_holders, vec![0]);
         assert_eq!(
             pool.reserved_bytes(),
             0,

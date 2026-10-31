@@ -76,14 +76,17 @@ pub struct RetentionStep {
     pub capture_error: Option<String>,
 }
 
-struct Probe {
+/// Weak reads of one allocation and its payloads, without retaining its charge.
+/// Callers must establish a stable boundary before comparing these reads with counters.
+pub struct Probe {
     owner: Weak<RetainedBlock>,
     header: Weak<Header>,
     transactions: Vec<Weak<Transaction>>,
 }
 
 impl Probe {
-    fn new(owner: &OwnedBlock) -> Self {
+    /// Observe an admitted allocation without adding a resource-holding reference.
+    pub fn new(owner: &OwnedBlock) -> Self {
         Self {
             owner: Arc::downgrade(&owner.0),
             header: Arc::downgrade(&owner.0.block.header),
@@ -97,7 +100,10 @@ impl Probe {
         }
     }
 
-    fn read(&self, id: usize, pools: &[DecodedBlockPool]) -> Result<AllocationView, String> {
+    /// Read actual payload references and the current charge owner without waiting.
+    /// A held or poisoned charge lock, or an unknown pool, makes the read unavailable.
+    /// `id` and pool order supply the caller's stable trace identities.
+    pub fn read(&self, id: usize, pools: &[DecodedBlockPool]) -> Result<AllocationView, String> {
         let holders = self.owner.strong_count();
         let owner = self.owner.upgrade();
         let pool = if let Some(owner) = &owner {

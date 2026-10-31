@@ -79,6 +79,7 @@ derive-new.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.1", features = ["test-support"] }
 tempfile = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }

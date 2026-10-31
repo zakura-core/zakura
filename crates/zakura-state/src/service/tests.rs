@@ -217,7 +217,9 @@ async fn await_block_info_waits_for_checkpoint_commit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charged() {
-    use zakura_node_services::block_memory::{Admission, BlockHandle, DecodedBlockPool};
+    use zakura_node_services::block_memory::{
+        model::Probe, Admission, BlockHandle, DecodedBlockPool,
+    };
 
     let _init_guard = zakura_test::init();
     let limit = Duration::from_secs(10);
@@ -232,14 +234,14 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
     let hash = child.hash();
     let pool = DecodedBlockPool::new(bytes);
     let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
+    let probe = Probe::new(&child);
     drop(
         state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(
             BlockHandle::from(child),
         )),
     );
     assert_eq!(state.finalized_state_queued_blocks.len(), 1);
-    assert!(bytes > 0);
-    assert_eq!(pool.reserved_bytes(), bytes);
+    assert_decoded_payload_retained(&probe, &pool, bytes);
 
     let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
@@ -259,25 +261,220 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
     })
     .await
     .expect("the real writer commits the cancelled caller's child");
-    assert_eq!(
-        pool.reserved_bytes(),
-        bytes,
-        "the published tip retains its transactions"
-    );
+    assert_decoded_payload_retained(&probe, &pool, bytes);
     drop((state, read));
+    assert_decoded_payload_retained(&probe, &pool, bytes);
+    drop((tip, changes));
+    wait_for_decoded_payload_release(&probe, &pool, limit).await;
+}
+
+fn assert_decoded_payload_retained(
+    probe: &zakura_node_services::block_memory::model::Probe,
+    pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    bytes: u64,
+) {
+    let allocation = probe.read(1, std::slice::from_ref(pool)).unwrap();
+    assert!(bytes > 0);
+    assert!(
+        allocation.holders > 0,
+        "the retained payload has a settlement owner"
+    );
+    assert_eq!(allocation.pool, Some(0));
+    assert_eq!(
+        allocation.header_holders, 1,
+        "no raw header escapes its owner"
+    );
+    assert_eq!(
+        allocation.transaction_holders,
+        vec![1],
+        "no raw transaction escapes its owner"
+    );
+    assert_eq!(allocation.measured_bytes, Some(bytes));
     assert_eq!(
         pool.reserved_bytes(),
         bytes,
-        "tip readers outlive the state worker"
+        "actual backend retention remains charged"
     );
-    drop((tip, changes));
+}
+
+async fn wait_for_decoded_payload_release(
+    probe: &zakura_node_services::block_memory::model::Probe,
+    pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    limit: Duration,
+) {
     timeout(limit, async {
         while pool.reserved_bytes() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
-    .expect("state teardown releases its final payload holder");
+    .expect("backend teardown settles its final charge");
+    let allocation = probe.read(1, std::slice::from_ref(pool)).unwrap();
+    assert_eq!(allocation.holders, 0, "no owner survives settlement");
+    assert_eq!(
+        allocation.header_holders, 0,
+        "no header survives the final owner"
+    );
+    assert_eq!(
+        allocation.transaction_holders,
+        vec![0],
+        "no transaction survives the final owner"
+    );
+    assert_eq!(
+        pool.reserved_bytes(),
+        0,
+        "the final owner settles its charge"
+    );
+}
+
+/// Each real state snapshot or read result keeps its allocation charged after
+/// invalidation and writer shutdown. The final drop releases the actual payloads.
+#[tokio::test(flavor = "multi_thread")]
+async fn retired_state_snapshots_and_read_results_keep_decoded_ownership() {
+    use zakura_node_services::block_memory::{
+        model::Probe, Admission, BlockHandle, DecodedBlockPool,
+    };
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    for (keep, name) in ["snapshot", "range", "block", "header", "transaction"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut chain = v4_coinbase_mainnet_chain();
+        let mut state = state_with_finalized_parent(&chain).await;
+        let read = state.read_service.clone();
+        let child = Arc::try_unwrap(chain.pop().unwrap()).unwrap();
+        let bytes = child.attributed_memory_size_bytes();
+        let hash = child.hash();
+        let transaction_hash = child.transactions[0].hash();
+        let pool = DecodedBlockPool::new(bytes);
+        let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&child);
+        let child = SemanticallyVerifiedBlock::from(BlockHandle::from(child));
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(child, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        wait_for_idle_writer(&state, limit).await;
+
+        let mut snapshot = Some(read.latest_non_finalized_state());
+        assert_eq!(
+            snapshot
+                .as_ref()
+                .unwrap()
+                .best_chain()
+                .unwrap()
+                .block(hash.into())
+                .unwrap()
+                .hash,
+            hash
+        );
+        let mut range = Some(read.block_range_snapshot().unwrap());
+        assert_eq!(
+            range
+                .as_ref()
+                .unwrap()
+                .block_and_size(&read.db, Height(2))
+                .unwrap()
+                .0
+                .hash(),
+            hash
+        );
+        let crate::ReadResponse::Block(Some(block)) = timeout(
+            limit,
+            read.clone().oneshot(crate::ReadRequest::Block(hash.into())),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("the live block is readable")
+        };
+        let crate::ReadResponse::BlockHeader { header, .. } = timeout(
+            limit,
+            read.clone()
+                .oneshot(crate::ReadRequest::BlockHeader(hash.into())),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("the live header is readable")
+        };
+        let crate::ReadResponse::Transaction(Some(transaction)) = timeout(
+            limit,
+            read.clone()
+                .oneshot(crate::ReadRequest::Transaction(transaction_hash)),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("the live transaction is readable")
+        };
+        let (mut block, mut header, mut transaction) =
+            (Some(block), Some(header), Some(transaction.tx));
+        assert_decoded_payload_retained(&probe, &pool, bytes);
+
+        timeout(limit, state.ready()).await.unwrap().unwrap();
+        timeout(limit, state.call(Request::InvalidateBlock(hash)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            timeout(
+                limit,
+                read.clone().oneshot(crate::ReadRequest::Block(hash.into()))
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            crate::ReadResponse::Block(None)
+        ));
+        if keep != 0 {
+            drop(snapshot.take());
+        }
+        if keep != 1 {
+            drop(range.take());
+        }
+        if keep != 2 {
+            drop(block.take());
+        }
+        if keep != 3 {
+            drop(header.take());
+        }
+        if keep != 4 {
+            drop(transaction.take());
+        }
+        drop((state, read));
+
+        tracing::info!(retained = name, "checking retention after writer shutdown");
+        if let Some(snapshot) = &snapshot {
+            assert_eq!(
+                snapshot
+                    .best_chain()
+                    .unwrap()
+                    .block(hash.into())
+                    .unwrap()
+                    .hash,
+                hash
+            );
+        }
+        if let Some(block) = &block {
+            assert_eq!(block.hash(), hash);
+        }
+        if let Some(header) = &header {
+            assert_eq!(header.hash(), hash);
+        }
+        if let Some(transaction) = &transaction {
+            assert_eq!(transaction.hash(), transaction_hash);
+        }
+        assert_decoded_payload_retained(&probe, &pool, bytes);
+        drop((snapshot, range, block, header, transaction));
+        wait_for_decoded_payload_release(&probe, &pool, limit).await;
+    }
 }
 
 /// Returns Mainnet blocks 0..=2 with v4 coinbases, so block 2 can reach the non-finalized state.

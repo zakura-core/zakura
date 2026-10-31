@@ -21,6 +21,9 @@ default = []
 
 # Tool and test features
 
+# Independent allocation reads for native backend and driver tests.
+test-support = ["serde", "serde/derive"]
+
 # Retain the published feature name after removing its unused dependency.
 color-eyre = []
 

@@ -17,7 +17,7 @@ use zakura_rt::sync::{
     Mutex, Notify,
 };
 
-#[cfg(any(test, zakura_sim))]
+#[cfg(any(test, zakura_sim, feature = "test-support"))]
 pub mod model;
 
 /// Capacity for decoded blocks, including references retained outside their store.

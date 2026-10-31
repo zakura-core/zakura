@@ -241,7 +241,7 @@ zakura-test = { path = "../zakura-test", version = "4.0.0" }
 # HeaderChainServicePort in its tests. Path-only, with no version, because
 # zakura-storage is never published, so packaging drops it.
 zakura-storage = { path = "../zakura-storage", features = ["driver-fidelity"] }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.1", features = ["rpc-client"] }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.1", features = ["rpc-client", "test-support"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).

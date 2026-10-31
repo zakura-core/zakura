@@ -847,7 +847,7 @@ fn unsupported_format() {
 
 #[test]
 fn previous_machine_formats_are_rejected() {
-    for format in [19, 20, 21, 22, 23] {
+    for format in [19, 20, 21, 22, 23, 24] {
         let dir = recorded(plan());
         edit_meta(dir.path(), |meta| meta["format"] = json!(format));
         assert_eq!(

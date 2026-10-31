@@ -442,6 +442,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     block_work::FUNDING_ENTRY,
     block_work::DECODED_RETENTION_ENTRY,
     header_work::REACTOR_ENTRY,
+    block_work::REACTOR_ENTRY,
     entry::<fixtures::Race<fixtures::LostUpdate>>(),
     entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
     entry::<fixtures::Race<fixtures::MissedNotify>>(),

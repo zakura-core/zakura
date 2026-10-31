@@ -1581,3 +1581,73 @@ fn reactor_machine_preserves_empty_and_short_inputs() {
             .verified());
     }
 }
+
+const BLOCK_REACTOR_INPUT: &[u8] = include_bytes!("fixtures/block-reactor-policy.bin");
+
+#[test]
+fn block_reactor_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_BLOCK_REACTOR_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(report.end.unwrap().steps, 15);
+    }
+}
+
+#[test]
+fn reactor_machine_records_and_replays_query_identities() {
+    use zakura_sim::record::machine::{MachineStep, ReactorAction};
+    let entry = harness::find("block/reactor-policy").unwrap();
+    let dir = record(entry, BLOCK_REACTOR_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/reactor-policy",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), 15);
+    assert_eq!(trace.meta.scenario["input"], json!(BLOCK_REACTOR_INPUT));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:block-reactor:") && step.draws.is_empty()));
+    let actions = |index: usize| {
+        let Some(MachineStep::Reactor(step)) = trace.steps[index].machine.as_deref() else {
+            panic!("reactor evidence missing");
+        };
+        step.actions.clone()
+    };
+    assert!(matches!(
+        actions(0).as_slice(),
+        [ReactorAction::QueryAccepted { query }] if query.query_id == 1
+    ));
+    assert!(matches!(
+        actions(1).as_slice(),
+        [ReactorAction::QueryRefused { query, closed: false }] if query.query_id == 2
+    ));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "block_reactor_machine_replay_child"])
+        .env("ZAKURA_BLOCK_REACTOR_MACHINE_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 2)["machine"]["step"]["actual"]["next_query_id"] = json!(99);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 2,
+            field: "machine"
+        })
+    ));
+}

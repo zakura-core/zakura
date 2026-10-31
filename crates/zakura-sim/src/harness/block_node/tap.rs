@@ -28,6 +28,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     mem,
+    num::NonZeroU64,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -37,8 +38,9 @@ use std::{
 
 use zakura_network::zakura::{
     block_sync_observe::{
-        BlockEvent, BlockSyncObserver, BudgetChangeKind, HeldBody, Holder, HolderChange, LeaseStep,
-        RequestStep, RequestWritePhase, RetainedBody, WorkItemPlace,
+        ActionRefusal, BlockEvent, BlockSyncObserver, BudgetChangeKind, HeldBody, Holder,
+        HolderChange, LeaseStep, QueryIdentity, ReactorTransition, RequestStep, RequestWritePhase,
+        RetainedBody, WorkItemPlace,
     },
     ServicePeerDirection, ZakuraPeerId,
 };
@@ -57,8 +59,9 @@ use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
         BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncPayload,
-        BlockSyncRange, BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained,
-        BlockSyncSubmission, BlockSyncWorkItem, StorageFact,
+        BlockSyncQuery, BlockSyncRange, BlockSyncReactorState, BlockSyncReactorTransition,
+        BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission,
+        BlockSyncWorkItem, StorageFact,
     },
     storage::{block_owner, hex},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
@@ -596,11 +599,87 @@ impl BlockTap {
                     })
                     .collect(),
             },
+            BlockEvent::Reactor { transition, state } => BlockSyncFact::Reactor {
+                transition: reactor_transition(transition),
+                state: BlockSyncReactorState {
+                    pending: state.pending.map(|query| query.query_id.get()),
+                    next_query_id: state.next_query_id.map(NonZeroU64::get),
+                    retry_armed: state.retry_armed,
+                    retry_forced: state.retry_forced,
+                    dispatch_closed: state.dispatch_closed,
+                    verified_tip: state.verified_block_tip.0,
+                    request_floor: state.request_floor.0,
+                    header_tip: state.best_header_tip.0,
+                    reset_epoch: state.last_reset_epoch,
+                    reaction_epoch: state.last_reaction_epoch,
+                },
+            },
             BlockEvent::SequencerClosed => BlockSyncFact::SequencerClosed,
             // The enum is non-exhaustive, and an event the log can't hold
             // would leave the evidence silently incomplete.
             unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
         })
+    }
+}
+
+fn reactor_query(query: &QueryIdentity) -> BlockSyncQuery {
+    BlockSyncQuery {
+        query_id: query.query_id.get(),
+        scope: query.scope.into(),
+        from: query.from.0,
+        limit: query.limit,
+        header_tip: query.best_header_tip.0,
+        forced: query.forced,
+    }
+}
+
+fn reactor_transition(transition: &ReactorTransition) -> BlockSyncReactorTransition {
+    use BlockSyncReactorTransition as Fact;
+    match transition {
+        ReactorTransition::QueryAccepted(query) => Fact::QueryAccepted(reactor_query(query)),
+        ReactorTransition::QueryRefused { query, refusal } => Fact::QueryRefused {
+            query: reactor_query(query),
+            refusal: match refusal {
+                ActionRefusal::ControlReserve => "control-reserve",
+                ActionRefusal::Full => "full",
+                ActionRefusal::Closed => "closed",
+            }
+            .to_owned(),
+        },
+        ReactorTransition::QueryReply {
+            query_id,
+            scope,
+            outcome,
+        } => Fact::QueryReply {
+            query_id: query_id.get(),
+            scope: (*scope).into(),
+            outcome: (*outcome).into(),
+        },
+        ReactorTransition::QueryFailed {
+            query_id,
+            scope,
+            matched,
+        } => Fact::QueryFailed {
+            query_id: query_id.get(),
+            scope: (*scope).into(),
+            matched: *matched,
+        },
+        ReactorTransition::RetryElapsed => Fact::RetryElapsed,
+        ReactorTransition::View {
+            reset,
+            tip_advanced,
+        } => Fact::View {
+            reset: *reset,
+            tip_advanced: *tip_advanced,
+        },
+        ReactorTransition::AuthorityChanged {
+            authority,
+            epoch_changed,
+        } => Fact::AuthorityChanged {
+            authority: (*authority).into(),
+            epoch_changed: *epoch_changed,
+        },
+        ReactorTransition::TipReset { tip } => Fact::TipReset { tip: tip.0 },
     }
 }
 

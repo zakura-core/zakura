@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "block_query"
+path = "fuzz_targets/block_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_sequencer_reset"
 path = "fuzz_targets/block_sequencer_reset.rs"
 test = false
@@ -65,6 +72,13 @@ bench = false
 [[bin]]
 name = "cadence"
 path = "fuzz_targets/cadence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_reactor"
+path = "fuzz_targets/block_reactor.rs"
 test = false
 doc = false
 bench = false

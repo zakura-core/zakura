@@ -227,6 +227,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("raw-transaction-escape"),
     },
     Coverage {
+        property: "block/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_query_identities",
+        ),
+        bypass: Bypass::Planted("refusal-consumes-query-id"),
+    },
+    Coverage {
         property: "block/work-funding",
         passing: passes(
             "tests/replay_exact.rs",

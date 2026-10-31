@@ -15,7 +15,10 @@ use zakura_header_chain::{
 };
 
 use super::*;
-use crate::zakura::block_sync::sequencer_task::initial_view;
+use crate::zakura::block_sync::{
+    sequencer_task::initial_view,
+    work_queue::{WorkOwnershipFailure, WorkOwnershipPhase},
+};
 
 fn hash(domain: u8, raw: u32) -> block::Hash {
     let mut hash = [domain; 32];
@@ -1189,18 +1192,54 @@ pub struct BlockReactorReplaySummary {
     pub resets: usize,
 }
 
-fn run(
-    inputs: impl IntoIterator<Item = Input>,
-    mut after_step: impl FnMut(&mut ReactorState),
-) -> BlockReactorReplaySummary {
-    let mut summary = BlockReactorReplaySummary::default();
-    let base = Instant::now();
-    let mut state = reactor_state(0, 20);
-    let mut model = Model::new(20);
-    // The finalized height stays at zero: no generated view raises it.
-    for input in inputs {
-        summary.transitions += 1;
-        let now = base + Duration::from_millis(model.now_ms);
+/// One history's production state, independent model, and evidence.
+struct Driver {
+    base: Instant,
+    state: ReactorState,
+    model: Model,
+    summary: BlockReactorReplaySummary,
+    /// Accepted, refused, and other transitions of the input being applied.
+    actions: Vec<ReactorMachineAction>,
+}
+
+impl Driver {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            state: reactor_state(0, 20),
+            // The finalized height stays at zero: no generated view raises it.
+            model: Model::new(20),
+            summary: BlockReactorReplaySummary::default(),
+            actions: Vec::new(),
+        }
+    }
+
+    /// Record and compare a refill's outcome.
+    fn record_refill(&mut self, actual: Refill, expected: Option<(ModelQuery, bool)>) {
+        let actual = match actual {
+            Refill::Held => None,
+            Refill::Accepted(query) => {
+                self.summary.accepted += 1;
+                self.actions
+                    .push(ReactorMachineAction::QueryAccepted(machine_query(query)));
+                Some((model_query(query), true))
+            }
+            Refill::Refused(query) => {
+                self.summary.refused += 1;
+                self.actions.push(ReactorMachineAction::QueryRefused {
+                    query: machine_query(query),
+                    closed: self.state.queries.dispatch_closed(),
+                });
+                Some((model_query(query), false))
+            }
+        };
+        assert_eq!(actual, expected, "{PROPERTY}");
+    }
+
+    /// Apply one input. Returns false when the input names no query, so it
+    /// changes nothing and needs no comparison.
+    fn apply(&mut self, input: Input) -> bool {
+        let now = self.base + Duration::from_millis(self.model.now_ms);
         match input {
             Input::Refill {
                 force,
@@ -1210,16 +1249,16 @@ fn run(
                 has_authority,
                 answer,
             } => {
-                let scope = has_authority.then(|| authority(model.authority));
+                let scope = has_authority.then(|| authority(self.model.authority));
                 let actual = refill_answered(
-                    &mut state,
+                    &mut self.state,
                     force,
                     work(first_unclaimed, backlog, low_water),
                     scope,
                     answer,
                     now,
                 );
-                let expected = model.refill(
+                let expected = self.model.refill(
                     force,
                     first_unclaimed,
                     backlog,
@@ -1227,83 +1266,82 @@ fn run(
                     has_authority,
                     answer,
                 );
-                let actual = match actual {
-                    Refill::Held => None,
-                    Refill::Accepted(query) => {
-                        summary.accepted += 1;
-                        Some((model_query(query), true))
-                    }
-                    Refill::Refused(query) => {
-                        summary.refused += 1;
-                        Some((model_query(query), false))
-                    }
-                };
-                assert_eq!(actual, expected, "{PROPERTY}");
+                self.record_refill(actual, expected);
             }
             Input::Reply {
                 target,
                 scope,
                 anchor,
             } => {
-                let Some(id) = model.named(target) else {
-                    continue;
+                let Some(id) = self.model.named(target) else {
+                    return false;
                 };
+                let tip = self.model.verified_tip;
                 let body_anchor = match anchor {
-                    AnchorKind::Current => (model.verified_tip, verified_hash(model.verified_tip)),
-                    AnchorKind::Ahead => (
-                        model.verified_tip + 1,
-                        verified_hash(model.verified_tip + 1),
-                    ),
+                    AnchorKind::Current => (tip, verified_hash(tip)),
+                    AnchorKind::Ahead => (tip + 1, verified_hash(tip + 1)),
                     AnchorKind::Behind => {
-                        let height = model.verified_tip.saturating_sub(1);
+                        let height = tip.saturating_sub(1);
                         (height, verified_hash(height))
                     }
-                    AnchorKind::OtherHash => (model.verified_tip, hash(0xCC, model.verified_tip)),
+                    AnchorKind::OtherHash => (tip, hash(0xCC, tip)),
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
                 let actual = complete_query(
-                    &mut state,
+                    &mut self.state,
                     query_id,
                     authority(scope),
                     Frontier {
                         height: block::Height(body_anchor.0),
                         hash: body_anchor.1,
                     },
-                    Some(authority(model.authority)),
+                    Some(authority(self.model.authority)),
                 );
-                let expected = model.reply(id, scope, body_anchor);
-                summary.replies += 1;
-                summary.stale_replies += usize::from(matches!(
+                let expected = self.model.reply(id, scope, body_anchor);
+                self.summary.replies += 1;
+                self.summary.stale_replies += usize::from(matches!(
                     expected,
                     ModelReply::Stale | ModelReply::StaleAuthority
                 ));
+                self.actions.push(ReactorMachineAction::Reply {
+                    query_id: id,
+                    scope: authority(scope),
+                    outcome: reply_outcome(actual),
+                });
                 assert_eq!(model_reply(actual), expected, "{PROPERTY}");
             }
             Input::Fail { target, scope } => {
-                let Some(id) = model.named(target) else {
-                    continue;
+                let Some(id) = self.model.named(target) else {
+                    return false;
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = state.queries.fail(query_id, authority(scope), now);
-                assert_eq!(actual, model.fail(id, scope), "{PROPERTY}");
+                let actual = self.state.queries.fail(query_id, authority(scope), now);
+                self.actions.push(ReactorMachineAction::Failed {
+                    query_id: id,
+                    scope: authority(scope),
+                    matched: actual,
+                });
+                assert_eq!(actual, self.model.fail(id, scope), "{PROPERTY}");
             }
             Input::RetryElapsed => {
-                if model
+                if self
+                    .model
                     .retry_until_ms
-                    .is_some_and(|until| until <= model.now_ms)
+                    .is_some_and(|until| until <= self.model.now_ms)
                 {
-                    summary.retry_expiries += 1;
-                    state.queries.retry_elapsed();
-                    model.retry_until_ms = None;
+                    self.summary.retry_expiries += 1;
+                    self.actions.push(ReactorMachineAction::RetryElapsed);
+                    self.state.queries.retry_elapsed();
+                    self.model.retry_until_ms = None;
                 }
             }
             Input::HeaderTip(tip) => {
-                state
+                self.state
                     .progress
                     .observe_header_tip(block::Height(tip), header_hash(tip));
-                model.header_tip = tip;
+                self.model.header_tip = tip;
             }
-            Input::Authority(generation) => model.authority = generation,
+            Input::Authority(generation) => self.model.authority = generation,
             Input::View {
                 tip,
                 floor_lag,
@@ -1313,13 +1351,19 @@ fn run(
                 refill_backlog,
             } => {
                 let floor = tip.saturating_sub(floor_lag);
-                let expected = model.view(tip, floor, reset, react);
-                let mut next = view(tip, model.reset_epoch, model.reaction_epoch);
+                let expected = self.model.view(tip, floor, reset, react);
+                let mut next = view(tip, self.model.reset_epoch, self.model.reaction_epoch);
                 next.download_floor = block::Height(floor);
-                let actual = state.observe_view(next);
-                summary.views += 1;
-                summary.reactions += usize::from(expected.is_some());
-                summary.resets += usize::from(expected.is_some_and(|(reset, _)| reset));
+                let actual = self.state.observe_view(next);
+                self.summary.views += 1;
+                self.summary.reactions += usize::from(expected.is_some());
+                self.summary.resets += usize::from(expected.is_some_and(|(reset, _)| reset));
+                self.actions.push(ReactorMachineAction::View {
+                    tip,
+                    floor,
+                    reacted: expected.is_some(),
+                    reset: expected.is_some_and(|(reset, _)| reset),
+                });
                 match expected {
                     None => assert_eq!(actual, ViewReaction::ObserveOnly, "{PROPERTY}"),
                     Some((reset, tip_advanced)) => {
@@ -1333,17 +1377,17 @@ fn run(
                         );
                         // The reaction refills, forced after a reset, with
                         // outstanding work over the low-water target.
-                        check(&state, &model, base);
-                        let scope = Some(authority(model.authority));
+                        check(&self.state, &self.model, self.base);
+                        let scope = Some(authority(self.model.authority));
                         let actual = refill(
-                            &mut state,
+                            &mut self.state,
                             reset,
                             work(Some(floor + 1), refill_backlog, 10),
                             scope,
                             refill_accept,
                             now,
                         );
-                        let expected = model.refill(
+                        let expected = self.model.refill(
                             reset,
                             Some(floor + 1),
                             refill_backlog,
@@ -1355,34 +1399,290 @@ fn run(
                                 Err(ActionRefusal::Full)
                             },
                         );
-                        if reset && floor < model.header_tip && !model.closed {
+                        if reset && floor < self.model.header_tip && !self.model.closed {
                             assert!(
                                 expected.is_some(),
                                 "{PROPERTY}: a reset refill always dispatches"
                             );
                         }
-                        let actual = match actual {
-                            Refill::Held => None,
-                            Refill::Accepted(query) => {
-                                summary.accepted += 1;
-                                Some((model_query(query), true))
-                            }
-                            Refill::Refused(query) => {
-                                summary.refused += 1;
-                                Some((model_query(query), false))
-                            }
-                        };
-                        assert_eq!(actual, expected, "{PROPERTY}");
+                        self.record_refill(actual, expected);
                     }
                 }
             }
-            Input::Wait(ms) => model.now_ms += ms,
+            Input::Wait(ms) => self.model.now_ms += ms,
         }
-        after_step(&mut state);
-        check(&state, &model, base);
+        true
     }
+}
 
-    summary
+fn run(
+    inputs: impl IntoIterator<Item = Input>,
+    mut after_step: impl FnMut(&mut ReactorState),
+) -> BlockReactorReplaySummary {
+    let mut driver = Driver::new();
+    for input in inputs {
+        driver.summary.transitions += 1;
+        if driver.apply(input) {
+            after_step(&mut driver.state);
+            check(&driver.state, &driver.model, driver.base);
+        }
+    }
+    driver.summary
+}
+
+// ---- semantic history ----
+
+/// A query's identity, authority, and bounds in a machine history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactorMachineQuery {
+    /// The query's exact ID.
+    pub query_id: u64,
+    /// The body-work authority that dispatched it.
+    pub scope: BodyWorkAuthority,
+    /// First requested height.
+    pub from: u32,
+    /// Requested height count.
+    pub limit: u32,
+    /// Header tip the query asked about.
+    pub header_tip: u32,
+    /// Whether the query bypassed the low-water gate.
+    pub forced: bool,
+}
+
+fn machine_query(query: PendingNeededQuery) -> ReactorMachineQuery {
+    ReactorMachineQuery {
+        query_id: query.query_id.get(),
+        scope: query.scope,
+        from: query.from.0,
+        limit: query.limit,
+        header_tip: query.best_header_tip.0,
+        forced: query.forced,
+    }
+}
+
+/// How the production state classified a needed-block reply.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReactorMachineReply {
+    /// The reply matched no pending query.
+    Stale,
+    /// The reply matched under a retired authority.
+    StaleAuthority,
+    /// State's anchor moved ahead of the verified mirror.
+    AnchorAdvanced,
+    /// State's anchor sits behind or beside the verified mirror.
+    AnchorReset,
+    /// The reply's blocks became current work.
+    Accepted,
+}
+
+fn reply_outcome(reply: NeededReply) -> ReactorMachineReply {
+    match reply {
+        NeededReply::Stale => ReactorMachineReply::Stale,
+        NeededReply::StaleAuthority => ReactorMachineReply::StaleAuthority,
+        NeededReply::AnchorAdvanced(_) => ReactorMachineReply::AnchorAdvanced,
+        NeededReply::AnchorReset(_) => ReactorMachineReply::AnchorReset,
+        NeededReply::Accept(_) => ReactorMachineReply::Accepted,
+    }
+}
+
+/// One transition an input caused, named by its exact identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReactorMachineAction {
+    /// The action channel accepted a query.
+    QueryAccepted(ReactorMachineQuery),
+    /// The action channel refused a query.
+    QueryRefused {
+        /// The refused proposal.
+        query: ReactorMachineQuery,
+        /// Whether the channel closed, rather than filled.
+        closed: bool,
+    },
+    /// A needed-block reply reached the state.
+    Reply {
+        /// The reply's query ID.
+        query_id: u64,
+        /// The reply's authority.
+        scope: BodyWorkAuthority,
+        /// The classification.
+        outcome: ReactorMachineReply,
+    },
+    /// A query failure reached the state.
+    Failed {
+        /// The failure's query ID.
+        query_id: u64,
+        /// The failure's authority.
+        scope: BodyWorkAuthority,
+        /// Whether it retired the pending query.
+        matched: bool,
+    },
+    /// The retry gate's deadline passed.
+    RetryElapsed,
+    /// A Sequencer view reached the state.
+    View {
+        /// The view's verified tip.
+        tip: u32,
+        /// The view's download floor.
+        floor: u32,
+        /// Whether the view's reaction epoch advanced.
+        reacted: bool,
+        /// Whether the reaction was a destructive reset.
+        reset: bool,
+    },
+}
+
+/// Reactor query and progress state at a completed input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactorMachineView {
+    /// The accepted query awaiting a reply.
+    pub pending: Option<ReactorMachineQuery>,
+    /// The next accepted query's ID.
+    pub next_query_id: Option<u64>,
+    /// The retry gate's deadline, as an offset from the history's clock origin.
+    pub retry_after_ms: Option<u64>,
+    /// Whether the next proposal owes a refused or failed query's force.
+    pub retry_forced: bool,
+    /// Whether the action channel reported closed.
+    pub dispatch_closed: bool,
+    /// Verified-tip mirror.
+    pub verified_tip: u32,
+    /// Query and scheduling floor.
+    pub request_floor: u32,
+    /// Header-tip mirror.
+    pub header_tip: u32,
+}
+
+/// One decoder-v2 operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockReactorStep {
+    /// One-based operation number.
+    pub step: usize,
+    /// The operation's causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// The transitions the operation caused.
+    pub actions: Vec<ReactorMachineAction>,
+    /// State read from production.
+    pub actual: ReactorMachineView,
+    /// State derived by the independent model.
+    pub expected: ReactorMachineView,
+    /// First failure, if the operation stopped the run.
+    pub failure: Option<WorkOwnershipFailure>,
+}
+
+/// A decoder-v2 history, captured until its first failure.
+#[derive(Debug)]
+pub struct BlockReactorHistory {
+    /// Captured operations.
+    pub steps: Vec<BlockReactorStep>,
+    /// Counters of a history without a failure.
+    pub summary: Option<BlockReactorReplaySummary>,
+}
+
+fn actual_view(state: &ReactorState, base: Instant) -> ReactorMachineView {
+    ReactorMachineView {
+        pending: state.queries.pending().map(machine_query),
+        next_query_id: state.queries.next_id().map(NonZeroU64::get),
+        retry_after_ms: state.queries.retry_at().map(|at| {
+            u64::try_from(at.duration_since(base).as_millis())
+                .expect("a history's deadlines fit in u64 milliseconds")
+        }),
+        retry_forced: state.queries.retry_forced(),
+        dispatch_closed: state.queries.dispatch_closed(),
+        verified_tip: state.progress.verified_block_tip.0,
+        request_floor: state.progress.request_floor.0,
+        header_tip: state.progress.best_header_tip.0,
+    }
+}
+
+fn expected_view(model: &Model) -> ReactorMachineView {
+    ReactorMachineView {
+        pending: model.pending.map(|query| ReactorMachineQuery {
+            query_id: query.id,
+            scope: authority(query.scope),
+            from: query.from,
+            limit: query.limit,
+            header_tip: query.header_tip,
+            forced: query.forced,
+        }),
+        next_query_id: Some(model.next_id),
+        retry_after_ms: model.retry_until_ms,
+        retry_forced: model.retry_forced,
+        dispatch_closed: model.closed,
+        verified_tip: model.verified_tip,
+        request_floor: model.floor,
+        header_tip: model.header_tip,
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+fn machine_failure(
+    payload: &(dyn std::any::Any + Send),
+    phase: WorkOwnershipPhase,
+) -> WorkOwnershipFailure {
+    let message = panic_message(payload);
+    WorkOwnershipFailure {
+        property_failure: message.contains(PROPERTY),
+        phase,
+        message,
+    }
+}
+
+/// Capture decoder-v2 operations with the exact identity of each accepted or
+/// refused query. The history holds at most 128 steps. A driver panic stays
+/// distinct from a property failure.
+pub fn trace_block_reactor_bytes(data: &[u8]) -> BlockReactorHistory {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let input = &data[..data.len().min(512)];
+    let mut driver = Driver::new();
+    let mut steps = Vec::new();
+    for (index, (chunk, operation)) in input.chunks(4).zip(decode(input)).enumerate() {
+        driver.summary.transitions += 1;
+        driver.actions.clear();
+        let mut failure = match catch_unwind(AssertUnwindSafe(|| driver.apply(operation))) {
+            Ok(_) => None,
+            Err(payload) => Some(machine_failure(
+                payload.as_ref(),
+                WorkOwnershipPhase::Transition,
+            )),
+        };
+        if failure.is_none() {
+            failure = catch_unwind(AssertUnwindSafe(|| {
+                check(&driver.state, &driver.model, driver.base);
+            }))
+            .err()
+            .map(|payload| machine_failure(payload.as_ref(), WorkOwnershipPhase::Invariant));
+        }
+        let failed = failure.is_some();
+        steps.push(BlockReactorStep {
+            step: index + 1,
+            input: chunk.to_vec(),
+            actions: std::mem::take(&mut driver.actions),
+            actual: actual_view(&driver.state, driver.base),
+            expected: expected_view(&driver.model),
+            failure,
+        });
+        if failed {
+            return BlockReactorHistory {
+                steps,
+                summary: None,
+            };
+        }
+    }
+    BlockReactorHistory {
+        steps,
+        summary: Some(driver.summary),
+    }
 }
 
 #[cfg(test)]
@@ -1470,6 +1770,41 @@ const WITNESS: &[u8] = &[
     0, 0, 1, 200, 0, 8, 2, 200, 7, 0, 200, 0, 3, 0, 0, 0, 1, 0, 0, 1, 6, 2, 1, 0, 6, 3, 0, 0, 5, 0,
     1, 0, 1, 0, 0, 0, 0, 0, 1, 200, 2, 0, 1, 0, 7, 0, 200, 0, 3, 0, 0, 0, 4, 0, 30, 0, 6, 0, 3, 0,
 ];
+
+#[test]
+fn reactor_history_records_exact_query_identities() {
+    let history = trace_block_reactor_bytes(WITNESS);
+    assert_eq!(history.steps.len(), WITNESS.len().div_ceil(4));
+    assert!(history.summary.is_some());
+    assert!(history.steps.iter().all(|step| step.failure.is_none()));
+    assert!(history
+        .steps
+        .iter()
+        .all(|step| step.actual == step.expected));
+    let first = history.steps[0]
+        .actions
+        .first()
+        .expect("the witness's first refill dispatches");
+    assert!(
+        matches!(first, ReactorMachineAction::QueryAccepted(query) if query.query_id == 1),
+        "{first:?}"
+    );
+    assert!(history.steps.iter().any(|step| step
+        .actions
+        .iter()
+        .any(|action| matches!(action, ReactorMachineAction::QueryRefused { query, closed: false } if query.query_id == 2))));
+}
+
+#[test]
+fn reactor_history_holds_refills_after_a_closed_channel() {
+    let history = trace_block_reactor_bytes(&[0, 24, 1, 200, 0, 0, 1, 200]);
+    assert!(history.steps[0].actual.dispatch_closed);
+    assert_eq!(history.steps[0].actual, history.steps[0].expected);
+    assert!(
+        history.steps[1].actions.is_empty(),
+        "a closed channel holds the refill"
+    );
+}
 
 #[test]
 #[allow(

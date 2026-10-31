@@ -202,8 +202,9 @@ pub use work_queue::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use reactor::{
-    replay_block_query_bytes, replay_block_reactor_bytes, BlockQueryReplaySummary,
-    BlockReactorReplaySummary,
+    replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
+    BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
+    ReactorMachineAction, ReactorMachineQuery, ReactorMachineReply, ReactorMachineView,
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]

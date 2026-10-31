@@ -50,7 +50,11 @@ mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{replay_block_query_bytes, BlockQueryReplaySummary};
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use tests::{replay_block_reactor_bytes, BlockReactorReplaySummary};
+pub use tests::{
+    replay_block_reactor_bytes, trace_block_reactor_bytes, BlockReactorHistory,
+    BlockReactorReplaySummary, BlockReactorStep, ReactorMachineAction, ReactorMachineQuery,
+    ReactorMachineReply, ReactorMachineView,
+};
 
 /// The block-sync reactor's logical state.
 #[derive(Debug)]

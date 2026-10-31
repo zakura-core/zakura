@@ -4,13 +4,13 @@ use std::{net::SocketAddr, time::Duration};
 
 use thiserror::Error;
 use zakura_quic::NodeId;
-use zakura_rt::collections::{hash_map::RandomState, HashMap, HashSet};
+use zakura_rt::collections::{HashMap, HashSet};
 
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
-    normalize_services, push_unique_service, DialCandidateExclusions, DiscoveryBookError,
-    DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
-    RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
+    normalize_services, push_unique_service, DialCandidateExclusions, DisclosureKey,
+    DiscoveryBookError, DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome,
+    ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
     ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate,
     ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry,
     ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
@@ -253,7 +253,7 @@ impl DiscoveryState {
     pub(super) fn new(
         local: LocalRecordState,
         config: ZakuraDiscoveryConfig,
-        disclosure_key: RandomState,
+        disclosure_key: DisclosureKey,
     ) -> Self {
         Self {
             book: ZakuraDiscoveryBook::with_disclosure_key(

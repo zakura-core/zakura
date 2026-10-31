@@ -83,11 +83,7 @@ impl Subsystem for WaitComplete {
 
 /// A signed record for `secret`, valid for ten minutes of the run's UTC, which
 /// is the clock discovery validates it against.
-fn record(secret: &NodeSecretKey, handshake: &ZakuraHandshakeConfig) -> ZakuraNodeRecord {
-    let now = utc_now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_secs();
+fn record(secret: &NodeSecretKey, handshake: &ZakuraHandshakeConfig, now: u64) -> ZakuraNodeRecord {
     let body = ZakuraNodeRecordBody {
         node_id: secret.public(),
         direct_addrs: vec![SocketAddr::new(
@@ -100,7 +96,7 @@ fn record(secret: &NodeSecretKey, handshake: &ZakuraHandshakeConfig) -> ZakuraNo
         network_id: handshake.network_id,
         chain_id: handshake.chain_id,
         sequence: 1,
-        expires_at_unix_secs: now + 600,
+        expires_at_unix_secs: now.saturating_add(600),
         extensions: Vec::new(),
     };
     ZakuraNodeRecord::sign(body, secret).expect("a fixture record signs")
@@ -182,9 +178,13 @@ pub fn spawn(sim: &mut Sim) -> Spawned {
             max_records_per_response: 1,
             expected_disconnect_after_exchange: true,
         };
+        let now = utc_now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the run clock is after the epoch")
+            .as_secs();
         let answers = [
             DiscoveryMessage::Hello {
-                record: record(&peer_secret, &handshake),
+                record: record(&peer_secret, &handshake, now),
             },
             DiscoveryMessage::Peers {
                 records: Vec::new(),

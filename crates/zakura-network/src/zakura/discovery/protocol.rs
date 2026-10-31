@@ -18,10 +18,7 @@ use zakura_chain::{
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 use zakura_rt::{
-    collections::{
-        hash_map::{self, RandomState},
-        HashMap, HashSet,
-    },
+    collections::{hash_map, HashMap, HashSet},
     sync::{watch, AsyncMutex},
     time::utc_now,
 };
@@ -1081,6 +1078,48 @@ fn verify_relayed(
     Ok((authentic, dropped))
 }
 
+/// The secret key for a requester's disclosure window.
+/// The runtime supplies random bytes; replay supplies the recorded bytes.
+#[derive(Clone)]
+pub(super) struct DisclosureKey([u8; 32]);
+
+impl DisclosureKey {
+    pub(super) fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn random() -> Self {
+        use rand_10::Rng;
+
+        let mut bytes = [0; 32];
+        zakura_rt::rand::rng().fill_bytes(&mut bytes);
+        Self::new(bytes)
+    }
+
+    fn hash(&self, requester: NodeId, epoch: u64) -> u64 {
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(8)
+            .key(&self.0)
+            .personal(b"ZkDiscWindowV1__")
+            .to_state();
+        hasher.update(requester.as_bytes());
+        hasher.update(&epoch.to_le_bytes());
+        u64::from_le_bytes(
+            hasher
+                .finalize()
+                .as_bytes()
+                .try_into()
+                .expect("the configured hash has eight bytes"),
+        )
+    }
+}
+
+impl fmt::Debug for DisclosureKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DisclosureKey").finish_non_exhaustive()
+    }
+}
+
 /// In-memory storage for signed Zakura discovery records.
 #[derive(Clone, Debug)]
 pub struct ZakuraDiscoveryBook {
@@ -1088,12 +1127,8 @@ pub struct ZakuraDiscoveryBook {
     static_candidates: HashMap<NodeId, ZakuraStaticDiscoveryCandidate>,
     limits: ZakuraDiscoveryBookLimits,
     local_node_id: Option<NodeId>,
-    /// Process-local SipHash key that places each requester's sample window.
-    ///
-    /// Never leaves this process; a remote peer must not be able to predict the window
-    /// another requester receives. `RandomState` is used for its randomly generated
-    /// 128-bit key, not for hashing any collection.
-    disclosure_key: RandomState,
+    /// Process-local secret that places each requester's sample window.
+    disclosure_key: DisclosureKey,
     /// The shuffled sample candidates of the current disclosure epoch.
     sample_snapshot: Option<SampleSnapshot>,
     /// Changes that can add sample candidates: a new or newly confirmed
@@ -1341,7 +1376,7 @@ impl ZakuraDiscoveryHandle {
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
-        let state = DiscoveryState::new(local, config, RandomState::new());
+        let state = DiscoveryState::new(local, config, DisclosureKey::random());
         let verification_context = state.validation_context(now_unix_secs);
         Ok(Self {
             inner: Arc::new(AsyncMutex::new(state)),
@@ -1909,12 +1944,12 @@ impl Default for ZakuraDiscoveryBook {
 impl ZakuraDiscoveryBook {
     /// Creates an empty discovery book with `limits` and a fresh random disclosure key.
     pub fn new(limits: ZakuraDiscoveryBookLimits) -> Self {
-        Self::with_disclosure_key(limits, None, RandomState::new())
+        Self::with_disclosure_key(limits, None, DisclosureKey::random())
     }
 
     /// Creates an empty discovery book that rejects the local node's record.
     pub fn with_local_node_id(limits: ZakuraDiscoveryBookLimits, local_node_id: NodeId) -> Self {
-        Self::with_disclosure_key(limits, Some(local_node_id), RandomState::new())
+        Self::with_disclosure_key(limits, Some(local_node_id), DisclosureKey::random())
     }
 
     /// Creates an empty discovery book that places sample windows with `disclosure_key`.
@@ -1923,7 +1958,7 @@ impl ZakuraDiscoveryBook {
     pub(super) fn with_disclosure_key(
         limits: ZakuraDiscoveryBookLimits,
         local_node_id: Option<NodeId>,
-        disclosure_key: RandomState,
+        disclosure_key: DisclosureKey,
     ) -> Self {
         Self {
             entries: HashMap::new(),
@@ -2209,23 +2244,16 @@ impl ZakuraDiscoveryBook {
             })
             .map(|(node_id, _)| *node_id)
             .collect();
+        // Hash-table iteration must not choose how the supplied RNG permutes the ids.
+        node_ids.sort_unstable_by_key(node_id_sort_key);
         node_ids.shuffle(rng);
         node_ids
     }
 
-    /// Keys a requester's sample window for one epoch.
-    ///
-    /// The offset only has to be unpredictable to remote peers. `disclosure_key` supplies
-    /// SipHash-1-3 with a random 128-bit key, so the secret keys the hash rather than
-    /// sitting in the hashed message; a requester that collects its own windows across many
-    /// epochs still cannot solve for the key and predict another requester's window.
+    /// Keys a requester's sample window with domain-separated BLAKE2b.
+    /// The explicit key and little-endian epoch make identical inputs replayable.
     fn disclosure_hash(&self, requester: NodeId, epoch: u64) -> u64 {
-        use std::hash::{BuildHasher, Hasher};
-
-        let mut hasher = self.disclosure_key.build_hasher();
-        hasher.write(requester.as_bytes());
-        hasher.write_u64(epoch);
-        hasher.finish()
+        self.disclosure_key.hash(requester, epoch)
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
@@ -3602,6 +3630,26 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
     const CHAIN_ID: [u8; 32] = [7; 32];
 
+    #[test]
+    fn disclosure_key_uses_stable_keyed_hash_vectors() {
+        let requester = NodeSecretKey::from_bytes(&[0; 32]).public();
+        // Python hashlib.blake2b independently generated these eight-byte vectors.
+        for (key, epoch, expected) in [
+            (7, 123, 6_598_621_294_292_466_246),
+            (8, 123, 8_505_510_220_519_877_603),
+            (7, 124, 9_050_357_187_271_330_853),
+        ] {
+            assert_eq!(
+                DisclosureKey::new([key; 32]).hash(requester, epoch),
+                expected
+            );
+        }
+        assert_eq!(
+            format!("{:?}", DisclosureKey::new([7; 32])),
+            "DisclosureKey { .. }"
+        );
+    }
+
     fn secret_key() -> NodeSecretKey {
         NodeSecretKey::generate()
     }
@@ -3742,7 +3790,7 @@ mod tests {
 
     /// The authenticated requester used by peer-sample tests.
     ///
-    /// Window placement is keyed by a per-book random `RandomState`, so tests assert
+    /// Window placement uses a per-book random disclosure key, so tests assert
     /// the set properties — stability within an epoch, rotation across epochs, and the
     /// disclosure bound — rather than any specific node id ordering.
     fn test_requester() -> NodeId {

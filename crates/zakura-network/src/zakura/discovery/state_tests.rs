@@ -16,7 +16,6 @@ use proptest::prelude::*;
 #[cfg(test)]
 use rand_10::{rngs::StdRng, SeedableRng};
 use zakura_quic::{NodeId, NodeSecretKey};
-use zakura_rt::collections::hash_map::RandomState;
 
 #[cfg(test)]
 use std::collections::HashSet;
@@ -25,7 +24,7 @@ use std::collections::HashSet;
 use super::protocol::RecordVerdict;
 
 use super::protocol::{
-    DiscoveryBookError, DiscoveryRecordError, DiscoveryRecordValidationContext,
+    DisclosureKey, DiscoveryBookError, DiscoveryRecordError, DiscoveryRecordValidationContext,
     DiscoveryServiceSummary, ImportOutcome, ServiceSummaryEnvelope, Services, ZakuraDiscoveryBook,
     ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraNodeRecord,
     ZakuraNodeRecordBody, ZakuraServiceId,
@@ -48,6 +47,79 @@ const BOOK_MAX_RECORDS: usize = 4;
 const BOOK_MAX_PER_RELAY: usize = 2;
 const SAMPLE_WINDOW: usize = 3;
 const HIGH_FAILURES: u32 = 3;
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "fresh-process checks compare the signed sample history"
+)]
+fn controlled_disclosure_replays_signed_samples_across_insertion_orders() {
+    fn history(reverse: bool) -> Vec<Vec<Vec<u8>>> {
+        let mut book = ZakuraDiscoveryBook::with_disclosure_key(
+            ZakuraDiscoveryBookLimits {
+                max_records: 16,
+                max_imported_records_per_response: SAMPLE_WINDOW,
+                ..ZakuraDiscoveryBookLimits::default()
+            },
+            None,
+            DisclosureKey::new([7; 32]),
+        );
+        let mut records: Vec<_> = (0..12)
+            .map(|index| {
+                record(
+                    &secret(80 + index),
+                    10 + index,
+                    1,
+                    START + 4 * DISCLOSURE_EPOCH,
+                )
+            })
+            .collect();
+        if reverse {
+            records.reverse();
+        }
+        for record in records {
+            let source = record.body.node_id;
+            book.import_record(record, Some(source), START, &context(START))
+                .unwrap();
+        }
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut history = Vec::new();
+        for epoch in 0..3 {
+            for requester in 0..RELAYS {
+                let records = book.sample_peers_with_rng(
+                    SAMPLE_WINDOW,
+                    &[],
+                    &[],
+                    START + epoch * DISCLOSURE_EPOCH,
+                    relay(requester),
+                    &mut rng,
+                );
+                assert_eq!(records.len(), SAMPLE_WINDOW);
+                history.push(
+                    records
+                        .into_iter()
+                        .map(|record| {
+                            let mut bytes = record.body.encode_for_signature().unwrap();
+                            bytes.extend_from_slice(&record.signature.to_bytes());
+                            bytes
+                        })
+                        .collect(),
+                );
+            }
+        }
+        history
+    }
+    let expected = history(false);
+    assert_eq!(
+        expected,
+        history(true),
+        "hash-table order must not change disclosure replay"
+    );
+    println!(
+        "signed_disclosure_history={}",
+        serde_json::to_string(&expected).unwrap()
+    );
+}
 
 const AUTHORS: usize = 6;
 const RELAYS: usize = 3;
@@ -405,7 +477,7 @@ pub struct DiscoveryBookReplaySummary {
 }
 fn run_book(
     ops: impl IntoIterator<Item = BookOp>,
-    #[allow(unused_variables)] seed: u64,
+    seed: u64,
     mut after_step: impl FnMut(&mut ZakuraDiscoveryBook, u64),
 ) -> DiscoveryBookReplaySummary {
     let mut summary = DiscoveryBookReplaySummary::default();
@@ -416,7 +488,12 @@ fn run_book(
         max_imported_records_per_response: SAMPLE_WINDOW,
         ..ZakuraDiscoveryBookLimits::default()
     };
-    let mut book = ZakuraDiscoveryBook::with_local_node_id(limits, local);
+    let mut key = [0; 32];
+    for part in key.chunks_exact_mut(8) {
+        part.copy_from_slice(&seed.to_le_bytes());
+    }
+    let mut book =
+        ZakuraDiscoveryBook::with_disclosure_key(limits, Some(local), DisclosureKey::new(key));
     let mut model = BookModel::default();
     #[cfg(test)]
     let mut rng = StdRng::seed_from_u64(seed);
@@ -579,7 +656,7 @@ fn discovery_state() -> DiscoveryState {
         peer_limits: peer_limits(),
         ..ZakuraDiscoveryConfig::default()
     };
-    DiscoveryState::new(local, config, RandomState::new())
+    DiscoveryState::new(local, config, DisclosureKey::new([0; 32]))
 }
 
 /// A peer's own `Services`, declared to expire at `expires`.

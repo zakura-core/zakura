@@ -21,6 +21,7 @@ on:
       - Legacy Pages redirect
       - Lint
       - P2P fuzzing
+      - Simulator fuzzing
       - PR node reaper
       - RPC fuzzing
       - Semver checks

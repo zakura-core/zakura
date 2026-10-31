@@ -40,7 +40,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    build::{build_fuzzer, target_harness, FUZZ_PACKAGE},
+    build::{build_fuzzer, target_harness, BuildIdentity, FUZZ_PACKAGE},
     run::run_logged,
     store::{record_bytes, write_once, CampaignError},
 };
@@ -189,6 +189,10 @@ pub struct TargetReadiness {
     pub applied: Vec<String>,
     /// The harness's own properties that applied in no seed's run.
     pub unapplied: Vec<String>,
+    /// The built target's identity, with its commit and whether the
+    /// checkout was dirty, so a copy of the report names what it checked.
+    /// `None` if the check stopped before the build.
+    pub build: Option<BuildIdentity>,
     /// The runs the target's stats file counted, if it was read.
     pub fuzzer_runs: Option<u64>,
     /// The retained production bypasses on the harness. Empty if none.
@@ -528,6 +532,7 @@ fn check_target(
         quarantined: Vec::new(),
         applied: Vec::new(),
         unapplied: Vec::new(),
+        build: None,
         fuzzer_runs: None,
         bypasses: Vec::new(),
     };
@@ -593,10 +598,11 @@ fn check_target(
         &options.sanitizer,
         &options.target_dir,
     ) {
-        Ok((bytes, _)) => {
+        Ok((bytes, identity)) => {
             fs::write(&fuzzer, bytes)
                 .and_then(|()| fs::set_permissions(&fuzzer, fs::Permissions::from_mode(0o755)))
                 .map_err(CampaignError::io(format!("writing {}", fuzzer.display())))?;
+            row.build = Some(identity);
         }
         Err(error) => return Ok(row.with(TargetStatus::BuildFailed, error.to_string())),
     }

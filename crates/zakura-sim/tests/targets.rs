@@ -418,6 +418,8 @@ fn quarantined_seeds_stay_in_the_report() {
     };
     assert_eq!(row.status, TargetStatus::NoSeeds, "{row:?}");
     assert_eq!(row.quarantined, [fixtures.join("stale.bin")]);
+    // The check stopped before the build, so the row names no build.
+    assert_eq!(row.build, None);
     assert!(row
         .lines()
         .iter()

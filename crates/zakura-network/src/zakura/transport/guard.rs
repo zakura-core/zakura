@@ -47,6 +47,48 @@ struct ByteBudgetInner {
     /// permit), so a waiter must register `subscribe_capacity().notified()`
     /// before re-reading the budget.
     capacity: Notify,
+    /// Receives each counter change, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: Option<BudgetObserver>,
+}
+
+/// One change of a [`ByteBudget`]'s counter, as a test or simulator observer
+/// sees it.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BudgetChange {
+    /// Which operation changed the counter.
+    pub kind: BudgetChangeKind,
+    /// The counter before the change.
+    pub before: u64,
+    /// The counter after the change.
+    pub after: u64,
+    /// The budget's maximum, which a reservation may not pass.
+    pub limit: u64,
+}
+
+/// Which [`ByteBudget`] operation changed its counter.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BudgetChangeKind {
+    /// A reservation within the budget's maximum.
+    Reserved,
+    /// A charge that skipped the admission gate: a floor overdraft.
+    Charged,
+    /// A release.
+    Released,
+}
+
+/// The callback a [`ByteBudget`] reports each counter change to.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone)]
+pub(crate) struct BudgetObserver(pub(crate) Arc<dyn Fn(BudgetChange) + Send + Sync>);
+
+#[cfg(any(test, zakura_sim))]
+impl std::fmt::Debug for BudgetObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BudgetObserver")
+    }
 }
 
 impl ByteBudget {
@@ -56,7 +98,31 @@ impl ByteBudget {
                 max_bytes,
                 reserved_bytes: AtomicU64::new(0),
                 capacity: Notify::new(),
+                #[cfg(any(test, zakura_sim))]
+                observer: None,
             }),
+        }
+    }
+
+    /// This new budget, reporting each counter change to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn with_observer(mut self, observer: Option<BudgetObserver>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("a budget gets its observer before anything clones it")
+            .observer = observer;
+        self
+    }
+
+    /// Reports one counter change to the observer, if one is installed.
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, kind: BudgetChangeKind, before: u64, after: u64) {
+        if let Some(observer) = &self.inner.observer {
+            (observer.0)(BudgetChange {
+                kind,
+                before,
+                after,
+                limit: self.inner.max_bytes,
+            });
         }
     }
 
@@ -94,7 +160,12 @@ impl ByteBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe(BudgetChangeKind::Reserved, reserved, next);
+                    return true;
+                }
                 Err(observed) => reserved = observed,
             }
         }
@@ -102,6 +173,7 @@ impl ByteBudget {
 
     /// Release `bytes` back to the shared counter (saturating at zero) and wake
     /// any consumer blocked on capacity.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) fn release(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
@@ -115,10 +187,50 @@ impl ByteBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    break;
+                }
                 Err(observed) => reserved = observed,
             }
         }
+        self.inner.capacity.notify_waiters();
+    }
+
+    /// Release `bytes` back to the shared counter (saturating at zero) and wake
+    /// any consumer blocked on capacity. Observer builds share
+    /// [`Self::release_then`]'s loop, so the two can't drift.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.release_then(bytes, || {});
+    }
+
+    /// [`Self::release`] that calls `released` after the counter changes and
+    /// before waking waiters, so an observer sees the release before any task
+    /// it wakes runs. Does nothing for 0 bytes.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn release_then(&mut self, bytes: u64, released: impl FnOnce()) {
+        if bytes == 0 {
+            return;
+        }
+        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
+        loop {
+            let next = reserved.saturating_sub(bytes);
+            match self.inner.reserved_bytes.compare_exchange_weak(
+                reserved,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    self.observe(BudgetChangeKind::Released, reserved, next);
+                    break;
+                }
+                Err(observed) => reserved = observed,
+            }
+        }
+        released();
         self.inner.capacity.notify_waiters();
     }
 
@@ -140,7 +252,12 @@ impl ByteBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe(BudgetChangeKind::Charged, reserved, next);
+                    break;
+                }
                 Err(observed) => reserved = observed,
             }
         }
@@ -165,6 +282,22 @@ impl ByteBudget {
     /// be missed between the check and the wait.
     pub(crate) fn subscribe_capacity(&self) -> &Notify {
         &self.inner.capacity
+    }
+}
+
+/// Apply one change of the shared reservation counter, from `before` to
+/// `after`, to its gauge.
+///
+/// Gauge increments commute, so concurrent reservers and releasers leave the
+/// gauge equal to the counter. A saturated release passes the counter's actual
+/// change, so it cannot drive the gauge below zero.
+fn publish_reserved_change(before: u64, after: u64) {
+    let gauge = metrics::gauge!("sync.block.budget.reserved_bytes");
+    // These lossy casts are metrics-only; the counter keeps the integer value.
+    if after >= before {
+        gauge.increment((after - before) as f64);
+    } else {
+        gauge.decrement((before - after) as f64);
     }
 }
 

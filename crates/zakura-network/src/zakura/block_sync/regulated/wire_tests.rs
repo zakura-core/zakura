@@ -1,13 +1,199 @@
 //! Exercise both the bounded envelope and the full production block decoder.
+//!
+//! The generated message and frame suites run on the stream-6 envelope.
 
 use proptest::prelude::*;
 use zakura_chain::block;
 
 use super::wire::{decode_control, Message, Range, RangeEnding};
 use crate::zakura::{
-    block_sync::{BlockSyncMessage, BlockSyncStatus},
-    wire_codec::{decode_frame, encode_frame, message_suite::decode_checked},
+    block_sync::{
+        config::MAX_BS_INFLIGHT_REQUESTS, service::block_sync_streams, BlockSyncMessage,
+        BlockSyncStatus, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, MSG_BS_BLOCK,
+        MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
+    },
+    check_frame_filter,
+    wire_codec::{
+        decode_frame, encode_frame,
+        message_suite::{
+            check_layout_carries_family, decode_checked, message_suite, MessageSample, Violation,
+        },
+        sample::WireSample,
+        HeightLe, WireError,
+    },
+    Frame,
 };
+
+/// A status with every field at its lowest or highest valid value.
+fn status(height: block::Height, hash_byte: u8, limit: impl Fn(u32) -> u32) -> BlockSyncStatus {
+    BlockSyncStatus {
+        servable_low: height,
+        servable_high: height,
+        tip_hash: block::Hash([hash_byte; 32]),
+        max_blocks_per_response: limit(MAX_BS_BLOCKS_PER_REQUEST),
+        max_inflight_requests: limit(MAX_BS_INFLIGHT_REQUESTS),
+        max_response_bytes: limit(MAX_BS_RESPONSE_BYTES),
+    }
+}
+
+/// A frame of `message_type` whose payload may break a domain rule.
+fn frame(message_type: u8, payload: Vec<u8>) -> Frame {
+    Frame {
+        message_type: message_type.into(),
+        flags: 0,
+        payload,
+    }
+}
+
+impl MessageSample for Message {
+    fn samples() -> Vec<Self> {
+        let max = block::Height::MAX;
+        let last_start = block::Height(max.0 - (MAX_BS_BLOCKS_PER_REQUEST - 1));
+        let largest_block = usize::try_from(block::MAX_BLOCK_BYTES).unwrap();
+        vec![
+            Self::Status(status(block::Height(0), 0, |_| 1)),
+            Self::Status(status(max, u8::MAX, |max| max)),
+            Self::GetBlocks(Range::new(block::Height(0), 1).unwrap()),
+            Self::GetBlocks(Range::new(last_start, MAX_BS_BLOCKS_PER_REQUEST).unwrap()),
+            Self::Block(vec![0]),
+            Self::Block(vec![u8::MAX; largest_block]),
+            Self::End(RangeEnding::done(block::Height(0), 1)),
+            Self::End(RangeEnding::done(max, MAX_BS_BLOCKS_PER_REQUEST)),
+            Self::End(RangeEnding::unavailable(block::Height(0), 1)),
+            Self::End(RangeEnding::unavailable(max, MAX_BS_BLOCKS_PER_REQUEST)),
+        ]
+    }
+
+    fn arbitrary_valid() -> BoxedStrategy<Self> {
+        let height = HeightLe::arbitrary;
+        let count = 1..=MAX_BS_BLOCKS_PER_REQUEST;
+        prop_oneof![
+            (
+                height(),
+                height(),
+                any::<[u8; 32]>(),
+                count.clone(),
+                1..=MAX_BS_INFLIGHT_REQUESTS,
+                1..=MAX_BS_RESPONSE_BYTES,
+            )
+                .prop_map(|(a, b, hash, blocks, inflight, bytes)| {
+                    Self::Status(BlockSyncStatus {
+                        servable_low: a.min(b),
+                        servable_high: a.max(b),
+                        tip_hash: block::Hash(hash),
+                        max_blocks_per_response: blocks,
+                        max_inflight_requests: inflight,
+                        max_response_bytes: bytes,
+                    })
+                }),
+            (height(), count.clone()).prop_filter_map(
+                "the range ends above the maximum height",
+                |(start, count)| Range::new(start, count).ok().map(Self::GetBlocks)
+            ),
+            proptest::collection::vec(any::<u8>(), 1..256).prop_map(Self::Block),
+            (height(), count.clone())
+                .prop_map(|(start, count)| Self::End(RangeEnding::done(start, count))),
+            (height(), count)
+                .prop_map(|(start, count)| Self::End(RangeEnding::unavailable(start, count))),
+        ]
+        .boxed()
+    }
+
+    fn violations() -> Vec<Violation<Self>> {
+        let max_height = block::Height::MAX.0;
+        let too_many = MAX_BS_BLOCKS_PER_REQUEST + 1;
+        vec![
+            Violation {
+                name: "status range runs backwards",
+                frame: frame(MSG_BS_STATUS, status_payload(2, 1, 1, 1, 1)),
+                rejected_by: |error| *error == WireError::OutOfRange("block-sync status"),
+            },
+            Violation {
+                name: "status serves no blocks per range",
+                frame: frame(MSG_BS_STATUS, status_payload(0, 0, 0, 1, 1)),
+                rejected_by: |error| *error == WireError::OutOfRange("block count"),
+            },
+            Violation {
+                name: "status allows no request in flight",
+                frame: frame(MSG_BS_STATUS, status_payload(0, 0, 1, 0, 1)),
+                rejected_by: |error| *error == WireError::OutOfRange("block-sync status"),
+            },
+            Violation {
+                name: "status targets no response bytes",
+                frame: frame(MSG_BS_STATUS, status_payload(0, 0, 1, 1, 0)),
+                rejected_by: |error| *error == WireError::OutOfRange("block-sync status"),
+            },
+            Violation {
+                name: "request for no blocks",
+                frame: frame(MSG_BS_GET_BLOCKS, range_payload(MSG_BS_GET_BLOCKS, 0, 0)),
+                rejected_by: |error| *error == WireError::OutOfRange("GetBlocks range"),
+            },
+            Violation {
+                name: "request for too many blocks",
+                frame: frame(
+                    MSG_BS_GET_BLOCKS,
+                    range_payload(MSG_BS_GET_BLOCKS, 0, too_many),
+                ),
+                rejected_by: |error| *error == WireError::OutOfRange("GetBlocks range"),
+            },
+            Violation {
+                name: "request ends above the maximum height",
+                frame: frame(
+                    MSG_BS_GET_BLOCKS,
+                    range_payload(MSG_BS_GET_BLOCKS, max_height, 2),
+                ),
+                rejected_by: |error| *error == WireError::OutOfRange("GetBlocks range"),
+            },
+            Violation {
+                name: "done after no blocks",
+                frame: frame(MSG_BS_BLOCKS_DONE, range_payload(MSG_BS_BLOCKS_DONE, 0, 0)),
+                rejected_by: |error| *error == WireError::OutOfRange("block count"),
+            },
+            Violation {
+                name: "unavailable range of too many blocks",
+                frame: frame(
+                    MSG_BS_RANGE_UNAVAILABLE,
+                    range_payload(MSG_BS_RANGE_UNAVAILABLE, 0, too_many),
+                ),
+                rejected_by: |error| *error == WireError::OutOfRange("block count"),
+            },
+            Violation {
+                name: "payload discriminator names another ending",
+                frame: frame(
+                    MSG_BS_BLOCKS_DONE,
+                    range_payload(MSG_BS_RANGE_UNAVAILABLE, 0, 1),
+                ),
+                rejected_by: |error| {
+                    *error == WireError::OutOfRange("frame and payload discriminator agreement")
+                },
+            },
+            Violation {
+                name: "block payload names a request",
+                frame: frame(MSG_BS_BLOCK, vec![MSG_BS_GET_BLOCKS, 0]),
+                rejected_by: |error| {
+                    *error == WireError::OutOfRange("frame and payload discriminator agreement")
+                },
+            },
+        ]
+    }
+
+    fn opaque_types() -> &'static [u16] {
+        // Widening a u8 discriminator to u16 is lossless.
+        &[MSG_BS_BLOCK as u16]
+    }
+}
+
+message_suite!(stream_six_family, Message);
+
+#[test]
+fn the_stream_carries_exactly_the_family_rows() {
+    check_layout_carries_family::<Message>(block_sync_streams());
+}
+
+#[test]
+fn readers_follow_the_stream() {
+    check_frame_filter(block_sync_streams());
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]

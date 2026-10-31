@@ -332,9 +332,7 @@ const FOREIGN: Stream = Stream {
 const SETUP_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn layout() -> SessionLayout {
-    SessionLayout {
-        streams: Arc::from([MEMBER_A, MEMBER_B, MEMBER_C]),
-    }
+    SessionLayout::from_validated(Arc::from([MEMBER_A, MEMBER_B, MEMBER_C]))
 }
 
 /// A member arriving just before the deadline keeps the first member's

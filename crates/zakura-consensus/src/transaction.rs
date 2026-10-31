@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -74,14 +73,6 @@ const MAX_CONCURRENT_UTXO_LOOKUPS: usize = 64;
 /// This is how long Zebra will wait for an output to be added to the mempool before verification
 /// of the transaction that spends it will fail.
 const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long to wait after responding to a mempool request with a transaction that creates new
-/// transparent outputs before polling the mempool service so that it will try adding the verified
-/// transaction and responding to any potential `AwaitOutput` requests.
-///
-/// This should be long enough for the mempool service's `Downloads` to finish processing the
-/// response from the transaction verifier.
-const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
 /// Number of blocks after NU6.3 activation during which a NU6.2 branch ID
 /// does not count as peer misbehavior.
@@ -653,7 +644,7 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
-                    joinsplit_data,
+                    joinsplit_data.as_deref(),
                     tx_id,
                 )?,
                 Transaction::V5 {
@@ -736,20 +727,6 @@ where
                         cached_ffi_transaction.p2sh_sigops(),
                         spent_outputs.into(),
                     )?;
-
-                    if let Some(mut mempool) = mempool {
-                        tokio::spawn(async move {
-                            // Best-effort poll of the mempool to provide a timely response to
-                            // `sendrawtransaction` RPC calls or `AwaitOutput` mempool calls.
-                            tokio::time::sleep(POLL_MEMPOOL_DELAY).await;
-                            let _ = mempool
-                                .ready()
-                                .await
-                                .expect("mempool poll_ready() method should not return an error")
-                                .call(mempool::Request::CheckForVerifiedTransactions)
-                                .await;
-                        });
-                    }
 
                     Response::Mempool { transaction, spent_mempool_outpoints }
                 },
@@ -1025,7 +1002,7 @@ where
         network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
-        joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let tx = request.transaction();
@@ -1309,7 +1286,7 @@ where
 
     /// Verifies a transaction's Sprout shielded join split data.
     fn verify_sprout_shielded_data(
-        joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         shielded_sighash: &SigHash,
     ) -> Result<AsyncChecks, TransactionError> {
         let mut checks = AsyncChecks::new();

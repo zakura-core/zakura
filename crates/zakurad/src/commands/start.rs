@@ -682,6 +682,7 @@ impl StartCmd {
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
         );
+        let mempool_verification_finished = mempool.verification_finished();
         let mempool = spawn_buffer(
             BoxService::new(mempool),
             mempool::downloads::MAX_INBOUND_CONCURRENCY,
@@ -794,8 +795,9 @@ impl StartCmd {
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors
-        let indexer_rpc_task_handle = {
-            if let Some(indexer_listen_addr) = config.rpc.indexer_listen_addr {
+        let indexer_rpc_task_handle = match config.rpc.indexer_listen_addr {
+            #[cfg(feature = "indexer-rpc")]
+            Some(indexer_listen_addr) => {
                 info!("spawning indexer RPC server");
                 let (indexer_rpc_task_handle, _listen_addr) =
                     zakura_rpc::node::start_indexer_server(
@@ -809,9 +811,20 @@ impl StartCmd {
                     .map_err(|err| eyre!(err))?;
 
                 indexer_rpc_task_handle
-            } else {
+            }
+            #[cfg(not(feature = "indexer-rpc"))]
+            Some(_) => {
+                return Err(eyre!(
+                    "rpc.indexer_listen_addr is configured, but this zakurad was built \
+                     without the `indexer-rpc` feature"
+                ));
+            }
+            None => {
+                #[cfg(feature = "indexer-rpc")]
                 warn!("configure an indexer_listen_addr to start the indexer RPC server");
-                spawn_erased(std::future::pending().in_current_span())
+                spawn_erased(
+                    std::future::pending::<Result<(), tower::BoxError>>().in_current_span(),
+                )
             }
         };
         node_tasks.track(&indexer_rpc_task_handle);
@@ -830,7 +843,8 @@ impl StartCmd {
         node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+        let mempool_queue_checker_task_handle =
+            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
         node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");

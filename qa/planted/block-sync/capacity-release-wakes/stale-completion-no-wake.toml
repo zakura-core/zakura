@@ -1,0 +1,10 @@
+# Restores #1523: a stale completion with no `applying` entry frees its slot
+# but wakes waiting work only when it verified with a semantic owner. The
+# input handles the detached commit's tip first, so the frontier releases
+# height 1 before its stale reply frees room, and the waiting fork body
+# stays unsubmitted.
+input = "crates/zakura-sim/tests/fixtures/block-sync-capacity-frontier-first.bin"
+# Besides sequencer_task.rs, which the patch changes, the rest of block sync
+# decides whether the tip or the reply arrives first. A change there can
+# move the input off that order.
+checks = ["crates/zakura-network/src/zakura/block_sync"]

@@ -1,0 +1,26 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+index d51e715c0..67972a7dd 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+@@ -76,16 +76,11 @@ pub(super) fn charge_decoded_handoff(
+     view: &watch::Receiver<SequencerView>,
+     decoded_bytes: u64,
+ ) -> bool {
+-    let queued = input_decoded_attributed_memory_bytes
+-        .fetch_add(decoded_bytes, Ordering::AcqRel)
+-        .saturating_add(decoded_bytes);
+-    if queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+-        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+-    {
+-        return true;
+-    }
+-    release_atomic_bytes(input_decoded_attributed_memory_bytes, decoded_bytes);
+-    false
++    // Keep every decoded block, whatever the budget holds, as the routine
++    // did before #1522's fix.
++    let _ = view;
++    add_atomic_bytes(input_decoded_attributed_memory_bytes, decoded_bytes);
++    true
+ }
+ 
+ impl SequencedBody {

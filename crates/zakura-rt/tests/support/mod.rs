@@ -34,6 +34,8 @@ pub struct Report {
     pub timers: usize,
     /// Each random draw's kind and bound, in order.
     pub draws: Vec<(DrawKind, u64)>,
+    /// Each task's spawn label, in task id order. The root task is `root`.
+    pub labels: Vec<&'static str>,
 }
 
 impl Report {
@@ -76,6 +78,7 @@ where
             now: s.now,
             timers: s.timers.len(),
             draws: mem::take(&mut s.draws),
+            labels: s.tasks.iter().map(|task| task.label).collect(),
         };
         (report, s.tasks[index(root)].exit.take())
     });
@@ -114,6 +117,7 @@ struct State {
 
 #[derive(Default)]
 struct Task {
+    label: &'static str,
     future: Option<BoxTask>,
     exit: Option<TaskExit>,
     finished: bool,
@@ -253,10 +257,11 @@ impl Executor for TestExecutor {
 
     fn unpark_all(&self, _wait: ObjectId) {}
 
-    fn spawn(&self, _label: &'static str, task: BoxTask) -> TaskId {
+    fn spawn(&self, label: &'static str, task: BoxTask) -> TaskId {
         with(|s| {
             let raw = u64::try_from(s.tasks.len()).expect("task count fits in u64");
             s.tasks.push(Task {
+                label,
                 future: Some(task),
                 ..Task::default()
             });

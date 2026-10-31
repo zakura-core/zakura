@@ -128,12 +128,12 @@ impl PendingState {
         let kind = layout.primary().kind;
         // Remove first so every invalid continuation releases the existing offer.
         let pending = self.sessions.remove(&kind);
-        if (layout.is_multi_stream() && id == 0) || !layout.streams.contains(&member) {
+        if (layout.is_multi_stream() && id == 0) || !layout.streams().contains(&member) {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
         let mut pending = pending.unwrap_or_else(|| PendingMetadata {
             id,
-            members: Vec::with_capacity(layout.streams.len()),
+            members: Vec::with_capacity(layout.streams().len()),
             deadline: now + setup_timeout,
             retry_delay: setup_timeout,
         });
@@ -147,12 +147,12 @@ impl PendingState {
             || pending
                 .members
                 .iter()
-                .any(|arrived| arrived.kind == member.kind || !layout.streams.contains(arrived))
+                .any(|arrived| arrived.kind == member.kind || !layout.streams().contains(arrived))
         {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
         pending.members.push(member);
-        if pending.members.len() == layout.streams.len() {
+        if pending.members.len() == layout.streams().len() {
             Ok(MemberArrival::Complete)
         } else {
             self.sessions.insert(kind, pending);

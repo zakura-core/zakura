@@ -10,13 +10,15 @@ mod error;
 mod events;
 #[cfg(any(test, feature = "header-fuzz"))]
 mod fuzz;
+#[cfg(any(test, zakura_sim))]
+pub mod observe;
 mod pipe;
 mod reactor;
 mod scheduler;
 mod service;
 #[cfg(test)]
 mod tests;
-pub(crate) mod v9;
+pub mod v9;
 mod wire;
 
 pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};
@@ -37,8 +39,9 @@ pub use scheduler::retry::{
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use service::drive_header_sync_actions;
+pub(crate) use service::HeaderSyncPassthroughService;
+pub use service::HeaderSyncService;
 pub use service::PeerSession;
-pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use v9::replay_header_sync_v9_codec_bytes;
 pub use v9::{Headers, HeadersOutcome, HeadersOutcomeCode, Status};

@@ -33,12 +33,6 @@ SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 # Make the build platform available as a variable
 ARG BUILDPLATFORM
 
-# Install zebra build deps
-RUN apt-get -qq update && \
-    apt-get -qq install -y --no-install-recommends \
-    libclang-dev \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
-
 # Build arguments and variables
 ARG CARGO_INCREMENTAL
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
@@ -130,13 +124,13 @@ CMD [ "cargo", "test" ]
 #
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
-# Always use portable Pasta arithmetic here, including with custom FEATURES.
 # Release archives and both runtime image variants inherit these binaries.
+# RUSTFLAGS sets no CPU target features, so they run on any x86-64 CPU.
 FROM deps AS release
 
 ARG SHORT_SHA
 ARG FEATURES
-ENV FEATURES=${FEATURES},portable
+ENV FEATURES=${FEATURES}
 # Compress debug sections with zlib, roughly 275 MB -> 110 MB on disk.
 # Not zstd: std's backtrace symbolizer only reads zlib, and file:line would be lost.
 ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib"
@@ -161,8 +155,10 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-rt,target=crates/zakura-rt \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
     --mount=type=bind,source=crates/zakura-scheduler,target=crates/zakura-scheduler \
+    --mount=type=bind,source=crates/zakura-sim,target=crates/zakura-sim \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
+    --mount=type=bind,source=crates/zakura-storage,target=crates/zakura-storage \
     --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
     --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \
     --mount=type=bind,source=crates/zakurad,target=crates/zakurad \

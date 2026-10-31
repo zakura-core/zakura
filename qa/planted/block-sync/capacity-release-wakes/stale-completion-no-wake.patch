@@ -1,0 +1,39 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+index a296c0f15..906e99c46 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+@@ -989,7 +989,7 @@ impl SequencerTask {
+             zakura_header_chain::BodyWorkOwner,
+             zakura_header_chain::StateVersion,
+         )>,
+-        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
++        _committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
+     ) -> (bool, bool) {
+         let result = outcome.result();
+         if matches!(result, BlockApplyResult::Rejected) {
+@@ -1021,24 +1021,7 @@ impl SequencerTask {
+                 outcome.verification(),
+                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
+             );
+-            // A detached submission from an older epoch completes with no
+-            // semantic owner, but its slot still frees room for waiting
+-            // `applying` work. Without this wake that work waits for an
+-            // unrelated event (#1523).
+-            //
+-            // The reactor can queue that completion before the epoch change
+-            // that made it stale. Until this task holds the epoch the reactor
+-            // judged against, the waiting work belongs to an older epoch, and
+-            // the queued epoch change resets it and wakes submission itself.
+-            let holds_committed_epoch =
+-                self.current_scope.map(|scope| scope.body_work_epoch) == committed_epoch;
+-            let room_for_waiting_work = released
+-                && self.sequencer.unsubmitted_applying_count() > 0
+-                && (semantic_completion.is_some() || holds_committed_epoch);
+-            return (
+-                false,
+-                room_for_waiting_work || (released && verified && semantic_completion.is_some()),
+-            );
++            return (false, released && verified && semantic_completion.is_some());
+         };
+         if applying_owner != owner
+             || applying_source != source

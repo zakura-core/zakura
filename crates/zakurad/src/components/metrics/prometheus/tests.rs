@@ -289,3 +289,118 @@ async fn endpoint_serves_the_metrics() {
         "# TYPE endpoint_test counter\nendpoint_test 7\n\n"
     );
 }
+
+#[test]
+fn delayed_writer_preserves_live_windows() {
+    use std::sync::{mpsc, Arc, Mutex};
+
+    let start = Instant::now();
+    let summary = Arc::new(Mutex::new(RollingSummary::new(start)));
+    summary.lock().unwrap().add(1.0, start);
+    let (captured_tx, captured_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+
+    // Model record's timestamp-before-lock boundary without sleeping or depending on
+    // mutex fairness: the older writer is suspended after capturing its timestamp.
+    std::thread::scope(|scope| {
+        let delayed_summary = Arc::clone(&summary);
+        scope.spawn(move || {
+            let now = start + WINDOW_DURATION - Duration::from_millis(1);
+            captured_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            delayed_summary.lock().unwrap().add(2.0, now);
+        });
+        captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        summary.lock().unwrap().add(100.0, start + WINDOW_DURATION);
+        resume_tx.send(()).unwrap();
+    });
+    let mut summary = summary.lock().unwrap();
+    summary.add(100.0, start + WINDOW_DURATION + Duration::from_millis(1));
+    let recent = summary.recent(start + WINDOW_DURATION + Duration::from_millis(2));
+    assert_eq!(recent.quantile(0.0), Some(1.0));
+    assert_eq!(recent.quantile(1.0), Some(100.0));
+    let median = recent.quantile(0.5).unwrap();
+    assert!((median - 2.0).abs() <= 2.0 * RELATIVE_ACCURACY);
+    assert_eq!(summary.count(), 4);
+    assert_eq!(summary.sum(), 203.0);
+
+    // Both samples from window zero expire together at the original boundary.
+    assert_eq!(
+        summary.recent(start + WINDOW_DURATION * 3).quantile(0.0),
+        Some(100.0)
+    );
+}
+
+#[test]
+fn delayed_windows_do_not_displace_newer_windows() {
+    let start = Instant::now();
+    let mut summary = RollingSummary::new(start);
+    for (index, value) in [(3, 3.0), (5, 5.0), (4, 4.0), (0, 100.0), (3, 30.0)] {
+        summary.add(value, start + WINDOW_DURATION * index);
+    }
+    let recent = summary.recent(start + WINDOW_DURATION * 5);
+    assert_eq!(recent.quantile(0.0), Some(3.0));
+    assert_eq!(recent.quantile(1.0), Some(30.0));
+    assert_eq!(summary.count(), 5);
+    assert_eq!(summary.sum(), 142.0);
+    assert_eq!(
+        summary.recent(start + WINDOW_DURATION * 6).quantile(0.0),
+        Some(4.0)
+    );
+    assert_eq!(
+        summary.recent(start + WINDOW_DURATION * 8).quantile(0.5),
+        None
+    );
+}
+
+#[tokio::test]
+async fn endpoint_preserves_health_and_other_paths() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let recorder = PrometheusRecorder::default();
+    metrics::with_local_recorder(&recorder, || {
+        metrics::counter!("endpoint.test").increment(7);
+    });
+    let addr = endpoint::spawn("127.0.0.1:0".parse().unwrap(), recorder).unwrap();
+    for (method, path, expected) in [
+        ("GET", "/health", "OK"),
+        ("GET", "/health?probe=1", "OK"),
+        ("POST", "/health", "OK"),
+        (
+            "GET",
+            "/metrics",
+            "# TYPE endpoint_test counter\nendpoint_test 7\n\n",
+        ),
+        (
+            "GET",
+            "/health/",
+            "# TYPE endpoint_test counter\nendpoint_test 7\n\n",
+        ),
+        (
+            "POST",
+            "/other",
+            "# TYPE endpoint_test counter\nendpoint_test 7\n\n",
+        ),
+    ] {
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\n\
+                 Host: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        })
+        .await
+        .expect("the endpoint answers within five seconds");
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{method} {path}: {headers}"
+        );
+        assert!(headers.contains("content-type: text/plain\r\n"));
+        assert_eq!(body, expected, "{method} {path}");
+    }
+}

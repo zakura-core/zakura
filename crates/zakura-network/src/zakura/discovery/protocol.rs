@@ -27,9 +27,11 @@ use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, Sessio
 use super::verified::VerifiedRecord;
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
 use crate::zakura::{
-    canonical_ip, regulation::SlotBudget, BlockSyncStatus, ServiceAdmissionDecision,
-    ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId,
-    ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    canonical_ip,
+    regulation::{SlotBudget, SlotPermit},
+    BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
+    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
+    MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 /// Native discovery stream kind.
@@ -1265,8 +1267,8 @@ pub struct ZakuraDiscoveryHandle {
     /// verification runs outside the lock. Every field except the time is fixed
     /// for the handle's lifetime.
     verification_context: DiscoveryRecordValidationContext,
-    /// Node-wide slots for record signature verification. Each session's
-    /// reader verifies one message at a time, so a peer holds at most one slot.
+    /// Node-wide slots for verification workers and their pending results.
+    /// Each session reader holds at most one slot until it installs or drops its result.
     verify_slots: SlotBudget,
 }
 
@@ -1549,6 +1551,7 @@ impl ZakuraDiscoveryHandle {
             return Ok(outcome);
         }
 
+        let verification_slot;
         let mut authentic = Vec::with_capacity(batch.len());
         let mut unverified = Vec::new();
         {
@@ -1562,7 +1565,7 @@ impl ZakuraDiscoveryHandle {
         }
         if !unverified.is_empty() {
             let unverified_len = unverified.len();
-            let Some(verified) = self
+            let Some((verified, slot)) = self
                 .verify_off_lock(move |context| verify_relayed(unverified, context))
                 .await
             else {
@@ -1570,9 +1573,12 @@ impl ZakuraDiscoveryHandle {
                 outcome.rejected += unverified_len;
                 return Ok(outcome);
             };
+            verification_slot = Some(slot);
             let (fresh, dropped) = verified?;
             outcome.rejected += dropped;
             authentic.extend(fresh);
+        } else {
+            verification_slot = None;
         }
 
         let now = current_unix_secs();
@@ -1580,6 +1586,7 @@ impl ZakuraDiscoveryHandle {
             .lock()
             .await
             .install_relayed(authentic, source, now, &mut outcome);
+        drop(verification_slot);
         Ok(outcome)
     }
 
@@ -1652,14 +1659,14 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let record = self
+        let verified = self
             .verify_connected_peer_record(record, peer_node_id)
             .await?;
         let now = current_unix_secs();
         self.inner
             .lock()
             .await
-            .install_connected_peer_record(record, now)
+            .install_connected_peer_record(verified.0, now)
     }
 
     /// Imports a connected peer's latest self-record, received on `session`, as
@@ -1671,14 +1678,14 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
     ) -> Result<ImportOutcome, SessionRecordError> {
-        let record = self
+        let verified = self
             .verify_connected_peer_record(record, peer_node_id)
             .await?;
         let now = current_unix_secs();
         self.inner
             .lock()
             .await
-            .install_session_record(session, record, now)
+            .install_session_record(session, verified.0, now)
     }
 
     /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
@@ -1686,7 +1693,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
-    ) -> Result<VerifiedRecord, DiscoveryBookError> {
+    ) -> Result<(VerifiedRecord, Option<SlotPermit>), DiscoveryBookError> {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
@@ -1701,23 +1708,24 @@ impl ZakuraDiscoveryHandle {
     async fn verify_unless_stored(
         &self,
         record: ZakuraNodeRecord,
-    ) -> Result<VerifiedRecord, DiscoveryBookError> {
+    ) -> Result<(VerifiedRecord, Option<SlotPermit>), DiscoveryBookError> {
         if let Some(stored) = self.inner.lock().await.stored_evidence(&record) {
-            return Ok(stored);
+            return Ok((stored, None));
         }
-        self.verify_off_lock(move |context| VerifiedRecord::verify(record, context))
+        let (verified, slot) = self
+            .verify_off_lock(move |context| VerifiedRecord::verify(record, context))
             .await
-            .ok_or(DiscoveryBookError::VerificationCancelled)?
-            .map_err(DiscoveryBookError::Record)
+            .ok_or(DiscoveryBookError::VerificationCancelled)?;
+        Ok((verified.map_err(DiscoveryBookError::Record)?, Some(slot)))
     }
 
     /// Runs `verify` in a blocking task under a node-wide verification slot,
-    /// with the validation context for now. Returns `None` if shutdown
-    /// cancelled the task.
+    /// with the validation context for now. The result retains the slot until installation.
+    /// Returns `None` if shutdown cancelled the task.
     async fn verify_off_lock<T: Send + 'static>(
         &self,
         verify: impl FnOnce(&DiscoveryRecordValidationContext) -> T + Send + 'static,
-    ) -> Option<T> {
+    ) -> Option<(T, SlotPermit)> {
         let slot = self.verify_slots.reserve().await;
         let context = DiscoveryRecordValidationContext {
             current_unix_secs: current_unix_secs(),
@@ -1725,8 +1733,8 @@ impl ZakuraDiscoveryHandle {
         };
         crate::zakura::resume_task_panic(
             zakura_rt::task::spawn_blocking_named("discovery_verify", move || {
-                let _slot = slot;
-                verify(&context)
+                // Tuple fields drop in order: destroy the result before releasing capacity.
+                (verify(&context), slot)
             })
             .await,
         )
@@ -7172,6 +7180,91 @@ mod tests {
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.added, 1);
         assert_eq!(outcome.rejected, 1);
+    }
+
+    #[tokio::test]
+    async fn verification_result_retains_capacity_until_its_payload_drops() {
+        let (_connected, connected_rx) = watch::channel(Vec::new());
+        let mut handle = discovery_handle_with_connected(connected_rx);
+        handle.verify_slots = SlotBudget::new(1).unwrap();
+        let result = handle
+            .verify_off_lock(|_| Arc::new(vec![0u8; 1024]))
+            .await
+            .unwrap();
+        let payload = Arc::downgrade(&result.0);
+        assert_eq!(
+            handle.verify_slots.available(),
+            0,
+            "a completed result still owns its slot"
+        );
+        assert!(handle.verify_slots.try_reserve().is_none());
+        drop(result);
+        assert!(payload.upgrade().is_none());
+        assert_eq!(handle.verify_slots.available(), 1);
+
+        let record = runtime_record_with(1, service(1), test_addr(1));
+        let verified = handle
+            .verify_connected_peer_record(record.clone(), record.body.node_id)
+            .await
+            .unwrap();
+        assert!(verified.1.is_some());
+        assert_eq!(
+            handle.verify_slots.available(),
+            0,
+            "the installation handoff retains verification capacity"
+        );
+        drop(verified);
+        assert_eq!(handle.verify_slots.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_verification_caller_keeps_the_running_worker_and_payload_charged() {
+        let (_connected, connected_rx) = watch::channel(Vec::new());
+        let mut handle = discovery_handle_with_connected(connected_rx);
+        handle.verify_slots = SlotBudget::new(1).unwrap();
+        let (started_tx, started_rx) = zakura_rt::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .verify_off_lock(move |_| {
+                        let payload = Arc::new(vec![0u8; 1024]);
+                        started_tx.send(Arc::downgrade(&payload)).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        payload
+                    })
+                    .await
+            }
+        });
+        let payload = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(payload.upgrade().is_some());
+        assert_eq!(
+            handle.verify_slots.available(),
+            0,
+            "caller cancellation cannot settle an executing worker"
+        );
+        assert!(
+            handle.inner.try_lock().is_ok(),
+            "verification never holds the discovery mutex"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.verify_slots.available() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            payload.upgrade().is_none(),
+            "the worker destroys the abandoned result before settlement"
+        );
     }
 
     /// Regression test for `claude-discovery-expensive-work-under-global-mutex`.

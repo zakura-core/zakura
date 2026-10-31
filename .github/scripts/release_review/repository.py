@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .assets import ASSET_PATHS, asset_text
-from .contracts import ReviewError
+from .contracts import Finding, ReviewError
 from .scope import matching_exclusion, safe_path
 
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?")
@@ -22,12 +22,35 @@ BASE_MARKER = re.compile(r"<!-- release-review-base: (.*?) -->")
 MAX_BLOB = 2_000_000
 
 
+def base_environment() -> dict[str, str]:
+    """Forward only process basics to Git, never tokens or inherited Git settings."""
+    return {key: value for key, value in os.environ.items()
+            if key in {"PATH", "HOME", "SYSTEMROOT", "TMPDIR"}}
+
+
 @dataclass(frozen=True)
 class ReviewUnit:
     id: str
     path: str
     part: int
     patch: str
+
+
+def split_patch(patch: str, limit: int) -> list[str]:
+    """Split a patch on line boundaries without dropping or truncating lines."""
+    chunks, current, size = [], [], 0
+    for line in patch.splitlines(keepends=True):
+        line_size = len(line.encode())
+        if line_size > limit:
+            raise ReviewError("a single diff line exceeds the review-unit limit")
+        if current and size + line_size > limit:
+            chunks.append("".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += line_size
+    if current:
+        chunks.append("".join(current))
+    return chunks
 
 
 class Repository:
@@ -39,8 +62,7 @@ class Repository:
     def git(self, *args: str, allowed: tuple[int, ...] = (0,),
             max_bytes: int = 8_000_000, truncate: bool = False) -> bytes:
         """Run a fixed Git read command with hooks, pagers, and external diffs disabled."""
-        env = {key: value for key, value in os.environ.items()
-               if key in {"PATH", "HOME", "SYSTEMROOT", "TMPDIR"}}
+        env = base_environment()
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                    GIT_TERMINAL_PROMPT="0", GIT_PAGER="cat", LC_ALL="C")
         try:
@@ -163,8 +185,7 @@ class Repository:
         lines = self.review_text(revision, path).splitlines()
         if start > len(lines):
             raise ReviewError("requested source line does not exist")
-        selected = "\n".join(f"{index + 1}: {line}" for index, line in enumerate(lines)
-                             if start <= index + 1 <= end)
+        selected = "\n".join(f"{number}: {line}" for number, line in enumerate(lines[start - 1:end], start))
         return {"revision": revision, "path": path, "text": selected[:20000],
                 "representation": "structured binary" if path in ASSET_PATHS else "UTF-8 source",
                 "truncated": len(selected) > 20000 or end > len(lines)}
@@ -179,6 +200,17 @@ class Repository:
             args.append(path)
         result = self.git(*args, allowed=(0, 1), max_bytes=80001, truncate=True).decode("utf-8", errors="replace")
         return {"revision": revision, "matches": result[:20000], "truncated": len(result) > 20000}
+
+    def patch_for_file(self, path: str) -> str:
+        """Validate both source blobs and build a text or asset patch."""
+        sources = {revision: self.review_text(revision, path) if path in self.trees[revision] else ""
+                   for revision in ("base", "head")}
+        if path in ASSET_PATHS:
+            return "".join(difflib.unified_diff(
+                sources["base"].splitlines(keepends=True), sources["head"].splitlines(keepends=True),
+                fromfile="base/" + path, tofile="head/" + path, n=12))
+        return self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                        "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
 
     def units(self, limit: int, excluded_paths: tuple[str, ...] = ()) -> tuple[list[ReviewUnit], list[dict]]:
         paths = self.git("diff", "--name-only", "-z", "--no-renames", self.refs["base"], self.refs["head"])
@@ -197,30 +229,12 @@ class Repository:
                     entry.update(status="out_of_scope", reason="excluded by configuration",
                                  exclusion_rule=rule)
                     continue
-                sources = {revision: self.review_text(revision, path) if path in self.trees[revision] else ""
-                           for revision in ("base", "head")}
+                patch = self.patch_for_file(path)
                 if path in ASSET_PATHS:
                     entry["representation"] = "structured binary"
-                    patch = "".join(difflib.unified_diff(
-                        sources["base"].splitlines(keepends=True), sources["head"].splitlines(keepends=True),
-                        fromfile="base/" + path, tofile="head/" + path, n=12))
-                else:
-                    patch = self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                                     "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
                 if len(patch.encode()) > 8_000_000:
                     raise ReviewError("file diff exceeds the eight-megabyte review limit")
-                chunks, current, size = [], [], 0
-                for line in patch.splitlines(keepends=True):
-                    line_size = len(line.encode())
-                    if line_size > limit:
-                        raise ReviewError("a single diff line exceeds the review-unit limit")
-                    if current and size + line_size > limit:
-                        chunks.append("".join(current))
-                        current, size = [], 0
-                    current.append(line)
-                    size += line_size
-                if current:
-                    chunks.append("".join(current))
+                chunks = split_patch(patch, limit)
                 for part, chunk in enumerate(chunks, 1):
                     unit = ReviewUnit(f"unit-{len(units) + 1}", path, part, chunk)
                     units.append(unit)
@@ -231,15 +245,15 @@ class Repository:
                 entry.update(status="excluded", reason=str(error))
         return units, coverage
 
-    def validate_finding(self, finding: dict, changed_paths: set[str]) -> None:
-        if finding["change_path"] not in changed_paths:
+    def validate_finding(self, finding: Finding, changed_paths: set[str]) -> None:
+        if finding.change_path not in changed_paths:
             raise ReviewError("finding does not identify a changed release file")
-        ref = finding["reference"]
-        if ref["end"] < ref["start"] or ref["end"] - ref["start"] > 40:
+        ref = finding.reference
+        if ref.end < ref.start or ref.end - ref.start > 40:
             raise ReviewError("finding source range is invalid or too broad")
-        lines = self.source(ref["revision"], ref["path"]).splitlines()
-        if ref["end"] > len(lines):
+        lines = self.source(ref.revision, ref.path).splitlines()
+        if ref.end > len(lines):
             raise ReviewError("finding cites a nonexistent source line")
-        excerpt = "\n".join(lines[ref["start"] - 1:ref["end"]])
-        if ref["quote"].strip() not in excerpt:
+        excerpt = "\n".join(lines[ref.start - 1:ref.end])
+        if ref.quote.strip() not in excerpt:
             raise ReviewError("finding quotation does not match the pinned source")

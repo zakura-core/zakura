@@ -13,33 +13,32 @@ from .contracts import ReviewError
 from .engine import review
 from .github import GitHub, fetch_head, publish, resolve_request
 from .models import AbliteratedProvider, JsonTransport, OpenAIProvider
-from .reporting import render, write_report
+from .reporting import render, write_checkpoint, write_report
 from .repository import Repository
+from .state import new_report
 
 
 def prepare(args) -> int:
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     context = resolve_request(GitHub(os.environ["GITHUB_REPOSITORY"]), os.environ["GITHUB_EVENT_NAME"], event)
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-        output.write(f"eligible={'true' if context else 'false'}\n")
-        if context:
-            output.write(f"pr_number={context['pr_number']}\nprovider={context['provider']}\n")
-    if context:
-        context.update(run_number=int(os.environ["GITHUB_RUN_NUMBER"]),
-                       run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
-                       run_url=f"https://github.com/{context['repository']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
-        args.output.mkdir(parents=True, exist_ok=True)
-        (args.output / "context.json").write_text(json.dumps(context))
-        print(f"Resolved release PR #{context['pr_number']} at {context['head_sha']}")
-    else:
-        print("No eligible current release PR for this event")
+        if not context:
+            output.write("eligible=false\n")
+            print("No eligible current release PR for this event")
+            return 0
+        output.write(f"eligible=true\npr_number={context['pr_number']}\nprovider={context['provider']}\n")
+    context.update(run_number=int(os.environ["GITHUB_RUN_NUMBER"]),
+                   run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                   run_url=f"https://github.com/{context['repository']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "context.json").write_text(json.dumps(context))
+    print(f"Resolved release PR #{context['pr_number']} at {context['head_sha']}")
     return 0
 
 
 def run_review(args) -> int:
     context = json.loads(args.context.read_text())
-    report = {key: value for key, value in context.items() if key != "pr_body"}
-    report.update(status="incomplete", findings=[], errors=[], coverage=[], synthesis_complete=False)
+    report = new_report(context)
     start = time.monotonic()
     repository = Repository(args.repo)
     try:
@@ -55,13 +54,9 @@ def run_review(args) -> int:
         if not key:
             raise ReviewError("selected provider API key is not configured in GitHub secrets")
         provider_type = OpenAIProvider if settings.provider == "openai" else AbliteratedProvider
-        report["pricing"] = {"input_usd_per_million": str(settings.input_price),
-                             "output_usd_per_million": str(settings.output_price),
-                             "cached_input_usd_per_million": (str(settings.cached_input_price)
-                                                              if settings.cached_input_price is not None else None)}
         prior = json.loads(args.resume_report.read_text()) if args.resume_report else None
         review(repository, provider_type(settings, key, JsonTransport()), settings, report,
-               lambda current: write_report(args.output, current), prior_report=prior)
+               lambda current: write_checkpoint(args.output, current), prior_report=prior)
     except (ReviewError, OSError, ValueError, KeyError, TypeError) as error:
         # Only our domain errors are safe to publish. Exceptions from I/O or malformed
         # external envelopes can contain credential-bearing URLs or provider payloads.
@@ -81,9 +76,8 @@ def publish_report(args) -> int:
         report = json.loads(report_path.read_text())
     else:
         context = json.loads(args.context.read_text())
-        report = {key: value for key, value in context.items() if key != "pr_body"}
-        report.update(status="incomplete", findings=[], coverage=[],
-                      errors=["review job stopped before producing a report"], synthesis_complete=False)
+        report = new_report(context)
+        report["errors"].append("review job stopped before producing a report")
         write_report(args.output, report)
     if report["repository"] != os.environ["GITHUB_REPOSITORY"]:
         raise ReviewError("report repository does not match this workflow")

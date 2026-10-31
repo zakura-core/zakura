@@ -29,7 +29,11 @@ fn capacity() -> ServeCapacity {
         start: Height(0),
         count: super::super::MAX_ITEMS_PER_REQUEST,
     });
-    let limits = sizing::serve_limits(largest.output_bytes(), Duration::from_millis(1));
+    let limits = sizing::serve_limits(
+        largest.output_bytes(),
+        Duration::from_millis(1),
+        crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    );
     ServeCapacity::new("example", &GET_ITEMS, limits).expect("derived limits are valid")
 }
 

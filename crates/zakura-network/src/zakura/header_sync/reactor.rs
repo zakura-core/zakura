@@ -196,7 +196,13 @@ fn build_header_sync_reactor(
         network: startup.network.clone(),
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
-        serving: v9::serving_capacity(),
+        serving: v9::serving_capacity(
+            startup
+                .config
+                .peer_limits
+                .max_inbound_peers
+                .saturating_add(startup.config.peer_limits.max_outbound_peers),
+        ),
         page_limits,
     };
     let header_bytes = header_sync_header_bytes_for_network(&startup.network);

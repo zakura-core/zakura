@@ -599,7 +599,7 @@ async fn serving_bounds_commitments_workers_and_outputs() {
     });
     let config = ZakuraBlockSyncConfig::default();
     let limit = serving_max_inflight_requests(&config);
-    let limits = serving_limits();
+    let limits = serving_limits(&config);
     let peer = ZakuraPeerId::new(vec![66; 32]).unwrap();
     let (serving, mut session, _output, cancel) = ready_session(&source, 66, 4);
     assert!(
@@ -647,4 +647,17 @@ async fn serving_bounds_commitments_workers_and_outputs() {
     })
     .await
     .expect("finished reads of a cancelled session return their workers and output grants");
+}
+
+/// Every configured session can hold a whole peer budget of unsent responses, so the
+/// node's output budget never pauses a conformant peer for another's reservations.
+#[test]
+fn getblocks_node_output_funds_every_session() {
+    let config = ZakuraBlockSyncConfig::default();
+    let limits = serving_limits(&config);
+    let sessions = config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers;
+    assert_eq!(
+        limits.node_output_bytes,
+        u64::try_from(sessions).unwrap() * limits.peer_output_bytes
+    );
 }

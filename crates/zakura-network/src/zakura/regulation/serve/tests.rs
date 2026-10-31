@@ -1562,3 +1562,37 @@ async fn an_unpolled_push_send_returns_its_grants() {
     assert_eq!(capacity.node_output.granted(), 0);
     assert_eq!(send.capacity(), 1);
 }
+
+/// Every serving peer holds its whole output budget at once, as a fast reader does
+/// because a grant reserves a response's cap until its write. None of it waits for
+/// the node budget, so these peers can't pause each other.
+#[test]
+fn every_serving_peer_can_hold_its_output_budget_at_once() {
+    const PEERS: u8 = 128;
+    let limits = crate::zakura::regulation::sizing::serve_limits(
+        1 << 20,
+        Duration::from_millis(1),
+        usize::from(PEERS),
+    );
+    let capacity = capacity(limits);
+    let peer_bytes = u32::try_from(limits.peer_output_bytes).expect("64 MiB fits u32");
+    let budgets: Vec<_> = (0..PEERS).map(|n| capacity.peer(&peer(n))).collect();
+    let grants: Vec<_> = budgets
+        .iter()
+        .map(|budgets| {
+            (
+                budgets
+                    .output
+                    .try_grant(peer_bytes)
+                    .expect("the peer budget is free"),
+                capacity
+                    .node_output
+                    .try_grant(peer_bytes)
+                    .expect("the node budget holds every peer's budget"),
+            )
+        })
+        .collect();
+    assert_eq!(capacity.node_output_held(), limits.node_output_bytes);
+    drop(grants);
+    assert_eq!(capacity.node_output_held(), 0);
+}

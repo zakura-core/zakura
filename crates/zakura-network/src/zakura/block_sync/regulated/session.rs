@@ -37,9 +37,10 @@ const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
 const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_ENDINGS);
 
 /// The production GetBlocks serving limits. Execution is fixed by
-/// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
-/// the response configuration cannot inflate execution concurrency.
-pub(crate) fn serving_limits() -> ServeLimits {
+/// [`NODE_EXECUTION`]; output sizing covers the largest possible response on
+/// every session, so the response configuration cannot inflate execution
+/// concurrency.
+pub(crate) fn serving_limits(config: &ZakuraBlockSyncConfig) -> ServeLimits {
     let largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
         .expect("the protocol's largest range starts at height zero")
         .response_cap(MAX_BS_RESPONSE_BYTES)
@@ -47,7 +48,7 @@ pub(crate) fn serving_limits() -> ServeLimits {
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
-        ..sizing::serve_limits(largest, sizing::TARGET_RTT)
+        ..sizing::serve_limits(largest, sizing::TARGET_RTT, serving_sessions(config))
     }
 }
 
@@ -108,7 +109,7 @@ pub(crate) struct Serving {
 
 impl Serving {
     pub(crate) fn new(source: Arc<dyn Source>, config: &ZakuraBlockSyncConfig) -> Self {
-        let limits = serving_limits();
+        let limits = serving_limits(config);
         debug_assert!(
             serving_sessions_fit_budget(config),
             "the reactor validates the config before serving",

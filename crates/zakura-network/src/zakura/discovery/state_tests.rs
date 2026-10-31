@@ -568,8 +568,8 @@ impl BookDriver {
             ..ZakuraDiscoveryBookLimits::default()
         };
         let mut key = [0; 32];
-        for part in key.chunks_exact_mut(8) {
-            part.copy_from_slice(&seed.to_le_bytes());
+        for part in key.as_chunks_mut::<8>().0 {
+            *part = seed.to_le_bytes();
         }
         Self {
             summary: DiscoveryBookReplaySummary::default(),

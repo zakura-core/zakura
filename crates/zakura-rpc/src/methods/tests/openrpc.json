@@ -404,7 +404,7 @@
     {
       "name": "submitblock",
       "summary": "Submits block to the node to be validated and committed.",
-      "description": "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (string, optional)\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.",
+      "description": "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (object, optional) ignored; any JSON value is accepted\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.",
       "params": [
         {
           "name": "hex_data",

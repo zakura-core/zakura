@@ -1304,6 +1304,7 @@ fn test_get_mining_info() -> Result<(), Box<dyn std::error::Error>> {
   "blocks": 2934350,
   "currentblocksize": 1629,
   "currentblocktx": 0,
+  "difficulty": 75402713.71590479,
   "networksolps": 6644588130,
   "networkhashps": 6644588130,
   "chain": "main",
@@ -1315,6 +1316,7 @@ fn test_get_mining_info() -> Result<(), Box<dyn std::error::Error>> {
     let tip_height = obj.tip_height();
     let current_block_size = obj.current_block_size();
     let current_block_tx = obj.current_block_tx();
+    let difficulty = obj.difficulty();
     let networksolps = obj.networksolps();
     let networkhashps = obj.networkhashps();
     let chain = obj.chain().clone();
@@ -1324,6 +1326,7 @@ fn test_get_mining_info() -> Result<(), Box<dyn std::error::Error>> {
         tip_height,
         current_block_size,
         current_block_tx,
+        difficulty,
         networksolps,
         networkhashps,
         chain,

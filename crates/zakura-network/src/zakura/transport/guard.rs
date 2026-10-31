@@ -347,55 +347,17 @@ impl ByteBudget {
 
     /// Release `bytes` back to the shared counter and wake
     /// any consumer blocked on capacity.
-    #[cfg(not(any(test, zakura_sim)))]
     fn release(&mut self, bytes: u64) {
         self.release_charge(bytes);
     }
 
-    #[cfg(any(test, zakura_sim))]
     fn release_charge(&self, bytes: u64) {
-        self.release_then(bytes, || {});
-    }
-
-    #[cfg(not(any(test, zakura_sim)))]
-    fn release_charge(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = reserved.checked_sub(bytes) else {
-                self.close();
-                break;
-            };
-            match self.inner.reserved_bytes.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    publish_reserved_change(reserved, next);
-                    break;
-                }
-                Err(observed) => reserved = observed,
-            }
-        }
-        self.inner.capacity.notify_waiters();
-    }
-
-    /// Release `bytes` back to the shared counter and wake
-    /// any consumer blocked on capacity. Observer builds share
-    /// [`Self::release_then`]'s loop, so the two can't drift.
-    #[cfg(any(test, zakura_sim))]
-    fn release(&mut self, bytes: u64) {
         self.release_then(bytes, || {});
     }
 
     /// [`Self::release`] that calls `released` after the counter changes and
     /// before waking waiters, so an observer sees the release before any task
     /// it wakes runs. Does nothing for 0 bytes.
-    #[cfg(any(test, zakura_sim))]
     fn release_then(&self, bytes: u64, released: impl FnOnce()) {
         if bytes == 0 {
             return;
@@ -414,6 +376,7 @@ impl ByteBudget {
             ) {
                 Ok(_) => {
                     publish_reserved_change(reserved, next);
+                    #[cfg(any(test, zakura_sim))]
                     self.observe(BudgetChangeKind::Released, reserved, next);
                     break;
                 }

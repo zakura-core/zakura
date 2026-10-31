@@ -221,6 +221,54 @@ async fn receipt_waits_for_admission_before_settlement() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn synchronous_receipts_do_not_wake_floor_rankers() {
+    for matched in [true, false] {
+        let Probe {
+            mut routine,
+            mut outbound,
+            blocks,
+            _bodies: mut bodies,
+            _events,
+        } = probe(3);
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 3,
+            ..BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        outbound.recv().await.unwrap();
+        outbound.recv().await.unwrap();
+        assert!(outbound.try_recv().is_err());
+        // Prime the RTT with a real receipt. Paused time keeps the next receipt's
+        // RTT unchanged, so neither slots nor RTT require a ranking notification.
+        deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
+        bodies.try_recv().unwrap();
+        assert!(routine.published_free_slots);
+        if !matched {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(2))
+                .unwrap();
+            routine.window.outstanding.remove(key).unwrap();
+        }
+        let registry = routine.registry.clone();
+        let ranked = registry.subscribe_floor_ranking().notified();
+        tokio::pin!(ranked);
+        assert!(futures::poll!(&mut ranked).is_pending());
+
+        deliver(&mut routine, BlockSyncMessage::Block(blocks[1].clone())).await;
+
+        assert!(bodies.try_recv().is_ok(), "the body reached the sequencer");
+        assert!(
+            futures::poll!(&mut ranked).is_pending(),
+            "a synchronous receipt must not wake floor rankers: matched={matched}"
+        );
+    }
+}
+
 /// A receiver wake can race with cancellation before the sender settles funding.
 #[tokio::test(flavor = "current_thread")]
 async fn receipt_keeps_funding_until_the_production_send_completes() {

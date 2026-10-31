@@ -2220,7 +2220,6 @@ impl PeerRoutine {
 
         // Admission reserved the sequencer slot before decode. Transfer the body
         // synchronously, then settle its request funding.
-        let handoff_blocked = HandoffBlocked::start(self);
         let receipt_settlement =
             ReceiptSettlement::new(self, outstanding_owner, height, receipt_settlement.funding);
         self.forward_body_to_sequencer(
@@ -2235,7 +2234,6 @@ impl PeerRoutine {
             body_permit,
         );
         drop(receipt_settlement);
-        drop(handoff_blocked);
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -2470,8 +2468,6 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
-        // Set through the release below, as on the matched path.
-        let handoff_blocked = HandoffBlocked::start(self);
         let receipt_settlement = ReceiptSettlement::new(self, owner, height, receipt_settlement);
         self.forward_body_to_sequencer(
             owner,
@@ -2489,7 +2485,6 @@ impl PeerRoutine {
         // the bytes are never invisible to both the limiter and the resident
         // snapshot.
         drop(receipt_settlement);
-        drop(handoff_blocked);
         true
     }
 

@@ -11,6 +11,9 @@ cargo-fuzz = true
 # suite manifest and campaign tooling read the mapping from here.
 [package.metadata.zakura-sim.targets]
 discovery_wait_complete = "discovery/wait-complete"
+discovery_verification_capacity = "discovery/verification-capacity"
+discovery_record_book = "discovery/record-book"
+discovery_session_installation = "discovery/session-installation"
 header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
 
@@ -59,3 +62,24 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "discovery_verification_capacity"
+path = "fuzz_targets/discovery_verification_capacity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_record_book"
+path = "fuzz_targets/discovery_record_book.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_session_installation"
+path = "fuzz_targets/discovery_session_installation.rs"
+test = false
+doc = false
+bench = false

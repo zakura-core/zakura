@@ -191,7 +191,7 @@ impl Fixture {
 
     fn with_queue(work: WorkQueue) -> Self {
         let fixture = Self {
-            budget: work.budget(),
+            budget: work.budget.clone(),
             work: Arc::new(work),
             cancel: CancellationToken::new(),
         };

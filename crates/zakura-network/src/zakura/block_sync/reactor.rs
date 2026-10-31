@@ -272,7 +272,6 @@ pub fn spawn_block_sync_reactor(
             &startup.config,
         )),
         config: startup.config.clone(),
-        budget: state.budget.clone(),
         work: state.work_queue.clone(),
         registry: registry.clone(),
         received_throughput: state.received_throughput.clone(),
@@ -1596,7 +1595,7 @@ impl BlockSyncReactor {
             height,
             token,
             outcome.result(),
-            self.state.budget.reserved(),
+            self.state.work_queue.budget().reserved(),
         );
         let persisted_availability = self.committed_view.as_ref().and_then(|snapshot| {
             (snapshot.frontiers.header_best.hash == hash)

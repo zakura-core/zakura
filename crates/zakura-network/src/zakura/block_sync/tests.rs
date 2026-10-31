@@ -3516,7 +3516,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         await_until(
             "watchdog settles the expired floor claim",
             Duration::from_secs(2),
-            || wiring.registry.total_unreceived() == 0 && wiring.budget.reserved() == 0,
+            || wiring.registry.total_unreceived() == 0 && wiring.work.budget().reserved() == 0,
         )
         .await
         .unwrap();

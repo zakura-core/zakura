@@ -14,6 +14,7 @@ use zakura_chain::serialization::ZcashDeserializeInto;
 /// A routine with `window` single-block requests' worth of work and capacity.
 pub(super) struct Probe {
     pub(super) routine: PeerRoutine,
+    pub(super) budget: ByteBudget,
     pub(super) outbound: FramedRecv,
     pub(super) blocks: Vec<Arc<block::Block>>,
     _bodies: mpsc::Receiver<SequencedBody>,
@@ -79,7 +80,6 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         config.clone(),
         true,
         generation,
-        budget,
         Arc::clone(&work),
         registry,
         Arc::new(std::sync::Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -120,6 +120,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         }),
     );
     Probe {
+        budget,
         routine,
         outbound,
         blocks,
@@ -141,6 +142,7 @@ async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
 async fn receipt_waits_for_admission_before_settlement() {
     for (matched, cancel_handoff) in [(true, false), (true, true), (false, false), (false, true)] {
         let Probe {
+            budget,
             mut routine,
             mut outbound,
             blocks,
@@ -156,7 +158,6 @@ async fn receipt_waits_for_admission_before_settlement() {
                 .unwrap();
             routine.window.outstanding.remove(key).unwrap();
         }
-        let budget = routine.budget.clone();
         let work = routine.work.clone();
         let charge = work.reserved_bytes();
         assert!(charge > 0);
@@ -225,6 +226,7 @@ async fn receipt_waits_for_admission_before_settlement() {
 async fn synchronous_receipts_do_not_wake_floor_rankers() {
     for matched in [true, false] {
         let Probe {
+            budget: _,
             mut routine,
             mut outbound,
             blocks,
@@ -272,6 +274,7 @@ async fn synchronous_receipts_do_not_wake_floor_rankers() {
 #[tokio::test(start_paused = true)]
 async fn accounting_closure_has_a_distinct_fill_stop() {
     let Probe {
+        budget: _,
         mut routine,
         mut outbound,
         _events: mut events,
@@ -321,6 +324,7 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
 
     for matched in [true, false] {
         let Probe {
+            budget,
             mut routine,
             mut outbound,
             blocks,
@@ -338,11 +342,11 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
         }
         let charge = routine.work.reserved_bytes();
         assert!(charge > 0);
-        let unrelated = routine.budget.reserve_owned(17).unwrap();
+        let unrelated = budget.reserve_owned(17).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
         routine.sequencer_input = sender;
         let wake = Arc::new(ReceiverWake {
-            budget: routine.budget.clone(),
+            budget: budget.clone(),
             resident: routine.sequencer_input_bytes.clone(),
             charge_at_send: AtomicU64::new(0),
             resident_at_send: AtomicU64::new(0),
@@ -387,6 +391,7 @@ async fn request_bookkeeping_scaling() {
     let largest = u32::try_from(SESSION_RESERVATIONS).expect("the session share fits u32");
     for window in [largest / 8, largest / 4, largest / 2, largest] {
         let Probe {
+            budget: _,
             mut routine,
             mut outbound,
             blocks,
@@ -441,6 +446,7 @@ async fn request_bookkeeping_scaling() {
 async fn accounting_failure_cancels_production_receipt() {
     for matched in [true, false] {
         let Probe {
+            budget,
             mut routine,
             mut outbound,
             blocks,
@@ -456,7 +462,6 @@ async fn accounting_failure_cancels_production_receipt() {
                 .unwrap();
             routine.window.outstanding.remove(key).unwrap();
         }
-        let budget = routine.budget.clone();
         let charge = routine.work.reserved_bytes();
         assert!(charge > 0);
         // Keep actual funding live while removing it from the queue's settlement pool.

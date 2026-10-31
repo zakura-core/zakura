@@ -305,7 +305,6 @@ pub(super) struct RoutineWiring {
     pub(super) request_pool: crate::zakura::regulation::ReservationPool,
     pub(super) serving: Arc<super::regulated::session::Serving>,
     pub(super) config: ZakuraBlockSyncConfig,
-    pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
     pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -462,7 +461,6 @@ pub(super) struct BlockSyncState {
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
     pub(super) work_queue: Arc<WorkQueue>,
-    pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
@@ -489,7 +487,6 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            budget: work_queue.budget(),
             work_queue,
             needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),

@@ -95,8 +95,8 @@ impl BlockSyncReactor {
                 row.floor_gap_oldest_outstanding_ms = floor_gap.oldest_outstanding_ms;
                 row.floor_gap_next_deadline_ms = floor_gap.next_deadline_ms;
             }
-            row.budget_available = Some(self.state.budget.available());
-            row.budget_reserved = Some(self.state.budget.reserved());
+            row.budget_available = Some(self.state.work_queue.budget().available());
+            row.budget_reserved = Some(self.state.work_queue.budget().reserved());
             let sequencer_input_queued_bytes = self.sequencer_input_bytes.load(Ordering::Relaxed);
             let sequencer_input_decoded_attributed_memory_bytes = self
                 .sequencer_input_decoded_attributed_memory_bytes
@@ -147,7 +147,8 @@ impl BlockSyncReactor {
                 let peers_wanting_slots = peers_with_status.saturating_sub(slots.saturated_peers);
                 let download_blocked_on_budget = u64::from(
                     peers_wanting_slots > 0
-                        && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
+                        && self.state.work_queue.budget().available()
+                            < BS_PER_BLOCK_WORST_CASE_BYTES,
                 );
                 row.peers_wanting_slots = Some(saturating_usize(peers_wanting_slots));
                 row.download_blocked_on_budget = Some(download_blocked_on_budget);

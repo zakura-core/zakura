@@ -506,7 +506,7 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
-    budget: super::state::ByteBudget,
+    budget: super::work_queue::BudgetReader,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -562,7 +562,6 @@ impl PeerRoutine {
         config: ZakuraBlockSyncConfig,
         allow_no_progress_park: bool,
         generation: u64,
-        budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
         received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -621,7 +620,7 @@ impl PeerRoutine {
             fill_stop_trace_at: BTreeMap::new(),
             generation,
             next_request_id: NonZeroU64::new(1),
-            budget,
+            budget: work.budget(),
             work,
             registry,
             received_throughput,
@@ -750,9 +749,8 @@ impl PeerRoutine {
     ) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
-        // pinned. The clones share the same underlying `Arc`, so the wakes still
-        // fire for releases/extends done through the routine's own `self.budget` /
-        // `self.work`.
+        // pinned. The budget reader observes releases from this queue, including
+        // receipt reservations that outlive a queue transition.
         let budget = self.budget.clone();
         let work = self.work.clone();
         let registry = Arc::clone(&self.registry);
@@ -3007,7 +3005,6 @@ mod tests {
             config.clone(),
             true,
             generation,
-            budget,
             Arc::clone(&work),
             Arc::clone(&registry),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -3571,7 +3568,6 @@ mod tests {
             config,
             true,
             0,
-            budget,
             Arc::clone(&work),
             registry,
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -3678,7 +3674,6 @@ mod tests {
             config,
             true,
             0,
-            budget.clone(),
             work.clone(),
             Arc::new(PeerRegistry::new()),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -3748,12 +3743,11 @@ mod tests {
         );
     }
 
-    /// A routine for peer `[id; 32]` that shares `budget`, `work` and `registry`
+    /// A routine for peer `[id; 32]` that shares `work` and `registry`
     /// and reads the download floor from `view`. It has received a `Status`
     /// that makes heights 1 to 10 servable.
     fn shared_floor_routine(
         id: u8,
-        budget: &ByteBudget,
         work: &Arc<WorkQueue>,
         registry: &Arc<PeerRegistry>,
         view: watch::Receiver<super::super::sequencer_task::SequencerView>,
@@ -3792,7 +3786,6 @@ mod tests {
             config,
             true,
             generation,
-            budget.clone(),
             Arc::clone(work),
             Arc::clone(registry),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -3831,8 +3824,7 @@ mod tests {
         );
         let registry = Arc::new(PeerRegistry::new());
         let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let (mut routine, mut out_recv) =
-            shared_floor_routine(7, &budget, &work, &registry, view_rx);
+        let (mut routine, mut out_recv) = shared_floor_routine(7, &work, &registry, view_rx);
         let _ = routine.try_fill().await;
 
         let requests = routine.window.outstanding.ownership();
@@ -3934,7 +3926,7 @@ mod tests {
         );
         let registry = Arc::new(PeerRegistry::new());
         let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let (routine, _out_recv) = shared_floor_routine(7, &budget, &work, &registry, view_rx);
+        let (routine, _out_recv) = shared_floor_routine(7, &work, &registry, view_rx);
         let log = Arc::new(Log::default());
         let mut routine = routine.with_observer(ObserverSlot(Some(log.clone())));
         let _ = routine.try_fill().await;
@@ -4024,7 +4016,6 @@ mod tests {
             config,
             true,
             generation,
-            budget.clone(),
             work.clone(),
             registry.clone(),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -4287,7 +4278,6 @@ mod tests {
             config,
             true,
             generation,
-            budget.clone(),
             work.clone(),
             registry.clone(),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -4475,7 +4465,6 @@ mod tests {
             config,
             true,
             0,
-            budget,
             Arc::clone(&work),
             Arc::new(PeerRegistry::new()),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
@@ -4799,7 +4788,6 @@ mod tests {
             config.clone(),
             !readmitted,
             generation,
-            budget.clone(),
             work.clone(),
             registry.clone(),
             Arc::new(Mutex::new(ThroughputMeter::new(now))),
@@ -5067,7 +5055,6 @@ mod tests {
             config.clone(),
             true,
             generation,
-            budget.clone(),
             work.clone(),
             registry.clone(),
             Arc::new(Mutex::new(ThroughputMeter::new(now))),
@@ -5199,7 +5186,6 @@ mod tests {
             config.clone(),
             true,
             generation,
-            work.budget(),
             work,
             registry,
             Arc::new(Mutex::new(ThroughputMeter::new(now))),

@@ -4,6 +4,7 @@ mod candidate_dialer;
 #[cfg(test)]
 mod conformance_tests;
 mod dialer;
+mod peer;
 mod pipe;
 mod protocol;
 mod redial;

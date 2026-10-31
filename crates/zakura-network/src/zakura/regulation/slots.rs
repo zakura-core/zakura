@@ -134,7 +134,6 @@ impl OutputByteBudget {
     }
 
     /// Bytes currently granted.
-    #[cfg(test)]
     pub(crate) fn granted(&self) -> u64 {
         // Widening usize to u64 is lossless on supported targets.
         self.capacity

@@ -423,6 +423,15 @@ impl ZakuraBlockSyncConfig {
         &self,
         backend_blocks: u64,
     ) -> Result<zakura_node_services::block_memory::DecodedBlockPool, &'static str> {
+        self.decoded_block_allowance(backend_blocks)
+            .map(zakura_node_services::block_memory::DecodedBlockPool::for_block_count)
+    }
+
+    /// Return the block count that a [decoded pool](Self::decoded_block_pool) admits.
+    pub(crate) fn decoded_block_allowance(
+        &self,
+        backend_blocks: u64,
+    ) -> Result<std::num::NonZeroU64, &'static str> {
         let windows = u64::try_from(self.submitted_apply_limit())
             .ok()
             .and_then(|count| count.checked_mul(4));
@@ -431,13 +440,12 @@ impl ZakuraBlockSyncConfig {
             .max_inbound_peers
             .checked_add(self.peer_limits.max_outbound_peers)
             .and_then(|count| u64::try_from(count).ok());
-        let limit = windows
+        windows
             .zip(peers)
             .and_then(|(windows, peers)| windows.checked_add(peers))
             .and_then(|count| count.checked_add(backend_blocks))
             .and_then(std::num::NonZeroU64::new)
-            .ok_or("decoded block-count allowance overflow")?;
-        Ok(zakura_node_services::block_memory::DecodedBlockPool::for_block_count(limit))
+            .ok_or("decoded block-count allowance overflow")
     }
 
     /// Return the resident look-ahead byte cap.

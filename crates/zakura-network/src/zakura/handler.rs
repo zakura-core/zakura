@@ -59,7 +59,8 @@ use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
     CompatResponseGrant, ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources,
-    OrderedStreamFailure, OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout,
+    OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerPhase, ResourceEnvelope,
+    SessionLayout,
     StreamResources,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -614,6 +615,15 @@ impl ZakuraLocalLimits {
             u64::from(self.quic.receive_window_bytes),
             self.quic.send_window_bytes,
             self.max_connections,
+        )
+    }
+
+    /// The most owners that these limits allow at once.
+    pub(crate) fn owner_bound(&self) -> OwnerBound {
+        OwnerBound::new(
+            self.max_pending_handshakes,
+            self.max_connections,
+            self.max_open_streams,
         )
     }
 
@@ -2776,7 +2786,9 @@ impl ZakuraProtocolHandler {
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
+        let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection();
+        self.resources.report_usage(limits_owner_bound);
         let mut workers = JoinSet::new();
         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();
         let mut session_io = ServiceSessionIO::default();
@@ -3436,6 +3448,7 @@ impl ZakuraProtocolHandler {
                 debug!(?error, "aborted Zakura stream worker ended");
             }
         }
+        self.resources.report_usage(limits_owner_bound);
         cleanup_guard.cleanup_registered_peer().await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
         conn.trace_connection(
@@ -4343,6 +4356,19 @@ async fn spawn_zakura_endpoint_inner(
         );
     }
     let limits = ZakuraLocalLimits::from_config(config);
+    let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_node(
+        config,
+        &limits,
+        header_sync_driver_startup
+            .as_ref()
+            .map_or(0, |startup| startup.decoded_backend_blocks),
+    )?;
+    debug!(
+        owners = ?node_envelope.owners,
+        retained_bytes_bound = %node_envelope.retained_bytes_bound(),
+        decoded_blocks = node_envelope.decoded_blocks,
+        "Zakura node resource envelope"
+    );
     validate_idle_invariant(&limits)?;
     let discovery_secret_key = secret_key.clone();
     // Bind a fixed address when configured so this node has a stable, advertisable
@@ -4769,6 +4795,11 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("pending handshake"))
             => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?;
+        let _owner = endpoint
+            .handler
+            .resources
+            .owners()
+            .enter(OwnerPhase::Handshake);
         let handshake_config = endpoint.handler.current_handshake_config();
         sim_chain!(run_native_initiator_handshake(
             &connection,

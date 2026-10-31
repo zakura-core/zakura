@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::debug;
 use zakura_rt::{
     sync::counter::{AtomicUsize, Ordering},
     time::Instant,
@@ -150,6 +151,41 @@ impl NodeResources {
         &self.owners
     }
 
+    /// What this node's owners hold now, in constant time.
+    pub(crate) fn usage(&self) -> NodeUsage {
+        NodeUsage {
+            owners: self.owners.counts(),
+            raw_bytes: self.raw.granted(),
+            output_bytes: self.output.granted(),
+            compat_response_bytes: self.compat_responses.granted(),
+            request_workers: self
+                .envelope
+                .request_workers
+                .saturating_sub(self.request_workers.available()),
+        }
+    }
+
+    /// Publish [`Self::usage`] under fixed metric labels, and count a breach of
+    /// `bound`, so reconnect churn that outlives its admission slot stays visible.
+    ///
+    /// This only observes. It never refuses an owner, because a stuck worker that
+    /// outlived its drain timeout already holds what it holds.
+    pub(crate) fn report_usage(&self, bound: OwnerBound) -> NodeUsage {
+        let usage = self.usage();
+        for (budget, bytes) in usage.budget_bytes() {
+            // A byte budget's size stays far below 2^53, so f64 represents it exactly.
+            metrics::gauge!("zakura.p2p.resources.held_bytes", "budget" => budget)
+                .set(bytes as f64);
+        }
+        // The worker count stays far below 2^53, so f64 represents it exactly.
+        metrics::gauge!("zakura.p2p.resources.request_workers").set(usage.request_workers as f64);
+        if !bound.admits(&usage.owners) {
+            metrics::counter!("zakura.p2p.owners.over_bound").increment(1);
+            debug!(?usage, ?bound, "Zakura owners exceed their admission bound");
+        }
+        usage
+    }
+
     /// Fresh per-connection budgets within the node's budgets.
     pub(crate) fn connection(&self) -> ConnectionResources {
         ConnectionResources {
@@ -227,6 +263,14 @@ pub(crate) struct StreamResources {
     pub(crate) request_workers: SlotBudget,
     /// Counts this stream from setup until its reader has ended.
     pub(crate) owner: OwnerGuard,
+}
+
+#[cfg(test)]
+impl NodeResources {
+    /// Take every free node-wide raw and output byte until the returned grants drop.
+    pub(crate) fn hold_node_budgets(&self) -> (Option<OutputGrant>, Option<OutputGrant>) {
+        (self.raw.hold_free(), self.output.hold_free())
+    }
 }
 
 #[cfg(test)]
@@ -400,7 +444,6 @@ impl OwnerPhase {
 ///
 /// An owner moves between phases one count at a time, so a read during a move
 /// can differ by that one owner.
-#[cfg(test)]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct OwnerCounts {
     pub(crate) handshake: usize,
@@ -409,11 +452,74 @@ pub(crate) struct OwnerCounts {
     pub(crate) retiring: usize,
 }
 
-#[cfg(test)]
 impl OwnerCounts {
     /// Every owner, whichever phase it is in.
+    #[cfg(test)]
     pub(crate) fn total(&self) -> usize {
         self.handshake + self.setup + self.installed + self.retiring
+    }
+
+    /// Every stream owner, whichever generation or phase it is in.
+    pub(crate) fn streams(&self) -> usize {
+        self.setup + self.installed + self.retiring
+    }
+}
+
+/// The most owners that this node's admission limits allow at once.
+///
+/// A stream owner holds its stream permit through retirement, and a connection
+/// returns its admission slot only after its stream owners settle. So setup,
+/// installed, and retiring owners of every generation share one bound.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerBound {
+    /// Control handshakes, which each hold a pending-handshake permit.
+    pub(crate) handshakes: usize,
+    /// Stream owners: each connection's stream permits, plus its one outbound
+    /// compatibility exchange.
+    pub(crate) streams: usize,
+}
+
+impl OwnerBound {
+    /// The bound for these admission limits.
+    pub(crate) fn new(
+        max_pending_handshakes: usize,
+        max_connections: usize,
+        max_open_streams: u16,
+    ) -> Self {
+        Self {
+            handshakes: max_pending_handshakes,
+            streams: max_connections.saturating_mul(usize::from(max_open_streams) + 1),
+        }
+    }
+
+    /// Whether `counts` fit this bound.
+    pub(crate) fn admits(&self, counts: &OwnerCounts) -> bool {
+        counts.handshake <= self.handshakes && counts.streams() <= self.streams
+    }
+}
+
+/// What this node's transport owners hold at one moment.
+///
+/// Each field reads its own counter, so a read during churn can mix moments.
+/// A floor frame holds a floor slot instead of bytes, and QUIC's buffers belong
+/// to the peer memory budget, so neither appears here.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NodeUsage {
+    pub(crate) owners: OwnerCounts,
+    pub(crate) raw_bytes: u64,
+    pub(crate) output_bytes: u64,
+    pub(crate) compat_response_bytes: u64,
+    pub(crate) request_workers: usize,
+}
+
+impl NodeUsage {
+    /// Each byte budget's fixed metric label and its held bytes.
+    pub(crate) fn budget_bytes(&self) -> [(&'static str, u64); 3] {
+        [
+            ("raw", self.raw_bytes),
+            ("output", self.output_bytes),
+            ("compat_response", self.compat_response_bytes),
+        ]
     }
 }
 
@@ -432,7 +538,6 @@ impl OwnerLedger {
     }
 
     /// The current counts.
-    #[cfg(test)]
     pub(crate) fn counts(&self) -> OwnerCounts {
         let count = |phase: OwnerPhase| self.0[phase as usize].load(Ordering::Relaxed);
         OwnerCounts {

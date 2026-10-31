@@ -26,6 +26,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod node_envelope;
 mod peer_memory;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit", zakura_sim))]

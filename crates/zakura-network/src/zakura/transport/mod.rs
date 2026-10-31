@@ -40,10 +40,10 @@ pub(crate) use io::{
     QueuedFrame, ResponseFrameSlot,
 };
 #[cfg(test)]
-pub(crate) use lifetime::OwnerCounts;
+pub(crate) use lifetime::{NodeUsage, OwnerCounts};
 pub(crate) use lifetime::{
     frame_wire_bytes, CompatResponseGrant, ConnectionResources, FrameGate, NodeResources,
-    OwnerPhase, ResourceEnvelope, StreamResources, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    OwnerBound, OwnerPhase, ResourceEnvelope, StreamResources, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]

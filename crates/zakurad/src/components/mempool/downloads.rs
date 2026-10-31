@@ -23,11 +23,17 @@
 //! But we want to download and gossip transactions,
 //! even when there are no other service requests.
 //!
+//! Each task sends its result before it signals the shared verification
+//! [`Notify`], so a mempool request sent after that signal always drains the
+//! result. The queue checker waits on this signal, so verified transactions
+//! reach the mempool without waiting for its periodic check.
+//!
 //! [`Mempool`]: super::Mempool
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -40,7 +46,7 @@ use futures::{
 };
 use pin_project::{pin_project, pinned_drop};
 use thiserror::Error;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::sync::{oneshot, Notify};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -218,11 +224,14 @@ where
     /// Peers whose transactions are not verified, shared with the mempool.
     peer_cooldowns: PeerCooldowns,
 
+    /// Signalled after each download and verify task sends its result.
+    verification_finished: Arc<Notify>,
+
     // Internal downloads state
-    /// A list of pending transaction download and verify tasks.
+    /// The result channels of pending transaction download and verify tasks.
     #[pin]
     pending: FuturesUnordered<
-        JoinHandle<
+        oneshot::Receiver<
             Result<
                 Result<
                     (
@@ -295,8 +304,10 @@ where
         // task is scheduled for wakeup when the next task becomes ready.
         //
         // TODO: this would be cleaner with poll_map (#2693)
-        let item = if let Some(join_result) = ready!(this.pending.poll_next(cx)) {
-            let result = join_result.expect("transaction download and verify tasks must not panic");
+        let item = if let Some(task_result) = ready!(this.pending.poll_next(cx)) {
+            let result = task_result.expect(
+                "download and verify tasks don't panic, and always send a result before exiting",
+            );
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
                     let hash = tx.transaction.id();
@@ -360,6 +371,7 @@ where
     /// `expose_peer_addresses` controls whether legacy peer labels are unredacted.
     /// `max_transaction_bytes` limits the serialized size of accepted transactions.
     /// `peer_cooldowns` lists the peers whose transactions are not verified.
+    /// `verification_finished` is signalled after each task sends its result.
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
@@ -371,6 +383,7 @@ where
         expose_peer_addresses: bool,
         max_transaction_bytes: u64,
         peer_cooldowns: PeerCooldowns,
+        verification_finished: Arc<Notify>,
     ) -> Self {
         Self {
             network,
@@ -379,6 +392,7 @@ where
             expose_peer_addresses,
             max_transaction_bytes,
             peer_cooldowns,
+            verification_finished,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
@@ -626,7 +640,9 @@ where
         })
         .in_current_span();
 
-        let task = tokio::spawn(async move {
+        let (result_tx, result_rx) = oneshot::channel();
+        let verification_finished = self.verification_finished.clone();
+        tokio::spawn(async move {
             let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
 
             // Prefer the cancel handle if both are ready.
@@ -668,10 +684,13 @@ where
                 },
             };
 
-            result
+            // Send before signalling, so a mempool woken by the signal can drain
+            // this result. The receiver is gone if the downloader was dropped.
+            let _ = result_tx.send(result);
+            verification_finished.notify_one();
         });
 
-        self.pending.push(task);
+        self.pending.push(result_rx);
         if let Some(source) = &source {
             // The per-peer cap check above ensures this can't exceed
             // `MAX_INBOUND_CONCURRENCY_PER_PEER`.
@@ -724,7 +743,7 @@ where
         // Replace the pending task list with an empty one and drop it.
         let _ = std::mem::take(&mut self.pending);
         // Signal cancellation to all running tasks.
-        // Since we already dropped the JoinHandles above, they should
+        // Since we already dropped the result receivers above, they should
         // fail silently.
         for (_hash, (cancel_tx, _gossip, _source)) in self.cancel_handles.drain() {
             let _ = cancel_tx.send(CancelDownloadAndVerify);
@@ -878,6 +897,7 @@ mod tests {
             false,
             u64::MAX,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         )
     }
 
@@ -977,6 +997,7 @@ mod tests {
             false,
             u64::MAX,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1028,6 +1049,7 @@ mod tests {
             false,
             u64::MAX,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1073,6 +1095,7 @@ mod tests {
             false,
             u64::MAX,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1135,6 +1158,7 @@ mod tests {
             false,
             max_transaction_bytes,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1149,6 +1173,57 @@ mod tests {
 
         assert!(result.is_ok(), "transaction at the limit should verify");
         assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The mempool only drains verified transactions when it is polled, so
+    /// the signal must not fire until the result can be drained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verification_finished_signal_follows_drainable_result() {
+        let verification_finished = Arc::new(Notify::new());
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    panic!("unexpected transaction verifier request: {request:?}");
+                };
+                let miner_fee = transaction.conventional_fee();
+                let transaction =
+                    VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                        .expect("test transaction pays its conventional fee");
+
+                Ok::<_, BoxError>(tx::Response::Mempool {
+                    transaction,
+                    spent_mempool_outpoints: Vec::new(),
+                })
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            PeerCooldowns::default(),
+            verification_finished.clone(),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Tx(empty_v5_transaction(1)), None, None)
+            .expect("pushed transaction is queued");
+
+        tokio::time::timeout(Duration::from_secs(1), verification_finished.notified())
+            .await
+            .expect("finished verification should signal the mempool");
+
+        let result = futures::FutureExt::now_or_never(downloads.next())
+            .expect("signalled result should be drainable without waiting")
+            .expect("download stream should yield an item")
+            .expect("pushed transaction should not time out");
+        assert!(result.is_ok(), "pushed transaction should verify");
     }
 
     #[tokio::test]
@@ -1189,6 +1264,7 @@ mod tests {
             false,
             max_bytes,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1273,6 +1349,7 @@ mod tests {
             false,
             max_bytes,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1338,6 +1415,7 @@ mod tests {
             false,
             u64::MAX,
             PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         let gossip = Gossip::Tx(transaction);
@@ -1412,6 +1490,7 @@ mod tests {
             false,
             u64::MAX,
             peer_cooldowns.clone(),
+            Arc::new(Notify::new()),
         );
 
         downloads

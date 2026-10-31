@@ -682,6 +682,7 @@ impl StartCmd {
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
         );
+        let mempool_verification_finished = mempool.verification_finished();
         let mempool = spawn_buffer(
             BoxService::new(mempool),
             mempool::downloads::MAX_INBOUND_CONCURRENCY,
@@ -842,7 +843,8 @@ impl StartCmd {
         node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+        let mempool_queue_checker_task_handle =
+            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
         node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");

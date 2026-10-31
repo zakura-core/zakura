@@ -81,8 +81,8 @@ fn exit_if_cpu_lacks_pasta_assembly_features() {
 
     eprintln!(
         "zakurad was built to use Pasta field assembly that needs CPU features this machine \
-         lacks: {}. Use an official release binary, or rebuild without CPU-specific RUSTFLAGS \
-         such as `-C target-cpu=native`.",
+         lacks: {}. Rebuild with the `portable` feature: \
+         `cargo build --locked --release --package zakura --features portable`.",
         missing.join(", ")
     );
     std::process::exit(1);

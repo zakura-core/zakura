@@ -730,6 +730,9 @@ impl PeerWorkQueue {
 }
 
 #[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{cmp::Ordering, sync::Arc};
 

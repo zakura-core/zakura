@@ -1496,7 +1496,11 @@ impl PeerRoutine {
             Ok(block) => block,
             Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
         };
-        match self.io.decoded_pool.try_admit(block, Admission::WithinLimit) {
+        match self
+            .io
+            .decoded_pool
+            .try_admit(block, Admission::WithinLimit)
+        {
             Ok(block) => {
                 let bytes = block.decoded_bytes();
                 Ok((Some(block), bytes))

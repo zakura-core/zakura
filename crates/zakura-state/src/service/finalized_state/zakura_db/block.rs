@@ -18,13 +18,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, PayloadAdmissionFailure,
-    TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, ParseScope,
+    PayloadAdmissionFailure, ReadMemoryExhausted, TransactionHandle,
 };
 
 use zakura_chain::{
     amount::NonNegative,
-    block::{self, Block, Height},
+    block::{self, Block, Height, MAX_BLOCK_BYTES},
     ironwood, orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
@@ -227,27 +227,50 @@ impl ZakuraDb {
         &self,
         hash_or_height: HashOrHeight,
     ) -> Result<Option<BlockHandle>, AdmissionFailure> {
-        self.block_from_pool(hash_or_height, &self.read_blocks)
+        let block = self
+            .read_blocks
+            .try_decode_bounded(&self.read_memory, |scope| {
+                Ok(self
+                    .decode_stored_block(hash_or_height, scope)?
+                    .map(|(block, _)| block))
+            })?;
+        Ok(block.map(Into::into))
     }
 
-    fn block_from_pool(
+    /// Decode a stored block and report its serialized size. `scope` funds raw rows and
+    /// decoded transactions as this read allocates them. Each raw row returns its charge
+    /// after decoding. Missing or pruned bodies return `Ok(None)`.
+    fn decode_stored_block(
         &self,
         hash_or_height: HashOrHeight,
-        pool: &zakura_node_services::block_memory::DecodedBlockPool,
-    ) -> Result<Option<BlockHandle>, AdmissionFailure> {
-        pool.try_decode(|| {
-            let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
-            let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
-            let transactions = raw_txs
-                .iter()
-                .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
-                .collect();
-            Some(Block {
+        scope: &mut ParseScope,
+    ) -> Result<Option<(Block, usize)>, ReadMemoryExhausted> {
+        let Some((raw_header, raw_txs)) = self.raw_block(hash_or_height, scope)? else {
+            return Ok(None);
+        };
+        let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
+        let tx_count = CompactSizeMessage::try_from(raw_txs.len())
+            .expect("stored block transaction count fits the wire format")
+            .zcash_serialize_to_vec()
+            .expect("serializing a transaction count to a vec cannot fail");
+        let mut size = raw_header.raw_bytes().len() + tx_count.len();
+        let mut transactions = Vec::with_capacity(raw_txs.len());
+        for raw_tx in raw_txs {
+            let transaction = Arc::<Transaction>::from_bytes(raw_tx.raw_bytes());
+            scope.try_charge(transaction.decoded_memory_size_bytes())?;
+            let raw_len = raw_tx.raw_bytes().len();
+            size += raw_len;
+            drop(raw_tx);
+            scope.release(byte_count(raw_len));
+            transactions.push(transaction);
+        }
+        Ok(Some((
+            Block {
                 header,
                 transactions,
-            })
-        })
-        .map(|block| block.map(Into::into))
+            },
+            size,
+        )))
     }
 
     /// Read a full block and its serialized size under final-holder admission.
@@ -257,26 +280,16 @@ impl ZakuraDb {
         hash_or_height: HashOrHeight,
     ) -> Result<Option<(BlockHandle, usize)>, AdmissionFailure> {
         let mut size = 0;
-        let block = self.read_blocks.try_decode(|| {
-            let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
-            let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
-            let transactions: Vec<_> = raw_txs
-                .iter()
-                .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
-                .collect();
-            let tx_count = CompactSizeMessage::try_from(transactions.len())
-                .expect("stored block transaction count fits the wire format");
-            let tx_raw = tx_count
-                .zcash_serialize_to_vec()
-                .expect("serializing a transaction count to a vec cannot fail");
-            size = raw_header.raw_bytes().len()
-                + raw_txs.iter().map(|tx| tx.raw_bytes().len()).sum::<usize>()
-                + tx_raw.len();
-            Some(Block {
-                header,
-                transactions,
-            })
-        })?;
+        let block = self
+            .read_blocks
+            .try_decode_bounded(&self.read_memory, |scope| {
+                let Some((block, stored_size)) = self.decode_stored_block(hash_or_height, scope)?
+                else {
+                    return Ok(None);
+                };
+                size = stored_size;
+                Ok(Some(block))
+            })?;
         Ok(block.map(|block| (block.into(), size)))
     }
 
@@ -291,7 +304,9 @@ impl ZakuraDb {
         hash_or_height: HashOrHeight,
     ) -> Result<Option<OwnedRawBlock>, PayloadAdmissionFailure> {
         self.read_raw_blocks
-            .try_decode(|| self.raw_block_bytes_within(hash_or_height, usize::MAX))
+            .try_decode_bounded(&self.read_memory, |scope| {
+                self.raw_block_bytes_within(hash_or_height, usize::MAX, scope)
+            })
     }
 
     /// Returns the serialized finalized block like [`Self::raw_block_result`],
@@ -301,25 +316,28 @@ impl ZakuraDb {
     /// CompactSize-encoded transaction count, and the raw transactions — so
     /// it is never deserialized. The recorded block size is checked before the
     /// transactions are read, and the exact size before the parts are copied
-    /// into the returned buffer.
+    /// into the returned buffer. `scope` funds the raw rows and that buffer.
     ///
-    /// Returns `None` if the block does not exist, if its transaction bodies
+    /// Returns `Ok(None)` if the block does not exist, if its transaction bodies
     /// are missing because they have been pruned, or if it does not fit.
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn raw_block_bytes_within(
         &self,
         hash_or_height: HashOrHeight,
         max_bytes: usize,
-    ) -> Option<Vec<u8>> {
+        scope: &mut ParseScope,
+    ) -> Result<Option<Vec<u8>>, ReadMemoryExhausted> {
         // The recorded size skips a block that cannot fit before its
         // transactions are read.
         if self
             .block_info(hash_or_height)
             .is_some_and(|info| usize::try_from(info.size()).is_ok_and(|size| size > max_bytes))
         {
-            return None;
+            return Ok(None);
         }
-        let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
+        let Some((raw_header, raw_txs)) = self.raw_block(hash_or_height, scope)? else {
+            return Ok(None);
+        };
 
         let tx_count = CompactSizeMessage::try_from(raw_txs.len())
             .expect("must work for a previously serialized block");
@@ -334,9 +352,10 @@ impl ZakuraDb {
                 .map(|raw_tx| raw_tx.raw_bytes().len())
                 .sum::<usize>();
         if size > max_bytes {
-            return None;
+            return Ok(None);
         }
 
+        scope.try_charge(byte_count(size))?;
         let mut bytes = Vec::with_capacity(size);
         bytes.extend_from_slice(raw_header.raw_bytes());
         bytes.extend_from_slice(&tx_count);
@@ -344,40 +363,53 @@ impl ZakuraDb {
             bytes.extend_from_slice(raw_tx.raw_bytes());
         }
 
-        Some(bytes)
+        Ok(Some(bytes))
     }
 
     /// Returns the raw [`Block`] with [`block::Hash`] or
     /// [`Height`], if it exists in the finalized chain and its raw transaction
     /// data is available.
     ///
-    /// Returns `None` if the block does not exist, or if its transaction bodies
-    /// are missing because they have been pruned.
+    /// Returns `Ok(None)` if the block does not exist, or if its transaction bodies
+    /// are missing because they have been pruned. `scope` funds each row as it arrives,
+    /// so a refusal stops the read before it copies the block's remaining rows.
     #[allow(clippy::unwrap_in_result)]
-    fn raw_block(&self, hash_or_height: HashOrHeight) -> Option<(RawBytes, Vec<RawBytes>)> {
+    fn raw_block(
+        &self,
+        hash_or_height: HashOrHeight,
+        scope: &mut ParseScope,
+    ) -> Result<Option<(RawBytes, Vec<RawBytes>)>, ReadMemoryExhausted> {
         // Block
-        let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+        let Some(height) = hash_or_height.height_or_else(|hash| self.height(hash)) else {
+            return Ok(None);
+        };
         if !self.contains_body_at_height(height) {
-            return None;
+            return Ok(None);
         }
 
-        let header = self.raw_block_header(height.into())?;
+        let Some(header) = self.raw_block_header(height.into()) else {
+            return Ok(None);
+        };
+        scope.try_charge(byte_count(header.raw_bytes().len()))?;
 
         // Transactions
 
-        let transactions: Vec<RawBytes> = self
-            .raw_transactions_by_height(height)
-            .map(|(_, tx)| tx)
-            .collect();
+        let mut transactions = Vec::new();
+        for (_, transaction) in self.raw_transactions_by_height(height) {
+            scope.try_charge(byte_count(transaction.raw_bytes().len()))?;
+            transactions.push(transaction);
+        }
 
         if self.raw_block_transactions_may_be_pruned(height) {
-            let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
+            let Some(transaction_hashes) = self.transaction_hashes_for_block(height.into()) else {
+                return Ok(None);
+            };
             if transactions.len() != transaction_hashes.len() {
-                return None;
+                return Ok(None);
             }
         }
 
-        Some((header, transactions))
+        Ok(Some((header, transactions)))
     }
 
     /// Returns `true` if `height` is in the range where raw transactions may
@@ -449,11 +481,18 @@ impl ZakuraDb {
     }
 
     /// Reserve a full block for chain-tip publication without spending data-result capacity.
+    #[allow(clippy::unwrap_in_result)]
     pub fn chain_tip_block(&self) -> Result<Option<BlockHandle>, AdmissionFailure> {
         let Some((height, _)) = self.tip() else {
             return Ok(None);
         };
-        self.block_from_pool(height.into(), &self.chain_tip_blocks)
+        // The fixed partition's block count bounds this parser with its results.
+        let block = self.chain_tip_blocks.try_decode(|| {
+            self.decode_stored_block(height.into(), &mut ParseScope::statically_bounded())
+                .expect("a statically bounded parser scope never refuses a charge")
+                .map(|(block, _)| block)
+        })?;
+        Ok(block.map(Into::into))
     }
 
     #[allow(clippy::unwrap_in_result)]
@@ -525,13 +564,25 @@ impl ZakuraDb {
         hash: transaction::Hash,
     ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure> {
         let mut location_and_time = None;
-        let transaction = self.read_transactions.try_decode::<Transaction>(|| {
-            let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-            let location = self.transaction_location(hash)?;
-            let time = self.block_header(location.height.into())?.time;
-            location_and_time = Some((location.height, time));
-            self.db.zs_get(&tx_by_loc, &location)
-        })?;
+        let transaction = self.read_transactions.try_decode_bounded::<Transaction>(
+            &self.read_memory,
+            |scope| {
+                scope.try_charge(MAX_BLOCK_BYTES)?;
+                let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+                let Some(location) = self.transaction_location(hash) else {
+                    return Ok(None);
+                };
+                let Some(header) = self.block_header(location.height.into()) else {
+                    return Ok(None);
+                };
+                location_and_time = Some((location.height, header.time));
+                let transaction: Option<Transaction> = self.db.zs_get(&tx_by_loc, &location);
+                if let Some(transaction) = &transaction {
+                    scope.try_charge(transaction.decoded_memory_size_bytes())?;
+                }
+                Ok(transaction)
+            },
+        )?;
         Ok(transaction.map(|transaction| {
             let (height, time) = location_and_time.expect("a decoded transaction has its location");
             (transaction.into(), height, time)
@@ -587,11 +638,19 @@ impl ZakuraDb {
                 return None;
             }
             let mut location = None;
-            let result = self.read_transactions.try_decode::<Transaction>(|| {
-                let (next_location, transaction) = transactions.next()?;
-                location = Some(next_location);
-                Some(transaction)
-            });
+            let result = self.read_transactions.try_decode_bounded::<Transaction>(
+                &self.read_memory,
+                |scope| {
+                    scope.try_charge(MAX_BLOCK_BYTES)?;
+                    let Some((next_location, transaction)) = transactions.next() else {
+                        return Ok(None);
+                    };
+                    location = Some(next_location);
+                    let transaction: Transaction = transaction;
+                    scope.try_charge(transaction.decoded_memory_size_bytes())?;
+                    Ok(Some(transaction))
+                },
+            );
             match result {
                 Ok(Some(transaction)) => Some(Ok((
                     location.expect("the decoded item has a location"),
@@ -1180,6 +1239,11 @@ impl ZakuraDb {
 ///
 /// Some UTXOs are created and spent in the same block, so they are in
 /// `tx_hash_indexes` and `new_outputs` rather than the database.
+/// Convert an in-memory length to a memory charge.
+fn byte_count(length: usize) -> u64 {
+    u64::try_from(length).unwrap_or(u64::MAX)
+}
+
 fn read_spent_utxo(
     db: &ZakuraDb,
     height: Height,

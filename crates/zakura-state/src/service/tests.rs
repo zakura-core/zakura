@@ -377,7 +377,7 @@ async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
     drop(first);
     assert!(active.load(Ordering::SeqCst));
     assert_eq!(
-        workers.available_permits(),
+        workers.slots.available_permits(),
         0,
         "the cancelled caller leaves its worker charged"
     );
@@ -393,7 +393,7 @@ async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
     };
     assert_eq!((height, hash), (Height(0), genesis.hash()));
     assert!(active.load(Ordering::SeqCst));
-    assert_eq!(workers.available_permits(), 0);
+    assert_eq!(workers.slots.available_permits(), 0);
 
     let mut block_reader = read.clone();
     let mut block_read = block_reader
@@ -417,7 +417,7 @@ async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
         "owned range reads must wait for the shared worker slot"
     );
     assert!(active.load(Ordering::SeqCst));
-    assert_eq!(workers.available_permits(), 0);
+    assert_eq!(workers.slots.available_permits(), 0);
 
     release.send(()).unwrap();
     let ReadResponse::Block(Some(block)) = timeout(limit, block_read).await.unwrap().unwrap()
@@ -436,7 +436,7 @@ async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
     );
     assert!(!active.load(Ordering::SeqCst));
     assert_eq!(
-        workers.available_permits(),
+        workers.slots.available_permits(),
         1,
         "completed workers release their slots"
     );

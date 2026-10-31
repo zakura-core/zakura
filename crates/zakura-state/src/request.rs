@@ -355,6 +355,10 @@ impl std::str::FromStr for HashOrHeight {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticallyVerifiedBlock {
     /// The block to commit to the state.
+    ///
+    /// This struct owns the allocations derived from the block, `new_outputs` and
+    /// `transaction_hashes`, alongside the block's charge. They have no charge of
+    /// their own, because each has a size proportional to the decoded block.
     pub block: BlockHandle,
     /// The hash of the block.
     pub hash: block::Hash,
@@ -2310,6 +2314,31 @@ impl TryFrom<Request> for ReadRequest {
     }
 }
 
+/// A blocking read refused because too many callers already wait for a worker slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("too many callers are waiting for a blocking state read slot")]
+pub struct ReadWaiterLimitExceeded;
+
+/// Worker slots for blocking reads, and a separate bound on callers waiting for one.
+///
+/// A worker slot follows its job until the job ends. A waiter slot lives only while its
+/// caller waits, and that wait holds no lock and no memory charge. Clones share both bounds.
+#[derive(Clone, Debug)]
+pub struct ReadWorkerPool {
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
+    waiters: Arc<tokio::sync::Semaphore>,
+}
+
+impl ReadWorkerPool {
+    /// Create a pool with `slots` concurrent jobs and `waiters` concurrent waiting callers.
+    pub fn new(slots: usize, waiters: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+            waiters: Arc::new(tokio::sync::Semaphore::new(waiters)),
+        }
+    }
+}
+
 #[derive(Debug)]
 /// A convenience type for spawning blocking tokio tasks with
 /// a timer in the scope of a provided span.
@@ -2329,10 +2358,11 @@ impl TimedSpan {
     /// The worker owns its slot until execution ends, even if the caller drops
     /// the returned future. An unadmitted read waits without spawning a worker.
     /// Dropping that waiting future releases its request and removes its waiter.
+    /// A read that would exceed the pool's waiter bound fails immediately.
     #[track_caller]
     pub fn spawn_blocking<T: Send + 'static>(
         mut self,
-        workers: Arc<tokio::sync::Semaphore>,
+        workers: ReadWorkerPool,
         f: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
     ) -> Pin<Box<dyn futures::Future<Output = Result<T, BoxError>> + Send>> {
         let location = std::panic::Location::caller();
@@ -2348,12 +2378,62 @@ impl TimedSpan {
             })
             .wait_for_panics()
         };
-        match workers.clone().try_acquire_owned() {
+        match workers.slots.clone().try_acquire_owned() {
             Ok(slot) => spawn(slot),
             Err(_) => Box::pin(async move {
-                let slot = workers.acquire_owned().await?;
+                let waiter = workers
+                    .waiters
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| ReadWaiterLimitExceeded)?;
+                let slot = workers.slots.clone().acquire_owned().await?;
+                drop(waiter);
                 spawn(slot).await
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod derived_allocation_tests {
+    use super::*;
+    use std::mem::size_of_val;
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    /// The most derived bytes that one legal test block has per decoded byte.
+    const MAX_DERIVED_BYTES_PER_DECODED_BYTE: u64 = 8;
+
+    #[test]
+    fn derived_allocations_stay_proportional_to_their_block() {
+        for bytes in [
+            &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES[..],
+        ] {
+            let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+            let decoded = block.attributed_memory_size_bytes();
+            let verified = SemanticallyVerifiedBlock::from(block);
+
+            let (outpoint, ordered) = verified
+                .new_outputs
+                .iter()
+                .next()
+                .expect("every test block has a coinbase output");
+            let entry = size_of_val(outpoint) + size_of_val(ordered);
+            let table = verified.new_outputs.capacity().saturating_mul(entry);
+            let scripts: usize = verified
+                .new_outputs
+                .values()
+                .map(|ordered| ordered.utxo.output.lock_script.as_raw_bytes().len())
+                .sum();
+            let hashes = size_of_val(&*verified.transaction_hashes);
+            let derived = u64::try_from(table + scripts + hashes).unwrap();
+
+            assert!(
+                derived <= MAX_DERIVED_BYTES_PER_DECODED_BYTE * decoded,
+                "{derived} derived bytes for {decoded} decoded bytes"
+            );
         }
     }
 }
@@ -2366,7 +2446,7 @@ mod locator_capacity_tests {
     #[tokio::test]
     async fn blocking_read_slot_survives_caller_drop_and_worker_panic() {
         use std::{sync::atomic::AtomicUsize, time::Duration};
-        use tokio::{sync::Semaphore, time::timeout};
+        use tokio::time::timeout;
 
         struct LiveJob(Arc<AtomicUsize>);
         impl Drop for LiveJob {
@@ -2376,7 +2456,7 @@ mod locator_capacity_tests {
         }
 
         for panic in [false, true] {
-            let workers = Arc::new(Semaphore::new(1));
+            let workers = ReadWorkerPool::new(1, 16);
             let active = Arc::new(AtomicUsize::new(0));
             let running = active.clone();
             let (started, started_rx) = tokio::sync::oneshot::channel();
@@ -2397,22 +2477,25 @@ mod locator_capacity_tests {
             drop(result);
             assert_eq!(active.load(Ordering::SeqCst), 1);
             assert_eq!(
-                workers.available_permits(),
+                workers.slots.available_permits(),
                 0,
                 "the actual worker owns its slot"
             );
             release.send(()).unwrap();
-            let slot = timeout(Duration::from_secs(10), workers.clone().acquire_owned())
-                .await
-                .unwrap()
-                .unwrap();
+            let slot = timeout(
+                Duration::from_secs(10),
+                workers.slots.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(
                 active.load(Ordering::SeqCst),
                 0,
                 "execution ends before slot release"
             );
             drop(slot);
-            assert_eq!(workers.available_permits(), 1);
+            assert_eq!(workers.slots.available_permits(), 1);
         }
     }
 
@@ -2427,8 +2510,8 @@ mod locator_capacity_tests {
         }
 
         for poll in [false, true] {
-            let workers = Arc::new(tokio::sync::Semaphore::new(1));
-            let occupied = workers.clone().try_acquire_owned().unwrap();
+            let workers = ReadWorkerPool::new(1, 16);
+            let occupied = workers.slots.clone().try_acquire_owned().unwrap();
             let released = Arc::new(AtomicBool::new(false));
             let input = PendingInput(released.clone());
             let ran = Arc::new(AtomicBool::new(false));
@@ -2449,7 +2532,7 @@ mod locator_capacity_tests {
                 "cancellation drops the waiting input"
             );
             assert!(!ran.load(Ordering::SeqCst), "unadmitted work never starts");
-            assert_eq!(workers.available_permits(), 0);
+            assert_eq!(workers.slots.available_permits(), 0);
             drop(occupied);
             let next = TimedSpan::new(
                 CodeTimer::start_desc("read_after_cancel"),
@@ -2463,8 +2546,36 @@ mod locator_capacity_tests {
                     .unwrap(),
                 7
             );
-            assert_eq!(workers.available_permits(), 1);
+            assert_eq!(workers.slots.available_permits(), 1);
         }
+    }
+
+    /// Callers beyond the waiter bound fail, and a cancelled waiter returns its waiter slot.
+    #[tokio::test]
+    async fn waiter_bound_refuses_excess_callers_without_holding_capacity() {
+        let workers = ReadWorkerPool::new(1, 1);
+        let occupied = workers.slots.clone().try_acquire_owned().unwrap();
+        let read = |workers: &ReadWorkerPool| {
+            TimedSpan::new(CodeTimer::start_desc("read_waiter"), tracing::Span::none())
+                .spawn_blocking(workers.clone(), || Ok(7))
+        };
+
+        let mut waiting = read(&workers);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let refused = read(&workers).await.unwrap_err();
+        assert!(refused.downcast_ref::<ReadWaiterLimitExceeded>().is_some());
+
+        drop(waiting);
+        let mut replacement = read(&workers);
+        assert!(futures::poll!(&mut replacement).is_pending());
+        drop(occupied);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), replacement)
+                .await
+                .unwrap()
+                .unwrap(),
+            7
+        );
     }
 
     /// An admitted job stays charged while Tokio queues it behind another blocking job.
@@ -2487,7 +2598,7 @@ mod locator_capacity_tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let workers = Arc::new(tokio::sync::Semaphore::new(1));
+            let workers = ReadWorkerPool::new(1, 16);
             let ran = Arc::new(AtomicBool::new(false));
             let executed = ran.clone();
             let result =
@@ -2499,16 +2610,18 @@ mod locator_capacity_tests {
             drop(result);
             assert!(!ran.load(Ordering::SeqCst));
             assert_eq!(
-                workers.available_permits(),
+                workers.slots.available_permits(),
                 0,
                 "the queued job keeps its admission"
             );
             release.send(()).unwrap();
-            let slot =
-                tokio::time::timeout(Duration::from_secs(10), workers.clone().acquire_owned())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let slot = tokio::time::timeout(
+                Duration::from_secs(10),
+                workers.slots.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(ran.load(Ordering::SeqCst));
             drop(slot);
             blocker.await.unwrap();
@@ -2530,7 +2643,7 @@ mod locator_capacity_tests {
                 CodeTimer::start_desc("locator_capacity_test"),
                 tracing::Span::none(),
             )
-            .spawn_blocking(Arc::new(tokio::sync::Semaphore::new(1)), move || {
+            .spawn_blocking(ReadWorkerPool::new(1, 16), move || {
                 let ReadRequest::HeaderLocator { permit: _permit } = request else {
                     unreachable!();
                 };

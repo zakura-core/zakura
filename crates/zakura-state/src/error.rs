@@ -168,6 +168,10 @@ pub enum StateInitError {
     #[error("disk block admission failed: {0}")]
     BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
 
+    /// The configured read limits cannot fund their workers and one legal result.
+    #[error("invalid read capacity configuration: {0}")]
+    ReadCapacity(#[from] crate::config::ReadCapacityError),
+
     /// The configured historical frontier artifact could not be read or decoded.
     ///
     /// Only nodes that derive historical trees reach this. A node that does not derive ignores an

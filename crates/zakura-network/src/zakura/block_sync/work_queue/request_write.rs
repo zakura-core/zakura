@@ -235,12 +235,14 @@ impl TakenRequest {
         let self_owned = self;
         #[cfg(any(test, zakura_sim))]
         {
-            self_owned.reporter = Some(RequestReporter {
+            let reporter = RequestReporter {
                 observer: self_owned.work.observer.clone(),
                 owner,
                 heights: self_owned.items.iter().map(|(height, _)| *height).collect(),
                 estimated_bytes: bytes,
-            });
+            };
+            reporter.report(RequestStep::Funded);
+            self_owned.reporter = Some(reporter);
         }
         Ok(UnpublishedRequest {
             taken: self_owned,

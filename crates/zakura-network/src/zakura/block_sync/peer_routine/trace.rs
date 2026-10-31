@@ -1,6 +1,10 @@
-use super::super::trace::{
-    elapsed_us, height as trace_height, peer as trace_peer, saturating_usize, BlockTraceEvent,
-    BlockTraceFields, BoolOrU64,
+use super::super::{
+    admission::RequestPriority,
+    trace::{
+        elapsed_us, height as trace_height, peer as trace_peer, request_owner as trace_owner,
+        saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
+    },
+    work_queue::UnpublishedRequest,
 };
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
@@ -123,8 +127,26 @@ impl PeerRoutine {
         });
     }
 
+    /// Record the exact owner, run, and charge that queue admission funded.
+    pub(super) fn trace_request_funded(&self, funded: &UnpublishedRequest) {
+        self.emit(bs_trace::BLOCK_REQUEST_FUNDED, |row| {
+            row.peer = Some(trace_peer(&self.io.peer));
+            row.request_owner = Some(trace_owner(&funded.owner()));
+            row.request_priority = Some(match funded.priority() {
+                RequestPriority::Floor => "floor",
+                RequestPriority::AboveFloor => "above_floor",
+            });
+            if let Some((start_height, _)) = funded.items().first() {
+                row.range_start = Some(trace_height(*start_height));
+            }
+            row.range_count = Some(saturating_usize(funded.items().len()));
+            row.estimated_bytes = Some(funded.bytes());
+        });
+    }
+
     pub(super) fn trace_get_blocks_sent(
         &self,
+        owner: &zakura_header_chain::BodyWorkOwner,
         start_height: block::Height,
         count: u32,
         estimated_bytes: u64,
@@ -132,6 +154,7 @@ impl PeerRoutine {
     ) {
         self.emit(bs_trace::BLOCK_GET_BLOCKS_SENT, |row| {
             row.peer = Some(trace_peer(&self.io.peer));
+            row.request_owner = Some(trace_owner(owner));
             row.range_start = Some(trace_height(start_height));
             row.range_count = Some(u64::from(count));
             row.estimated_bytes = Some(estimated_bytes);

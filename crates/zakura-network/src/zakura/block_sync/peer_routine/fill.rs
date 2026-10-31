@@ -138,6 +138,9 @@ pub(super) struct FillReport {
     pub(super) stop: FillStop,
     /// Requests the pass published.
     pub(super) sent: u32,
+    /// Taken heights the retry filter returned to the queue. These heights made
+    /// no progress in this pass; `retry_at` schedules their next attempt.
+    pub(super) filtered_heights: usize,
     /// When to retry work that the retry filter returned, if it returned any.
     pub(super) retry_at: Option<Instant>,
 }
@@ -149,6 +152,8 @@ struct FillPass {
     now: Instant,
     /// The wake that the retry filter scheduled for work it returned.
     retry_at: Option<Instant>,
+    /// Taken heights that the retry filter returned in this pass.
+    filtered_heights: usize,
 }
 
 /// Requester and transport capacity for one request, acquired before any work
@@ -191,6 +196,7 @@ enum PublishOutcome {
 /// The facts that a published request's diagnostics report.
 #[derive(Copy, Clone, Debug)]
 struct IssuedRequest {
+    owner: zakura_header_chain::BodyWorkOwner,
     start_height: block::Height,
     count: u32,
     estimated_bytes: u64,
@@ -227,6 +233,7 @@ impl PeerRoutine {
         let mut pass = FillPass {
             now,
             retry_at: None,
+            filtered_heights: 0,
         };
         let request_sender = self.io.session.request_sender();
         let mut sent = 0u32;
@@ -239,6 +246,7 @@ impl PeerRoutine {
         let report = FillReport {
             stop,
             sent,
+            filtered_heights: pass.filtered_heights,
             retry_at: pass.retry_at,
         };
         self.finish_fill_pass(report);
@@ -278,6 +286,7 @@ impl PeerRoutine {
         // Funding: the queue derives the charge and floor exception from the
         // retained run, never from the probe.
         let unpublished = self.fund(request, download_floor)?;
+        self.trace_request_funded(&unpublished);
         let first_height = unpublished
             .items()
             .first()
@@ -285,6 +294,7 @@ impl PeerRoutine {
             .ok_or(FillStop::Internal)?;
 
         // Preparation: the request, its response authorization, and its frame.
+        let owner = unpublished.owner();
         let request = block_range_request(&unpublished)?;
         let writer = self.authorize_response(&request, capacity.entry, capacity.exchange)?;
         let queued_at = Instant::now();
@@ -293,6 +303,7 @@ impl PeerRoutine {
 
         // Publication: writer fence, work claim, outstanding record, then send.
         let issued = IssuedRequest {
+            owner,
             start_height: request.start_height,
             count: request.count,
             estimated_bytes: request.estimated_bytes,
@@ -341,6 +352,11 @@ impl PeerRoutine {
             metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
         }
         metrics::counter!("sync.block.fill_stop", "reason" => report.stop.as_str()).increment(1);
+        if report.filtered_heights > 0 {
+            // Widening usize to u64 is lossless on supported targets.
+            metrics::counter!("sync.block.fill.retry_filtered_heights")
+                .increment(report.filtered_heights as u64);
+        }
         if report.sent == 0 {
             self.trace_fill_stop(report.stop.as_str());
         }
@@ -497,11 +513,14 @@ impl PeerRoutine {
             self.retry_fact(*height, item, now)
         });
         let Some(keep) = run.keep else {
+            pass.filtered_heights += request.items().len();
             // The pass stops here, and this wake replaces any earlier attempt's.
             pass.retry_at = self.retry_filter_wake_deadline(now, run.timed_rejection);
             return Err(FillStop::RetryAvoid);
         };
-        if keep.len() != request.items().len() {
+        let filtered = request.items().len() - keep.len();
+        if filtered > 0 {
+            pass.filtered_heights += filtered;
             request.retain_range(keep);
             pass.retry_at = [
                 pass.retry_at,
@@ -722,6 +741,7 @@ impl PeerRoutine {
         self.publish_request_claims(key);
         self.publish_slot_diagnostics();
         self.trace_get_blocks_sent(
+            &issued.owner,
             issued.start_height,
             issued.count,
             issued.estimated_bytes,

@@ -1949,6 +1949,43 @@ fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
     });
 }
 
+/// A peer moving between ready and busy doesn't republish the block advertiser's peer list.
+#[test]
+fn block_advertiser_peer_list_is_republished_only_on_membership_change() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+    let (discovered, sidecar_addr, _ordinary_addr, _sidecar_handle, _ordinary_handle) =
+        sidecar_and_ordinary_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .with_block_gossip_peer_ips(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .build();
+        peer_set.ready().await.unwrap();
+        let mut advertiser = peer_set.block_advertiser();
+        assert_eq!(advertiser.peers.borrow_and_update().len(), 2);
+
+        let peer = peer_set.take_ready_service(&sidecar_addr).unwrap();
+        peer_set.push_unready(sidecar_addr, peer);
+        peer_set.ready().await.unwrap();
+        assert!(
+            !advertiser.peers.has_changed().unwrap(),
+            "a peer becoming busy is not a membership change"
+        );
+
+        peer_set.remove(&sidecar_addr);
+        peer_set.ready().await.unwrap();
+        assert!(advertiser.peers.has_changed().unwrap());
+        assert_eq!(advertiser.peers.borrow_and_update().len(), 1);
+    });
+}
+
 /// The block advertiser waits for a peer instead of failing while none is connected.
 #[test]
 fn block_advertiser_waits_for_a_connected_peer() {

@@ -1006,11 +1006,17 @@ where
     }
 
     /// Records the block gossip sender for the current ready or busy connection generation.
+    ///
+    /// Marks the published peer list stale only when this is a new peer or a new connection for
+    /// the key, because this runs every time a peer moves between ready and busy.
     fn insert_block_gossip_peer(&mut self, key: D::Key, svc: &D::Service) {
         let mut peer = svc.block_gossip.clone();
         peer.sidecar = self.is_zcashd_compat_peer(svc);
+        let unchanged = self.block_gossip_peers.get(&key).is_some_and(|known| {
+            known.sender.same_channel(&peer.sender) && known.sidecar == peer.sidecar
+        });
         self.block_gossip_peers.insert(key, peer);
-        self.block_gossip_peers_changed = true;
+        self.block_gossip_peers_changed |= !unchanged;
     }
 
     /// Returns true if `service` is a configured zcashd sidecar peer.

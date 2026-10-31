@@ -181,6 +181,10 @@ pub struct TargetReadiness {
     pub detail: Option<String>,
     /// Each admitted seed's run in this process.
     pub seeds: Vec<SeedRun>,
+    /// The optional seeds that failed validation, which no run includes,
+    /// relative to the repository's root: the harness's, and those whose
+    /// sidecar names no registered harness.
+    pub quarantined: Vec<PathBuf>,
     /// The harness's own properties that applied in some seed's run.
     pub applied: Vec<String>,
     /// The harness's own properties that applied in no seed's run.
@@ -515,6 +519,7 @@ fn check_target(
         status: TargetStatus::Ready,
         detail: None,
         seeds: Vec::new(),
+        quarantined: Vec::new(),
         applied: Vec::new(),
         unapplied: Vec::new(),
         fuzzer_runs: None,
@@ -527,6 +532,11 @@ fn check_target(
     let loaded = seed::load(&options.fixtures, Some(entry.name))
         .map_err(CampaignError::io("listing the seed directories"))?;
     row.bypasses = bypasses(&options.repo, &loaded.admitted).map_err(CampaignError::Refused)?;
+    row.quarantined = loaded
+        .quarantined
+        .iter()
+        .map(|failed| seed::from_root(&failed.path))
+        .collect();
     if let Some(failed) = loaded.rejected.first() {
         return Ok(row.with(
             TargetStatus::SeedsRejected,
@@ -650,8 +660,8 @@ pub fn smoke_command(
 
 impl TargetReadiness {
     /// The row in words: its target, harness, status and detail, the
-    /// harness's own properties that applied and those that didn't, and its
-    /// retained bypasses, one line each.
+    /// harness's own properties that applied and those that didn't, its
+    /// quarantined seeds, and its retained bypasses, one line each.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "{} ({}): {}{}",
@@ -670,6 +680,14 @@ impl TargetReadiness {
                 "  applied in no seed: {}",
                 self.unapplied.join(", ")
             ));
+        }
+        if !self.quarantined.is_empty() {
+            let files: Vec<String> = self
+                .quarantined
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect();
+            lines.push(format!("  quarantined: {}", files.join(", ")));
         }
         if self.bypasses.is_empty() {
             lines.push("  no retained production bypass".to_owned());

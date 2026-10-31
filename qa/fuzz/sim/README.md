@@ -286,8 +286,9 @@ must name the harness the table maps it to, so a target whose
   which libFuzzer cuts it to.
 
 It prints each target's status, the harness's own properties that applied
-and those that didn't, and the retained bypasses under `qa/planted/` whose
-input runs on the harness, or that there are none. `<dir>/readiness.json`
+and those that didn't, the optional seeds it quarantined, and the retained
+bypasses under `qa/planted/` whose input runs on the harness, or that there
+are none. `<dir>/readiness.json`
 holds the same report, and `<dir>/<target>/` holds the binary, the seeds,
 the log and the stats. The command exits 0 only if every target is
 `ready`. A seed run shows that a target builds and runs its harness. It

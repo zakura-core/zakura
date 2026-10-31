@@ -371,3 +371,58 @@ fn a_seed_past_max_len_is_unaccounted() {
     assert_eq!(judge(Some(4097)).0, TargetStatus::Ready);
     assert_eq!(judge(None).0, TargetStatus::Ready);
 }
+
+/// A checkout with this repository's suite and fuzz manifest, and one
+/// seed directory, so `check_targets` stops at each harness's seeds.
+fn checkout(dir: &Path) -> (PathBuf, PathBuf) {
+    let repo = dir.join("repo");
+    for file in [
+        PathBuf::from(SUITE_FILE),
+        Path::new(FUZZ_PACKAGE).join("Cargo.toml"),
+    ] {
+        fs::create_dir_all(repo.join(&file).parent().unwrap()).unwrap();
+        fs::copy(root().join(&file), repo.join(&file)).unwrap();
+    }
+    let fixtures = dir.join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    (repo, fixtures)
+}
+
+/// An optional seed that fails validation is quarantined, and its row
+/// names it, so no seed drops out of the report unseen. The report on
+/// disk is the one returned.
+#[test]
+fn quarantined_seeds_stay_in_the_report() {
+    use zakura_sim::campaign::{check_targets, Readiness, TargetsOptions, READINESS_FILE};
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, fixtures) = checkout(dir.path());
+    fs::write(fixtures.join("stale.bin"), b"stale").unwrap();
+    fs::write(
+        fixtures.join("stale.toml"),
+        "harness = \"discovery/wait-complete\"\ngenerator = 1\nsha256 = \"00\"\n\
+         scenario_sha256 = \"00\"\nsource = \"a test\"\nrequired = false\n",
+    )
+    .unwrap();
+    let options = TargetsOptions {
+        repo,
+        out: dir.path().join("out"),
+        targets: vec!["discovery_wait_complete".to_owned()],
+        sanitizer: "none".to_owned(),
+        target_dir: dir.path().join("target"),
+        fixtures: vec![fixtures.clone()],
+        child: std::time::Duration::from_secs(1),
+    };
+    let report = check_targets(&options, |_| {}).unwrap();
+    let [row] = report.targets.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(row.status, TargetStatus::NoSeeds, "{row:?}");
+    assert_eq!(row.quarantined, [fixtures.join("stale.bin")]);
+    assert!(row
+        .lines()
+        .iter()
+        .any(|line| line.contains("quarantined") && line.contains("stale.bin")));
+    let written: Readiness =
+        serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
+    assert_eq!(written, report);
+}

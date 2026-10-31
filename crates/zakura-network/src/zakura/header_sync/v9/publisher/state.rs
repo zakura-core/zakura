@@ -19,6 +19,8 @@
 //! capacity signal, and tells state about them by identity: a [`SlotOffer`]
 //! for an `Open`, a [`CapacityWait`] for a capacity refusal, and a [`Page`]'s
 //! facts for a page. Dropping this state releases nothing and wakes nobody.
+//! State emits no metric, log, or transition event: it returns what happened,
+//! and the runtime owner reports it.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -37,7 +39,10 @@ use super::{
 };
 use crate::zakura::{
     header_sync::wire::{AuxSchema, MAX_HS_RANGE},
-    regulation::{Applied, PublicationLedger, SlotId, SlotOffer, SubscriptionLimits, Totals},
+    regulation::{
+        Applied, PublicationLedger, PublicationOpened, SlotId, SlotOffer, SubscriptionLimits,
+        Totals,
+    },
 };
 
 /// The fields an update must repeat from its `Open`.
@@ -256,14 +261,6 @@ impl PublisherState {
         }
     }
 
-    /// This state, reporting its subscription transitions through `tap` if
-    /// there is one.
-    #[cfg(any(test, zakura_sim))]
-    pub(super) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<u64>>) -> Self {
-        self.publications = self.publications.observed_by(tap);
-        self
-    }
-
     /// Check an `Open` and apply it to the ledger under the slot `offer`. A
     /// refused `Open` changes nothing and leaves the offer with its owner.
     pub(super) fn open(
@@ -271,13 +268,13 @@ impl PublisherState {
         update: &SubscribeHeaders,
         limits: PageLimits,
         offer: SlotOffer,
-    ) -> Result<(), PublisherFault> {
+    ) -> Result<PublicationOpened, PublisherFault> {
         let id = update.subscription_id;
         let schema = update.tree_aux_schema;
         if (limits.aux_schema_mask & schema.mask_bit()) != schema.mask_bit() {
             return Err(PublisherFault::UnadvertisedSchema);
         }
-        self.publications.open(
+        let opened = self.publications.open(
             id,
             update.update_sequence,
             update.added_credit,
@@ -299,7 +296,7 @@ impl PublisherState {
                 stall: None,
             },
         );
-        Ok(())
+        Ok(opened)
     }
 
     /// Check a `Grant` or `Close` and apply it to the ledger. A refused update
@@ -336,12 +333,12 @@ impl PublisherState {
 
     /// End every subscription that is closing or has an outcome queued, in
     /// order, queue each terminal outcome to write in that order, and return
-    /// the outcomes.
+    /// each ended subscription with its outcome.
     ///
     /// An outcome this node already queued wins over `SubscriptionClosed`,
     /// as the specification requires. Ending the subscription of the job in
     /// progress abandons that job.
-    pub(super) fn end_due(&mut self) -> Vec<HeadersOutcomeCode> {
+    pub(super) fn end_due(&mut self) -> Vec<(u64, HeadersOutcomeCode)> {
         let due: Vec<(u64, HeadersOutcomeCode)> = self
             .subscriptions
             .iter()
@@ -377,7 +374,7 @@ impl PublisherState {
                     slot,
                     abandons,
                 });
-                Some(outcome)
+                Some((id, outcome))
             })
             .collect()
     }

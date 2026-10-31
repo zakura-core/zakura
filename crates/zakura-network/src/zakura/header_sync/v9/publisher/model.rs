@@ -927,7 +927,7 @@ impl Machine {
     }
 
     fn end_due(&mut self) {
-        let ended = self.owner.state.end_due();
+        let ended = self.owner.end_due();
         let model = &mut self.model;
         let expected: Vec<(u64, HeadersOutcomeCode)> = model
             .subs

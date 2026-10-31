@@ -57,8 +57,8 @@ pub(crate) mod sizing;
 
 mod subscription;
 pub(crate) use subscription::{
-    within_window, Applied, CreditExceeded, PageStall, PublicationLedger, PublicationSlots,
-    Publications, ResponseCredit, SharedSubscriptions, SlotId, SlotOffer, SubscribeRefused,
+    within_window, Applied, CreditExceeded, PageStall, PublicationLedger, PublicationOpened,
+    PublicationReporter, PublicationSlots, Publications, ResponseCredit, SharedSubscriptions, SlotId, SlotOffer, SubscribeRefused,
     SubscriptionEnded, SubscriptionFault, SubscriptionLimits, Subscriptions, TerminalPermit,
     Totals, Update,
 };

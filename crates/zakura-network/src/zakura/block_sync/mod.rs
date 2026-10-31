@@ -129,7 +129,7 @@ impl zakura_header_chain::Clock for BlockSyncClock {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
     zakura_header_chain::BodyWorkAuthority {
         header: zakura_header_chain::HeaderWorkAuthority {
@@ -189,3 +189,12 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
         }
     }
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use work_queue::{replay_work_ownership_bytes, WorkOwnershipReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_registry::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};

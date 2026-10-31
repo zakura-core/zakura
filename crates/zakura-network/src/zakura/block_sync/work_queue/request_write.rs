@@ -270,6 +270,13 @@ impl UnpublishedRequest {
 
     /// Publish outstanding state and enqueue under the work lock. The local
     /// claim survives the callback so a closed channel cannot drop it under the lock.
+    #[cfg_attr(
+        any(test, zakura_sim),
+        allow(
+            clippy::unwrap_in_result,
+            reason = "missing capture is an infrastructure failure, not a publication refusal"
+        )
+    )]
     pub(in crate::zakura::block_sync) fn publish(
         self,
         publish: impl FnOnce(&Arc<RequestWrite>),

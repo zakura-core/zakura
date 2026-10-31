@@ -972,3 +972,6 @@ impl WorkQueue {
         self.lock().state.in_flight_contains(height)
     }
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{replay_work_ownership_bytes, WorkOwnershipReplaySummary};

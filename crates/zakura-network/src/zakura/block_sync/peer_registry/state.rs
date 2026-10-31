@@ -31,8 +31,13 @@ use super::{
 };
 use crate::zakura::ZakuraConnId;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};
 
 // ---- peer summaries ----
 

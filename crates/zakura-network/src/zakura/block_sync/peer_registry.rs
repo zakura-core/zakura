@@ -50,6 +50,11 @@ use super::{
 use crate::zakura::ZakuraConnId;
 
 mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};
 
 use state::{BodyRetryAlarms, PeerTable, SupplierRetryState};
 

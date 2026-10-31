@@ -99,13 +99,23 @@ struct Observations {
     exit: String,
 }
 
+/// What the test does with block sync's action channel.
+#[derive(Clone, Copy)]
+enum ActionSeam {
+    /// A task drains every action and answers none.
+    Drain,
+    /// A task reports each block query failed and drains every other action.
+    FailQueries,
+    /// The test drops the receiver, which closes the channel.
+    Close,
+}
+
 /// What block sync starts from.
 struct Scenario {
     /// The committed header-chain view block sync starts from.
     view: CommittedHeaderChainView,
-    /// Whether a task drains block sync's actions. Without one, the action
-    /// receiver is dropped, so every action fails to dispatch.
-    drain_actions: bool,
+    /// What happens to block sync's actions.
+    actions: ActionSeam,
     /// UTC at virtual time zero.
     utc_origin: Option<SystemTime>,
 }
@@ -116,7 +126,7 @@ impl Scenario {
         let genesis = genesis();
         Scenario {
             view: committed_view(genesis, genesis, AlarmSet::default()),
-            drain_actions: true,
+            actions: ActionSeam::Drain,
             utc_origin: None,
         }
     }
@@ -185,13 +195,11 @@ struct Run {
     steps: Vec<String>,
     deadlines: Vec<Duration>,
     shutdown: CancellationToken,
-    /// Block sync's handle and the committed-view sender, until shutdown
-    /// drops them. The handle owns the routine wiring, which keeps the
-    /// sequencer's body input open.
-    inputs: Option<(
-        BlockSyncHandle,
-        watch::Sender<Option<CommittedHeaderChainView>>,
-    )>,
+    /// Block sync's handle, until shutdown drops it. The handle owns the
+    /// routine wiring, which keeps the sequencer's body input open.
+    handle: Rc<RefCell<Option<BlockSyncHandle>>>,
+    /// The committed-view sender, until shutdown drops it.
+    views: Option<watch::Sender<Option<CommittedHeaderChainView>>>,
     exit: Rc<RefCell<Option<String>>>,
 }
 
@@ -221,13 +229,30 @@ impl Run {
         let (handle, mut actions, reactor) =
             spawn_block_sync_reactor(startup(&scenario.view, views_rx, shutdown.clone()))
                 .expect("block sync starts");
-        if scenario.drain_actions {
-            sched.spawn_root(
-                "actions",
-                async move { while actions.recv().await.is_some() {} },
-            );
-        } else {
-            drop(actions);
+        let handle = Rc::new(RefCell::new(Some(handle)));
+        match scenario.actions {
+            ActionSeam::Drain => {
+                sched.spawn_root(
+                    "actions",
+                    async move { while actions.recv().await.is_some() {} },
+                );
+            }
+            ActionSeam::FailQueries => {
+                let handle = Rc::clone(&handle);
+                sched.spawn_root("actions", async move {
+                    while let Some(action) = actions.recv().await {
+                        if let BlockSyncAction::QueryNeededBlocks {
+                            query_id, scope, ..
+                        } = action
+                        {
+                            if let Some(handle) = &*handle.borrow() {
+                                let _ = handle.send_needed_blocks_query_failure(query_id, scope);
+                            }
+                        }
+                    }
+                });
+            }
+            ActionSeam::Close => drop(actions),
         }
         let exit = Rc::new(RefCell::new(None));
         {
@@ -247,7 +272,8 @@ impl Run {
             steps: Vec::new(),
             deadlines: Vec::new(),
             shutdown,
-            inputs: Some((handle, views)),
+            handle,
+            views: Some(views),
             exit,
         }
     }
@@ -321,7 +347,8 @@ impl Run {
                 ),
             }
         }
-        drop(self.inputs.take());
+        self.handle.take();
+        self.views.take();
         let end = loop {
             match self.settle() {
                 Status::WaitingOnTime => {
@@ -406,24 +433,27 @@ fn the_same_plan_replays_the_same_block_sync_run() {
     assert_ne!(first.steps, other.steps);
 }
 
+/// A scenario whose header tip is ahead of the verified tip, but by less than
+/// the empty-state quiet period's lag, so the reactor asks for the missing
+/// bodies at once.
+fn behind(actions: ActionSeam) -> Scenario {
+    let genesis = genesis();
+    Scenario {
+        view: committed_view(
+            genesis,
+            Frontier::new(block::Height(10), block::Hash([0x11; 32])),
+            AlarmSet::default(),
+        ),
+        actions,
+        utc_origin: None,
+    }
+}
+
 #[test]
 fn block_sync_timers_ignore_the_host_clock() {
-    // The header tip is ahead of the verified tip, but by less than the
-    // empty-state quiet period's lag, so the reactor asks for the missing
-    // bodies at once. With the action receiver dropped, that query fails to
-    // dispatch, and the reactor retries it after a delay.
-    let behind = || {
-        let genesis = genesis();
-        Scenario {
-            view: committed_view(
-                genesis,
-                Frontier::new(block::Height(10), block::Hash([0x11; 32])),
-                AlarmSet::default(),
-            ),
-            drain_actions: false,
-            utc_origin: None,
-        }
-    };
+    // The action task reports each query failed, and the reactor retries it
+    // after a delay.
+    let behind = || behind(ActionSeam::FailQueries);
 
     let first = run(behind(), 3, 2);
     std::thread::sleep(Duration::from_millis(50));
@@ -443,6 +473,16 @@ fn block_sync_timers_ignore_the_host_clock() {
         "host time passing between runs changes nothing"
     );
     assert_no_panic(&first);
+}
+
+/// A closed action channel can never accept a query, so the reactor arms no
+/// retry and only its metrics tick wakes it.
+#[test]
+fn a_closed_action_channel_arms_no_query_retry() {
+    let observed = run(behind(ActionSeam::Close), 3, 2);
+    let tick = ZakuraBlockSyncConfig::default().request_timeout;
+    assert_eq!(observed.deadlines[..3], [tick, tick * 2, tick * 3]);
+    assert_no_panic(&observed);
 }
 
 /// A recorder that keeps each gauge's last value by name.
@@ -561,7 +601,7 @@ fn block_sync_alarm_age_follows_scenario_utc() {
     };
     let scenario = Scenario {
         view: committed_view(genesis, genesis, alarms),
-        drain_actions: true,
+        actions: ActionSeam::Drain,
         utc_origin: Some(origin),
     };
 

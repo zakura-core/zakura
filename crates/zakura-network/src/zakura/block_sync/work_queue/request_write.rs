@@ -190,7 +190,10 @@ impl TakenRequest {
         })?;
         let funding = {
             let inner = self.work.lock();
-            if cancel.is_cancelled() || !inner.state.is_unpublished_claim(owner, &self.items) {
+            if inner.admission_closed
+                || cancel.is_cancelled()
+                || !inner.state.is_unpublished_claim(owner, &self.items)
+            {
                 return None;
             }
             match self.work.budget.reserve_owned(bytes) {
@@ -294,7 +297,8 @@ impl UnpublishedRequest {
         });
         {
             let mut inner = claim.work.lock();
-            if claim.cancel.is_cancelled()
+            if inner.admission_closed
+                || claim.cancel.is_cancelled()
                 || !inner.state.is_unpublished_claim(claim.owner, &claim.items)
             {
                 return None;

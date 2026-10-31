@@ -377,13 +377,12 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 }
 
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
-/// `ByteBudget` clone, an `Arc<WorkQueue>` clone, an action sender clone, and the
+/// work queue, an action sender, and the
 /// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
 /// `Misbehavior` on the same action channel the reactor uses.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
     retained_body_limit: u64,
-    budget: ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     actions: mpsc::Sender<BlockSyncAction>,
@@ -455,7 +454,6 @@ impl SequencerTask {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         sequencer: Sequencer,
-        budget: ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
         actions: mpsc::Sender<BlockSyncAction>,
@@ -476,7 +474,6 @@ impl SequencerTask {
             sequencer,
             retained_body_limit: ZakuraBlockSyncConfig::default()
                 .effective_max_reorder_lookahead_bytes(),
-            budget,
             work,
             registry,
             actions,
@@ -1482,8 +1479,7 @@ impl SequencerTask {
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
                 .saturating_add(applying_decoded_attributed_memory_bytes);
         // Retained bodies do not charge the request budget.
-        self.budget
-            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
+        self.work.audit_funding();
         let next = SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
@@ -1782,7 +1778,6 @@ mod tests {
         let budget = ByteBudget::new(1_000_000);
         SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -1867,7 +1862,7 @@ mod tests {
         task.handle_accept_body(body);
         assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
         assert_eq!(task.work.reserved_bytes(), 0);
-        assert_eq!(task.budget.reserved(), 0);
+        assert_eq!(task.work.budget().reserved(), 0);
         assert!(task.work.pending_contains(block::Height(500)));
         assert!(task
             .work
@@ -1934,7 +1929,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -1980,7 +1974,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2042,7 +2035,6 @@ mod tests {
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
             work.clone(),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2096,7 +2088,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2191,7 +2182,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2307,7 +2297,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2432,7 +2421,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             registry.clone(),
             actions,
@@ -2512,7 +2500,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -2586,7 +2573,6 @@ mod tests {
                 let budget = ByteBudget::new(123);
                 let mut task = SequencerTask::new(
                     Sequencer::new(block::Height(0), 1),
-                    budget.clone(),
                     Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                     Arc::new(PeerRegistry::new()),
                     actions,
@@ -2689,7 +2675,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions.clone(),
@@ -2799,7 +2784,6 @@ mod tests {
             let budget = ByteBudget::new(123);
             let mut task = SequencerTask::new(
                 Sequencer::new(block::Height(0), 1),
-                budget.clone(),
                 Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions,
@@ -2924,7 +2908,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -3014,7 +2997,6 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -3072,7 +3054,6 @@ mod tests {
         let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,

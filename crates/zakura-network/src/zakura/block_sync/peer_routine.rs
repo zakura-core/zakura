@@ -5266,7 +5266,6 @@ mod tests {
         let budget = ByteBudget::new(1_000_000);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
             actions,

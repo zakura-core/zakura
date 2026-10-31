@@ -189,7 +189,6 @@ pub fn spawn_bench_sequencer(
 
     let task = SequencerTask::new(
         sequencer,
-        budget,
         work,
         Arc::new(super::peer_registry::PeerRegistry::new()),
         actions_tx,

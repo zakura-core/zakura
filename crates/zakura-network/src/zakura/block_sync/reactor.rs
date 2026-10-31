@@ -232,7 +232,6 @@ pub fn spawn_block_sync_reactor(
 
     let sequencer_task = SequencerTask::new(
         sequencer,
-        state.budget.clone(),
         state.work_queue.clone(),
         registry.clone(),
         actions_tx.clone(),

@@ -5266,7 +5266,6 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let budget = ByteBudget::new(1);
     let task = SequencerTask::new(
         Sequencer::new(block::Height(0), submission_limit),
-        budget.clone(),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
@@ -5492,7 +5491,6 @@ impl CappedSequencerTask {
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions_tx,
@@ -5954,7 +5952,6 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let budget = ByteBudget::new(1);
     let task = SequencerTask::new(
         Sequencer::new(block::Height(0), submission_limit),
-        budget.clone(),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
@@ -6178,7 +6175,6 @@ impl DetachedWindow {
         let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), submission_limit),
-            budget.clone(),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
             actions_tx,

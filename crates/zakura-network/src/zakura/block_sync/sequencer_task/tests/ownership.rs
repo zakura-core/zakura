@@ -27,7 +27,6 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     let budget = ByteBudget::new(1);
     let mut task = SequencerTask::new(
         Sequencer::new(block::Height(0), 2),
-        budget.clone(),
         Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
@@ -240,7 +239,6 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let budget = ByteBudget::new(1);
     let task = SequencerTask::new(
         Sequencer::new(block::Height(0), 2),
-        budget.clone(),
         Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,

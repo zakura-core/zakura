@@ -1333,3 +1333,51 @@ fn capacity_release_wakes_after_unlocking_the_work_queue() {
         );
     }
 }
+
+#[test]
+fn funding_drift_closes_publication_and_survives_reset() {
+    let mut f = Fixture::new();
+    let request = f.take(1);
+    assert!(
+        f.work.audit_funding(),
+        "unpublished funding may exceed the ledger"
+    );
+    {
+        let mut inner = f.work.lock();
+        // Inject an untracked owner without changing the logical ledger.
+        inner.funding.merge(f.budget.reserve_owned(1).unwrap());
+    }
+    assert!(!f.work.audit_funding());
+    assert!(request
+        .publish(|_| panic!("closed queue published"))
+        .is_none());
+    // Remove the injected owner so reset exercises a consistent drained queue.
+    let funding = f.work.lock().funding.split(1);
+    drop(funding);
+    f.work.reset_above(block::Height(0));
+    assert_eq!(f.budget.reserved(), 0);
+    assert!(!f.work.audit_funding(), "reset must preserve closure");
+}
+
+#[test]
+fn funding_drift_refuses_normal_and_floor_admission() {
+    for floor in [block::Height(0), block::Height(1)] {
+        let f = Fixture::new();
+        let taken = f.work.take_request(
+            block::Height(1),
+            block::Height(2),
+            2,
+            200,
+            7,
+            NonZeroU64::new(1).unwrap(),
+        );
+        f.work
+            .lock()
+            .funding
+            .merge(f.budget.reserve_owned(1).unwrap());
+        assert!(!f.work.audit_funding());
+        assert!(taken.admit(floor, f.cancel.clone()).is_none());
+        assert_eq!(f.budget.reserved(), 1);
+        assert_eq!(f.work.pending_len(), 2);
+    }
+}

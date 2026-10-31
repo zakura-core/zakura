@@ -149,6 +149,7 @@ impl WorkReturnOutcome {
 struct WorkQueueInner {
     state: WorkQueueState,
     funding: ByteReservation,
+    admission_closed: bool,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
     request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
@@ -206,6 +207,7 @@ impl WorkQueue {
             inner: StdMutex::new(WorkQueueInner {
                 state: WorkQueueState::new(floor),
                 funding: budget.empty_reservation(),
+                admission_closed: false,
                 request_writes: HashMap::new(),
             }),
             budget,
@@ -783,12 +785,24 @@ impl WorkQueue {
         self.lock().state.reserved_above(floor)
     }
 
+    /// Close admission and publication when queue funding disagrees with its ledger.
+    /// Reset can drain owners but cannot reopen this queue.
+    pub(super) fn audit_funding(&self) -> bool {
+        let mut inner = self.lock();
+        let logical = inner.state.reserved_bytes();
+        let funded = inner.funding.bytes();
+        let counter_ok = self.budget.audit(funded, "block-sync queue funding");
+        if logical != funded || !counter_ok {
+            inner.admission_closed = true;
+        }
+        !inner.admission_closed
+    }
+
     /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.
     ///
-    /// O(1): returns the incrementally-maintained counter. This is on the
-    /// sequencer's hot path via `publish_view`, so it must not scan the maps.
-    /// `reserved_bytes_scanned` is the O(n) ground-truth recomputation used by
-    /// the audit / tests to catch drift.
+    /// Returns the maintained counter. Tests compare it with
+    /// `reserved_bytes_scanned` to detect drift.
+    #[cfg(test)]
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.lock().state.reserved_bytes()
     }

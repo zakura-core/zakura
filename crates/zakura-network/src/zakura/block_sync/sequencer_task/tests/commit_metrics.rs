@@ -107,7 +107,6 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                     let budget = ByteBudget::new(123);
                     let mut task = SequencerTask::new(
                         Sequencer::new(block::Height(0), 1),
-                        budget.clone(),
                         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                         Arc::new(PeerRegistry::new()),
                         actions,

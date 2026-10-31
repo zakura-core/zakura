@@ -568,8 +568,8 @@ impl BookDriver {
             ..ZakuraDiscoveryBookLimits::default()
         };
         let mut key = [0; 32];
-        for part in key.chunks_exact_mut(8) {
-            part.copy_from_slice(&seed.to_le_bytes());
+        for part in key.as_chunks_mut::<8>().0 {
+            *part = seed.to_le_bytes();
         }
         Self {
             summary: DiscoveryBookReplaySummary::default(),
@@ -1905,6 +1905,7 @@ fn session_trace_separates_stale_results_and_retained_hints() {
 
 /// Fills the book, replaces a record, evicts on quota and on the record limit, samples,
 /// and moves a record to another relay.
+#[cfg(test)]
 const BOOK_TRACE_WITNESS: &[u8] = &[
     // Authors 0..=3 import their own records, valid for 110 seconds.
     0, 0, 1, 255, 0, 1, 1, 255, 0, 2, 1, 255, 0, 3, 1, 255, // A dial confirms author 0.
@@ -1920,6 +1921,7 @@ const BOOK_TRACE_WITNESS: &[u8] = &[
 ];
 
 /// Installs a current result, rejects a stale result, retains a hint, and reads it.
+#[cfg(test)]
 const STATE_TRACE_WITNESS: &[u8] = &[
     0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
     7, 0, 0, 40, 8, 0, 0, 0, // Peer 0 disconnects while peer 1's `Hello` installs.

@@ -1814,6 +1814,8 @@ where
     fn shutdown(&mut self, error: impl Into<SharedPeerError>) {
         let mut error = error.into();
 
+        self.trace.request_finished("error");
+
         // Close channels first, so other tasks can start shutting down.
         self.client_rx.close();
 
@@ -1869,9 +1871,14 @@ where
         self.update_state_metrics(None);
 
         // Finally, flush pending client requests.
-        while let Some(InProgressClientRequest { tx, span, .. }) =
-            self.client_rx.close_and_flush_next()
+        while let Some(InProgressClientRequest {
+            request,
+            tx,
+            span,
+            trace,
+        }) = self.client_rx.close_and_flush_next()
         {
+            self.trace.dequeued(&trace, &request, true);
             trace!(
                 parent: &span,
                 %error,

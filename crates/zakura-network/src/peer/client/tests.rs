@@ -395,3 +395,63 @@ where
         (task_handle, abort_handle)
     }
 }
+
+#[tokio::test]
+async fn enqueue_trace_precedes_receiver_wakeup() {
+    use crate::{
+        lifecycle_trace::{
+            tests::{capture, drain, rows},
+            ConnectionTrace,
+        },
+        Request,
+    };
+    use futures::Stream;
+    use std::task::{Context, Wake, Waker};
+    use tower::{Service, ServiceExt};
+    use zakura_jsonl_trace::{tables, JsonlTraceTables};
+
+    struct InspectQueue(ConnectionTrace);
+    impl Wake for InspectQueue {
+        fn wake(self: Arc<Self>) {
+            self.0.dispatched(99, &Request::Peers, "p2c", 1);
+        }
+    }
+    let (trace, mut trace_rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "queue-test");
+    let (mut client, mut harness) = ClientTestHarness::build().finish();
+    client.connection_trace = conn.clone();
+    let receiver = harness.client_request_receiver.as_mut().unwrap();
+    let waker = Waker::from(Arc::new(InspectQueue(conn.clone())));
+    assert!(std::pin::Pin::new(receiver)
+        .poll_next(&mut Context::from_waker(&waker))
+        .is_pending());
+    client.ready().await.unwrap();
+    let response = client.call(Request::Peers);
+    let written = rows(&drain(&mut trace_rx), tables::P2P_REQUEST);
+    assert_eq!(written[0]["event"], "enqueue");
+    assert_eq!(written[1]["event"], "dispatch");
+    assert_eq!(written[1]["queued"], "1");
+    drop(response);
+}
+
+#[tokio::test]
+async fn rejected_send_releases_trace_queue_count() {
+    use crate::{
+        lifecycle_trace::tests::{capture, drain, rows},
+        Request,
+    };
+    use tower::{Service, ServiceExt};
+    use zakura_jsonl_trace::{tables, JsonlTraceTables};
+
+    let (trace, mut trace_rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "closed-queue");
+    let (mut client, mut harness) = ClientTestHarness::build().finish();
+    client.connection_trace = conn.clone();
+    client.ready().await.unwrap();
+    drop(harness.client_request_receiver.take());
+    assert!(client.call(Request::Peers).await.is_err());
+    conn.dispatched(99, &Request::Peers, "p2c", 1);
+    let written = rows(&drain(&mut trace_rx), tables::P2P_REQUEST);
+    assert_eq!(written.last().unwrap()["queued"], "0");
+    assert_eq!(written[1]["result"], "enqueue_failed");
+}

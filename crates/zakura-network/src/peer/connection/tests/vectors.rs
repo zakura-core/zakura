@@ -1294,6 +1294,7 @@ async fn traced_connection_records_request_and_message_rows() {
     conn.dispatched(7, &request, "p2c", 1);
     let stamp = conn.stamp_dispatched(&request);
     let (tx, response) = oneshot::channel();
+    conn.enqueued(&stamp);
     client_tx
         .try_send(ClientRequest {
             request,
@@ -1304,7 +1305,6 @@ async fn traced_connection_records_request_and_message_rows() {
             trace: stamp,
         })
         .expect("internal request channel is valid");
-    conn.enqueued(&stamp);
 
     assert_eq!(outbound.next().await, Some(Message::GetAddr));
     peer_tx
@@ -1347,4 +1347,46 @@ async fn traced_connection_records_request_and_message_rows() {
     assert!(messages
         .iter()
         .all(|row| row["conn"] == conn.id().to_string() && row["direction"] == "outbound"));
+}
+
+#[tokio::test]
+async fn traced_disconnect_finishes_active_request() {
+    use crate::lifecycle_trace::tests::{capture, drain, rows};
+    use zakura_jsonl_trace::{tables, JsonlTraceTables};
+
+    let (trace, mut trace_rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "disconnect");
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) =
+        super::new_traced_test_connection::<PanicAssertion>(true, conn.clone());
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let request = Request::Peers;
+    let stamp = conn.stamp(Some(7), &request);
+    let (tx, response) = oneshot::channel();
+    conn.enqueued(&stamp);
+    client_tx
+        .try_send(ClientRequest {
+            request,
+            tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+            trace: stamp,
+        })
+        .unwrap();
+    assert_eq!(outbound.next().await, Some(Message::GetAddr));
+    drop(peer_tx);
+    assert!(response.await.unwrap().is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(5), connection_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let written = rows(&drain(&mut trace_rx), tables::P2P_REQUEST);
+    let finishes: Vec<_> = written
+        .iter()
+        .filter(|row| row["event"] == "finish")
+        .collect();
+    assert_eq!(finishes.len(), 1);
+    assert_eq!(finishes[0]["request_id"], "7");
+    assert_eq!(finishes[0]["result"], "error");
 }

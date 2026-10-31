@@ -3,7 +3,7 @@
 //! - `dispatch`: the peer set selected this connection. Records the selection route, the number
 //!   of candidate peers, and the request the connection was already serving with the number of
 //!   requests already queued for it.
-//! - `enqueue`: the connection channel accepted the request.
+//! - `enqueue`: the sender is publishing the request to the connection channel.
 //! - `dequeue`: the connection task took the request from the channel. `queue_us` is the time
 //!   since `enqueue`.
 //! - `write`: the connection task finished writing the request message. `write_us` is the time
@@ -218,7 +218,10 @@ impl ConnectionTrace {
         }))
     }
 
-    /// Records that this connection's channel accepted the request stamped with `trace`.
+    /// Records the request before publishing it to this connection's channel.
+    ///
+    /// The receiver can run as soon as the sender publishes the request. Call
+    /// [`Self::enqueue_failed`] if the channel rejects it.
     pub(crate) fn enqueued(&self, trace: &RequestTrace) {
         let (Some(state), Some(stamp)) = (self.requests(), trace.0) else {
             return;
@@ -231,6 +234,18 @@ impl ConnectionTrace {
         state.emitter.emit_event(|| RequestRow {
             queued: Some(queued),
             ..state.request_row(self.id, "enqueue", stamp.request_id, stamp.desc)
+        });
+    }
+
+    /// Releases the queue count when the channel rejects a stamped request.
+    pub(crate) fn enqueue_failed(&self, trace: &RequestTrace) {
+        let (Some(state), Some(stamp)) = (self.requests(), trace.0) else {
+            return;
+        };
+        state.queued.fetch_sub(1, Ordering::Relaxed);
+        state.emitter.emit_event(|| RequestRow {
+            result: Some("enqueue_failed"),
+            ..state.request_row(self.id, "finish", stamp.request_id, stamp.desc)
         });
     }
 
@@ -285,14 +300,7 @@ impl ConnectionTrace {
             return;
         };
 
-        let active = {
-            let mut active = state.lock(&state.active);
-            if error.is_some() {
-                active.take()
-            } else {
-                *active
-            }
-        };
+        let active = *state.lock(&state.active);
         let Some(active) = active else {
             return;
         };
@@ -303,6 +311,9 @@ impl ConnectionTrace {
             error: error.map(ToString::to_string),
             ..state.request_row(self.id, "write", active.request_id, active.desc)
         });
+        if error.is_some() {
+            self.request_finished("error");
+        }
     }
 
     /// Records that the connection task stopped serving its active request with `result`.

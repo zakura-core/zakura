@@ -1501,3 +1501,33 @@ async fn an_unpolled_terminal_send_frees_its_slot() {
     drop(unpolled);
     publications.open(3, 0, LIMIT, 0).unwrap();
 }
+
+/// Data fills the queue and two subscriptions end together. Both terminals queue
+/// at once behind that data, and each slot returns with its own terminal's write.
+#[tokio::test]
+async fn each_subscription_ends_at_a_full_queue_with_its_own_slot() {
+    let mut publications = opened(1, &[1]);
+    let first = publications.end(&1).unwrap();
+    publications.open(2, 0, LIMIT, 0).unwrap();
+    let second = publications.end(&2).unwrap();
+    let (send, mut recv) = framed_channel(1);
+    send.try_send(frame(message_type::PAGE)).unwrap();
+    for terminal in [first, second] {
+        assert_eq!(
+            terminal
+                .send(&send, frame(message_type::ENDED))
+                .now_or_never(),
+            Some(true),
+            "no queue slot delays the terminal",
+        );
+    }
+    assert!(
+        publications.open(3, 0, LIMIT, 0).is_err(),
+        "both queued terminals keep their slots",
+    );
+
+    assert_eq!(recv.recv().await, Some(frame(message_type::PAGE)));
+    assert_eq!(recv.recv().await, Some(frame(message_type::ENDED)));
+    assert_eq!(recv.recv().await, Some(frame(message_type::ENDED)));
+    publications.open(3, 0, LIMIT, 0).unwrap();
+}

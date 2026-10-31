@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Terminal frames queued beyond a stream's depth | `crates/zakura-network/src/zakura/transport/io.rs` | waited for a queue slot → up to the stream's live subscription slots, without waiting | [#1620](https://github.com/zakura-core/zakura/pull/1620) | Each subscription's slot funds its terminal outcome's place, so full data queues and other terminals cannot delay it. |
 | Raw inbound frame bytes per connection | `crates/zakura-network/src/zakura/transport/lifetime.rs` | unbounded → `2 * receive_window_bytes` (one floor frame per stream on top) | [#1620](https://github.com/zakura-core/zakura/pull/1620) | Admit raw frames before allocating them. Only frames behind a lagging local consumer reach it, so the transport stays the byte limit for a healthy peer. |
 | Raw inbound frame bytes per node | `crates/zakura-network/src/zakura/transport/lifetime.rs` | unbounded → `max_connections * 2 * receive_window_bytes` | [#1620](https://github.com/zakura-core/zakura/pull/1620) | Hold every connection's budget at once, so one peer's traffic cannot pause another. |
 | Queued frame bytes without another owner, per connection and per node | `crates/zakura-network/src/zakura/transport/lifetime.rs` | unbounded → `2 * send_window_bytes` and `max_connections * 2 * send_window_bytes` | [#1620](https://github.com/zakura-core/zakura/pull/1620) | Fund plain queued frames through their transport writes, without one peer's queue pausing another. |

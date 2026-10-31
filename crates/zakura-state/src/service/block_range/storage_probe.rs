@@ -66,6 +66,8 @@ fn elapsed_us(began: Instant) -> u32 {
 /// `ZAKURA_STORAGE_PROBE_DECODE=1` instead reads decoded block batches through
 /// the read service. That mode excludes encoding and caps concurrency at 48,
 /// so its largest batch workload retains at most 768 of the 1024 data slots.
+/// `ZAKURA_STORAGE_PROBE_TRANSACTIONS=1` instead reads transactions by hash and
+/// holds each batch until it ends, with the same concurrency cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual storage evidence; requires ZAKURA_STORAGE_PROBE_CACHE_DIR"]
 #[allow(clippy::print_stderr)]
@@ -87,6 +89,11 @@ async fn getblocks_storage_read_probe() {
     assert!(
         !(encode && decode),
         "choose serialized encoding or decoded reads"
+    );
+    let transactions = std::env::var_os("ZAKURA_STORAGE_PROBE_TRANSACTIONS").is_some();
+    assert!(
+        !(transactions && (encode || decode)),
+        "transaction reads measure neither block encoding nor block decoding"
     );
     let control_reads = std::env::var_os("ZAKURA_STORAGE_PROBE_CONTROL").is_some();
     let storage_mode = if std::env::var_os("ZAKURA_STORAGE_PROBE_ARCHIVE").is_some() {
@@ -131,6 +138,28 @@ async fn getblocks_storage_read_probe() {
         memory_kib()
     );
 
+    let mut hashes = Vec::new();
+    if transactions {
+        for height in retained.0..=retained.1 {
+            let response = state
+                .clone()
+                .oneshot(ReadRequest::BlocksByHeightRange {
+                    start: Height(height),
+                    count: 1,
+                })
+                .await
+                .unwrap();
+            let ReadResponse::Blocks(blocks) = response else {
+                panic!("decoded range requests return block batches")
+            };
+            for (_, block, _) in blocks.iter() {
+                hashes.extend(block.transactions().map(|transaction| transaction.hash()));
+            }
+        }
+        assert!(!hashes.is_empty(), "the probe needs stored transactions");
+    }
+    let hashes = Arc::new(hashes);
+
     for (shape, count) in [
         ("sequential_near_tip", 1_u32),
         ("random_retained", 1),
@@ -138,7 +167,7 @@ async fn getblocks_storage_read_probe() {
         ("unavailable_above_tip", 1),
     ] {
         for concurrency in [1_usize, 4, 8, 16, 19, 24, 32, 38, 48, 64, 76] {
-            if decode && concurrency > 48 {
+            if (decode || transactions) && concurrency > 48 {
                 continue;
             }
             if drop_caches {
@@ -178,6 +207,7 @@ async fn getblocks_storage_read_probe() {
                 .map(|worker| {
                     let mut state = state.clone();
                     let next = next.clone();
+                    let hashes = hashes.clone();
                     // A small xorshift keeps random heights reproducible per worker.
                     let mut seed = 0x9E37_79B9_u32 ^ u32::try_from(worker).unwrap();
                     tokio::spawn(async move {
@@ -199,6 +229,40 @@ async fn getblocks_storage_read_probe() {
                                 _ => retained.0 + seed % span,
                             };
                             let began = Instant::now();
+                            if transactions {
+                                let mut results = Vec::with_capacity(count as usize);
+                                for offset in 0..count {
+                                    let hash = if shape == "unavailable_above_tip" {
+                                        zakura_chain::transaction::Hash([0xff; 32])
+                                    } else {
+                                        // Height selection maps onto the stored hash list.
+                                        let index = (start - retained.0 + offset) as usize;
+                                        hashes[index % hashes.len()]
+                                    };
+                                    let response = state
+                                        .clone()
+                                        .oneshot(ReadRequest::Transaction(hash))
+                                        .await
+                                        .unwrap();
+                                    let ReadResponse::Transaction(result) = response else {
+                                        panic!("transaction requests return one transaction")
+                                    };
+                                    assert_eq!(
+                                        result.is_some(),
+                                        shape != "unavailable_above_tip",
+                                        "stored hashes resolve and unknown hashes do not"
+                                    );
+                                    if let Some(result) = result {
+                                        assert_eq!(result.tx.hash(), hash);
+                                        tally.blocks += 1;
+                                        results.push(result);
+                                    }
+                                }
+                                drop(std::hint::black_box(results));
+                                tally.latencies_us.push(elapsed_us(began));
+                                tally.reads += 1;
+                                continue;
+                            }
                             if decode {
                                 let response = state
                                     .clone()

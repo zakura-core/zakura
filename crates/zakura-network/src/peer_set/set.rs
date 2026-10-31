@@ -100,7 +100,6 @@ use std::{
     marker::PhantomData,
     net::IpAddr,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -129,7 +128,7 @@ use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
-        block_gossip::{BlockGossipPeer, BLOCK_GOSSIP_CONCURRENCY},
+        block_gossip::{BlockGossipPeer, BlockGossipScheduler, BLOCK_UPLOAD_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{
@@ -243,8 +242,9 @@ where
     block_gossip_peers_tx: watch::Sender<Vec<BlockGossipPeer>>,
     /// Whether `block_gossip_peers` changed since it was last published.
     block_gossip_peers_changed: bool,
-    /// Share the cap across early, committed, and concurrent block broadcasts.
-    block_gossip_slots: Arc<tokio::sync::Semaphore>,
+    /// Shares upload slots across early, committed, and concurrent block broadcasts, and lets a
+    /// newer block's broadcast supersede older ones.
+    block_gossip_scheduler: BlockGossipScheduler,
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
@@ -381,7 +381,7 @@ where
             block_gossip_peers: HashMap::new(),
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
-            block_gossip_slots: Arc::new(tokio::sync::Semaphore::new(BLOCK_GOSSIP_CONCURRENCY)),
+            block_gossip_scheduler: BlockGossipScheduler::new(BLOCK_UPLOAD_CONCURRENCY),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
 
@@ -1363,9 +1363,8 @@ where
             .collect();
         crate::peer::block_gossip::broadcast_block(
             peers,
-            hash,
             mined,
-            self.block_gossip_slots.clone(),
+            self.block_gossip_scheduler.start(hash),
         )
     }
 
@@ -1385,7 +1384,7 @@ where
     {
         crate::peer::block_gossip::BlockAdvertiser {
             peers: self.block_gossip_peers_tx.subscribe(),
-            slots: self.block_gossip_slots.clone(),
+            scheduler: self.block_gossip_scheduler.clone(),
             minimum_peer_version: self.minimum_peer_version.clone(),
         }
     }

@@ -10,6 +10,7 @@ simulator step loop.
 | `block_peer_registry` | `block/peer-registry` | 1 |
 | `block_retry_authority` | `block/retry-authority` | 1 |
 | `block_fill` | `block/fill-retry-run`, `block/fill-retained-funding`, `block/fill-commit-window` | 1 |
+| `block_request_lifecycle` | `block/request-lifecycle` | 1 |
 
 Each decoder reads at most 512 bytes. Each model checks the state after every
 operation. The colocated tests retain nonzero witnesses and planted failures.
@@ -30,6 +31,9 @@ correction remains intact. Decoder 1 keeps the original byte interpretation.
 `7aef27b246dcf8f0d3625d598553d2a827411ea0`. Decoder 1 keeps that byte layout, and
 its funding check now runs through queue admission. The driver takes up to 30
 items, which the one-block production cap does not reach.
-The request-lifecycle target follows the B4 pure-state port. Other machine
+`block_request_lifecycle` comes from PR #1679 and tracks requests,
+transport-start facts, and no-progress charges. Its witness expires one written
+request and one unwritten request, matches a replacement request, and resets the
+remaining window. Other machine
 targets follow their owning delivery packets. Shared replay integration and
 campaign scheduling remain open. No fuzz campaign blocks PR CI.

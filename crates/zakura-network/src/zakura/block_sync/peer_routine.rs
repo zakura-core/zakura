@@ -64,6 +64,8 @@ mod requester_tests;
 #[cfg(test)]
 mod scaling_tests;
 mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{replay_request_lifecycle_bytes, RequestLifecycleReplaySummary};
 mod trace;
 
 use fill::FillStop;

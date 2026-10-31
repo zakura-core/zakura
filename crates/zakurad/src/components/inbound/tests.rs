@@ -163,10 +163,10 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
             DEFAULT_MAX_CONNS_PER_IP,
             Span::none(),
         ))),
-        block_download_peer_set: Buffer::new(
+        block_download_peer_set: tower::util::BoxCloneSyncService::new(Buffer::new(
             BoxService::new(MockService::build().for_unit_tests()),
             1,
-        ),
+        )),
         block_verifier: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
         mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
         state: Buffer::new(BoxService::new(state), 1),

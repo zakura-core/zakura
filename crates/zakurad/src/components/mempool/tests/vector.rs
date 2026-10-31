@@ -11,7 +11,7 @@ use std::{
 use eyre::Report;
 use tokio::time::{self, timeout};
 use tower::{
-    util::{BoxCloneService, BoxService},
+    util::{BoxCloneService, BoxCloneSyncService, BoxService},
     ServiceBuilder, ServiceExt,
 };
 
@@ -3759,7 +3759,7 @@ async fn setup_with_mempool_config(
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
-        Buffer::new(BoxService::new(peer_set.clone()), 1),
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 1)),
         state_service.clone(),
         BoxCloneService::new(read_only_state_service),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),

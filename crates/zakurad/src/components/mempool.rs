@@ -31,7 +31,12 @@ use std::{
 
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    timeout::Timeout,
+    util::{BoxCloneService, BoxCloneSyncService},
+    Service, ServiceExt,
+};
 
 use zakura_chain::{
     block::{self, Height},
@@ -120,8 +125,7 @@ fn transaction_error_peer_log_label(
     }
 }
 
-type Outbound =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type Outbound = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;

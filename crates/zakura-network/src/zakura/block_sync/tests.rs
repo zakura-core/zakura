@@ -28,7 +28,7 @@ use super::{
     request::*,
     sequencer::*,
     sequencer_task::{
-        initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
+        initial_view, SequencedBody, SequencerControlInput, SequencerIO, SequencerView,
     },
     state::*,
     work_queue::WorkQueue,
@@ -186,6 +186,40 @@ pub(super) fn genesis_frontiers() -> BlockSyncFrontiers {
     }
 }
 
+/// Reactor startup driven by a header-tip watch, with the committed view that
+/// owns body work at startup.
+///
+/// The reactor schedules body work only under committed body-work authority.
+/// This startup supplies a view whose verified and header frontiers match
+/// `frontiers` and `best_header_tip`, so tests reach that authority through
+/// the same `committed_views` input production uses.
+fn header_tip_startup(
+    frontiers: BlockSyncFrontiers,
+    best_header_tip: (block::Height, block::Hash),
+    header_tip: watch::Receiver<(block::Height, block::Hash)>,
+    config: ZakuraBlockSyncConfig,
+) -> BlockSyncStartup {
+    let mut startup = BlockSyncStartup::new(frontiers, best_header_tip, header_tip, config);
+    let verified = zakura_header_chain::Frontier::new(
+        frontiers.verified_block_tip,
+        frontiers.verified_block_hash,
+    );
+    let snapshot = committed_snapshot(
+        0,
+        0,
+        0,
+        zakura_header_chain::Frontier::new(
+            frontiers.finalized_height,
+            frontiers.verified_block_hash,
+        ),
+        verified,
+        zakura_header_chain::Frontier::new(best_header_tip.0, best_header_tip.1),
+    );
+    let (_views, committed_views) = watch::channel(Some(committed_view(snapshot, 0)));
+    startup.committed_views = Some(committed_views);
+    startup
+}
+
 /// A header-tip watch channel that starts at genesis.
 fn genesis_tip_channel() -> (
     watch::Sender<(block::Height, block::Hash)>,
@@ -199,7 +233,7 @@ fn genesis_startup(
     tip_rx: watch::Receiver<(block::Height, block::Hash)>,
     config: ZakuraBlockSyncConfig,
 ) -> BlockSyncStartup {
-    BlockSyncStartup::new(
+    header_tip_startup(
         genesis_frontiers(),
         (block::Height(0), block::Hash([0; 32])),
         tip_rx,
@@ -5264,7 +5298,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
     let budget = ByteBudget::new(1);
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
@@ -5488,7 +5522,7 @@ impl CappedSequencerTask {
         let (actions_tx, actions_rx) = mpsc::channel(8);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let budget = ByteBudget::new(1);
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
@@ -5950,7 +5984,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
     let budget = ByteBudget::new(1);
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
@@ -6173,7 +6207,7 @@ impl DetachedWindow {
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let budget = ByteBudget::new(1);
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), submission_limit),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
@@ -8130,7 +8164,7 @@ async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(1), blocks[0].hash()),
         tip_rx,
@@ -8947,7 +8981,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     config.max_inflight_block_bytes = u64::from(block1_size);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -9970,7 +10004,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     let mut config = fill_loop_mechanics_config();
     config.peer_limits.max_outbound_peers = 1;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(4), block::Hash([4; 32])),
         tip_rx,
@@ -10364,7 +10398,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(3), blocks[2].hash()),
         tip_rx,
@@ -10559,7 +10593,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     config.peer_limits.outbound_queue_depth = 128;
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(BEST_HEADER_TIP), block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(800),
             verified_block_tip: block::Height(800),
@@ -10786,7 +10820,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -10917,7 +10951,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -11043,7 +11077,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -11138,7 +11172,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -11246,7 +11280,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -11650,7 +11684,7 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -11797,7 +11831,7 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
 async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -12415,7 +12449,7 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
     let mut config = immediate_body_download_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -12612,7 +12646,7 @@ async fn reactor_waits_for_a_deferred_status_without_reporting_queue_pressure() 
     let mut config = immediate_body_download_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let mut startup = BlockSyncStartup::new(
+    let mut startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -12681,7 +12715,7 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
     config.request_timeout = Duration::from_secs(300);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(2),
             verified_block_tip: block::Height(2),
@@ -13514,7 +13548,7 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     config.request_timeout = Duration::from_secs(300);
 
     let (_tip_tx, tip_rx) = genesis_tip_channel();
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(4), blocks[3].hash()),
         tip_rx,
@@ -13585,7 +13619,7 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
         max_inflight_requests: 1,
         ..ZakuraBlockSyncConfig::default()
     };
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([50; 32])),
         tip_rx,
@@ -13593,6 +13627,9 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
     );
     let (_handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    // Body work at genesis waits out the far-ahead header quiet period.
+    time::pause();
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD).await;
 
     assert!(matches!(
         next_action(&mut actions).await,
@@ -13611,7 +13648,7 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
 async fn selected_body_fork_reanchors_before_scheduling_successors() {
     let best_header_tip = block::Height(4);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(2),
@@ -13675,7 +13712,7 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
 async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
@@ -13760,7 +13797,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
 async fn failed_needed_block_query_retries_without_losing_newer_query_ownership() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
@@ -13819,7 +13856,7 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
 async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
@@ -13899,7 +13936,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         max_inflight_requests: 4,
         ..ZakuraBlockSyncConfig::default()
     };
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([50; 32])),
         tip_rx,
@@ -13907,6 +13944,9 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
     );
     let (handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    // Body work at genesis waits out the far-ahead header quiet period.
+    time::pause();
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD).await;
 
     // Startup refill scans from the floor (queue empty → `max_claimed` is None).
     assert!(matches!(
@@ -13966,7 +14006,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
 #[tokio::test]
 async fn reactor_ignores_stale_non_reset_frontier_updates() {
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3600), block::Hash([36; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(3200),
             verified_block_tip: block::Height(3200),
@@ -14014,7 +14054,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -14086,7 +14126,7 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     // the wedge within the test window.
     config.request_timeout = Duration::from_secs(300);
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -14186,7 +14226,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
     let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -14257,7 +14297,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     };
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -14386,7 +14426,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     };
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -14624,7 +14664,7 @@ async fn testnet_fork_body_keeps_selected_body_despite_wrong_branch_hint() {
         let parent = block::Height(height.0 - 1);
         let parent_hash = selected.header.previous_block_hash;
         let (tip_tx, tip_rx) = watch::channel((parent, parent_hash));
-        let startup = BlockSyncStartup::new(
+        let startup = header_tip_startup(
             BlockSyncFrontiers {
                 finalized_height: block::Height(4_350_714),
                 verified_block_tip: parent,
@@ -14784,7 +14824,7 @@ async fn unsolicited_terminator_closes_the_connection() {
     let config = ZakuraBlockSyncConfig::default();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),

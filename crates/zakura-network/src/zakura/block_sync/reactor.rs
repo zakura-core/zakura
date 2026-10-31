@@ -230,7 +230,7 @@ pub fn spawn_block_sync_reactor(
     let mut retry_jitter_seed = [0u8; 32];
     zakura_rt::rand::rng().fill_bytes(&mut retry_jitter_seed);
 
-    let sequencer_task = SequencerTask::new(
+    let sequencer_task = SequencerIO::new(
         sequencer,
         state.work_queue.clone(),
         registry.clone(),

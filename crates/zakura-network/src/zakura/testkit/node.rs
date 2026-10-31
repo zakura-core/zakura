@@ -550,16 +550,21 @@ impl ZakuraTestNodeBuilder {
             header_sync_actions = Some((shutdown, actions));
             header_sync_handle = Some(handle.clone());
 
+            let block_frontiers = BlockSyncFrontiers {
+                finalized_height: frontiers.finalized_height,
+                verified_block_tip: frontiers.verified_block_tip,
+                verified_block_hash: verified_block_tip_hash,
+            };
+            let block_header_tip = best_header_tip.unwrap_or(anchor);
             let mut startup = BlockSyncStartup::new(
-                BlockSyncFrontiers {
-                    finalized_height: frontiers.finalized_height,
-                    verified_block_tip: frontiers.verified_block_tip,
-                    verified_block_hash: verified_block_tip_hash,
-                },
-                best_header_tip.unwrap_or(anchor),
+                block_frontiers,
+                block_header_tip,
                 handle.subscribe_tip(),
                 self.block_sync_config.clone(),
             );
+            // Block sync schedules body work only under committed authority.
+            startup.committed_views =
+                Some(startup_committed_view(block_frontiers, block_header_tip));
             if let Some(source) = self.block_range_source {
                 startup = startup.with_range_source(source);
             }
@@ -665,6 +670,46 @@ impl Drop for ZakuraTestNode {
             }
         }
     }
+}
+
+/// A committed header view that owns body work from `frontiers` toward
+/// `best_header_tip`. A test node publishes it once at startup; its header-tip
+/// watch then moves the body-download target.
+fn startup_committed_view(
+    frontiers: BlockSyncFrontiers,
+    best_header_tip: (block::Height, block::Hash),
+) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>> {
+    let finalized = zakura_header_chain::Frontier::new(
+        frontiers.finalized_height,
+        frontiers.verified_block_hash,
+    );
+    let header_best = zakura_header_chain::Frontier::new(best_header_tip.0, best_header_tip.1);
+    let snapshot = zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::default(),
+        header_generation: zakura_header_chain::HeaderGeneration::new(0),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized,
+            header_best,
+            verified_best: zakura_header_chain::Frontier::new(
+                frontiers.verified_block_tip,
+                frontiers.verified_block_hash,
+            ),
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header_best.hash,
+        ),
+        oldest_retained_height: finalized.height,
+        alarms: Default::default(),
+    };
+    let (_views, views) =
+        tokio::sync::watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+            snapshot,
+            zakura_header_chain::BodyWorkEpoch::default(),
+        )));
+    views
 }
 
 #[cfg(test)]

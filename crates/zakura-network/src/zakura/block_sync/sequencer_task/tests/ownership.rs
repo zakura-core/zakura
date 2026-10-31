@@ -25,7 +25,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     let (actions, mut actions_rx) = mpsc::channel(8);
     let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
     let budget = ByteBudget::new(1);
-    let mut task = SequencerTask::new(
+    let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
         Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
@@ -43,8 +43,8 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         Duration::from_secs(60),
         ZakuraTrace::noop(),
     );
-    let check = |task: &mut SequencerTask, label: &str| {
-        let owners = task.sequencer.ownership_snapshot();
+    let check = |task: &mut SequencerIO, label: &str| {
+        let owners = task.state.sequencer.ownership_snapshot();
         let reorder: u64 = owners.reorder.iter().map(|body| body.bytes).sum();
         let applying: u64 = owners.applying.iter().map(|body| body.bytes).sum();
         let submissions: u64 = owners.submissions.iter().map(|owner| owner.bytes).sum();
@@ -169,7 +169,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     assert_eq!(check(&mut task, "submission").submissions.len(), 2);
 
     // Height 2 leaves `applying`, but the driver still holds its submission.
-    task.sequencer.remove_applying(block::Height(2));
+    task.state.sequencer.remove_applying(block::Height(2));
     let owners = check(&mut task, "detachment");
     assert!(owners
         .submissions
@@ -177,7 +177,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         .any(|owner| owner.height == block::Height(2) && owner.detached));
 
     let (owner, source, token, block) = &submitted[1];
-    assert!(task.sequencer.finish_submission(
+    assert!(task.state.sequencer.finish_submission(
         *owner,
         *source,
         *token,
@@ -186,14 +186,20 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     ));
     check(&mut task, "detached completion");
 
-    task.sequencer.advance_verified_tip(block::Height(1), true);
+    task.state
+        .sequencer
+        .advance_verified_tip(block::Height(1), true);
     check(&mut task, "commit");
 
-    task.destructive_reset_to(block::Height(0), false);
+    let mut operations = Vec::new();
+    task.state
+        .destructive_reset_to(block::Height(0), false, &mut operations);
+    task.execute(operations).await;
     assert!(check(&mut task, "reset").reorder.is_empty());
 
     let (owner, source, token, block) = &submitted[0];
-    task.sequencer
+    task.state
+        .sequencer
         .finish_submission(*owner, *source, *token, block::Height(1), block.hash());
     let owners = check(&mut task, "final completion");
     assert!(owners.applying.is_empty());
@@ -237,7 +243,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
     let log = Arc::new(Log::default());
     let budget = ByteBudget::new(1);
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
         Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),

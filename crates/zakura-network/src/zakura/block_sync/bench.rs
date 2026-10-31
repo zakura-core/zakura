@@ -1,6 +1,6 @@
 //! Offline benchmark helper for the block-sync [`Sequencer`].
 //!
-//! Spawns the **real** [`SequencerTask`] — the
+//! Spawns the **real** [`SequencerIO`] — the
 //! body reorder + ordered-submit pipeline — with no peers and no reactor, and exposes
 //! a minimal handle (split into parts via [`BenchSequencerHandle::into_parts`]) to
 //! drive it from an offline benchmark:
@@ -45,7 +45,7 @@ use super::{
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
-        charge_decoded_handoff, initial_view, SequencedBody, SequencerControlInput, SequencerTask,
+        charge_decoded_handoff, initial_view, SequencedBody, SequencerControlInput, SequencerIO,
         SequencerView,
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
@@ -81,7 +81,7 @@ pub struct SequencerProgress {
     pub committed_blocks_per_sec: u64,
 }
 
-/// Drives the real block-sync `SequencerTask` for an offline benchmark. Split into
+/// Drives the real block-sync `SequencerIO` for an offline benchmark. Split into
 /// independent parts via [`into_parts`](Self::into_parts) so the feed, submission
 /// drain, and commit feedback can run concurrently without borrow conflicts.
 pub struct BenchSequencerHandle {
@@ -128,7 +128,7 @@ pub struct BenchCommitter {
     _join: JoinHandle<()>,
 }
 
-/// Spawns the real `SequencerTask` starting from `verified_block_tip` (typically
+/// Spawns the real `SequencerIO` starting from `verified_block_tip` (typically
 /// `start - 1`), with no peers and no reactor.
 ///
 /// `submit_in_flight_limit` caps blocks submitted-but-not-applied; `max_inflight_bytes`
@@ -193,7 +193,7 @@ pub fn spawn_bench_sequencer(
     let body_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
 
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         sequencer,
         work,
         Arc::new(super::peer_registry::PeerRegistry::new()),

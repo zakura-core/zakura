@@ -5331,7 +5331,7 @@ mod tests {
     #[tokio::test]
     async fn a_tip_body_is_decoded_once() {
         use super::super::sequencer::Sequencer;
-        use super::super::sequencer_task::SequencerTask;
+        use super::super::sequencer_task::SequencerIO;
         use super::super::BlockSyncAction;
 
         let (_, mut sequenced, _) = hand_off_mainnet_block_1(0, 0).await;
@@ -5345,7 +5345,7 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let budget = ByteBudget::new(1_000_000);
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),

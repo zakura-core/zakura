@@ -228,8 +228,10 @@ fn each_shortfall_gets_its_own_status() {
         judge_run(HARNESS, &seeds, exit, log, files, applied).0
     };
 
+    // libFuzzer runs a list of files without the empty input, so a run of
+    // each seed once is ready.
     assert_eq!(
-        judge(ok, &log, &[stats(HARNESS, 3, true)], &applied),
+        judge(ok, &log, &[stats(HARNESS, 2, true)], &applied),
         TargetStatus::Ready
     );
     // A leak check runs a seed twice.
@@ -267,7 +269,7 @@ fn each_shortfall_gets_its_own_status() {
         vec![stats(HARNESS, 3, true), stats(HARNESS, 3, true)],
         vec![Err("parsing stats-1.json: bad".to_owned())],
         vec![stats(HARNESS, 3, false)],
-        vec![stats(HARNESS, 2, true)],
+        vec![stats(HARNESS, 1, true)],
     ] {
         assert_eq!(
             judge(ok, &log, &files, &applied),

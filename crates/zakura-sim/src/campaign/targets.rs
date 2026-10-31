@@ -16,8 +16,7 @@
 //!    list of files, with the suite row's libFuzzer arguments and variables
 //!    and [`STATS_VAR`] set;
 //! 5. reads the process's stats file, which must name the mapped harness,
-//!    be complete, and count at least one run per seed and one for the
-//!    empty input libFuzzer runs as it starts.
+//!    be complete, and count at least one run per seed.
 //!
 //! Each target gets one [`TargetStatus`], and each status means one thing.
 //! A target is ready only if every step passed and at least one of its
@@ -294,9 +293,10 @@ pub fn own_applicability(entry: &HarnessEntry, seeds: &[SeedRun]) -> (Vec<String
 ///
 /// The run must exit cleanly, report each seed's file as run, and leave
 /// exactly one complete stats file that names `harness` and counts at least
-/// one run per seed plus the empty input libFuzzer runs as it starts.
-/// libFuzzer runs an input a second time when the input allocated more than
-/// it freed, to check for a leak, so a seed can count twice.
+/// one run per seed. libFuzzer runs a list of files without the empty
+/// input it runs before fuzzing. It runs an input a second time when the
+/// input allocated more than it freed, to check for a leak, so a seed can
+/// count twice.
 pub fn judge_run(
     harness: &str,
     seeds: &[PathBuf],
@@ -354,14 +354,11 @@ pub fn judge_run(
             Some("the target's stats file isn't complete".to_owned()),
         );
     }
-    // libFuzzer runs the empty input once as it starts, and runs an input
-    // again when it allocated more than it freed, to look for a leak.
-    let least = seeds.len() as u64 + 1;
-    if stats.counts.runs < least {
+    if stats.counts.runs < seeds.len() as u64 {
         return (
             TargetStatus::Unaccounted,
             Some(format!(
-                "the target counted {} runs, fewer than its {} seeds and the empty input",
+                "the target counted {} runs, fewer than its {} seeds",
                 stats.counts.runs,
                 seeds.len()
             )),
@@ -581,8 +578,8 @@ fn check_target(
     }
     fs::create_dir_all(dir.join("artifacts"))
         .map_err(CampaignError::io(format!("creating {}", dir.display())))?;
-    // Each seed gets libFuzzer's timeout, and the empty input one more.
-    let deadline = options.child * (files.len() as u32 + 1) + GRACE;
+    // Each seed gets libFuzzer's timeout twice, for its leak check's rerun.
+    let deadline = options.child * (2 * files.len() as u32) + GRACE;
     let (exit, log) = run_logged(command, &dir.join("run.log"), Some(deadline), None, |_| {})?;
     let stats: Vec<Result<ProcessStats, String>> = sorted(&stats_dir)
         .map_err(CampaignError::Refused)?

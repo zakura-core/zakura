@@ -5437,6 +5437,87 @@ mod tests {
         Some((body.attributed_memory_size_bytes(), sequenced, queued))
     }
 
+    /// Measure one native framed receipt per peer connection. Run manually in release mode.
+    #[test]
+    #[ignore = "manual release performance measurement"]
+    #[allow(
+        clippy::print_stdout,
+        reason = "manual benchmark emits JSON measurements"
+    )]
+    fn native_decoded_handoff_performance() {
+        const TEST_NAME: &str =
+            "zakura::block_sync::peer_routine::tests::native_decoded_handoff_performance";
+        zakura_test::allocations::in_isolated_process(TEST_NAME, || {
+            async fn receipt(runtime: &tokio::runtime::Runtime, applying: u64, queued: u64) {
+                drop(std::hint::black_box(
+                    hand_off_mainnet_block_1(applying, queued).await,
+                ));
+                for _ in 0..100 {
+                    if runtime.metrics().num_alive_tasks() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    runtime.metrics().num_alive_tasks(),
+                    0,
+                    "connection teardown must finish its tasks"
+                );
+            }
+            let iterations: usize = std::env::var("NATIVE_HANDOFF_ITERATIONS")
+                .map_or(10_000, |value| {
+                    value.parse().expect("iteration count is numeric")
+                });
+            assert!(iterations > 0);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let cap = super::super::config::BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+            for (scenario, applying, queued) in [
+                ("decoded", 0, 0),
+                ("applying-saturated", cap, 0),
+                ("queue-saturated", 0, cap),
+            ] {
+                runtime.block_on(async {
+                    for _ in 0..64 {
+                        receipt(&runtime, applying, queued).await;
+                    }
+                });
+                let mut latency = Vec::with_capacity(iterations);
+                let started = std::time::Instant::now();
+                runtime.block_on(async {
+                    for _ in 0..iterations {
+                        let started = std::time::Instant::now();
+                        receipt(&runtime, applying, queued).await;
+                        latency.push(started.elapsed().as_nanos());
+                    }
+                });
+                let elapsed_ns = started.elapsed().as_nanos();
+                latency.sort_unstable();
+                let p50_ns = latency[iterations / 2];
+                let p95_ns = latency[(iterations - 1) * 95 / 100];
+                let p99_ns = latency[(iterations - 1) * 99 / 100];
+                println!("{{\"scenario\":\"{scenario}\",\"iterations\":{iterations},\"elapsed_ns\":{elapsed_ns},\"p50_ns\":{p50_ns},\"p95_ns\":{p95_ns},\"p99_ns\":{p99_ns}}}");
+                let allocation_iterations = 100;
+                let measurement = zakura_test::allocations::ProcessMeasurement::start();
+                runtime.block_on(async {
+                    for _ in 0..allocation_iterations {
+                        receipt(&runtime, applying, queued).await;
+                    }
+                });
+                let allocations = measurement.snapshot();
+                drop(measurement);
+                assert_eq!(
+                    allocations.retained_bytes, 0,
+                    "every measured connection releases its allocations"
+                );
+                println!("{{\"scenario\":\"{scenario}\",\"allocation_iterations\":{allocation_iterations},\"requests\":{},\"requested_bytes\":{},\"peak_live_bytes\":{},\"retained_bytes\":{}}}",
+                allocations.requests, allocations.requested_bytes, allocations.peak_live_bytes, allocations.retained_bytes);
+            }
+        });
+    }
+
     /// With room in the decoded budget, the routine hands its decoded copy
     /// to the sequencer and charges it to the input queue.
     #[tokio::test]

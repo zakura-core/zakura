@@ -7047,7 +7047,7 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
 /// time. Per-height size-estimate reservation used by the budget-accounting tests.
 const THREE_BLOCK_ESTIMATE: u64 = 1_000;
 
-fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRange {
+fn outstanding_three_block_range() -> OutstandingBlockRange {
     let request = BlockRangeRequest {
         owner: test_work_owner(),
         start_height: block::Height(1),
@@ -7074,7 +7074,6 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
             },
         ],
     };
-    assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -7089,8 +7088,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
 
 #[test]
 fn outstanding_range_accumulates_delivered_bytes_for_bbr_sample() {
-    let mut budget = ByteBudget::new(THREE_BLOCK_ESTIMATE * 3);
-    let mut outstanding = outstanding_three_block_range(&mut budget);
+    let mut outstanding = outstanding_three_block_range();
 
     for (height, bytes) in [
         (block::Height(1), 700),
@@ -7123,8 +7121,8 @@ fn block_budget_ledger_releases_reserved_exactly_once() {
 
 #[test]
 fn budget_audit_catches_injected_drift() {
-    let mut budget = ByteBudget::new(1_000);
-    assert!(budget.try_reserve(400));
+    let budget = ByteBudget::new(1_000);
+    let funding = budget.reserve_owned(400).unwrap();
     assert!(budget.audit(400, "test matching audit"));
     // A budget excess is expected receipt-handoff skew (paired call sites drain
     // the source ledger before releasing the budget), never drift.
@@ -7135,7 +7133,7 @@ fn budget_audit_catches_injected_drift() {
         !budget.audit(500, "test injected drift"),
         "audit reports a budget shortfall as drift"
     );
-    budget.release(400);
+    drop(funding);
     assert!(budget.audit(0, "test released audit"));
 }
 
@@ -7305,19 +7303,19 @@ proptest::proptest! {
         // Whichever terminal path runs first (receipt, or a timeout/watchdog
         // release) drains the mirrored budget to zero; any later path is a no-op.
         let mut ledger = BlockBudgetLedger::reserved(estimate);
-        let mut budget = ByteBudget::new(u64::MAX);
-        prop_assert!(budget.try_reserve(estimate));
+        let budget = ByteBudget::new(u64::MAX);
+        let mut funding = budget.reserve_owned(estimate).unwrap();
 
         if release_before_receipt {
-            budget.release(ledger.release_reserved());
+            drop(funding.split(ledger.release_reserved()));
             prop_assert_eq!(budget.reserved(), 0);
             prop_assert!(!ledger.is_reserved());
         }
-        budget.release(ledger.release_reserved());
+        drop(funding.split(ledger.release_reserved()));
         prop_assert_eq!(budget.reserved(), 0);
         prop_assert_eq!(ledger.reserved_charge(), 0);
         // A third release still yields nothing.
-        budget.release(ledger.release_reserved());
+        drop(funding.split(ledger.release_reserved()));
         prop_assert_eq!(budget.reserved(), 0);
     }
 }
@@ -7332,9 +7330,10 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
 
     // Happy path: download -> release-on-receipt -> buffer (uncharged) -> commit.
     {
-        let mut budget = ByteBudget::new(max);
+        let budget = ByteBudget::new(max);
         let mut reorder = ReorderBuffer::new();
-        let mut outstanding = outstanding_three_block_range(&mut budget);
+        let mut outstanding = outstanding_three_block_range();
+        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), max);
         assert!(budget.reserved() <= budget.max_bytes_for_test());
 
@@ -7346,7 +7345,7 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
             .into_iter()
             .enumerate()
         {
-            budget.release(estimate);
+            drop(funding.split(estimate));
             outstanding.mark_received(height);
             assert_eq!(
                 reorder.insert(height, block.clone(), actuals[index], peer(0)),
@@ -7378,17 +7377,18 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
     // Timeout / short-response path: the received height released its estimate at
     // receipt; the unreceived heights release theirs exactly once on timeout.
     {
-        let mut budget = ByteBudget::new(max);
-        let mut outstanding = outstanding_three_block_range(&mut budget);
+        let budget = ByteBudget::new(max);
+        let mut outstanding = outstanding_three_block_range();
+        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), estimate * 3);
         // A short response delivers only height 1; its estimate is released.
-        budget.release(estimate);
+        drop(funding.split(estimate));
         outstanding.mark_received(block::Height(1));
         // The remaining two unreceived heights still reserve their estimate each.
         assert_eq!(outstanding.reserved_bytes(), estimate * 2);
         assert_eq!(budget.reserved(), estimate * 2);
         // On timeout the outstanding range releases its still-reserved estimates.
-        budget.release(outstanding.reserved_bytes());
+        drop(funding.split(outstanding.reserved_bytes()));
         assert_eq!(budget.reserved(), 0);
     }
 
@@ -7457,7 +7457,7 @@ fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
 fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let hint = 1_000u64;
     // Budget holds several hint-sized shares: enough to reserve this body's hint.
-    let mut budget = ByteBudget::new(hint * 4);
+    let budget = ByteBudget::new(hint * 4);
     let mut reorder = ReorderBuffer::new();
 
     let request = BlockRangeRequest {
@@ -7473,7 +7473,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
             estimated_bytes: hint,
         }],
     };
-    assert!(budget.try_reserve(request.estimated_bytes));
+    let funding = budget.reserve_owned(request.estimated_bytes).unwrap();
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -7495,7 +7495,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     // Receipt: release the reserved hint. The oversized body is retained at its
     // actual size by the reorder buffer, invisible to the request budget (the
     // resident look-ahead gate accounts for it instead).
-    budget.release(hint);
+    drop(funding);
     outstanding.mark_received(block::Height(1));
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     assert_eq!(
@@ -7507,7 +7507,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert_eq!(budget.reserved(), 0);
     assert_eq!(outstanding.reserved_bytes(), 0);
     assert!(
-        budget.try_reserve(hint),
+        budget.reserve_owned(hint).is_some(),
         "the freed reservation funds the next request immediately"
     );
     let dropped = reorder.drop_through(block::Height(1));

@@ -3598,7 +3598,7 @@ mod tests {
 
         // A byte budget reserved down to exactly zero free: the case that used to wedge.
         let budget = ByteBudget::new(8_192);
-        assert!(budget.try_reserve(8_192));
+        let _unrelated = budget.reserve_owned(8_192).unwrap();
         assert_eq!(budget.available(), 0, "the budget is exactly full");
 
         // The floor height (1) is pending and servable by this peer; the download floor

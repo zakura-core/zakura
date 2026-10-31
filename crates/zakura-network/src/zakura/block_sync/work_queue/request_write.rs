@@ -298,6 +298,7 @@ impl UnpublishedRequest {
         {
             let mut inner = claim.work.lock();
             if inner.admission_closed
+                || claim.work.budget.is_closed()
                 || claim.cancel.is_cancelled()
                 || !inner.state.is_unpublished_claim(claim.owner, &claim.items)
             {

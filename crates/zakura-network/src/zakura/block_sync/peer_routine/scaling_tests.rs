@@ -156,11 +156,11 @@ async fn receipt_waits_for_admission_before_settlement() {
                 .unwrap();
             routine.window.outstanding.remove(key).unwrap();
         }
-        let mut budget = routine.budget.clone();
+        let budget = routine.budget.clone();
         let work = routine.work.clone();
         let charge = work.reserved_bytes();
         assert!(charge > 0);
-        assert!(budget.try_reserve(17));
+        let unrelated = budget.reserve_owned(17).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
         let slot = sender.clone().reserve_owned().await.unwrap();
         routine.sequencer_input = sender;
@@ -217,7 +217,7 @@ async fn receipt_waits_for_admission_before_settlement() {
             17,
             "routine cleanup cannot release twice"
         );
-        budget.release(17);
+        drop(unrelated);
     }
 }
 

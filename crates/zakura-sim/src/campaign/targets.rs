@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     build::{build_fuzzer, target_harness, FUZZ_PACKAGE},
     run::run_logged,
-    store::CampaignError,
+    store::{record_bytes, write_once, CampaignError},
 };
 use crate::{
     explore::{
@@ -499,11 +499,17 @@ pub fn check_targets(
         checked(&row);
         report.targets.push(row);
     }
+    // A synced file linked into place, so a kill leaves either no report
+    // or the whole one.
     let path = out.join(READINESS_FILE);
-    let json = serde_json::to_string_pretty(&report)
-        .map_err(|error| CampaignError::Refused(format!("serializing the report: {error}")))?;
-    fs::write(&path, format!("{json}\n"))
-        .map_err(CampaignError::io(format!("writing {}", path.display())))?;
+    if !write_once(&path, &record_bytes(&report))
+        .map_err(CampaignError::io(format!("writing {}", path.display())))?
+    {
+        return Err(CampaignError::Refused(format!(
+            "{} appeared while the targets ran",
+            path.display()
+        )));
+    }
     Ok(report)
 }
 

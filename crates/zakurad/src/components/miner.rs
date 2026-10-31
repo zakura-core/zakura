@@ -59,14 +59,18 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 
-/// Returns `true` if `new_header` should replace the internal miner's current
-/// block template.
+/// Retain valid work across timestamp-only updates, but adopt changed transactions.
 fn should_replace_mining_template(
     current_header: Option<block::Header>,
     new_header: block::Header,
     submit_old: Option<bool>,
 ) -> bool {
-    current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
+    let Some(current_header) = current_header else {
+        return true;
+    };
+
+    current_header != new_header
+        && (submit_old != Some(true) || current_header.merkle_root != new_header.merkle_root)
 }
 
 /// Cancels mining when the current template changes or becomes unavailable.
@@ -342,9 +346,9 @@ where
             rpc.network(),
         )?;
 
-        // Only replace the current template when old work is no longer valid.
-        // Mempool-only updates set `submit_old` to true, so cancelling for them
-        // would discard useful solver work.
+        // `submit_old` permits submitting an old solution; it does not require continuing to
+        // mine it. Adopt transaction changes so the empty template returned on a new tip does
+        // not keep pending transactions out of subsequent blocks.
         let template_replaced = template_sender.send_if_modified(|old_block| {
             if !should_replace_mining_template(
                 old_block.as_ref().map(|block| *block.header),
@@ -650,13 +654,13 @@ mod tests {
     }
 
     #[test]
-    fn mining_template_updates_respect_submit_old() {
+    fn mining_template_keeps_valid_work_when_transactions_are_unchanged() {
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Arc<Block>>()
             .expect("block 1 deserializes");
         let current_header = *block.header;
         let mut changed_header = current_header;
-        changed_header.nonce.0[0] ^= 1;
+        changed_header.time += chrono::Duration::seconds(1);
 
         assert!(should_replace_mining_template(None, current_header, None));
         assert!(!should_replace_mining_template(
@@ -679,6 +683,46 @@ mod tests {
             changed_header,
             None,
         ));
+    }
+
+    #[test]
+    fn populated_template_replaces_empty_work_and_cancels_all_solvers() {
+        let populated = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("the block fixture deserializes");
+        assert!(
+            populated.transactions.len() > 1,
+            "the fixture includes a non-coinbase transaction"
+        );
+        let mut empty = (*populated).clone();
+        empty.transactions.truncate(1);
+        Arc::make_mut(&mut empty.header).merkle_root = empty.transactions.iter().collect();
+        let empty = Arc::new(empty);
+        let old_header = *empty.header;
+        assert_eq!(
+            old_header.previous_block_hash,
+            populated.header.previous_block_hash
+        );
+
+        let (sender, receiver) = watch::channel(Some(empty));
+        let mut solvers: Vec<_> = (0..6)
+            .map(|_| WatchReceiver::new(receiver.clone()))
+            .collect();
+        assert!(sender.send_if_modified(|current| {
+            if !should_replace_mining_template(
+                current.as_ref().map(|block| *block.header),
+                *populated.header,
+                Some(true),
+            ) {
+                return false;
+            }
+            *current = Some(populated.clone());
+            true
+        }));
+        assert_eq!(*receiver.borrow(), Some(populated));
+        for solver in &mut solvers {
+            assert!(cancel_if_mining_template_changed(solver, old_header).is_err());
+        }
     }
 
     /// The internal miner switches from standard to minimum difficulty work on the same parent.

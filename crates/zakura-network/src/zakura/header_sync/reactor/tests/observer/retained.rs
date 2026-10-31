@@ -314,6 +314,22 @@ async fn teardown_ends_each_unfinished_call_and_its_headers() {
         ownership(&events),
         vec![(1, None), (1, Some(HeaderWorkEnd::Dropped))]
     );
+    let position = |wanted: fn(&ReactorEvent) -> bool| {
+        events
+            .iter()
+            .position(wanted)
+            .expect("teardown reports both events")
+    };
+    assert!(
+        position(|event| matches!(
+            event,
+            ReactorEvent::CallEnded {
+                end: CallEnd::Dropped,
+                ..
+            }
+        )) < position(|event| matches!(event, ReactorEvent::HeadersEnded { .. })),
+        "the call's end comes before anything its future holds drops"
+    );
     ledger_accepts(&events).finish().expect("every call ended");
 }
 

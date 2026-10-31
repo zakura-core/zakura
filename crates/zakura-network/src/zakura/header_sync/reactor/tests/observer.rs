@@ -60,6 +60,99 @@ impl Recorder {
 
 mod retained;
 
+/// One shared log of what a [`PendingCall`](observe::PendingCall) reports and what
+/// its future holds drops, in order.
+#[derive(Debug, Default)]
+struct DropOrder(StdMutex<Vec<String>>);
+
+impl HeaderSyncObserver for DropOrder {
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .push(format!("{event:?}"));
+    }
+}
+
+/// Something a guarded future holds, which logs its own drop, as a storage call's
+/// receipt or a permit's release would.
+struct LogsDrop(Arc<DropOrder>);
+
+impl Drop for LogsDrop {
+    fn drop(&mut self) {
+        self.0
+             .0
+            .lock()
+            .expect("no test panics while holding it")
+            .push("held dropped".to_owned());
+    }
+}
+
+/// A guarded call dropped unfinished reports its dropped end before anything its
+/// future holds drops, so a storage receipt always follows its call's end.
+#[tokio::test]
+async fn a_dropped_call_reports_before_its_future_drops() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot(Some(order.clone()));
+    let held = LogsDrop(order.clone());
+    let pending = observe::PendingCall::new(
+        Box::pin(async move {
+            let _held = held;
+            std::future::pending::<()>().await
+        }),
+        observe::PortTap::new(1, &slot),
+    );
+    drop(pending);
+    assert_eq!(
+        *order.0.lock().expect("no test panics while holding it"),
+        [
+            format!(
+                "{:?}",
+                ReactorEvent::CallEnded {
+                    call: 1,
+                    end: CallEnd::Dropped
+                }
+            ),
+            "held dropped".to_owned(),
+        ]
+    );
+}
+
+/// A call that finished, or that reported its own end and then dropped at a later
+/// await, reports no second end.
+#[tokio::test]
+async fn an_ended_call_reports_no_dropped_end() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot(Some(order.clone()));
+    let mut finished =
+        observe::PendingCall::new(Box::pin(async {}), observe::PortTap::new(1, &slot));
+    (&mut finished).await;
+    drop(finished);
+    assert!(order.0.lock().expect("no test panics").is_empty());
+
+    let tap = observe::PortTap::new(2, &slot);
+    let inner = tap.clone();
+    let mut ended = observe::PendingCall::new(
+        Box::pin(async move {
+            inner.end(CallEnd::Replied);
+            std::future::pending::<()>().await
+        }),
+        tap,
+    );
+    assert!(futures::poll!(&mut ended).is_pending());
+    drop(ended);
+    assert_eq!(
+        *order.0.lock().expect("no test panics"),
+        [format!(
+            "{:?}",
+            ReactorEvent::CallEnded {
+                call: 2,
+                end: CallEnd::Replied
+            }
+        )]
+    );
+}
+
 /// Where a [`ScriptedPort`] call panics.
 #[derive(Copy, Clone, Debug)]
 enum PanicAt {

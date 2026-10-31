@@ -14,6 +14,12 @@
 //! A call caught panicking ends the run with
 //! [`HarnessFailure::ReactorPortPanicked`] once its drain is logged.
 //!
+//! The reactor's teardown is done once the observer is gone, since every pending
+//! call's future holds a clone through its drop. Every dropped call's operation
+//! must have its drop receipt by then, unless storage's shutdown removed it while
+//! the call still existed, or the run fails as `UnpairedDrop`. A run that ends
+//! before the teardown is done leaves that open.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -158,20 +164,27 @@ impl HeaderSyncObserver for TapObserver {
     fn observe(&self, event: ReactorEvent) {
         let state = &self.0;
         let in_run = zakura_rt::sim::run_id() == Some(state.run);
-        // Ownership events and dropped calls stay out of the observation log,
-        // whose format pinned Plans fix. A teardown may report them after the run.
+        // Ownership events stay out of the observation log, whose format pinned
+        // Plans fix.
         if matches!(
             event,
-            ReactorEvent::HeadersHeld { .. }
-                | ReactorEvent::HeadersEnded { .. }
-                | ReactorEvent::CallEnded {
-                    end: CallEnd::Dropped,
-                    ..
-                }
+            ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
         ) {
             if in_run {
                 state.check_work(&event);
             }
+            return;
+        }
+        // The run's own shutdown drops a live reactor after the log froze.
+        if !in_run
+            && matches!(
+                event,
+                ReactorEvent::CallEnded {
+                    end: CallEnd::Dropped,
+                    ..
+                }
+            )
+        {
             return;
         }
         if !in_run {
@@ -465,7 +478,8 @@ impl ActionSource for ReactorTap {
     /// order, and records what it delivered in the checkpoint. A drain that
     /// doesn't pair is still logged, then fails, unless the tap is unhealthy,
     /// which the run reports instead, or records a port panic as the run's
-    /// harness failure.
+    /// harness failure. Once the reactor's teardown is done, a dropped call still
+    /// waiting for its drop receipt fails as `UnpairedDrop`.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -506,7 +520,14 @@ impl ActionSource for ReactorTap {
             return Err(rule);
         }
         match paired {
-            Ok(()) => Ok(()),
+            Ok(()) => match self.pairer.waiting_drop() {
+                Some((call, op)) if self.state.observer.strong_count() == 0 => Err(format!(
+                    "UnpairedDrop: the reactor's teardown is done with call {call} dropped and \
+                     its operation {op} given no drop receipt, and no shutdown removed it while \
+                     the call still existed"
+                )),
+                _ => Ok(()),
+            },
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or

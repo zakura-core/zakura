@@ -1497,7 +1497,7 @@ async fn block_advert_while_awaiting_response() {
         tokio::join!(
             async {
                 inbound_service
-                    .expect_request(Request::AdvertiseBlock(next_hash, None))
+                    .expect_request(Request::AdvertiseBlock(next_hash.into(), None))
                     .await
                     .respond(Response::Nil);
             },
@@ -1538,7 +1538,7 @@ async fn block_advert_as_ordinary_request_is_an_error() {
         let (request_tx, request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                request: Request::AdvertiseBlock(block::Hash([5; 32]), None),
+                request: Request::AdvertiseBlock(block::Hash([5; 32]).into(), None),
                 tx: request_tx,
                 inv_collector: None,
                 transient_addr: None,
@@ -1684,7 +1684,7 @@ async fn single_block_inv_during_getblocks_is_also_gossiped() {
             Response::BlockHashes(vec![announced_hash])
         );
         inbound_service
-            .expect_request(Request::AdvertiseBlock(announced_hash, None))
+            .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
             .await
             .respond(Response::Nil);
         assert!(shared_error_slot.try_get_error().is_none());
@@ -1721,7 +1721,7 @@ async fn single_block_inv_during_getblocks_survives_inbound_overload() {
             Response::BlockHashes(vec![announced_hash])
         );
         inbound_service
-            .expect_request(Request::AdvertiseBlock(announced_hash, None))
+            .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
             .await
             .respond(Err(Overloaded::new()));
 
@@ -1800,7 +1800,7 @@ async fn single_block_inv_during_getblocks_survives_inbound_error() {
         tokio::join!(
             async {
                 inbound_service
-                    .expect_request(Request::AdvertiseBlock(announced_hash, None))
+                    .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
                     .await
                     .respond(Err("synthetic inbound service error"));
             },

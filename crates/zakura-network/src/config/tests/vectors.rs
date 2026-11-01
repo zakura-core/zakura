@@ -1652,3 +1652,60 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
         assert!(error.contains("at most 3,633"), "unexpected error: {error}");
     }
 }
+
+#[test]
+fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str("").expect("empty config parses");
+    assert_eq!(config.advert_window_min, 32);
+    assert_eq!(config.advert_window_max, 48);
+    assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
+
+    let config: Config = toml::from_str(
+        "advert_window_min = 2\n\
+         advert_window_max = 16\n\
+         advert_window_full_size_bytes = 1000\n",
+    )
+    .expect("configured fan-out parses");
+    assert_eq!(config.advert_window_min, 2);
+    assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_full_size_bytes, 1000);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip, config);
+
+    // Equal bounds are a fixed window.
+    let config: Config = toml::from_str("advert_window_min = 48").expect("equal bounds parse");
+    assert_eq!(config.advert_window_min, config.advert_window_max);
+}
+
+#[test]
+fn invalid_advert_fanout_config_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    for (config, field) in [
+        ("advert_window_min = 0", "advert_window_min"),
+        (
+            "advert_window_min = 10\nadvert_window_max = 9",
+            "advert_window_min",
+        ),
+        // The default maximum of 48 is below this minimum, and the reverse.
+        ("advert_window_min = 49", "advert_window_min"),
+        ("advert_window_max = 31", "advert_window_max"),
+        (
+            "advert_window_full_size_bytes = 0",
+            "advert_window_full_size_bytes",
+        ),
+        // Removed settings.
+        ("advert_target_secs = 1.0", "advert_target_secs"),
+        ("advert_window_initial = 32", "advert_window_initial"),
+        ("advert_window_fixed = 8", "advert_window_fixed"),
+    ] {
+        let error = toml::from_str::<Config>(config)
+            .expect_err("invalid fan-out config is rejected")
+            .to_string();
+        assert!(error.contains(field), "{config:?} gave {error}");
+    }
+}

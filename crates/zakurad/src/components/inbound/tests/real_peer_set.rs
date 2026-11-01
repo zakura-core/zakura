@@ -1047,7 +1047,7 @@ async fn setup(
         false,
         peer_set.clone(),
         state_service.clone(),
-        tower::util::BoxCloneService::new(read_only_state_service),
+        tower::util::BoxCloneService::new(read_only_state_service.clone()),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1082,6 +1082,7 @@ async fn setup(
         sync_status.clone(),
         chain_tip_change,
         peer_set.clone(),
+        read_only_state_service,
         Some(submitblock_channel.receiver()),
     ));
 
@@ -1175,7 +1176,7 @@ mod submitblock_test {
 
         // State
         let state_config = StateConfig::ephemeral();
-        let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
+        let (_state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
                 .await
                 .expect("ephemeral state initialization succeeds");
@@ -1221,6 +1222,7 @@ mod submitblock_test {
             .send(MinedBlockEvent::Committed {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
+                size: 1_000,
             })
             .unwrap();
         let gossip_task_handle = tokio::spawn(
@@ -1228,6 +1230,7 @@ mod submitblock_test {
                 sync_status.clone(),
                 chain_tip_change,
                 peer_set.clone(),
+                read_only_state_service,
                 Some(submitblock_channel.receiver()),
             )
             .in_current_span(),

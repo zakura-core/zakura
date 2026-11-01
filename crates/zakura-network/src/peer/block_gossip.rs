@@ -1,11 +1,13 @@
 //! Pace legacy block advertisements using the corresponding block writes.
 //!
-//! Each broadcast advertises to at most [`BLOCK_ADVERT_WINDOW`] peers at a time, and moves on to
-//! the next peer once an earlier one finishes. Writing an `inv` uses only that window. A peer
-//! takes one of the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots, shared by every broadcast, only
-//! once it requests the block, and keeps it through the body write and its drain allowance. A
-//! peer waiting for a slot keeps its window entry, so busy uploads still slow each broadcast's
-//! fan-out, but they cannot delay another block's first `inv`s.
+//! Each broadcast advertises to at most its advert window of peers at a time, and moves on to
+//! the next peer once an earlier one finishes. [`AdvertFanout`] sizes that window from the
+//! block's size. Configured sidecars are advertised first, outside the window. Writing an `inv`
+//! uses only that window. A peer takes one of the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots,
+//! shared by every broadcast, only once it requests the block, and keeps it through the body
+//! write and its drain allowance. A peer waiting for a slot keeps its window entry, so busy
+//! uploads still slow each broadcast's fan-out, but they cannot delay another block's first
+//! `inv`s.
 //!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
@@ -29,7 +31,7 @@ use crate::{
     peer::{MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
-    BoxError, Request, Response,
+    BoxError, Config, Request, Response,
 };
 
 /// Pending block adverts per connection. Slow peers can catch up through later tip gossip.
@@ -62,8 +64,49 @@ pub(crate) enum BlockAdvertError {
 
 /// Maximum concurrent block uploads requested through legacy block broadcasts, across broadcasts.
 pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
-/// Maximum peers that one broadcast has advertised to and is not yet finished with.
-pub(crate) const BLOCK_ADVERT_WINDOW: usize = 32;
+
+/// Chooses how many peers one block broadcast advertises to at once, from the block's size.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdvertFanout {
+    min: usize,
+    max: usize,
+    full_size_bytes: u64,
+}
+
+impl AdvertFanout {
+    /// Returns the fan-out policy in `config`.
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            min: config.advert_window_min,
+            max: config.advert_window_max,
+            full_size_bytes: config.advert_window_full_size_bytes,
+        }
+    }
+
+    /// Returns the advert window of a block of `size` serialized bytes, and records it in metrics.
+    ///
+    /// The window is `min + floor((max - min) * (full_size - size) / full_size)` below the full
+    /// size, and `min` at or above the full size or when the size is unknown.
+    pub(crate) fn window(&self, size: Option<u32>) -> usize {
+        let window = size.map_or(self.min, |size| {
+            let below_full = self.full_size_bytes.saturating_sub(u64::from(size));
+            // Both factors fit in 64 bits, so the product cannot overflow.
+            let above_min = self.max.saturating_sub(self.min) as u128 * u128::from(below_full)
+                / u128::from(self.full_size_bytes.max(1));
+            // `above_min` is at most `max - min`.
+            usize::try_from(above_min).map_or(self.max, |above_min| self.min + above_min)
+        });
+        if let Some(size) = size {
+            metrics::histogram!("peer.block_gossip.advert_block_size_bytes")
+                .record(f64::from(size));
+        }
+        // Windows are at most a few hundred peers, so they convert exactly.
+        #[allow(clippy::cast_precision_loss)]
+        metrics::histogram!("peer.block_gossip.advert_window").record(window as f64);
+        window
+    }
+}
+
 /// Every this many mined-block advertisements, a random peer replaces the next-lowest RTT.
 ///
 /// Peers with the lowest RTT could otherwise hold every slot without completing uploads.
@@ -370,21 +413,32 @@ impl Drop for UploadSlot {
     }
 }
 
-/// Advertises `hash` to `peers`, at most [`BLOCK_ADVERT_WINDOW`] at a time, paced through their
-/// block uploads.
+/// Advertises `hash` to `peers`, paced through their block uploads.
 ///
-/// Succeeds if at least one peer was advertised to.
+/// Configured sidecars are all advertised at once, first. Other peers are advertised to at most
+/// `window` at a time. Succeeds if at least one peer was advertised to.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
+    window: usize,
     mined: bool,
     slots: BlockUploadSlots,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
-    let peers = order_peers(peers, mined, &mut rand_10::rng());
+    let mut sidecars = order_peers(peers, mined, &mut rand_10::rng());
+    let others = sidecars.split_off(sidecars.iter().take_while(|peer| peer.sidecar).count());
     async move {
-        let mut sends = futures::stream::iter(peers)
-            .map(|peer| peer.advertise(hash, slots.clone()))
-            .buffer_unordered(BLOCK_ADVERT_WINDOW);
+        let advertise = |peers: Vec<BlockGossipPeer>, window: usize| {
+            let slots = slots.clone();
+            futures::stream::iter(peers)
+                .map(move |peer| peer.advertise(hash, slots.clone()))
+                .buffer_unordered(window)
+        };
+        let sidecar_window = sidecars.len().max(1);
+        // `select` polls the sidecars first, so their adverts are queued first.
+        let mut sends = futures::stream::select(
+            advertise(sidecars, sidecar_window),
+            advertise(others, window),
+        );
         let mut succeeded = false;
         while let Some(sent) = sends.next().await {
             succeeded |= sent;
@@ -409,6 +463,8 @@ pub(crate) struct BlockAdvertiser<C> {
     pub(crate) peers: watch::Receiver<Vec<BlockGossipPeer>>,
     /// Shared with the peer set's own block broadcasts.
     pub(crate) slots: BlockUploadSlots,
+    /// Sizes each broadcast's advert window. Shared with the peer set's own block broadcasts.
+    pub(crate) fanout: AdvertFanout,
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
 }
 
@@ -440,9 +496,11 @@ impl<C: ChainTip> BlockAdvertiser<C> {
         &mut self,
         request: Request,
     ) -> BoxFuture<'static, Result<Response, BoxError>> {
-        let (hash, mined) = match request {
-            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => (hash, false),
-            Request::AdvertiseMinedBlock(hash) => (hash, true),
+        let (block, mined) = match request {
+            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
+                (block, false)
+            }
+            Request::AdvertiseMinedBlock(block) => (block, true),
             other => {
                 return futures::future::ready(Err(format!(
                     "block advertiser cannot send {}",
@@ -458,6 +516,7 @@ impl<C: ChainTip> BlockAdvertiser<C> {
         };
         let mut peers = self.peers.clone();
         let slots = self.slots.clone();
+        let window = self.fanout.window(block.size);
         async move {
             let peers: Vec<_> = peers
                 .wait_for(|peers| peers.iter().any(eligible))
@@ -467,7 +526,7 @@ impl<C: ChainTip> BlockAdvertiser<C> {
                 .filter(|peer| eligible(peer))
                 .cloned()
                 .collect();
-            broadcast_block(peers, hash, mined, slots).await
+            broadcast_block(peers, block.hash, window, mined, slots).await
         }
         .boxed()
     }
@@ -514,9 +573,12 @@ pub(crate) fn order_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{peer_registry::PeerRegistry, ConnectedPeer};
+    use crate::{peer_registry::PeerRegistry, AdvertisedBlock, ConnectedPeer};
     use futures::FutureExt;
     use rand_10::{rngs::StdRng, SeedableRng};
+
+    /// The advert window these tests use. Tests of the size-based window use their own.
+    const TEST_WINDOW: usize = 32;
 
     fn peer() -> (BlockGossipPeer, mpsc::Receiver<BlockAdvert>) {
         let (sender, receiver) = mpsc::channel(BLOCK_ADVERT_QUEUE);
@@ -634,6 +696,7 @@ mod tests {
         let mut broadcasts = vec![tokio::spawn(broadcast_block(
             peers.clone(),
             parent,
+            TEST_WINDOW,
             true,
             slots.clone(),
         ))];
@@ -641,6 +704,7 @@ mod tests {
             broadcasts.push(tokio::spawn(broadcast_block(
                 peers.clone(),
                 parent,
+                TEST_WINDOW,
                 true,
                 slots.clone(),
             )));
@@ -669,6 +733,7 @@ mod tests {
         broadcasts.push(tokio::spawn(broadcast_block(
             peers,
             child,
+            TEST_WINDOW,
             true,
             slots.clone(),
         )));
@@ -948,17 +1013,27 @@ mod tests {
         tokio::task::yield_now().await;
 
         // A parent broadcast with more peers than its window, which never request.
-        let (peers, mut writes) = connected_peers(BLOCK_ADVERT_WINDOW + 8);
-        let parent_broadcast =
-            tokio::spawn(broadcast_block(peers.clone(), parent, true, slots.clone()));
-        for _ in 0..BLOCK_ADVERT_WINDOW {
+        let (peers, mut writes) = connected_peers(TEST_WINDOW + 8);
+        let parent_broadcast = tokio::spawn(broadcast_block(
+            peers.clone(),
+            parent,
+            TEST_WINDOW,
+            true,
+            slots.clone(),
+        ));
+        for _ in 0..TEST_WINDOW {
             assert_eq!(writes.recv().await.unwrap().1, parent);
         }
 
         let mined = Instant::now();
-        let child_broadcast =
-            tokio::spawn(broadcast_block(peers.clone(), child, true, slots.clone()));
-        for _ in 0..BLOCK_ADVERT_WINDOW {
+        let child_broadcast = tokio::spawn(broadcast_block(
+            peers.clone(),
+            child,
+            TEST_WINDOW,
+            true,
+            slots.clone(),
+        ));
+        for _ in 0..TEST_WINDOW {
             assert_eq!(writes.recv().await.unwrap().1, child);
             assert_eq!(mined.elapsed(), Duration::ZERO, "the child waited");
         }
@@ -966,7 +1041,7 @@ mod tests {
         assert!(queued.await.unwrap(), "the queued parent advert is written");
 
         // Every peer also gets the rest of the parent fan-out once its window entries expire.
-        let (mut parents, mut children) = (BLOCK_ADVERT_WINDOW, BLOCK_ADVERT_WINDOW);
+        let (mut parents, mut children) = (TEST_WINDOW, TEST_WINDOW);
         while parents < peers.len() || children < peers.len() {
             let write = timeout(Duration::from_secs(60), writes.recv())
                 .await
@@ -979,6 +1054,127 @@ mod tests {
         }
         assert!(parent_broadcast.await.unwrap().is_ok());
         assert!(child_broadcast.await.unwrap().is_ok());
+    }
+
+    /// Starts a broadcast of a block of `size` bytes to `peers` with the fan-out policy in
+    /// `config`, and returns the peers it advertised to before any advert finished.
+    async fn first_wave(config: Config, peers: Vec<BlockGossipPeer>, size: u32) -> Vec<usize> {
+        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
+        let fanout = AdvertFanout::from_config(&config);
+        let (peers, mut writes) = peers_writing(peers);
+        let block = AdvertisedBlock {
+            size: Some(size),
+            ..block::Hash([40; 32]).into()
+        };
+        let broadcast = tokio::spawn(broadcast_block(
+            peers,
+            block.hash,
+            fanout.window(block.size),
+            false,
+            slots,
+        ));
+        let mut wave = Vec::new();
+        // These peers never request the block, so no advert finishes before the request wait.
+        while let Ok(Some((index, _))) = timeout(BLOCK_REQUEST_WAIT / 2, writes.recv()).await {
+            wave.push(index);
+        }
+        broadcast.abort();
+        wave
+    }
+
+    /// Wires `peers`' advert queues to connections that write every advert at once.
+    fn peers_writing(
+        peers: Vec<BlockGossipPeer>,
+    ) -> (
+        Vec<BlockGossipPeer>,
+        mpsc::UnboundedReceiver<(usize, block::Hash)>,
+    ) {
+        let (connected, writes) = connected_peers(peers.len());
+        let peers = peers
+            .into_iter()
+            .zip(connected)
+            .map(|(peer, connected)| BlockGossipPeer {
+                sidecar: peer.sidecar,
+                ..connected
+            })
+            .collect();
+        (peers, writes)
+    }
+
+    fn plain_peers(count: usize) -> Vec<BlockGossipPeer> {
+        (0..count).map(|_| peer().0).collect()
+    }
+
+    /// The default window is 32 at or above 1.5 MiB, and rises linearly to 48 at 0 bytes.
+    #[test]
+    fn default_advert_window_follows_block_size() {
+        /// A full NU7 block, just below the reference size.
+        const FULL_NU7_BLOCK: u32 = 1_513_987;
+        const FULL_SIZE: u32 = 1_572_864;
+        let fanout = AdvertFanout::from_config(&Config::default());
+
+        assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 32);
+        assert_eq!(fanout.window(Some(FULL_SIZE)), 32);
+        assert_eq!(fanout.window(Some(FULL_SIZE + 1)), 32);
+        assert_eq!(fanout.window(Some(u32::MAX)), 32);
+        assert_eq!(fanout.window(Some(0)), 48);
+        assert_eq!(fanout.window(None), 32);
+        // The mid-point is exact, and the result floors on either side of it.
+        assert_eq!(fanout.window(Some(FULL_SIZE / 2)), 40);
+        assert_eq!(fanout.window(Some(FULL_SIZE / 2 - 1)), 40);
+        assert_eq!(fanout.window(Some(FULL_SIZE / 2 + 1)), 39);
+    }
+
+    /// Equal bounds give a fixed window, and large bounds do not overflow.
+    #[test]
+    fn advert_window_uses_configured_bounds() {
+        let fanout = |min, max| {
+            AdvertFanout::from_config(&Config {
+                advert_window_min: min,
+                advert_window_max: max,
+                advert_window_full_size_bytes: u64::MAX,
+                ..Config::default()
+            })
+        };
+        for size in [Some(0), Some(1_500_000), Some(u32::MAX), None] {
+            assert_eq!(fanout(9, 9).window(size), 9);
+        }
+        assert_eq!(fanout(1, usize::MAX).window(Some(0)), usize::MAX);
+    }
+
+    /// Broadcasts advertise to the window's peers at once, up to the peers they have.
+    #[tokio::test(start_paused = true)]
+    async fn first_wave_follows_block_size() {
+        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
+        assert_eq!(wave(100, 1_513_987).await.len(), 32);
+        assert_eq!(wave(100, 10_000_000).await.len(), 32);
+        assert_eq!(wave(100, 2_000).await.len(), 47);
+        assert_eq!(wave(40, 2_000).await.len(), 40);
+    }
+
+    /// Sidecars beyond the window are all advertised at once, outside the window.
+    #[tokio::test(start_paused = true)]
+    async fn sidecars_beyond_the_window_go_first() {
+        // More sidecars than the minimum window of 32, which a 10 MB block uses.
+        const SIDECARS: usize = 40;
+        let mut peers = plain_peers(SIDECARS + 40);
+        for peer in &mut peers[..SIDECARS] {
+            peer.sidecar = true;
+        }
+        let wave = first_wave(Config::default(), peers, 10_000_000).await;
+        assert_eq!(
+            wave.len(),
+            SIDECARS + 32,
+            "every sidecar plus a minimum window: {wave:?}"
+        );
+        assert!(
+            (0..SIDECARS).all(|sidecar| wave.contains(&sidecar)),
+            "every sidecar is in the first wave: {wave:?}"
+        );
+        assert!(
+            wave[..SIDECARS].iter().all(|index| *index < SIDECARS),
+            "sidecar adverts are written first: {wave:?}"
+        );
     }
 
     /// A committed broadcast does not drop its early broadcast's queued adverts.
@@ -1013,6 +1209,7 @@ mod tests {
         let early = tokio::spawn(broadcast_block(
             vec![peer.clone()],
             hash,
+            TEST_WINDOW,
             true,
             slots.clone(),
         ));
@@ -1022,7 +1219,13 @@ mod tests {
             .send(Err(BlockAdvertError::AuthorizationRevoked))
             .unwrap();
         assert!(early.await.unwrap().is_err());
-        let committed = tokio::spawn(broadcast_block(vec![peer], hash, true, slots.clone()));
+        let committed = tokio::spawn(broadcast_block(
+            vec![peer],
+            hash,
+            TEST_WINDOW,
+            true,
+            slots.clone(),
+        ));
         accept(&mut receiver, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT).await;
         assert!(committed.await.unwrap().is_ok());
@@ -1036,7 +1239,7 @@ mod tests {
         const BLOCKS: u8 = 8;
         let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
         let (peers, mut writes, bodies) =
-            requesting_peers(2 * BLOCK_ADVERT_WINDOW, Some(Duration::from_secs(2)));
+            requesting_peers(2 * TEST_WINDOW, Some(Duration::from_secs(2)));
         let mut broadcasts = Vec::new();
         for block in 0..BLOCKS {
             let hash = block::Hash([0xc0 + block; 32]);
@@ -1044,6 +1247,7 @@ mod tests {
             broadcasts.push(tokio::spawn(broadcast_block(
                 peers.clone(),
                 hash,
+                TEST_WINDOW,
                 false,
                 slots.clone(),
             )));
@@ -1061,14 +1265,14 @@ mod tests {
             }
             assert_eq!(first, Some(Duration::ZERO), "block {block} waited");
             assert!(
-                count <= BLOCK_ADVERT_WINDOW,
+                count <= TEST_WINDOW,
                 "block {block} advertised to {count} peers during busy uploads"
             );
         }
         let max_bodies = bodies.max.load(std::sync::atomic::Ordering::SeqCst);
         // A body write lasts two block intervals, so the windows of three broadcasts can overlap.
         assert!(
-            max_bodies <= BLOCK_UPLOAD_CONCURRENCY + 3 * BLOCK_ADVERT_WINDOW,
+            max_bodies <= BLOCK_UPLOAD_CONCURRENCY + 3 * TEST_WINDOW,
             "{max_bodies} concurrent body writes"
         );
         broadcasts.iter().for_each(|broadcast| broadcast.abort());
@@ -1216,11 +1420,9 @@ mod tests {
                 "RTT order outside random slots in chunk {position}"
             );
         }
-        let first_wave = &mined[..BLOCK_ADVERT_WINDOW];
+        let first_wave = &mined[..TEST_WINDOW];
         assert!(
-            first_wave
-                .iter()
-                .any(|rtt| *rtt > BLOCK_ADVERT_WINDOW as u128),
+            first_wave.iter().any(|rtt| *rtt > TEST_WINDOW as u128),
             "a random slot reaches beyond the lowest-RTT peers: {first_wave:?}"
         );
     }

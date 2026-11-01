@@ -128,7 +128,7 @@ use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
-        block_gossip::{BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
+        block_gossip::{AdvertFanout, BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{
@@ -244,6 +244,8 @@ where
     block_gossip_peers_changed: bool,
     /// Share the upload slots across early, committed, and concurrent block broadcasts.
     block_gossip_slots: BlockUploadSlots,
+    /// Sizes each block broadcast's advert window.
+    block_gossip_fanout: AdvertFanout,
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
@@ -381,6 +383,7 @@ where
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
             block_gossip_slots: BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY),
+            block_gossip_fanout: AdvertFanout::from_config(config),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
 
@@ -1344,9 +1347,11 @@ where
 
     /// Pace legacy inventory through the corresponding uploads, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (hash, mined) = match req {
-            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => (hash, false),
-            Request::AdvertiseMinedBlock(hash) => (hash, true),
+        let (block, mined) = match req {
+            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
+                (block, false)
+            }
+            Request::AdvertiseMinedBlock(block) => (block, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
         self.prune_block_gossip_peers();
@@ -1360,7 +1365,8 @@ where
             .collect();
         crate::peer::block_gossip::broadcast_block(
             peers,
-            hash,
+            block.hash,
+            self.block_gossip_fanout.window(block.size),
             mined,
             self.block_gossip_slots.clone(),
         )
@@ -1393,6 +1399,7 @@ where
         crate::peer::block_gossip::BlockAdvertiser {
             peers: self.block_gossip_peers_tx.subscribe(),
             slots: self.block_gossip_slots.clone(),
+            fanout: self.block_gossip_fanout,
             minimum_peer_version: self.minimum_peer_version.clone(),
         }
     }

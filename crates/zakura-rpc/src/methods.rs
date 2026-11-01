@@ -1799,6 +1799,8 @@ where
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
+        // Block gossip sizes its advert fan-out from this.
+        let size = block.zcash_serialized_size();
         let submission_guard = match self.gbt.reserve_mined_submission(block_hash) {
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
@@ -1838,6 +1840,7 @@ where
                             let event = MinedBlockEvent::Early {
                                 hash: block_hash,
                                 height,
+                                size,
                                 submitted_at,
                                 submission,
                                 pending: registration.signal(),
@@ -1866,6 +1869,7 @@ where
                     .send(MinedBlockEvent::Committed {
                         hash: block_hash,
                         height,
+                        size,
                     })
                     .is_err()
                 {

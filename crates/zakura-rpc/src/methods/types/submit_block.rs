@@ -128,6 +128,8 @@ pub enum MinedBlockEvent {
         hash: block::Hash,
         /// The block height.
         height: block::Height,
+        /// The block's serialized size in bytes.
+        size: usize,
         /// When the RPC accepted the submitted bytes.
         submitted_at: std::time::Instant,
         /// The RPC method that accepted the submission.
@@ -141,6 +143,8 @@ pub enum MinedBlockEvent {
         hash: block::Hash,
         /// The block height.
         height: block::Height,
+        /// The block's serialized size in bytes.
+        size: usize,
     },
 }
 

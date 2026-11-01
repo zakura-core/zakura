@@ -83,6 +83,21 @@ pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 ///       connections to an IP.
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
+/// The default advert window of a block at or above the full size.
+///
+/// This will be used as `Config.advert_window_min` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
+
+/// The default advert window of an empty block.
+///
+/// This will be used as `Config.advert_window_max` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 48;
+
+/// The default block size that gets the minimum advert window, 1.5 MiB.
+///
+/// This will be used as `Config.advert_window_full_size_bytes` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES: u64 = 1_572_864;
+
 /// The default peerset target size.
 ///
 /// This will be used as `Config.peerset_initial_target_size` if no valid value is provided.

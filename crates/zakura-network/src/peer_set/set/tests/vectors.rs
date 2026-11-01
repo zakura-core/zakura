@@ -414,8 +414,9 @@ fn block_gossip_skips_busy_outdated_peers() {
         );
 
         let hash = block::Hash([6; 32]);
-        let _broadcast =
-            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        let _broadcast = tokio::spawn(
+            peer_set.route_block_broadcast(Request::AdvertiseBlock(hash.into(), None)),
+        );
         tokio::task::yield_now().await;
         let advert = handles[0]
             .try_to_receive_block_advert()
@@ -1442,8 +1443,9 @@ fn unready_sidecar_block_gossip_is_delivered() {
         let sidecar = peer_set.take_ready_service(&sidecar_addr).unwrap();
         peer_set.push_unready(sidecar_addr, sidecar);
         let hash = block::Hash([7; 32]);
-        let broadcast =
-            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        let broadcast = tokio::spawn(
+            peer_set.route_block_broadcast(Request::AdvertiseBlock(hash.into(), None)),
+        );
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1483,7 +1485,7 @@ fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
 
         let hash = block::Hash([8; 32]);
         // Called through `Service`, as the node's block gossip task does.
-        let broadcast = tokio::spawn(advertiser.oneshot(Request::AdvertiseMinedBlock(hash)));
+        let broadcast = tokio::spawn(advertiser.oneshot(Request::AdvertiseMinedBlock(hash.into())));
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1529,7 +1531,10 @@ fn block_advertiser_peer_list_is_republished_only_on_membership_change() {
         // A peer set broadcast drops the removed peer before the next poll. The poll stays
         // pending with no peer left, but still publishes the removal.
         peer_set.remove(&ordinary_addr);
-        drop(peer_set.route_block_broadcast(Request::AdvertiseBlock(block::Hash([7; 32]), None)));
+        drop(
+            peer_set
+                .route_block_broadcast(Request::AdvertiseBlock(block::Hash([7; 32]).into(), None)),
+        );
         std::future::poll_fn(|cx| {
             assert!(peer_set.poll_ready(cx).is_pending());
             std::task::Poll::Ready(())
@@ -1557,7 +1562,8 @@ fn block_advertiser_waits_for_a_connected_peer() {
             .with_minimum_peer_version(minimum_peer_version)
             .build();
         let mut advertiser = peer_set.block_advertiser();
-        let broadcast = advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32])));
+        let broadcast =
+            advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32]).into()));
         assert!(
             tokio::time::timeout(Duration::from_secs(60), broadcast)
                 .await

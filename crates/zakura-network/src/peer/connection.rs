@@ -1371,7 +1371,7 @@ where
                 // We don't expect to be advertised multiple blocks at a time,
                 // so we ignore any advertisements of multiple blocks.
                 [InventoryHash::Block(hash)] => Request::AdvertiseBlock(
-                    *hash,
+                    (*hash).into(),
                     self.connection_info
                         .connected_addr
                         .get_transient_addr()

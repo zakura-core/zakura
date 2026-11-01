@@ -1,15 +1,26 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-index c101954cd..8edb40a82 100644
+index c6163d2c1..6caf696eb 100644
 --- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-@@ -2250,10 +2250,6 @@ impl PeerRoutine {
-             body_permit,
-         )
-         .await;
--        #[cfg(not(any(test, zakura_sim)))]
--        self.budget.release(reserved_estimate);
--        #[cfg(any(test, zakura_sim))]
--        self.release_handoff(outstanding_owner, height, reserved_estimate);
-         self.handoff_blocked.store(false, Ordering::Relaxed);
-         // This body opened only this peer's slots; the want-work loop runs at the
-         // top of the next iteration.
+@@ -380,20 +380,7 @@ impl Drop for ReceiptSettlement {
+         #[cfg(not(any(test, zakura_sim)))]
+         drop(funding);
+         #[cfg(any(test, zakura_sim))]
+-        {
+-            let charge = funding.bytes();
+-            funding.release_then(|| {
+-                observe!(
+-                    self.observer,
+-                    super::block_sync_observe::BlockEvent::HandoffEnded {
+-                        peer: self.peer.clone(),
+-                        owner: self.owner,
+-                        height: self.height,
+-                        charge,
+-                    }
+-                );
+-            });
+-        }
++        std::mem::forget(funding);
+     }
+ }
+ 

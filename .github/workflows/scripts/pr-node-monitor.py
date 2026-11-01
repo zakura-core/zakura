@@ -233,6 +233,9 @@ def take_sample(args) -> dict:
                                           for path in ("sync", "gossip"))
         sample["body_downloads"] = sum(metric_value(metrics, f"{path}_downloaded_block_count") or 0
                                        for path in ("sync", "gossip"))
+        for path in ("sync", "gossip"):
+            sample[f"{path}_semantic_commits"] = metric_value(metrics, f"{path}_semantic_committed_count") or 0
+            sample[f"{path}_body_downloads"] = metric_value(metrics, f"{path}_downloaded_block_count") or 0
         for key, name in (
             ("finalized_height", "state_finalized_block_height"),
             ("vct_fast_blocks", "state_vct_fast_block_count"),
@@ -702,9 +705,16 @@ def main(argv=None) -> int:
     window_start = max((path.get("start_elapsed", 0) for path in summary["missing_parent"].values()), default=0)
     measured_samples = [s for s in samples if s["elapsed"] >= window_start]
     summary["work_counter_windows"] = {field: counter_window(measured_samples, field)
-                                        for field in ("semantic_commits", "body_downloads")}
+                                        for field in ("semantic_commits", "body_downloads", "sync_semantic_commits",
+                                                      "gossip_semantic_commits", "sync_body_downloads", "gossip_body_downloads")}
     summary["semantic_commits"] = summary["work_counter_windows"]["semantic_commits"]["delta"]
     summary["body_downloads"] = summary["work_counter_windows"]["body_downloads"]["delta"]
+    summary["reference_height_window"] = counter_window(measured_samples, "reference_height")
+    lags = sorted(s["reference_height"] - s["height"] for s in measured_samples
+                  if s.get("reference_height") is not None and s.get("height") is not None)
+    summary["tip_lag"] = {"maximum_blocks": max(lags, default=None),
+                          "p50_blocks": lags[len(lags) // 2] if lags else None,
+                          "p95_blocks": lags[int((len(lags) - 1) * .95)] if lags else None}
     if args.require_capacity:
         reasons = []
         if any(v["verdict"] != "ok" for v in summary["missing_parent"].values()):

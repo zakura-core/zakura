@@ -174,6 +174,7 @@ PACKAGE_TOP_FILES = (
     "test_zakura_monitoring_compat.py",
     "test_zakura_monitoring_lane.py",
     "test_zakura_monitoring_nu7.py",
+    "test_zakura_monitoring_difficulty.py",
     "test_zakura_monitoring_install.py",
 )
 

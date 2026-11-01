@@ -242,6 +242,64 @@ check can send its recovery without losing or duplicating the original alert.
 Other request failures and malformed, incomplete, or stale bundles still alert
 immediately. The freshness limit remains 48 hours.
 
+## Mainnet Difficulty Headroom
+
+The Mainnet fleet watchdog sends difficulty warnings and recoveries to the
+existing `#zakura-alerts` webhook when `difficulty_monitor = true` on the
+Mainnet fleet. It reads only our fleet's accepted tips; no explorer, external
+RPC, new secret or additional node RPC request is required. The collector
+includes the exact `difficulty_bits` from its existing accepted-tip header
+request, bound to that tip's hash and height.
+
+Headroom is the maximum admitted target from PR #1915 divided by the observed
+target. This equals observed difficulty divided by the fixed admission floor.
+Decisions use integer arithmetic; rounded ratios are for Slack display only.
+The reference target, multiplier and starting height have a CI coupling check
+against the node's Rust policy, so a policy update must update monitoring too.
+
+| Condition | Notification |
+| --- | --- |
+| Headroom below 2× for 15 minutes | Warning |
+| Headroom below 1.25× | Immediate critical escalation |
+| Headroom below 1× | Immediate floor-breach escalation |
+| Headroom above 2.25× for 15 minutes | Recovery |
+| Observation unavailable for 10 minutes | Separate monitoring-unavailable alert |
+
+The monitor selects the highest fresh Mainnet accepted tip and requires a
+second fleet node to corroborate its hash, or its sampled ancestry when the
+second node is behind. Conflicting tips or targets cannot establish health;
+missing data at the highest tip cannot fall back to a lower, easier-to-monitor
+tip. Observations require fresh collection and node timestamps. A tip that
+does not advance in 10 minutes becomes unavailable even if a restarted
+collector refreshes its timestamps. Gaps over three minutes interrupt the
+warning and recovery holds. Unavailability preserves an existing difficulty
+incident, and restoring observations is distinct from difficulty recovery.
+Severity remains latched until the recovery condition, with one notification
+per escalation and no repeated posts for unchanged conditions.
+
+All fleet nodes may share the admission floor. If they all stop accepting
+blocks below it, this monitor cannot establish those unseen blocks' difficulty.
+It reports stale observations and retains the existing fleet stall alerts;
+an old accepted target never proves fresh health. A floor-breach alert is
+possible only when a fleet node actually accepts and reports such a block.
+Peer-supplied rejected headers are not an alert source. Operators should
+inspect fleet progress and prepare a reviewed policy update; the monitor
+never changes the floor or adds PagerDuty escalation.
+
+Incident timers and transitions share the existing durable fleet Slack queue.
+Slack failures and deployment suppression defer delivery without discarding
+alerts or recoveries. Existing webhook acknowledgement crash limitations apply.
+
+Roll out the collector update on the Mainnet dashboard before activating the
+watchdog configuration, and verify `difficulty_bits` on at least two advancing
+Mainnet nodes. The monitoring-only `fleet-deploy` operation updates the
+watchdog, not the dashboard; updating only that package leaves the source
+unavailable. Use the existing dashboard installation procedure and then deploy
+the monitoring package from an exact tested commit. Preserve incident state.
+Check the installed policy and fresh observations before testing labeled
+failure and recovery notifications in `#zakura-alerts` with temporary state.
+Activation and real-channel acceptance are separate from merging the code.
+
 ## NU7 Dashboard Availability
 
 The existing fleet watchdog also checks

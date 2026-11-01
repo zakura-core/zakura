@@ -2,6 +2,8 @@
 //!
 //! The harness's verifier holds each block until its parent has committed, like the real
 //! verifier's parent and UTXO waits, so a child whose parent never arrives waits forever.
+//!
+//! Harnesses run on Regtest, which waives proof of work, because most tests rewrite block headers.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -57,7 +59,7 @@ fn block_3() -> Arc<Block> {
 
 /// Returns `block` with its parent replaced by `parent`, keeping its coinbase height.
 ///
-/// The harness never checks proof of work, so the new hash only needs to be distinct.
+/// The block no longer has valid proof of work, so it needs a network that waives it.
 fn with_parent(block: &Block, parent: block::Hash) -> Arc<Block> {
     let mut header = *block.header;
     header.previous_block_hash = parent;
@@ -113,6 +115,9 @@ struct Harness {
     /// Requests for these hashes are answered only after the paired sender fires.
     gates: Arc<std::sync::Mutex<HashMap<block::Hash, oneshot::Receiver<()>>>>,
 
+    /// The next request for each of these hashes fails.
+    failures: Arc<std::sync::Mutex<HashSet<block::Hash>>>,
+
     _tip_sender: zs::ChainTipSender,
 }
 
@@ -122,6 +127,11 @@ impl Harness {
     /// The network serves `blocks`. Requests for any other hash never complete, like a parent
     /// that no peer can deliver.
     fn new(blocks: impl IntoIterator<Item = Arc<Block>>) -> Self {
+        Self::on_network(Network::new_regtest(Default::default()), blocks)
+    }
+
+    /// [`Self::new`], on `network`.
+    fn on_network(chain_network: Network, blocks: impl IntoIterator<Item = Arc<Block>>) -> Self {
         let genesis = genesis();
         let genesis_hash = genesis.hash();
 
@@ -133,17 +143,28 @@ impl Harness {
         );
         let gates: Arc<std::sync::Mutex<HashMap<block::Hash, oneshot::Receiver<()>>>> =
             Arc::default();
+        let failures: Arc<std::sync::Mutex<HashSet<block::Hash>>> = Arc::default();
 
         let (requests_tx, requests) = mpsc::unbounded_channel();
         let network_gates = gates.clone();
+        let network_failures = failures.clone();
         let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
             let blocks = blocks.clone();
             let gates = network_gates.clone();
+            let failures = network_failures.clone();
             let requests_tx = requests_tx.clone();
 
             async move {
                 let hash = requested_hash(&request);
                 requests_tx.send(request)?;
+
+                if failures
+                    .lock()
+                    .expect("failure lock is not poisoned")
+                    .remove(&hash)
+                {
+                    return Err("the peer failed the request".into());
+                }
 
                 let gate = gates
                     .lock()
@@ -210,7 +231,7 @@ impl Harness {
         let mut tip_block: zs::ChainTipBlock = zs::SemanticallyVerifiedBlock::from(genesis).into();
         tip_block.height = block::Height(0);
         let (mut tip_sender, latest_chain_tip, _tip_change) =
-            zs::ChainTipSender::new(None, &Network::Mainnet);
+            zs::ChainTipSender::new(None, &chain_network);
         tip_sender.set_finalized_tip(tip_block);
 
         let downloads = Downloads::new(
@@ -220,7 +241,7 @@ impl Harness {
             verifier,
             state,
             latest_chain_tip,
-            Network::Mainnet,
+            chain_network,
         );
 
         Self {
@@ -228,6 +249,7 @@ impl Harness {
             requests,
             commits,
             gates,
+            failures,
             _tip_sender: tip_sender,
         }
     }
@@ -606,4 +628,105 @@ async fn dropping_downloads_cancels_child_and_parent_recovery() {
     })
     .await
     .expect("dropping downloads cancels every task and releases its services");
+}
+
+/// A child without valid proof of work starts no recovery and charges nothing to its advertiser,
+/// so that advertiser's later child with valid proof of work recovers its own parent.
+#[tokio::test(start_paused = true)]
+async fn invalid_proof_of_work_child_does_not_start_a_recovery() {
+    let peer = zn::PeerSource::Zakura(
+        zn::zakura::ZakuraPeerId::new(vec![9; 32]).expect("test peer id is within bounds"),
+    );
+    let parent = block_1();
+    let child = block_2();
+    let invalid = with_parent(&child, unavailable(0x42));
+    let mut harness = Harness::on_network(
+        Network::Mainnet,
+        [parent.clone(), child.clone(), invalid.clone()],
+    );
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(invalid.hash(), Some(peer.clone())),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.drain_requests().await,
+        vec![request_from(invalid.hash(), peer.clone())],
+        "the unavailable parent is not requested"
+    );
+    assert_eq!(harness.parent_recoveries(), 0);
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(peer.clone())),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(child.hash(), peer.clone())
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(parent.hash(), peer)
+    );
+}
+
+/// A finished recovery holds nothing, even before the stream collects its result.
+///
+/// The stream is only polled on the next inbound request, so a failed parent download must not
+/// look in flight to the next child that needs the same parent.
+#[tokio::test(start_paused = true)]
+async fn failed_recovery_does_not_suppress_a_later_recovery() {
+    let parent = block_1();
+    let child = block_2();
+    let sibling = sibling_of(&child, 7);
+    let mut harness = Harness::new([parent.clone(), child.clone(), sibling.clone()]);
+    harness
+        .failures
+        .lock()
+        .expect("failure lock is not poisoned")
+        .insert(parent.hash());
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(legacy(2))),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(child.hash(), legacy(2))
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(parent.hash(), legacy(2))
+    );
+
+    // The failed task finishes while the stream is idle.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(harness.parent_recoveries(), 0);
+    assert_eq!(harness.downloads.spawner.admission().queue_len(), 1);
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(sibling.hash(), Some(legacy(3))),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(sibling.hash(), legacy(3))
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(parent.hash(), legacy(3)),
+        "the later child requests the parent again"
+    );
+
+    assert_eq!(harness.next_commit().await, parent.hash());
+    let children = HashSet::from([harness.next_commit().await, harness.next_commit().await]);
+    assert_eq!(children, HashSet::from([child.hash(), sibling.hash()]));
 }

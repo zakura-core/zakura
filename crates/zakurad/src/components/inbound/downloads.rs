@@ -52,6 +52,11 @@ pub struct GossipedTipChildHeightMismatch {
     pub height: block::Height,
     pub expected_height: block::Height,
     pub hash: block::Hash,
+
+    /// Whether the body answered a parent recovery rather than an advertised download.
+    ///
+    /// A failed recovery is left to the syncer, so it stays within [`MAX_PARENT_RECOVERIES`].
+    pub parent_recovery: bool,
 }
 
 /// Source key used for inbound block download ordering.
@@ -140,6 +145,9 @@ enum ParentRecovery {
 
     /// The inbound queue is at capacity.
     FullQueue,
+
+    /// The child's header fails the proof of work checks, so it did not start a recovery.
+    InvalidProofOfWork,
 }
 
 impl ParentRecovery {
@@ -151,6 +159,7 @@ impl ParentRecovery {
             Self::TooManyRecoveries => "too_many_recoveries",
             Self::SourceRecoveryInFlight => "source_recovery_in_flight",
             Self::FullQueue => "full_queue",
+            Self::InvalidProofOfWork => "invalid_proof_of_work",
         }
     }
 }
@@ -363,7 +372,10 @@ impl Admission {
         self.cancel_handles.len()
     }
 
-    /// Releases everything held by the task for `hash`, after it finished.
+    /// Releases everything held by the task for `hash`.
+    ///
+    /// The task calls this as it finishes. The stream only runs when the next inbound request
+    /// polls it, and until then a stale entry would misdirect other tasks' parent recoveries.
     fn release(&mut self, hash: &block::Hash) {
         self.parent_recoveries.remove(hash);
 
@@ -518,16 +530,15 @@ where
         //
         // TODO: this would be cleaner with poll_map (#2693)
         if let Some(join_result) = ready!(this.pending.as_mut().poll_next(cx)) {
-            let (result, hash) =
-                match join_result.expect("block download and verify tasks must not panic") {
-                    Ok(hash) => {
-                        // The block finally arrived, so its poisoned-retry budget is spent.
-                        this.poisoned_retries.release(&hash);
-                        (Ok(hash), hash)
-                    }
-                    Err((e, hash, advertiser_addr)) => (Err((e, advertiser_addr)), hash),
-                };
-            this.spawner.admission().release(&hash);
+            let result = match join_result.expect("block download and verify tasks must not panic")
+            {
+                Ok(hash) => {
+                    // The block finally arrived, so its poisoned-retry budget is spent.
+                    this.poisoned_retries.release(&hash);
+                    Ok(hash)
+                }
+                Err((e, _hash, advertiser_addr)) => Err((e, advertiser_addr)),
+            };
             Poll::Ready(Some(result))
         } else {
             Poll::Ready(None)
@@ -800,9 +811,10 @@ where
     /// missing from the state.
     ///
     /// If `parent` already has an inbound download, the child waits on it. Otherwise one
-    /// recovery download is requested from the child's advertiser, `child_source`, which has
-    /// the parent if it validated the child. A child without a source routes the request
-    /// through the peer set's inventory instead.
+    /// recovery download is requested with `child_source` as its source. The peer set sends it
+    /// to a peer that advertised `parent` if there is one, and otherwise to the child's
+    /// advertiser, which has the parent if it validated the child. A child without a source
+    /// routes the request through the peer set's inventory.
     ///
     /// A failed recovery is not retried here: the syncer recovers the parent as before.
     ///
@@ -811,7 +823,8 @@ where
     /// Recoveries are bounded by [`MAX_PARENT_RECOVERIES`] in total, by one per child
     /// advertiser, by the inbound queue limit, and to a single hop, because recovered parents
     /// never recover their own parents. The caller only calls this for children close enough
-    /// to the tip that one hop could connect them.
+    /// to the tip that one hop could connect them, and whose headers carry valid proof of work,
+    /// so a peer cannot occupy these slots with blocks that cost nothing to make.
     fn recover_parent(
         &self,
         parent: block::Hash,
@@ -1041,6 +1054,7 @@ where
                         height: block_height,
                         expected_height,
                         hash,
+                        parent_recovery: kind == DownloadKind::ParentRecovery,
                     }),
                     advertiser_addr,
                 ))?;
@@ -1091,7 +1105,23 @@ where
                     );
 
                 if parent_is_missing {
-                    let recovery = spawner.recover_parent(parent, download_source);
+                    let header = block.header.clone();
+                    let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
+                        zakura_consensus::proof_of_work_is_valid(
+                            &header,
+                            &chain_network,
+                            &block_height,
+                            &hash,
+                        )
+                    })
+                    .await
+                    .unwrap_or(false);
+
+                    let recovery = if proof_of_work_is_valid {
+                        spawner.recover_parent(parent, download_source)
+                    } else {
+                        ParentRecovery::InvalidProofOfWork
+                    };
                     debug!(
                         ?hash,
                         ?parent,
@@ -1139,9 +1169,10 @@ where
         .in_current_span()
         .boxed();
 
+        let task_admission = self.admission.clone();
         let task = tokio::spawn(async move {
             // Prefer the cancel handle if both are ready.
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
                 _ = &mut cancel_rx => {
                     trace!("task cancelled prior to completion");
@@ -1149,7 +1180,15 @@ where
                     Err(("canceled".into(), hash, None))
                 }
                 verification = fut => verification,
-            }
+            };
+
+            // `spawn_download_task` holds this lock until it has recorded the task.
+            task_admission
+                .lock()
+                .expect("admission is only mutated by non-panicking bookkeeping code")
+                .release(&hash);
+
+            result
         });
 
         assert!(

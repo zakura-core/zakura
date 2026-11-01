@@ -171,6 +171,27 @@ pub fn equihash_solution_is_valid(
     PowPolicy::validating(network).validate_solution(header)
 }
 
+/// Returns `true` if `header` passes the context-free proof of work checks of the block verifier
+/// on `network`, or if `network` waives them.
+///
+/// This lets callers reject blocks that cost nothing to make before spending anything on them.
+/// It does not check the block's difficulty against the chain.
+pub fn proof_of_work_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> bool {
+    match PowPolicy::for_network(network) {
+        Ok(policy) if policy.is_authenticated_custom_waiver() => true,
+        Ok(_) => {
+            difficulty_is_valid(header, network, height, hash).is_ok()
+                && equihash_solution_is_valid(header, network).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
 /// subsidy in `block` is valid for `network`
 ///

@@ -562,9 +562,13 @@ impl Service<zn::Request> for Inbound {
                             ));
                         }
 
-                        // The outcome, including a replacement refused by the queue bounds, is
-                        // logged by `retry_poisoned` itself.
-                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        // A failed parent recovery is left to the syncer. A re-request would
+                        // leave the recovery bounds, because it is an ordinary download.
+                        if !mismatch.parent_recovery {
+                            // The outcome, including a replacement refused by the queue bounds,
+                            // is logged by `retry_poisoned` itself.
+                            let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        }
                         continue;
                     }
 

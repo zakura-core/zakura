@@ -1292,6 +1292,10 @@ impl ParametersBuilder {
     /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
+        if NetworkUpgrade::Nu7.activation_height(&network).is_some() {
+            super::subsidy::block_subsidy_fraction_numerator(&network)
+                .map_err(|_| ParametersBuilderError::InvalidReissuanceFraction)?;
+        }
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
         // The network holds the height ranges after NU7 moves the inherited ones.

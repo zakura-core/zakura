@@ -58,7 +58,7 @@ pub(crate) fn exit_if_cpu_lacks_pasta_assembly_features() {
         return;
     }
     eprintln!(
-        "zakurad was built to require CPU features this machine lacks: {}. \
+        "This Zakura binary requires CPU features this machine lacks: {}. \
          Rebuild with `--features portable` and without CPU-specific compiler flags.",
         missing.join(", ")
     );

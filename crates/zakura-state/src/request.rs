@@ -371,7 +371,7 @@ pub struct SemanticallyVerifiedBlock {
     /// earlier transaction.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
     pub transaction_hashes: Arc<[transaction::Hash]>,
@@ -579,7 +579,7 @@ impl FinalizedBlock {
             block: block.block,
             hash: block.hash,
             height: block.height,
-            new_outputs: block.new_outputs,
+            new_outputs: Arc::unwrap_or_clone(block.new_outputs),
             transaction_hashes: block.transaction_hashes,
             treestate,
             deferred_pool_balance_change: block.deferred_pool_balance_change,
@@ -691,7 +691,7 @@ impl ContextuallyVerifiedBlock {
             block,
             hash,
             height,
-            new_outputs: Arc::new(new_outputs),
+            new_outputs,
             spent_outputs,
             transaction_hashes,
             chain_value_pool_change,
@@ -722,7 +722,10 @@ impl CheckpointVerifiedBlock {
             .coinbase_height()
             .expect("checkpoint verified block should have a coinbase height");
         let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let new_outputs = Arc::new(transparent::new_ordered_outputs(
+            &block,
+            &transaction_hashes,
+        ));
 
         Self(SemanticallyVerifiedBlock {
             block,
@@ -762,7 +765,10 @@ impl SemanticallyVerifiedBlock {
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
         let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let new_outputs = Arc::new(transparent::new_ordered_outputs(
+            &block,
+            &transaction_hashes,
+        ));
 
         Self {
             block,
@@ -799,7 +805,10 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
         let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let new_outputs = Arc::new(transparent::new_ordered_outputs(
+            &block,
+            &transaction_hashes,
+        ));
 
         Self {
             block,
@@ -883,7 +892,7 @@ mod tests {
         ));
 
         let semantic = SemanticallyVerifiedBlock::from(cloned);
-        assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+        assert!(Arc::ptr_eq(&semantic.new_outputs, &contextual.new_outputs));
 
         let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
             &Network::Mainnet,
@@ -895,7 +904,7 @@ mod tests {
         let expected_outputs = unique.new_outputs.as_ref().clone();
 
         let semantic = SemanticallyVerifiedBlock::from(unique);
-        assert_eq!(semantic.new_outputs, expected_outputs);
+        assert_eq!(*semantic.new_outputs, expected_outputs);
     }
 
     #[test]
@@ -945,7 +954,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: Arc::unwrap_or_clone(valid.new_outputs),
+            new_outputs: valid.new_outputs,
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
@@ -962,7 +971,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             block: finalized.block,
             hash: finalized.hash,
             height: finalized.height,
-            new_outputs: finalized.new_outputs,
+            new_outputs: Arc::new(finalized.new_outputs),
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
             auth_data_root: None,

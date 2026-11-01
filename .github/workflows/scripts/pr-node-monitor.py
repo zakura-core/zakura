@@ -91,12 +91,18 @@ def counter_window(samples: list[dict], field: str) -> dict:
             "delta": values[-1] - values[0] if values else 0}
 
 
-def summarize_capacity(samples: list[dict], interval: float) -> dict:
+def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = False) -> dict:
     """Combine sampled utilization with event counters that capture brief saturation."""
     result = {}
     for path in ("sync", "gossip"):
-        observations = [s for s in samples
-                        if s.get("missing_parent", {}).get(path, {}).get("capacity") is not None]
+        starts = [s for s in samples
+                  if s.get("missing_parent", {}).get(path, {}).get("capacity") is not None
+                  and (s.get("peers") or 0) > 0 and not s.get("rpc_error")
+                  and (not at_tip or (s.get("reference_height") is not None and s.get("height") is not None
+                                      and abs(s["reference_height"] - s["height"]) <= 2))]
+        start = starts[0]["elapsed"] if starts else None
+        observations = [s for s in samples if start is not None and s["elapsed"] >= start
+                        and s.get("missing_parent", {}).get(path, {}).get("capacity") is not None]
         if not observations:
             result[path] = {"verdict": "incomplete", "reason": "No reservation metrics."}
             continue
@@ -135,6 +141,8 @@ def summarize_capacity(samples: list[dict], interval: float) -> dict:
 
         result[path] = {
             "verdict": "failed" if failures else "ok", "failures": failures,
+            "start_elapsed": observations[0]["elapsed"],
+            "end_elapsed": observations[-1]["elapsed"],
             "observed_seconds": observations[-1]["elapsed"] - observations[0]["elapsed"],
             "samples": len(observations),
             "capacities": sorted({v["capacity"] for v in values}),
@@ -606,6 +614,12 @@ def main(argv=None) -> int:
             f"state={sample['active_state']}"
         )
         print(status, flush=True)
+        if args.require_capacity and any(
+            (path.get("limit_reached_count") or 0) > 0 or (path.get("capacity_deferred_count") or 0) > 0
+            for path in sample.get("missing_parent", {}).values()
+        ):
+            print("normal-traffic capacity acceptance failed; preserving this observation", flush=True)
+            break
         if args.require_startup_height and not startup_height_checked:
             startup_height, startup_error = read_startup_height(args.log_file)
             if startup_error is None or sample["elapsed"] > RPC_GRACE_SECS:
@@ -679,10 +693,12 @@ def main(argv=None) -> int:
         expected_snapshot_height=args.expected_snapshot_height,
         startup_height_error=startup_error,
     )
-    summary["missing_parent"] = summarize_capacity(samples, args.interval)
+    summary["missing_parent"] = summarize_capacity(samples, args.interval, at_tip=bool(args.required_observation_seconds))
     summary["missing_parent_durations"] = next((s["missing_parent_durations"] for s in reversed(samples)
                                                 if s.get("missing_parent_durations")), {})
-    summary["work_counter_windows"] = {field: counter_window(samples, field)
+    window_start = max((path.get("start_elapsed", 0) for path in summary["missing_parent"].values()), default=0)
+    measured_samples = [s for s in samples if s["elapsed"] >= window_start]
+    summary["work_counter_windows"] = {field: counter_window(measured_samples, field)
                                         for field in ("semantic_commits", "body_downloads")}
     summary["semantic_commits"] = summary["work_counter_windows"]["semantic_commits"]["delta"]
     summary["body_downloads"] = summary["work_counter_windows"]["body_downloads"]["delta"]
@@ -700,7 +716,7 @@ def main(argv=None) -> int:
                 reasons.append("Tip qualification requires an independent reference.")
             elif any(s.get("reference_error") or s.get("reference_height") is None
                      or s.get("height") is None or abs(s["reference_height"] - s["height"]) > 2
-                     for s in samples if s.get("missing_parent")):
+                     for s in measured_samples if s.get("missing_parent")):
                 reasons.append("Independent tip coverage is missing or lag exceeded two blocks.")
             if (summary.get("blocks_synced") or 0) < 1:
                 reasons.append("The tip run observed no committed chain progress.")

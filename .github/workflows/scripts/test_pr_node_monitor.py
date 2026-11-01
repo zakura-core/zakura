@@ -59,6 +59,15 @@ class CapacityQualification(unittest.TestCase):
         self.assertEqual(measured["sync"]["minimum_headroom"], 15)
         self.assertEqual(measured["sync"]["events_since_process_start"]["admitted_count"], 0)
 
+    def test_startup_is_outside_the_window_but_later_connectivity_loss_fails(self):
+        startup = dict(self.observation(0), peers=0)
+        measured = monitor.summarize_capacity([startup, self.observation(1), self.observation(2)], 1)
+        self.assertEqual(measured["sync"]["verdict"], "ok")
+        self.assertEqual(measured["sync"]["start_elapsed"], 1)
+        self.assertEqual(measured["sync"]["observed_seconds"], 1)
+        lost = dict(self.observation(3), peers=0)
+        self.assertEqual(monitor.summarize_capacity([self.observation(1), lost], 1)["sync"]["verdict"], "failed")
+
     def test_event_counter_catches_a_spike_between_scrapes(self):
         measured = monitor.summarize_capacity([
             self.observation(0), self.observation(1, saturation=1, peak=15)], 1)

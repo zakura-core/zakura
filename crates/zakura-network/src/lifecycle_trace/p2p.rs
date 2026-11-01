@@ -207,7 +207,7 @@ impl ConnectionTrace {
                 .then(|| saturating_micros(report.elapsed)),
             acked_bytes: Some(report.acked_message_bytes()),
             tcp_retrans: report.retransmits(),
-            samples: Some(saturating_count(report.samples.len())),
+            samples: Some(report.sample_count),
             result: Some(result),
             ..state.row(self.id, event, Some(seq), "block")
         });

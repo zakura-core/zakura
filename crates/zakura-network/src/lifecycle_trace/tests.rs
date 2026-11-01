@@ -439,11 +439,12 @@ fn p2p_body_upload_rows_record_acknowledgement_or_its_absence() {
         elapsed: Duration::from_millis(250),
         message_len: 1_000,
         start,
-        samples: vec![UploadSample {
+        sample_count: 5,
+        last_sample: Some(UploadSample {
             elapsed: Duration::from_millis(250),
             info: last,
             acked_message_bytes,
-        }],
+        }),
     };
 
     conn.p2p_body_upload(3, &report(UploadOutcome::Acked, 1_000));
@@ -458,7 +459,7 @@ fn p2p_body_upload_rows_record_acknowledgement_or_its_absence() {
     assert_eq!(rows[0]["tcp_retrans"], "3");
     assert_eq!(rows[0]["tcp_total_retrans"], "5");
     assert_eq!(rows[0]["tcp_delivery_rate"], "2000000");
-    assert_eq!(rows[0]["samples"], "1");
+    assert_eq!(rows[0]["samples"], "5");
     assert_eq!(rows[0]["result"], "acked");
 
     assert_eq!(rows[1]["event"], "body_ack_timeout");

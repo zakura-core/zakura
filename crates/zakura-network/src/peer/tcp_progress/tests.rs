@@ -198,6 +198,11 @@ mod linux {
             !watcher.is_finished(),
             "nothing is acknowledged past the receiver's window"
         );
+        let waiting = progress.sample().expect("the socket is readable");
+        assert!(
+            waiting.bytes_acked < message_len / 2,
+            "only the receiver's window is acknowledged before it reads: {waiting:?}"
+        );
         start_reading.notify_one();
 
         let (drain_started, drained) = reader.await.expect("reader task");
@@ -208,6 +213,10 @@ mod linux {
 
         assert_eq!(report.outcome, UploadOutcome::Acked);
         assert_eq!(report.acked_message_bytes(), message_len);
+        assert!(
+            report.sample_count >= (READ_DELAY.as_millis() / SAMPLE_INTERVAL.as_millis()) as u64 / 2,
+            "the watch sampled while the receiver waited: {report:?}"
+        );
         let acked_at = report.started_at + report.elapsed;
         assert!(
             acked_at >= drain_started,
@@ -218,26 +227,6 @@ mod linux {
             "the watch sees the acknowledgement within a few samples of the drain"
         );
 
-        // Before the receiver read anything, at most its window was acknowledged.
-        let waiting: Vec<_> = report
-            .samples
-            .iter()
-            .filter(|sample| report.started_at + sample.elapsed < drain_started)
-            .collect();
-        assert!(
-            !waiting.is_empty(),
-            "the watch sampled while the receiver waited"
-        );
-        for sample in &waiting {
-            assert!(
-                sample.acked_message_bytes < message_len / 2,
-                "only the receiver's window is acknowledged before it reads: {sample:?}"
-            );
-        }
-        assert!(report
-            .samples
-            .windows(2)
-            .all(|pair| pair[0].acked_message_bytes <= pair[1].acked_message_bytes));
         // Zero-window probes may count as retransmissions, so only check the counter is read.
         assert!(report.retransmits().is_some());
     }
@@ -255,7 +244,40 @@ mod linux {
             .await
             .expect("the watch ends once the connection is gone");
         assert_eq!(report.outcome, UploadOutcome::Closed);
-        assert!(report.samples.is_empty());
+        assert_eq!(report.sample_count, 0);
+        assert!(report.last_sample.is_none());
+    }
+
+    /// Duplicates stop when the budget is spent, and a closed connection's share returns to it.
+    /// A watch that outlives its connection holds no share.
+    #[tokio::test]
+    async fn descriptor_budget_limits_duplicates_until_a_connection_closes() {
+        let (sender, _receiver) = connected_pair().await;
+        let budget = Arc::new(Semaphore::new(1));
+
+        let first = TcpSocket::duplicate(&sender, &budget).expect("the budget has room");
+        assert!(
+            TcpSocket::duplicate(&sender, &budget).is_none(),
+            "the budget is spent"
+        );
+
+        let weak = first.downgrade();
+        drop(first);
+        assert!(weak.sample().is_none(), "the duplicate closed");
+        assert!(
+            TcpSocket::duplicate(&sender, &budget).is_some(),
+            "closing the connection returned its share"
+        );
+    }
+
+    #[test]
+    fn descriptor_budget_is_an_eighth_of_the_open_file_limit() {
+        assert_eq!(descriptor_budget(Some(512)), 64);
+        assert_eq!(descriptor_budget(Some(1024)), 128);
+        assert_eq!(descriptor_budget(None), 128);
+        assert_eq!(descriptor_budget(Some(0)), 1);
+        // `RLIM_INFINITY`.
+        assert_eq!(descriptor_budget(Some(u64::MAX)), 1 << 20);
     }
 
     /// A connection watches at most [`MAX_WATCHED_UPLOADS`] uploads at once.

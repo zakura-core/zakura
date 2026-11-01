@@ -16,12 +16,15 @@
 //!
 //! # Cost
 //!
-//! Each sample is one `getsockopt(TCP_INFO)` call, a few hundred nanoseconds with no
-//! allocation beyond the report's sample list. Starting a watch reads `TCP_INFO` around `SIOCOUTQ` and retries up to three times.
+//! Each sample is one `getsockopt(TCP_INFO)` call, a few hundred nanoseconds with no allocation.
+//! Starting a watch reads `TCP_INFO` around `SIOCOUTQ` and retries up to three times.
 //! Sampling runs only while a watched upload is unacknowledged: at most
 //! [`MAX_WATCHED_UPLOADS`] watches per connection, each sampling every [`SAMPLE_INTERVAL`] for
-//! at most [`ACK_TIMEOUT`]. That bounds the cost to 80 system calls per second per connection
-//! and 600 samples per watch. Nothing samples while no upload is watched.
+//! at most [`ACK_TIMEOUT`]. That bounds the cost to 80 system calls per second per connection.
+//! A watch keeps only its latest sample. Nothing samples while no upload is watched.
+//!
+//! Each sampled connection holds one extra file descriptor. At most an eighth of the process's
+//! open file limit goes to these descriptors, and connections beyond that are not sampled.
 
 use std::{
     any::Any,
@@ -81,14 +84,47 @@ pub struct TcpInfo {
 #[derive(Debug)]
 pub struct TcpSocket {
     #[cfg(target_os = "linux")]
-    fd: Arc<std::os::fd::OwnedFd>,
+    fd: Arc<BudgetedFd>,
+}
+
+/// A duplicated socket descriptor and its share of the [`DESCRIPTOR_BUDGET`].
+///
+/// The permit drops after the descriptor closes, so the budget never undercounts open duplicates.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct BudgetedFd {
+    fd: std::os::fd::OwnedFd,
+    _budget: OwnedSemaphorePermit,
+}
+
+/// The duplicated socket descriptors the process may hold.
+///
+/// Connections and database files share the open file limit. The handshake duplicates a descriptor
+/// for each connection a peer opens, so this budget keeps sampling from using up that limit. Read
+/// on the first connection, after startup has raised the limit.
+#[cfg(target_os = "linux")]
+static DESCRIPTOR_BUDGET: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
+    Arc::new(Semaphore::new(descriptor_budget(sys::open_file_limit())))
+});
+
+/// Returns how many duplicates `open_file_limit` allows: one eighth of it, or one eighth of
+/// [`ASSUMED_OPEN_FILE_LIMIT`] if the limit is unknown.
+#[cfg(target_os = "linux")]
+fn descriptor_budget(open_file_limit: Option<u64>) -> usize {
+    /// A common default soft limit.
+    const ASSUMED_OPEN_FILE_LIMIT: u64 = 1024;
+    /// Far more connections than a node accepts, and within the semaphore's permit range.
+    const MAX_DESCRIPTOR_BUDGET: u64 = 1 << 20;
+
+    let budget = open_file_limit.unwrap_or(ASSUMED_OPEN_FILE_LIMIT) / 8;
+    usize::try_from(budget.clamp(1, MAX_DESCRIPTOR_BUDGET)).expect("the budget fits in usize")
 }
 
 /// A non-owning [`TcpSocket`] handle that reads nothing once the connection is gone.
 #[derive(Clone, Debug)]
 pub struct WeakTcpSocket {
     #[cfg(target_os = "linux")]
-    fd: std::sync::Weak<std::os::fd::OwnedFd>,
+    fd: std::sync::Weak<BudgetedFd>,
 }
 
 impl TcpSocket {
@@ -101,13 +137,15 @@ impl TcpSocket {
     }
 
     /// Returns a handle to `stream`'s socket, or `None` if the platform exposes no TCP delivery
-    /// counters or the descriptor cannot be duplicated.
+    /// counters, the descriptor budget is spent, or the descriptor cannot be duplicated.
     pub fn from_tcp_stream(stream: &tokio::net::TcpStream) -> Option<Self> {
         #[cfg(target_os = "linux")]
         {
-            use std::os::fd::AsFd;
-            let fd = stream.as_fd().try_clone_to_owned().ok()?;
-            Some(Self { fd: Arc::new(fd) })
+            let socket = Self::duplicate(stream, &DESCRIPTOR_BUDGET);
+            if socket.is_none() {
+                metrics::counter!("peer.tcp_progress.socket_unsampled").increment(1);
+            }
+            socket
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -116,12 +154,26 @@ impl TcpSocket {
         }
     }
 
+    /// Duplicates `stream`'s descriptor if `budget` has room.
+    #[cfg(target_os = "linux")]
+    fn duplicate(stream: &tokio::net::TcpStream, budget: &Arc<Semaphore>) -> Option<Self> {
+        use std::os::fd::AsFd;
+        let budget = budget.clone().try_acquire_owned().ok()?;
+        let fd = stream.as_fd().try_clone_to_owned().ok()?;
+        Some(Self {
+            fd: Arc::new(BudgetedFd {
+                fd,
+                _budget: budget,
+            }),
+        })
+    }
+
     /// Reads the socket's current TCP state.
     pub fn sample(&self) -> Option<TcpInfo> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            sys::tcp_info(self.fd.as_raw_fd())
+            sys::tcp_info(self.fd.fd.as_raw_fd())
         }
         #[cfg(not(target_os = "linux"))]
         None
@@ -141,7 +193,7 @@ impl TcpSocket {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            sys::send_queue_bytes(self.fd.as_raw_fd())
+            sys::send_queue_bytes(self.fd.fd.as_raw_fd())
         }
         #[cfg(not(target_os = "linux"))]
         None
@@ -156,7 +208,7 @@ impl WeakTcpSocket {
             use std::os::fd::AsRawFd;
             // Holding the upgraded handle keeps the descriptor open for the call.
             let fd = self.fd.upgrade()?;
-            sys::tcp_info(fd.as_raw_fd())
+            sys::tcp_info(fd.fd.as_raw_fd())
         }
         #[cfg(not(target_os = "linux"))]
         None
@@ -295,22 +347,23 @@ pub struct UploadReport {
     pub message_len: u64,
     /// The socket state when the watch started.
     pub start: TcpInfo,
-    /// Every sample, in order. The last one is the socket state when the watch ended, unless the
-    /// connection closed first.
-    pub samples: Vec<UploadSample>,
+    /// How many samples the watch took.
+    pub sample_count: u64,
+    /// The latest sample: the socket state when the watch ended, unless the connection closed
+    /// first. A peer can hold a watch open for [`ACK_TIMEOUT`], so earlier samples are not kept.
+    pub last_sample: Option<UploadSample>,
 }
 
 impl UploadReport {
     /// Bytes of the message the peer had acknowledged by the last sample.
     pub fn acked_message_bytes(&self) -> u64 {
-        self.samples
-            .last()
+        self.last_sample
             .map_or(0, |sample| sample.acked_message_bytes)
     }
 
     /// The socket state at the last sample.
     pub fn last(&self) -> Option<&TcpInfo> {
-        self.samples.last().map(|sample| &sample.info)
+        self.last_sample.as_ref().map(|sample| &sample.info)
     }
 
     /// Segments retransmitted on the connection between the start of the watch and the last
@@ -328,7 +381,8 @@ impl UploadWatch {
         let deadline = self.started_at + ACK_TIMEOUT;
         let mut ticks = tokio::time::interval(SAMPLE_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut samples = Vec::new();
+        let mut sample_count = 0;
+        let mut last_sample = None;
 
         let outcome = loop {
             ticks.tick().await;
@@ -336,7 +390,8 @@ impl UploadWatch {
             let Some(info) = self.socket.sample() else {
                 break UploadOutcome::Closed;
             };
-            samples.push(UploadSample {
+            sample_count += 1;
+            last_sample = Some(UploadSample {
                 elapsed: now.saturating_duration_since(self.started_at),
                 info,
                 acked_message_bytes: self.acked_message_bytes(&info),
@@ -352,13 +407,14 @@ impl UploadWatch {
         UploadReport {
             outcome,
             started_at: self.started_at,
-            elapsed: match (outcome, samples.last()) {
+            elapsed: match (outcome, last_sample) {
                 (UploadOutcome::Acked, Some(sample)) => sample.elapsed,
                 _ => self.started_at.elapsed(),
             },
             message_len: self.message_len,
             start: self.start,
-            samples,
+            sample_count,
+            last_sample,
         }
     }
 
@@ -495,6 +551,17 @@ mod sys {
     };
 
     use super::TcpInfo;
+
+    /// Returns the process's soft open file limit, or `None` if it cannot be read.
+    pub(super) fn open_file_limit() -> Option<u64> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid `rlimit` that outlives the call.
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        (result == 0).then_some(limit.rlim_cur)
+    }
 
     /// The prefix of the kernel's `struct tcp_info` (`include/uapi/linux/tcp.h`) through
     /// `tcpi_delivery_rate`, as of Linux 4.9. The kernel appends fields over time and copies

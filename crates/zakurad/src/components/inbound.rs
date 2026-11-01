@@ -562,9 +562,13 @@ impl Service<zn::Request> for Inbound {
                             ));
                         }
 
-                        // The outcome, including a replacement refused by the queue bounds, is
-                        // logged by `retry_poisoned` itself.
-                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        // A failed parent recovery is left to the syncer. A re-request would
+                        // leave the recovery bounds, because it is an ordinary download.
+                        if !mismatch.parent_recovery {
+                            // The outcome, including a replacement refused by the queue bounds,
+                            // is logged by `retry_poisoned` itself.
+                            let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        }
                         continue;
                     }
 
@@ -861,7 +865,6 @@ impl Service<zn::Request> for Inbound {
             // The size of this response is limited by the `Connection` state machine in the network layer
             zn::Request::MempoolTransactionIds => {
                 mempool.clone().oneshot(mempool::Request::TransactionIds).map_ok(|resp| match resp {
-                    mempool::Response::TransactionIds(transaction_ids) if transaction_ids.is_empty() => zn::Response::Nil,
                     mempool::Response::TransactionIds(transaction_ids) => zn::Response::TransactionIds(transaction_ids.into_iter().collect()),
                     _ => unreachable!("Mempool component should always respond to a `TransactionIds` request with a `TransactionIds` response"),
                 })

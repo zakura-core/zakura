@@ -4,7 +4,8 @@
 //! the input with `zakura_sim::explore`, which classifies the run, and
 //! [`fuzz_one`] acts on the class: it records and panics on an `Active`
 //! violation, panics on a harness failure, and saves a trace of each
-//! `Known` and `Draft` violation once.
+//! `Known` and `Draft` violation once. With `ZAKURA_SIM_STATS` set, the
+//! target also counts every run for its campaign's evidence.
 //!
 //! The package needs `RUSTFLAGS="--cfg zakura_sim"`. Without it,
 //! `zakura-sim` compiles to an empty crate, so the build fails here instead.
@@ -16,6 +17,8 @@ compile_error!("qa/fuzz/sim needs RUSTFLAGS=\"--cfg zakura_sim\"");
 mod feedback;
 #[cfg(zakura_sim)]
 mod fuzz;
+#[cfg(zakura_sim)]
+mod stats;
 
 #[cfg(zakura_sim)]
 pub use feedback::*;

@@ -16,7 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    manifest::{Budget, Manifest, WorkerPlan, FEEDBACK_VAR, SANITIZER_VARS},
+    manifest::{Budget, Manifest, WorkerPlan, SANITIZER_VARS},
     snapshot::Source,
     store::{
         now_unix, partial_path, read_record, record_bytes, replace, write_once, CampaignError,
@@ -24,7 +24,10 @@ use super::{
     },
 };
 use crate::{
-    explore::{ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, EXPECT_VAR},
+    explore::{
+        feedback::FEEDBACK_VAR, stats::STATS_VAR, ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC,
+        ABANDON_LIMIT_VAR, EXPECT_VAR,
+    },
     trace::ARTIFACTS_VAR,
 };
 
@@ -51,6 +54,9 @@ const ARTIFACTS_DIR: &str = "artifacts";
 
 /// A worker's `ZAKURA_SIM_ARTIFACTS`: the target's saved inputs and traces.
 const SIM_DIR: &str = "sim";
+
+/// A worker's `ZAKURA_SIM_STATS`: each fuzzer process's stats file.
+pub(super) const STATS_DIR: &str = "stats";
 
 /// The compaction's libFuzzer artifacts: the inputs its merge crashed on.
 const COMPACT_ARTIFACTS_DIR: &str = "compact-artifacts";
@@ -123,7 +129,7 @@ pub enum WorkerOutcome {
 }
 
 /// How one fuzzer process ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttemptEnd {
     /// It exited 0 at its time limit.
@@ -160,6 +166,10 @@ pub struct Attempt {
     pub seed: u32,
     /// libFuzzer's `-max_total_time`.
     pub max_total_time: u64,
+    /// Its process ID, which names its stats file. `None` in a record
+    /// written before attempts recorded it.
+    #[serde(default)]
+    pub pid: Option<u32>,
     /// When it started, in seconds since the Unix epoch.
     pub started_unix: u64,
     /// How long it ran, in milliseconds.
@@ -557,16 +567,19 @@ impl Worker<'_> {
             .arg(self.snapshot)
             .arg(format!("-seed={seed}"))
             .arg(format!("-max_total_time={seconds}"))
-            .arg(format!("-artifact_prefix={}/", artifacts.display()));
+            .arg(format!("-artifact_prefix={}/", artifacts.display()))
+            .env(STATS_VAR, self.dir.join(STATS_DIR));
         let deadline = Duration::from_secs(seconds + self.budget.timeout_secs) + GRACE;
         let started_unix = now_unix();
         let started = Instant::now();
         let log = self.dir.join(format!("log-{number}.txt"));
-        let pid = self.dir.join(PID_FILE);
+        let pid_file = self.dir.join(PID_FILE);
+        let mut pid = None;
         let (exit, output) = run_logged(command, &log, Some(deadline), None, |child| {
+            pid = Some(child);
             // The pid file only lets `close` find a live fuzzer, so a
             // failed write costs nothing else.
-            let _ = replace(&pid, format!("{child}\n").as_bytes());
+            let _ = replace(&pid_file, format!("{child}\n").as_bytes());
         })?;
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let failure = ProcessFailure::of(exit, &output);
@@ -586,6 +599,7 @@ impl Worker<'_> {
             attempt: number,
             seed,
             max_total_time: seconds,
+            pid,
             started_unix,
             millis,
             code: match exit {
@@ -624,7 +638,7 @@ impl Worker<'_> {
 /// budget's libFuzzer flags, its sanitizer variables and the target's
 /// variables. The target saves its inputs and traces under `sim`, and runs
 /// without [`EXPECT_VAR`], which would make it ignore every failure but one
-/// property's.
+/// property's, and without [`STATS_VAR`], which a worker's process adds.
 pub(super) fn fuzzer_command(
     fuzzer: &Path,
     cpus: Option<&str>,
@@ -646,7 +660,8 @@ pub(super) fn fuzzer_command(
         .args(&budget.libfuzzer_args)
         .env(ARTIFACTS_VAR, sim)
         .env(ABANDON_LIMIT_VAR, budget.abandon_limit.to_string())
-        .env_remove(EXPECT_VAR);
+        .env_remove(EXPECT_VAR)
+        .env_remove(STATS_VAR);
     match &budget.feedback_mode {
         Some(mode) => command.env(FEEDBACK_VAR, mode),
         None => command.env_remove(FEEDBACK_VAR),
@@ -967,20 +982,27 @@ fn stopped_worker(plan: &WorkerPlan, dir: &Path) -> Result<WorkerEnd, CampaignEr
     if outcome.exists() {
         return read_record(&outcome, None);
     }
+    let attempts = read_attempts(dir)?;
+    Ok(WorkerEnd {
+        index: plan.index,
+        outcome: WorkerOutcome::Unfinished,
+        attempts: u32::try_from(attempts.len()).unwrap_or(u32::MAX),
+        millis: attempts.iter().fold(0u64, |millis, attempt| {
+            millis.saturating_add(attempt.millis)
+        }),
+    })
+}
+
+/// Every attempt in worker directory `dir`'s log, in order. A missing log
+/// holds none. A line cut off when the supervisor stopped, or garbled on
+/// disk, isn't an attempt.
+pub(super) fn read_attempts(dir: &Path) -> Result<Vec<Attempt>, CampaignError> {
     let log = dir.join(ATTEMPTS_FILE);
     let io = || CampaignError::io(format!("reading {}", log.display()));
-    let mut attempts = 0;
-    let mut millis = 0u64;
+    let mut attempts = Vec::new();
     let mut reader = match File::open(&log) {
         Ok(file) => BufReader::new(file),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(WorkerEnd {
-                index: plan.index,
-                outcome: WorkerOutcome::Unfinished,
-                attempts,
-                millis,
-            })
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(attempts),
         Err(error) => return Err(io()(error)),
     };
     let mut line = Vec::new();
@@ -999,19 +1021,11 @@ fn stopped_worker(plan: &WorkerPlan, dir: &Path) -> Result<WorkerEnd, CampaignEr
             reader.skip_until(b'\n').map_err(io())?;
             continue;
         }
-        // A line cut off when the supervisor stopped, or garbled on disk,
-        // isn't an attempt.
         if let Ok(attempt) = serde_json::from_slice::<Attempt>(&line) {
-            attempts += 1;
-            millis = millis.saturating_add(attempt.millis);
+            attempts.push(attempt);
         }
     }
-    Ok(WorkerEnd {
-        index: plan.index,
-        outcome: WorkerOutcome::Unfinished,
-        attempts,
-        millis,
-    })
+    Ok(attempts)
 }
 
 /// The process ID in the worker's pid file, if that process still runs
@@ -1041,7 +1055,7 @@ fn failure_dirs(dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
 }
 
 /// Run `dir`'s worker `index`'s directory.
-fn worker_dir(dir: &Path, index: usize) -> PathBuf {
+pub(super) fn worker_dir(dir: &Path, index: usize) -> PathBuf {
     dir.join(WORKERS_DIR).join(index.to_string())
 }
 

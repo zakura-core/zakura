@@ -220,6 +220,65 @@ bundle `<input sha256>-<n>/` with the first free `n`.
 `sim-verify-archive` checks every bundle against its `SHA256SUMS`, and counts
 the bundles under each harness, provenance and signature.
 
+### Minimized bundles
+
+With `--target`, triage also minimizes each `confirmed` failure in the
+`active` bucket with `cargo xtask sim-minimize`, as
+[Minimizing a crash](#minimizing-a-crash) describes. It needs
+`--runs` and `--wall-secs`, takes `--sanitizer`, and passes `--child-secs`
+on:
+
+```console
+cargo xtask sim-triage --sim fixtures/all --out <archive> --target race_fixtures \
+    --runs 64 --wall-secs 300 --child-secs 30 artifacts/race_fixtures/crash-…
+```
+
+The failure's bundle is in place before the minimizer starts, and the
+minimizer reads that bundle's `input.bin`. So a minimizer that fails or is
+killed never costs the failure its bundle, and the failure's bundle never
+changes. The minimizer writes under `.staging/`, with no time limit from
+triage: its own budgets bound `tmin` and each check. The minimizer rebuilds
+`zakura-sim` in the target directory triage runs from, so before the first
+input triage copies its own binary under `.staging/`, and every input's
+`record` and `replay` children run that copy. Triage refuses to start if the
+copy's SHA-256 isn't the running build's, and removes the copy when it exits.
+If its report says
+`minimized`, triage copies its output, without the pinned binaries in
+`bin/`, into a new bundle, and holds it to the failure's bundle:
+
+- the report must name the bundle's harness, property and input;
+- the original's and the candidate's `zakura-sim confirm` records must be
+  `confirmed`, on the bundle's harness, generator and property, each on its
+  own input, and on a build equivalent to the bundle's;
+- held to the original's confirmation again, the candidate's must stay
+  `confirmed`: the same property, assumptions with their parameters, and
+  cleanup;
+- the candidate's `input.bin` must hash to its digest and be smaller than
+  the original, and its trace must read with that input;
+- a fresh `zakura-sim replay` must replay the candidate's trace Exact.
+
+If any of that fails, or the minimizer kept no candidate, triage prints why
+and leaves the minimizer's output under `.staging/`, without the pinned
+binaries, whose SHA-256 its report keeps. Otherwise the new
+bundle goes beside the failure's bundle as `<bundle name>.minimized/`, or
+`<bundle name>.minimized-<n>/` with the first free `n`. It holds the
+candidate as `input.bin`, the minimizer's output under `minimizer/`, the
+minimizer's and the replay's output under `runs/`, `minimized.json` and
+`SHA256SUMS`. `minimized.json` names the failure's bundle, its input and the
+SHA-256 of its `SHA256SUMS`. A minimized bundle never changes after its
+rename. A later triage of the same input keeps the first minimized bundle
+that verifies, and doesn't run the minimizer. If none verifies, it minimizes
+again, and puts its own beside the others. Only a confirmed `active` failure
+is minimized, since the fuzz target's filter selects only an `Active`
+property.
+
+`sim-verify-archive` also holds each minimized bundle to its failure's
+bundle: its name must be that bundle's name with `.minimized`, that bundle's
+`SHA256SUMS` must be the one it was minimized from, and its files must pass
+every check above except the replay. Every field of `minimized.json` but
+`child_timeout_ms` and `build` must match what those files and the failure's
+bundle give. It counts minimized bundles on their own line.
+
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
 
@@ -296,6 +355,9 @@ main.
   running; stop it with `kill -- -<pid>`.
 - `status` lists the runs, and `verify` checks every record in the store,
   and each end record against its run's files as `resume` does.
+- `evidence` sums what a run's fuzzer processes counted, per worker and for
+  the run, and `--out <file>` also writes it as JSON. See
+  [Campaign evidence](#campaign-evidence).
 
 Every run ends with exactly one end record, `runs/<manifest>/end.json`, with
 one of three statuses:
@@ -328,6 +390,9 @@ cargo xtask sim-campaign start --store /mnt/campaign --campaign discovery-2026-1
     --sim discovery/wait-complete --build <sha256> --workers 4 --seconds 43200 \
     --compact-secs 600 --artifacts <uri>
 
+# What the last run's processes counted, and where the counts fall short.
+cargo xtask sim-campaign evidence --store /mnt/campaign --out evidence.json
+
 # After the host or the supervisor stopped: check the store and continue.
 cargo xtask sim-campaign verify --store /mnt/campaign
 cargo xtask sim-campaign resume --store /mnt/campaign
@@ -341,6 +406,40 @@ cargo xtask record --sim discovery/wait-complete \
     --input /mnt/campaign/runs/<run>/workers/0/artifacts/crash-… --out <dir>
 cargo xtask replay <dir>
 ```
+
+### Campaign evidence
+
+The supervisor sets `ZAKURA_SIM_STATS` to each worker's
+`workers/<n>/stats/` directory, and each fuzzer process writes its counts to
+`stats-<pid>.json` there: every 10 seconds, when the target stops the
+process on a run it counted (a failure it panics on, or the abandonment
+limit), and at a clean exit. The counts are runs by what the target did
+(`clean`, `fail`, `harness-failure`, `abandoned`), runs by how they ended
+(`violation`, `budget`, `idle/<status>`, `harness`, `not-run`), drains that
+stopped at their bound, cleanup (abandoned runs and their leaked tasks, and
+runs with unwound, panicked or unwind-failed tasks), each property's runs by
+outcome with its applicable evaluations, and the runs that reached each
+feature. Only the clean exit marks a file `complete`, since libFuzzer exits
+there with `exit` between runs and the target's `atexit` handler runs. An
+`exit` from inside a run leaves the file incomplete. A crash, a timeout
+or a kill leaves the counts of the last write, and the file stays incomplete.
+The compaction's merge writes no stats.
+
+`evidence` matches each file to the attempt in the worker's attempts log
+whose process has the file's process ID and started while the attempt ran.
+It reports each worker's outcome, its processes by how they ended, and its
+counts; the run's totals; the totals of the complete files that logged
+processes wrote and whose attempts exited cleanly, with code 0 and no
+failure in their output; each property's assumption losses
+(`assumptions-never-held` and `assumption-lost`); the features reached, by
+family; and the properties, the harness's and any file's, that none of
+those complete files saw apply. It lists every gap: a worker that didn't
+spend its budget, a process that left no file, a file its process never
+marked complete, a complete file whose attempt didn't exit cleanly, a file
+no logged process wrote (a reused process ID or a
+stale copy among them), and a file that can't be read, that another
+harness wrote, or that isn't named `stats-<pid>.json`. Feature counts come
+only from a target with a collector.
 
 `cargo xtask sim-minimize` minimizes a saved failure, as
 [Minimizing a crash](#minimizing-a-crash) describes, and

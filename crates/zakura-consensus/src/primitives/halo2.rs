@@ -333,11 +333,12 @@ fn batch_verifier(vk: &'static ItemVerifyingKey, verifier_name: &'static str) ->
 /// Builds the uncached batching-and-fallback stack for `vk`.
 fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackService {
     Fallback::new(
-        Batch::new(
+        Batch::new_with_idle(
             Verifier::new(vk),
             HALO2_MAX_BATCH_SIZE,
             None,
             super::MAX_BATCH_LATENCY,
+            super::MAX_BATCH_IDLE,
         ),
         OrchardFallback { vk },
     )

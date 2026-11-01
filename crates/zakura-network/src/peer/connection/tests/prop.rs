@@ -205,6 +205,7 @@ async fn send_block_request(
         inv_collector: None,
         transient_addr: None,
         span: Span::none(),
+        trace: Default::default(),
     };
 
     client_requests

@@ -114,6 +114,26 @@ fn new_test_connection_with_protection<A>(
     mpsc::Receiver<Message>,
     ErrorSlot,
 ) {
+    new_traced_test_connection(
+        is_protected_peer,
+        crate::lifecycle_trace::ConnectionTrace::untraced(),
+    )
+}
+
+/// Creates a new [`Connection`] instance for testing that records lifecycle rows with `trace`.
+fn new_traced_test_connection<A>(
+    is_protected_peer: bool,
+    trace: crate::lifecycle_trace::ConnectionTrace,
+) -> (
+    Connection<
+        MockService<Request, Response, A>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, A>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
     let mock_inbound_service = MockService::build().finish();
     let (client_tx, client_rx) = mpsc::channel(0);
     let shared_error_slot = ErrorSlot::default();
@@ -170,6 +190,7 @@ fn new_test_connection_with_protection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        trace,
     );
 
     (
@@ -225,6 +246,7 @@ fn new_never_closing_test_connection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        crate::lifecycle_trace::ConnectionTrace::untraced(),
     );
 
     (connection, client_tx, shared_error_slot)

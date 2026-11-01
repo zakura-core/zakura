@@ -471,6 +471,107 @@ pub const MINING: JsonlTraceTable = JsonlTraceTable::csv(
     ],
 );
 
+/// Legacy P2P wire messages: send attempt, write completion, and decoded receipt.
+///
+/// Rows share `conn` with `p2p_request` and `block_gossip`, and `seq` orders sends on one
+/// connection. Transport samples for a connection join on `conn`.
+pub const P2P: JsonlTraceTable = JsonlTraceTable::csv(
+    "p2p",
+    "p2p.csv",
+    &[
+        "event",
+        "conn",
+        "direction",
+        "peer",
+        "seq",
+        "msg",
+        "hash",
+        "height",
+        "item_count",
+        "block_hashes",
+        "tx_count",
+        "nonce",
+        "body_bytes",
+        "write_us",
+        "result",
+        "error",
+    ],
+);
+
+/// Legacy peer request routing: peer selection, connection queueing, and request writes.
+pub const P2P_REQUEST: JsonlTraceTable = JsonlTraceTable::csv(
+    "p2p_request",
+    "p2p_request.csv",
+    &[
+        "event",
+        "request_id",
+        "conn",
+        "direction",
+        "peer",
+        "request",
+        "hash",
+        "item_count",
+        "route",
+        "candidates",
+        "active_request",
+        "active_request_id",
+        "active_age_us",
+        "queued",
+        "queue_us",
+        "write_us",
+        "elapsed_us",
+        "result",
+        "error",
+    ],
+);
+
+/// Legacy block advertisement scheduling: broadcast, upload-slot, and inventory write events.
+pub const BLOCK_GOSSIP: JsonlTraceTable = JsonlTraceTable::csv(
+    "block_gossip",
+    "block_gossip.csv",
+    &[
+        "event",
+        "broadcast_id",
+        "hash",
+        "reason",
+        "conn",
+        "peer",
+        "position",
+        "peers",
+        "concurrency",
+        "available_slots",
+        "wait_us",
+        "held_us",
+        "requested_us",
+        "written_us",
+        "elapsed_us",
+        "release_reason",
+        "succeeded",
+        "succeeded_peers",
+    ],
+);
+
+/// Gossip and sync block download, verification, and commit timing.
+pub const BLOCK_VERIFY: JsonlTraceTable = JsonlTraceTable::csv(
+    "block_verify",
+    "block_verify.csv",
+    &[
+        "event",
+        "source",
+        "hash",
+        "height",
+        "parent_hash",
+        "parent",
+        "tip_height",
+        "download_us",
+        "wait_us",
+        "verify_us",
+        "total_us",
+        "result",
+        "error",
+    ],
+);
+
 /// Every table a node can write.
 pub const ALL: &[JsonlTraceTable] = &[
     HANDSHAKE,
@@ -487,6 +588,10 @@ pub const ALL: &[JsonlTraceTable] = &[
     LEGACY_PEER_REQUEST,
     LEGACY_SYNC,
     MINING,
+    P2P,
+    P2P_REQUEST,
+    BLOCK_GOSSIP,
+    BLOCK_VERIFY,
 ];
 
 /// A set of registered trace tables that a tracer writes.

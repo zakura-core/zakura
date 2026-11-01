@@ -21,6 +21,7 @@ use tower::Service;
 use zakura_chain::diagnostic::task::CheckForPanics;
 
 use crate::{
+    lifecycle_trace::{ConnectionTrace, RequestTrace},
     peer::{
         error::{AlreadyErrored, ErrorSlot, PeerError, SharedPeerError},
         ConnectionInfo,
@@ -67,6 +68,9 @@ pub struct Client {
 
     /// A handle to the task responsible for sending periodic heartbeats.
     pub(crate) heartbeat_task: JoinHandle<Result<(), BoxError>>,
+
+    /// This connection's identifier and request queue trace.
+    pub(crate) connection_trace: ConnectionTrace,
 }
 
 /// A signal sent by the [`Client`] half of a peer connection,
@@ -98,6 +102,9 @@ pub(crate) struct ClientRequest {
     /// The tracing context for the request, so that work the connection task does
     /// processing messages in the context of this request will have correct context.
     pub span: tracing::Span,
+
+    /// The request's queueing context for the `p2p_request` trace table.
+    pub trace: RequestTrace,
 }
 
 /// A receiver for the `peer::Server`, which wraps a `mpsc::Receiver`,
@@ -138,6 +145,9 @@ pub(super) struct InProgressClientRequest {
     /// The tracing context for the request, so that work the connection task does
     /// processing messages in the context of this request will have correct context.
     pub span: tracing::Span,
+
+    /// The request's queueing context for the `p2p_request` trace table.
+    pub trace: RequestTrace,
 }
 
 /// A `oneshot::Sender` for client responses, that must be used by calling `send()`.
@@ -195,11 +205,17 @@ impl From<ClientRequest> for InProgressClientRequest {
             inv_collector,
             transient_addr,
             span,
+            trace,
         } = client_request;
 
         let tx = MustUseClientResponseSender::new(tx, &request, inv_collector, transient_addr);
 
-        InProgressClientRequest { request, tx, span }
+        InProgressClientRequest {
+            request,
+            tx,
+            span,
+            trace,
+        }
     }
 }
 
@@ -638,21 +654,35 @@ impl Service<Request> for Client {
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        self.send_request(request)
+    }
+}
+
+impl Client {
+    /// Sends `request` to the connection task.
+    ///
+    /// The caller must have polled this client ready.
+    fn send_request(&mut self, request: Request) -> <Self as Service<Request>>::Future {
         let (tx, rx) = oneshot::channel();
+        let trace = self.connection_trace.stamp_dispatched(&request);
         // get the current Span to propagate it to the peer connection task.
         // this allows the peer connection to enter the correct tracing context
         // when it's handling messages in the context of processing this
         // request.
         let span = tracing::Span::current();
 
+        // Publish the trace before the channel can wake the connection task.
+        self.connection_trace.enqueued(&trace);
         match self.server_tx.try_send(ClientRequest {
             request,
             tx,
             inv_collector: Some(self.inv_collector.clone()),
             transient_addr: self.connection_info.connected_addr.get_transient_addr(),
             span,
+            trace,
         }) {
             Err(e) => {
+                self.connection_trace.enqueue_failed(&trace);
                 if e.is_disconnected() {
                     let peer_error = self
                         .error_slot

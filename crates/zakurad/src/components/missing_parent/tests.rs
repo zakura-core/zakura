@@ -17,7 +17,7 @@ fn block(byte: u8) -> Deferred {
 
 fn state(
     result: zs::ParentInputs,
-) -> impl Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone {
+) -> impl Service<zs::Request, Response = zs::Response, Error = BoxError, Future: Send> + Clone {
     service_fn(move |request| async move {
         assert!(
             matches!(request, zs::Request::CheckParentInputs { ref outpoints, .. } if outpoints.is_empty())

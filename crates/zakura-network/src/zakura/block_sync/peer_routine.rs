@@ -231,14 +231,14 @@ impl ReceiptSettlement {
         height: block::Height,
         funding: crate::zakura::transport::ByteReservation,
     ) -> Self {
-        routine.handoff_blocked.store(true, Ordering::Relaxed);
+        routine.io.handoff_blocked.store(true, Ordering::Relaxed);
         #[cfg(any(test, zakura_sim))]
         routine.observe_handoff_started(owner, height, funding.bytes());
         #[cfg(not(any(test, zakura_sim)))]
         let _ = (owner, height);
         Self {
             funding: Some(funding),
-            handoff_blocked: Arc::clone(&routine.handoff_blocked),
+            handoff_blocked: Arc::clone(&routine.io.handoff_blocked),
             #[cfg(any(test, zakura_sim))]
             observer: routine.io.observer.clone(),
             #[cfg(any(test, zakura_sim))]

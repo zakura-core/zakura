@@ -64,11 +64,11 @@ audit-as-crates-io = false
 [policy.zakura-scheduler]
 criteria = "safe-to-run"
 
-[policy.zakura-sim]
-criteria = "safe-to-run"
-
 [policy.zakura-script]
 audit-as-crates-io = false
+
+[policy.zakura-sim]
+criteria = "safe-to-run"
 
 [policy.zakura-state]
 audit-as-crates-io = false
@@ -78,11 +78,6 @@ audit-as-crates-io = false
 
 [policy.zakura-utils]
 audit-as-crates-io = false
-
-[[exemptions.addchain]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.addr2line]]
 version = "0.21.0"
@@ -387,109 +382,149 @@ version = "0.52.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zakura-address]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-bellman]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+
+[[exemptions.zakura-bento]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.zakura-bento-core]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.zakura-bento-macros]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.zakura-bls12-381]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-equihash]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-jubjub]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-note-encryption]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Common note-encryption package; carry the existing exact-version audit backlog forward to v4.0.0. Direct package review remains pending; this is not an audit certification."
+notes = "Common note-encryption package; carry the existing exact-version audit backlog forward to v5.0.0-rc.2. Direct package review remains pending; this is not an audit certification."
 
 [[exemptions.zakura-orchard]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-orchard-legacy]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
 notes = "Common Orchard legacy-backend support package. Exact-version audit backlog entry pending dedicated review; this is not an audit certification."
 
 [[exemptions.zakura-pairing]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-pasta-curves]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-primitives]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-protocol]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-reddsa]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-redjubjub]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+
+[[exemptions.zakura-sensei]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.zakura-sensei-artifacts]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.zakura-sensei-macros]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.zakura-sensei-shared]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.zakura-sinsemilla]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-transparent]]
-version = "4.0.0"
+version = "5.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Coordinated Common v5.0.0-rc.2 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
-[[exemptions.zcash_script]]
-version = "0.6.0"
+[[exemptions.zakura-udon]]
+version = "0.2.0"
 criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.zakura-zcash-script]]
+version = "0.0.1"
+criteria = "safe-to-deploy"
+notes = "Introduced by Common v5.0.0-rc.2; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.zerovec]]
 version = "0.11.6"

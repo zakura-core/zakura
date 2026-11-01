@@ -1042,6 +1042,12 @@ impl StateService {
         let parent_hash = semantically_verified.block.header.previous_block_hash;
         let hash = semantically_verified.hash;
 
+        // Drop hashes of any blocks the write task has rejected before checking
+        // the SentHashes membership below. Without this, a rejected same-hash
+        // block would lock out a later honest re-delivery of a block at the
+        // same hash as a false "duplicate".
+        self.drain_non_finalized_write_updates();
+
         let is_replacement = self
             .non_finalized_state_queued_blocks
             .get_mut(&hash)
@@ -1049,12 +1055,6 @@ impl StateService {
         let reclaim_capacity =
             !is_replacement && !self.drains_the_non_finalized_queue_now(&parent_hash);
         self.prune_abandoned_queued_blocks(Some((hash, parent_hash)), reclaim_capacity);
-
-        // Drop hashes of any blocks the write task has rejected before checking
-        // the SentHashes membership below. Without this, a rejected same-hash
-        // block would lock out a later honest re-delivery of a block at the
-        // same hash as a false "duplicate".
-        self.drain_non_finalized_write_updates();
 
         if let Some((ancestor, kind)) = self
             .non_finalized_failed_ancestors

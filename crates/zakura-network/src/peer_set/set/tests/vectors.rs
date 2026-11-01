@@ -2134,6 +2134,16 @@ async fn reconnect_replaces_a_closed_ready_connection() {
             .expect("the first connection becomes ready");
         assert_eq!(peers.ready_services.len(), 1);
 
+        // The first connection stalls, one stall short of being disconnected for it.
+        for _ in 0..FIND_RESPONSE_STALL_THRESHOLD - 1 {
+            peers
+                .stall_event_tx
+                .send((address, super::super::StallOutcome::Stall))
+                .expect("the peer set holds the receiver");
+        }
+        let _ = peers.ready().now_or_never();
+        assert_eq!(peers.find_response_stalls.len(), 1);
+
         // The first connection closes, and the peer reconnects before the next poll.
         first_handle.stop_connection_task().await;
         let (second, _second_handle) = ClientTestHarness::build()
@@ -2152,6 +2162,8 @@ async fn reconnect_replaces_a_closed_ready_connection() {
         assert!(peers.block_gossip_peers[&address]
             .sender
             .same_channel(&second_sender));
+        // The new connection does not inherit the closed connection's stall count.
+        assert_eq!(peers.find_response_stalls.len(), 0);
     })
     .await
     .expect("the reconnect is admitted in place of the closed connection");

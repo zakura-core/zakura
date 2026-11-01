@@ -721,6 +721,9 @@ where
     /// Drops the ready service for `key` if its connection has already failed, and returns
     /// whether it did. A busy service for `key` is left alone.
     ///
+    /// The dropped connection's stall count is cleared, so a reconnecting peer starts fresh, as it
+    /// does after a disconnect.
+    ///
     /// A ready service is never pending: it only becomes unready when the peer set sends it a
     /// request, and unready services are tracked separately.
     fn drop_ready_service_if_failed(&mut self, key: &D::Key, cx: &mut Context<'_>) -> bool {
@@ -736,6 +739,7 @@ where
                     "ready service failed before the peer reconnected, dropping service"
                 );
                 self.ready_services.remove(key);
+                self.find_response_stalls.clear(*key);
                 true
             }
             Poll::Ready(Ok(())) => false,

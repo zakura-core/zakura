@@ -3062,6 +3062,14 @@ where
                 );
                 false
             }
+            BlockDownloadVerifyError::BelowMinimumWork { .. } => {
+                debug!(
+                    error = ?e,
+                    %peer,
+                    "block target is easier than the Mainnet admission floor, continuing sync"
+                );
+                false
+            }
             BlockDownloadVerifyError::AboveLookaheadHeightLimit { .. } => {
                 debug!(
                     error = ?e,

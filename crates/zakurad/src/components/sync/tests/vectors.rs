@@ -4031,28 +4031,39 @@ async fn cancel_all_ends_a_parent_wait() {
     verifier.expect_no_requests().await;
 }
 
-/// The parent wait gives up at its own limit when the state never answers, so a stalled state
-/// can't hold a download task past that limit.
-#[tokio::test(start_paused = true)]
-async fn parent_wait_times_out_when_the_state_never_answers() {
-    let mut state = MockService::build().for_unit_tests::<zs::Request, zs::Response, _>();
-    let parent = block::Hash([0xAA; 32]);
-    let wait = sync::state_parent_wait(state.clone());
+/// A state service that never becomes ready.
+#[derive(Clone)]
+struct NeverReadyState;
 
+impl Service<zs::Request> for NeverReadyState {
+    type Response = zs::Response;
+    type Error = crate::BoxError;
+    type Future = std::future::Ready<Result<zs::Response, crate::BoxError>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn call(&mut self, request: zs::Request) -> Self::Future {
+        unreachable!("a never-ready service is never called: {request:?}")
+    }
+}
+
+/// The parent wait gives up at its own limit when the state never becomes ready, which the
+/// state's own `AwaitBlockInfo` limit doesn't cover, so a stalled state can't hold a download
+/// task past that limit.
+#[tokio::test(start_paused = true)]
+async fn parent_wait_times_out_when_the_state_is_never_ready() {
+    let wait = sync::state_parent_wait(NeverReadyState);
     let start = tokio::time::Instant::now();
-    let ((committed, waited), ()) =
-        tokio::join!(async { ((wait.0)(parent).await, start.elapsed()) }, async {
-            // Hold the request unanswered well past the limit.
-            let _unanswered = state
-                .expect_request(zs::Request::AwaitBlockInfo(parent))
-                .await;
-            tokio::time::sleep(sync::UNCONFIRMED_BINDING_PARENT_WAIT * 2).await;
-        });
+
+    let committed = (wait.0)(block::Hash([0xAA; 32])).await;
+
     assert!(
         !committed,
-        "an unanswered wait counts as the parent not committing"
+        "an expired wait counts as the parent not committing"
     );
-    assert_eq!(waited, sync::UNCONFIRMED_BINDING_PARENT_WAIT);
+    assert_eq!(start.elapsed(), sync::UNCONFIRMED_BINDING_PARENT_WAIT);
 }
 
 /// A block whose binding is still unconfirmed after the download task waited is dropped without

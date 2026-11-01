@@ -9,7 +9,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use eyre::{eyre, Report};
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinError,
-    time::{sleep, sleep_until, timeout},
+    time::{sleep, sleep_until, timeout, Instant},
 };
 use tower::{
     builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, timeout::Timeout, Service,
@@ -1712,7 +1712,7 @@ where
                 // Give the in-flight blocks a chance to finish on their own first, so a healthy
                 // sync doesn't re-run the fanout.
                 let completed = tokio::select! {
-                    completed = tokio::time::timeout_at(next_tip_refresh.into(), self.downloads.next()) => completed,
+                    completed = tokio::time::timeout_at(next_tip_refresh, self.downloads.next()) => completed,
                     _ = &mut parent_observer => {
                         parent_observer = parent_budget.observe(self.state.clone(), self.latest_chain_tip.clone()).boxed();
                         continue;
@@ -1810,7 +1810,7 @@ where
             // Copy the earliest backoff deadline out so the timer future doesn't borrow `self`
             // across the `select!` while other arms borrow `self.downloads`.
             let registry_retry_at = self.registry_miss_retry.values().min().copied();
-            let step = tokio::time::timeout_at((last_progress + BLOCK_VERIFY_TIMEOUT).into(), async {
+            let step = tokio::time::timeout_at(last_progress + BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
 

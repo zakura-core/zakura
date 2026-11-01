@@ -106,12 +106,11 @@ jobs:
         run: |
           set -euo pipefail
           source=crates/zakurad/src/bin/zakurad/cpu_features.rs
-          for mode in baseline assembly portable combined; do
+          for mode in minimal default portable; do
             flags=()
             case "$mode" in
-              assembly) flags=(--cfg 'feature="x86_64-asm"') ;;
-              portable) flags=(--cfg 'feature="portable"') ;;
-              combined) flags=(--cfg 'feature="x86_64-asm"' --cfg 'feature="portable"') ;;
+              default) flags=(--cfg 'feature="x86_64-asm"') ;;
+              portable) flags=(--cfg 'feature="x86_64-asm"' --cfg 'feature="portable"') ;;
             esac
             rustc --edition=2021 --test "$source" "${flags[@]}" -o "$RUNNER_TEMP/cpu-tests"
             "$RUNNER_TEMP/cpu-tests"
@@ -132,9 +131,17 @@ jobs:
       - name: Check locked all-feature build
         if: ${{ !cancelled() }}
         run: cargo check --locked --all-features --all-targets
-      - name: Check explicit x86 assembly build
+      - name: Check default x86 assembly build
         if: ${{ !cancelled() }}
-        run: cargo check --locked --package zakura --bin zakurad --features x86_64-asm
+        run: |
+          cargo tree --locked --package zakura --target x86_64-unknown-linux-gnu \
+            -e features -i zakura-pasta-curves > "$RUNNER_TEMP/pasta-default-features"
+          grep -F 'zakura-pasta-curves feature "x86_64-asm"' "$RUNNER_TEMP/pasta-default-features"
+          if grep -F 'zakura-pasta-curves feature "portable"' "$RUNNER_TEMP/pasta-default-features"; then
+            echo "Default builds must select assembly, not the portable override." >&2
+            exit 1
+          fi
+          cargo check --locked --package zakura --bin zakurad
       - name: Check generated RPC artifacts
         if: ${{ !cancelled() }}
         run: cargo xtask check-rpc-artifacts

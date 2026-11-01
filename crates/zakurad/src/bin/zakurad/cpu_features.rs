@@ -59,8 +59,7 @@ pub(crate) fn exit_if_cpu_lacks_pasta_assembly_features() {
     }
     eprintln!(
         "zakurad was built to require CPU features this machine lacks: {}. \
-         Use an official release binary, or rebuild without CPU-specific compiler flags \
-         and disable `x86_64-asm` or enable `portable`.",
+         Rebuild with `--features portable` and without CPU-specific compiler flags.",
         missing.join(", ")
     );
     std::process::exit(1);

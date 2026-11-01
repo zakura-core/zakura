@@ -6,9 +6,7 @@ use std::{env, sync::OnceLock};
 use zakura_sim::explore::feedback::{
     Counters, Feedback, NewCollector, FEATURES, FEEDBACK_BACKEND, FEEDBACK_VERSION,
 };
-
-/// The variable that turns semantic feedback `on`, the default, or `off`.
-pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
+pub use zakura_sim::explore::feedback::{FEEDBACK_LINE, FEEDBACK_VAR};
 
 /// The counters libFuzzer reads. On Linux they sit in the section whose
 /// `__start_` and `__stop_` symbols libFuzzer reads as its extra counters.
@@ -31,7 +29,7 @@ pub fn feedback(collector: NewCollector) -> Feedback {
 
 /// The counters `ZAKURA_SIM_FEEDBACK` picks, read once per process. The
 /// first call logs the backend, its version, the feature count and the
-/// mode, as `zakura-sim feedback: backend=… version=… features=… mode=…`.
+/// mode, as [`FEEDBACK_LINE`] and `backend=… version=… features=… mode=…`.
 ///
 /// # Panics
 ///
@@ -51,7 +49,7 @@ fn counters() -> &'static Counters {
             other => panic!("{FEEDBACK_VAR} must be `on` or `off`, not `{other}`"),
         };
         eprintln!(
-            "zakura-sim feedback: backend={FEEDBACK_BACKEND} version={FEEDBACK_VERSION} \
+            "{FEEDBACK_LINE}backend={FEEDBACK_BACKEND} version={FEEDBACK_VERSION} \
              features={FEATURES} mode={mode}"
         );
         counters

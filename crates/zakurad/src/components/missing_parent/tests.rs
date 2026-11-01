@@ -171,19 +171,31 @@ async fn failed_state_read_does_not_authorize_a_verification_wait() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn saturated_waits_allow_a_real_connected_state_commit() {
-    use zakura_chain::{parameters::Network, serialization::ZcashDeserializeInto};
+    use proptest::{
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use zakura_chain::{
+        block::{arbitrary::allow_all_transparent_coinbase_spends, Block, LedgerState},
+        parameters::Network,
+    };
     let _init_guard = zakura_test::init();
-    let (service, _, _, _) = zs::init(zs::Config::ephemeral(), &Network::Mainnet, Height(0), 0)
+    let network = Network::new_regtest(Default::default());
+    let strategy = LedgerState::genesis_strategy(Some(network.clone()), None, Some(4), true)
+        .prop_flat_map(|ledger| {
+            Block::partial_chain_strategy(ledger, 2, allow_all_transparent_coinbase_spends, true)
+        });
+    let blocks = strategy
+        .new_tree(&mut TestRunner::deterministic())
+        .unwrap()
+        .current()
+        .0;
+    let genesis = blocks[0].clone();
+    let child = blocks[1].clone();
+    let (service, _, _, _) = zs::init(zs::Config::ephemeral(), &network, Height(0), 0)
         .await
         .unwrap();
     let state = tower::buffer::Buffer::new(tower::util::BoxService::new(service), 1);
-    let genesis: Arc<zakura_chain::block::Block> =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
-    let child: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
     state
         .clone()
         .oneshot(zs::Request::CommitCheckpointVerifiedBlock(genesis.into()))

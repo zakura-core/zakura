@@ -1598,6 +1598,8 @@ fn validate_and_commit_non_finalized_with_metrics(
     contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
     let total_start = Instant::now();
+    let block = prepared.block.clone();
+    let auth_data_root = prepared.auth_data_root;
     let initial_checks_start = Instant::now();
     let initial_checks =
         check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
@@ -1621,6 +1623,29 @@ fn validate_and_commit_non_finalized_with_metrics(
                 finalized_state,
                 contextual_metrics,
             )
+        }
+    });
+    // Contextual rules can read authorizing data before the commitment check runs, such as v6
+    // anchors. A failure is only the block's if its header commits to that data
+    // (see `check::auth_data_commitment`).
+    let result = result.map_err(|error| {
+        if !matches!(
+            error.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+        ) {
+            return error;
+        }
+        match check::auth_data_commitment(
+            &non_finalized_state.network,
+            non_finalized_state,
+            finalized_state,
+            block,
+            auth_data_root,
+        ) {
+            crate::AuthDataCommitment::Mismatch(mismatch) => {
+                ValidateContextError::InvalidBlockCommitment(mismatch)
+            }
+            crate::AuthDataCommitment::Bound | crate::AuthDataCommitment::Unavailable => error,
         }
     });
     contextual_metrics.record_duration(

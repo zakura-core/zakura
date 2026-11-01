@@ -51,6 +51,13 @@ fn prepared_test_verifier(
             zs::Request::CheckParentInputs { .. } => {
                 zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
             }
+            // A rejected candidate confirms that its header commits to its body.
+            zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(
+                zakura_chain::block_info::BlockInfo::new(Default::default(), 0),
+            )),
+            zs::Request::CheckAuthDataCommitment(_) => {
+                zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
+            }
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
         Ok::<_, BoxError>(response)
@@ -183,6 +190,115 @@ async fn missing_input_requires_committed_parent_evidence() {
                     "{reads:?}: {error:?}"
                 );
                 assert_eq!(error.misbehavior_score(), 0);
+            }
+        }
+    }
+}
+
+/// A semantic failure on an NU5 block is only intrinsic once its header commits to the
+/// delivered authorizing data.
+///
+/// From NU5, transaction IDs do not commit to signatures, proofs, or scripts (ZIP 244), so a
+/// body can differ in one of them under the same block hash. The verifier must then report the
+/// commitment mismatch rather than the rule the differing data fails.
+#[tokio::test]
+async fn nu5_semantic_failures_wait_for_the_auth_data_commitment() {
+    use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Binding {
+        Bound,
+        Mismatch,
+        Unavailable,
+        ParentRejected,
+    }
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+
+    for binding in [
+        Binding::Bound,
+        Binding::Mismatch,
+        Binding::Unavailable,
+        Binding::ParentRejected,
+    ] {
+        let state = service_fn(move |request: zs::Request| async move {
+            Ok::<_, BoxError>(match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::CheckParentInputs { .. } => {
+                    zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                }
+                zs::Request::AwaitBlockInfo(hash) => match binding {
+                    Binding::ParentRejected => {
+                        return Err(zs::AwaitBlockInfoError::Rejected { hash }.into())
+                    }
+                    _ => zs::Response::BlockInfo(Some(zakura_chain::block_info::BlockInfo::new(
+                        Default::default(),
+                        0,
+                    ))),
+                },
+                zs::Request::CheckAuthDataCommitment(_) => {
+                    zs::Response::AuthDataCommitment(match binding {
+                        Binding::Bound => zs::AuthDataCommitment::Bound,
+                        Binding::Mismatch => zs::AuthDataCommitment::Mismatch(
+                            block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                                actual: [0x42; 32],
+                                expected: [0x24; 32],
+                            },
+                        ),
+                        Binding::Unavailable | Binding::ParentRejected => {
+                            zs::AuthDataCommitment::Unavailable
+                        }
+                    })
+                }
+                _ => panic!("unexpected state request: {request:?}"),
+            })
+        });
+        let transaction = service_fn(|request: tx::Request| async move {
+            let tx::Request::Block { transaction, .. } = &request else {
+                panic!("block verification sent a mempool transaction request");
+            };
+            if transaction.is_coinbase() {
+                Ok(accept_block_transaction(request))
+            } else {
+                Err::<tx::Response, BoxError>(TransactionError::Halo2VerificationFailed.into())
+            }
+        });
+
+        let error = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(Request::Commit(block.clone()))
+        .await
+        .expect_err("the altered proof fails verification");
+        let class = error.body_verification_class();
+
+        match binding {
+            Binding::Bound => assert!(
+                matches!(class, BodyVerificationClass::ConsensusInvalid(_)),
+                "{binding:?}: {error:?}"
+            ),
+            Binding::Mismatch => {
+                assert!(
+                    matches!(class, BodyVerificationClass::PayloadMismatch(kind)
+                        if kind.proves_tampered_body()),
+                    "{binding:?}: {error:?}"
+                );
+                assert!(error.is_auth_commitment_mismatch(), "{error:?}");
+            }
+            Binding::Unavailable | Binding::ParentRejected => {
+                assert_eq!(
+                    class,
+                    BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext),
+                    "{binding:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0, "{binding:?}");
             }
         }
     }
@@ -499,12 +615,19 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
         ] {
             let candidate = Arc::new(candidate.clone());
             let state = service_fn(|request: zs::Request| async move {
-                let zs::Request::KnownBlock(hash) = request else {
-                    panic!("invalid content must be rejected before contextual validation");
-                };
-                Ok::<_, BoxError>(zs::Response::KnownBlock(
-                    (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
-                ))
+                Ok::<_, BoxError>(match request {
+                    zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                        (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                    ),
+                    // A mined commit's rejection confirms the auth data binding afterwards.
+                    zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(
+                        zakura_chain::block_info::BlockInfo::new(Default::default(), 0),
+                    )),
+                    zs::Request::CheckAuthDataCommitment(_) => {
+                        zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
+                    }
+                    _ => panic!("invalid content must be rejected before contextual validation"),
+                })
             });
             let transaction =
                 service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
@@ -2154,6 +2277,9 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
                     zs::Request::CommitSemanticallyVerifiedBlock(block) => {
                         zs::Response::Committed(block.hash)
                     }
+                    zs::Request::CheckAuthDataCommitment(_) => {
+                        zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
+                    }
                     _ => panic!("ZIP 234 test received an unexpected state request: {request:?}"),
                 };
                 Ok::<_, BoxError>(response)
@@ -2289,9 +2415,11 @@ async fn derived_nsm_crossing_gates_block_verification() {
                         assert_eq!(requested_hash, hash);
                         zs::Response::KnownBlock(None)
                     }
+                    // A rejected block also waits for its parent to confirm its header
+                    // commits to its body.
                     zs::Request::AwaitBlockInfo(requested_parent) => {
                         assert!(
-                            active,
+                            active || !valid,
                             "the pre-crossing block must not request an NSM balance"
                         );
                         assert_eq!(requested_parent, expected_parent);
@@ -2301,6 +2429,10 @@ async fn derived_nsm_crossing_gates_block_verification() {
                         assert!(valid, "an invalid coinbase must not reach state commit");
                         assert_eq!(block.hash, hash);
                         zs::Response::Committed(block.hash)
+                    }
+                    zs::Request::CheckAuthDataCommitment(_) => {
+                        assert!(!valid, "a valid block needs no binding check");
+                        zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
                     }
                     _ => panic!("unexpected state request: {request:?}"),
                 })

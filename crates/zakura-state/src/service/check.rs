@@ -259,6 +259,60 @@ where
     Ok(())
 }
 
+/// Checks whether `block`'s header commits to the authorizing data in its body, using the
+/// history tree of its parent in `non_finalized_state` or at the finalized tip.
+///
+/// From NU5, a block hash commits to signatures, proofs, scripts, and v6 anchors only through
+/// `hashBlockCommitments` (ZIP 244), so a body with the right transaction IDs can still carry
+/// authorizing data its header does not commit to. A consensus failure in such a body says
+/// nothing about the block. Callers use this check to tell the two apart.
+pub(crate) fn auth_data_commitment(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    block: Arc<Block>,
+    precomputed_auth_data_root: Option<AuthDataRoot>,
+) -> crate::AuthDataCommitment {
+    use crate::{service::read, AuthDataCommitment};
+
+    if !matches!(
+        block.commitment(network),
+        Ok(block::Commitment::ChainHistoryBlockTxAuthCommitment(_))
+    ) {
+        return AuthDataCommitment::Bound;
+    }
+
+    let parent_hash = block.header.previous_block_hash;
+    let parent_chain =
+        non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
+    let parent_height = read::find::height_by_hash(parent_chain.clone(), db, parent_hash);
+    let Some(history_tree) = read::tree::history_tree(parent_chain, db, parent_hash.into()) else {
+        return AuthDataCommitment::Unavailable;
+    };
+    // The body's coinbase height is not checked yet, and the commitment check below requires
+    // a sequential height with a usable parent history tree.
+    let height = block.coinbase_height();
+    if parent_height.and_then(|parent| parent.next().ok()) != height
+        || (history_tree.hash().is_none()
+            && NetworkUpgrade::Heartwood.activation_height(network) != height)
+    {
+        return AuthDataCommitment::Unavailable;
+    }
+
+    match block_commitment_is_valid_for_chain_history(
+        block,
+        network,
+        &history_tree,
+        precomputed_auth_data_root,
+    ) {
+        Ok(()) => AuthDataCommitment::Bound,
+        Err(ValidateContextError::InvalidBlockCommitment(
+            error @ CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. },
+        )) => AuthDataCommitment::Mismatch(error),
+        Err(_) => AuthDataCommitment::Unavailable,
+    }
+}
+
 /// Check that `block` is contextually valid for `network`, using
 /// the `history_tree` up to and including the previous block.
 #[tracing::instrument(skip(block, history_tree))]

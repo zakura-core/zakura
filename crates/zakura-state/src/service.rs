@@ -2206,6 +2206,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
             | Request::CheckPreparedMinedRelayEligibility(_)
+            | Request::CheckAuthDataCommitment(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
@@ -3543,6 +3544,19 @@ impl Service<ReadRequest> for ReadStateService {
                 )?;
 
                 Ok(ReadResponse::PreparedMinedRelayEligibility(eligibility))
+            }
+
+            ReadRequest::CheckAuthDataCommitment(commitment) => {
+                let latest_non_finalized_state = state.latest_non_finalized_state();
+                Ok(ReadResponse::AuthDataCommitment(
+                    check::auth_data_commitment(
+                        &state.network,
+                        &latest_non_finalized_state,
+                        &state.db,
+                        commitment.block,
+                        commitment.auth_data_root,
+                    ),
+                ))
             }
 
             // Used by the get_block and get_block_hash RPCs.

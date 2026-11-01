@@ -112,6 +112,16 @@ pub enum VerifyBlockError {
     #[error("parent {parent} is not in a chain that can accept the block")]
     ParentUnavailable { parent: block::Hash },
 
+    /// An NU5 body failed a consensus rule, but the parent's history tree was unavailable to
+    /// confirm that the header commits to the body's authorizing data.
+    ///
+    /// See [`confirm_auth_data_binding`] for why the failure is not yet attributed to the block.
+    #[error("{source}; the header's commitment to this body is unconfirmed because parent {parent} is unavailable")]
+    AuthDataUnconfirmed {
+        parent: block::Hash,
+        source: Box<VerifyBlockError>,
+    },
+
     /// Errors originating from the state service, which may arise from general failures in interacting with the state.
     /// This is for errors that are not specifically related to block depth or commit failures.
     #[error("state service error for block {hash}: {source}")]
@@ -198,7 +208,7 @@ impl VerifyBlockError {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::MissingTransparentInput { .. } => consensus("context.missing_transparent_output"),
-            Self::ParentUnavailable { .. } => {
+            Self::ParentUnavailable { .. } | Self::AuthDataUnconfirmed { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             }
             Self::Transaction(error) => error.body_verification_class(),
@@ -266,6 +276,75 @@ where
         Ok(Ok(zs::Response::ParentInputs(inputs))) => inputs,
         Ok(Ok(_)) => unreachable!("wrong response to Request::CheckParentInputs"),
         Ok(Err(_)) | Err(_) => zs::ParentInputs::Inconclusive,
+    }
+}
+
+/// Confirms that a consensus failure found before commit applies to the block, not just to the
+/// delivered body.
+///
+/// From NU5, transaction IDs do not commit to signatures, proofs, or scripts (ZIP 244). The
+/// header commits to them only through `hashBlockCommitments`, which state checks at commit. A
+/// body can differ in that data under the same block hash, so a failure found earlier
+/// is intrinsic only if the header commits to the delivered authorizing data. A mismatch is
+/// reported as the commitment failure state would report, and an unknown binding is retryable.
+async fn confirm_auth_data_binding<S>(
+    state_service: S,
+    network: &Network,
+    block: Arc<block::Block>,
+    error: VerifyBlockError,
+) -> VerifyBlockError
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone,
+{
+    // Commit already checked the binding, and only a deterministic verdict needs it.
+    if matches!(error, VerifyBlockError::Commit(_))
+        || !matches!(
+            error.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+        )
+        || !matches!(
+            block.commitment(network),
+            Ok(block::Commitment::ChainHistoryBlockTxAuthCommitment(_))
+        )
+    {
+        return error;
+    }
+
+    let parent = block.header.previous_block_hash;
+    let unconfirmed = |error| VerifyBlockError::AuthDataUnconfirmed {
+        parent,
+        source: Box::new(error),
+    };
+    // The parent's history tree exists once it commits. A rejected parent fails fast, and
+    // the wait has its own limit.
+    if !matches!(
+        state_service
+            .clone()
+            .oneshot(zs::Request::AwaitBlockInfo(parent))
+            .await,
+        Ok(zs::Response::BlockInfo(Some(_)))
+    ) {
+        return unconfirmed(error);
+    }
+
+    let commitment = zs::BlockCommitmentData {
+        block,
+        auth_data_root: None,
+    };
+    match state_service
+        .oneshot(zs::Request::CheckAuthDataCommitment(commitment))
+        .await
+    {
+        Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)) => error,
+        Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Mismatch(mismatch))) => {
+            VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(Box::new(
+                zs::ValidateContextError::InvalidBlockCommitment(mismatch),
+            )))
+        }
+        Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Unavailable)) | Err(_) => {
+            unconfirmed(error)
+        }
+        Ok(_) => unreachable!("wrong response to Request::CheckAuthDataCommitment"),
     }
 }
 
@@ -363,6 +442,9 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
+        // Proposals never become body evidence, so they keep the first failure.
+        let binding_check = (!request.is_proposal())
+            .then(|| (self.state_service.clone(), network.clone(), block.clone()));
         async move {
             // Keep this receipt registered until verification finishes or is cancelled.
             let _receipt = receipt;
@@ -752,6 +834,14 @@ where
 
             commit_prepared_block(state_service, prepared_block, mined).await
         }
+        .then(|result| async move {
+            match (result, binding_check) {
+                (Err(error), Some((state_service, network, block))) => {
+                    Err(confirm_auth_data_binding(state_service, &network, block, error).await)
+                }
+                (result, _) => result,
+            }
+        })
         .instrument(span)
         .boxed()
     }

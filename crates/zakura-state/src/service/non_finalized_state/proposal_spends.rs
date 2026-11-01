@@ -1,68 +1,77 @@
 //! Transparent spend results from recent block proposals, reused when the solved block commits.
 //!
 //! A mining pool validates each block template as a proposal before handing it out, then
-//! submits the solved block. Both run the same transparent spend check against the same
-//! parent, so the commit can reuse the proposal's result instead of looking up every spent
-//! output again.
+//! submits the solved block. Both run the same transparent spend check and value pool sum
+//! against the same parent, so the commit can reuse the proposal's results instead of
+//! looking up every spent output again.
 
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 
-use zakura_chain::{block, transaction, transparent};
+use zakura_chain::{
+    amount::NegativeAllowed, block, transaction, transparent, value_balance::ValueBalance,
+};
 
-use crate::SemanticallyVerifiedBlock;
+use crate::{ContextuallyVerifiedBlock, SemanticallyVerifiedBlock};
 
 /// How many proposal results to keep. Templates are refreshed one at a time, so only the
 /// latest few can still be solved.
 const MAX_ENTRIES: usize = 4;
 
-/// The spent outputs of one validated proposal.
+/// The spend check and value pool results of one validated proposal.
+pub(crate) struct CheckedSpends {
+    /// The outputs the block spends, including outputs created earlier in the same block.
+    pub(crate) spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    /// The block's change to the chain value pools.
+    pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
+}
+
 struct Entry {
     parent_hash: block::Hash,
     transaction_hashes: Arc<[transaction::Hash]>,
-    spent_utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    spends: CheckedSpends,
 }
 
 /// Spend check results shared by a non-finalized state and its clones.
 ///
-/// The spend check reads only the parent chain and the transactions' effecting data: which
-/// outputs they spend and what they create and pay. A block's parent hash fixes the parent
-/// chain, and its transaction IDs commit to the effecting data of every transaction, so a
-/// block with the same parent and the same transaction ID list gets the same result.
+/// The spend check and value pool sum read only the parent chain and the transactions'
+/// effecting data: which outputs they spend and what they create and pay. A block's parent
+/// hash fixes the parent chain and its height, and its transaction IDs commit to the effecting
+/// data of every transaction, including the coinbase's deferred pool payment, so a block with
+/// the same parent and the same transaction ID list gets the same results.
 #[derive(Clone, Default)]
 pub(crate) struct ProposalSpends(Arc<Mutex<VecDeque<Entry>>>);
 
 impl ProposalSpends {
-    /// Remembers the spent outputs of a proposal that passed the spend check.
-    pub(crate) fn remember(
-        &self,
-        proposal: &SemanticallyVerifiedBlock,
-        spent_utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-    ) {
+    /// Remembers the spent outputs and value pool change of a proposal that passed the spend
+    /// check.
+    pub(crate) fn remember(&self, proposal: &ContextuallyVerifiedBlock) {
         let entry = Entry {
             parent_hash: proposal.block.header.previous_block_hash,
             transaction_hashes: proposal.transaction_hashes.clone(),
-            spent_utxos: spent_utxos.clone(),
+            spends: CheckedSpends {
+                spent_outputs: proposal.spent_outputs.clone(),
+                chain_value_pool_change: proposal.chain_value_pool_change,
+            },
         };
         let mut entries = self.lock();
-        entries.retain(|old| !old.matches(proposal));
+        entries.retain(|old| !old.matches(&proposal.block, &proposal.transaction_hashes));
         if entries.len() == MAX_ENTRIES {
             entries.pop_front();
         }
         entries.push_back(entry);
     }
 
-    /// Removes and returns the spent outputs of a proposal with `block`'s parent and
-    /// transactions, if one was validated.
-    pub(crate) fn take(
-        &self,
-        block: &SemanticallyVerifiedBlock,
-    ) -> Option<HashMap<transparent::OutPoint, transparent::OrderedUtxo>> {
+    /// Removes and returns the results of a proposal with `block`'s parent and transactions,
+    /// if one was validated.
+    pub(crate) fn take(&self, block: &SemanticallyVerifiedBlock) -> Option<CheckedSpends> {
         let mut entries = self.lock();
-        let index = entries.iter().position(|entry| entry.matches(block))?;
-        entries.remove(index).map(|entry| entry.spent_utxos)
+        let index = entries
+            .iter()
+            .position(|entry| entry.matches(&block.block, &block.transaction_hashes))?;
+        entries.remove(index).map(|entry| entry.spends)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Entry>> {
@@ -74,9 +83,9 @@ impl ProposalSpends {
 }
 
 impl Entry {
-    fn matches(&self, block: &SemanticallyVerifiedBlock) -> bool {
-        self.parent_hash == block.block.header.previous_block_hash
-            && self.transaction_hashes == block.transaction_hashes
+    fn matches(&self, block: &block::Block, transaction_hashes: &[transaction::Hash]) -> bool {
+        self.parent_hash == block.header.previous_block_hash
+            && *self.transaction_hashes == *transaction_hashes
     }
 }
 
@@ -92,7 +101,7 @@ mod tests {
         arbitrary::Prepare,
         service::{finalized_state::FinalizedState, non_finalized_state::NonFinalizedState},
         tests::FakeChainHelper,
-        Config,
+        Config, ContextuallyVerifiedBlock,
     };
 
     use super::{ProposalSpends, MAX_ENTRIES};
@@ -114,9 +123,8 @@ mod tests {
         let _init_guard = zakura_test::init();
         let (parent, child, other_child) = blocks();
         let spends = ProposalSpends::default();
-        let empty = Default::default();
 
-        spends.remember(&child.clone().prepare(), &empty);
+        spends.remember(&child.clone().prepare().test_with_zero_chain_pool_change());
 
         assert!(spends.take(&other_child.prepare()).is_none());
         let mut more_transactions = Block::clone(&child);
@@ -144,13 +152,12 @@ mod tests {
         let _init_guard = zakura_test::init();
         let (parent, ..) = blocks();
         let spends = ProposalSpends::default();
-        let empty = Default::default();
 
         let mut block = parent;
         let mut proposals = Vec::new();
         for _ in 0..=MAX_ENTRIES {
             block = block.make_fake_child();
-            spends.remember(&block.clone().prepare(), &empty);
+            spends.remember(&block.clone().prepare().test_with_zero_chain_pool_change());
             proposals.push(block.clone().prepare());
         }
 
@@ -191,7 +198,11 @@ mod tests {
             .expect("the proposal clone shares its results with the original state");
         state
             .proposal_spends
-            .remember(&child.clone().prepare(), &recorded);
+            .remember(&ContextuallyVerifiedBlock::with_spends_and_value_change(
+                child.clone().prepare(),
+                recorded.spent_outputs,
+                recorded.chain_value_pool_change,
+            ));
 
         state
             .commit_block(child.clone().prepare(), &finalized_state)

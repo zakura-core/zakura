@@ -857,7 +857,7 @@ where
                     if entry.parent_recovery {
                         if !matches!(
                             spawner.recover_parent(entry.hash, entry.routing_source.clone()),
-                            ParentRecovery::Requested | ParentRecovery::Attached
+                            ParentRecovery::Requested
                         ) {
                             spawner.parent_budget.dispatch_refused(&entry.hash);
                         }
@@ -934,7 +934,8 @@ where
             return ParentRecovery::Closed;
         }
 
-        if admission.cancel_handles.contains_key(&parent) {
+        if admission.cancel_handles.contains_key(&parent) || self.parent_budget.is_deferred(&parent)
+        {
             return ParentRecovery::Attached;
         }
 

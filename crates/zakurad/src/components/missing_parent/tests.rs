@@ -204,6 +204,65 @@ async fn reset_during_a_state_read_cannot_restore_old_round_metadata() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn observer_bounds_parent_checks_and_releases_running_attempts() {
+    use zakura_chain::chain_tip::mock::MockChainTip;
+    let budget = Budget::new("sync", 20);
+    let mut attempts = Vec::new();
+    for byte in 1..=5 {
+        let mut entry = block(byte);
+        entry.parent = block::Hash([byte; 32]);
+        let mut attempt = budget.attempt(entry.hash);
+        attempt
+            .admit(state(zs::ParentInputs::ParentUnavailable), entry)
+            .await
+            .unwrap();
+        attempts.push(attempt);
+    }
+    let calls = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let checked = calls.clone();
+    let checks = gate.clone();
+    let service = service_fn(move |_| {
+        let gate = checks.clone();
+        checked.fetch_add(1, Ordering::Relaxed);
+        async move {
+            let _permit = gate.acquire().await.unwrap();
+            Ok::<_, BoxError>(zs::Response::ParentInputs(zs::ParentInputs::Available))
+        }
+    });
+    let (tip, _sender) = MockChainTip::new();
+    let observed = budget.clone();
+    let observer = tokio::spawn(async move { observed.observe(service, tip).await });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    gate.add_permits(4);
+    observer.await.unwrap();
+    assert_eq!(budget.lock().charges.len(), 1);
+    let (tip, _sender) = MockChainTip::new();
+    budget
+        .observe(state(zs::ParentInputs::Available), tip)
+        .await;
+    assert!(budget.lock().charges.is_empty());
+    drop(attempts);
+    assert!(budget.lock().charges.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn observer_does_not_spin_when_tip_notifications_close() {
+    let budget = Budget::new("sync", 20);
+    let (tip, sender) = zakura_chain::chain_tip::mock::MockChainTip::new();
+    drop(sender);
+    assert!(timeout(
+        Duration::from_secs(1),
+        budget.observe(state(zs::ParentInputs::Available), tip)
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test(start_paused = true)]
 async fn failed_state_read_does_not_authorize_a_verification_wait() {
     let budget = Budget::new("sync", 20);
     let mut attempt = budget.attempt(block(1).hash);

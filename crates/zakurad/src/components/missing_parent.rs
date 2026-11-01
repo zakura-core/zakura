@@ -446,7 +446,8 @@ impl Budget {
 /// Confirm usable ancestry through the state boundary, never through inventory.
 async fn parent_available<S>(state: S, parent: block::Hash) -> Result<zs::ParentInputs, BoxError>
 where
-    S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send,
 {
     match timeout(
         CHECK_TIMEOUT,
@@ -466,7 +467,8 @@ impl Attempt {
     /// Try admission without holding an active task waiting for an accounting slot.
     pub async fn admit<S>(&mut self, state: S, block: Deferred) -> Result<(), Deferred>
     where
-        S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+        S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
+        S::Future: Send,
     {
         let result = parent_available(state, block.parent).await;
         if matches!(result, Ok(zs::ParentInputs::Available)) {

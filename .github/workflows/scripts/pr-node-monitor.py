@@ -16,6 +16,7 @@ height boundary was not crossed).
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import re
 import subprocess
@@ -50,6 +51,79 @@ def metric_value(text: str, name: str) -> float | None:
         )
     ]
     return max(values) if values else None
+
+
+CAPACITY_FIELDS = (
+    "capacity", "reserved", "limit", "active", "headroom", "peak", "deferred",
+    "limit_reached_count", "capacity_deferred_count", "capacity_reduction_overage_count",
+    "near_80_count", "near_90_count", "available_count", "admitted_count",
+    "read_failed_count", "inconclusive_count", "expired_count", "overflow_count",
+    "retry_limit_count", "retried_count",
+)
+
+
+def capacity_metrics(text: str) -> dict:
+    """Absent reservation metrics remain unknown, never zero."""
+    return {path: {field: metric_value(text, f"{path}_missing_parent_{field}")
+                   for field in CAPACITY_FIELDS} for path in ("sync", "gossip")}
+
+
+def summarize_capacity(samples: list[dict], interval: float) -> dict:
+    """Combine sampled utilization with event counters that capture brief saturation."""
+    result = {}
+    for path in ("sync", "gossip"):
+        observations = [s for s in samples
+                        if s.get("missing_parent", {}).get(path, {}).get("capacity") is not None]
+        if not observations:
+            result[path] = {"verdict": "incomplete", "reason": "No reservation metrics."}
+            continue
+        values = [s["missing_parent"][path] for s in observations]
+        failures = []
+        window = [s for s in samples if s.get("elapsed", 0) >= observations[0]["elapsed"]]
+        if len(window) != len(observations):
+            failures.append("Metrics missing inside the observation window.")
+        gaps = [b["elapsed"] - a["elapsed"] for a, b in zip(observations, observations[1:])]
+        if any(gap > max(2.5 * interval, 2.5) for gap in gaps):
+            failures.append("The sampling interval was interrupted.")
+        if any(v.get(key) is None for v in values for key in CAPACITY_FIELDS):
+            failures.append("Reservation metrics are incomplete.")
+        if any(v.get("limit") != v["capacity"] - ((int(v["capacity"]) + 3) // 4)
+               for v in values):
+            failures.append("The measured allowance disagrees with the reservation.")
+        if any((s.get("peers") or 0) < 1 or s.get("rpc_error") for s in observations):
+            failures.append("RPC or peer connectivity was unavailable.")
+        if len({s.get("pid") for s in observations if s.get("pid")}) > 1:
+            failures.append("The node process changed.")
+        for name in ("limit_reached_count", "capacity_deferred_count", "capacity_reduction_overage_count"):
+            counters = [v.get(name) for v in values]
+            if any(value is None for value in counters):
+                continue
+            if any(b < a for a, b in zip(counters, counters[1:])):
+                failures.append(f"Counter reset: {name}.")
+            if max(counters) > 0:
+                failures.append(f"Nonzero {name}: {max(counters):g}.")
+        utilization = sorted(v["active"] / v["limit"] for v in values
+                             if v.get("active") is not None and (v.get("limit") or 0) > 0)
+
+        def quantile(fraction):
+            if not utilization:
+                return None
+            return utilization[min(len(utilization) - 1, int((len(utilization) - 1) * fraction))]
+
+        result[path] = {
+            "verdict": "failed" if failures else "ok", "failures": failures,
+            "observed_seconds": observations[-1]["elapsed"] - observations[0]["elapsed"],
+            "samples": len(observations),
+            "capacities": sorted({v["capacity"] for v in values}),
+            "allowances": sorted({v["limit"] for v in values if v.get("limit") is not None}),
+            "peak": max((v.get("peak") or 0) for v in values),
+            "minimum_headroom": min((v["headroom"] for v in values if v.get("headroom") is not None), default=None),
+            "utilization_p50": quantile(.50), "utilization_p95": quantile(.95), "utilization_p99": quantile(.99),
+            "sampled_seconds_above_80_percent": sum(gap for gap, value in zip(gaps, values) if (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .8),
+            "sampled_seconds_above_90_percent": sum(gap for gap, value in zip(gaps, values) if (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .9),
+            "events_since_process_start": {key: values[-1].get(key) for key in CAPACITY_FIELDS if key.endswith("_count")},
+        }
+    return result
 
 
 def systemd_props(service: str) -> dict[str, str]:
@@ -96,6 +170,13 @@ def take_sample(args) -> dict:
             metrics = resp.read().decode("utf-8", "replace")
         # Retain one complete scrape and use it for all counters in this sample.
         (Path(args.out) / "metrics.prom").write_text(metrics)
+        with gzip.open(Path(args.out) / "metrics-scrapes.jsonl.gz", "at") as archive:
+            archive.write(json.dumps({"time": time.time(), "metrics": metrics}) + "\n")
+        sample["missing_parent"] = capacity_metrics(metrics)
+        sample["semantic_commits"] = sum(metric_value(metrics, f"{path}_semantic_committed_count") or 0
+                                          for path in ("sync", "gossip"))
+        sample["body_downloads"] = sum(metric_value(metrics, f"{path}_downloaded_block_count") or 0
+                                       for path in ("sync", "gossip"))
         for key, name in (
             ("finalized_height", "state_finalized_block_height"),
             ("vct_fast_blocks", "state_vct_fast_block_count"),
@@ -108,6 +189,7 @@ def take_sample(args) -> dict:
     sample["active_state"] = props.get("ActiveState")
     sample["restarts"] = int(props.get("NRestarts") or 0)
     pid = props.get("MainPID", "0")
+    sample["pid"] = pid
     sample["rss_mib"] = rss_mib(pid) if pid != "0" else None
     return sample
 
@@ -378,16 +460,32 @@ def write_markdown(out: Path, summary: dict, samples: list[dict], notes_file: st
         lines += summary["last_errors"]
         lines += ["```"]
 
+    if "missing_parent" in summary:
+        lines += ["", "### Missing-parent reservation", "",
+                  "| Path | Verdict | Peak | Minimum headroom | p99 utilization | Saturation events | Capacity deferrals |",
+                  "|---|---|---:|---:|---:|---:|---:|"]
+        for path, measured in summary["missing_parent"].items():
+            events = measured.get("events_since_process_start", {})
+            lines.append(f"| {path} | {measured['verdict']} | {fmt(measured.get('peak'))} | "
+                         f"{fmt(measured.get('minimum_headroom'))} | {fmt(measured.get('utilization_p99'))} | "
+                         f"{fmt(events.get('limit_reached_count'))} | {fmt(events.get('capacity_deferred_count'))} |")
+        for reason in summary.get("qualification_failures", []):
+            lines.append(f"- {reason}")
+
     if notes_file and Path(notes_file).is_file():
         lines += ["", "### Notes", "", Path(notes_file).read_text().rstrip()]
 
     (out / "summary.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration-minutes", type=float, required=True)
-    parser.add_argument("--interval", type=float, default=30)
+    parser.add_argument("--interval", type=float, default=1)
+    parser.add_argument("--require-capacity", action="store_true")
+    parser.add_argument("--required-semantic-blocks", type=int, default=0)
+    parser.add_argument("--required-observation-seconds", type=float, default=0)
+    parser.add_argument("--reference-rpc-url", help="independent healthy node for tip qualification")
     parser.add_argument("--rpc-url", default="http://127.0.0.1:8232")
     parser.add_argument("--metrics-url", default="http://127.0.0.1:9999/metrics")
     parser.add_argument("--service", default="zakurad")
@@ -424,7 +522,7 @@ def main() -> int:
         help="require successful tree_aux commits, not just pre-commit fast-block attempts",
     )
     parser.add_argument("--out", required=True, help="output directory")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.expected_snapshot_height is not None and (
         not args.require_startup_height or args.expected_snapshot_height < 0
     ):
@@ -441,6 +539,11 @@ def main() -> int:
     startup_height_checked = False
     while True:
         sample = take_sample(args)
+        if args.reference_rpc_url:
+            try:
+                sample["reference_height"] = rpc_call(args.reference_rpc_url, "getblockcount")
+            except Exception as exc:
+                sample["reference_error"] = str(exc)
         sample["elapsed"] = time.monotonic() - start
         samples.append(sample)
         with (out / "samples.jsonl").open("a") as stream:
@@ -527,6 +630,30 @@ def main() -> int:
         expected_snapshot_height=args.expected_snapshot_height,
         startup_height_error=startup_error,
     )
+    summary["missing_parent"] = summarize_capacity(samples, args.interval)
+    summary["semantic_commits"] = max((s.get("semantic_commits", 0) for s in samples), default=0)
+    summary["body_downloads"] = max((s.get("body_downloads", 0) for s in samples), default=0)
+    if args.require_capacity:
+        reasons = []
+        if any(v["verdict"] != "ok" for v in summary["missing_parent"].values()):
+            reasons.append("Reservation qualification failed or is incomplete.")
+        if summary["semantic_commits"] < args.required_semantic_blocks:
+            reasons.append("Insufficient fully semantically verified blocks.")
+        if any(v.get("observed_seconds", 0) < args.required_observation_seconds
+               for v in summary["missing_parent"].values()):
+            reasons.append("Insufficient uninterrupted observation time.")
+        if args.required_observation_seconds:
+            if not args.reference_rpc_url:
+                reasons.append("Tip qualification requires an independent reference.")
+            elif any(s.get("reference_error") or s.get("reference_height") is None
+                     or s.get("height") is None or abs(s["reference_height"] - s["height"]) > 2
+                     for s in samples if s.get("missing_parent")):
+                reasons.append("Independent tip coverage is missing or lag exceeded two blocks.")
+            if (summary.get("blocks_synced") or 0) < 1:
+                reasons.append("The tip run observed no committed chain progress.")
+        summary["qualification_failures"] = reasons
+        if reasons:
+            summary["verdict"] = "failed"
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_markdown(out, summary, samples, args.notes)
     print(f"verdict: {summary['verdict']}", flush=True)

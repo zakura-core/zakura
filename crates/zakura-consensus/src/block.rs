@@ -659,7 +659,8 @@ where
                                     zs::ParentInputs::ParentUnavailable => {
                                         VerifyBlockError::ParentUnavailable { parent }
                                     }
-                                    zs::ParentInputs::Inconclusive => {
+                                    zs::ParentInputs::Available
+                                    | zs::ParentInputs::Inconclusive => {
                                         VerifyBlockError::Transaction(
                                             TransactionError::TransparentInputNotFound,
                                         )

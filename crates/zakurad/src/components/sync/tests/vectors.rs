@@ -3610,6 +3610,7 @@ async fn empty_block_response_is_retryable_download_failure() {
     let mut downloads = Downloads::new(
         peer_set.clone(),
         verifier,
+        available_parent_state(),
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
@@ -3658,6 +3659,7 @@ async fn block_download_network_readiness_times_out() {
     let mut downloads = Downloads::new(
         NeverReadyNetwork,
         verifier,
+        available_parent_state(),
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
@@ -3677,6 +3679,14 @@ async fn block_download_network_readiness_times_out() {
 }
 
 /// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`.
+fn available_parent_state(
+) -> tower::util::BoxCloneSyncService<zs::Request, zs::Response, crate::BoxError> {
+    tower::util::BoxCloneSyncService::new(tower::service_fn(|request| async move {
+        assert!(matches!(request, zs::Request::CheckParentInputs { .. }));
+        Ok::<_, crate::BoxError>(zs::Response::ParentInputs(zs::ParentInputs::Available))
+    }))
+}
+
 fn setup_downloads(
     peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
     verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
@@ -3692,6 +3702,7 @@ fn setup_downloads(
     Downloads::new(
         peer_set,
         verifier,
+        available_parent_state(),
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,

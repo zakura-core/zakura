@@ -154,12 +154,14 @@ pub enum Response {
 /// The result of checking a candidate block's external inputs against its parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParentInputs {
+    /// The parent belongs to a usable committed chain and every input is unspent there.
+    Available,
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),
     /// The parent is neither in a non-finalized chain nor the finalized tip,
     /// so no chain can accept the candidate now.
     ParentUnavailable,
-    /// Every input is unspent at the parent, or the parent context changed during the read.
+    /// The parent context is not coherent enough to establish input availability.
     Inconclusive,
 }
 

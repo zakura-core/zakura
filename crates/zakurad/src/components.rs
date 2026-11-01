@@ -7,6 +7,7 @@ pub mod inbound;
 #[allow(missing_docs)]
 pub mod mempool;
 pub mod metrics;
+mod missing_parent;
 #[allow(missing_docs)]
 pub mod sync;
 #[allow(missing_docs)]

@@ -324,7 +324,7 @@ pub fn parent_inputs(
                 .copied()
                 .find(|outpoint| unspent_utxo(chain, db, *outpoint).is_none())
         };
-        missing.map_or(ParentInputs::Inconclusive, ParentInputs::Missing)
+        missing.map_or(ParentInputs::Available, ParentInputs::Missing)
     };
 
     // The database holds exactly the finalized tip's UTXO set.

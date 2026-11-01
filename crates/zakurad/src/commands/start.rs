@@ -695,6 +695,7 @@ impl StartCmd {
         info!("fully initializing inbound peer request handler");
         // Fully start the inbound service as soon as possible
         let setup_data = InboundSetupData {
+            max_checkpoint_height,
             address_book: address_book.clone(),
             block_download_peer_set: peer_set.clone(),
             block_verifier: block_verifier_router.clone(),

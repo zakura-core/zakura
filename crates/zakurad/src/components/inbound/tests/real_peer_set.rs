@@ -1063,6 +1063,7 @@ async fn setup(
 
     // Initialize the inbound service
     let setup_data = InboundSetupData {
+        max_checkpoint_height: zakura_chain::block::Height(0),
         address_book,
         block_download_peer_set: peer_set.clone(),
         block_verifier: buffered_block_verifier,

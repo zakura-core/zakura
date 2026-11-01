@@ -35,6 +35,7 @@ use zakura_state as zs;
 use crate::components::{
     auth_download_height::tip_child_mismatch,
     download_work::has_sufficient_work,
+    missing_parent::{Budget as ParentBudget, Deferred as ParentDeferred},
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -123,6 +124,9 @@ impl<Request: Clone> hedge::Policy<Request> for AlwaysHedge {
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum BlockDownloadVerifyError {
+    /// The block body and active task were released for parent-triggered retry.
+    #[error(transparent)]
+    MissingParentDeferred(#[from] ParentDeferred),
     #[error("permanent readiness error from the network service: {error:?}")]
     NetworkServiceError {
         #[source]
@@ -344,6 +348,10 @@ where
     /// A service that verifies downloaded blocks.
     verifier: ZV,
 
+    state: tower::util::BoxCloneSyncService<zs::Request, zs::Response, BoxError>,
+
+    pub(super) parent_budget: ParentBudget,
+
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
 
@@ -473,22 +481,33 @@ where
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<ZS>(
         network: ZN,
         verifier: ZV,
+        state: ZS,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         chain_network: Network,
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
-    ) -> Self {
+    ) -> Self
+    where
+        ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+        ZS::Future: Send,
+    {
         let past_lookahead_limit_receiver =
             zs::WatchReceiver::new(past_lookahead_limit_sender.subscribe());
 
         Self {
             network,
             verifier,
+            state: tower::util::BoxCloneSyncService::new(state),
+            parent_budget: ParentBudget::new("sync", lookahead_limit),
             latest_chain_tip,
             lookahead_limit,
             chain_network,
@@ -573,7 +592,7 @@ where
         &mut self,
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
-        if self.cancel_handles.contains_key(&hash) {
+        if self.cancel_handles.contains_key(&hash) || self.parent_budget.is_deferred(&hash) {
             metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
         }
@@ -616,6 +635,8 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let mut verifier = self.verifier.clone();
+        let state = self.state.clone();
+        let mut parent_attempt = self.parent_budget.attempt(hash);
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
@@ -848,6 +869,13 @@ where
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }
 
+                if block_height > max_checkpoint_height {
+                    parent_attempt.admit(state, ParentDeferred {
+                        hash, parent: block.header.previous_block_hash, height: block_height,
+                        source: None, parent_recovery: false,
+                    }).await?;
+                }
+
                 // Wait for the verifier service to be ready.
                 let readiness = verifier.ready();
                 // Prefer the cancel handle if both are ready.
@@ -897,11 +925,15 @@ where
                 };
 
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
+                parent_attempt.completed(verification.is_ok());
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
                     .record(verify_start.elapsed().as_secs_f64());
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);
+                    if block_height > max_checkpoint_height {
+                        metrics::counter!("sync.semantic_committed.count").increment(1);
+                    }
                 }
 
                 verification
@@ -933,6 +965,7 @@ where
 
     /// Cancel all running tasks and reset the downloader state.
     pub fn cancel_all(&mut self) {
+        self.parent_budget.reset();
         self.emit_diagnostic_snapshot(
             "pipeline_reset",
             self.latest_chain_tip.best_tip_height(),

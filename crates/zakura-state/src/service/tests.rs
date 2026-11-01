@@ -2870,11 +2870,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
     check_parent_inputs(
         &mut state,
         [
-            (
-                blocks[1].hash(),
-                vec![coinbase(1)],
-                ParentInputs::Inconclusive,
-            ),
+            (blocks[1].hash(), vec![coinbase(1)], ParentInputs::Available),
             (
                 blocks[1].hash(),
                 vec![coinbase(1), missing],
@@ -2916,7 +2912,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[5].hash(),
                 vec![coinbase(1), coinbase(3), coinbase(5)],
-                ParentInputs::Inconclusive,
+                ParentInputs::Available,
             ),
             (
                 blocks[5].hash(),
@@ -2924,11 +2920,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
                 ParentInputs::Missing(missing),
             ),
             // A parent below the best tip uses a fork that excludes the outputs above it.
-            (
-                blocks[4].hash(),
-                vec![coinbase(3)],
-                ParentInputs::Inconclusive,
-            ),
+            (blocks[4].hash(), vec![coinbase(3)], ParentInputs::Available),
             (
                 blocks[4].hash(),
                 vec![coinbase(5)],
@@ -2946,11 +2938,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
                 ParentInputs::Missing(coinbase(5)),
             ),
             // The finalized tip excludes non-finalized outputs.
-            (
-                blocks[1].hash(),
-                vec![coinbase(1)],
-                ParentInputs::Inconclusive,
-            ),
+            (blocks[1].hash(), vec![coinbase(1)], ParentInputs::Available),
             (
                 blocks[1].hash(),
                 vec![coinbase(2)],
@@ -3054,7 +3042,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
     // Sanity: the aligned view proves coinbase(2) present at block 5.
     assert_eq!(
         read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
-        ParentInputs::Inconclusive
+        ParentInputs::Available
     );
 
     // Gap: drop block 2 from the chain, so neither the chain nor the database has it.
@@ -3106,12 +3094,12 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         (
             blocks[5].hash(),
             vec![coinbase(1), coinbase(2), coinbase(5)],
-            ParentInputs::Inconclusive,
+            ParentInputs::Available,
         ),
         (
             blocks[4].hash(),
             vec![coinbase(2), coinbase(4)],
-            ParentInputs::Inconclusive,
+            ParentInputs::Available,
         ),
         (
             blocks[4].hash(),
@@ -3128,11 +3116,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
             vec![coinbase(3)],
             ParentInputs::Missing(coinbase(3)),
         ),
-        (
-            blocks[2].hash(),
-            vec![coinbase(2)],
-            ParentInputs::Inconclusive,
-        ),
+        (blocks[2].hash(), vec![coinbase(2)], ParentInputs::Available),
         (
             blocks[1].hash(),
             vec![coinbase(1)],

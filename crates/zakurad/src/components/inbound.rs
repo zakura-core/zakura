@@ -256,6 +256,8 @@ fn mempool_queue_source(source: zn::PeerSource) -> mempool::QueueSource {
 
 /// The services used by the [`Inbound`] service.
 pub struct InboundSetupData {
+    /// Last height handled by the checkpoint verifier.
+    pub max_checkpoint_height: zakura_chain::block::Height,
     /// A shared list of peer addresses.
     pub address_book: Arc<std::sync::Mutex<AddressBook>>,
 
@@ -466,6 +468,7 @@ impl Service<zn::Request> for Inbound {
             } => match setup.try_recv() {
                 Ok(setup_data) => {
                     let InboundSetupData {
+                        max_checkpoint_height,
                         address_book,
                         block_download_peer_set,
                         block_verifier,
@@ -486,6 +489,7 @@ impl Service<zn::Request> for Inbound {
                         state.clone(),
                         latest_chain_tip,
                         network,
+                        max_checkpoint_height,
                     ));
 
                     result = Ok(());

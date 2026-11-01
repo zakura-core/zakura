@@ -157,6 +157,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
         zakura_state::ChainTipSender::new(None, &network);
     let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup = InboundSetupData {
+        max_checkpoint_height: zakura_chain::block::Height(0),
         address_book: Arc::new(std::sync::Mutex::new(AddressBook::new(
             "0.0.0.0:0".parse()?,
             &network,

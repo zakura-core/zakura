@@ -32,6 +32,7 @@ use zakura_state as zs;
 use crate::components::{
     auth_download_height::tip_child_mismatch,
     download_work::has_sufficient_work,
+    missing_parent::{Budget as ParentBudget, Deferred as ParentDeferred},
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -341,6 +342,8 @@ const MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 /// known, and the parent's download must be deduplicated against every other inbound download.
 #[derive(Debug, Default)]
 struct Admission {
+    /// Metadata retries continue independently of inbound request polling.
+    parent_driver: Option<JoinHandle<()>>,
     /// The downloads stream has shut down and accepts no further recoveries.
     closed: bool,
 
@@ -404,6 +407,8 @@ impl Admission {
 /// polled.
 #[derive(Debug)]
 struct TaskSpawner<ZN, ZV, ZS> {
+    parent_budget: ParentBudget,
+    max_checkpoint_height: block::Height,
     /// The configured full verification concurrency limit, after applying the minimum limit.
     full_verify_concurrency_limit: usize,
 
@@ -434,6 +439,8 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
     fn clone(&self) -> Self {
         Self {
             full_verify_concurrency_limit: self.full_verify_concurrency_limit,
+            parent_budget: self.parent_budget.clone(),
+            max_checkpoint_height: self.max_checkpoint_height,
             network: self.network.clone(),
             verifier: self.verifier.clone(),
             state: self.state.clone(),
@@ -494,6 +501,10 @@ where
         let mut admission = self.spawner.admission();
         // Tasks retain the admission state, so the stream must cancel them explicitly.
         admission.closed = true;
+        if let Some(driver) = admission.parent_driver.take() {
+            driver.abort();
+        }
+        self.spawner.parent_budget.reset();
         admission.cancel_handles.clear();
     }
 }
@@ -577,6 +588,7 @@ where
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
         chain_network: Network,
+        max_checkpoint_height: block::Height,
     ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
@@ -588,6 +600,8 @@ where
             expose_peer_addresses,
             spawner: TaskSpawner {
                 full_verify_concurrency_limit,
+                parent_budget: ParentBudget::new("gossip", full_verify_concurrency_limit),
+                max_checkpoint_height,
                 network,
                 verifier,
                 state,
@@ -712,7 +726,9 @@ where
         let mut admission = self.spawner.admission();
         let queue_len = admission.queue_len();
 
-        if admission.cancel_handles.contains_key(&hash) {
+        if admission.cancel_handles.contains_key(&hash)
+            || self.spawner.parent_budget.is_deferred(&hash)
+        {
             debug!(
                 ?hash,
                 queue_len,
@@ -801,6 +817,85 @@ where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send,
 {
+    /// Locks the admission bookkeeping. Callers must not hold the guard across an `await`.
+    fn ensure_parent_driver(&self) {
+        let mut admission = self.admission();
+        if admission.closed
+            || !self.parent_budget.has_pending()
+            || admission
+                .parent_driver
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let spawner = self.clone();
+        let driver: BoxFuture<'static, ()> = async move {
+            loop {
+                {
+                    let mut admission = spawner.admission();
+                    if admission.closed || !spawner.parent_budget.has_pending() {
+                        admission.parent_driver.take();
+                        break;
+                    }
+                }
+                spawner
+                    .parent_budget
+                    .observe(spawner.state.clone(), spawner.latest_chain_tip.clone())
+                    .await;
+                let slots = {
+                    let admission = spawner.admission();
+                    if admission.closed {
+                        break;
+                    }
+                    spawner
+                        .full_verify_concurrency_limit
+                        .saturating_sub(admission.queue_len())
+                };
+                for entry in spawner.parent_budget.take_ready(slots) {
+                    if entry.parent_recovery {
+                        if !matches!(
+                            spawner.recover_parent(entry.hash, entry.source.clone()),
+                            ParentRecovery::Requested | ParentRecovery::Attached
+                        ) {
+                            spawner.parent_budget.dispatch_refused(&entry.hash);
+                        }
+                        continue;
+                    }
+                    let mut admission = spawner.admission();
+                    let advertiser = entry.source.clone().map(AdvertiserSource::from);
+                    let source_full = advertiser.as_ref().is_some_and(|source| {
+                        admission.source_counts.get(source).copied().unwrap_or(0)
+                            >= source.max_in_flight(spawner.full_verify_concurrency_limit)
+                    });
+                    if admission.closed
+                        || admission.queue_len() >= spawner.full_verify_concurrency_limit
+                        || source_full
+                    {
+                        spawner.parent_budget.dispatch_refused(&entry.hash);
+                        continue;
+                    }
+                    if admission.cancel_handles.contains_key(&entry.hash) {
+                        continue;
+                    }
+                    let task = spawner.spawn_download_task(
+                        &mut admission,
+                        DownloadTask {
+                            hash: entry.hash,
+                            download_source: entry.source,
+                            advertiser,
+                            kind: DownloadKind::Advertised,
+                        },
+                    );
+                    let _ = spawner.spawned_sender.send(task);
+                }
+                let _ = spawner.parent_budget.take_rediscovery();
+            }
+        }
+        .boxed();
+        admission.parent_driver = Some(tokio::spawn(driver));
+    }
+
     /// Locks the admission bookkeeping. Callers must not hold the guard across an `await`.
     fn admission(&self) -> std::sync::MutexGuard<'_, Admission> {
         self.admission
@@ -906,6 +1001,9 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let max_checkpoint_height = self.max_checkpoint_height;
+        let mut parent_attempt = self.parent_budget.attempt(hash);
+        let retry_source = download_source.clone();
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -1113,7 +1211,7 @@ where
                 // parent as before.
                 let parent_is_missing = one_hop_from_tip
                     && matches!(
-                        state.oneshot(zs::Request::KnownBlock(parent)).await,
+                        state.clone().oneshot(zs::Request::KnownBlock(parent)).await,
                         Ok(zs::Response::KnownBlock(None))
                     );
 
@@ -1150,18 +1248,40 @@ where
                 }
             }
 
+            if block_height > max_checkpoint_height {
+                let result = parent_attempt
+                    .admit(
+                        state.clone(),
+                        ParentDeferred {
+                            hash,
+                            parent: block.header.previous_block_hash,
+                            height: block_height,
+                            source: retry_source,
+                            parent_recovery: kind == DownloadKind::ParentRecovery,
+                        },
+                    )
+                    .await;
+                spawner.ensure_parent_driver();
+                result.map_err(|error| (BoxError::from(error), None))?;
+            }
+
             let _source_guard = match source_lock {
                 Some(source_lock) => Some(source_lock.lock_owned().await),
                 None => None,
             };
 
-            verifier
+            let result = verifier
                 .oneshot(zakura_consensus::Request::Commit(block))
                 .await
                 .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+                .map_err(|e| (e, advertiser_addr));
+            parent_attempt.completed(result.is_ok());
+            result
         }
         .map_ok(move |(hash, height)| {
+            if height > max_checkpoint_height {
+                metrics::counter!("gossip.semantic_committed.count").increment(1);
+            }
             match kind {
                 DownloadKind::Advertised => {
                     info!(?height, "downloaded and verified gossiped block")
@@ -1276,6 +1396,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            block::Height(0),
         )
     }
 
@@ -1397,6 +1518,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            block::Height(0),
         );
 
         for index in 0..MIN_CONCURRENCY_LIMIT {
@@ -1493,12 +1615,16 @@ mod tests {
             verifier,
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
+                    zs::Request::CheckParentInputs { .. } => {
+                        Ok(zs::Response::ParentInputs(zs::ParentInputs::Available))
+                    }
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
             Network::Mainnet,
+            block::Height(0),
         );
 
         assert_eq!(
@@ -1603,12 +1729,16 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
+                    zs::Request::CheckParentInputs { .. } => {
+                        Ok(zs::Response::ParentInputs(zs::ParentInputs::Available))
+                    }
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
             Network::Mainnet,
+            block::Height(0),
         );
 
         assert_eq!(
@@ -1678,12 +1808,16 @@ mod tests {
             verifier,
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
+                    zs::Request::CheckParentInputs { .. } => {
+                        Ok(zs::Response::ParentInputs(zs::ParentInputs::Available))
+                    }
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
             Network::Mainnet,
+            block::Height(0),
         );
 
         assert_eq!(
@@ -1781,12 +1915,16 @@ mod tests {
             // height check runs. Answering `None` lets the download proceed.
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
+                    zs::Request::CheckParentInputs { .. } => {
+                        Ok(zs::Response::ParentInputs(zs::ParentInputs::Available))
+                    }
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
             Network::Mainnet,
+            block::Height(0),
         )
     }
 

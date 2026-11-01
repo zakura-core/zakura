@@ -216,6 +216,9 @@ impl Harness {
             async move {
                 match request {
                     // Gossip always fetches the body, so the state never reports it present.
+                    zs::Request::CheckParentInputs { .. } => {
+                        Ok(zs::Response::ParentInputs(zs::ParentInputs::Available))
+                    }
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
                         known
@@ -242,6 +245,7 @@ impl Harness {
             state,
             latest_chain_tip,
             chain_network,
+            block::Height(0),
         );
 
         Self {

@@ -1286,6 +1286,7 @@ async fn caches_getaddr_response() {
         let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
 
         let setup_data = InboundSetupData {
+            max_checkpoint_height: zakura_chain::block::Height(0),
             address_book: address_book.clone(),
             block_download_peer_set: buffered_peer_set,
             block_verifier,
@@ -1585,6 +1586,7 @@ async fn setup_with_misbehavior_receiver(
     let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
 
     let setup_data = InboundSetupData {
+        max_checkpoint_height: zakura_chain::block::Height(0),
         address_book,
         block_download_peer_set: buffered_peer_set,
         block_verifier,

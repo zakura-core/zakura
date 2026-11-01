@@ -1070,6 +1070,7 @@ where
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
+            state.clone(),
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
             max(
@@ -1533,6 +1534,10 @@ where
         >,
     ) -> Result<(), Report> {
         let checkpoint_bootstrap = header_runtime_status.is_some();
+        let parent_budget = self.downloads.parent_budget.clone();
+        let mut parent_observer = parent_budget
+            .observe(self.state.clone(), self.latest_chain_tip.clone())
+            .boxed();
 
         // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
@@ -1552,6 +1557,27 @@ where
         let mut last_progress = Instant::now();
 
         'sync_round: loop {
+            if futures::poll!(&mut parent_observer).is_ready() {
+                parent_observer = parent_budget
+                    .observe(self.state.clone(), self.latest_chain_tip.clone())
+                    .boxed();
+            }
+            let capacity = self.lookahead_limit(reserve.len());
+            parent_budget.set_capacity(capacity);
+            for entry in
+                parent_budget.take_ready(capacity.saturating_sub(self.downloads.in_flight()))
+            {
+                match self.downloads.download_and_verify(entry.hash).await {
+                    Ok(())
+                    | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {}
+                    Err(error) => {
+                        parent_budget.dispatch_refused(&entry.hash);
+                        self.handle_block_response(Err(error))?;
+                    }
+                }
+            }
+            // Expired metadata is rediscovered from committed state on the next normal round.
+            let _ = parent_budget.take_rediscovery();
             if header_runtime_status
                 .as_ref()
                 .is_some_and(|status| status.borrow().is_ready())
@@ -1574,6 +1600,10 @@ where
 
             // Opportunistically handle any block tasks that are already finished, without blocking.
             while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
+                let deferred = matches!(
+                    &rsp,
+                    Err(BlockDownloadVerifyError::MissingParentDeferred(_))
+                );
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
@@ -1592,7 +1622,9 @@ where
                     continue 'sync_round;
                 }
                 result?;
-                last_progress = Instant::now();
+                if !deferred {
+                    last_progress = Instant::now();
+                }
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
@@ -1674,6 +1706,10 @@ where
 
                 match completed {
                     Ok(Some(rsp)) => {
+                        let deferred = matches!(
+                            &rsp,
+                            Err(BlockDownloadVerifyError::MissingParentDeferred(_))
+                        );
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
                         if header_runtime_status
                             .as_ref()
@@ -1689,7 +1725,9 @@ where
                             continue 'sync_round;
                         }
                         result?;
-                        last_progress = Instant::now();
+                        if !deferred {
+                            last_progress = Instant::now();
+                        }
                         self.update_metrics();
                     }
                     // `downloads` only yields `None` when nothing is in flight, which we just ruled
@@ -1743,6 +1781,7 @@ where
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
                 && self.registry_miss_retry.is_empty()
+                && !parent_budget.has_pending()
             {
                 break;
             }
@@ -1758,6 +1797,11 @@ where
             let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
+
+                    _ = &mut parent_observer => {
+                        parent_observer = parent_budget.observe(self.state.clone(), self.latest_chain_tip.clone()).boxed();
+                        // Parent probes do not count as chain progress.
+                    }
 
                     // Retry required blocks that registry-missed once their backoff elapses. This
                     // is not gated by speculative lookahead dispatch, so the head-of-line block gets
@@ -1790,6 +1834,7 @@ where
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
+                        let deferred = matches!(&rsp, Err(BlockDownloadVerifyError::MissingParentDeferred(_)));
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
                         if header_runtime_status
                             .as_ref()
@@ -1805,7 +1850,7 @@ where
                             return Ok(());
                         }
                         result?;
-                        last_progress = Instant::now();
+                        if !deferred { last_progress = Instant::now(); }
                         self.update_metrics();
                     }
 
@@ -2567,6 +2612,12 @@ where
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), Report> {
+        if matches!(
+            &response,
+            Err(BlockDownloadVerifyError::MissingParentDeferred(_))
+        ) {
+            return Ok(());
+        }
         let response = match response {
             Err(BlockDownloadVerifyError::Invalid {
                 ref error,
@@ -3023,6 +3074,7 @@ where
         let peer = block_error_peer_label(e, expose_peer_addresses);
 
         match e {
+            BlockDownloadVerifyError::MissingParentDeferred(_) => false,
             // The retry handler bounds these races without cancelling the parent's commit.
             e if Self::is_utxo_lookup_timeout(e)
                 || Self::is_post_checkpoint_verify_timeout(e)

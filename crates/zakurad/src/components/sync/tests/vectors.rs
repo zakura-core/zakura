@@ -2392,6 +2392,146 @@ async fn unavailable_parent_retries_while_parent_can_arrive() -> Result<(), crat
     Ok(())
 }
 
+fn auth_data_unconfirmed(hash: block::Hash, parent: block::Hash) -> BlockDownloadVerifyError {
+    BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::AuthDataUnconfirmed {
+                parent,
+                source: Box::new(VerifyBlockError::Transaction(
+                    TransactionError::Halo2VerificationFailed,
+                )),
+            }),
+        },
+        height: Height(42),
+        hash,
+        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
+    }
+}
+
+/// A block whose binding is unconfirmed because its parent is still downloading waits for that
+/// parent without retrying, restarting, or scoring the supplier, and is requeued once the parent
+/// verifies.
+#[tokio::test]
+async fn unconfirmed_binding_waits_for_a_downloading_parent() -> Result<(), crate::BoxError> {
+    let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+    assert!(!TestChainSync::should_restart_sync(
+        &auth_data_unconfirmed(hash, parent),
+        false
+    ));
+
+    chain_sync.downloads.download_and_verify(parent).await?;
+    let _parent_download = peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(parent).collect()))
+        .await;
+
+    // Repeated fast failures while the parent downloads neither retry nor spend any budget.
+    for _ in 0..=sync::BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT {
+        let (response, _) = tokio::join!(
+            chain_sync
+                .handle_block_response_with_missing_retry(Err(auth_data_unconfirmed(hash, parent))),
+            async {
+                state
+                    .expect_request(zs::Request::KnownBlock(parent))
+                    .await
+                    .respond(zs::Response::KnownBlock(None));
+            },
+        );
+        response?;
+    }
+    assert!(chain_sync.unconfirmed_binding_waits.contains_key(&hash));
+    assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+    assert_eq!(chain_sync.utxo_race_drops, 0);
+    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    peers.expect_no_requests().await;
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Ok((Height(41), parent)))
+        .await?;
+    assert!(chain_sync.unconfirmed_binding_waits.is_empty());
+    let _retry = peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await;
+    Ok(())
+}
+
+/// A block whose binding is unconfirmed is retried at once if its parent has committed since, and
+/// dropped if its parent can't arrive.
+#[tokio::test]
+async fn unconfirmed_binding_retries_after_commit_and_drops_without_parent(
+) -> Result<(), crate::BoxError> {
+    for committed in [true, false] {
+        let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
+        let hash = block::Hash([0xCC; 32]);
+        let parent = block::Hash([0xAA; 32]);
+        let (response, _) = tokio::join!(
+            chain_sync
+                .handle_block_response_with_missing_retry(Err(auth_data_unconfirmed(hash, parent))),
+            async {
+                state
+                    .expect_request(zs::Request::KnownBlock(parent))
+                    .await
+                    .respond(zs::Response::KnownBlock(
+                        committed.then_some(zs::KnownBlock::BestChain),
+                    ));
+            },
+        );
+        response?;
+        assert!(
+            chain_sync.unconfirmed_binding_waits.is_empty(),
+            "{committed}"
+        );
+        if committed {
+            assert_eq!(chain_sync.verify_timeout_retry_counts.get(&hash), Some(&1));
+            let _retry = peers
+                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+                .await;
+        } else {
+            assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+            peers.expect_no_requests().await;
+        }
+    }
+    Ok(())
+}
+
+/// A wait past its deadline requeues the block if its parent committed through another path, and
+/// drops it otherwise.
+#[tokio::test]
+async fn unconfirmed_binding_wait_expiry_requeues_or_drops() -> Result<(), crate::BoxError> {
+    for committed in [true, false] {
+        let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
+        let hash = block::Hash([0xCC; 32]);
+        let parent = block::Hash([0xAA; 32]);
+        chain_sync
+            .unconfirmed_binding_waits
+            .insert(hash, (parent, tokio::time::Instant::now()));
+        let (response, _) = tokio::join!(chain_sync.expire_unconfirmed_binding_waits(), async {
+            state
+                .expect_request(zs::Request::KnownBlock(parent))
+                .await
+                .respond(zs::Response::KnownBlock(
+                    committed.then_some(zs::KnownBlock::Finalized),
+                ));
+        });
+        response?;
+        assert!(
+            chain_sync.unconfirmed_binding_waits.is_empty(),
+            "{committed}"
+        );
+        if committed {
+            let _retry = peers
+                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+                .await;
+        } else {
+            peers.expect_no_requests().await;
+        }
+    }
+    Ok(())
+}
+
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
     BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {

@@ -309,7 +309,7 @@ where
 /// Reads the serialized size of the committed block `hash` from the state.
 ///
 /// Returns `None` if the block is not found, or the read fails or takes longer than
-/// [`BLOCK_SIZE_READ_TIMEOUT`]. The broadcast then uses its widest advert window.
+/// [`BLOCK_SIZE_READ_TIMEOUT`]. The broadcast then uses its minimum advert window.
 async fn committed_block_size<RS>(read_state: RS, hash: block::Hash) -> Option<u32>
 where
     RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,

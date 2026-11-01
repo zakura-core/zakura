@@ -1658,51 +1658,27 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 
     let config: Config = toml::from_str("").expect("empty config parses");
-    assert_eq!(config.advert_target, Duration::from_secs(1));
-    assert_eq!(config.advert_window_initial, 32);
-    assert_eq!(config.advert_window_min, 16);
-    assert_eq!(config.advert_window_max, 264);
-    assert_eq!(config.advert_window_fixed, None);
+    assert_eq!(config.advert_window_min, 32);
+    assert_eq!(config.advert_window_max, 48);
+    assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
 
     let config: Config = toml::from_str(
-        "advert_target_secs = 0.5\n\
-         advert_window_initial = 12\n\
-         advert_window_min = 2\n\
+        "advert_window_min = 2\n\
          advert_window_max = 16\n\
-         advert_window_fixed = 8\n",
+         advert_window_full_size_bytes = 1000\n",
     )
     .expect("configured fan-out parses");
-    assert_eq!(config.advert_target, Duration::from_millis(500));
-    assert_eq!(config.advert_window_initial, 12);
     assert_eq!(config.advert_window_min, 2);
     assert_eq!(config.advert_window_max, 16);
-    assert_eq!(config.advert_window_fixed, Some(8));
+    assert_eq!(config.advert_window_full_size_bytes, 1000);
 
     let serialized = toml::to_string(&config).expect("config serializes");
-    assert!(
-        serialized.contains("advert_target_secs = 0.5"),
-        "{serialized}"
-    );
     let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
     assert_eq!(roundtrip, config);
 
-    // Equal bounds are a fixed range, and an integer target is whole seconds.
-    let config: Config = toml::from_str(
-        "advert_target_secs = 2\n\
-         advert_window_initial = 9\n\
-         advert_window_min = 9\n\
-         advert_window_max = 9",
-    )
-    .expect("equal bounds parse");
-    assert_eq!(config.advert_target, Duration::from_secs(2));
-    assert_eq!(
-        (
-            config.advert_window_min,
-            config.advert_window_initial,
-            config.advert_window_max
-        ),
-        (9, 9, 9)
-    );
+    // Equal bounds are a fixed window.
+    let config: Config = toml::from_str("advert_window_min = 48").expect("equal bounds parse");
+    assert_eq!(config.advert_window_min, config.advert_window_max);
 }
 
 #[test]
@@ -1712,23 +1688,20 @@ fn invalid_advert_fanout_config_is_rejected() {
     for (config, field) in [
         ("advert_window_min = 0", "advert_window_min"),
         (
-            "advert_window_min = 10\nadvert_window_initial = 10\nadvert_window_max = 9",
+            "advert_window_min = 10\nadvert_window_max = 9",
             "advert_window_min",
         ),
-        // The default initial window of 32 is outside these bounds.
-        ("advert_window_max = 31", "advert_window_initial"),
-        ("advert_window_min = 33", "advert_window_initial"),
-        ("advert_window_initial = 15", "advert_window_initial"),
-        ("advert_window_initial = 265", "advert_window_initial"),
-        ("advert_window_fixed = 0", "advert_window_fixed"),
-        ("advert_target_secs = 0", "advert_target_secs"),
-        ("advert_target_secs = -1.0", "advert_target_secs"),
-        ("advert_target_secs = nan", "advert_target_secs"),
-        ("advert_target_secs = inf", "advert_target_secs"),
+        // The default maximum of 48 is below this minimum, and the reverse.
+        ("advert_window_min = 49", "advert_window_min"),
+        ("advert_window_max = 31", "advert_window_max"),
         (
-            "advert_bandwidth_bytes_per_sec = 12500000",
-            "advert_bandwidth_bytes_per_sec",
+            "advert_window_full_size_bytes = 0",
+            "advert_window_full_size_bytes",
         ),
+        // Removed settings.
+        ("advert_target_secs = 1.0", "advert_target_secs"),
+        ("advert_window_initial = 32", "advert_window_initial"),
+        ("advert_window_fixed = 8", "advert_window_fixed"),
     ] {
         let error = toml::from_str::<Config>(config)
             .expect_err("invalid fan-out config is rejected")

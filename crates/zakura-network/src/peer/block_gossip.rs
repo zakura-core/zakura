@@ -2,11 +2,12 @@
 //!
 //! Each broadcast advertises to at most its advert window of peers at a time, and moves on to
 //! the next peer once an earlier one finishes. [`AdvertFanout`] sizes that window from the
-//! block's size and the measured upload bandwidth. Configured sidecars are advertised first,
-//! outside the window. Writing an `inv` uses only that window. A peer takes one of the
-//! [`BLOCK_UPLOAD_CONCURRENCY`] upload slots, shared by every broadcast, only once it requests
-//! the block, and keeps it through the body write and its drain allowance. A peer waiting for a slot keeps its window entry, so busy uploads still slow each broadcast's
-//! fan-out, but they cannot delay another block's first `inv`s.
+//! block's size. Configured sidecars are advertised first, outside the window. Writing an `inv`
+//! uses only that window. A peer takes one of the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots,
+//! shared by every broadcast, only once it requests the block, and keeps it through the body
+//! write and its drain allowance. A peer waiting for a slot keeps its window entry, so busy
+//! uploads still slow each broadcast's fan-out, but they cannot delay another block's first
+//! `inv`s.
 //!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
@@ -27,10 +28,10 @@ use zakura_chain::{block, chain_tip::ChainTip};
 
 use crate::{
     constants::REQUEST_TIMEOUT,
-    peer::{advert_fanout::AdvertFanout, MinimumPeerVersion, SharedPeerError},
+    peer::{MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
-    BoxError, Request, Response,
+    BoxError, Config, Request, Response,
 };
 
 /// Pending block adverts per connection. Slow peers can catch up through later tip gossip.
@@ -63,6 +64,49 @@ pub(crate) enum BlockAdvertError {
 
 /// Maximum concurrent block uploads requested through legacy block broadcasts, across broadcasts.
 pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
+
+/// Chooses how many peers one block broadcast advertises to at once, from the block's size.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdvertFanout {
+    min: usize,
+    max: usize,
+    full_size_bytes: u64,
+}
+
+impl AdvertFanout {
+    /// Returns the fan-out policy in `config`.
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            min: config.advert_window_min,
+            max: config.advert_window_max,
+            full_size_bytes: config.advert_window_full_size_bytes,
+        }
+    }
+
+    /// Returns the advert window of a block of `size` serialized bytes, and records it in metrics.
+    ///
+    /// The window is `min + floor((max - min) * (full_size - size) / full_size)` below the full
+    /// size, and `min` at or above the full size or when the size is unknown.
+    pub(crate) fn window(&self, size: Option<u32>) -> usize {
+        let window = size.map_or(self.min, |size| {
+            let below_full = self.full_size_bytes.saturating_sub(u64::from(size));
+            // Both factors fit in 64 bits, so the product cannot overflow.
+            let above_min = self.max.saturating_sub(self.min) as u128 * u128::from(below_full)
+                / u128::from(self.full_size_bytes.max(1));
+            // `above_min` is at most `max - min`.
+            usize::try_from(above_min).map_or(self.max, |above_min| self.min + above_min)
+        });
+        if let Some(size) = size {
+            metrics::histogram!("peer.block_gossip.advert_block_size_bytes")
+                .record(f64::from(size));
+        }
+        // Windows are at most a few hundred peers, so they convert exactly.
+        #[allow(clippy::cast_precision_loss)]
+        metrics::histogram!("peer.block_gossip.advert_window").record(window as f64);
+        window
+    }
+}
+
 /// Every this many mined-block advertisements, a random peer replaces the next-lowest RTT.
 ///
 /// Peers with the lowest RTT could otherwise hold every slot without completing uploads.
@@ -529,14 +573,11 @@ pub(crate) fn order_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        peer::advert_fanout::UploadBandwidth, peer_registry::PeerRegistry, AdvertisedBlock, Config,
-        ConnectedPeer,
-    };
+    use crate::{peer_registry::PeerRegistry, AdvertisedBlock, ConnectedPeer};
     use futures::FutureExt;
     use rand_10::{rngs::StdRng, SeedableRng};
 
-    /// The advert window these tests use. Tests of the adaptive window size their own.
+    /// The advert window these tests use. Tests of the size-based window use their own.
     const TEST_WINDOW: usize = 32;
 
     fn peer() -> (BlockGossipPeer, mpsc::Receiver<BlockAdvert>) {
@@ -1015,27 +1056,11 @@ mod tests {
         assert!(child_broadcast.await.unwrap().is_ok());
     }
 
-    /// Returns a measured bandwidth whose estimate is `bytes_per_second`, from one upload that
-    /// peers acknowledged over one second.
-    fn bandwidth_measured_at(bytes_per_second: u64) -> UploadBandwidth {
-        let bandwidth = UploadBandwidth::measured();
-        let started = std::time::Instant::now();
-        bandwidth.upload_started(started);
-        bandwidth.upload_finished(bytes_per_second, started + Duration::from_secs(1));
-        bandwidth
-    }
-
     /// Starts a broadcast of a block of `size` bytes to `peers` with the fan-out policy in
-    /// `config`, which reads `bandwidth`, and returns the peers it advertised to before any
-    /// advert finished.
-    async fn first_wave(
-        config: Config,
-        bandwidth: UploadBandwidth,
-        peers: Vec<BlockGossipPeer>,
-        size: u32,
-    ) -> Vec<usize> {
+    /// `config`, and returns the peers it advertised to before any advert finished.
+    async fn first_wave(config: Config, peers: Vec<BlockGossipPeer>, size: u32) -> Vec<usize> {
         let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
-        let fanout = AdvertFanout::from_config(&config, bandwidth);
+        let fanout = AdvertFanout::from_config(&config);
         let (peers, mut writes) = peers_writing(peers);
         let block = AdvertisedBlock {
             size: Some(size),
@@ -1080,118 +1105,67 @@ mod tests {
         (0..count).map(|_| peer().0).collect()
     }
 
-    /// Before the upload bandwidth is measured, every block goes to the initial 32 peers at
-    /// once, whatever its size. This is also the window on platforms that cannot measure it.
-    #[tokio::test(start_paused = true)]
-    async fn advert_window_is_initial_before_measurement() {
-        for size in [2_000, 1_500_000, 10_000_000] {
-            let config = Config::default();
-            let bandwidth = UploadBandwidth::from_config(&config);
-            let wave = first_wave(config, bandwidth, plain_peers(100), size).await;
-            assert_eq!(wave.len(), 32, "{size} byte block");
-        }
-        for size in [2_000, 10_000_000] {
-            let wave = first_wave(
-                Config::default(),
-                UploadBandwidth::unmeasured(),
-                plain_peers(100),
-                size,
-            )
-            .await;
-            assert_eq!(wave.len(), 32, "unmeasured {size} byte block");
-        }
+    /// The default window is 32 at or above 1.5 MiB, and rises linearly to 48 at 0 bytes.
+    #[test]
+    fn default_advert_window_follows_block_size() {
+        /// A full NU7 block, just below the reference size.
+        const FULL_NU7_BLOCK: u32 = 1_513_987;
+        const FULL_SIZE: u32 = 1_572_864;
+        let fanout = AdvertFanout::from_config(&Config::default());
+
+        assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 32);
+        assert_eq!(fanout.window(Some(FULL_SIZE)), 32);
+        assert_eq!(fanout.window(Some(FULL_SIZE + 1)), 32);
+        assert_eq!(fanout.window(Some(u32::MAX)), 32);
+        assert_eq!(fanout.window(Some(0)), 48);
+        assert_eq!(fanout.window(None), 32);
+        // The mid-point is exact, and the result floors on either side of it.
+        assert_eq!(fanout.window(Some(FULL_SIZE / 2)), 40);
+        assert_eq!(fanout.window(Some(FULL_SIZE / 2 - 1)), 40);
+        assert_eq!(fanout.window(Some(FULL_SIZE / 2 + 1)), 39);
     }
 
-    /// Once 12.5 MB/s is measured, with the default 1 s target and 16..=264 window, a 1.5 MB
-    /// block computes ceil(8.33) = 9 peers and clamps to the floor of 16, a 2 KB block goes to
-    /// every peer up to the ceiling of 264, and a 10 MB block goes to the floor.
-    #[tokio::test(start_paused = true)]
-    async fn measured_advert_window_follows_block_size() {
-        let wave = |peers, size| {
-            first_wave(
-                Config::default(),
-                bandwidth_measured_at(12_500_000),
-                plain_peers(peers),
-                size,
-            )
-        };
-        assert_eq!(wave(300, 1_500_000).await.len(), 16);
-        assert_eq!(wave(300, 2_000).await.len(), 264);
-        assert_eq!(wave(100, 2_000).await.len(), 100);
-        assert_eq!(wave(300, 10_000_000).await.len(), 16);
-    }
-
-    /// Below the default floor, the measured window is the unclamped `ceil(B̂ · τ / S)`: a
-    /// 1.5 MB block at 12.5 MB/s and 1 s goes to ceil(8.33) = 9 peers at once, and at 3 MB/s
-    /// and 2 s to 4.
-    #[tokio::test(start_paused = true)]
-    async fn measured_advert_window_below_the_default_floor_is_unclamped() {
-        let low_floor = Config {
-            advert_window_min: 1,
-            ..Config::default()
-        };
-        let wave = first_wave(
-            low_floor.clone(),
-            bandwidth_measured_at(12_500_000),
-            plain_peers(100),
-            1_500_000,
-        )
-        .await;
-        assert_eq!(wave.len(), 9);
-        let slower = Config {
-            advert_target: Duration::from_secs(2),
-            ..low_floor
-        };
-        let wave = first_wave(
-            slower,
-            bandwidth_measured_at(3_000_000),
-            plain_peers(100),
-            1_500_000,
-        )
-        .await;
-        assert_eq!(wave.len(), 4);
-    }
-
-    /// `advert_window_fixed` advertises every block to that many peers at once, even with a
-    /// measured bandwidth.
-    #[tokio::test(start_paused = true)]
-    async fn fixed_advert_window_ignores_block_size() {
-        for size in [2_000, 1_500_000, 10_000_000] {
-            let config = Config {
-                advert_window_fixed: Some(8),
+    /// Equal bounds give a fixed window, and large bounds do not overflow.
+    #[test]
+    fn advert_window_uses_configured_bounds() {
+        let fanout = |min, max| {
+            AdvertFanout::from_config(&Config {
+                advert_window_min: min,
+                advert_window_max: max,
+                advert_window_full_size_bytes: u64::MAX,
                 ..Config::default()
-            };
-            let wave = first_wave(
-                config,
-                bandwidth_measured_at(12_500_000),
-                plain_peers(100),
-                size,
-            )
-            .await;
-            assert_eq!(wave.len(), 8);
+            })
+        };
+        for size in [Some(0), Some(1_500_000), Some(u32::MAX), None] {
+            assert_eq!(fanout(9, 9).window(size), 9);
         }
+        assert_eq!(fanout(1, usize::MAX).window(Some(0)), usize::MAX);
+    }
+
+    /// Broadcasts advertise to the window's peers at once, up to the peers they have.
+    #[tokio::test(start_paused = true)]
+    async fn first_wave_follows_block_size() {
+        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
+        assert_eq!(wave(100, 1_513_987).await.len(), 32);
+        assert_eq!(wave(100, 10_000_000).await.len(), 32);
+        assert_eq!(wave(100, 2_000).await.len(), 47);
+        assert_eq!(wave(40, 2_000).await.len(), 40);
     }
 
     /// Sidecars beyond the window are all advertised at once, outside the window.
     #[tokio::test(start_paused = true)]
     async fn sidecars_beyond_the_window_go_first() {
-        // More sidecars than the default floor of 16, which a 10 MB block uses.
-        const SIDECARS: usize = 20;
+        // More sidecars than the minimum window of 32, which a 10 MB block uses.
+        const SIDECARS: usize = 40;
         let mut peers = plain_peers(SIDECARS + 40);
         for peer in &mut peers[..SIDECARS] {
             peer.sidecar = true;
         }
-        let wave = first_wave(
-            Config::default(),
-            bandwidth_measured_at(12_500_000),
-            peers,
-            10_000_000,
-        )
-        .await;
+        let wave = first_wave(Config::default(), peers, 10_000_000).await;
         assert_eq!(
             wave.len(),
-            SIDECARS + 16,
-            "every sidecar plus a floor-sized window: {wave:?}"
+            SIDECARS + 32,
+            "every sidecar plus a minimum window: {wave:?}"
         );
         assert!(
             (0..SIDECARS).all(|sidecar| wave.contains(&sidecar)),

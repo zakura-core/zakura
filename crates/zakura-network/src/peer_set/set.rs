@@ -128,8 +128,7 @@ use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
-        advert_fanout::{AdvertFanout, UploadBandwidth},
-        block_gossip::{BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
+        block_gossip::{AdvertFanout, BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{
@@ -348,8 +347,6 @@ where
     /// - `bans`: a map of banned IP addresses that should be dropped;
     /// - `address_book`: when peer set is busy, it logs address book diagnostics.
     /// - `minimum_peer_version`: endpoint to see the minimum peer protocol version in real time.
-    /// - `upload_bandwidth`: the block upload bandwidth that sizes block broadcasts, shared with
-    ///   the connections that measure it.
     /// - `max_conns_per_ip`: configured maximum number of peers that can be in the
     ///   peer set per IP, defaults to the config value or to
     ///   [`crate::constants::DEFAULT_MAX_CONNS_PER_IP`].
@@ -363,7 +360,6 @@ where
         bans: BannedIps,
         address_metrics: watch::Receiver<AddressMetrics>,
         minimum_peer_version: MinimumPeerVersion<C>,
-        upload_bandwidth: UploadBandwidth,
         max_conns_per_ip: Option<usize>,
     ) -> Self {
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
@@ -387,7 +383,7 @@ where
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
             block_gossip_slots: BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY),
-            block_gossip_fanout: AdvertFanout::from_config(config, upload_bandwidth),
+            block_gossip_fanout: AdvertFanout::from_config(config),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
 
@@ -1403,7 +1399,7 @@ where
         crate::peer::block_gossip::BlockAdvertiser {
             peers: self.block_gossip_peers_tx.subscribe(),
             slots: self.block_gossip_slots.clone(),
-            fanout: self.block_gossip_fanout.clone(),
+            fanout: self.block_gossip_fanout,
             minimum_peer_version: self.minimum_peer_version.clone(),
         }
     }

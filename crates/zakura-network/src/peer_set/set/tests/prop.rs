@@ -311,12 +311,9 @@ fn sidecar_peer_always_receives_block_gossip() {
     let _guard = runtime.enter();
     tokio::time::pause();
 
-    // A fixed window, so the first wave does not depend on the block's size.
-    const WINDOW: usize = 32;
-    let config = Config {
-        advert_window_fixed: Some(WINDOW),
-        ..Config::default()
-    };
+    let config = Config::default();
+    // The advertisement carries no size, so the broadcast uses the minimum window.
+    let window = config.advert_window_min;
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     let mut handles = Vec::with_capacity(TOTAL_PEERS);
@@ -384,7 +381,7 @@ fn sidecar_peer_always_receives_block_gossip() {
             "configured sidecar receives the first wave"
         );
         // The sidecar is advertised outside the window.
-        assert_eq!(received, WINDOW + 1);
+        assert_eq!(received, window + 1);
         tokio::task::yield_now().await;
         // Inventory completion alone cannot start the remaining advertisements.
         for handle in &mut handles {

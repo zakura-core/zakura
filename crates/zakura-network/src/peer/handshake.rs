@@ -41,9 +41,8 @@ use crate::{
     constants,
     meta_addr::MetaAddrChange,
     peer::{
-        advert_fanout::UploadBandwidth, tcp_progress::TcpSocket, CancelHeartbeatTask, Client,
-        ClientRequest, Connection, ConnectionRequests, ErrorSlot, HandshakeError,
-        MinimumPeerVersion, PeerError,
+        CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
+        HandshakeError, MinimumPeerVersion, PeerError,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -99,9 +98,6 @@ where
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
 
-    /// The shared block upload bandwidth that each connection's body uploads measure, if any.
-    upload_bandwidth: Option<UploadBandwidth>,
-
     parent_span: Span,
 }
 
@@ -149,7 +145,6 @@ where
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
             bans: self.bans.clone(),
-            upload_bandwidth: self.upload_bandwidth.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -508,7 +503,6 @@ where
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
     bans: Option<BannedIps>,
-    upload_bandwidth: Option<UploadBandwidth>,
 }
 
 impl<S, C> Builder<S, C>
@@ -594,7 +588,6 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
             bans: self.bans,
-            upload_bandwidth: self.upload_bandwidth,
         }
     }
 
@@ -629,14 +622,6 @@ where
     /// If this is unset, block adverts are not checked against bans when they are written.
     pub fn with_bans(mut self, bans: BannedIps) -> Self {
         self.bans = Some(bans);
-        self
-    }
-
-    /// Measure block body uploads into the shared `upload_bandwidth`. Optional.
-    ///
-    /// If this is unset, or `upload_bandwidth` is unmeasured, no upload is measured.
-    pub(crate) fn with_upload_bandwidth(mut self, upload_bandwidth: UploadBandwidth) -> Self {
-        self.upload_bandwidth = Some(upload_bandwidth);
         self
     }
 
@@ -690,7 +675,6 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             bans: self.bans.unwrap_or_default(),
-            upload_bandwidth: self.upload_bandwidth,
             parent_span: Span::current(),
         })
     }
@@ -719,7 +703,6 @@ where
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
             bans: None,
-            upload_bandwidth: None,
         }
     }
 }
@@ -1586,7 +1569,6 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let bans = self.bans.clone();
-        let upload_bandwidth = self.upload_bandwidth.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
 
@@ -1608,12 +1590,6 @@ where
 
             // Start timing the handshake for metrics
             let handshake_start = Instant::now();
-
-            // Capture the socket before the stream is wrapped and split. Without a measured
-            // upload bandwidth, no descriptor is duplicated.
-            let body_upload_watcher = upload_bandwidth.as_ref().and_then(|bandwidth| {
-                bandwidth.watcher(|| TcpSocket::from_transport(&data_stream))
-            });
 
             let mut peer_conn = Framed::new(
                 data_stream,
@@ -1893,8 +1869,7 @@ where
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
-            )
-            .with_body_upload_watcher(body_upload_watcher);
+            );
 
             let block_uploads = server.block_uploads.clone();
             let client_peer_registry_updater = peer_registry_updater.clone();

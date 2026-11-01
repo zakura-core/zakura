@@ -64,10 +64,7 @@ impl AdvertisedBlock {
 impl From<block::Hash> for AdvertisedBlock {
     /// Returns an advertisement of the block with `hash` and unknown size.
     fn from(hash: block::Hash) -> Self {
-        Self {
-            hash,
-            size: None,
-        }
+        Self { hash, size: None }
     }
 }
 
@@ -292,8 +289,7 @@ pub enum Request {
     ///
     /// Legacy gossip progressively advertises to connected peers in random order.
     /// A bounded number of advertisements await block uploads at once. That window is sized
-    /// from the block's serialized size and the measured upload bandwidth, so the first peers
-    /// receive a large block sooner.
+    /// from the block's serialized size, so the first peers receive a large block sooner.
     ///
     /// The second field is the source peer that sent us this `inv`:
     /// `Some(source)` when the advertisement was relayed from a remote peer,

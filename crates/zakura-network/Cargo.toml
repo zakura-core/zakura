@@ -92,10 +92,6 @@ zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
 zakura-quic = { path = "../zakura-quic", version = "0.1.0" }
 zakura-rt = { path = "../zakura-rt", version = "0.1.0-rc0" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# `TCP_INFO` delivery counters for block body uploads (`peer::tcp_progress`).
-libc = { workspace = true }
-
 [dev-dependencies]
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

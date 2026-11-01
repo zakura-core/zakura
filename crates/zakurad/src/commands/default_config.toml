@@ -64,10 +64,9 @@ internal_miner = false
 optimistic_block_inventory = true
 
 [network]
-advert_target_secs = 1.0
-advert_window_initial = 32
-advert_window_max = 264
-advert_window_min = 16
+advert_window_full_size_bytes = 1572864
+advert_window_max = 48
+advert_window_min = 32
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
 expose_peer_addresses = false

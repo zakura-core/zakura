@@ -4781,6 +4781,33 @@ async fn rpc_z_validateaddress_regtest() {
     );
 }
 
+#[tokio::test]
+async fn difficulty_before_first_block() {
+    let _init_guard = zakura_test::init();
+    for network in [Mainnet, Network::new_default_testnet()] {
+        for use_default in [true, false] {
+            let mut state: MockService<ReadRequest, ReadResponse, _, BoxError> =
+                MockService::build().for_unit_tests();
+            let difficulty = chain_tip_difficulty(network.clone(), state.clone(), use_default);
+            let handler = async {
+                state
+                    .expect_request(ReadRequest::ChainInfo)
+                    .await
+                    .respond_error("not enough blocks in the state".into());
+            };
+            let (result, ()) = tokio::join!(difficulty, handler);
+            if use_default {
+                assert_eq!(result.unwrap(), 1.0);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "getdifficulty retains its empty-state error"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdifficulty() {
     let _init_guard = zakura_test::init();

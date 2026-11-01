@@ -62,7 +62,7 @@ async fn request_body_error_returns_err_instead_of_panic() {
         .body(ErrorBody)
         .expect("valid request");
 
-    let mut middleware = HttpRequestMiddleware::new(MockRpcService, None, 2_097_152);
+    let mut middleware = HttpRequestMiddleware::new(MockRpcService, None, 2_097_152, 2_097_152);
     let result = middleware.call(request).await;
 
     assert!(
@@ -83,13 +83,13 @@ async fn oversized_request_body_is_rejected() {
         .body(body)
         .expect("valid request");
 
-    let mut middleware = HttpRequestMiddleware::new(MockRpcService, None, limit);
+    let mut middleware = HttpRequestMiddleware::new(MockRpcService, None, limit, 2_097_152);
     let result = middleware.call(request).await;
 
     assert!(result.is_err(), "oversized request body should be rejected");
 }
 
-/// A mock JSON-RPC server that, like jsonrpsee, answers each batch member and
+/// A mock JSON-RPC server that answers each batch member and
 /// rejects members that are not JSON-RPC 2.0.
 #[derive(Clone)]
 struct BatchEchoService;
@@ -137,7 +137,7 @@ async fn batch_round_trip(body: serde_json::Value) -> serde_json::Value {
             serde_json::to_vec(&body).expect("valid JSON"),
         ))
         .expect("valid request");
-    let response = HttpRequestMiddleware::new(BatchEchoService, None, 2_097_152)
+    let response = HttpRequestMiddleware::new(BatchEchoService, None, 2_097_152, 2_097_152)
         .call(request)
         .await
         .expect("the mock server responds");
@@ -198,4 +198,43 @@ async fn mixed_batch_is_unchanged() {
             {"jsonrpc": "2.0", "id": 2, "error": {"code": -32600, "message": "Invalid request"}},
         ])
     );
+}
+
+#[tokio::test]
+async fn legacy_batch_preserves_null_ids() {
+    let response = batch_round_trip(serde_json::json!([
+        {"jsonrpc": "1.0", "method": "getinfo", "params": [], "id": null},
+    ]))
+    .await;
+    assert_eq!(response[0]["jsonrpc"], "1.0");
+    assert!(response[0]["id"].is_null());
+    assert_eq!(response[0]["result"], "getinfo");
+}
+
+#[tokio::test]
+async fn compatibility_conversion_preserves_raw_parameters() {
+    use http_body_util::BodyExt;
+
+    let params = r#"{"n":1e100,"n":9007199254740993}"#;
+    for body in [
+        format!(r#"{{"method":"echo","params":{params},"id":1}}"#),
+        format!(r#"[{{"method":"echo","params":{params},"id":1}}]"#),
+        format!(r#"{{"jsonrpc":"2.0","method":"echo","params":{params},"id":1}}"#),
+    ] {
+        let echo = tower::service_fn(|request: HttpRequest| async move {
+            let bytes = request.into_body().collect().await?.to_bytes();
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": String::from_utf8(bytes.to_vec()).expect("requests are UTF-8"),
+            });
+            Ok::<_, BoxError>(HttpResponse::new(HttpBody::from(body.to_string())))
+        });
+        let response = HttpRequestMiddleware::new(echo, None, 4096, 4096)
+            .call(HttpRequest::new(HttpBody::from(body)))
+            .await
+            .expect("echo responds");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(response["result"].as_str().unwrap().contains(params));
+    }
 }

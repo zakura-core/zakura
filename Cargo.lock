@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "13.0.1-rc0"
+version = "14.0.0-rc0"
 dependencies = [
  "anyhow",
  "async-trait",

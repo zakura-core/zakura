@@ -320,31 +320,9 @@ impl RpcSchema for GetBlockTemplateParameters {
 impl RpcSchema for SubmitBlockParameters {
     const COMPONENT: Option<&'static str> = Some("SubmitBlockParameters");
 
-    fn schema(generator: &mut Generator) -> Value {
+    fn schema(_generator: &mut Generator) -> Value {
         json!({
-            "description": "Optional argument `jsonparametersobject` for `submitblock` RPC request\n\n\
-                See the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.",
-            "type": "object",
-            "properties": {
-                "workid": described::<Option<String>>(
-                    generator,
-                    "The workid for the block template.\n\n\
-                     > If the server provided a workid, it MUST be included with submissions,\n\n\
-                     Rationale:\n\n\
-                     > If servers allow all mutations, it may be hard to identify which job it is \
-                     based on.\n\
-                     > While it may be possible to verify the submission by its content, it is \
-                     much easier\n\
-                     > to compare it to the job issued. It is very easy for the miner to keep \
-                     track of this.\n\
-                     > Therefore, using a \"workid\" is a very cheap solution to enable more \
-                     mutations.\n\n\
-                     <https://en.bitcoin.it/wiki/BIP_0022#Rationale>\n\n\
-                     Zakura accepts this field but does not read it. The verifier identifies a \
-                     prepared\ncandidate by its content, so a submission reuses the prepared work \
-                     whether or not the\nminer echoes the work ID back.",
-                ),
-            },
+            "description": "Optional ignored argument for `submitblock`. Any JSON value is accepted.",
         })
     }
 }

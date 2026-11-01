@@ -167,7 +167,7 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     deprecated: false,
 }),
 ("submitblock", openrpc::RpcMethod {
-    description: "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (object, optional) ignored; any JSON value is accepted\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.\n",
+    description: "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (any JSON value, optional) ignored\n\n# Notes\n\n - The optional argument is ignored, including any work ID.\n",
     params: |_g| vec![
         _g.param::<HexData>("hex_data", crate::methods::PARAM_HEX_DATA_DESC, true),
         _g.param::<SubmitBlockParameters>("_parameters", crate::methods::PARAM__PARAMETERS_DESC, false),

@@ -504,9 +504,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 51
+content-length: 71
 
-{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
 
 === missing param
 POST content-type=Some("application/json")

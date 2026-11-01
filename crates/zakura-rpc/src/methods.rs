@@ -744,11 +744,11 @@ pub trait RpcServer {
     /// # Parameters
     ///
     /// - `hexdata`: (string, required)
-    /// - `jsonparametersobject`: (object, optional) ignored; any JSON value is accepted
+    /// - `jsonparametersobject`: (any JSON value, optional) ignored
     ///
     /// # Notes
     ///
-    ///  - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.
+    ///  - The optional argument is ignored, including any work ID.
     #[method(name = "submitblock")]
     async fn submit_block(
         &self,
@@ -6184,8 +6184,6 @@ where
     // # TODO
     // - add a separate request like BestChainNextMedianTimePast, but skipping the
     //   consistency check, because any block's difficulty is ok for display
-    // - return 1.0 for a "not enough blocks in the state" error, like `zcashd`:
-    // <https://github.com/zcash/zcash/blob/7b28054e8b46eb46a9589d0bdc8e29f9fa1dc82d/src/rpc/blockchain.cpp#L40-L41>
     let response = state
         .ready()
         .and_then(|service| service.call(request))
@@ -6194,7 +6192,8 @@ where
     let response = match (should_use_default, response) {
         (_, Ok(res)) => res,
         (true, Err(_)) => {
-            return Ok((U256::from(network.target_difficulty_limit()) >> 128).as_u128() as f64);
+            // Before the first block, zcashd reports minimum difficulty.
+            return Ok(1.0);
         }
         (false, Err(error)) => return Err(error).map_error(0),
     };

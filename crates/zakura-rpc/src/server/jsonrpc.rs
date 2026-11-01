@@ -375,7 +375,14 @@ impl<'a> ParamsSequence<'a> {
                 self.0 = "";
                 return None;
             }
-            b'[' | b',' => json = &json[1..],
+            b'[' => {
+                json = json[1..].trim_start();
+                if json.starts_with(']') {
+                    self.0 = "";
+                    return None;
+                }
+            }
+            b',' => json = &json[1..],
             _ => return Some(Err(invalid_params())),
         }
 
@@ -681,6 +688,16 @@ impl MethodResponse {
         )
     }
 
+    /// Returns an error when compatibility conversion exceeds the response limit.
+    pub(super) fn too_large_response(id: Id, limit: usize, batch: bool) -> Self {
+        let (code, message) = if batch {
+            (TOO_BIG_BATCH_RESPONSE_CODE, TOO_BIG_BATCH_RESPONSE_MSG)
+        } else {
+            (OVERSIZED_RESPONSE_CODE, OVERSIZED_RESPONSE_MSG)
+        };
+        Self::server_error(id, code, message, limit)
+    }
+
     fn encode_error(id: &Id, error: WireError) -> Self {
         let code = error.code;
         let json = serde_json::value::to_raw_value(&Response::<()> {
@@ -789,20 +806,20 @@ impl BatchResponseBuilder {
 }
 
 /// A writer that fails when more than `max_len` bytes are written.
-struct BoundedWriter {
+pub(super) struct BoundedWriter {
     max_len: usize,
     buf: Vec<u8>,
 }
 
 impl BoundedWriter {
-    fn new(max_len: usize) -> Self {
+    pub(super) fn new(max_len: usize) -> Self {
         Self {
             max_len,
             buf: Vec::with_capacity(128),
         }
     }
 
-    fn into_json(self) -> Box<RawValue> {
+    pub(super) fn into_json(self) -> Box<RawValue> {
         let json = String::from_utf8(self.buf).expect("serde_json writes UTF-8");
         RawValue::from_string(json).expect("serde_json writes valid JSON")
     }

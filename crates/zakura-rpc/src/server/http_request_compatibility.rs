@@ -10,13 +10,14 @@ use futures::{future, FutureExt};
 use http_body_util::{BodyExt, Limited};
 use hyper::header;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use tower::BoxError;
 use tower::Service;
 
 use super::{
     cookie::Cookie,
     http::{HttpBody, HttpRequest, HttpResponse},
-    jsonrpc::ErrorObject,
+    jsonrpc::{BoundedWriter, ErrorObject, Id, MethodResponse},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -51,25 +52,28 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 ///
 /// This enables compatibility with `zcash-cli`.
 ///
-/// ## Security
-///
-/// Any user-specified data in RPC requests is hex or base58check encoded.
-/// We assume lightwalletd validates data encodings before sending it on to Zebra.
-/// So any fixes Zebra performs won't change user-specified data.
+/// Request parameters and IDs retain their raw JSON during conversion.
 #[derive(Clone, Debug)]
 pub struct HttpRequestMiddleware<S> {
     service: S,
     cookie: Option<Cookie>,
     max_request_body_size: usize,
+    max_response_body_size: usize,
 }
 
 impl<S> HttpRequestMiddleware<S> {
-    /// Create a new `HttpRequestMiddleware` with the given service, cookie, and request body size limit.
-    pub fn new(service: S, cookie: Option<Cookie>, max_request_body_size: usize) -> Self {
+    /// Creates middleware with the given service, cookie, and body size limits.
+    pub fn new(
+        service: S,
+        cookie: Option<Cookie>,
+        max_request_body_size: usize,
+        max_response_body_size: usize,
+    ) -> Self {
         Self {
             service,
             cookie,
             max_request_body_size,
+            max_response_body_size,
         }
     }
 
@@ -147,7 +151,10 @@ impl<S> HttpRequestMiddleware<S> {
         let (format, bytes) =
             if let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(bytes.as_ref()) {
                 let version = request.version();
-                if matches!(version, JsonRpcVersion::Unknown) {
+                if !matches!(
+                    version,
+                    JsonRpcVersion::Bitcoind | JsonRpcVersion::Lightwalletd
+                ) {
                     (ClientFormat::Unchanged, bytes)
                 } else {
                     (
@@ -191,36 +198,70 @@ impl<S> HttpRequestMiddleware<S> {
     async fn response_from_json_rpc_2(
         format: ClientFormat,
         response: HttpResponse<HttpBody>,
+        max_response_body_size: usize,
     ) -> Result<HttpResponse<HttpBody>, BoxError> {
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await?.to_bytes();
         let converted = match format {
-            ClientFormat::Single(version) => {
-                serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref())
-                    .ok()
-                    .map(|response| serde_json::to_vec(&response.into_version(version)))
-            }
-            ClientFormat::Batch(version) => {
-                serde_json::from_slice::<'_, Vec<JsonRpcResponse>>(bytes.as_ref())
-                    .ok()
-                    .map(|responses| {
-                        serde_json::to_vec(
-                            &responses
-                                .into_iter()
-                                .map(|response| response.into_version(version))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-            }
-            ClientFormat::Unchanged => None,
+            ClientFormat::Batch(version) => serde_json::from_slice::<Vec<JsonRpcResponse>>(&bytes)
+                .ok()
+                .map(|responses| {
+                    Self::serialize_response(
+                        &responses
+                            .into_iter()
+                            .map(|response| response.into_version(version))
+                            .collect::<Vec<_>>(),
+                        version,
+                        Id::Null,
+                        max_response_body_size,
+                        true,
+                    )
+                }),
+            _ => None,
         };
-        let bytes = converted.map_or(bytes, |converted| {
-            converted.expect("serializing parsed JSON succeeds").into()
+        // The server answers batch-level errors with a single error object.
+        let converted = converted.or_else(|| {
+            let version = match format {
+                ClientFormat::Single(version) | ClientFormat::Batch(version) => version,
+                ClientFormat::Unchanged => return None,
+            };
+            let response = serde_json::from_slice::<JsonRpcResponse>(&bytes).ok()?;
+            let id_json = response.id.to_string();
+            let id = serde_json::from_str(&id_json).unwrap_or(Id::Null);
+            Some(Self::serialize_response(
+                &response.into_version(version),
+                version,
+                id,
+                max_response_body_size,
+                matches!(format, ClientFormat::Batch(_)),
+            ))
         });
+        let bytes = converted.map_or(bytes, Into::into);
         Ok(HttpResponse::from_parts(
             parts,
             HttpBody::from(bytes.as_ref().to_vec()),
         ))
+    }
+
+    /// Bounds the final wire representation, including legacy envelope fields.
+    fn serialize_response<T: Serialize>(
+        response: &T,
+        version: JsonRpcVersion,
+        id: Id<'_>,
+        limit: usize,
+        batch: bool,
+    ) -> Vec<u8> {
+        let mut writer = BoundedWriter::new(limit);
+        if serde_json::to_writer(&mut writer, response).is_ok() {
+            return writer.into_json().get().as_bytes().to_vec();
+        }
+
+        let error = MethodResponse::too_large_response(id, limit, batch);
+        let error: JsonRpcResponse = serde_json::from_str(error.as_json().get())
+            .expect("server errors are valid JSON-RPC responses");
+        // As in the dispatcher, allow the error envelope to fit a tiny limit.
+        serde_json::to_vec(&error.into_version(version))
+            .expect("server errors contain only JSON values")
     }
 }
 
@@ -229,14 +270,20 @@ impl<S> HttpRequestMiddleware<S> {
 pub struct HttpRequestMiddlewareLayer {
     cookie: Option<Cookie>,
     max_request_body_size: usize,
+    max_response_body_size: usize,
 }
 
 impl HttpRequestMiddlewareLayer {
-    /// Create a new `HttpRequestMiddlewareLayer` with the given cookie and request body size limit.
-    pub fn new(cookie: Option<Cookie>, max_request_body_size: usize) -> Self {
+    /// Creates a layer with the given cookie and body size limits.
+    pub fn new(
+        cookie: Option<Cookie>,
+        max_request_body_size: usize,
+        max_response_body_size: usize,
+    ) -> Self {
         Self {
             cookie,
             max_request_body_size,
+            max_response_body_size,
         }
     }
 }
@@ -245,7 +292,12 @@ impl<S> tower::Layer<S> for HttpRequestMiddlewareLayer {
     type Service = HttpRequestMiddleware<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        HttpRequestMiddleware::new(service, self.cookie.clone(), self.max_request_body_size)
+        HttpRequestMiddleware::new(
+            service,
+            self.cookie.clone(),
+            self.max_request_body_size,
+            self.max_response_body_size,
+        )
     }
 }
 
@@ -282,12 +334,13 @@ where
 
         let mut service = self.service.clone();
         let max_request_body_size = self.max_request_body_size;
+        let max_response_body_size = self.max_response_body_size;
 
         async move {
             let (format, request) =
                 Self::request_to_json_rpc_2(request, max_request_body_size).await?;
             let response = service.call(request).await.map_err(Into::into)?;
-            Self::response_from_json_rpc_2(format, response).await
+            Self::response_from_json_rpc_2(format, response, max_response_body_size).await
         }
         .boxed()
     }
@@ -324,24 +377,26 @@ struct JsonRpcRequest {
     jsonrpc: Option<String>,
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<serde_json::Value>,
+    params: Option<Box<RawValue>>,
+    #[serde(
+        default,
+        deserialize_with = "present_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    id: Option<Box<RawValue>>,
+}
+
+/// Preserves an explicit null ID, which is a call rather than a notification.
+fn present_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(deserializer).map(Some)
 }
 
 impl JsonRpcRequest {
     fn version(&self) -> JsonRpcVersion {
         match (self.jsonrpc.as_deref(), &self.params, &self.id) {
-            (
-                Some("2.0"),
-                _,
-                None
-                | Some(
-                    serde_json::Value::Null
-                    | serde_json::Value::String(_)
-                    | serde_json::Value::Number(_),
-                ),
-            ) => JsonRpcVersion::TwoPointZero,
+            (Some("2.0"), _, _) => JsonRpcVersion::TwoPointZero,
             (Some("1.0"), Some(_), Some(_)) => JsonRpcVersion::Lightwalletd,
             (None, Some(_), Some(_)) => JsonRpcVersion::Bitcoind,
             _ => JsonRpcVersion::Unknown,

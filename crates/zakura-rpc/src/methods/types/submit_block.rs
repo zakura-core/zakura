@@ -22,8 +22,7 @@ use crate::methods::GetBlockTemplateHandler;
 ///
 /// See the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.
 ///
-/// Zakura ignores this argument, so it accepts any JSON value: pool software such as
-/// s-nomp sends values other than an object when it checks for `submitblock` support.
+/// Zakura ignores this argument, so it accepts any JSON value.
 /// Only an object's string `workid` field is kept.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(from = "serde_json::Value")]

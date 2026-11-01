@@ -688,3 +688,59 @@ async fn response_size_limits_and_cookie_authentication() {
 
     insta::assert_snapshot!(output);
 }
+
+/// Legacy mining probes retain zcashd's error code and duplicate named parameters
+/// still reach the dispatcher's validation, even inside converted batches.
+#[tokio::test]
+async fn legacy_mining_parameter_errors() {
+    let _init_guard = zakura_test::init();
+    let addr = start_server(local_config()).await;
+    for request in [
+        r#"{"method":"submitblock","params":[],"id":1}"#,
+        r#"{"method":"getblock","params":{"hash_or_height":"1","hash_or_height":"2"},"id":1}"#,
+    ] {
+        for body in [request.to_string(), format!("[{request}]")] {
+            let response = send(addr, &Case::post("legacy parameter error", body), None).await;
+            let (_, body) = response.split_once("\n\n").unwrap();
+            let response: serde_json::Value = serde_json::from_str(body).unwrap();
+            let response = response.as_array().map_or(&response, |batch| &batch[0]);
+            assert_eq!(response["id"], 1);
+            assert_eq!(response["error"]["code"], -1);
+            assert!(response["result"].is_null());
+            assert!(response.get("jsonrpc").is_none());
+        }
+    }
+}
+
+/// A 2.0 response that fits can grow past the limit when converted to 1.0.
+#[tokio::test]
+async fn legacy_response_limits_apply_after_conversion() {
+    let _init_guard = zakura_test::init();
+    for (batch, limit, error_code) in [(false, 66, -32008), (true, 68, -32011)] {
+        let conf = Config {
+            max_response_body_size: limit,
+            ..local_config()
+        };
+        let addr = start_server(conf).await;
+        let request = r#"{"jsonrpc":"1.0","method":"getstandardfee","params":[],"id":1}"#;
+        let body = if batch {
+            format!("[{request}]")
+        } else {
+            request.to_string()
+        };
+        let response = send(addr, &Case::post("legacy response limit", body), None).await;
+        let (_, body) = response.split_once("\n\n").unwrap();
+        let response: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(response["jsonrpc"], "1.0");
+        assert_eq!(response["error"]["code"], error_code);
+        assert!(response["result"].is_null());
+        assert_eq!(
+            response["id"],
+            if batch {
+                serde_json::Value::Null
+            } else {
+                1.into()
+            }
+        );
+    }
+}

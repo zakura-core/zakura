@@ -16,6 +16,7 @@ use eyre::{eyre, Report};
 use futures::{
     future::OptionFuture,
     stream::{FuturesUnordered, StreamExt},
+    FutureExt,
 };
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};

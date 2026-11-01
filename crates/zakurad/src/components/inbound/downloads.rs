@@ -855,7 +855,7 @@ where
                 for entry in spawner.parent_budget.take_ready(slots) {
                     if entry.parent_recovery {
                         if !matches!(
-                            spawner.recover_parent(entry.hash, entry.source.clone()),
+                            spawner.recover_parent(entry.hash, entry.routing_source.clone()),
                             ParentRecovery::Requested | ParentRecovery::Attached
                         ) {
                             spawner.parent_budget.dispatch_refused(&entry.hash);
@@ -863,7 +863,7 @@ where
                         continue;
                     }
                     let mut admission = spawner.admission();
-                    let advertiser = entry.source.clone().map(AdvertiserSource::from);
+                    let advertiser = entry.routing_source.clone().map(AdvertiserSource::from);
                     let source_full = advertiser.as_ref().is_some_and(|source| {
                         admission.source_counts.get(source).copied().unwrap_or(0)
                             >= source.max_in_flight(spawner.full_verify_concurrency_limit)
@@ -882,7 +882,7 @@ where
                         &mut admission,
                         DownloadTask {
                             hash: entry.hash,
-                            download_source: entry.source,
+                            download_source: entry.routing_source,
                             advertiser,
                             kind: DownloadKind::Advertised,
                         },
@@ -1256,7 +1256,7 @@ where
                             hash,
                             parent: block.header.previous_block_hash,
                             height: block_height,
-                            source: retry_source,
+                            routing_source: retry_source,
                             parent_recovery: kind == DownloadKind::ParentRecovery,
                         },
                     )

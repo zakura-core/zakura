@@ -10,7 +10,7 @@ fn block(byte: u8) -> Deferred {
         hash: block::Hash([byte; 32]),
         parent: block::Hash([0xee; 32]),
         height: Height(3_600_000),
-        source: None,
+        routing_source: None,
         parent_recovery: false,
     }
 }
@@ -204,7 +204,7 @@ async fn saturated_waits_allow_a_real_connected_state_commit() {
                 hash: child.hash(),
                 parent: child.header.previous_block_hash,
                 height: Height(1),
-                source: None,
+                routing_source: None,
                 parent_recovery: false,
             },
         )

@@ -37,7 +37,7 @@ pub struct Deferred {
     pub hash: block::Hash,
     pub parent: block::Hash,
     pub height: Height,
-    pub source: Option<PeerSource>,
+    pub routing_source: Option<PeerSource>,
     pub parent_recovery: bool,
 }
 

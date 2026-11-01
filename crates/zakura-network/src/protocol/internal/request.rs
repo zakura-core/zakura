@@ -106,6 +106,9 @@ pub enum Request {
     /// This is used by authenticated transports that can safely route a
     /// gossiped-inventory download back to the peer that advertised it.
     ///
+    /// The legacy peer set prefers ready peers that advertised the inventory. If there are none,
+    /// it sends a single-block request to a ready legacy `source` that isn't missing the block.
+    ///
     /// # Returns
     ///
     /// Returns [`Response::Blocks`](super::Response::Blocks).

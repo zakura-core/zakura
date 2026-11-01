@@ -142,7 +142,7 @@ use crate::{
         external::{canonical_ip, InventoryHash},
         internal::{Request, Response},
     },
-    BannedIps, BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
+    BannedIps, BoxError, Config, PeerError, PeerSocketAddr, PeerSource, SharedPeerError,
 };
 
 #[cfg(test)]
@@ -1192,12 +1192,28 @@ where
             .missing_peers(hash)
             .copied()
             .collect();
-        let maybe_peer_list = self
-            .ready_services
-            .keys()
-            .filter(|addr| !missing_peer_list.contains(addr))
-            .copied()
-            .collect();
+
+        // No ready peer advertised this block, so its known source is the most likely to have it:
+        // a child's advertiser has validated the child's parent. Advertisers go first, so this
+        // can't take a request away from a peer that said it has the block.
+        let block_source = match &req {
+            Request::BlocksByHashFrom {
+                source: PeerSource::LegacySocket(addr),
+                ..
+            } if self.ready_services.contains_key(addr) && !missing_peer_list.contains(addr) => {
+                Some(*addr)
+            }
+            _ => None,
+        };
+        let maybe_peer_list = match block_source {
+            Some(addr) => HashSet::from([addr]),
+            None => self
+                .ready_services
+                .keys()
+                .filter(|addr| !missing_peer_list.contains(addr))
+                .copied()
+                .collect(),
+        };
 
         // Security: choose a random, less-loaded peer that might have the inventory.
         let peer = self.select_p2c_peer_from_list(&maybe_peer_list);

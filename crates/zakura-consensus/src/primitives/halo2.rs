@@ -41,9 +41,13 @@ use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 /// This means that there can be hundreds of actions verified by some proofs,
 /// but just one action in others.
 ///
-/// To compensate for larger proofs, we process the batch once there are over
-/// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
-const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
+/// To compensate for larger proofs, we process the batch once there are at least
+/// [`HALO2_MAX_BATCH_SIZE`] weighted actions among pending items in the queue.
+/// Counting each bundle as at least two actions keeps the previous bound of 64 bundles.
+///
+/// Each batch ends with one multi-scalar multiplication, so twice the shared batch size means
+/// fewer of those for large Orchard blocks. Zebra measured 256 as slower than 128.
+const HALO2_MAX_BATCH_SIZE: usize = 2 * super::MAX_BATCH_SIZE;
 
 /// The type of verification results.
 type VerifyResult = bool;
@@ -147,12 +151,12 @@ pub struct Item {
 
 impl RequestWeight for Item {
     fn request_weight(&self) -> usize {
-        self.action_count()
+        self.action_count().max(2)
     }
 }
 
 impl Item {
-    /// Returns the number of Orchard actions in this item's bundle, which is its batch weight.
+    /// Returns the number of Orchard actions in this item's bundle.
     pub fn action_count(&self) -> usize {
         self.bundle.actions().len()
     }

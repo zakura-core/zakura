@@ -110,6 +110,10 @@ const TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
 /// Maximum requeues of one block after a transient verification timeout in a sync round.
 const BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT: usize = 3;
 
+/// Bounds a download task's wait for the parent of a block whose authorizing data binding was
+/// unconfirmed, including state readiness. The state's own limit only covers the request.
+const UNCONFIRMED_BINDING_PARENT_WAIT: Duration = zs::constants::AWAIT_BLOCK_INFO_TIMEOUT;
+
 /// Minimum UTXO lookup timeouts without a verified block before the syncer restarts.
 const MIN_UTXO_RACE_DROPS_BEFORE_RESTART: usize = 4;
 
@@ -1074,8 +1078,12 @@ where
             // Boxing lets rustc prove this future is `Send` for spawned callers.
             futures::FutureExt::boxed(async move {
                 matches!(
-                    state.oneshot(zs::Request::AwaitBlockInfo(parent)).await,
-                    Ok(zs::Response::BlockInfo(Some(_)))
+                    timeout(
+                        UNCONFIRMED_BINDING_PARENT_WAIT,
+                        state.oneshot(zs::Request::AwaitBlockInfo(parent)),
+                    )
+                    .await,
+                    Ok(Ok(zs::Response::BlockInfo(Some(_))))
                 )
             })
         }));

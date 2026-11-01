@@ -861,3 +861,66 @@ async fn cached_verifier_still_rejects_a_corrupted_proof_after_verifying_a_valid
         "expected SaplingVerificationFailed, got: {error:?}"
     );
 }
+
+/// Since Common's sapling-crypto keeps value commitments as bytes, a Sapling `cv` that is not a
+/// valid, non-small-order point converts through librustzcash, and the library verifier is what
+/// rejects it.
+///
+/// The transaction verifier rejects such a transaction earlier, in
+/// `check::sapling_point_encodings_are_valid` (see
+/// `sapling_spends_with_invalid_value_commitments_are_rejected_after_roundtrip`). This pins the
+/// second layer: if a bundle with an invalid `cv` reaches the Sapling verifier anyway,
+/// `check_bundle` fails closed before it batches any proof or signature.
+#[test]
+fn library_verifier_rejects_invalid_value_commitments_that_now_convert() {
+    let _init_guard = zakura_test::init();
+
+    let (nu, tx) = mined_sapling_transactions()
+        .into_iter()
+        .find(|(_, tx)| {
+            matches!(tx, Transaction::V4 { .. })
+                && tx.sapling_spends_per_anchor().next().is_some()
+                && tx.sapling_outputs().next().is_some()
+        })
+        .expect(
+            "mainnet test blocks must contain a V4 Sapling transaction with spends and outputs",
+        );
+
+    let check_bundle = |tx: &Transaction| {
+        let item = item(tx, nu).expect(
+            "librustzcash conversion keeps a Sapling cv as bytes, so even an invalid cv converts",
+        );
+        sapling_crypto::BatchValidator::new().check_bundle(item.bundle, item.sighash.into())
+    };
+
+    assert!(
+        check_bundle(&tx),
+        "the unmodified bundle must pass check_bundle, so a failure below is the cv's"
+    );
+
+    // The identity, (u, v) = (0, 1), which is on the curve but of small order, and bytes that
+    // decode to no point.
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let off_curve = [0xffu8; 32];
+
+    for (bad, kind) in [(identity, "small-order"), (off_curve, "off-curve")] {
+        let bad_cv = bad[..]
+            .zcash_deserialize_into::<zakura_chain::sapling::ValueCommitment>()
+            .expect("deserialization defers point validation, so it stores the bytes");
+
+        let spend_corrupted = mutated_spend(&tx, |spend| spend.cv = bad_cv);
+        assert!(!spend_corrupted.sapling_point_encodings_are_valid());
+        assert!(
+            !check_bundle(&spend_corrupted),
+            "check_bundle must reject a {kind} spend cv"
+        );
+
+        let output_corrupted = mutated_output(&tx, |output| output.cv = bad_cv);
+        assert!(!output_corrupted.sapling_point_encodings_are_valid());
+        assert!(
+            !check_bundle(&output_corrupted),
+            "check_bundle must reject a {kind} output cv"
+        );
+    }
+}

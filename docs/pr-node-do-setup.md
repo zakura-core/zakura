@@ -63,9 +63,7 @@ mode×network, matched by a hidden marker), and in a `zakura-pr-node-<run id>`
 artifact together with `summary.json` and the node logs. Runs for a bare `ref`
 without an open PR skip the comment.
 
-## Inspecting a kept node
-
-### Verification-capacity qualification on existing hosts
+## Verification-capacity qualification on existing hosts
 
 The same collector supports an isolated foreground follower through `--pid-file`.
 Write the follower's PID to that file and capture both stdout and stderr in
@@ -92,6 +90,8 @@ including brief events between scrapes. Retain `samples.jsonl`,
 `metrics-scrapes.jsonl.gz`, both summaries, and the combined node log as workflow
 artifacts. The summaries include interval counter baselines, occupancy
 percentiles, event high-water marks, and minimum headroom.
+
+## Inspecting a kept node
 
 The step summary prints the droplet IP. On the droplet:
 

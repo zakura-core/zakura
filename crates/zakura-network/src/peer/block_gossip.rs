@@ -29,7 +29,7 @@ use crate::{
     peer::{MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
-    BoxError, Request, Response,
+    BannedIps, BoxError, PeerSocketAddr, Request, Response,
 };
 
 /// Pending block adverts per connection. Slow peers can catch up through later tip gossip.
@@ -83,6 +83,7 @@ enum UploadState {
     Requested(Instant),
     Written(Instant),
     Finished(bool),
+    Revoked,
 }
 
 impl UploadState {
@@ -179,7 +180,14 @@ impl BlockUploads {
             .values()
             .filter_map(Weak::upgrade)
         {
-            upload.send_replace(UploadState::Finished(false));
+            upload.send_if_modified(|state| {
+                if matches!(state, UploadState::Finished(_) | UploadState::Revoked) {
+                    false
+                } else {
+                    *state = UploadState::Finished(false);
+                    true
+                }
+            });
         }
     }
 }
@@ -189,7 +197,7 @@ struct UploadClaim(Arc<watch::Sender<UploadState>>);
 impl Drop for UploadClaim {
     fn drop(&mut self) {
         self.0.send_if_modified(|state| {
-            if matches!(state, UploadState::Finished(_)) {
+            if matches!(state, UploadState::Finished(_) | UploadState::Revoked) {
                 false
             } else {
                 *state = UploadState::Finished(false);
@@ -203,6 +211,8 @@ impl Drop for UploadClaim {
 #[derive(Clone, Debug)]
 pub(crate) struct BlockGossipPeer {
     pub(crate) sender: mpsc::Sender<BlockAdvert>,
+    /// Address used for live authorization checks, absent for isolated connections.
+    pub(crate) address: Option<PeerSocketAddr>,
     pub(crate) uploads: BlockUploads,
     pub(crate) registry: Option<PeerRegistryUpdater>,
     pub(crate) version: Version,
@@ -222,7 +232,16 @@ impl BlockGossipPeer {
     ///
     /// Returns false if the `inv` was not written, or if the peer requested the block and the
     /// upload failed or did not finish in time.
+    #[cfg(test)]
     pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
+        matches!(
+            self.advertise_outcome(hash, slots).await,
+            AdvertOutcome::Sent
+        )
+    }
+
+    /// Advertises the block and distinguishes authorization revocation from delivery failure.
+    async fn advertise_outcome(self, hash: block::Hash, slots: BlockUploadSlots) -> AdvertOutcome {
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
@@ -231,15 +250,17 @@ impl BlockGossipPeer {
             }
             // Early and committed announcements join an existing upload for this peer.
             let succeeded = loop {
-                if let UploadState::Finished(succeeded) = *progress.borrow_and_update() {
-                    break succeeded;
+                match *progress.borrow_and_update() {
+                    UploadState::Finished(succeeded) => break succeeded,
+                    UploadState::Revoked => return AdvertOutcome::Revoked,
+                    _ => {}
                 }
                 if progress.changed().await.is_err() {
                     break false;
                 }
             };
             if succeeded || retried || self.sender.is_closed() {
-                return succeeded;
+                return AdvertOutcome::from(succeeded);
             }
             // The joined upload can fail without reaching this peer, for example when early
             // inventory ends in `notfound`. Advertise once more after its owner releases the claim.
@@ -258,11 +279,16 @@ impl BlockGossipPeer {
         // Dropping `written` makes the connection skip an advert that it has not started writing.
         let advertised = timeout(inventory_wait, async {
             self.sender.send(advert).await.ok()?;
-            written.await.ok()?.ok()
+            written.await.ok()
         })
         .await;
-        if !matches!(advertised, Ok(Some(_))) {
-            return false;
+        match advertised {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(BlockAdvertError::AuthorizationRevoked))) => {
+                claim.0.send_replace(UploadState::Revoked);
+                return AdvertOutcome::Revoked;
+            }
+            _ => return AdvertOutcome::Failed,
         }
         // The connection usually marks the write first; senders without a connection rely on this.
         claim.0.send_if_modified(UploadState::start_waiting);
@@ -287,6 +313,7 @@ impl BlockGossipPeer {
                     break !matches!(*progress.borrow(), UploadState::Finished(false));
                 }
                 UploadState::Finished(succeeded) => break succeeded,
+                UploadState::Revoked => return AdvertOutcome::Revoked,
             };
             let requested = matches!(state, UploadState::Requested(_));
             tokio::select! {
@@ -306,7 +333,7 @@ impl BlockGossipPeer {
         };
         drop(upload);
         claim.0.send_replace(UploadState::Finished(succeeded));
-        succeeded
+        AdvertOutcome::from(succeeded)
     }
 }
 
@@ -370,6 +397,28 @@ impl Drop for UploadSlot {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AdvertOutcome {
+    Sent,
+    Revoked,
+    Failed,
+}
+
+impl From<bool> for AdvertOutcome {
+    fn from(sent: bool) -> Self {
+        if sent {
+            Self::Sent
+        } else {
+            Self::Failed
+        }
+    }
+}
+
+/// At least one selected connection lost authorization and none succeeded.
+#[derive(Debug, thiserror::Error)]
+#[error("block advertisement candidates lost authorization")]
+struct RevokedCandidates;
+
 /// Advertises `hash` to `peers`, at most [`BLOCK_ADVERT_WINDOW`] at a time, paced through their
 /// block uploads.
 ///
@@ -383,14 +432,18 @@ pub(crate) fn broadcast_block(
     let peers = order_peers(peers, mined, &mut rand_10::rng());
     async move {
         let mut sends = futures::stream::iter(peers)
-            .map(|peer| peer.advertise(hash, slots.clone()))
+            .map(|peer| peer.advertise_outcome(hash, slots.clone()))
             .buffer_unordered(BLOCK_ADVERT_WINDOW);
         let mut succeeded = false;
-        while let Some(sent) = sends.next().await {
-            succeeded |= sent;
+        let mut revoked = false;
+        while let Some(outcome) = sends.next().await {
+            succeeded |= matches!(outcome, AdvertOutcome::Sent);
+            revoked |= matches!(outcome, AdvertOutcome::Revoked);
         }
         if succeeded {
             Ok(Response::Nil)
+        } else if revoked {
+            Err(Box::new(RevokedCandidates) as BoxError)
         } else {
             Err(std::io::Error::other("block broadcast reached no peers").into())
         }
@@ -410,11 +463,14 @@ pub(crate) struct BlockAdvertiser<C> {
     /// Shared with the peer set's own block broadcasts.
     pub(crate) slots: BlockUploadSlots,
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
+    pub(crate) bans: BannedIps,
+    /// Acknowledged after the owner processes pending discovery and authorization events.
+    pub(crate) refresh: Option<mpsc::Sender<oneshot::Sender<()>>>,
 }
 
 /// Always ready: an advertisement waits inside its own future for a connected peer, never for
 /// an idle one. Requests other than block advertisements fail.
-impl<C: ChainTip> tower::Service<Request> for BlockAdvertiser<C> {
+impl<C: ChainTip + Clone + Send + 'static> tower::Service<Request> for BlockAdvertiser<C> {
     type Response = Response;
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<Response, BoxError>>;
@@ -431,11 +487,11 @@ impl<C: ChainTip> tower::Service<Request> for BlockAdvertiser<C> {
     }
 }
 
-impl<C: ChainTip> BlockAdvertiser<C> {
+impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     /// Advertises the block in `request` to every eligible connected peer.
     ///
-    /// Waits until at least one connected peer meets the minimum protocol version, so the latest
-    /// block still reaches the first peer that connects.
+    /// Waits for an authorized connected peer, refreshing candidates after revocation. The
+    /// caller owns the overall deadline and cancellation, including any wait for new peers.
     pub(crate) fn advertise(
         &mut self,
         request: Request,
@@ -452,22 +508,38 @@ impl<C: ChainTip> BlockAdvertiser<C> {
                 .boxed()
             }
         };
-        let minimum_version = self.minimum_peer_version.current();
-        let eligible = move |peer: &BlockGossipPeer| {
-            peer.version >= minimum_version && !peer.sender.is_closed()
-        };
+        let mut minimum = self.minimum_peer_version.clone();
+        let bans = self.bans.clone();
+        let refresh = self.refresh.clone();
         let mut peers = self.peers.clone();
         let slots = self.slots.clone();
         async move {
-            let peers: Vec<_> = peers
-                .wait_for(|peers| peers.iter().any(eligible))
-                .await
-                .map_err(|_| "peer set stopped")?
-                .iter()
-                .filter(|peer| eligible(peer))
-                .cloned()
-                .collect();
-            broadcast_block(peers, hash, mined, slots).await
+            loop {
+                if let Some(refresh) = &refresh {
+                    let (done, ready) = oneshot::channel();
+                    refresh.send(done).await.map_err(|_| "peer set stopped")?;
+                    ready.await.map_err(|_| "peer set stopped")?;
+                }
+                let minimum_version = minimum.current();
+                let candidates: Vec<_> = peers
+                    .borrow_and_update()
+                    .iter()
+                    .filter(|peer| {
+                        peer.version >= minimum_version
+                            && !peer.sender.is_closed()
+                            && !peer.address.is_some_and(|addr| bans.contains(addr.ip()))
+                    })
+                    .cloned()
+                    .collect();
+                if !candidates.is_empty() {
+                    match broadcast_block(candidates, hash, mined, slots.clone()).await {
+                        Err(error) if error.is::<RevokedCandidates>() => {}
+                        result => return result,
+                    }
+                }
+                // Do not replay the same rejected snapshot or reset the caller's deadline.
+                peers.changed().await.map_err(|_| "peer set stopped")?;
+            }
         }
         .boxed()
     }
@@ -523,6 +595,7 @@ mod tests {
         (
             BlockGossipPeer {
                 sender,
+                address: None,
                 uploads: BlockUploads::default(),
                 registry: None,
                 version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
@@ -1223,5 +1296,157 @@ mod tests {
                 .any(|rtt| *rtt > BLOCK_ADVERT_WINDOW as u128),
             "a random slot reaches beyond the lowest-RTT peers: {first_wave:?}"
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn revoked_snapshot_waits_for_later_authorized_connection() {
+        timeout(Duration::from_secs(10), async {
+            let (first, mut first_rx) = peer();
+            let (published, peers) = watch::channel(vec![first]);
+            let slots = BlockUploadSlots::new(1);
+            let advertiser = BlockAdvertiser {
+                peers,
+                slots: slots.clone(),
+                minimum_peer_version: MinimumPeerVersion::new(
+                    zakura_chain::chain_tip::NoChainTip,
+                    &zakura_chain::parameters::Network::Mainnet,
+                ),
+                bans: BannedIps::default(),
+                refresh: None,
+            };
+            let hash = block::Hash([61; 32]);
+            let mut broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+                advertiser,
+                Request::AdvertiseMinedBlock(hash),
+            ));
+            let advert = first_rx.recv().await.unwrap();
+            advert
+                .result
+                .send(Err(BlockAdvertError::AuthorizationRevoked))
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(slots.available_uploads(), 1);
+            assert!((&mut broadcast).now_or_never().is_none());
+            assert!(
+                first_rx.try_recv().is_err(),
+                "the rejected snapshot is not retried"
+            );
+            let (later, mut later_rx) = peer();
+            published.send_replace(vec![later]);
+            accept(&mut later_rx, hash).await;
+            assert!(broadcast.await.unwrap().is_ok());
+        })
+        .await
+        .expect("the pending announcement reaches a later authorized peer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_advertisements_preserve_revocation_and_release_permits() {
+        timeout(Duration::from_secs(1), async {
+            let (peer, mut receiver) = peer();
+            let slots = BlockUploadSlots::new(1);
+            let hash = block::Hash([62; 32]);
+            let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone()));
+            let advert = receiver.recv().await.unwrap();
+            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone()));
+            tokio::task::yield_now().await;
+            advert
+                .result
+                .send(Err(BlockAdvertError::AuthorizationRevoked))
+                .unwrap();
+            assert!(matches!(first.await.unwrap(), AdvertOutcome::Revoked));
+            assert!(matches!(second.await.unwrap(), AdvertOutcome::Revoked));
+            assert_eq!(slots.available_uploads(), 1);
+            assert!(receiver.try_recv().is_err());
+        })
+        .await
+        .expect("joined rejections finish promptly");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn waiting_advert_rechecks_version_and_existing_bans() {
+        timeout(Duration::from_secs(10), async {
+            let (minimum, tip) = MinimumPeerVersion::with_mock_chain_tip(
+                &zakura_chain::parameters::Network::Mainnet,
+            );
+            let old_version = crate::protocol::external::types::Version::min_remote_for_height(
+                &zakura_chain::parameters::Network::Mainnet,
+                None,
+            );
+            let (published, peers) = watch::channel(Vec::new());
+            let banned: PeerSocketAddr = "127.0.0.2:8233"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into();
+            let advertiser = BlockAdvertiser {
+                peers,
+                slots: BlockUploadSlots::new(1),
+                minimum_peer_version: minimum,
+                bans: BannedIps::with_banned_ip(banned.ip()),
+                refresh: None,
+            };
+            let hash = block::Hash([72; 32]);
+            let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+                advertiser,
+                Request::AdvertiseMinedBlock(hash),
+            ));
+            tokio::task::yield_now().await;
+            let height = zakura_chain::parameters::NetworkUpgrade::Nu6_3
+                .activation_height(&zakura_chain::parameters::Network::Mainnet)
+                .unwrap();
+            tip.send_best_tip_height(Some(height));
+            let (mut outdated, mut outdated_rx) = peer();
+            outdated.version = old_version;
+            let (mut forbidden, mut forbidden_rx) = peer();
+            forbidden.address = Some(banned);
+            let (allowed, mut allowed_rx) = peer();
+            published.send_replace(vec![outdated, forbidden, allowed]);
+            accept(&mut allowed_rx, hash).await;
+            assert!(outdated_rx.try_recv().is_err());
+            assert!(forbidden_rx.try_recv().is_err());
+            assert!(broadcast.await.unwrap().is_ok());
+        })
+        .await
+        .expect("selection uses current authorization after waiting");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn revoked_wait_obeys_caller_deadline() {
+        let (peer, mut receiver) = peer();
+        let (_published, peers) = watch::channel(vec![peer]);
+        let slots = BlockUploadSlots::new(1);
+        let advertiser = BlockAdvertiser {
+            peers,
+            slots: slots.clone(),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+        };
+        let hash = block::Hash([73; 32]);
+        let deadline = timeout(
+            Duration::from_secs(1),
+            tower::ServiceExt::oneshot(advertiser, Request::AdvertiseMinedBlock(hash)),
+        );
+        let reject = async {
+            let advert = receiver.recv().await.unwrap();
+            advert
+                .result
+                .send(Err(BlockAdvertError::AuthorizationRevoked))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(deadline, reject);
+        assert!(result.is_err());
+        assert_eq!(slots.available_uploads(), 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnect_preserves_a_completed_authorization_rejection() {
+        let uploads = BlockUploads::default();
+        let (progress, claim) = uploads.register(block::Hash([74; 32]));
+        let claim = claim.unwrap();
+        claim.0.send_replace(UploadState::Revoked);
+        uploads.disconnected();
+        assert!(matches!(*progress.borrow(), UploadState::Revoked));
     }
 }

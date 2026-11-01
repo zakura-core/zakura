@@ -47,6 +47,7 @@ impl From<Client> for LoadTrackedClient {
         let connection_info = client.connection_info.clone();
         let block_gossip = super::block_gossip::BlockGossipPeer {
             sender: client.block_advert_tx.clone(),
+            address: connection_info.connected_addr.get_transient_addr(),
             uploads: client.block_uploads.clone(),
             registry: client.peer_registry_updater.clone(),
             version: connection_info.remote.version,

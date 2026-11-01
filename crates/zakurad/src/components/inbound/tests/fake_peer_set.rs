@@ -6,7 +6,12 @@ use std::{collections::HashSet, iter, net::SocketAddr, str::FromStr, sync::Arc, 
 
 use futures::FutureExt;
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    builder::ServiceBuilder,
+    util::{BoxCloneSyncService, BoxService},
+    Service, ServiceExt,
+};
 use tracing::{Instrument, Span};
 
 use zakura_chain::{
@@ -1267,8 +1272,9 @@ async fn caches_getaddr_response() {
 
         let peer_set = MockService::build()
             .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
-            .for_unit_tests();
-        let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+            .for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>();
+        let buffered_peer_set =
+            BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
         let buffered_mempool_service =
             Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 10);
@@ -1450,7 +1456,8 @@ async fn setup_with_misbehavior_receiver(
     let mut peer_set = MockService::build()
         .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
         .for_unit_tests();
-    let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+    let buffered_peer_set =
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
     let mock_tx_verifier = MockService::build().for_unit_tests();
     let buffered_tx_verifier = Buffer::new(BoxService::new(mock_tx_verifier.clone()), 10);

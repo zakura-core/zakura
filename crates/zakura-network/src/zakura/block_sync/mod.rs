@@ -73,8 +73,9 @@ mod work_queue;
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
-    BenchSubmit, SequencerProgress,
+    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchBudgetReceipts,
+    BenchCommitter, BenchReceiptBatch, BenchSequencerHandle, BenchSubmissions, BenchSubmit,
+    BenchWorkCapacity, BenchWorkChurn, SequencerProgress, WorkRequestEnd,
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
@@ -129,7 +130,7 @@ impl zakura_header_chain::Clock for BlockSyncClock {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
     zakura_header_chain::BodyWorkAuthority {
         header: zakura_header_chain::HeaderWorkAuthority {
@@ -189,3 +190,18 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
         }
     }
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use work_queue::{
+    replay_work_ownership_bytes, trace_work_funding_bytes, trace_work_ownership_bytes,
+    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
+    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
+    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
+    WorkOwnershipView,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_registry::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};

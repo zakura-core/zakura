@@ -1071,7 +1071,10 @@ mod tests {
     fn shared_changes_affect_the_committed_case() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let cases = cases(&repo_root).expect("the planted cases parse");
-        let case = cases.first().expect("a committed case");
+        let case = cases
+            .iter()
+            .find(|case| case.property.starts_with("discovery/"))
+            .expect("a committed discovery case");
         let watched = watched(&repo_root, case).expect("the case's files exist");
         for path in [
             "crates/xtask/src/sim.rs",

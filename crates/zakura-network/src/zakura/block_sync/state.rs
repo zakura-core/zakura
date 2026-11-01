@@ -202,6 +202,7 @@ impl BodyRetention {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
+    pub(super) accounting: crate::zakura::transport::BudgetClosureReader,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
@@ -220,6 +221,7 @@ pub struct BlockSyncHandle {
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 #[derive(Debug)]
 pub struct DetachedHandleEvents {
+    accounting: ByteBudget,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
     needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
     // Held so the handle's bounded queue and watches stay open.
@@ -231,6 +233,16 @@ pub struct DetachedHandleEvents {
 
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 impl DetachedHandleEvents {
+    /// Inject a local accounting failure through the real budget closure signal.
+    pub fn fail_accounting(&self) {
+        let _notification = self.accounting.defer_closure_notification();
+        self.accounting
+            .close(crate::zakura::transport::BudgetClosure::Funding {
+                logical: 1,
+                funded: 0,
+            });
+    }
+
     /// The next control event sent with [`BlockSyncHandle::send_control`],
     /// if one is waiting.
     pub fn try_next_control(&mut self) -> Option<BlockSyncEvent> {
@@ -261,7 +273,9 @@ impl BlockSyncHandle {
         let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
         let (status_tx, status) = watch::channel(config.initial_status());
         let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+        let accounting = ByteBudget::new(config.max_inflight_block_bytes);
         let handle = BlockSyncHandle {
+            accounting: accounting.closure_reader(),
             events,
             lifecycle,
             needed_query_failures,
@@ -271,6 +285,7 @@ impl BlockSyncHandle {
             routine_wiring: None,
         };
         let receiver = DetachedHandleEvents {
+            accounting,
             lifecycle: lifecycle_rx,
             needed_query_failures: needed_query_failures_rx,
             _events: events_rx,
@@ -290,7 +305,6 @@ pub(super) struct RoutineWiring {
     pub(super) request_pool: crate::zakura::regulation::ReservationPool,
     pub(super) serving: Arc<super::regulated::session::Serving>,
     pub(super) config: ZakuraBlockSyncConfig,
-    pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
     pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -307,6 +321,17 @@ pub(super) struct RoutineWiring {
 }
 
 impl BlockSyncHandle {
+    /// Wait for a local request-accounting failure. The driver must stop rather
+    /// than replace this budget while old owners can still retain resources.
+    pub async fn accounting_closed(&self) {
+        self.accounting.closed().await;
+    }
+
+    /// Whether a local accounting failure has closed request admission.
+    pub fn is_accounting_closed(&self) -> bool {
+        self.accounting.is_closed()
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,
@@ -436,7 +461,6 @@ pub(super) struct BlockSyncState {
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
     pub(super) work_queue: Arc<WorkQueue>,
-    pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
@@ -447,6 +471,13 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
+        let budget = ByteBudget::new(startup.config.max_inflight_block_bytes);
+        #[cfg(any(test, zakura_sim))]
+        let budget = budget.with_observer(startup.observer.budget_observer());
+        let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget);
+        #[cfg(any(test, zakura_sim))]
+        let work_queue = work_queue.with_observer(startup.observer.clone());
+        let work_queue = Arc::new(work_queue);
         Self {
             finalized_height: startup.frontiers.finalized_height,
             verified_block_hash: startup.frontiers.verified_block_hash,
@@ -456,18 +487,7 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            #[cfg(not(any(test, zakura_sim)))]
-            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
-            #[cfg(not(any(test, zakura_sim)))]
-            budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
-            #[cfg(any(test, zakura_sim))]
-            work_queue: Arc::new(
-                WorkQueue::new(startup.frontiers.verified_block_tip)
-                    .with_observer(startup.observer.clone()),
-            ),
-            #[cfg(any(test, zakura_sim))]
-            budget: ByteBudget::new(startup.config.max_inflight_block_bytes)
-                .with_observer(startup.observer.budget_observer()),
+            work_queue,
             needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
         }

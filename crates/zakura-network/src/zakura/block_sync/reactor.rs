@@ -232,7 +232,6 @@ pub fn spawn_block_sync_reactor(
 
     let sequencer_task = SequencerTask::new(
         sequencer,
-        state.budget.clone(),
         state.work_queue.clone(),
         registry.clone(),
         actions_tx.clone(),
@@ -273,7 +272,6 @@ pub fn spawn_block_sync_reactor(
             &startup.config,
         )),
         config: startup.config.clone(),
-        budget: state.budget.clone(),
         work: state.work_queue.clone(),
         registry: registry.clone(),
         received_throughput: state.received_throughput.clone(),
@@ -299,6 +297,7 @@ pub fn spawn_block_sync_reactor(
     };
 
     let handle = BlockSyncHandle {
+        accounting: state.work_queue.budget().closure_reader(),
         events: events_tx,
         lifecycle: lifecycle_tx,
         needed_query_failures: needed_query_failure_tx,
@@ -660,7 +659,7 @@ impl BlockSyncReactor {
                 .state
                 .work_queue
                 .revoke_for_owner(claim.meta.owner, [claim.height]);
-            self.state.budget.release(released.released_bytes);
+
             // Settlement arbitrates against writer startup. Skipped frames and
             // already-settled work must not count against the peer.
             if servable_peers > 2 && released.returned_count > 0 && !released.request_was_unwritten
@@ -1596,7 +1595,7 @@ impl BlockSyncReactor {
             height,
             token,
             outcome.result(),
-            self.state.budget.reserved(),
+            self.state.work_queue.budget().reserved(),
         );
         let persisted_availability = self.committed_view.as_ref().and_then(|snapshot| {
             (snapshot.frontiers.header_best.hash == hash)

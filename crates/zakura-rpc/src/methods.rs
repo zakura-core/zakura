@@ -3803,23 +3803,26 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block) => block,
-            Err(error) => {
-                tracing::info!(
-                    ?error,
-                    "submit block failed: block bytes could not be deserialized into a structurally valid block"
-                );
+        let block = match self
+            .gbt
+            .prepared_candidates()
+            .decode_submitted(&block_bytes)
+        {
+            Some(block) => block,
+            None => match block_bytes.zcash_deserialize_into::<Block>() {
+                Ok(block) => Arc::new(block),
+                Err(error) => {
+                    tracing::info!(
+                        ?error,
+                        "submit block failed: block bytes could not be deserialized into a structurally valid block"
+                    );
 
-                return Ok(SubmitBlockErrorResponse::Rejected.into());
-            }
+                    return Ok(SubmitBlockErrorResponse::Rejected.into());
+                }
+            },
         };
-        self.run_mined_block_lifecycle(
-            Arc::new(block),
-            submitted_at,
-            MinedBlockSubmission::FullBlock,
-        )
-        .await
+        self.run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::FullBlock)
+            .await
     }
 
     async fn submit_solution(

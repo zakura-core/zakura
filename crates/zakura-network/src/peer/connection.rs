@@ -950,10 +950,10 @@ where
 
                             self.update_state_metrics(None);
 
-                            // A block announcement that also answered the response is delivered
-                            // first, so the inbound service's load cannot cost the client a
-                            // reply the peer already gave; the announcement is then handled on
-                            // an idle connection, like any other unsolicited message.
+                            // A message can finish the response and still need inbound handling:
+                            // a one-block inv can also be an announcement, and an unsolicited
+                            // transaction ends the pending transaction batch. Deliver the reply
+                            // first, so inbound service load cannot cost the client its response.
                             if request_msg.is_some()
                                 && matches!(
                                     self.state,
@@ -966,9 +966,8 @@ where
                                 self.deliver_finished_response();
                             }
 
-                            // If the message was not consumed as a response, or it was a
-                            // block announcement that also answered the response, check
-                            // whether it can be handled as a request.
+                            // If the handler returned the message, check whether it can also
+                            // be handled as a request.
                             let unused_msg = if let Some(request_msg) = request_msg {
                                 // do NOT instrument with the request span, this is
                                 // independent work
@@ -1499,11 +1498,6 @@ where
         }
     }
 
-    /// Given a `req` originating from the peer, drive it to completion and send
-    /// any appropriate messages to the remote peer. If an error occurs while
-    /// processing the request (e.g., the service is shedding load), then we call
-    /// fail_with to terminate the entire peer connection, shrinking the number
-    /// of connected peers.
     /// Sends the finished response of the pending client request to the client, and makes the
     /// connection idle.
     ///
@@ -1546,6 +1540,11 @@ where
         self.state = State::AwaitingRequest;
     }
 
+    /// Given a `req` originating from the peer, drive it to completion and send
+    /// any appropriate messages to the remote peer. If an error occurs while
+    /// processing the request (e.g., the service is shedding load), then we call
+    /// fail_with to terminate the entire peer connection, shrinking the number
+    /// of connected peers.
     async fn drive_peer_request(&mut self, req: Request) {
         trace!(?req);
 

@@ -1835,6 +1835,110 @@ async fn single_block_inv_during_getblocks_survives_inbound_error() {
     .expect("the reply is delivered although the advert failed");
 }
 
+/// An unsolicited transaction completes a pending transaction batch before inbound processing,
+/// even when the inbound service fails. Both partial and not-found replies keep the connection
+/// usable for later requests.
+#[tokio::test]
+async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
+    use zakura_chain::{
+        serialization::ZcashDeserializeInto,
+        transaction::{self, UnminedTx, UnminedTxId},
+    };
+
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    let requested_block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let unrelated_block: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let requested = UnminedTx::from(requested_block.transactions[0].clone());
+    let unrelated = UnminedTx::from(unrelated_block.transactions[0].clone());
+    let missing = UnminedTxId::from_legacy_id(transaction::Hash([9; 32]));
+    assert_ne!(requested.id(), unrelated.id());
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for received_requested in [false, true] {
+            let (mut peer_tx, peer_rx) = mpsc::channel(1);
+            let (
+                connection,
+                mut client_tx,
+                mut inbound_service,
+                mut peer_outbound_messages,
+                shared_error_slot,
+            ) = new_test_connection();
+            let connection_task = tokio::spawn(connection.run(peer_rx));
+            let (request_tx, request_rx) = oneshot::channel();
+            client_tx
+                .try_send(ClientRequest {
+                    request: Request::TransactionsById(HashSet::from([requested.id(), missing])),
+                    tx: request_tx,
+                    inv_collector: None,
+                    transient_addr: None,
+                    span: Span::current(),
+                })
+                .unwrap();
+            assert!(matches!(
+                peer_outbound_messages.next().await,
+                Some(Message::GetData(_))
+            ));
+
+            if received_requested {
+                peer_tx
+                    .send(Ok(Message::Tx(requested.clone())))
+                    .await
+                    .unwrap();
+            }
+            peer_tx
+                .send(Ok(Message::Tx(unrelated.clone())))
+                .await
+                .unwrap();
+
+            // Do not answer the inbound request until the transaction reply has arrived.
+            let response = request_rx.await.unwrap();
+            if received_requested {
+                assert_eq!(
+                    response.unwrap(),
+                    Response::Transactions(vec![
+                        crate::InventoryResponse::Available((requested.clone(), None)),
+                        crate::InventoryResponse::Missing(missing),
+                    ])
+                );
+            } else {
+                assert_eq!(
+                    response.unwrap_err().not_found_class(),
+                    Some(crate::NotFoundClass::Response)
+                );
+            }
+            inbound_service
+                .expect_request(Request::PushTransaction(unrelated.clone(), None))
+                .await
+                .respond(Err("synthetic inbound service error"));
+
+            let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+            let hashes = vec![block::Hash([3; 32]), block::Hash([4; 32])];
+            peer_tx
+                .send(Ok(Message::Inv(
+                    hashes.iter().copied().map(InventoryHash::Block).collect(),
+                )))
+                .await
+                .unwrap();
+            assert_eq!(
+                request_rx.await.unwrap().unwrap(),
+                Response::BlockHashes(hashes)
+            );
+            assert!(shared_error_slot.try_get_error().is_none());
+
+            drop(client_tx);
+            connection_task.await.unwrap();
+        }
+    })
+    .await
+    .expect("transaction replies precede inbound failures and later requests still succeed");
+}
+
 /// A connection rechecks bans while a request is awaiting its response, and does not write an
 /// advert to a banned peer. The pending request and the connection are unaffected.
 #[tokio::test]

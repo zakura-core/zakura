@@ -214,7 +214,8 @@ mod linux {
         assert_eq!(report.outcome, UploadOutcome::Acked);
         assert_eq!(report.acked_message_bytes(), message_len);
         assert!(
-            report.sample_count >= (READ_DELAY.as_millis() / SAMPLE_INTERVAL.as_millis()) as u64 / 2,
+            report.sample_count
+                >= (READ_DELAY.as_millis() / SAMPLE_INTERVAL.as_millis()) as u64 / 2,
             "the watch sampled while the receiver waited: {report:?}"
         );
         let acked_at = report.started_at + report.elapsed;

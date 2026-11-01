@@ -24,6 +24,13 @@ use crate::{
     PeerError,
 };
 
+/// The most block hashes one `p2p` row lists.
+///
+/// A peer answers `getblocks` with at most 500 hashes, so this keeps every hash of an honest
+/// message. A peer can send a far longer inventory list, and without a limit one message would
+/// produce a row of several megabytes. `item_count` and `tx_count` still count the whole message.
+pub(super) const MAX_ROW_BLOCK_HASHES: usize = 500;
+
 /// A send recorded by [`ConnectionTrace::p2p_send_start`], completed by
 /// [`ConnectionTrace::p2p_send_done`].
 #[derive(Debug)]
@@ -85,7 +92,8 @@ struct MessageSummary<'a> {
     height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     item_count: Option<u64>,
-    /// Every block hash in an inventory batch, in message order.
+    /// The block hashes in an inventory batch, in message order, up to
+    /// [`MAX_ROW_BLOCK_HASHES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     block_hashes: Option<BlockHashes<'a>>,
     /// The number of transaction entries in an inventory batch.
@@ -132,12 +140,19 @@ impl<T: fmt::Display> Serialize for Shown<T> {
     }
 }
 
-/// The block hashes in an inventory list, serialized as a list of hash strings.
+/// The first [`MAX_ROW_BLOCK_HASHES`] block hashes in an inventory list, serialized as a list of
+/// hash strings.
 struct BlockHashes<'a>(&'a [InventoryHash]);
 
 impl Serialize for BlockHashes<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().filter_map(block_hash).map(Shown))
+        serializer.collect_seq(
+            self.0
+                .iter()
+                .filter_map(block_hash)
+                .take(MAX_ROW_BLOCK_HASHES)
+                .map(Shown),
+        )
     }
 }
 

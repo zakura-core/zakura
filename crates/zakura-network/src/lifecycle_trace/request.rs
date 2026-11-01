@@ -263,7 +263,7 @@ impl ConnectionTrace {
                 // Every stamped request was counted when the channel accepted it.
                 let _ = state
                     .queued
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
                         queued.checked_sub(1)
                     });
                 (

@@ -158,9 +158,6 @@ impl Budget {
                 self.count("limit_reached.count");
             }
         }
-        if capacity_change && active > 0 && active >= limit {
-            self.count("capacity_reduction_overage.count");
-        }
         state.band = band;
         for (name, value) in [
             ("capacity", state.capacity),
@@ -209,7 +206,14 @@ impl Budget {
         if state.capacity == capacity.max(1) {
             return;
         }
+        let previous_capacity = state.capacity;
         state.capacity = capacity.max(1);
+        if state.capacity < previous_capacity
+            && !state.charges.is_empty()
+            && state.charges.len() >= Self::limit(state.capacity)
+        {
+            self.count("capacity_reduction_overage.count");
+        }
         while state.deferred.len() > state.capacity {
             if let Some(index) = state
                 .deferred
@@ -551,7 +555,12 @@ impl Drop for Attempt {
                 .get(&self.hash)
                 .is_some_and(|e| e.owner == self.id)
             {
-                state.deferred.shift_remove(&self.hash);
+                let entry = state
+                    .deferred
+                    .shift_remove(&self.hash)
+                    .expect("this attempt still owns the deferred entry");
+                metrics::histogram!(self.budget.metric("deferred.duration_seconds"), "reason" => self.outcome)
+                    .record(entry.first.elapsed().as_secs_f64());
             }
             self.budget.publish(&mut state, false);
         }

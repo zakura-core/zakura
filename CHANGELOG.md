@@ -34,6 +34,9 @@ independently.
 
 ### Changed
 
+- Updated the Common cryptography libraries to `5.0.0-rc.2` and aligned
+  transparent script parsing with Common’s `zakura-zcash-script` crate
+  ([#1897](https://github.com/zakura-core/zakura/pull/1897)).
 - The Prometheus metrics endpoint is now built into `zakurad` instead of using
   `metrics-exporter-prometheus`. Metric names and the output format are unchanged.
   Histogram quantiles now use every sample from the last minute, within 0.1%, so some

@@ -23,7 +23,7 @@ use crate::{
     },
     peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
     protocol::external::{types::Version, InventoryHash},
-    BannedIps, BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
+    BannedIps, BoxError, PeerSocketAddr, PeerSource, Request, Response, SharedPeerError,
 };
 
 use super::{PeerSetBuilder, PeerVersions};
@@ -642,6 +642,120 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
             "request routed to non-advertised peer",
         );
     });
+}
+
+/// How a [`Request::BlocksByHashFrom`] test marks peers in the inventory registry.
+#[derive(Copy, Clone)]
+enum BlockSourceRegistry {
+    Empty,
+    OtherPeerAdvertised,
+    SourceMissing,
+}
+
+/// Checks which peer a single-block request with a known source is routed to under `registry`.
+fn route_block_request_with_source(registry: BlockSourceRegistry) {
+    const PEERS: usize = 16;
+    const SOURCE: usize = 3;
+    const ADVERTISER: usize = 7;
+
+    let test_hash = block::Hash([0; 32]);
+    let test_inv = InventoryHash::Block(test_hash);
+
+    // `mock_peer_discovery` numbers its test ports from 1.
+    let peer_addr = |index: usize| -> PeerSocketAddr {
+        format!("127.0.0.1:{}", index + 1)
+            .parse()
+            .expect("hard-coded test address is valid")
+    };
+
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version; PEERS],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    // CORRECTNESS: This test does not depend on external resources that could really timeout.
+    tokio::time::pause();
+
+    let (discovered_peers, mut handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .max_conns_per_ip(max(PEERS, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        let change = match registry {
+            BlockSourceRegistry::Empty => None,
+            BlockSourceRegistry::OtherPeerAdvertised => Some(InventoryStatus::new_available(
+                test_inv,
+                peer_addr(ADVERTISER),
+            )),
+            BlockSourceRegistry::SourceMissing => {
+                Some(InventoryStatus::new_missing(test_inv, peer_addr(SOURCE)))
+            }
+        };
+        if let Some(change) = change {
+            peer_set_guard
+                .inventory_sender()
+                .as_mut()
+                .expect("unexpected missing inv sender")
+                .send(change)
+                .expect("unexpected dropped receiver");
+        }
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+        assert_eq!(peer_ready.ready_services.len(), PEERS);
+
+        let _fut = peer_ready.call(Request::BlocksByHashFrom {
+            hashes: iter::once(test_hash).collect(),
+            source: PeerSource::LegacySocket(peer_addr(SOURCE)),
+        });
+
+        let receivers: Vec<usize> = handles
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, handle)| {
+                handle
+                    .try_to_receive_outbound_client_request()
+                    .request()
+                    .map(|_| index)
+            })
+            .collect();
+
+        assert_eq!(receivers.len(), 1, "exactly one peer gets the request");
+        match registry {
+            BlockSourceRegistry::Empty => assert_eq!(receivers[0], SOURCE),
+            BlockSourceRegistry::OtherPeerAdvertised => assert_eq!(receivers[0], ADVERTISER),
+            BlockSourceRegistry::SourceMissing => assert_ne!(receivers[0], SOURCE),
+        }
+    })
+}
+
+/// A single-block request with a known source goes to that source if no peer advertised the block.
+#[test]
+fn peer_set_routes_unadvertised_block_to_its_source() {
+    route_block_request_with_source(BlockSourceRegistry::Empty);
+}
+
+/// A peer that advertised the block goes before the request's source.
+#[test]
+fn peer_set_prefers_block_advertiser_over_request_source() {
+    route_block_request_with_source(BlockSourceRegistry::OtherPeerAdvertised);
+}
+
+/// A source that said it is missing the block does not get the request.
+#[test]
+fn peer_set_skips_block_source_that_is_missing_the_block() {
+    route_block_request_with_source(BlockSourceRegistry::SourceMissing);
 }
 
 /// Check that a peer set routes inventory requests to peers that are not missing that inventory.

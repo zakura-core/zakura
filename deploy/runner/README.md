@@ -268,7 +268,9 @@ against the node's Rust policy, so a policy update must update monitoring too.
 The monitor selects the highest fresh Mainnet accepted tip and requires a
 second fleet node to corroborate its hash, or its sampled ancestry when the
 second node is behind. Conflicting tips or targets cannot establish health;
-missing data at the highest tip cannot fall back to a lower, easier-to-monitor
+tip-only reporters can corroborate a hash when another node supplies the
+target for that same highest hash, including the macOS verifier's tip report.
+Missing data at the highest tip cannot fall back to a lower, easier-to-monitor
 tip. Observations require fresh collection and node timestamps. A tip that
 does not advance in 10 minutes becomes unavailable even if a restarted
 collector refreshes its timestamps. Gaps over three minutes interrupt the

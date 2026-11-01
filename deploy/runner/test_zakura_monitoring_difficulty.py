@@ -151,7 +151,7 @@ class DifficultyTests(unittest.TestCase):
 
     def test_invalid_and_conflicting_data_never_establish_health(self):
         invalid = []
-        for field, value in (("rpc_chain", "test"), ("rpc_ok", False), ("difficulty_bits", None),
+        for field, value in (("rpc_chain", "test"), ("rpc_ok", False), ("difficulty_bits", "bad"),
                              ("last_seen_at", float("nan")), ("block_hash", "bad")):
             data = snapshot()
             data["rows"][0][field] = value
@@ -173,6 +173,16 @@ class DifficultyTests(unittest.TestCase):
         for data in invalid:
             with self.subTest(data=data), self.assertRaises(ValueError):
                 difficulty.observation(data, 1000)
+
+    def test_tip_only_reporter_can_corroborate_the_same_highest_header(self):
+        data = snapshot()
+        del data["rows"][1]["difficulty_bits"]
+        sample = difficulty.observation(data, 1000)
+        self.assertEqual(sample["nodes"], ["node-a", "node-b"])
+        self.assertEqual(sample["target"], 6990935 << 192)
+        del data["rows"][0]["difficulty_bits"]
+        with self.assertRaisesRegex(ValueError, "highest Mainnet tip"):
+            difficulty.observation(data, 1000)
 
 
 class WatchdogDifficultyTests(unittest.TestCase):

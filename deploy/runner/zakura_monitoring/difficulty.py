@@ -84,7 +84,12 @@ def observation(snapshot: dict | None, now: float) -> dict:
     height = max(row["height"] for row in candidates)
     leaders = [row for row in candidates if row["height"] == height]
     hashes = {row["block_hash"].lower() for row in leaders}
-    targets = {expanded_target(row.get("difficulty_bits")) for row in leaders}
+    # A tip-only reporter can corroborate the header hash without exposing its
+    # target. At least one reporter of that same highest hash must supply it.
+    targets = {expanded_target(row["difficulty_bits"]) for row in leaders
+               if row.get("difficulty_bits") is not None}
+    if not targets:
+        raise ValueError("missing or malformed target at highest Mainnet tip")
     if len(hashes) != 1 or len(targets) != 1:
         raise ValueError("highest Mainnet tips disagree")
     selected = leaders[0]

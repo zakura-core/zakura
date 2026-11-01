@@ -1679,20 +1679,15 @@ async fn single_block_inv_during_getblocks_is_also_gossiped() {
             .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
             .unwrap();
 
-        tokio::join!(
-            async {
-                inbound_service
-                    .expect_request(Request::AdvertiseBlock(announced_hash, None))
-                    .await
-                    .respond(Response::Nil);
-            },
-            async {
-                assert_eq!(
-                    request_rx.await.unwrap().unwrap(),
-                    Response::BlockHashes(vec![announced_hash])
-                );
-            }
+        // The reply is delivered before the advert reaches the inbound service.
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(vec![announced_hash])
         );
+        inbound_service
+            .expect_request(Request::AdvertiseBlock(announced_hash, None))
+            .await
+            .respond(Response::Nil);
         assert!(shared_error_slot.try_get_error().is_none());
 
         drop(client_tx);
@@ -1700,6 +1695,42 @@ async fn single_block_inv_during_getblocks_is_also_gossiped() {
     })
     .await
     .expect("the response and the block advert are both delivered");
+}
+
+/// The `getblocks` reply is not lost when the inbound service sheds the block advert that the
+/// same one-hash `inv` produced, whether or not the overload policy then drops the connection.
+#[tokio::test]
+async fn single_block_inv_during_getblocks_survives_inbound_overload() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (connection, mut client_tx, mut inbound_service, mut peer_outbound_messages, _) =
+            new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let announced_hash = block::Hash([2; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
+            .unwrap();
+
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(vec![announced_hash])
+        );
+        inbound_service
+            .expect_request(Request::AdvertiseBlock(announced_hash, None))
+            .await
+            .respond(Err(Overloaded::new()));
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the reply is delivered although the advert was shed");
 }
 
 /// A block `inv` with several hashes is a `getblocks` reply only, never a block advert.

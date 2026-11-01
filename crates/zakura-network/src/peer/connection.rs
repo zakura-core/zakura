@@ -843,45 +843,8 @@ where
                 // because the response might be `Nil` or synthetic.
                 State::AwaitingResponse {
                     handler: Handler::Finished(_),
-                    ref span,
                     ..
-                } => {
-                    // We have to get rid of the span reference so we can tamper with the state.
-                    let span = span.clone();
-                    trace!(
-                        parent: &span,
-                        "returning completed response to client request"
-                    );
-
-                    // Replace the state with a temporary value,
-                    // so we can take ownership of the response sender.
-                    let tmp_state = std::mem::replace(&mut self.state, State::Failed);
-
-                    if let State::AwaitingResponse {
-                        handler: Handler::Finished(response),
-                        tx,
-                        ..
-                    } = tmp_state
-                    {
-                        if let Ok(response) = response.as_ref() {
-                            debug!(%response, "finished receiving peer response to Zakura request");
-                            // Add a metric for inbound responses to outbound requests.
-                            metrics::counter!(
-                                "zakura.net.in.responses",
-                                "command" => response.command(),
-                            )
-                            .increment(1);
-                        } else {
-                            debug!(error = ?response, "error in peer response to Zakura request");
-                        }
-
-                        let _ = tx.send(response.map_err(Into::into));
-                    } else {
-                        unreachable!("already checked for AwaitingResponse");
-                    }
-
-                    self.state = State::AwaitingRequest;
-                }
+                } => self.deliver_finished_response(),
 
                 // We're awaiting a response to a client request,
                 // so also wait on cancellation, timeout, and response-free block adverts.
@@ -986,6 +949,22 @@ where
                             };
 
                             self.update_state_metrics(None);
+
+                            // A block announcement that also answered the response is delivered
+                            // first, so the inbound service's load cannot cost the client a
+                            // reply the peer already gave; the announcement is then handled on
+                            // an idle connection, like any other unsolicited message.
+                            if request_msg.is_some()
+                                && matches!(
+                                    self.state,
+                                    State::AwaitingResponse {
+                                        handler: Handler::Finished(_),
+                                        ..
+                                    }
+                                )
+                            {
+                                self.deliver_finished_response();
+                            }
 
                             // If the message was not consumed as a response, or it was a
                             // block announcement that also answered the response, check
@@ -1525,6 +1504,48 @@ where
     /// processing the request (e.g., the service is shedding load), then we call
     /// fail_with to terminate the entire peer connection, shrinking the number
     /// of connected peers.
+    /// Sends the finished response of the pending client request to the client, and makes the
+    /// connection idle.
+    ///
+    /// # Panics
+    ///
+    /// If the state is not `AwaitingResponse` with a `Finished` handler.
+    fn deliver_finished_response(&mut self) {
+        // Replace the state with a temporary value,
+        // so we can take ownership of the response sender.
+        let tmp_state = std::mem::replace(&mut self.state, State::Failed);
+
+        if let State::AwaitingResponse {
+            handler: Handler::Finished(response),
+            tx,
+            span,
+        } = tmp_state
+        {
+            trace!(
+                parent: &span,
+                "returning completed response to client request"
+            );
+
+            if let Ok(response) = response.as_ref() {
+                debug!(%response, "finished receiving peer response to Zakura request");
+                // Add a metric for inbound responses to outbound requests.
+                metrics::counter!(
+                    "zakura.net.in.responses",
+                    "command" => response.command(),
+                )
+                .increment(1);
+            } else {
+                debug!(error = ?response, "error in peer response to Zakura request");
+            }
+
+            let _ = tx.send(response.map_err(Into::into));
+        } else {
+            unreachable!("the caller checked for AwaitingResponse with a Finished handler");
+        }
+
+        self.state = State::AwaitingRequest;
+    }
+
     async fn drive_peer_request(&mut self, req: Request) {
         trace!(?req);
 

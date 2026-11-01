@@ -7,11 +7,21 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# What each target checks and which decoder reads its bytes. The C1 suite manifest
+# generates its coverage rows from this table, and scripts/check-fuzz-campaign.py
+# fails a target without an entry. A new decoder gets a new corpus cache.
+[package.metadata.zakura-machine.targets]
+header_publisher = { decoder = 1, properties = ["header/publisher-policy"] }
+fork_transitions = { decoder = 1, unregistered = "a panic in the fork engine's replay is the finding; it reports no property ID" }
+header_codec_v9 = { decoder = 1, unregistered = "a panic in the version 9 codec is the finding; it reports no property ID" }
+header_pursuit = { decoder = 1, unregistered = "a panic in the pursuit replay is the finding; it reports no property ID" }
+recovery_rows = { decoder = 1, unregistered = "a panic in the recovery replay is the finding; it reports no property ID" }
+
 [dependencies]
 libfuzzer-sys = "0.4"
 zakura-chain = { path = "../../../crates/zakura-chain" }
 zakura-header-chain = { path = "../../../crates/zakura-header-chain", features = ["fuzz-impl"] }
-zakura-network = { path = "../../../crates/zakura-network", features = ["header-fuzz"] }
+zakura-network = { path = "../../../crates/zakura-network", features = ["header-fuzz", "p2p-fuzz"] }
 zakura-state = { path = "../../../crates/zakura-state", features = ["header-fuzz"] }
 
 [[bin]]
@@ -31,6 +41,13 @@ bench = false
 [[bin]]
 name = "header_pursuit"
 path = "fuzz_targets/header_pursuit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_publisher"
+path = "fuzz_targets/header_publisher.rs"
 test = false
 doc = false
 bench = false

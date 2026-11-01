@@ -1,13 +1,24 @@
 //! Supervised native Zakura dialing and redial policy.
+//!
+//! [`RedialState`] owns one peer's redial policy. [`RedialIO`] owns the dial
+//! attempts and the registration watch, and traces each attempt's phases in
+//! `discovery_dial_phase` rows.
 
 use std::{future::Future, pin::Pin, time::Duration};
 
 use zakura_quic::NodeAddr;
 use zakura_rt::{sync::watch, time::Instant};
 
-use crate::zakura::{
-    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
-};
+use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent};
+use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZakuraTrace};
+
+mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod state_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state_tests::{replay_redial_bytes, RedialReplaySummary};
+
+use state::{RedialNext, RedialStart, RedialState};
 
 /// A connection that served at least this long is treated as healthy, so the
 /// next re-dial after it drops starts from the initial (fast) backoff again
@@ -95,7 +106,8 @@ enum DialResult {
     /// Failed to establish, or served only briefly (e.g. a duplicate was closed).
     Failed,
     /// The peer speaks another ALPN; wait at least
-    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
+    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`](crate::zakura::ZAKURA_ALPN_MISMATCH_BACKOFF)
+    /// before the next dial.
     AlpnMismatch,
     /// This node hit one of its own limits before sending the peer anything
     /// (`ZakuraHandlerError::is_pre_dial_limit`). Retry after the initial
@@ -126,17 +138,15 @@ pub(crate) async fn native_dial_supervised(
 
     let shutdown = endpoint.background_shutdown_token();
     let registered = endpoint.supervisor().subscribe();
-    let supervised = run_dial_supervisor(peer_id, registered, policy, move || {
+    let trace = endpoint.trace();
+    let supervised = run_dial_supervisor(peer_id, registered, trace, policy, move || {
         let endpoint = endpoint.clone();
         let node_addr = node_addr.clone();
         let limits = limits.clone();
         Box::pin(async move {
             let started = Instant::now();
             match super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits).await {
-                Ok(()) if started.elapsed() >= ZAKURA_REDIAL_HEALTHY_CONNECTION => {
-                    DialResult::Healthy
-                }
-                Ok(()) => DialResult::Failed,
+                Ok(()) => DialResult::lasting(started.elapsed()),
                 Err(error) if error.is_alpn_mismatch() => {
                     tracing::debug!(
                         ?error,
@@ -170,135 +180,243 @@ pub(crate) async fn native_dial_supervised(
 
 /// Retry/backoff loop shared by configured bootstrap peers and the upgrade dial.
 ///
-/// Before each dial it skips a peer that is already registered (it may have
-/// dialed us first) so the two directions do not churn duplicate connections.
-/// Exits when `policy.max_attempts` consecutive attempts fail, when a
-/// `connect_once` peer connects or finishes serving, or when the supervisor's
-/// registration watch closes (node shutdown). `dial` is injected so the loop is
-/// unit-testable without real network I/O.
+/// [`RedialState`] chooses each step; see [`RedialIO::run`]. `dial` is injected
+/// so the loop is unit-testable without real network I/O.
 async fn run_dial_supervisor<F>(
     peer_id: ZakuraPeerId,
-    mut registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    trace: ZakuraTrace,
     policy: RedialPolicy,
-    mut dial: F,
+    dial: F,
 ) where
     F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
 {
-    let mut backoff = policy.initial_backoff;
-    let mut failures = 0usize;
+    RedialIO {
+        peer_id,
+        registered,
+        dial,
+        trace,
+        attempts: 0,
+    }
+    .run(RedialState::new(policy))
+    .await
+}
 
-    loop {
-        // Already connected (possibly an inbound dial from the same peer).
-        let already_registered = registered
-            .borrow_and_update()
-            .iter()
-            .any(|id| id == &peer_id);
+/// One supervised peer's runtime resources: its dial attempts and the
+/// supervisor's registration watch. [`RedialState`] decides what they do.
+struct RedialIO<F> {
+    peer_id: ZakuraPeerId,
+    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    dial: F,
+    trace: ZakuraTrace,
+    /// Attempts this supervisor has started, which numbers the next one.
+    attempts: u64,
+}
 
-        let mut attempt = if already_registered {
-            if !policy.redial_after_drop {
-                // Wait for it to deregister, then re-dial promptly.
-                zakura_rt::select! {
-                    changed = registered.changed() => {
-                        if changed.is_err() {
+impl<F> RedialIO<F>
+where
+    F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
+{
+    /// Runs attempts until `state` stops them or the registration watch closes.
+    ///
+    /// Before each dial it skips a peer that is already registered (it may have
+    /// dialed us first) so the two directions do not churn duplicate connections.
+    /// Exits when `policy.max_attempts` consecutive attempts fail, when a
+    /// `connect_once` peer connects or finishes serving, or when the supervisor's
+    /// registration watch closes (node shutdown).
+    async fn run(mut self, mut state: RedialState) {
+        loop {
+            let (mut result, mut attempt) = match state.start(self.peer_is_registered()) {
+                RedialStart::Dial => {
+                    let mut attempt = self.start_attempt();
+                    let result = self.watched_dial(&mut attempt).await;
+                    attempt.finish_dial();
+                    (result, attempt)
+                }
+                RedialStart::AwaitRegisteredSettle(timeout) => {
+                    // Wait for it to deregister, then re-dial promptly.
+                    zakura_rt::select! {
+                        changed = self.registered.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            state.registration_changed();
+                            continue;
+                        }
+                        _ = zakura_rt::time::sleep(timeout) => {
                             return;
                         }
-                        backoff = policy.initial_backoff;
-                        failures = 0;
-                        continue;
                     }
-                    _ = zakura_rt::time::sleep(policy.registered_settle_timeout) => {
+                }
+                // A maintained dial owns this peer, so score the registration the
+                // same way a dial this loop drove is scored. Two things matter.
+                //
+                // Wait for *this* peer to deregister rather than for any peer-set
+                // change: on a busy node an unrelated peer connecting is not this
+                // connection ending.
+                //
+                // Then require the registration to have lasted before crediting it
+                // as healthy. A peer that shares no service beyond discovery is
+                // closed as soon as its discovery exchange completes
+                // (`discovery_exchange_complete`), and the deregistration for the
+                // connection this loop just dialed often lands after the dial
+                // future returns. Resetting the backoff on that registration made
+                // every such peer re-dial at once, forever.
+                RedialStart::ScoreRegistration => {
+                    let mut attempt = self.start_attempt();
+                    attempt.observe_registration(true);
+                    let Some(registered_for) =
+                        wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await
+                    else {
+                        return;
+                    };
+                    attempt.observe_registration(false);
+                    (DialResult::lasting(registered_for), attempt)
+                }
+            };
+
+            // The connection deregistration can land after the dial future returns.
+            // Wait for the watch to catch up before applying this attempt's result,
+            // so the residual registration does not become a second attempt on the
+            // next loop iteration. A concurrent registration that remains healthy
+            // can still upgrade a failed dial to a healthy connection.
+            if state.waits_for_lagging_deregistration() && self.peer_is_registered() {
+                attempt.observe_registration(true);
+                let Some(registered_for) =
+                    wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await
+                else {
+                    return;
+                };
+                attempt.observe_registration(false);
+                result = result.with_lagging_registration(registered_for);
+            }
+
+            match state.record(result) {
+                RedialNext::Stop => return,
+                RedialNext::RedialNow => {}
+                // Back off, but wake early only if the peer appears in the supervisor
+                // from another connection. Ignore unrelated peer-set changes,
+                // including the deregistration from the failed attempt we just
+                // observed.
+                RedialNext::RetryAfter(wait) => {
+                    if !sleep_unless_registered(&mut self.registered, &self.peer_id, wait).await {
                         return;
                     }
                 }
             }
-
-            // A maintained dial owns this peer, so score the registration the
-            // same way a dial this loop drove is scored. Two things matter.
-            //
-            // Wait for *this* peer to deregister rather than for any peer-set
-            // change: on a busy node an unrelated peer connecting is not this
-            // connection ending.
-            //
-            // Then require the registration to have lasted before crediting it
-            // as healthy. A peer that shares no service beyond discovery is
-            // closed as soon as its discovery exchange completes
-            // (`discovery_exchange_complete`), and the deregistration for the
-            // connection this loop just dialed often lands after the dial
-            // future returns. Resetting the backoff on that registration made
-            // every such peer re-dial at once, forever.
-            let Some(registered_for) =
-                wait_for_peer_deregistration(&mut registered, &peer_id).await
-            else {
-                return;
-            };
-            if registered_for >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
-                DialResult::Healthy
-            } else {
-                DialResult::Failed
-            }
-        } else {
-            dial().await
-        };
-
-        // The connection deregistration can land after the dial future returns.
-        // Wait for the watch to catch up before applying this attempt's result,
-        // so the residual registration does not become a second attempt on the
-        // next loop iteration. A concurrent registration that remains healthy
-        // can still upgrade a failed dial to a healthy connection.
-        if policy.redial_after_drop
-            && registered
-                .borrow_and_update()
-                .iter()
-                .any(|id| id == &peer_id)
-        {
-            let Some(registered_for) =
-                wait_for_peer_deregistration(&mut registered, &peer_id).await
-            else {
-                return;
-            };
-            if registered_for >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
-                attempt = DialResult::Healthy;
-            }
         }
-
-        match attempt {
-            DialResult::Healthy => {
-                if !policy.redial_after_drop {
-                    return;
-                }
-                backoff = policy.initial_backoff;
-                failures = 0;
-                continue;
-            }
-            DialResult::LocalLimit => {
-                if !sleep_unless_registered(&mut registered, &peer_id, policy.initial_backoff).await
-                {
-                    return;
-                }
-                continue;
-            }
-            DialResult::Failed | DialResult::AlpnMismatch => {}
-        }
-
-        failures += 1;
-        if policy.max_attempts.is_some_and(|max| failures >= max) {
-            return;
-        }
-
-        // Back off, but wake early only if the peer appears in the supervisor
-        // from another connection. Ignore unrelated peer-set changes,
-        // including the deregistration from the failed attempt we just
-        // observed.
-        let wait = if attempt == DialResult::AlpnMismatch {
-            backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
-        } else {
-            backoff
-        };
-        if !sleep_unless_registered(&mut registered, &peer_id, wait).await {
-            return;
-        }
-        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
     }
+
+    /// Numbers the next attempt and traces its start.
+    fn start_attempt(&mut self) -> TracedAttempt {
+        let attempt = TracedAttempt {
+            trace: self.trace.clone(),
+            peer_id: self.peer_id.clone(),
+            attempt: self.attempts,
+            registered: false,
+            dialing: false,
+        };
+        self.attempts = self.attempts.wrapping_add(1);
+        attempt.phase(DialPhase::Recorded);
+        attempt
+    }
+
+    /// Runs one dial, and traces the peer's registrations while it runs.
+    ///
+    /// The trace reads a clone of the watch. A registration during the dial
+    /// stays unseen on the loop's own receiver, so it still wakes a later
+    /// backoff.
+    async fn watched_dial(&mut self, attempt: &mut TracedAttempt) -> DialResult {
+        attempt.dialing = true;
+        let mut registrations = self.registered.clone();
+        let mut watching = true;
+        let mut dial = (self.dial)();
+        let result = loop {
+            zakura_rt::select! {
+                biased;
+                result = &mut dial => break result,
+                changed = registrations.changed(), if watching => {
+                    watching = changed.is_ok();
+                    if watching {
+                        attempt.observe_registration(peer_in(&registrations, &self.peer_id));
+                    }
+                }
+            }
+        };
+        attempt.observe_registration(peer_in(&self.registered, &self.peer_id));
+        result
+    }
+
+    /// Whether the peer is registered now, marking the watch seen.
+    fn peer_is_registered(&mut self) -> bool {
+        self.registered
+            .borrow_and_update()
+            .iter()
+            .any(|id| id == &self.peer_id)
+    }
+}
+
+/// One attempt's `discovery_dial_phase` rows.
+///
+/// Dropping it during its dial traces how the dial ended: shutdown drops the
+/// supervisor's future, and a panic unwinds through it.
+struct TracedAttempt {
+    trace: ZakuraTrace,
+    peer_id: ZakuraPeerId,
+    attempt: u64,
+    /// Whether the last registration row showed the peer registered.
+    registered: bool,
+    /// Whether the attempt's dial is running.
+    dialing: bool,
+}
+
+impl TracedAttempt {
+    fn phase(&self, phase: DialPhase) {
+        self.trace.emit_event(|| {
+            DiscoveryDialPhaseEvent::new(
+                self.peer_id.as_bytes(),
+                DialOwner::Redial,
+                self.attempt,
+                phase,
+            )
+        });
+    }
+
+    /// Traces a change in whether the peer is registered.
+    fn observe_registration(&mut self, registered: bool) {
+        if registered != self.registered {
+            self.registered = registered;
+            self.phase(if registered {
+                DialPhase::RegistrationSeen
+            } else {
+                DialPhase::RegistrationEnded
+            });
+        }
+    }
+
+    /// Traces that the attempt's dial returned its result.
+    fn finish_dial(&mut self) {
+        self.dialing = false;
+        self.phase(DialPhase::WorkerFinished);
+    }
+}
+
+impl Drop for TracedAttempt {
+    fn drop(&mut self) {
+        if self.dialing {
+            self.phase(if std::thread::panicking() {
+                DialPhase::WorkerPanicked
+            } else {
+                DialPhase::WorkerCancelled
+            });
+        }
+    }
+}
+
+/// Whether `peer_id` is in the watch's current value. It leaves the watch's
+/// change tracking alone.
+fn peer_in(registered: &watch::Receiver<Vec<ZakuraPeerId>>, peer_id: &ZakuraPeerId) -> bool {
+    registered.borrow().iter().any(|id| id == peer_id)
 }
 
 /// Sleeps for `wait`, waking early if `peer_id` registers from another
@@ -350,9 +468,22 @@ async fn wait_for_peer_deregistration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zakura::{trace::peer_label, ZAKURA_ALPN_MISMATCH_BACKOFF};
 
     fn redial_test_peer_id() -> ZakuraPeerId {
         ZakuraPeerId::new(vec![9u8; 32]).expect("32-byte node id is valid")
+    }
+
+    /// Runs the supervisor without a trace, for tests of its dial policy.
+    async fn untraced_supervisor<F>(
+        peer_id: ZakuraPeerId,
+        registered: watch::Receiver<Vec<ZakuraPeerId>>,
+        policy: RedialPolicy,
+        dial: F,
+    ) where
+        F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
+    {
+        run_dial_supervisor(peer_id, registered, ZakuraTrace::noop(), policy, dial).await
     }
 
     fn count_dial(
@@ -380,7 +511,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_dial_supervisor(
+            untraced_supervisor(
                 redial_test_peer_id(),
                 registered,
                 policy,
@@ -403,7 +534,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_dial_supervisor(
+            untraced_supervisor(
                 redial_test_peer_id(),
                 registered,
                 policy,
@@ -432,7 +563,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_dial_supervisor(
+            untraced_supervisor(
                 peer_id,
                 registered,
                 policy,
@@ -460,7 +591,7 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             peer_id,
             registered,
             policy,
@@ -495,7 +626,7 @@ mod tests {
             }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
         };
 
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             redial_test_peer_id(),
             registered,
             policy,
@@ -527,7 +658,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(600),
-            run_dial_supervisor(
+            untraced_supervisor(
                 redial_test_peer_id(),
                 registered,
                 policy,
@@ -563,7 +694,7 @@ mod tests {
             Box::pin(async move { result }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
         };
 
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             redial_test_peer_id(),
             registered,
             policy,
@@ -610,7 +741,7 @@ mod tests {
             }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
         };
 
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             peer_id,
             registered,
             RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
@@ -657,7 +788,7 @@ mod tests {
             }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
         };
 
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             peer_id,
             registered,
             RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
@@ -698,7 +829,7 @@ mod tests {
                 Box::pin(async move { result }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
             }
         };
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             redial_test_peer_id(),
             registered,
             RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(30), 2),
@@ -720,7 +851,7 @@ mod tests {
     async fn dial_supervisor_backs_off_ten_minutes_after_alpn_mismatch() {
         let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let supervisor = tokio::spawn(run_dial_supervisor(
+        let supervisor = tokio::spawn(untraced_supervisor(
             redial_test_peer_id(),
             registered,
             RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
@@ -740,5 +871,161 @@ mod tests {
             "the redial runs once the ALPN backoff ends"
         );
         supervisor.abort();
+    }
+
+    /// A trace that queues its rows, and the queue's `(owner, attempt, phase)`
+    /// reader.
+    fn captured_trace() -> (ZakuraTrace, impl FnMut() -> Vec<(String, u64, String)>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let trace = ZakuraTrace::new(zakura_jsonl_trace::JsonlTracer::new(tx), "node");
+        let rows = move || {
+            let mut rows = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                let row: serde_json::Value =
+                    serde_json::from_slice(&event.line).expect("each trace row is JSON");
+                assert_eq!(row["event"], "discovery_dial_phase");
+                assert_eq!(row["peer"], peer_label(&redial_test_peer_id()));
+                rows.push((
+                    row["owner"]
+                        .as_str()
+                        .expect("rows name their owner")
+                        .to_owned(),
+                    row["attempt"].as_u64().expect("rows number their attempt"),
+                    row["phase"]
+                        .as_str()
+                        .expect("rows name their phase")
+                        .to_owned(),
+                ));
+            }
+            rows
+        };
+        (trace, rows)
+    }
+
+    /// Each redial attempt traces its start, the registrations during its dial,
+    /// and the dial's return, under its own number.
+    #[tokio::test(start_paused = true)]
+    async fn redial_attempts_trace_their_registration_phases() {
+        let peer_id = redial_test_peer_id();
+        let (registered_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let (trace, mut rows) = captured_trace();
+        let dial_peer = peer_id.clone();
+        let dial = move || {
+            let registered_tx = registered_tx.clone();
+            let dial_peer = dial_peer.clone();
+            Box::pin(async move {
+                let _ = registered_tx.send(vec![dial_peer]);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let _ = registered_tx.send(Vec::new());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                DialResult::Failed
+            }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_dial_supervisor(
+                peer_id,
+                registered,
+                trace,
+                RedialPolicy::connect_once(Duration::from_millis(1), Duration::from_millis(1), 2),
+                dial,
+            ),
+        )
+        .await
+        .expect("connect_once stops after its two attempts");
+
+        let expected = |attempt, phase: &str| ("redial".to_owned(), attempt, phase.to_owned());
+        assert_eq!(
+            rows(),
+            [0, 1]
+                .into_iter()
+                .flat_map(|attempt| [
+                    expected(attempt, "recorded"),
+                    expected(attempt, "registration_seen"),
+                    expected(attempt, "registration_ended"),
+                    expected(attempt, "worker_finished"),
+                ])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A registration from another connection gets an attempt's rows too, since
+    /// the loop scores it as an attempt. No dial runs for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_scored_registration_traces_no_dial() {
+        let peer_id = redial_test_peer_id();
+        let (registered_tx, registered) = tokio::sync::watch::channel(vec![peer_id.clone()]);
+        let (trace, mut rows) = captured_trace();
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            peer_id,
+            registered,
+            trace,
+            RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(1), 1),
+            count_dial(&Default::default(), DialResult::Failed),
+        ));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        registered_tx.send(Vec::new()).expect("the loop watches");
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("one failure ends the bounded dial")
+            .expect("the supervisor does not panic");
+
+        let phases: Vec<_> = rows().into_iter().map(|row| row.2).collect();
+        assert_eq!(
+            phases,
+            ["recorded", "registration_seen", "registration_ended"]
+        );
+    }
+
+    /// Shutdown drops the supervisor during a dial, which ends the attempt in
+    /// the trace.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_supervisor_traces_a_cancelled_dial() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let (trace, mut rows) = captured_trace();
+        let dial =
+            || Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = DialResult> + Send>>;
+        let supervised = run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            trace,
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(1)),
+            dial,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), supervised)
+                .await
+                .is_err(),
+            "the dial never returns"
+        );
+
+        let phases: Vec<_> = rows().into_iter().map(|row| row.2).collect();
+        assert_eq!(phases, ["recorded", "worker_cancelled"]);
+    }
+
+    /// A dial that panics ends its attempt in the trace as it unwinds.
+    #[tokio::test]
+    async fn a_panicking_dial_traces_its_end() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let (trace, mut rows) = captured_trace();
+        let dial = || {
+            Box::pin(async { panic!("the dial panics") as DialResult })
+                as Pin<Box<dyn Future<Output = DialResult> + Send>>
+        };
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            trace,
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(1)),
+            dial,
+        ));
+        let joined = tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("the panic ends the task");
+        assert!(joined.is_err_and(|error| error.is_panic()));
+
+        let phases: Vec<_> = rows().into_iter().map(|row| row.2).collect();
+        assert_eq!(phases, ["recorded", "worker_panicked"]);
     }
 }

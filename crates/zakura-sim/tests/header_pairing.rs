@@ -14,10 +14,18 @@ use std::{
     },
 };
 
+use futures::FutureExt;
 use support::{inputs, run};
 use zakura_chain::block;
-use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, HeaderLocator};
-use zakura_network::zakura::observe::{CallEnd, HeaderSyncObserver, ReactorEvent};
+use zakura_header_chain::{
+    BodyWorkOwner, BranchId, EngineSnapshot, HeaderGeneration, HeaderLocator, HeaderWorkAuthority,
+    VctRootRepairState, VctRootRepairStatus,
+};
+use zakura_network::zakura::{
+    observe::{as_call, CallEnd, HeaderSyncObserver, PortCall, ReactorEvent},
+    spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig,
+    ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
+};
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, ApplyHeaderTargetReply, HeaderChainFuture, LocatorReadPermit,
     Port, PortError, PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath,
@@ -38,7 +46,7 @@ use zakura_sim::{
     },
     observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest},
     ActionSource, Boundary, HarnessFailure, Identity, MemorySink, Observation, ObservationLog,
-    PlanInput, RunReport,
+    PlanInput, RunReport, Sim,
 };
 use zakura_storage::header::{
     adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture,
@@ -98,6 +106,189 @@ fn fact_at(report: &RunReport, seq: u64) -> &StorageFact {
             _ => None,
         })
         .unwrap_or_else(|| panic!("the node's storage logged fact {seq}"))
+}
+
+/// The node's reactor at A5 with a VCT repair to read, on `port`, reporting to
+/// `observer`. Returns the handles the run must keep and the reactor's task.
+fn repairing_reactor(
+    port: &Arc<ControlledPort>,
+    observer: Arc<dyn HeaderSyncObserver>,
+) -> (Box<dyn std::any::Any>, zakura_rt::task::JoinHandle<()>) {
+    let fixture = HeaderFixture::regtest();
+    let anchor = fixture.anchor();
+    let tip = Chain::main(5).tip(&fixture);
+    let mut startup = HeaderSyncStartup::new(
+        fixture.network().clone(),
+        (anchor.height, anchor.hash),
+        FullStateFrontiers {
+            finalized_height: anchor.height,
+            verified_block_tip: anchor.height,
+            verified_block_hash: anchor.hash,
+        },
+        Some((tip.height, tip.hash)),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    let (repairs, repairs_rx) = zakura_rt::sync::watch::channel(VctRootRepairStatus {
+        state: VctRootRepairState::Unavailable {
+            height: block::Height(1),
+        },
+        generation: 7,
+    });
+    let dyn_port: Arc<dyn Port> = port.clone();
+    startup.committed_snapshots = Some(dyn_port.selected_chain());
+    startup.vct_root_repairs = Some(repairs_rx);
+    startup.header_chain_port = dyn_port;
+    startup.observer.0 = Some(observer);
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+    (Box::new((handle, actions, repairs)), reactor)
+}
+
+/// A storage source for a run on `port`, preloaded at A5, holding the VCT context
+/// read forever, and draining `tap`.
+fn held_vct_source(sim: &mut Sim, port: &Arc<ControlledPort>, tap: ReactorTap) -> PolicySource {
+    preload(port.engine(), &HeaderFixture::regtest(), &Chain::main(5));
+    let held = Policy {
+        bound_ms: None,
+        holds: vec![Hold {
+            select: Select {
+                kind: Some(OpKind::VctContext),
+                ..Select::default()
+            },
+            // Never: the run makes no locator read.
+            until: Trigger::Submitted(Select::nth(OpKind::Locator, 1)),
+            then: vec![Allow::Engine],
+            deadline_ms: None,
+        }],
+        ..Policy::converging()
+    };
+    PolicySource::new(sim, port.clone(), held, Effects::default()).with_tap(tap)
+}
+
+/// A real reactor aborted with a call pending in real storage: the call's end
+/// names the operation it submitted, and that operation's real `CallerDropped`
+/// follows the end and pairs with it. The run ends for the reactor's loss, not
+/// for its pairing, on this base where a lost reactor always fails its run.
+#[test]
+fn a_real_dropped_call_pairs_with_its_own_receipt() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let source = held_vct_source(&mut sim, &port, tap);
+    sim.add_source(Box::new(source));
+    let (held, reactor) = repairing_reactor(&port, observer);
+    let watched = port.clone();
+    sim.scheduler().spawn_root("stopper", async move {
+        for _ in 0..1_000 {
+            if !watched.pending().is_empty() {
+                break;
+            }
+            zakura_rt::task::yield_now().await;
+        }
+        reactor.abort();
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    drop(held);
+
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert!(detail.starts_with("ReactorGone"), "{detail}");
+    let events = events(&report);
+    let (watermark, call, op) = events
+        .iter()
+        .find_map(|(storage_seq, event)| match event {
+            ReactorFact::CallEnded {
+                call,
+                end,
+                op: Some(op),
+            } if end == "dropped" => Some((*storage_seq, *call, *op)),
+            _ => None,
+        })
+        .expect("the pending call ends dropped, naming its operation");
+    assert!(
+        events.iter().any(|(_, event)| matches!(
+            event,
+            ReactorFact::Dispatched { call: dispatched, port: ReactorCall::VctContext { .. } }
+                if *dispatched == call
+        )),
+        "the dropped call is the VCT read"
+    );
+    let logged = |wanted: &dyn Fn(u64, &StorageFact) -> bool| {
+        report.log.entries().iter().any(|entry| {
+            matches!(&entry.obs, Observation::Storage { instance: 0, seq, fact, .. }
+                if wanted(*seq, fact))
+        })
+    };
+    assert!(
+        logged(&|_, fact| matches!(fact,
+            StorageFact::Submitted { id, call: submitter, .. }
+                if *id == op && *submitter == Some(call))),
+        "storage names the call that submitted the operation"
+    );
+    assert!(
+        logged(&|seq, fact| seq > watermark
+            && matches!(fact, StorageFact::CallerDropped { id } if *id == op)),
+        "the operation's receipt follows the call's end"
+    );
+}
+
+/// A call that ended dropped while its real storage call stays alive, and so
+/// leaves no receipt, fails the run once the reactor's teardown is done.
+#[test]
+fn a_drop_with_no_receipt_fails_at_teardown() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let source = PolicySource::new(
+        &mut sim,
+        port.clone(),
+        Policy::converging(),
+        Effects::default(),
+    )
+    .with_tap(tap);
+    sim.add_source(Box::new(source));
+    let submitting: Arc<dyn Port> = port.clone();
+    sim.scheduler().spawn_root("reactor", async move {
+        let hash = block::Hash([7; 32]);
+        observer.observe(ReactorEvent::Dispatched {
+            call: 1,
+            op: PortCall::Locator {
+                peer: ZakuraPeerId::new(vec![1; 32]).expect("32 bytes is a valid peer ID"),
+                session_id: 1,
+                target_tip_hash: hash,
+                scope: HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(1),
+                    branch: BranchId {
+                        anchor_hash: hash,
+                        target_tip_hash: hash,
+                    },
+                },
+            },
+        });
+        let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a fresh semaphore has a permit");
+        let mut future = submitting.continuation_locator(LocatorReadPermit::new(permit));
+        assert!(
+            as_call(1, || (&mut future).now_or_never()).is_none(),
+            "storage holds the call"
+        );
+        observer.observe(ReactorEvent::CallEnded {
+            call: 1,
+            end: CallEnd::Dropped,
+        });
+        std::mem::forget(future);
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert!(
+        detail.starts_with("UnpairedDrop: the reactor's teardown is done with call 1"),
+        "{detail}"
+    );
 }
 
 /// With the node's first locator held until 30 s after its submission, the

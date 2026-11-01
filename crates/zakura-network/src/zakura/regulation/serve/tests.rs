@@ -1383,6 +1383,30 @@ async fn one_slot_serving_drains_before_control_uses_the_slot() {
     }
 }
 
+#[test]
+fn only_more_than_twice_the_limit_is_over_committed() {
+    for limit in [0u32, 1, 2, 7, u32::MAX / 2, u32::MAX] {
+        let margin = limit.saturating_mul(2);
+        for open in [0u32, 1, limit, limit.saturating_add(1), margin] {
+            if open > margin {
+                continue;
+            }
+            let expected = if open > limit {
+                CommitmentLoad::OverLimit
+            } else {
+                CommitmentLoad::Within
+            };
+            assert_eq!(commitment_load(open, limit), Ok(expected), "{open}/{limit}");
+        }
+        if let Some(open) = limit.checked_mul(2).and_then(|twice| twice.checked_add(1)) {
+            assert_eq!(
+                commitment_load(open, limit),
+                Err(ServeViolation::OverCommitted { open, limit })
+            );
+        }
+    }
+}
+
 /// [`Scripted`], logging the node execution slots held at each lease report.
 #[derive(Debug)]
 struct Leased {
@@ -1537,4 +1561,38 @@ async fn an_unpolled_push_send_returns_its_grants() {
     drop(unpolled);
     assert_eq!(capacity.node_output.granted(), 0);
     assert_eq!(send.capacity(), 1);
+}
+
+/// Every serving peer holds its whole output budget at once, as a fast reader does
+/// because a grant reserves a response's cap until its write. None of it waits for
+/// the node budget, so these peers can't pause each other.
+#[test]
+fn every_serving_peer_can_hold_its_output_budget_at_once() {
+    const PEERS: u8 = 128;
+    let limits = crate::zakura::regulation::sizing::serve_limits(
+        1 << 20,
+        Duration::from_millis(1),
+        usize::from(PEERS),
+    );
+    let capacity = capacity(limits);
+    let peer_bytes = u32::try_from(limits.peer_output_bytes).expect("64 MiB fits u32");
+    let budgets: Vec<_> = (0..PEERS).map(|n| capacity.peer(&peer(n))).collect();
+    let grants: Vec<_> = budgets
+        .iter()
+        .map(|budgets| {
+            (
+                budgets
+                    .output
+                    .try_grant(peer_bytes)
+                    .expect("the peer budget is free"),
+                capacity
+                    .node_output
+                    .try_grant(peer_bytes)
+                    .expect("the node budget holds every peer's budget"),
+            )
+        })
+        .collect();
+    assert_eq!(capacity.node_output_held(), limits.node_output_bytes);
+    drop(grants);
+    assert_eq!(capacity.node_output_held(), 0);
 }

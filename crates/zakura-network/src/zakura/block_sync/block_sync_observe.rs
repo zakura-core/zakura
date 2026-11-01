@@ -18,6 +18,9 @@ use zakura_chain::block;
 use zakura_header_chain::BodyWorkOwner;
 
 pub use super::{
+    reactor::{
+        ActionRefusal, QueryIdentity, QueryReplyOutcome, ReactorSnapshot, ReactorTransition,
+    },
     regulated::session::AdmittedRange,
     reorder::RetainedBody,
     sequencer::{PayloadOwnership, SequencerOwnership, SubmissionOwnership},
@@ -189,6 +192,13 @@ pub enum BlockEvent {
     WorkQueue(Vec<WorkItemOwnership>),
     /// The sequencer's retained bodies, read by the sequencer task.
     Sequencer(SequencerOwnership),
+    /// The reactor completed a view, reset, or query transition.
+    Reactor {
+        /// The transition.
+        transition: ReactorTransition,
+        /// The reactor's logical state after it.
+        state: Box<ReactorSnapshot>,
+    },
     /// The sequencer task is dropping and takes no more bodies. Each queued
     /// body released after this has no next holder: the task's drop
     /// releases the bodies left in its input, and a routine's send fails.
@@ -198,6 +208,9 @@ pub enum BlockEvent {
 /// One step of a request's frame write.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RequestStep {
+    /// Admission moved the exact charge for the request's retained run from the
+    /// budget into unpublished funding.
+    Funded,
     /// The request reserved its heights and queued its frame.
     Published,
     /// Transport started writing the frame.

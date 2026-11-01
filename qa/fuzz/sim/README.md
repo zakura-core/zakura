@@ -21,6 +21,12 @@ a sanitizer must turn the feature off:
 RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s none --no-default-features race_fixtures
 ```
 
+`sim-fuzz.yml` runs each mapped target nightly and for longer on Sunday, or on a
+manual dispatch. It caches `corpus/<target>/` under the target's name and a digest of
+the trace format, adds the harness's committed seeds, and replays that corpus in a
+fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
+whose target has no harness or no campaign.
+
 ## Targets
 
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
@@ -64,6 +70,21 @@ The funding property compares actual retention with the independent model at
 completed operations. It does not establish asynchronous cancellation races,
 decoded-body retention, or backend-worker retention. Run long campaigns manually
 or nightly; this target adds no blocking PR fuzz campaign.
+
+`block_reactor_policy` uses the same pipeline for the reactor's query and view
+policy, with reactor decoder 2 read from at most 512 causal bytes. Each record
+holds the input, the exact identity of each accepted or refused query, and the
+production and model views. The target establishes pure transitions. The real
+action channel, reply routes, and shutdown have witnesses in `zakura-network`.
+
+`discovery_record_book` and `discovery_session_installation` use the shared trace
+and replay pipeline without starting QUIC. Each consumes at most 512 causal
+bytes under its own decoder-v2 identity. They compare the real owner with its
+independent model after each completed operation. They do not establish
+asynchronous races or teardown. `discovery_verification_capacity` runs the real
+handle under the scheduler and checks that unsettled verification results stay
+within the slots while a slow holder keeps the state lock. Run long campaigns
+manually or nightly; these targets add no blocking PR fuzz campaign.
 
 ## Semantic feedback
 

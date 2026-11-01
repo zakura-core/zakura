@@ -34,10 +34,123 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call.
+    /// The events recorded since the last call, without retained-header ownership.
     fn take(&self) -> Vec<ReactorEvent> {
+        self.take_all()
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    ReactorEvent::HeadersHeld { .. }
+                        | ReactorEvent::HeadersEnded { .. }
+                        | ReactorEvent::CallEnded {
+                            end: CallEnd::Dropped,
+                            ..
+                        }
+                )
+            })
+            .collect()
+    }
+
+    /// Every event recorded since the last call.
+    fn take_all(&self) -> Vec<ReactorEvent> {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
     }
+}
+
+mod retained;
+
+/// One shared log of what a [`PendingCall`](observe::PendingCall) reports and what
+/// its future holds drops, in order.
+#[derive(Debug, Default)]
+struct DropOrder(StdMutex<Vec<String>>);
+
+impl HeaderSyncObserver for DropOrder {
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .push(format!("{event:?}"));
+    }
+}
+
+/// Something a guarded future holds, which logs its own drop, as a storage call's
+/// receipt or a permit's release would.
+struct LogsDrop(Arc<DropOrder>);
+
+impl Drop for LogsDrop {
+    fn drop(&mut self) {
+        self.0
+             .0
+            .lock()
+            .expect("no test panics while holding it")
+            .push("held dropped".to_owned());
+    }
+}
+
+/// A guarded call dropped unfinished reports its dropped end before anything its
+/// future holds drops, so a storage receipt always follows its call's end.
+#[tokio::test]
+async fn a_dropped_call_reports_before_its_future_drops() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot(Some(order.clone()));
+    let held = LogsDrop(order.clone());
+    let pending = observe::PendingCall::new(
+        Box::pin(async move {
+            let _held = held;
+            std::future::pending::<()>().await
+        }),
+        observe::PortTap::new(1, &slot),
+    );
+    drop(pending);
+    assert_eq!(
+        *order.0.lock().expect("no test panics while holding it"),
+        [
+            format!(
+                "{:?}",
+                ReactorEvent::CallEnded {
+                    call: 1,
+                    end: CallEnd::Dropped
+                }
+            ),
+            "held dropped".to_owned(),
+        ]
+    );
+}
+
+/// A call that finished, or that reported its own end and then dropped at a later
+/// await, reports no second end.
+#[tokio::test]
+async fn an_ended_call_reports_no_dropped_end() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot(Some(order.clone()));
+    let mut finished =
+        observe::PendingCall::new(Box::pin(async {}), observe::PortTap::new(1, &slot));
+    (&mut finished).await;
+    drop(finished);
+    assert!(order.0.lock().expect("no test panics").is_empty());
+
+    let tap = observe::PortTap::new(2, &slot);
+    let inner = tap.clone();
+    let mut ended = observe::PendingCall::new(
+        Box::pin(async move {
+            inner.end(CallEnd::Replied);
+            std::future::pending::<()>().await
+        }),
+        tap,
+    );
+    assert!(futures::poll!(&mut ended).is_pending());
+    drop(ended);
+    assert_eq!(
+        *order.0.lock().expect("no test panics"),
+        [format!(
+            "{:?}",
+            ReactorEvent::CallEnded {
+                call: 2,
+                end: CallEnd::Replied
+            }
+        )]
+    );
 }
 
 /// Where a [`ScriptedPort`] call panics.
@@ -64,6 +177,10 @@ struct ScriptedPort {
     panic: Option<PanicAt>,
     /// Prepares the port answered.
     prepares: AtomicUsize,
+    /// Targets that later prepares seal, last first, before prepares fail.
+    prepared: StdMutex<Vec<port::PreparedHeaderTarget>>,
+    /// Applies succeed.
+    applies: bool,
 }
 
 impl ScriptedPort {
@@ -156,7 +273,12 @@ impl port::Port for ScriptedPort {
         Box::pin(async move {
             self.answer().await;
             self.prepares.fetch_add(1, Ordering::SeqCst);
-            Err(local_failure(request.owner))
+            let sealed = self
+                .prepared
+                .lock()
+                .expect("no test panics while holding it")
+                .pop();
+            sealed.ok_or_else(|| local_failure(request.owner))
         })
     }
 
@@ -168,6 +290,9 @@ impl port::Port for ScriptedPort {
         let owner = target.owner();
         Box::pin(async move {
             self.answer().await;
+            if self.applies {
+                return Ok(port::ApplyHeaderTargetOutcome::Applied);
+            }
             Err(local_failure(owner))
         })
     }
@@ -239,6 +364,7 @@ fn request_ref(active: &ActiveHeaderRequest) -> RequestRef {
         peer: active.peer.clone(),
         session_id: active.owner.session_id(),
         request_id: active.request_id.get(),
+        incarnation: active.incarnation.get(),
         owner: active.owner,
         target_tip_hash: active.target.status.selected_tip_hash,
     }
@@ -410,6 +536,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
                     peer: peer.clone(),
                     session_id: 7,
                     request_id: 9,
+                    incarnation: seeded.incarnation.get(),
                     owner: seeded.owner,
                     target_tip_hash: seeded.target.status.selected_tip_hash,
                 },
@@ -510,7 +637,10 @@ async fn handled_follows_the_callbacks_effects() {
     let seeded = active(&reactor, &peer);
     recorder.take();
 
-    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
     complete_next(&mut reactor).await;
 
     assert_eq!(
@@ -599,7 +729,10 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
         )
     };
     recorder.take();
-    assert!(reactor.dispatch_action(operation));
+    assert!(matches!(
+        reactor.dispatch_action(operation),
+        StorageDispatch::Started(_)
+    ));
 
     let _new_outbound = connect(&mut reactor, &peer, 2);
     seed_applying_request(&mut reactor, &snapshot, peer.clone(), 2);
@@ -666,14 +799,15 @@ async fn timed_out_locator_ends_timed_out() {
     recorder.take();
 
     let started = Instant::now();
-    assert!(
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     complete_next(&mut reactor).await;
 
     assert_eq!(started.elapsed(), reactor.startup.request_timeout);
@@ -739,7 +873,10 @@ async fn synthetic_prepare_ends_not_submitted() {
     recorder.take();
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
-        assert!(reactor.dispatch_action(operation));
+        assert!(matches!(
+            reactor.dispatch_action(operation),
+            StorageDispatch::Started(_)
+        ));
         complete_next(&mut reactor).await;
         assert_eq!(
             recorder.take(),
@@ -788,7 +925,10 @@ async fn port_panic_before_and_after_submission() {
         let seeded = active(&reactor, &peer);
         recorder.take();
 
-        assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        assert!(matches!(
+            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            StorageDispatch::Started(_)
+        ));
         complete_next(&mut reactor).await;
 
         assert_eq!(
@@ -852,7 +992,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     observer.recorder.take();
 
-    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
     let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
         .catch_unwind()
         .await;
@@ -900,7 +1043,10 @@ async fn observer_panic_unwinds_with_its_own_payload() {
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
 
-        assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        assert!(matches!(
+            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            StorageDispatch::Started(_)
+        ));
         let payload = AssertUnwindSafe(reactor.pending_port_operations.next())
             .catch_unwind()
             .await
@@ -984,23 +1130,31 @@ async fn offer_waiting_on_staging_full_and_locator_capacity() {
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
     recorder.take();
 
-    assert!(
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Deferred(_)
+    ));
 
     assert_eq!(
         recorder.take(),
-        vec![ReactorEvent::OfferWaiting {
-            peer,
-            session_id: 0,
-            target_tip_hash: target,
-            cause: WaitCause::LocatorCapacity,
-        }]
+        vec![
+            ReactorEvent::StorageRefused {
+                call: 1,
+                kind: StorageCallKind::Locator,
+                cause: observe::RefusalCause::LocatorCapacity,
+            },
+            ReactorEvent::OfferWaiting {
+                peer,
+                session_id: 0,
+                target_tip_hash: target,
+                cause: WaitCause::LocatorCapacity,
+            }
+        ]
     );
     assert!(reactor.pending_port_operations.is_empty());
 }

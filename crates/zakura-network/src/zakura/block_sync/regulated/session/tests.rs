@@ -474,8 +474,9 @@ fn the_serving_limit_follows_session_slots_and_configuration() {
 /// Serving enforces the advertised limit: `2 × limit` open requests are served, one more faults.
 #[tokio::test]
 async fn serving_enforces_the_budgeted_limit() {
+    let gate = Arc::new(Semaphore::new(0));
     let source = Arc::new(ControlledSource {
-        default_gate: Some(Arc::new(Semaphore::new(0))),
+        default_gate: Some(gate.clone()),
         ..Default::default()
     });
     let config = ZakuraBlockSyncConfig::default();
@@ -581,5 +582,82 @@ async fn admitted_ranges_leave_owner_state_unchanged() {
             last: Height(1),
             completed: true,
         }]
+    );
+}
+
+/// Peer serving keeps three bounds at once on the production session: the
+/// commitments it accepts, the reads that actually run, and the output it has
+/// granted. Queued requests beyond a peer's execution share spawn no worker and
+/// hold no output grant, and a cancelled session's reads return every slot as
+/// they finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serving_bounds_commitments_workers_and_outputs() {
+    let gate = Arc::new(Semaphore::new(0));
+    let source = Arc::new(ControlledSource {
+        default_gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let config = ZakuraBlockSyncConfig::default();
+    let limit = serving_max_inflight_requests(&config);
+    let limits = serving_limits(&config);
+    let peer = ZakuraPeerId::new(vec![66; 32]).unwrap();
+    let (serving, mut session, _output, cancel) = ready_session(&source, 66, 4);
+    assert!(
+        usize::try_from(2 * limit).unwrap() > limits.peer_execution,
+        "the commitment margin exceeds the workers, so the worker bound is visible"
+    );
+
+    for height in 1..=2 * limit {
+        session
+            .admit(Range::new(Height(height), 1).unwrap())
+            .unwrap();
+    }
+    assert_eq!(session.serve.open(), 2 * limit);
+    assert!(
+        session
+            .admit(Range::new(Height(2 * limit + 1), 1).unwrap())
+            .is_err(),
+        "a commitment past the margin is a violation"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while source.started.load(Ordering::SeqCst) < limits.peer_execution {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the peer's execution share starts reading");
+    // Give an over-limit dispatch time to appear before checking its absence.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(source.started.load(Ordering::SeqCst), limits.peer_execution);
+    let (workers, output_bytes) = serving.leases_held(&peer);
+    assert_eq!(workers, limits.peer_execution);
+    assert!(output_bytes > 0, "each running read holds its output grant");
+    assert!(output_bytes <= limits.peer_output_bytes);
+
+    // A storage read outlives its session, and its lease lasts as long as the read.
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(serving.leases_held(&peer).0, limits.peer_execution);
+    gate.add_permits(limits.peer_execution);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while serving.leases_held(&peer) != (0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finished reads of a cancelled session return their workers and output grants");
+}
+
+/// Every configured session can hold a whole peer budget of unsent responses, so the
+/// node's output budget never pauses a conformant peer for another's reservations.
+#[test]
+fn getblocks_node_output_funds_every_session() {
+    let config = ZakuraBlockSyncConfig::default();
+    let limits = serving_limits(&config);
+    let sessions = config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers;
+    assert_eq!(
+        limits.node_output_bytes,
+        u64::try_from(sessions).unwrap() * limits.peer_output_bytes
     );
 }

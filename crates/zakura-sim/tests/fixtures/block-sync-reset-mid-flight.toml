@@ -5,7 +5,7 @@
 # node submits its third body.
 harness = "block-sync/storage"
 generator = 2
-sha256 = "fc591c33d3cc19cf3b7773e48e4431229c8ea36911f432912f12966cb88cf427"
+sha256 = "a2c150166776359084c99f20b03c8e4b0a6f42cbc1b9ed617aea41cbac621f21"
 scenario_sha256 = "ef7a2693943a5f576cfab7e8029e9ceef242b4bd6c02d7d5b726c360bf127914"
 source = "crates/zakura-sim/tests/block_semantic_properties.rs"
 

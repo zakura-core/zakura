@@ -5,7 +5,7 @@ use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
     request::*,
-    work_queue::{RequestWriteStatus, WorkQueue},
+    work_queue::WorkQueue,
     *,
 };
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
@@ -460,14 +460,10 @@ impl BlockSyncHandle {
     }
 }
 
+/// The reactor's peer sessions and its handles to the shared download owners.
+/// The reactor's logical state lives in its `ReactorState`.
 #[derive(Debug)]
 pub(super) struct BlockSyncState {
-    pub(super) finalized_height: block::Height,
-    pub(super) verified_block_hash: block::Hash,
-    pub(super) servable_high: block::Height,
-    pub(super) servable_hash: block::Hash,
-    pub(super) best_header_tip: block::Height,
-    pub(super) best_header_hash: block::Hash,
     /// Thin per-peer handles the reactor keeps for demux/serving/admission. The
     /// per-peer *download* state moved into the spawned [`PeerRoutine`](super::peer_routine)
     /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
@@ -480,7 +476,6 @@ pub(super) struct BlockSyncState {
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
     pub(super) work_queue: Arc<WorkQueue>,
-    pub(super) needed_heights: Vec<block::Height>,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
@@ -498,28 +493,10 @@ impl BlockSyncState {
         let work_queue = work_queue.with_observer(startup.observer.clone());
         let work_queue = Arc::new(work_queue);
         Self {
-            finalized_height: startup.frontiers.finalized_height,
-            verified_block_hash: startup.frontiers.verified_block_hash,
-            servable_high: startup.frontiers.verified_block_tip,
-            servable_hash: startup.frontiers.verified_block_hash,
-            best_header_tip: startup.best_header_tip.0,
-            best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             work_queue,
-            needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-        }
-    }
-
-    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
-        BlockSyncStatus {
-            servable_low: block::Height::MIN,
-            servable_high: self.servable_high,
-            tip_hash: self.servable_hash,
-            max_blocks_per_response: config.advertised_max_blocks_per_response(),
-            max_inflight_requests: config.advertised_max_inflight_requests(),
-            max_response_bytes: config.advertised_max_response_bytes(),
         }
     }
 
@@ -725,6 +702,7 @@ impl DownloadWindow {
         self.bbr.reliability_permille()
     }
 
+    #[cfg(test)]
     pub(super) fn available_slots(&self) -> usize {
         self.available_slots_at(Instant::now())
     }
@@ -735,7 +713,7 @@ impl DownloadWindow {
 
     /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
     /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
-    /// (above-floor) capacity used by [`Self::available_slots`]; a small positive `bonus` is
+    /// (above-floor) capacity used by [`Self::available_slots_at`]; a small positive `bonus` is
     /// the floor bypass — it lets the lowest missing height be fetched even when the
     /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
     ///
@@ -936,23 +914,16 @@ impl DownloadWindow {
         self.clear_liveness_if_idle();
     }
 
-    /// Retire attempts that never reached the wire, refunding only their own
-    /// probe charges. Keep unanswered requests from this peer accountable.
-    pub(super) fn discard_skipped_requests(&mut self) -> Vec<OutstandingBlockRange> {
-        self.outstanding
-            .skipped()
-            .into_iter()
-            .filter_map(|key| self.retire_locally(key))
-            .collect()
-    }
-
-    /// End a locally retired obligation before discarding its write status. If
-    /// transport has not started, it must skip the frame and refund this probe.
-    pub(super) fn retire_locally(&mut self, key: RequestKey) -> Option<OutstandingBlockRange> {
+    /// End a locally retired obligation whose write settled as `write`. A
+    /// request that never reached the wire refunds its own probe charge.
+    pub(super) fn retire_locally(
+        &mut self,
+        key: RequestKey,
+        write: WriteOutcome,
+    ) -> Option<OutstandingBlockRange> {
         let charged = self.outstanding.is_charged_for_liveness(key);
         let outstanding = self.outstanding.remove(key)?;
-        outstanding.write_status.expire_unwritten();
-        if outstanding.write_status.was_skipped() && charged {
+        if write == WriteOutcome::Skipped && charged {
             self.requests_without_block_progress =
                 self.requests_without_block_progress.saturating_sub(1);
         }
@@ -1013,23 +984,29 @@ impl DownloadWindow {
 pub(super) struct PeerBlockState {
     pub(super) session: BlockSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
-    pub(super) status_delivery: super::status::StatusDelivery,
 }
 
 impl PeerBlockState {
     pub(super) fn new(session: BlockSyncPeerSession) -> Self {
         Self {
             direction: session.direction(),
-            status_delivery: super::status::StatusDelivery::new(Instant::now()),
             session,
         }
     }
 }
 
+/// How a published request's frame write settled.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum WriteOutcome {
+    /// Transport skipped the frame, or will skip it, so the peer never saw it.
+    Skipped,
+    /// Transport started writing the frame, so the peer may owe a response.
+    Started,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
-    pub(super) write_status: RequestWriteStatus,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,

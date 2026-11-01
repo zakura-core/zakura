@@ -14,6 +14,12 @@
 //! A call caught panicking ends the run with
 //! [`HarnessFailure::ReactorPortPanicked`] once its drain is logged.
 //!
+//! The reactor's teardown is done once the observer is gone, since every pending
+//! call's future holds a clone through its drop. Every dropped call's operation
+//! must have its drop receipt by then, unless storage's shutdown removed it while
+//! the call still existed, or the run fails as `UnpairedDrop`. A run that ends
+//! before the teardown is done leaves that open.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -27,8 +33,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, PortCall, ReactorEvent, RequestRef,
-        WaitCause,
+        CallEnd, HeaderSyncObserver, HeaderTargetPhase, HeaderWorkLedger, PortCall, ReactorEvent,
+        RefusalCause, RequestRef, StorageCallKind, WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
@@ -76,6 +82,15 @@ struct TapState {
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
     buffer: Mutex<Buffer>,
+    /// Checks each call's identity and retained headers as events arrive.
+    work: Mutex<WorkCheck>,
+}
+
+/// The tap's ownership check, and the first rule a history broke.
+#[derive(Default)]
+struct WorkCheck {
+    ledger: HeaderWorkLedger,
+    broken: Option<String>,
 }
 
 /// Events recorded and not yet drained.
@@ -92,6 +107,20 @@ impl TapState {
     /// elsewhere can't leave it half changed.
     fn buffer(&self) -> std::sync::MutexGuard<'_, Buffer> {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Feeds `event` to the ownership check, keeping the first broken rule.
+    fn check_work(&self, event: &ReactorEvent) {
+        let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        if work.broken.is_none() {
+            work.broken = work.ledger.observe(event).err();
+        }
+    }
+
+    /// The first rule this run's history broke.
+    fn broken_work_rule(&self) -> Option<String> {
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.broken.clone()
     }
 }
 
@@ -134,10 +163,35 @@ impl HeaderSyncObserver for TapObserver {
     /// tap's run. Neither step yields.
     fn observe(&self, event: ReactorEvent) {
         let state = &self.0;
-        if zakura_rt::sim::run_id() != Some(state.run) {
+        let in_run = zakura_rt::sim::run_id() == Some(state.run);
+        // Ownership events stay out of the observation log, whose format pinned
+        // Plans fix.
+        if matches!(
+            event,
+            ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
+        ) {
+            if in_run {
+                state.check_work(&event);
+            }
+            return;
+        }
+        // The run's own shutdown drops a live reactor after the log froze.
+        if !in_run
+            && matches!(
+                event,
+                ReactorEvent::CallEnded {
+                    end: CallEnd::Dropped,
+                    ..
+                }
+            )
+        {
+            return;
+        }
+        if !in_run {
             state.refused.store(true, Ordering::Relaxed);
             return;
         }
+        state.check_work(&event);
         // The port's own std lock, which the reactor never holds here.
         let storage_seq = match state.port.upgrade() {
             Some(port) => port.last_seq(),
@@ -180,6 +234,7 @@ impl ReactorTap {
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
                 buffer: Mutex::default(),
+                work: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -292,6 +347,25 @@ fn call(call: PortCall) -> ReactorCall {
     }
 }
 
+/// `kind`'s name.
+fn call_kind(kind: StorageCallKind) -> &'static str {
+    match kind {
+        StorageCallKind::Locator => "locator",
+        StorageCallKind::VctRepairContext => "vct-context",
+        StorageCallKind::Prepare => "prepare",
+        StorageCallKind::Apply => "apply",
+    }
+}
+
+/// `cause`'s name.
+fn refusal_cause(cause: RefusalCause) -> &'static str {
+    match cause {
+        RefusalCause::LocatorCapacity => "locator-capacity",
+        RefusalCause::LocalOperationBusy => "local-operation-busy",
+        RefusalCause::ExternalQueue => "external-queue",
+    }
+}
+
 /// `end`'s name.
 fn end(end: CallEnd) -> &'static str {
     match end {
@@ -300,6 +374,7 @@ fn end(end: CallEnd) -> &'static str {
         CallEnd::TimedOut => "timed-out",
         CallEnd::NotSubmitted => "not-submitted",
         CallEnd::PortPanicked => "port-panicked",
+        CallEnd::Dropped => "dropped",
     }
 }
 
@@ -333,6 +408,12 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             op: None,
         },
         ReactorEvent::Handled { call, panicked } => ReactorFact::Handled { call, panicked },
+        ReactorEvent::StorageJoined { call } => ReactorFact::StorageJoined { call },
+        ReactorEvent::StorageRefused { call, kind, cause } => ReactorFact::StorageRefused {
+            call,
+            kind: call_kind(kind).to_owned(),
+            cause: refusal_cause(cause).to_owned(),
+        },
         ReactorEvent::Started {
             request: started,
             purpose: why,
@@ -397,7 +478,8 @@ impl ActionSource for ReactorTap {
     /// order, and records what it delivered in the checkpoint. A drain that
     /// doesn't pair is still logged, then fails, unless the tap is unhealthy,
     /// which the run reports instead, or records a port panic as the run's
-    /// harness failure.
+    /// harness failure. Once the reactor's teardown is done, a dropped call still
+    /// waiting for its drop receipt fails as `UnpairedDrop`.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -434,8 +516,18 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
+        if let Some(rule) = self.state.broken_work_rule() {
+            return Err(rule);
+        }
         match paired {
-            Ok(()) => Ok(()),
+            Ok(()) => match self.pairer.waiting_drop() {
+                Some((call, op)) if self.state.observer.strong_count() == 0 => Err(format!(
+                    "UnpairedDrop: the reactor's teardown is done with call {call} dropped and \
+                     its operation {op} given no drop receipt, and no shutdown removed it while \
+                     the call still existed"
+                )),
+                _ => Ok(()),
+            },
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or

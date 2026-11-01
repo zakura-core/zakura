@@ -91,6 +91,90 @@ async fn a_saturated_gate_holds_the_payload_until_capacity_returns() -> Result<(
     Ok(())
 }
 
+/// One stream's unfunded frame stays in QUIC's buffers, where the peer memory budget
+/// funds it, while a second stream on the same saturated connection delivers its floor
+/// frame. Neither frame adds to the node's raw charge, so nothing counts twice.
+#[tokio::test]
+async fn a_saturated_node_delivers_another_streams_floor_frame() -> Result<(), BoxError> {
+    let mut link = Link::connect().await?;
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+        1 << 20,
+        1,
+    )));
+    let connection = node.connection();
+    let (raw_hold, output_hold) = node.hold_node_budgets();
+    let held_raw = node.usage().raw_bytes;
+
+    let mut paused = tabled_context(None, 128);
+    paused.resources = connection.stream();
+    let paused_floor = paused.resources.raw.try_admit(1).unwrap();
+    let mut flowing = tabled_context(None, 128);
+    flowing.resources = connection.stream();
+    assert_eq!(node.usage().owners.setup, 2);
+
+    let bytes = frame_bytes(1, 16);
+    let (_paused_peer_send, _paused_peer_recv, send, recv) = link.open(&bytes).await?;
+    let (paused_tx, mut paused_rx) = mpsc::channel(4);
+    let (_paused_outbound, outbound_rx) = worker_framed_channel(1);
+    let paused_cancel = paused.connection_token.clone();
+    paused.precheck.start();
+    let paused_worker = AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker(
+        send,
+        recv,
+        prelude(None),
+        paused,
+        paused_tx,
+        outbound_rx,
+        4,
+    )));
+
+    let (_flowing_peer_send, _flowing_peer_recv, send, recv) = link.open(&bytes).await?;
+    let (flowing_tx, mut flowing_rx) = mpsc::channel(4);
+    let (_flowing_outbound, outbound_rx) = worker_framed_channel(1);
+    let flowing_cancel = flowing.connection_token.clone();
+    flowing.precheck.start();
+    let flowing_worker = AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker(
+        send,
+        recv,
+        prelude(None),
+        flowing,
+        flowing_tx,
+        outbound_rx,
+        4,
+    )));
+
+    let delivered = timeout(TEST_TIMEOUT, flowing_rx.recv())
+        .await?
+        .ok_or("the second stream's floor funds its frame")?;
+    assert_eq!(delivered.frame.payload, vec![1; 16]);
+    assert!(
+        timeout(HELD, paused_rx.recv()).await.is_err(),
+        "the first stream's floor is taken, so its frame stays in QUIC"
+    );
+    assert_eq!(
+        node.usage().raw_bytes,
+        held_raw,
+        "unread and floor frames add no raw charge"
+    );
+
+    drop(paused_floor);
+    let released = timeout(TEST_TIMEOUT, paused_rx.recv())
+        .await?
+        .ok_or("the returned floor slot admits the held frame")?;
+    assert_eq!(released.frame.payload, vec![1; 16]);
+
+    drop((delivered, released));
+    paused_cancel.cancel();
+    flowing_cancel.cancel();
+    timeout(TEST_TIMEOUT, paused_worker).await??;
+    timeout(TEST_TIMEOUT, flowing_worker).await??;
+    assert_eq!(node.usage().owners.total(), 0);
+    drop((raw_hold, output_hold));
+    assert_eq!(node.usage().raw_bytes, 0);
+    link.close().await;
+    Ok(())
+}
+
 /// A peer that declares a large frame and stops holds its admitted bytes only
 /// until cancellation ends the reader. Each stream's owner leaves the count.
 #[tokio::test]

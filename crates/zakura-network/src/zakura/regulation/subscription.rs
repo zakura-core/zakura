@@ -100,7 +100,10 @@ mod tests;
 use thiserror::Error;
 
 pub(crate) use credit::{within_window, CreditExceeded, ResponseCredit, Totals};
-pub(crate) use publisher::{Applied, PageStall, Publications, TerminalPermit};
+pub(crate) use publisher::{
+    Applied, PageStall, PublicationLedger, PublicationOpened, PublicationReporter,
+    PublicationSlots, Publications, SlotId, SlotOffer, TerminalPermit,
+};
 pub(crate) use subscriber::{
     SharedSubscriptions, SubscribeRefused, SubscriptionEnded, Subscriptions, Update,
 };

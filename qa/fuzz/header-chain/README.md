@@ -11,7 +11,7 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . header_codec_v9
 ```
 
 The available targets are `header_codec_v9`, `fork_transitions`, `header_pursuit`,
-and `recovery_rows`. `header_codec_v9` fuzzes the header sync version 9 codec.
+`header_publisher`, and `recovery_rows`. `header_codec_v9` fuzzes the header sync version 9 codec.
 Its first input byte selects the header size and message type, and the rest is
 the payload.
 `cargo-fuzz` creates and updates each target's local `corpus/` and `artifacts/`
@@ -27,6 +27,18 @@ When libFuzzer reports a failure, reproduce and minimize the artifact:
 cargo +nightly-2026-07-15 fuzz run --fuzz-dir . header_codec_v9 path/to/crash-artifact
 cargo xtask minimize-header-fuzz qa/fuzz/header-chain/artifacts/<target>/crash-…
 ```
+
+`header-fuzz.yml` runs each target nightly and for longer on Sunday, or on a manual
+dispatch. It caches `corpus/<target>/` under the target's name and decoder version,
+and replays that corpus in a fresh process before fuzzing:
+
+```console
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> corpus/<target> -- -runs=0
+```
+
+The `[package.metadata.zakura-machine.targets]` table in `Cargo.toml` registers each
+target's properties and decoder version. `scripts/check-fuzz-campaign.py` fails a pull
+request whose target has no entry or no campaign.
 
 Turn every confirmed bug into a normal deterministic test in the owning crate.
 Do not commit raw or minimized corpus files.

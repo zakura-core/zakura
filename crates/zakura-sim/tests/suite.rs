@@ -474,6 +474,79 @@ fn an_unmapped_fuzz_target_fails() {
     );
 }
 
+/// Coverage comes from the harness registry and the machine tables, so each row
+/// reaches a target or names the harness whose missing-target row explains it.
+#[test]
+fn the_generated_coverage_joins_harnesses_and_machines() {
+    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+        panic!("{problems}");
+    });
+    let property_ids: BTreeSet<_> = manifest
+        .properties
+        .iter()
+        .map(|row| row.property.clone())
+        .collect();
+    let machine_ids: BTreeSet<_> = manifest
+        .targets
+        .iter()
+        .flat_map(|row| row.properties.clone())
+        .collect();
+    let covered: BTreeSet<_> = manifest
+        .coverage
+        .iter()
+        .map(|row| row.property.clone())
+        .collect();
+    assert_eq!(
+        covered,
+        property_ids.union(&machine_ids).cloned().collect(),
+        "the rows are exactly the declared properties"
+    );
+    for row in &manifest.coverage {
+        let missing = row.harnesses.iter().any(|harness| {
+            manifest
+                .harnesses
+                .iter()
+                .any(|entry| entry.harness == *harness && entry.missing_target.is_some())
+        });
+        assert!(missing || !row.targets.is_empty(), "{row:?}");
+    }
+    let block_query = manifest
+        .coverage
+        .iter()
+        .find(|row| row.property == "block/query-dispatch")
+        .expect("the p2p machine table declares this property");
+    assert_eq!(block_query.targets, ["target/p2p/block_query"]);
+}
+
+/// A fuzz package's target outside the simulator needs a machine registration.
+#[test]
+fn a_machine_target_without_a_registration_fails() {
+    let dir = scratch();
+    let package = dir.path().join("qa/fuzz/machine");
+    fs::create_dir_all(package.join("fuzz_targets")).unwrap();
+    fs::write(package.join("fuzz_targets/plain.rs"), "fn main() {}\n").unwrap();
+    fs::write(package.join("fuzz_targets/empty.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname = \"machine-fuzz\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [package.metadata.zakura-machine.targets]\nempty = { decoder = 1 }\n\
+         stale = { decoder = 1, properties = [\"a/b\"] }\n\n\
+         [[bin]]\nname = \"plain\"\npath = \"fuzz_targets/plain.rs\"\n\n\
+         [[bin]]\nname = \"empty\"\npath = \"fuzz_targets/empty.rs\"\n\n[workspace]\n",
+    )
+    .unwrap();
+
+    let problems = problems_at(dir.path(), &scratch_suite(None, &[]));
+
+    assert_problem(
+        &problems,
+        "qa/fuzz/machine defines the target `plain`, and its \
+         `[package.metadata.zakura-machine.targets]` table doesn't register it",
+    );
+    assert_problem(&problems, "must give the machine `empty` either properties");
+    assert_problem(&problems, "registers `stale` as a machine");
+}
+
 #[test]
 fn a_simulator_target_neither_excluded_nor_mapped_fails() {
     let dir = scratch();
@@ -637,7 +710,12 @@ fn every_problem_is_reported_at_once() {
 #[test]
 fn the_nightly_pin_matches_the_workflows() {
     let workflows = seed::repo_root().join(".github/workflows");
-    for file in ["header-fuzz.yml", "tests-unit.yml"] {
+    for file in [
+        "header-fuzz.yml",
+        "p2p-fuzz.yml",
+        "sim-fuzz.yml",
+        "tests-unit.yml",
+    ] {
         let text = std::fs::read_to_string(workflows.join(file)).unwrap();
         assert!(text.contains(NIGHTLY), "{file} doesn't pin {NIGHTLY}");
     }

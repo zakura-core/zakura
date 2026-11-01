@@ -31,7 +31,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
         PeerSession::from_parts_with_session_id(peer.clone(), session_id, send, cancel.clone()),
     ));
     assert!(
-        reactor.peer_state.contains_key(&peer),
+        reactor.sessions.contains_key(&peer),
         "the fixture peer starts admitted"
     );
     EvictionFixture {
@@ -50,13 +50,14 @@ impl EvictionFixture {
     /// Strike count charged against the currently admitted session, if any.
     fn unproductive_requests(&self) -> Option<u32> {
         self.reactor
-            .peer_state
+            .state
+            .peers
             .get(&self.peer)
-            .map(|state| state.unproductive_requests)
+            .map(|schedule| schedule.unproductive_requests)
     }
 
     fn is_admitted(&self) -> bool {
-        self.reactor.peer_state.contains_key(&self.peer)
+        self.reactor.sessions.contains_key(&self.peer)
     }
 
     /// Publish one request owned by `session_id` and let its deadline expire unanswered.
@@ -69,6 +70,7 @@ impl EvictionFixture {
         );
         let deadline = Instant::now();
         self.reactor
+            .state
             .request_deadlines
             .insert(self.peer.clone(), deadline);
         self.reactor.retire_timed_out_requests(deadline);

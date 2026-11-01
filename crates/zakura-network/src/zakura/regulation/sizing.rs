@@ -37,15 +37,19 @@ pub(crate) const fn peer_output_bytes() -> u64 {
     2 * DEFAULT_ZAKURA_SEND_WINDOW
 }
 
-/// Unsent response bytes the whole node may hold: twice the bandwidth-delay
-/// product, so the node can fill the target link.
+/// Unsent response bytes the whole node may hold for `peers` serving peers
+/// that may each hold `peer_bytes`: all of it at once, so a conformant peer
+/// can't pause another one. A grant reserves a response's whole cap until the
+/// write, so peers that read at full speed still hold their budget.
 ///
 /// This bounds encoded bytes, not allocator or queue overhead. Response slots
 /// separately bound per-response bookkeeping. A non-reading peer's frames
-/// stay queued until its stream's write deadline. Serving fairness between
-/// peers that stop reading belongs to prioritization, not to this bound.
-pub(crate) const fn node_output_bytes() -> u64 {
-    2 * bandwidth_delay_bytes()
+/// stay queued until its stream's write deadline. The node budget can only
+/// bind on responses of a session that released its slot.
+pub(crate) const fn node_output_bytes(peers: usize, peer_bytes: u64) -> u64 {
+    let peers = if peers == 0 { 1 } else { peers };
+    // Widening usize to u64 is lossless on supported targets.
+    peer_bytes.saturating_mul(peers as u64)
 }
 
 /// Node execution slots for responses of `response_bytes` that take
@@ -72,21 +76,27 @@ pub(crate) const fn node_execution(response_bytes: u64, produce_time: Duration) 
     }
 }
 
-/// Serving limits for responses of at most `largest_response` bytes that
-/// take `produce_time` each.
+/// Serving limits for at most `peers` serving peers and responses of at most
+/// `largest_response` bytes that take `produce_time` each.
 ///
 /// One peer may use half the node's execution slots: the node default is
 /// already twice what one connection needs, so a single peer still reaches
 /// the target, and a stalled peer cannot hold every slot.
-pub(crate) const fn serve_limits(largest_response: u64, produce_time: Duration) -> ServeLimits {
+pub(crate) const fn serve_limits(
+    largest_response: u64,
+    produce_time: Duration,
+    peers: usize,
+) -> ServeLimits {
     let node_execution = node_execution(largest_response, produce_time);
+    let peer_bytes = max(peer_output_bytes(), largest_response);
+    let node_bytes = node_output_bytes(peers, peer_bytes);
     ServeLimits {
-        node_output_responses: output_responses(max(node_output_bytes(), largest_response)),
-        peer_output_responses: output_responses(max(peer_output_bytes(), largest_response)),
+        node_output_responses: output_responses(node_bytes),
+        peer_output_responses: output_responses(peer_bytes),
         node_execution,
         peer_execution: node_execution.div_ceil(2),
-        peer_output_bytes: max(peer_output_bytes(), largest_response),
-        node_output_bytes: max(node_output_bytes(), largest_response),
+        peer_output_bytes: peer_bytes,
+        node_output_bytes: node_bytes,
     }
 }
 
@@ -166,13 +176,13 @@ mod tests {
             (32 << 20, Duration::from_millis(50)),
             (4 << 30, Duration::from_secs(1)),
         ] {
-            let limits = serve_limits(largest, produce_time);
+            let limits = serve_limits(largest, produce_time, 92);
             assert!(limits.node_execution >= node_execution(largest, produce_time));
             // One peer alone still gets the undoubled Little's-law count.
             assert!(2 * limits.peer_execution >= limits.node_execution);
             assert!(limits.peer_output_bytes >= peer_output_bytes());
             assert!(limits.peer_output_bytes >= largest);
-            assert!(limits.node_output_bytes >= node_output_bytes());
+            assert_eq!(limits.node_output_bytes, 92 * limits.peer_output_bytes);
             assert!(limits.node_output_bytes >= largest);
         }
     }
@@ -182,9 +192,15 @@ mod tests {
         assert_eq!(output_responses(1), 1);
         assert_eq!(output_responses(4096), 1);
         assert_eq!(output_responses(4097), 2);
-        let limits = serve_limits(12, Duration::from_micros(1));
+        let limits = serve_limits(12, Duration::from_micros(1), 2);
         assert_eq!(limits.peer_output_responses, 16_384);
-        assert_eq!(limits.node_output_responses, 305_176);
+        assert_eq!(limits.node_output_responses, 32_768);
+    }
+
+    #[test]
+    fn no_peers_still_fund_one_peers_output() {
+        let limits = serve_limits(12, Duration::from_micros(1), 0);
+        assert_eq!(limits.node_output_bytes, limits.peer_output_bytes);
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# Installs a verification result whose session was superseded.
+input = "crates/zakura-sim/tests/fixtures/discovery-session-installation.bin"
+# The harness drives discovery state and the transport types under it.
+checks = ["crates/zakura-network/src/zakura"]

@@ -213,6 +213,13 @@ smoke-secs = 60
 args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
+[[target]]
+package = "header-chain"
+name = "header_publisher"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
+timeout-secs = 2700
+
 # RocksDB keeps process-global allocations after each temporary database
 # closes, so the exit-time leak check is off too, as header-fuzz.yml and the
 # package's README say.
@@ -505,6 +512,13 @@ timeout-secs = 1800
 
 [[target]]
 package = "p2p"
+name = "discovery_book"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
 name = "block_peer_registry"
 smoke-secs = 60
 args = ["-max_len=512"]
@@ -512,7 +526,70 @@ timeout-secs = 1800
 
 [[target]]
 package = "p2p"
+name = "discovery_state"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
 name = "block_retry_authority"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_session"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_query"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_redial"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_fill"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_query"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_reactor"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_request_lifecycle"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_candidate"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
@@ -526,7 +603,21 @@ timeout-secs = 1800
 
 [[target]]
 package = "sim"
+name = "discovery_record_book"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
 name = "block_work_funding"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "discovery_session_installation"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
@@ -555,6 +646,33 @@ timeout-secs = 1800
 [[target]]
 package = "p2p"
 name = "block_sequencer_reset"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "header_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "discovery_verification_capacity"
+smoke-secs = 60
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "header_publisher_policy"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800

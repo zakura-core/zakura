@@ -403,6 +403,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         FactKind::ShutDown { dropped, deferred } => StorageFact::ShutDown {
             dropped: dropped.into_iter().map(|id| id.0).collect(),
             deferred: deferred.iter().map(request).collect(),
+            callers_alive: Vec::new(),
         },
     };
     Observation::Storage {

@@ -1,0 +1,182 @@
+name: Simulator fuzzing
+
+on:
+  # Run a bounded campaign daily, and a longer one on Sunday.
+  schedule:
+    - cron: "58 5 * * 1-6"
+    - cron: "58 5 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.13.2
+  SIM_FUZZ_NIGHTLY: nightly-2026-07-15
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+  # Without this flag the package fails with a `compile_error!`.
+  RUSTFLAGS: --cfg zakura_sim
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `max_len: 0` lets libFuzzer choose, because the suite sets no limit for the target.
+          - target: discovery_wait_complete
+            harness: discovery/wait-complete
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 0
+          - target: discovery_verification_capacity
+            harness: discovery/verification-capacity
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 0
+          - target: discovery_record_book
+            harness: discovery/record-book
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: discovery_session_installation
+            harness: discovery/session-installation
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: header_sync_storage
+            harness: header-sync/storage
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 4096
+          - target: race_fixtures
+            harness: fixtures/all
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 0
+          - target: block_work_ownership
+            harness: block/work-ownership
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: block_work_funding
+            harness: block/work-funding
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: block_decoded_retention
+            harness: block/decoded-retention
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: header_reactor_policy
+            harness: header/reactor-policy
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: header_publisher_policy
+            harness: header/publisher-policy
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+          - target: block_reactor_policy
+            harness: block/reactor-policy
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 4096
+            max_len: 512
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: ${{ env.SIM_FUZZ_NIGHTLY }}
+          cache: true
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Restore the target's corpus
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 #v4.2.3
+        with:
+          path: qa/fuzz/sim/corpus/${{ matrix.target }}
+          # The trace format decides what the bytes mean, so a new format starts a new corpus.
+          key: sim-fuzz-corpus-${{ matrix.target }}-${{ hashFiles('crates/zakura-sim/src/record.rs') }}-${{ github.run_id }}
+          restore-keys: |
+            sim-fuzz-corpus-${{ matrix.target }}-${{ hashFiles('crates/zakura-sim/src/record.rs') }}-
+      - name: Add the harness's committed seeds
+        env:
+          HARNESS: ${{ matrix.harness }}
+          TARGET: ${{ matrix.target }}
+        run: cargo xtask sim-seeds --sim "${HARNESS}" --out "qa/fuzz/sim/corpus/${TARGET}"
+      - name: Replay the corpus in a fresh process
+        working-directory: qa/fuzz/sim
+        env:
+          TARGET: ${{ matrix.target }}
+          RSS_MB: ${{ matrix.rss_mb }}
+        run: |
+          cargo fuzz run --fuzz-dir . "${TARGET}" "corpus/${TARGET}" -- \
+            -runs=0 \
+            -rss_limit_mb="${RSS_MB}"
+      - name: Run bounded campaign
+        working-directory: qa/fuzz/sim
+        env:
+          NORMAL_SECONDS: ${{ matrix.seconds }}
+          WEEKLY_SECONDS: ${{ matrix.weekly_seconds }}
+          SCHEDULE: ${{ github.event.schedule }}
+          TARGET: ${{ matrix.target }}
+          RSS_MB: ${{ matrix.rss_mb }}
+          MAX_LEN: ${{ matrix.max_len }}
+        run: |
+          seconds="${NORMAL_SECONDS}"
+          if [ "${SCHEDULE}" = "58 5 * * 0" ]; then
+            seconds="${WEEKLY_SECONDS}"
+          fi
+          # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+          cargo fuzz run --fuzz-dir . "${TARGET}" -- \
+            -max_total_time="${seconds}" \
+            -rss_limit_mb="${RSS_MB}" \
+            -max_len="${MAX_LEN}"
+      - name: Replay crash artifacts in a fresh process
+        if: failure()
+        working-directory: qa/fuzz/sim
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          for artifact in artifacts/"${TARGET}"/*; do
+            [ -f "${artifact}" ] || continue
+            # A second failure confirms the artifact; the campaign already failed the job.
+            cargo fuzz run --fuzz-dir . "${TARGET}" "${artifact}" -- -runs=1 || true
+          done
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: sim-fuzz-${{ matrix.target }}-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: qa/fuzz/sim/artifacts/${{ matrix.target }}

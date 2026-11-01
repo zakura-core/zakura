@@ -1,0 +1,14 @@
+--- a/crates/zakura-network/src/zakura/regulation/subscription/publisher.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/publisher.rs
+@@ -396,11 +396,6 @@
+         if published.sent.len() >= history {
+             return Err(PageStall::HistoryFull);
+         }
+-        // The check above found enough unspent credit, so this spends it.
+-        published
+-            .credit
+-            .consume(u64::from(objects), bytes)
+-            .map_err(|_| PageStall::NoCredit)?;
+         published
+             .sent
+             .push_back((cursor, published.credit.consumed()));

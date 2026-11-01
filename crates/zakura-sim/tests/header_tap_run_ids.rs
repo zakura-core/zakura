@@ -34,10 +34,7 @@ fn registration_and_runtime_run_ids_can_differ() {
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let emitter = observer.clone();
     sim.scheduler().spawn_root("reactor", async move {
-        emitter.observe(ReactorEvent::Handled {
-            call: 1,
-            panicked: false,
-        });
+        emitter.observe(ReactorEvent::StorageJoined { call: 1 });
     });
     sim.add_source(Box::new(tap));
     let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
@@ -54,7 +51,7 @@ fn registration_and_runtime_run_ids_can_differ() {
         report.log.entries().iter().any(|entry| matches!(
             entry.obs,
             Observation::Reactor {
-                event: ReactorFact::Handled { call: 1, .. },
+                event: ReactorFact::StorageJoined { call: 1 },
                 ..
             }
         )),

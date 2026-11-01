@@ -15,6 +15,8 @@
 //! - a harness that no target runs and no `missing-target` row names;
 //! - a fuzz target that `qa/suite.toml` neither maps nor excludes;
 //! - a simulator fuzz target that its package's table maps to no harness;
+//! - another fuzz target that its package's machine table doesn't register, or
+//!   registers with neither a property nor a reason;
 //! - a simulator-only test target that a package's `tests` list leaves out;
 //! - a simulator package whose library row runs and has no unit tests;
 //! - an ignored test that `qa/suite.toml` doesn't list, or an attribute
@@ -339,6 +341,41 @@ impl Build {
     }
 }
 
+/// One row per property ID: each harness that reports it and each target that
+/// reaches it, by running one of those harnesses or checking it as a machine.
+fn coverage_rows(
+    harnesses: &[HarnessRow],
+    properties: &[PropertyRow],
+    targets: &[TargetRow],
+) -> Vec<CoverageRow> {
+    let mut rows: BTreeMap<String, CoverageRow> = BTreeMap::new();
+    for property in properties {
+        let row = rows.entry(property.property.clone()).or_default();
+        row.harnesses.push(property.harness.clone());
+        if let Some(harness) = harnesses
+            .iter()
+            .find(|harness| harness.harness == property.harness)
+        {
+            row.targets.extend(harness.targets.iter().cloned());
+        }
+    }
+    for target in targets {
+        for property in &target.properties {
+            let row = rows.entry(property.clone()).or_default();
+            row.targets.push(target.id.clone());
+        }
+    }
+    rows.into_iter()
+        .map(|(property, mut row)| {
+            row.id = format!("coverage/{property}");
+            row.property = property;
+            row.targets.sort();
+            row.targets.dedup();
+            row
+        })
+        .collect()
+}
+
 /// `true`, for serde defaults.
 fn yes() -> bool {
     true
@@ -412,6 +449,9 @@ pub struct Manifest {
     pub seed_witnesses: Vec<SeedWitnessRow>,
     /// One row per fuzz target the suite runs.
     pub targets: Vec<TargetRow>,
+    /// One row per property ID, generated from the harness registry and the
+    /// fuzz packages' machine tables.
+    pub coverage: Vec<CoverageRow>,
     /// One row per missing target and planned property, harness or
     /// feature.
     pub pending: Vec<PendingRow>,
@@ -488,6 +528,8 @@ pub struct Counts {
     pub seed_witnesses: usize,
     /// Target rows.
     pub targets: usize,
+    /// Coverage rows.
+    pub coverage: usize,
     /// Pending rows, by kind name.
     pub pending: BTreeMap<String, usize>,
     /// Excluded rows.
@@ -670,12 +712,31 @@ pub struct TargetRow {
     pub harness: Option<String>,
     /// The harnesses it covers through `harness`.
     pub covers: Vec<String>,
+    /// The property IDs it checks, from its package's
+    /// `[package.metadata.zakura-machine.targets]` table.
+    pub properties: Vec<String>,
+    /// The decoder version that reads its bytes, from the same table.
+    pub decoder: Option<u32>,
     /// The smoke run's length.
     pub smoke_secs: u64,
     /// The command.
     pub command: String,
     /// Its timeout.
     pub timeout_secs: u64,
+}
+
+/// Where one property ID is checked. The manifest generates this row, so it
+/// can't drift from what the harnesses and machine tables declare.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CoverageRow {
+    /// `coverage/<property>`.
+    pub id: String,
+    /// The property's ID.
+    pub property: String,
+    /// The harnesses that report it.
+    pub harnesses: Vec<String>,
+    /// The target rows that run those harnesses or check it directly.
+    pub targets: Vec<String>,
 }
 
 /// A planned row.
@@ -815,6 +876,7 @@ impl Builder<'_> {
         let pending = self.pending();
         let (harnesses, properties) =
             self.harnesses(&witnesses, &seed_witnesses, &targets, &pending);
+        let coverage = coverage_rows(&harnesses, &properties, &targets);
         let excluded: Vec<ExcludedRow> =
             excluded_tests.into_iter().chain(excluded_targets).collect();
         let mut counts = Counts {
@@ -826,6 +888,7 @@ impl Builder<'_> {
             seeds: seed_sets.iter().map(|row| row.seeds.len()).sum(),
             seed_witnesses: seed_witnesses.len(),
             targets: targets.len(),
+            coverage: coverage.len(),
             excluded: excluded.len(),
             ..Counts::default()
         };
@@ -863,6 +926,7 @@ impl Builder<'_> {
             seed_sets,
             seed_witnesses,
             targets,
+            coverage,
             pending,
             excluded,
             seed_report,
@@ -1377,6 +1441,41 @@ impl Builder<'_> {
         (sets, witnesses, rows)
     }
 
+    /// Fail each fuzz target outside the simulator package that isn't
+    /// excluded and that its package's machine table doesn't register.
+    fn check_machines(
+        &mut self,
+        bins: &BTreeSet<(String, String)>,
+        excluded: &BTreeSet<(String, String)>,
+        machines: &BTreeMap<(String, String), MachineTarget>,
+    ) {
+        for key in bins {
+            if key.0 != SIM_FUZZ_PACKAGE && !excluded.contains(key) && !machines.contains_key(key) {
+                self.problem(format!(
+                    "{FUZZ_DIR}/{} defines the target `{}`, and its \
+                     `[package.metadata.zakura-machine.targets]` table doesn't register it",
+                    key.0, key.1
+                ));
+            }
+        }
+        for (key, machine) in machines {
+            if !bins.contains(key) {
+                self.problem(format!(
+                    "{FUZZ_DIR}/{}/Cargo.toml registers `{}` as a machine, and defines no such \
+                     target",
+                    key.0, key.1
+                ));
+            }
+            if machine.properties.is_empty() == machine.unregistered.is_none() {
+                self.problem(format!(
+                    "{FUZZ_DIR}/{}/Cargo.toml must give the machine `{}` either properties or \
+                     the reason that it reports none",
+                    key.0, key.1
+                ));
+            }
+        }
+    }
+
     /// The target rows, the excluded targets' rows, and each fuzz
     /// package's lockfile digest. Every binary target of every fuzz
     /// package must be mapped or excluded, and each mapped one of
@@ -1386,6 +1485,8 @@ impl Builder<'_> {
         let mut bins = BTreeSet::new();
         // The harness each target runs, by (package, target).
         let mut harnesses = BTreeMap::new();
+        // The machine registration of each target, by (package, target).
+        let mut machines = BTreeMap::new();
         let mut lockfiles = BTreeMap::new();
         let dir = self.root.join(FUZZ_DIR);
         let packages = match sorted_dirs(&dir) {
@@ -1404,6 +1505,9 @@ impl Builder<'_> {
             for cargo in self.cargo_packages(&manifest).unwrap_or_default() {
                 for target in cargo.targets.iter().filter(|target| target.is("bin")) {
                     bins.insert((package.clone(), target.name.clone()));
+                }
+                for (name, machine) in cargo.machines() {
+                    machines.insert((package.clone(), name), machine);
                 }
                 for (name, harness) in cargo.harnesses() {
                     harnesses.insert((package.clone(), name), harness);
@@ -1439,11 +1543,13 @@ impl Builder<'_> {
                 ));
             }
         }
+        self.check_machines(&bins, &excluded, &machines);
         let mut mapped = BTreeSet::new();
         let mut rows = Vec::new();
         for target in &self.suite.target {
             let key = (target.package.clone(), target.name.clone());
             let harness: Option<String> = harnesses.get(&key).cloned();
+            let machine = machines.get(&key);
             if !bins.contains(&key) {
                 self.problem(format!(
                     "{SUITE_FILE} maps {FUZZ_DIR}/{}'s target `{}`, which its Cargo.toml \
@@ -1508,6 +1614,8 @@ impl Builder<'_> {
                 name: target.name.clone(),
                 harness,
                 covers: target.covers.clone(),
+                properties: machine.map_or_else(Vec::new, |machine| machine.properties.clone()),
+                decoder: machine.map(|machine| machine.decoder),
                 smoke_secs: target.smoke_secs,
                 command: format!("{corpus} && {fuzz}"),
                 timeout_secs: target.timeout_secs,
@@ -1927,6 +2035,15 @@ impl CargoPackage {
             .map(|sim| sim.targets)
             .unwrap_or_default()
     }
+
+    /// Its `[package.metadata.zakura-machine.targets]` table.
+    fn machines(&self) -> BTreeMap<String, MachineTarget> {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.zakura_machine.as_ref())
+            .map(|machine| machine.targets.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// The part of a package's `[package.metadata]` the manifest reads.
@@ -1935,6 +2052,30 @@ struct PackageMetadata {
     /// `[package.metadata.zakura-sim]`.
     #[serde(rename = "zakura-sim")]
     zakura_sim: Option<SimMetadata>,
+    /// `[package.metadata.zakura-machine]`.
+    #[serde(rename = "zakura-machine")]
+    zakura_machine: Option<MachineMetadata>,
+}
+
+/// `[package.metadata.zakura-machine]`.
+#[derive(Deserialize)]
+struct MachineMetadata {
+    /// The registration of each fuzz target, by target.
+    #[serde(default)]
+    targets: BTreeMap<String, MachineTarget>,
+}
+
+/// What one fuzz target outside the simulator checks.
+#[derive(Clone, Deserialize)]
+struct MachineTarget {
+    /// The version of the decoder that reads its bytes.
+    decoder: u32,
+    /// The property IDs that it checks.
+    #[serde(default)]
+    properties: Vec<String>,
+    /// Why it reports no property ID.
+    #[serde(default)]
+    unregistered: Option<String>,
 }
 
 /// `[package.metadata.zakura-sim]`.

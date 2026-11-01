@@ -311,11 +311,20 @@ pub fn parent_inputs(
     outpoints: &[transparent::OutPoint],
 ) -> ParentInputs {
     let first_missing = |chain: Option<&Arc<Chain>>| {
-        outpoints
-            .iter()
-            .copied()
-            .find(|outpoint| unspent_utxo(chain, db, *outpoint).is_none())
-            .map_or(ParentInputs::Inconclusive, ParentInputs::Missing)
+        let missing = if outpoints.len() >= 32 {
+            use rayon::prelude::*;
+            // Keep the first missing input deterministic while overlapping database reads.
+            outpoints
+                .par_iter()
+                .copied()
+                .find_first(|outpoint| unspent_utxo(chain, db, *outpoint).is_none())
+        } else {
+            outpoints
+                .iter()
+                .copied()
+                .find(|outpoint| unspent_utxo(chain, db, *outpoint).is_none())
+        };
+        missing.map_or(ParentInputs::Inconclusive, ParentInputs::Missing)
     };
 
     // The database holds exactly the finalized tip's UTXO set.

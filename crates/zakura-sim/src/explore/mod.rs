@@ -23,12 +23,14 @@
 //!
 //! [`feedback`] turns abstract protocol states into features libFuzzer
 //! reads beside its code edges (E2a), and [`state`] collects the protocol
-//! states of the feature table as those features (E2b).
+//! states of the feature table as those features (E2b). [`stats`] counts a
+//! fuzz process's runs for its campaign's evidence (E4b-min).
 
 pub mod feedback;
 mod process;
 mod save;
 pub mod state;
+pub mod stats;
 pub mod triage;
 mod worker;
 

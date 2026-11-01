@@ -13,12 +13,17 @@ use futures::{
 };
 use tokio::sync::broadcast;
 
-use zakura_chain::{block::Height, serialization::SerializationError};
+use zakura_chain::{
+    block::Height, chain_tip::NoChainTip, parameters::Network, serialization::SerializationError,
+};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
     constants::CURRENT_NETWORK_PROTOCOL_VERSION,
-    peer::{Client, ConnectedAddr, Connection, ConnectionInfo, ErrorSlot},
+    peer::{
+        Client, ConnectedAddr, Connection, ConnectionInfo, ConnectionRequests, ErrorSlot,
+        MinimumPeerVersion,
+    },
     peer_set::ActiveConnectionCounter,
     protocol::{
         external::{AddrInVersion, Message},
@@ -49,6 +54,8 @@ impl ConnectedClient {
     pub fn spawn(addr: PeerSocketAddr) -> Self {
         let inbound_service = MockService::build().for_unit_tests();
         let (server_tx, server_rx) = mpsc::channel(0);
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
         let error_slot = ErrorSlot::default();
 
         // Leave room for several writes so tests can inspect them after the fact.
@@ -86,7 +93,12 @@ impl ConnectedClient {
 
         let connection = Connection::new(
             inbound_service.clone(),
-            server_rx,
+            ConnectionRequests {
+                client_rx: server_rx,
+                block_advert_rx,
+                minimum_peer_version: MinimumPeerVersion::new(NoChainTip, &Network::Mainnet),
+                bans: Default::default(),
+            },
             error_slot.clone(),
             peer_tx,
             ActiveConnectionCounter::new_counter().track_connection(),
@@ -113,6 +125,7 @@ impl ConnectedClient {
             connection_info,
             shutdown_tx: Some(shutdown_tx),
             server_tx,
+            block_advert_tx,
             inv_collector: broadcast::channel(16).0,
             error_slot,
             connection_task,

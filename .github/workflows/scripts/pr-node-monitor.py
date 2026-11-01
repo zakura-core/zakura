@@ -167,6 +167,19 @@ def systemd_props(service: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
+def process_props(pid_file: str) -> dict[str, str]:
+    """Observe an isolated follower without replacing the host's service unit."""
+    try:
+        pid = Path(pid_file).read_text().strip()
+        if not pid.isdecimal() or int(pid) < 1:
+            raise ValueError("invalid process identity")
+        status = Path(f"/proc/{pid}/status").read_text()
+        active = not re.search(r"^State:\s+Z", status, re.MULTILINE)
+        return {"MainPID": pid, "ActiveState": "active" if active else "inactive", "NRestarts": "0"}
+    except (OSError, ValueError):
+        return {"MainPID": "0", "ActiveState": "inactive", "NRestarts": "0"}
+
+
 def rss_mib(pid: str) -> float | None:
     try:
         status = Path(f"/proc/{pid}/status").read_text()
@@ -217,7 +230,7 @@ def take_sample(args) -> dict:
             sample[key] = metric_value(metrics, name)
     except Exception as exc:  # noqa: BLE001 — metrics failure is recorded in the sample
         sample["metrics_error"] = str(exc)
-    props = systemd_props(args.service)
+    props = process_props(args.pid_file) if getattr(args, "pid_file", None) else systemd_props(args.service)
     sample["active_state"] = props.get("ActiveState")
     sample["restarts"] = int(props.get("NRestarts") or 0)
     pid = props.get("MainPID", "0")
@@ -284,12 +297,13 @@ def startup_height_failure(
     return None
 
 
-def scan_logs(log_file: str, service: str) -> dict:
-    errors = warns = 0
+def scan_logs(log_file: str, service: str | None) -> dict:
+    errors = warns = panics = 0
     last_errors: list[str] = []
     try:
         with open(log_file, errors="replace") as fh:
             for line in fh:
+                panics += len(re.findall(r"panicked at", line))
                 if " ERROR " in line:
                     errors += 1
                     last_errors.append(line.rstrip()[:300])
@@ -304,10 +318,8 @@ def scan_logs(log_file: str, service: str) -> dict:
         capture_output=True,
         text=True,
         check=False,
-    ).stdout
-    panics = len(re.findall(r"panicked at", journal)) + len(
-        re.findall(r"panicked at", "".join(last_errors))
-    )
+    ).stdout if service else ""
+    panics += len(re.findall(r"panicked at", journal))
     return {"errors": errors, "warns": warns, "panics": panics, "last_errors": last_errors}
 
 
@@ -521,6 +533,7 @@ def main(argv=None) -> int:
     parser.add_argument("--rpc-url", default="http://127.0.0.1:8232")
     parser.add_argument("--metrics-url", default="http://127.0.0.1:9999/metrics")
     parser.add_argument("--service", default="zakurad")
+    parser.add_argument("--pid-file", help="observe an isolated foreground follower; log-file must include its stderr")
     parser.add_argument("--log-file", default="/var/log/zakura/zakura.log")
     parser.add_argument("--notes", default=None, help="markdown notes file to append")
     parser.add_argument("--meta", default="", help="comma-separated key=value run metadata")
@@ -650,7 +663,7 @@ def main(argv=None) -> int:
         read_startup_height(args.log_file) if args.require_startup_height
         else (args.known_start_height, None)
     )
-    logs = scan_logs(args.log_file, args.service)
+    logs = scan_logs(args.log_file, None if args.pid_file else args.service)
     actual_duration_min = (time.monotonic() - start) / 60
     summary = build_summary(
         meta,

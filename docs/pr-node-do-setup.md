@@ -65,6 +65,34 @@ without an open PR skip the comment.
 
 ## Inspecting a kept node
 
+### Verification-capacity qualification on existing hosts
+
+The same collector supports an isolated foreground follower through `--pid-file`.
+Write the follower's PID to that file and capture both stdout and stderr in
+`--log-file`; the collector then checks that process instead of a systemd unit.
+Keep its binary, configuration, and fresh state clone in a run-owned directory.
+Obtain maintenance authorization before pausing a host's existing workload, and
+restore that workload after measurement. Do not compare throughput on a host
+that is also doing unrelated work.
+
+For capacity qualification, use `--require-capacity --interval 1` and record the
+exact revision, build features, host resources, configuration, snapshot URL and
+checksum, and phase in `--meta`. Catch-up requires
+`--required-semantic-blocks 1000`; checkpoint commits do not satisfy this count.
+Use the same immutable fixture and fixed height interval for three paired
+baseline/candidate trials on each host.
+
+For an at-tip observation, restart the candidate against its caught-up state and
+use `--required-observation-seconds 3600 --reference-rpc-url <independent-RPC>`.
+Allow startup time in `--duration-minutes`; only the uninterrupted measured
+window counts toward the hour. Lost connectivity, missing scrapes, a process
+change, or insufficient semantic coverage makes qualification incomplete.
+Saturation events or capacity-driven deferrals fail normal-traffic acceptance,
+including brief events between scrapes. Retain `samples.jsonl`,
+`metrics-scrapes.jsonl.gz`, both summaries, and the combined node log as workflow
+artifacts. The summaries include interval counter baselines, occupancy
+percentiles, event high-water marks, and minimum headroom.
+
 The step summary prints the droplet IP. On the droplet:
 
 ```bash

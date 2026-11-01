@@ -104,6 +104,25 @@ sync_missing_parent_charge_duration_seconds{reason="parent_available",quantile="
                                                 "semantic_commits"),
                          {"baseline": 2000, "final": 2100, "delta": 100})
 
+    def test_isolated_process_observation_fails_when_identity_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid = Path(directory) / "node.pid"
+            self.assertEqual(monitor.process_props(str(pid))["ActiveState"], "inactive")
+            pid.write_text("invalid")
+            self.assertEqual(monitor.process_props(str(pid))["ActiveState"], "inactive")
+        with patch.object(monitor.Path, "read_text", side_effect=["123", "State:\tS (sleeping)\n"]):
+            self.assertEqual(monitor.process_props("node.pid"), {"MainPID": "123", "ActiveState": "active", "NRestarts": "0"})
+        with patch.object(monitor.Path, "read_text", side_effect=["123", "State:\tZ (zombie)\n"]):
+            self.assertEqual(monitor.process_props("node.pid")["ActiveState"], "inactive")
+
+    def test_isolated_follower_panics_are_detected_without_a_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "node.log"
+            log.write_text("thread 'worker' panicked at src/main.rs:1\n")
+            with patch.object(monitor.subprocess, "run") as run:
+                self.assertEqual(monitor.scan_logs(str(log), None)["panics"], 1)
+                run.assert_not_called()
+
 
 class StartupHeight(unittest.TestCase):
     def read(self, text: str):

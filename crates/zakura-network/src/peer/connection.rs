@@ -17,6 +17,7 @@ use tracing::Instrument;
 
 use zakura_chain::{
     block::{self, Block},
+    chain_tip::{ChainTip, NoChainTip},
     serialization::SerializationError,
     transaction::{UnminedTx, UnminedTxId},
 };
@@ -28,16 +29,18 @@ use crate::{
     },
     meta_addr::MetaAddr,
     peer::{
-        connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
-        ConnectionInfo, ErrorSlot, InProgressClientRequest, MustUseClientResponseSender, PeerError,
-        SharedPeerError,
+        block_gossip::{BlockAdvert, BlockAdvertError},
+        connection::peer_tx::PeerTx,
+        error::AlreadyErrored,
+        ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
+        MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, InventoryHash, Message},
         internal::{InventoryResponse, Request, Response},
     },
-    BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
+    BannedIps, BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
 };
 
 use InventoryResponse::*;
@@ -136,6 +139,10 @@ impl Handler {
     /// interpretable as a response, we return ownership to the caller.
     ///
     /// Unexpected messages are left unprocessed, and may be rejected later.
+    ///
+    /// A one-hash block `inv` answers a pending `FindBlocks` request and is also
+    /// returned, because it may be a block announcement that the caller still
+    /// has to handle as a request.
     ///
     /// `addr` responses are limited to avoid peer set takeover. Any excess
     /// addresses are stored in `cached_addrs`.
@@ -397,16 +404,28 @@ impl Handler {
                 }
             }
 
-            // TODO:
-            // - use `any(inv)` rather than `all(inv)`?
+            // An empty inventory can be a late mempool reply after cancellation.
+            // Zakura and zcashd send no message for an empty getblocks result.
+            //
+            // Peers announce a new block with a one-hash `inv`, and a `getblocks` reply is
+            // also an `inv`, so a one-hash `inv` here can be either. It answers the request
+            // either way, and it is also returned so the run loop handles it as a block
+            // advert: the gossip downloader then fetches the block right away, instead of
+            // the syncer fetching it only once its whole discovery round has finished.
+            // A genuine one-hash reply takes the same path, so it also counts as an inbound
+            // `AdvertiseBlock` request in the metrics and starts one extra block download,
+            // which the inbound downloader drops when the block is already in the state.
             (Handler::FindBlocks, Message::Inv(items))
-                if items
-                    .iter()
-                    .all(|item| matches!(item, InventoryHash::Block(_))) =>
+                if !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
-                )))
+                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                if let [InventoryHash::Block(_)] = items[..] {
+                    ignored_msg = Some(Message::Inv(items));
+                }
+                Handler::Finished(Ok(response))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
                 Handler::Finished(Ok(Response::BlockHeaders(headers)))
@@ -541,8 +560,19 @@ impl From<Request> for InboundMessage {
     }
 }
 
+/// Where a connection reads our requests from, and the authorization it rechecks before
+/// writing a block advert.
+pub(crate) struct ConnectionRequests<C> {
+    /// Ordinary requests, which may wait for a response.
+    pub(crate) client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
+    /// Block adverts, read even while a request is awaiting its response.
+    pub(crate) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
+    pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
+    pub(crate) bans: BannedIps,
+}
+
 /// The channels, services, and associated state for a peer connection.
-pub struct Connection<S, Tx>
+pub struct Connection<S, Tx, C = NoChainTip>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
@@ -578,6 +608,13 @@ where
     ///
     /// This channel accepts [`Request`]s, and produces [`InProgressClientRequest`]s.
     pub(super) client_rx: ClientRequestReceiver,
+
+    /// Receives block adverts independently of the current request's response.
+    pub(super) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
+
+    /// Live authorization, rechecked immediately before advert writes.
+    minimum_peer_version: MinimumPeerVersion<C>,
+    bans: BannedIps,
 
     /// A slot for an error shared between the Connection and the Client that uses it.
     ///
@@ -619,13 +656,13 @@ where
     last_overload_time: Option<Instant>,
 }
 
-impl<S, Tx> fmt::Debug for Connection<S, Tx>
+impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // skip the channels, they don't tell us anything useful
-        f.debug_struct(std::any::type_name::<Connection<S, Tx>>())
+        f.debug_struct(std::any::type_name::<Self>())
             .field("connection_info", &self.connection_info)
             .field("state", &self.state)
             .field("request_timer", &self.request_timer)
@@ -638,7 +675,7 @@ where
     }
 }
 
-impl<S, Tx> Connection<S, Tx>
+impl<S, Tx, C> Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
@@ -646,7 +683,12 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inbound_service: S,
-        client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
+        ConnectionRequests {
+            client_rx,
+            block_advert_rx,
+            minimum_peer_version,
+            bans,
+        }: ConnectionRequests<C>,
         error_slot: ErrorSlot,
         peer_tx: Tx,
         connection_tracker: ConnectionTracker,
@@ -661,6 +703,9 @@ where
             cached_addrs: initial_cached_addrs,
             svc: inbound_service,
             client_rx: client_rx.into(),
+            block_advert_rx,
+            minimum_peer_version,
+            bans,
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
@@ -672,10 +717,11 @@ where
     }
 }
 
-impl<S, Tx> Connection<S, Tx>
+impl<S, Tx, C> Connection<S, Tx, C>
 where
     S: Service<Request, Response = Response, Error = BoxError>,
     S::Error: Into<BoxError>,
+    C: ChainTip,
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     /// Consume this `Connection` to form a spawnable future containing its event loop.
@@ -703,8 +749,8 @@ where
         // If there is no pending request, we wait on either an incoming peer message or
         // an incoming request, whichever comes first.
         //
-        // If there is a pending request, we wait only on an incoming peer message, and
-        // check whether it can be interpreted as a response to the pending request.
+        // If there is a pending request, peer messages can complete it. Block adverts use a
+        // separate channel in either state because they do not expect a response.
         //
         // TODO: turn this comment into a module-level comment, after splitting the module.
         loop {
@@ -715,11 +761,11 @@ where
                     trace!("awaiting client request or peer message");
                     // # Correctness
                     //
-                    // Currently, select prefers the first future if multiple futures are ready.
-                    // We use this behaviour to prioritise messages on each individual peer
-                    // connection in this order:
-                    // - incoming messages from the remote peer, then
-                    // - outgoing messages to the remote peer.
+                    // Peer messages precede adverts so a ready GetBlocks request gets its response
+                    // first; otherwise the peer could mistake our advert for that response.
+                    // Adverts precede ordinary client requests because they need no response.
+                    // Ordinary client requests follow peer messages to avoid confusing unsolicited
+                    // inventory with a response to a new request.
                     //
                     // This improves the performance of peer responses to Zebra requests, and new
                     // peer requests to Zebra's inbound service.
@@ -752,12 +798,22 @@ where
                     // Zebra services might be temporarily delayed until the peer times out, if a
                     // request to that peer is sent by the service, and the service blocks until
                     // the request completes (or times out).
-                    match future::select(peer_rx.next(), self.client_rx.next()).await {
-                        Either::Left((None, _)) => {
+                    let incoming = tokio::select! {
+                        biased;
+                        msg = peer_rx.next() => Either::Left(msg),
+                        // A closed advert channel disables only this branch.
+                        Some(advert) = self.block_advert_rx.recv() => {
+                            self.send_block_advert(advert).await;
+                            continue;
+                        }
+                        req = self.client_rx.next() => Either::Right(req),
+                    };
+                    match incoming {
+                        Either::Left(None) => {
                             self.fail_with(PeerError::ConnectionClosed).await;
                         }
-                        Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
-                        Either::Left((Some(Ok(msg)), _)) => {
+                        Either::Left(Some(Err(e))) => self.fail_with(e).await,
+                        Either::Left(Some(Ok(msg))) => {
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -767,7 +823,7 @@ where
                                 );
                             }
                         }
-                        Either::Right((None, _)) => {
+                        Either::Right(None) => {
                             trace!("client_rx closed, ending connection");
 
                             // There are no requests to be flushed,
@@ -776,7 +832,7 @@ where
                             self.shutdown_async(PeerError::ClientDropped).await;
                             break;
                         }
-                        Either::Right((Some(req), _)) => {
+                        Either::Right(Some(req)) => {
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -787,48 +843,11 @@ where
                 // because the response might be `Nil` or synthetic.
                 State::AwaitingResponse {
                     handler: Handler::Finished(_),
-                    ref span,
                     ..
-                } => {
-                    // We have to get rid of the span reference so we can tamper with the state.
-                    let span = span.clone();
-                    trace!(
-                        parent: &span,
-                        "returning completed response to client request"
-                    );
-
-                    // Replace the state with a temporary value,
-                    // so we can take ownership of the response sender.
-                    let tmp_state = std::mem::replace(&mut self.state, State::Failed);
-
-                    if let State::AwaitingResponse {
-                        handler: Handler::Finished(response),
-                        tx,
-                        ..
-                    } = tmp_state
-                    {
-                        if let Ok(response) = response.as_ref() {
-                            debug!(%response, "finished receiving peer response to Zakura request");
-                            // Add a metric for inbound responses to outbound requests.
-                            metrics::counter!(
-                                "zakura.net.in.responses",
-                                "command" => response.command(),
-                            )
-                            .increment(1);
-                        } else {
-                            debug!(error = ?response, "error in peer response to Zakura request");
-                        }
-
-                        let _ = tx.send(response.map_err(Into::into));
-                    } else {
-                        unreachable!("already checked for AwaitingResponse");
-                    }
-
-                    self.state = State::AwaitingRequest;
-                }
+                } => self.deliver_finished_response(),
 
                 // We're awaiting a response to a client request,
-                // so wait on either a peer message, or on a request cancellation.
+                // so also wait on cancellation, timeout, and response-free block adverts.
                 State::AwaitingResponse {
                     ref span,
                     ref mut tx,
@@ -844,70 +863,30 @@ where
 
                     // # Security
                     //
-                    // select() prefers the first future if multiple futures are ready.
+                    // Biased selection preserves cancellation and timeout priority.
                     //
                     // If multiple futures are ready, we want the priority for each individual
                     // connection to be:
                     // - cancellation, then
                     // - timeout, then
-                    // - peer responses.
+                    // - peer messages, then
+                    // - block adverts.
                     //
                     // (Messages to other peers are processed concurrently.)
                     //
                     // This makes sure a peer can't block disconnection or timeouts by sending too
                     // many messages. It also avoids doing work to process messages after a
                     // connection has failed.
-                    let cancel = future::select(tx.cancellation(), timer_ref);
-                    match future::select(cancel, peer_rx.next())
-                        .instrument(span.clone())
-                        .await
-                    {
-                        Either::Right((None, _)) => {
-                            self.fail_with(PeerError::ConnectionClosed).await
+                    // Peer messages precede adverts to preserve response ordering, as above.
+                    let peer_msg = tokio::select! {
+                        biased;
+                        _ = tx.cancellation() => {
+                            // The client receiver was dropped, so we don't need to send on `tx` here.
+                            trace!(parent: &span, "client request was cancelled");
+                            self.state = State::AwaitingRequest;
+                            continue;
                         }
-                        Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
-                        Either::Right((Some(Ok(peer_msg)), _cancel)) => {
-                            self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
-
-                            // Try to process the message using the handler.
-                            // This extremely awkward construction avoids
-                            // keeping a live reference to handler across the
-                            // call to handle_message_as_request, which takes
-                            // &mut self. This is a sign that we don't properly
-                            // factor the state required for inbound and
-                            // outbound requests.
-                            let request_msg = match self.state {
-                                State::AwaitingResponse {
-                                    ref mut handler, ..
-                                } => span.in_scope(|| handler.process_message(peer_msg, &mut self.cached_addrs, self.connection_info.connected_addr.get_transient_addr())),
-                                _ => unreachable!("unexpected state after AwaitingResponse: {:?}, peer_msg: {:?}, client_receiver: {:?}",
-                                                  self.state,
-                                                  peer_msg,
-                                                  self.client_rx,
-                                ),
-                            };
-
-                            self.update_state_metrics(None);
-
-                            // If the message was not consumed as a response,
-                            // check whether it can be handled as a request.
-                            let unused_msg = if let Some(request_msg) = request_msg {
-                                // do NOT instrument with the request span, this is
-                                // independent work
-                                self.handle_message_as_request(request_msg).await
-                            } else {
-                                None
-                            };
-
-                            if let Some(unused_msg) = unused_msg {
-                                debug!(
-                                    %unused_msg,
-                                    %self.state,
-                                    "ignoring peer message: not a response or a request",
-                                );
-                            }
-                        }
-                        Either::Left((Either::Right(_), _peer_fut)) => {
+                        _ = timer_ref => {
                             trace!(parent: &span, "client request timed out");
                             let e = PeerError::ConnectionReceiveTimeout;
 
@@ -937,11 +916,73 @@ where
                                     self.client_rx
                                 ),
                             };
+                            continue;
                         }
-                        Either::Left((Either::Left(_), _peer_fut)) => {
-                            // The client receiver was dropped, so we don't need to send on `tx` here.
-                            trace!(parent: &span, "client request was cancelled");
-                            self.state = State::AwaitingRequest;
+                        msg = peer_rx.next().instrument(span.clone()) => msg,
+                        Some(advert) = self.block_advert_rx.recv() => {
+                            self.send_block_advert(advert).await;
+                            continue;
+                        }
+                    };
+                    match peer_msg {
+                        None => self.fail_with(PeerError::ConnectionClosed).await,
+                        Some(Err(e)) => self.fail_with(e).await,
+                        Some(Ok(peer_msg)) => {
+                            self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
+
+                            // Try to process the message using the handler.
+                            // This extremely awkward construction avoids
+                            // keeping a live reference to handler across the
+                            // call to handle_message_as_request, which takes
+                            // &mut self. This is a sign that we don't properly
+                            // factor the state required for inbound and
+                            // outbound requests.
+                            let request_msg = match self.state {
+                                State::AwaitingResponse {
+                                    ref mut handler, ..
+                                } => span.in_scope(|| handler.process_message(peer_msg, &mut self.cached_addrs, self.connection_info.connected_addr.get_transient_addr())),
+                                _ => unreachable!("unexpected state after AwaitingResponse: {:?}, peer_msg: {:?}, client_receiver: {:?}",
+                                                  self.state,
+                                                  peer_msg,
+                                                  self.client_rx,
+                                ),
+                            };
+
+                            self.update_state_metrics(None);
+
+                            // A message can finish the response and still need inbound handling:
+                            // a one-block inv can also be an announcement, and an unsolicited
+                            // transaction ends the pending transaction batch. Deliver the reply
+                            // first, so inbound service load cannot cost the client its response.
+                            if request_msg.is_some()
+                                && matches!(
+                                    self.state,
+                                    State::AwaitingResponse {
+                                        handler: Handler::Finished(_),
+                                        ..
+                                    }
+                                )
+                            {
+                                self.deliver_finished_response();
+                            }
+
+                            // If the handler returned the message, check whether it can also
+                            // be handled as a request.
+                            let unused_msg = if let Some(request_msg) = request_msg {
+                                // do NOT instrument with the request span, this is
+                                // independent work
+                                self.handle_message_as_request(request_msg).await
+                            } else {
+                                None
+                            };
+
+                            if let Some(unused_msg) = unused_msg {
+                                debug!(
+                                    %unused_msg,
+                                    %self.state,
+                                    "ignoring peer message: not a response or a request",
+                                );
+                            }
                         }
                     }
                 }
@@ -977,6 +1018,61 @@ where
         );
 
         self.shutdown_async(error).await;
+    }
+
+    /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
+    /// acknowledges it once the local write completes.
+    ///
+    /// Does not change the state of any request that is awaiting its response.
+    async fn send_block_advert(&mut self, advert: BlockAdvert) {
+        if advert.result.is_closed() {
+            metrics::counter!("peer.canceled").increment(1);
+            metrics::counter!(
+                "zakura.net.out.requests.canceled",
+                "command" => "AdvertiseBlock",
+            )
+            .increment(1);
+            return;
+        }
+
+        metrics::counter!(
+            "zakura.net.out.requests",
+            "command" => "AdvertiseBlock",
+        )
+        .increment(1);
+
+        let address = self.connection_info.connected_addr.get_transient_addr();
+        let version = self.connection_info.remote.version;
+        let minimum = &mut self.minimum_peer_version;
+        let bans = &self.bans;
+        let delivery = self
+            .peer_tx
+            .send_authorized(
+                Message::Inv(vec![InventoryHash::Block(advert.hash)]),
+                || {
+                    version >= minimum.current()
+                        && !address.is_some_and(|addr| bans.contains(addr.ip()))
+                },
+            )
+            .await;
+        match delivery {
+            Ok(true) => {
+                // Mark the write before reading the peer's next message, which can be its getdata.
+                self.block_uploads.advertised(advert.hash);
+                let _ = advert.result.send(Ok(()));
+            }
+            Ok(false) => {
+                debug!(hash = ?advert.hash, "not advertising block: peer authorization was revoked");
+                let _ = advert
+                    .result
+                    .send(Err(BlockAdvertError::AuthorizationRevoked));
+            }
+            Err(error) => {
+                let error = SharedPeerError::from(error);
+                let _ = advert.result.send(Err(error.clone().into()));
+                self.fail_with(error).await;
+            }
+        }
     }
 
     /// Handle an internal client request, possibly generating outgoing messages to the
@@ -1015,6 +1111,12 @@ where
 
         let new_handler = match (&self.state, request) {
             (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
+            // Block adverts reach the connection through its advert queue, which the peer set's
+            // block advertiser fills. A `Client` caller that sends one as an ordinary request,
+            // such as an isolated connection, gets an error instead of an `inv`.
+            (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
+                Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
+            }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,
@@ -1153,19 +1255,6 @@ where
                     .send(Message::Inv(hashes))
                     .await
                     .map(|()|
-                         Handler::Finished(Ok(Response::Nil))
-                    )
-            }
-            (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash) | AdvertiseMinedBlock(hash)) => {
-                let sent = self
-                    .peer_tx
-                    .send(Message::Inv(vec![hash.into()]))
-                    .await;
-                if sent.is_ok() {
-                    // Mark the write before reading the peer's next message, which can be its getdata.
-                    self.block_uploads.advertised(hash);
-                }
-                sent.map(|()|
                          Handler::Finished(Ok(Response::Nil))
                     )
             }
@@ -1310,7 +1399,7 @@ where
                 [] => {
                     debug!(%msg, "ignoring empty inv");
 
-                    // This might be a minor protocol error, or it might mean "not found".
+                    // A reply can arrive after its mempool or block-locator request was canceled.
                     Unused
                 }
                 [InventoryHash::Block(_), InventoryHash::Block(_), ..] => {
@@ -1407,6 +1496,48 @@ where
             Consumed => None,
             Unused => Some(msg),
         }
+    }
+
+    /// Sends the finished response of the pending client request to the client, and makes the
+    /// connection idle.
+    ///
+    /// # Panics
+    ///
+    /// If the state is not `AwaitingResponse` with a `Finished` handler.
+    fn deliver_finished_response(&mut self) {
+        // Replace the state with a temporary value,
+        // so we can take ownership of the response sender.
+        let tmp_state = std::mem::replace(&mut self.state, State::Failed);
+
+        if let State::AwaitingResponse {
+            handler: Handler::Finished(response),
+            tx,
+            span,
+        } = tmp_state
+        {
+            trace!(
+                parent: &span,
+                "returning completed response to client request"
+            );
+
+            if let Ok(response) = response.as_ref() {
+                debug!(%response, "finished receiving peer response to Zakura request");
+                // Add a metric for inbound responses to outbound requests.
+                metrics::counter!(
+                    "zakura.net.in.responses",
+                    "command" => response.command(),
+                )
+                .increment(1);
+            } else {
+                debug!(error = ?response, "error in peer response to Zakura request");
+            }
+
+            let _ = tx.send(response.map_err(Into::into));
+        } else {
+            unreachable!("the caller checked for AwaitingResponse with a Finished handler");
+        }
+
+        self.state = State::AwaitingRequest;
     }
 
     /// Given a `req` originating from the peer, drive it to completion and send
@@ -1725,7 +1856,7 @@ fn overload_drop_connection_probability(now: Instant, prev: Option<Instant>) -> 
     raw_drop_probability.clamp(MIN_OVERLOAD_DROP_PROBABILITY, MAX_OVERLOAD_DROP_PROBABILITY)
 }
 
-impl<S, Tx> Connection<S, Tx>
+impl<S, Tx, C> Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
@@ -1861,7 +1992,7 @@ where
     }
 }
 
-impl<S, Tx> Drop for Connection<S, Tx>
+impl<S, Tx, C> Drop for Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {

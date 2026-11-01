@@ -210,6 +210,10 @@ fn header_hash_payload_mismatch(
 /// Keeps a receipt charge live until the synchronous send finishes or unwinds.
 struct ReceiptSettlement {
     funding: Option<crate::zakura::transport::ByteReservation>,
+    /// The routine's flag for [`PeerRegistry::floor_has_preferred_unsaturated_server`].
+    /// A routine stalled anywhere in its handoff isn't a floor carrier, so
+    /// the flag stays set from this settlement's creation through the release.
+    handoff_blocked: Arc<AtomicBool>,
     #[cfg(any(test, zakura_sim))]
     observer: super::block_sync_observe::ObserverSlot,
     #[cfg(any(test, zakura_sim))]
@@ -227,12 +231,14 @@ impl ReceiptSettlement {
         height: block::Height,
         funding: crate::zakura::transport::ByteReservation,
     ) -> Self {
+        routine.handoff_blocked.store(true, Ordering::Relaxed);
         #[cfg(any(test, zakura_sim))]
         routine.observe_handoff_started(owner, height, funding.bytes());
         #[cfg(not(any(test, zakura_sim)))]
-        let _ = (routine, owner, height);
+        let _ = (owner, height);
         Self {
             funding: Some(funding),
+            handoff_blocked: Arc::clone(&routine.handoff_blocked),
             #[cfg(any(test, zakura_sim))]
             observer: routine.io.observer.clone(),
             #[cfg(any(test, zakura_sim))]
@@ -268,6 +274,7 @@ impl Drop for ReceiptSettlement {
                 );
             });
         }
+        self.handoff_blocked.store(false, Ordering::Relaxed);
     }
 }
 

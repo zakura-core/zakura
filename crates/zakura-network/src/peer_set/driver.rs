@@ -84,15 +84,15 @@ impl Service<Request> for Client {
                     .map(|error| Box::new(error) as BoxError)
                     .unwrap_or_else(|| "peer set driver closed".into())
             };
-            if error.borrow().is_some() {
-                return Err(closed(&error));
-            }
             // A reserved permit may send after the receiver closes. Watch terminal state as
-            // well as the reply so that such a request cannot wait on an abandoned queue.
+            // well as the reply so that such a request cannot wait on an abandoned queue: the
+            // error watch fires at once for a failure that happened before this first poll. A
+            // reply that was already dispatched wins over a later failure, because its response
+            // future runs on the connection, not on the owner.
             let future = tokio::select! {
                 biased;
-                _ = error.changed() => return Err(closed(&error)),
                 response = response => response.map_err(|_| closed(&error))?,
+                _ = error.changed() => return Err(closed(&error)),
             };
             future.await
         }

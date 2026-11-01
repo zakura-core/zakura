@@ -1489,6 +1489,16 @@ fn recv_advertise_block(handle: &mut ClientTestHarness) -> Option<block::Hash> {
     Some(advert.hash)
 }
 
+/// Waits for the mock peer to receive an ordinary request from the peer set.
+async fn receive_client_request(handle: &mut ClientTestHarness) -> ClientRequest {
+    loop {
+        if let Some(request) = handle.try_to_receive_outbound_client_request().request() {
+            return request;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Builds a discovery stream of two ready inbound-direct peers: a sidecar at
 /// `127.0.0.1` (a configured block-gossip carve-out IP) and an ordinary peer at
 /// `127.0.0.2`. Returns the stream, the two addresses, and a mock handle for
@@ -1968,55 +1978,95 @@ async fn driver_yields_when_idle() {
     shutdown.cancel();
 }
 
-/// Inventory from peers does not wake maintenance: only request routing reads the inventory
-/// registry, so it is refreshed there instead.
+/// Inventory from peers does not wake maintenance while no request is being routed, and costs at
+/// most one maintenance pass after one was: only request routing reads the inventory registry,
+/// and the waker it registers there fires once.
 #[tokio::test(start_paused = true)]
-async fn driver_ignores_inventory_wakes() {
+async fn driver_bounds_maintenance_on_inventory_wakes() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     let _init = zakura_test::init();
-    let polls = Arc::new(AtomicUsize::new(0));
-    let count = polls.clone();
-    let discovered = stream::poll_fn(move |_| {
-        count.fetch_add(1, Ordering::Relaxed);
-        std::task::Poll::<Option<Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>>::Pending
-    });
-    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
-    let (peers, mut guard) = PeerSetBuilder::new()
-        .with_discover(discovered)
-        .with_minimum_peer_version(minimum)
-        .build();
-    let inventory = guard
-        .inventory_sender()
-        .take()
-        .expect("the builder creates an inventory channel");
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let (_ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
-    let (done, ready) = tokio::sync::oneshot::channel();
-    adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
-    timeout(Duration::from_secs(1), ready)
-        .await
-        .unwrap()
-        .unwrap();
-    let before = polls.load(Ordering::Relaxed);
-    let peer: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
-    for index in 0..10u8 {
-        inventory
-            .send(InventoryChange::new_available(
-                InventoryHash::Block(block::Hash([index; 32])),
-                peer,
-            ))
-            .expect("the peer set holds the inventory receiver");
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        polls.load(Ordering::Relaxed),
-        before,
-        "inventory alone does not run maintenance"
-    );
-    shutdown.cancel();
+    timeout(Duration::from_secs(10), async {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let count = polls.clone();
+        let (discovery, mut discovered) = futures::channel::mpsc::unbounded::<
+            Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>,
+        >();
+        let discovered = stream::poll_fn(move |cx| {
+            count.fetch_add(1, Ordering::Relaxed);
+            discovered.poll_next_unpin(cx)
+        });
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, mut guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        let inventory = guard
+            .inventory_sender()
+            .take()
+            .expect("the builder creates an inventory channel");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let (done, ready) = tokio::sync::oneshot::channel();
+        adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+        ready.await.unwrap();
+        let peer: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        let send_inventory = |index: u8| {
+            inventory
+                .send(InventoryChange::new_available(
+                    InventoryHash::Block(block::Hash([index; 32])),
+                    peer,
+                ))
+                .expect("the peer set holds the inventory receiver");
+        };
+
+        // Before any request is routed, inventory never wakes maintenance.
+        let before = polls.load(Ordering::Relaxed);
+        for index in 0..10u8 {
+            send_inventory(index);
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            before,
+            "inventory alone does not run maintenance"
+        );
+
+        // Routing a request reads the inventory registry, which registers its waker once.
+        let (client, mut handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: peer })
+            .finish();
+        discovery
+            .unbounded_send(Ok(Change::Insert(peer, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+        let response = ordinary.ready().await.unwrap().call(Request::Peers);
+        let request = receive_client_request(&mut handle).await;
+        request.tx.send(Ok(Response::Peers(Vec::new()))).unwrap();
+        response.await.expect("the routed request completes");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let before = polls.load(Ordering::Relaxed);
+        for index in 10..20u8 {
+            send_inventory(index);
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            polls.load(Ordering::Relaxed) <= before + 1,
+            "inventory costs at most one maintenance pass per routed request"
+        );
+        shutdown.cancel();
+    })
+    .await
+    .expect("inventory wakes stay bounded before and after a routed request");
 }
 
 /// A chain tip change that keeps the minimum peer version does not rerun maintenance; one that
@@ -2198,4 +2248,210 @@ async fn empty_advert_refresh_demands_more_peers() {
         "an empty refresh demands more peers"
     );
     shutdown.cancel();
+}
+
+/// A request whose caller gave up while waiting for a peer is discarded, not sent to the next
+/// peer: a caller's timeout must not cost a peer a request nobody awaits.
+#[tokio::test(start_paused = true)]
+async fn driver_discards_a_request_its_caller_abandoned() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+
+        // The request waits for a peer, then its caller gives up.
+        let abandoned = ordinary.ready().await.unwrap().call(Request::Peers);
+        tokio::task::yield_now().await;
+        drop(abandoned);
+
+        let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        let (client, mut handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+
+        // The first request the peer receives is a later one, and nothing follows it.
+        let served = ordinary.ready().await.unwrap().call(Request::Peers);
+        let request = receive_client_request(&mut handle).await;
+        assert!(matches!(request.request, Request::Peers));
+        assert!(
+            handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none(),
+            "the abandoned request is not sent"
+        );
+        request.tx.send(Ok(Response::Peers(Vec::new()))).unwrap();
+        assert!(served.await.is_ok());
+        shutdown.cancel();
+    })
+    .await
+    .expect("an abandoned request is discarded before dispatch");
+}
+
+/// When the peer set owner stops on an error, every client reports that error, while a response
+/// future that was already handed to its caller keeps running.
+#[tokio::test(start_paused = true)]
+async fn driver_failure_fails_every_client_and_keeps_dispatched_responses() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let other = ordinary.clone();
+        let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        let (client, mut handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+        let dispatched = ordinary.ready().await.unwrap().call(Request::Peers);
+        let request = receive_client_request(&mut handle).await;
+
+        // The discovery stream closes, so the owner cannot continue.
+        drop(discovery);
+        let error = loop {
+            tokio::task::yield_now().await;
+            if let Err(error) = ordinary.ready().await {
+                break error;
+            }
+        };
+        assert!(
+            error.to_string().contains("discovery stream closed"),
+            "the owner's error reaches the caller: {error}"
+        );
+        assert!(
+            other.oneshot(Request::Peers).await.is_err(),
+            "every client sees the failure"
+        );
+
+        // The response future already handed to its caller still completes.
+        request.tx.send(Ok(Response::Peers(Vec::new()))).unwrap();
+        let result = dispatched.await;
+        assert!(
+            result.is_ok(),
+            "a dispatched response outlives the owner: {:?}",
+            result.err()
+        );
+    })
+    .await
+    .expect("owner failure fails clients without losing dispatched responses");
+}
+
+/// A revoked advertisement retried through the owner's refresh barrier reaches a peer that
+/// connects later, and never replays the rejected snapshot.
+#[tokio::test(start_paused = true)]
+async fn driver_refresh_retries_a_revoked_advertisement_on_a_later_peer() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let mut book = crate::AddressBook::new(
+            "127.0.0.1:1".parse().unwrap(),
+            &Network::Mainnet,
+            1,
+            tracing::Span::none(),
+        );
+        let bans = book.bans();
+        let revoked_addr: PeerSocketAddr = "127.0.0.2:8233".parse::<SocketAddr>().unwrap().into();
+        book.update(crate::meta_addr::MetaAddr::new_initial_peer(revoked_addr));
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        peers.bans = bans.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let (client, mut revoked) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: revoked_addr })
+            .finish();
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(
+                revoked_addr,
+                client.into(),
+            )))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+
+        let hash = block::Hash([83; 32]);
+        let mut broadcast =
+            tokio::spawn(adverts.clone().oneshot(Request::AdvertiseMinedBlock(hash)));
+        let advert = revoked.receive_block_advert().await;
+        assert_eq!(advert.hash, hash);
+        // The peer is banned before its connection writes the inventory, so the connection
+        // rejects the advertisement and the peer set drops the connection.
+        book.update(crate::meta_addr::MetaAddrChange::UpdateMisbehavior {
+            addr: revoked_addr,
+            score_increment: crate::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        });
+        assert!(bans.contains(revoked_addr.ip()));
+        advert
+            .result
+            .send(Err(
+                crate::peer::block_gossip::BlockAdvertError::AuthorizationRevoked,
+            ))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.is_empty())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            (&mut broadcast).now_or_never().is_none(),
+            "the advertisement waits for a later peer"
+        );
+        assert!(
+            revoked.try_to_receive_block_advert().is_none(),
+            "the rejected snapshot is not replayed"
+        );
+
+        let later_addr: PeerSocketAddr = "127.0.0.3:8233".parse::<SocketAddr>().unwrap().into();
+        let (client, mut later) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: later_addr })
+            .finish();
+        discovery
+            .unbounded_send(Ok(Change::Insert(later_addr, client.into())))
+            .unwrap();
+        let advert = later.receive_block_advert().await;
+        assert_eq!(advert.hash, hash);
+        advert.result.send(Ok(())).unwrap();
+        assert!(broadcast.await.unwrap().is_ok());
+        assert!(revoked.try_to_receive_block_advert().is_none());
+        shutdown.cancel();
+    })
+    .await
+    .expect("a revoked advertisement is retried on a later peer through the refresh barrier");
 }

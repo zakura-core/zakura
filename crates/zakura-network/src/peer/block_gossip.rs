@@ -234,7 +234,10 @@ impl BlockGossipPeer {
     /// upload failed or did not finish in time.
     #[cfg(test)]
     pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
-        matches!(self.advertise_outcome(hash, slots).await, AdvertOutcome::Sent)
+        matches!(
+            self.advertise_outcome(hash, slots).await,
+            AdvertOutcome::Sent
+        )
     }
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
@@ -1299,7 +1302,7 @@ mod tests {
         timeout(Duration::from_secs(10), async {
             let (first, mut first_rx) = peer();
             let (published, peers) = watch::channel(vec![first]);
-            let slots = Arc::new(Semaphore::new(1));
+            let slots = BlockUploadSlots::new(1);
             let advertiser = BlockAdvertiser {
                 peers,
                 slots: slots.clone(),
@@ -1321,7 +1324,7 @@ mod tests {
                 .send(Err(BlockAdvertError::AuthorizationRevoked))
                 .unwrap();
             tokio::task::yield_now().await;
-            assert_eq!(slots.available_permits(), 1);
+            assert_eq!(slots.available_uploads(), 1);
             assert!((&mut broadcast).now_or_never().is_none());
             assert!(
                 first_rx.try_recv().is_err(),
@@ -1340,7 +1343,7 @@ mod tests {
     async fn joined_advertisements_preserve_revocation_and_release_permits() {
         timeout(Duration::from_secs(1), async {
             let (peer, mut receiver) = peer();
-            let slots = Arc::new(Semaphore::new(1));
+            let slots = BlockUploadSlots::new(1);
             let hash = block::Hash([62; 32]);
             let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone()));
             let advert = receiver.recv().await.unwrap();
@@ -1352,7 +1355,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(first.await.unwrap(), AdvertOutcome::Revoked));
             assert!(matches!(second.await.unwrap(), AdvertOutcome::Revoked));
-            assert_eq!(slots.available_permits(), 1);
+            assert_eq!(slots.available_uploads(), 1);
             assert!(receiver.try_recv().is_err());
         })
         .await
@@ -1375,7 +1378,7 @@ mod tests {
                 .into();
             let advertiser = BlockAdvertiser {
                 peers,
-                slots: Arc::new(Semaphore::new(1)),
+                slots: BlockUploadSlots::new(1),
                 minimum_peer_version: minimum,
                 bans: BannedIps::with_banned_ip(banned.ip()),
                 refresh: None,
@@ -1408,7 +1411,7 @@ mod tests {
     async fn revoked_wait_obeys_caller_deadline() {
         let (peer, mut receiver) = peer();
         let (_published, peers) = watch::channel(vec![peer]);
-        let slots = Arc::new(Semaphore::new(1));
+        let slots = BlockUploadSlots::new(1);
         let advertiser = BlockAdvertiser {
             peers,
             slots: slots.clone(),
@@ -1433,7 +1436,7 @@ mod tests {
         };
         let (result, ()) = tokio::join!(deadline, reject);
         assert!(result.is_err());
-        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(slots.available_uploads(), 1);
         assert!(receiver.try_recv().is_err());
     }
 

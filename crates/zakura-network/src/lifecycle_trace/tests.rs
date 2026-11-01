@@ -353,6 +353,31 @@ fn p2p_rows_record_every_inventory_block_hash_and_the_write_completion() {
     assert!(rows[4]["seq"].is_empty());
 }
 
+/// A peer can send up to 50,000 inventory entries, so one row lists a bounded number of hashes
+/// and still counts the whole message.
+#[test]
+fn p2p_rows_limit_the_block_hashes_of_oversized_inventory() {
+    let (trace, mut rx) = capture(JsonlTraceTables::from_names(["p2p"]).unwrap());
+    let conn = trace.connection(true, "flooder");
+    let items: Vec<InventoryHash> = (0..=u16::try_from(p2p::MAX_ROW_BLOCK_HASHES).unwrap())
+        .map(|index| {
+            let mut bytes = [0; 32];
+            bytes[..2].copy_from_slice(&index.to_le_bytes());
+            block::Hash(bytes).into()
+        })
+        .collect();
+    let total = items.len();
+
+    conn.p2p_recv(&Message::Inv(items));
+
+    let rows = rows(&drain(&mut rx), tables::P2P);
+    let hashes: Vec<String> =
+        serde_json::from_str(&rows[0]["block_hashes"]).expect("block hashes are a JSON list");
+    assert_eq!(hashes.len(), p2p::MAX_ROW_BLOCK_HASHES);
+    assert_eq!(rows[0]["item_count"], total.to_string());
+    assert_eq!(rows[0]["tx_count"], "0");
+}
+
 #[test]
 fn p2p_block_rows_record_hash_height_and_size() {
     use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};

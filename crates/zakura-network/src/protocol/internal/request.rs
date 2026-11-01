@@ -173,10 +173,8 @@ pub enum Request {
     /// is no way for the network layer to distinguish them. For this reason, the
     /// response may occasionally contain a single hash of a new chain tip rather
     /// than a list of hashes of subsequent blocks. We believe that unsolicited
-    /// `inv` messages will always have exactly one block hash, so the connection
-    /// also hands a one-hash response to the inbound service as a
-    /// [`Request::AdvertiseBlock`], and the gossip downloader may fetch that
-    /// block as well.
+    /// `inv` messages will always have exactly one block hash. Discovery processes
+    /// replies incrementally so these hashes need not wait for the entire round.
     FindBlocks {
         /// Hashes of known blocks, ordered from highest height to lowest height.
         //

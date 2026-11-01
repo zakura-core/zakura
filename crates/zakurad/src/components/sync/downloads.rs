@@ -1,7 +1,7 @@
 //! A download stream for Zebra's block syncer.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -122,6 +122,12 @@ impl<Request: Clone> hedge::Policy<Request> for AlwaysHedge {
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum BlockDownloadVerifyError {
+    /// Optional discovery work failed; it must not restart a required chain download.
+    #[error("optional discovery hint failed: {error}")]
+    HintFailed {
+        #[source]
+        error: Box<BlockDownloadVerifyError>,
+    },
     #[error("permanent readiness error from the network service: {error:?}")]
     NetworkServiceError {
         #[source]
@@ -368,6 +374,9 @@ where
     /// verify tasks.
     cancel_handles: HashMap<block::Hash, oneshot::Sender<()>>,
 
+    /// Pending hashes that have not yet been anchored by a validated discovery reply.
+    hints: HashSet<block::Hash>,
+
     /// Current lifecycle phase for each pending legacy block task.
     task_states: Arc<Mutex<HashMap<block::Hash, LegacyTaskState>>>,
 
@@ -414,6 +423,7 @@ where
             match join_result.expect("block download and verify tasks must not panic") {
                 Ok((height, hash)) => {
                     this.cancel_handles.remove(&hash);
+                    this.hints.remove(&hash);
                     let state = take_task_state(this.task_states, hash);
                     this.trace
                         .block_finish(hash, LegacyBlockOutcome::Verified(height), state);
@@ -422,10 +432,16 @@ where
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
+                    let optional = this.hints.remove(&hash);
                     let state = take_task_state(this.task_states, hash);
                     this.trace
                         .block_finish(hash, LegacyBlockOutcome::Error(&e), state);
-                    Poll::Ready(Some(Err(e)))
+                    let error = if optional {
+                        BlockDownloadVerifyError::HintFailed { error: Box::new(e) }
+                    } else {
+                        e
+                    };
+                    Poll::Ready(Some(Err(error)))
                 }
             }
         } else {
@@ -488,6 +504,7 @@ where
             past_lookahead_limit_receiver,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
+            hints: HashSet::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
             trace,
         }
@@ -562,6 +579,7 @@ where
         &mut self,
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
+        self.promote(&hash);
         if self.cancel_handles.contains_key(&hash) {
             metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
@@ -915,6 +933,37 @@ where
         Ok(())
     }
 
+    /// Queues optional work using the same ownership and verification as required blocks.
+    pub(super) async fn download_hint(
+        &mut self,
+        hash: block::Hash,
+    ) -> Result<(), BlockDownloadVerifyError> {
+        if self.contains(&hash) || self.hints.len() >= super::FANOUT {
+            return Ok(());
+        }
+        self.download_and_verify(hash).await?;
+        self.hints.insert(hash);
+        Ok(())
+    }
+
+    /// Turns an existing optional fetch into required work without issuing another request.
+    pub(super) fn promote(&mut self, hash: &block::Hash) {
+        self.hints.remove(hash);
+    }
+
+    pub(super) fn hint_count(&self) -> usize {
+        self.hints.len()
+    }
+
+    /// Cancels optional work before native sync takes over block-body ownership.
+    pub(super) fn cancel_hints(&mut self) {
+        for hash in &self.hints {
+            if let Some(cancel) = self.cancel_handles.remove(hash) {
+                let _ = cancel.send(());
+            }
+        }
+    }
+
     /// Cancel all running tasks and reset the downloader state.
     pub fn cancel_all(&mut self) {
         self.emit_diagnostic_snapshot(
@@ -927,6 +976,7 @@ where
 
         // Replace the pending task list with an empty one and drop it.
         let _ = std::mem::take(&mut self.pending);
+        self.hints.clear();
 
         // Signal cancellation to all running tasks.
         // Since we already dropped the JoinHandles above, they should

@@ -885,6 +885,8 @@ where
                 // the parent once and verify the same body again. The task keeps its lookahead slot
                 // while it waits, and stays cancellable.
                 let mut verify_start;
+                // Measured before any parent wait, so the metric only covers verification.
+                let mut verify_elapsed;
                 let mut waited_for_parent = false;
                 let verification = loop {
                     // Wait for the verifier service to be ready.
@@ -934,6 +936,7 @@ where
                         }
                         verification = rsp => verification,
                     };
+                    verify_elapsed = verify_start.elapsed();
 
                     if !waited_for_parent {
                         if let Some(parent) = unconfirmed_parent(&verification) {
@@ -956,7 +959,7 @@ where
 
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
-                    .record(verify_start.elapsed().as_secs_f64());
+                    .record(verify_elapsed.as_secs_f64());
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);

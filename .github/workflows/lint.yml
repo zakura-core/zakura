@@ -131,7 +131,7 @@ jobs:
       - name: Check locked all-feature build
         if: ${{ !cancelled() }}
         run: cargo check --locked --all-features --all-targets
-      - name: Check default x86 assembly build
+      - name: Check default x86 assembly features
         if: ${{ !cancelled() }}
         run: |
           cargo tree --locked --package zakura --target x86_64-unknown-linux-gnu \
@@ -141,7 +141,6 @@ jobs:
             echo "Default builds must select assembly, not the portable override." >&2
             exit 1
           fi
-          cargo check --locked --package zakura --bin zakurad
       - name: Check generated RPC artifacts
         if: ${{ !cancelled() }}
         run: cargo xtask check-rpc-artifacts

@@ -9,7 +9,7 @@ use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, sync
 
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
-use zakura_rt::sync::atomic::{AtomicBool, Ordering};
+use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
 use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
@@ -346,9 +346,11 @@ pub(crate) struct PortTap {
     /// The call's number, or 0 for an action that calls no port.
     pub(crate) call: u64,
     observer: Option<Arc<dyn HeaderSyncObserver>>,
-    /// Set once the call's end is reported, through any clone, so a
-    /// [`PendingCall`] dropped after it reports nothing.
-    ended: Arc<AtomicBool>,
+    /// How many ends this call reported, through any clone, so a [`PendingCall`]
+    /// dropped after one reports nothing. Only the reactor's task touches it. A
+    /// simulator's coordination atomic would be a scheduling point, which would
+    /// split a storage receipt from its call's end.
+    ended: Arc<AtomicU64>,
 }
 
 impl PortTap {
@@ -378,7 +380,7 @@ impl PortTap {
     /// Reports that the call ended with `end`, from outside the port future's
     /// panic catch, where an observer panic already unwinds the reactor.
     pub(crate) fn end_after_catch(&self, end: CallEnd) {
-        self.ended.store(true, Ordering::Relaxed);
+        self.ended.fetch_add(1, Ordering::Relaxed);
         if let Some(observer) = &self.observer {
             observer.observe(ReactorEvent::CallEnded {
                 call: self.call,
@@ -545,7 +547,7 @@ impl<F> Drop for PendingCall<F> {
     /// Reports the call dropped unless a poll finished, its end was already
     /// reported, or the thread is unwinding, then drops the future.
     fn drop(&mut self) {
-        let reported = self.done || self.tap.ended.load(Ordering::Relaxed);
+        let reported = self.done || self.tap.ended.load(Ordering::Relaxed) > 0;
         if !reported && !std::thread::panicking() {
             self.tap.end_after_catch(CallEnd::Dropped);
         }

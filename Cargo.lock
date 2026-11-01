@@ -3144,6 +3144,7 @@ dependencies = [
  "zakura-chain",
  "zakura-header-chain",
  "zakura-rt",
+ "zakura-test",
 ]
 
 [[package]]

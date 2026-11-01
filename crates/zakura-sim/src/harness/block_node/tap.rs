@@ -56,9 +56,9 @@ use crate::{
     domain::block_sync::OwnerInput,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
-        BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncRange,
-        BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission,
-        BlockSyncWorkItem, StorageFact,
+        BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncPayload,
+        BlockSyncRange, BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained,
+        BlockSyncSubmission, BlockSyncWorkItem, StorageFact,
     },
     storage::{block_owner, hex},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
@@ -563,6 +563,14 @@ impl BlockTap {
                     .collect(),
             },
             BlockEvent::Sequencer(ownership) => BlockSyncFact::Sequencer {
+                payloads: ownership
+                    .payloads
+                    .iter()
+                    .map(|payload| BlockSyncPayload {
+                        id: payload.id,
+                        decoded_attributed_memory_bytes: payload.decoded_attributed_memory_bytes,
+                    })
+                    .collect(),
                 reorder: ownership
                     .reorder
                     .iter()
@@ -644,6 +652,8 @@ impl Allocations {
             bytes: retained.bytes,
         };
         BlockSyncRetained {
+            payload_id: retained.payload_id,
+            policy_decoded_bytes: retained.policy_decoded_bytes,
             body: body(&held),
             admitted_estimate_bytes: retained.admitted_estimate_bytes,
             allocation: self.number(retained.allocation, held),

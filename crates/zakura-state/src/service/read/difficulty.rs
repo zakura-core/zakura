@@ -171,7 +171,7 @@ fn best_relevant_chain_and_history_tree(
     (
         Height,
         block::Hash,
-        Vec<Arc<block::Header>>,
+        Vec<zakura_node_services::block_memory::HeaderHandle>,
         Arc<HistoryTree>,
     ),
     BoxError,
@@ -228,7 +228,7 @@ fn best_relevant_chain_and_history_tree(
 ///
 /// See [`get_block_template_chain_info()`] for details.
 fn difficulty_time_and_history_tree(
-    relevant_chain: Vec<Arc<block::Header>>,
+    relevant_chain: Vec<zakura_node_services::block_memory::HeaderHandle>,
     tip_height: Height,
     tip_hash: block::Hash,
     network: &Network,
@@ -599,7 +599,7 @@ mod tests {
                     .checked_add(Duration32::from_seconds(offset))
                     .unwrap();
                 let result = difficulty_time_and_history_tree(
-                    relevant_chain.clone(),
+                    relevant_chain.iter().cloned().map(Into::into).collect(),
                     tip_height,
                     block.hash(),
                     &network,
@@ -690,7 +690,10 @@ mod tests {
                 (after_tip(BLOCK_MAX_TIME_SINCE_MEDIAN + 1), max_time),
             ] {
                 let result = difficulty_time_and_history_tree(
-                    vec![header.clone(); span],
+                    vec![
+                        zakura_node_services::block_memory::HeaderHandle::Shared(header.clone());
+                        span
+                    ],
                     tip_height,
                     block.hash(),
                     &network,
@@ -728,7 +731,12 @@ mod tests {
                 let required = usize::try_from((tip + 1).min(span)).unwrap();
                 for count in 0..=required {
                     let result = difficulty_time_and_history_tree(
-                        vec![block.header.clone(); count],
+                        vec![
+                            zakura_node_services::block_memory::HeaderHandle::Shared(
+                                block.header.clone()
+                            );
+                            count
+                        ],
                         Height(tip),
                         block.hash(),
                         &network,

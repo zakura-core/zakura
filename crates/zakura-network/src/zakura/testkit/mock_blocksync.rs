@@ -219,7 +219,8 @@ impl MockApplyFrontier {
         }
     }
 
-    pub(crate) fn apply(&self, block: &block::Block) -> MockApplyOutcome {
+    pub(crate) fn apply<'a>(&self, block: impl Into<block::BlockView<'a>>) -> MockApplyOutcome {
+        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("synthetic block has a coinbase height");

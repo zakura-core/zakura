@@ -205,3 +205,9 @@ pub use peer_registry::{
     replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
     RetryAuthorityReplaySummary,
 };
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use sequencer_task::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
+};

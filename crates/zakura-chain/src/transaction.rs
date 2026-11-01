@@ -175,6 +175,12 @@ pub enum Transaction {
     },
 }
 
+impl AsRef<Transaction> for Transaction {
+    fn as_ref(&self) -> &Transaction {
+        self
+    }
+}
+
 impl AttributedMemorySize for Transaction {
     fn attributed_memory_size_bytes(&self) -> u64 {
         use Transaction::*;

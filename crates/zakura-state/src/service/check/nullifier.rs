@@ -38,25 +38,25 @@ pub(crate) fn no_duplicates_in_finalized_chain(
     semantically_verified: &SemanticallyVerifiedBlock,
     finalized_state: &ZakuraDb,
 ) -> Result<(), ValidateContextError> {
-    for nullifier in semantically_verified.block.sprout_nullifiers() {
+    for nullifier in semantically_verified.block.view().sprout_nullifiers() {
         if finalized_state.contains_sprout_nullifier(nullifier) {
             Err(nullifier.duplicate_nullifier_error(true))?;
         }
     }
 
-    for nullifier in semantically_verified.block.sapling_nullifiers() {
+    for nullifier in semantically_verified.block.view().sapling_nullifiers() {
         if finalized_state.contains_sapling_nullifier(nullifier) {
             Err(nullifier.duplicate_nullifier_error(true))?;
         }
     }
 
-    for nullifier in semantically_verified.block.orchard_nullifiers() {
+    for nullifier in semantically_verified.block.view().orchard_nullifiers() {
         if finalized_state.contains_orchard_nullifier(nullifier) {
             Err(nullifier.duplicate_nullifier_error(true))?;
         }
     }
 
-    for nullifier in semantically_verified.block.ironwood_nullifiers() {
+    for nullifier in semantically_verified.block.view().ironwood_nullifiers() {
         if finalized_state.contains_ironwood_nullifier(nullifier) {
             Err(duplicate_ironwood_nullifier_error(nullifier, true))?;
         }

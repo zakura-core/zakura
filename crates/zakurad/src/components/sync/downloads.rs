@@ -737,7 +737,7 @@ where
                 // discard a height-rewritten body as a benign old block: unattributed,
                 // unscored, and not requeued. See `crate::components::auth_download_height`.
                 if let Some(expected_height) = tip_child_mismatch(
-                    block.header.previous_block_hash,
+                    block.header().previous_block_hash,
                     block_height,
                     best_tip,
                 ) {

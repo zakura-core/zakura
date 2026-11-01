@@ -1,3 +1,4 @@
+use zakura_node_services::block_memory::DecodedBlockPool;
 use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
 use super::{
@@ -59,6 +60,8 @@ pub struct BlockSyncStartup {
         Option<watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>>,
     /// Local stream-6 configuration.
     pub config: ZakuraBlockSyncConfig,
+    /// Shared native decoded retention through the last driver or backend holder.
+    pub decoded_pool: DecodedBlockPool,
     /// Shared shutdown signal owned by the embedding endpoint or test harness.
     pub shutdown: CancellationToken,
     /// Enables query actions for state-backed metadata.
@@ -82,10 +85,12 @@ impl BlockSyncStartup {
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
+        decoded_pool: DecodedBlockPool,
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
             body_retention: None,
+            decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers,
             best_header_tip,
@@ -108,10 +113,12 @@ impl BlockSyncStartup {
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
         committed_views: watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+        decoded_pool: DecodedBlockPool,
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
             body_retention: None,
+            decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers,
             best_header_tip,
@@ -151,9 +158,10 @@ impl BlockSyncStartup {
         self
     }
 
-    pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn inert(decoded_pool: DecodedBlockPool, config: ZakuraBlockSyncConfig) -> Self {
         Self {
             body_retention: None,
+            decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
@@ -302,6 +310,7 @@ impl BlockSyncHandle {
 /// `service::add_peer`.
 #[derive(Clone, Debug)]
 pub(super) struct RoutineWiring {
+    pub(super) decoded_pool: DecodedBlockPool,
     pub(super) request_pool: crate::zakura::regulation::ReservationPool,
     pub(super) serving: Arc<super::regulated::session::Serving>,
     pub(super) config: ZakuraBlockSyncConfig,
@@ -321,15 +330,25 @@ pub(super) struct RoutineWiring {
 }
 
 impl BlockSyncHandle {
-    /// Wait for a local request-accounting failure. The driver must stop rather
-    /// than replace this budget while old owners can still retain resources.
+    /// Wait for request or decoded-retention accounting to close admission.
+    /// The driver must not replace capacity while old owners retain resources.
     pub async fn accounting_closed(&self) {
-        self.accounting.closed().await;
+        let Some(wiring) = self.routine_wiring.as_ref() else {
+            return self.accounting.closed().await;
+        };
+        zakura_rt::select! {
+            () = self.accounting.closed() => {},
+            () = wiring.decoded_pool.closed() => {},
+        }
     }
 
-    /// Whether a local accounting failure has closed request admission.
+    /// Whether an accounting failure has closed request or decoded admission.
     pub fn is_accounting_closed(&self) -> bool {
         self.accounting.is_closed()
+            || self
+                .routine_wiring
+                .as_ref()
+                .is_some_and(|wiring| wiring.decoded_pool.is_closed())
     }
 
     /// Send a fact/event to the block-sync reactor.

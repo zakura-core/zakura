@@ -16,7 +16,7 @@ use zakura_chain::{
     block,
     chain_tip::ChainTip,
     parameters::{Network, NetworkUpgrade},
-    transaction::{self, Transaction},
+    transaction::{self},
 };
 
 use crate::{
@@ -26,6 +26,8 @@ use crate::{
 
 use TipAction::*;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -60,7 +62,13 @@ pub struct ChainTipBlock {
     pub time: DateTime<Utc>,
 
     /// The block transactions.
-    pub transactions: Vec<Arc<Transaction>>,
+    #[cfg_attr(
+        any(test, feature = "proptest-impl"),
+        proptest(
+            strategy = "any::<Vec<Arc<transaction::Transaction>>>().prop_map(|transactions| transactions.into_iter().map(Into::into).collect())"
+        )
+    )]
+    pub transactions: Vec<zakura_node_services::block_memory::TransactionHandle>,
 
     /// The mined transaction IDs of the transactions in `block`,
     /// in the same order as `block.transactions`.
@@ -118,10 +126,10 @@ impl From<ContextuallyVerifiedBlock> for ChainTipBlock {
         Self {
             hash,
             height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
+            time: block.header().time,
+            transactions: block.transactions().collect(),
             transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
+            previous_block_hash: block.header().previous_block_hash,
         }
     }
 }
@@ -142,10 +150,10 @@ impl From<SemanticallyVerifiedBlock> for ChainTipBlock {
         Self {
             hash,
             height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
+            time: block.header().time,
+            transactions: block.transactions().collect(),
             transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
+            previous_block_hash: block.header().previous_block_hash,
         }
     }
 }

@@ -299,7 +299,12 @@ static BLOCK_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
             .into();
     let hash = Ok(block.hash());
 
-    vec![(Request::Commit(block), hash)]
+    vec![(
+        Request::Commit(zakura_node_services::block_memory::BlockHandle::Shared(
+            block,
+        )),
+        hash,
+    )]
 });
 
 static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: LazyLock<
@@ -310,7 +315,12 @@ static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: LazyLock<
             .unwrap()
             .into();
 
-    vec![(Request::Commit(block), Err(ExpectedTranscriptError::Any))]
+    vec![(
+        Request::Commit(zakura_node_services::block_memory::BlockHandle::Shared(
+            block,
+        )),
+        Err(ExpectedTranscriptError::Any),
+    )]
 });
 
 static NO_COINBASE_TRANSCRIPT: LazyLock<
@@ -319,7 +329,9 @@ static NO_COINBASE_TRANSCRIPT: LazyLock<
     let block = block_no_transactions();
 
     vec![(
-        Request::Commit(Arc::new(block)),
+        Request::Commit(zakura_node_services::block_memory::BlockHandle::Shared(
+            Arc::new(block),
+        )),
         Err(ExpectedTranscriptError::Any),
     )]
 });
@@ -347,7 +359,9 @@ static STATE_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
 
     vec![(
         zs::Request::Block(hash.into()),
-        Ok(zs::Response::Block(Some(block))),
+        Ok(zs::Response::Block(Some(
+            zakura_node_services::block_memory::BlockHandle::Shared(block),
+        ))),
     )]
 });
 
@@ -546,7 +560,9 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                 .ready()
                 .await
                 .unwrap()
-                .call(Request::Commit(genesis.clone()))
+                .call(Request::Commit(
+                    zakura_node_services::block_memory::BlockHandle::Shared(genesis.clone())
+                ))
                 .await
                 .unwrap(),
             genesis.hash()
@@ -584,11 +600,13 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         };
         let request = if mined {
             Request::CommitMined {
-                block: candidate,
+                block: zakura_node_services::block_memory::BlockHandle::Shared(candidate),
                 admission: zs::BlockAdmission::pending(),
             }
         } else {
-            Request::Commit(candidate)
+            Request::Commit(zakura_node_services::block_memory::BlockHandle::Shared(
+                candidate,
+            ))
         };
         let candidate_response = tokio::spawn(router.ready().await.unwrap().call(request));
 
@@ -626,7 +644,9 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                     .ready()
                     .await
                     .unwrap()
-                    .call(Request::Commit(block.clone()))
+                    .call(Request::Commit(
+                        zakura_node_services::block_memory::BlockHandle::Shared(block.clone())
+                    ))
                     .await
                     .unwrap(),
                 block.hash(),
@@ -740,7 +760,9 @@ async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
         };
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            router.oneshot(Request::Commit(Arc::new(block))),
+            router.oneshot(Request::Commit(
+                zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
+            )),
         )
         .await
         .unwrap()
@@ -833,7 +855,9 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
             .unwrap()
         };
         let checkpoint_error = in_progress_checkpoint()
-            .oneshot(block.clone())
+            .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
+                block.clone(),
+            ))
             .await
             .unwrap_err();
         assert_eq!(
@@ -848,7 +872,9 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
             crate::transaction::boxed_state(unknown_block_state),
             crate::transaction::boxed_transaction_verifier(transaction),
         )
-        .oneshot(Request::Commit(block.clone()))
+        .oneshot(Request::Commit(
+            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+        ))
         .await
         .unwrap_err();
         assert_eq!(
@@ -869,7 +895,9 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
                 ),
             };
             let error = router
-                .oneshot(Request::Commit(block.clone()))
+                .oneshot(Request::Commit(
+                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                ))
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -936,7 +964,9 @@ async fn forged_height_across_upgrade_is_a_payload_mismatch() {
         ),
     };
     let error = router
-        .oneshot(Request::Commit(Arc::new(block)))
+        .oneshot(Request::Commit(
+            zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
+        ))
         .await
         .unwrap_err();
     assert_eq!(

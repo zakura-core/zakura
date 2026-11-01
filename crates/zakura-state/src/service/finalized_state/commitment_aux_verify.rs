@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use zakura_chain::{
-    block::{merkle::AuthDataRoot, Block, Header, Height},
+    block::{merkle::AuthDataRoot, Header, Height},
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::commitment_aux_verify::{
@@ -28,8 +28,8 @@ use crate::{service::check, ValidateContextError};
 /// One block-sized step in supplied commitment-root verification.
 #[derive(Clone, Debug)]
 pub(crate) struct CommitmentRootVerification {
-    pub(crate) block: Option<Arc<Block>>,
-    pub(crate) header: Arc<Header>,
+    pub(crate) block: Option<zakura_node_services::block_memory::BlockHandle>,
+    pub(crate) header: zakura_node_services::block_memory::HeaderHandle,
     pub(crate) height: Height,
     pub(crate) roots: Option<(
         sapling::tree::Root,
@@ -44,7 +44,7 @@ impl CommitmentRootVerification {
     /// Verify this block's parent-history commitment, then fold the supplied
     /// per-block roots into the running history tree for the next block.
     pub(crate) fn with_roots(
-        block: Arc<Block>,
+        block: zakura_node_services::block_memory::BlockHandle,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
         ironwood_root: ironwood::tree::Root,
@@ -55,7 +55,7 @@ impl CommitmentRootVerification {
             .coinbase_height()
             .expect("checkpoint-verified blocks have a coinbase height");
         CommitmentRootVerification {
-            header: block.header.clone(),
+            header: block.retained_header(),
             height,
             block: Some(block),
             roots: Some((sapling_root, orchard_root, ironwood_root)),
@@ -75,7 +75,7 @@ impl CommitmentRootVerification {
     ) -> Self {
         CommitmentRootVerification {
             block: None,
-            header,
+            header: header.into(),
             height,
             roots: None,
             precomputed_auth_data_root,
@@ -143,12 +143,12 @@ impl CommitmentRootVerificationError {
 /// - Sapling..Heartwood: the header's `FinalSaplingRoot` commits the Sapling root
 ///   directly, so the supplied root must equal it.
 /// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the empty-tree root.
-pub(crate) fn verify_supplied_sapling_root_below_heartwood(
+pub(crate) fn verify_supplied_sapling_root_below_heartwood<'a>(
     network: &Network,
-    block: &Block,
+    block: impl Into<zakura_chain::block::BlockView<'a>>,
     sapling_root: &sapling::tree::Root,
 ) -> Result<(), ValidateContextError> {
-    let expected = match block.commitment(network)? {
+    let expected = match block.into().commitment(network)? {
         Commitment::FinalSaplingRoot(header_root) => header_root,
         Commitment::PreSaplingReserved(_) => sapling::tree::NoteCommitmentTree::default().root(),
         // Heartwood activation and later are authenticated by the MMR path.
@@ -331,7 +331,13 @@ where
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
         history_tree
-            .push(network, block, &sapling_root, &orchard_root, &ironwood_root)
+            .push(
+                network,
+                &block,
+                &sapling_root,
+                &orchard_root,
+                &ironwood_root,
+            )
             .map_err(Arc::new)
             .map_err(ValidateContextError::from)
             .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
@@ -407,7 +413,7 @@ mod tests {
     }
 
     fn verification_item(
-        block: Arc<Block>,
+        block: zakura_node_services::block_memory::BlockHandle,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
     ) -> CommitmentRootVerification {
@@ -429,18 +435,23 @@ mod tests {
         let ironwood_root = empty_ironwood_root();
 
         let with_roots = CommitmentRootVerification::with_roots(
-            block.clone(),
+            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
             sapling_root,
             orchard_root,
             ironwood_root,
             None,
             true,
         );
-        assert!(Arc::ptr_eq(
-            with_roots.block.as_ref().expect("roots item has a block"),
-            &block
+        let zakura_node_services::block_memory::BlockHandle::Shared(retained) =
+            with_roots.block.as_ref().expect("roots item has a block")
+        else {
+            panic!("the fixture supplies a shared block")
+        };
+        assert!(Arc::ptr_eq(retained, &block));
+        assert!(std::ptr::eq(
+            with_roots.header.as_ref(),
+            block.header.as_ref()
         ));
-        assert!(Arc::ptr_eq(&with_roots.header, &block.header));
         assert_eq!(with_roots.height, block.coinbase_height().unwrap());
         assert_eq!(
             with_roots.roots,
@@ -456,7 +467,10 @@ mod tests {
             Some(block.auth_data_root()),
         );
         assert!(header_only.block.is_none());
-        assert!(Arc::ptr_eq(&header_only.header, &block.header));
+        assert!(std::ptr::eq(
+            header_only.header.as_ref(),
+            block.header.as_ref()
+        ));
         assert_eq!(header_only.height, height);
         assert_eq!(header_only.roots, None);
         assert_eq!(
@@ -695,7 +709,11 @@ mod tests {
 
         // Positive: the real roots reconstruct a tree the next block's header commits to.
         let ok_items = vec![
-            verification_item(act_block.clone(), act_root, empty_orchard_root),
+            verification_item(
+                zakura_node_services::block_memory::BlockHandle::Shared(act_block.clone()),
+                act_root,
+                empty_orchard_root,
+            ),
             CommitmentRootVerification::header_only(
                 next_block.header.clone(),
                 Height(activation + 1),
@@ -710,7 +728,11 @@ mod tests {
         // following block's commitment is checked.
         assert_ne!(act_root, next_root, "test needs two distinct roots");
         let bad_items = vec![
-            verification_item(act_block, next_root, empty_orchard_root),
+            verification_item(
+                zakura_node_services::block_memory::BlockHandle::Shared(act_block),
+                next_root,
+                empty_orchard_root,
+            ),
             CommitmentRootVerification::header_only(
                 next_block.header.clone(),
                 Height(activation + 1),
@@ -819,7 +841,11 @@ mod tests {
                 .orchard_tree_by_height(&Height(h))
                 .expect("archive fork has the per-height Orchard tree")
                 .root();
-            verification_item(block, sapling_root, orchard_root)
+            verification_item(
+                zakura_node_services::block_memory::BlockHandle::Shared(block),
+                sapling_root,
+                orchard_root,
+            )
         };
         let items: Vec<_> = (start..=end + 1).map(item_at).collect();
 
@@ -967,7 +993,7 @@ mod tests {
                 "auth-data root at {height:?}"
             );
             CommitmentRootVerification::with_roots(
-                block,
+                zakura_node_services::block_memory::BlockHandle::Shared(block),
                 roots.sapling_root,
                 roots.orchard_root,
                 roots.ironwood_root,
@@ -1098,12 +1124,14 @@ mod tests {
             let (sapling_root, orchard_root, ironwood_root) = activation_item
                 .roots
                 .expect("served root verification items contain roots");
-            let history_tree = HistoryTree::from_block(
+            let history_tree = HistoryTree::from_parts(
                 &Mainnet,
-                activation_block,
-                &sapling_root,
-                &orchard_root,
-                &ironwood_root,
+                zakura_chain::history_tree::HistoryTreeBlockParts::from_block(
+                    &activation_block,
+                    &sapling_root,
+                    &orchard_root,
+                    &ironwood_root,
+                ),
             )
             .expect("network-upgrade activation starts a history-tree epoch");
             let confirm_end = end

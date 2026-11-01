@@ -16,7 +16,7 @@ use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     serialization::SerializationError,
     transaction::{UnminedTx, UnminedTxId},
 };
@@ -61,7 +61,7 @@ pub(super) enum Handler {
     FindHeaders,
     BlocksByHash {
         pending_hashes: HashSet<block::Hash>,
-        blocks: Vec<Arc<Block>>,
+        blocks: Vec<zakura_node_services::block_memory::BlockHandle>,
     },
     TransactionsById {
         pending_ids: HashSet<UnminedTxId>,

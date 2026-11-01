@@ -252,7 +252,7 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
         history_tree
             .push(
                 network,
-                block.clone(),
+                &block,
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
@@ -686,7 +686,7 @@ impl Fixture {
         for block in self.chain.iter().take(height.0 as usize + 1) {
             tree.push(
                 &self.network,
-                block.clone(),
+                block,
                 &empty_sapling_root(),
                 &empty_orchard_root(),
                 &empty_ironwood_root(),
@@ -717,7 +717,7 @@ impl Fixture {
             self.history_tree_through(parent),
             vec![
                 CommitmentRootVerification::with_roots(
-                    block.clone(),
+                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
                     record.sapling_root,
                     record.orchard_root,
                     record.ironwood_root,
@@ -1295,7 +1295,7 @@ fn fold_placement_is_checked_before_every_history_tree_push() {
 
     tree.push(
         &network,
-        chain[HEARTWOOD as usize].clone(),
+        &chain[HEARTWOOD as usize],
         &empty_sapling_root(),
         &empty_orchard_root(),
         &empty_ironwood_root(),

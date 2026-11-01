@@ -1204,7 +1204,8 @@ mod tests {
             assert!(
                 watched
                     .iter()
-                    .any(|path| path.starts_with("crates/zakura-network")),
+                    .any(|path| path.starts_with("crates/zakura-network")
+                        || path.starts_with("crates/zakura-node-services")),
                 "{} watches the production file it patches",
                 case.patch.display()
             );

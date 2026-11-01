@@ -21,8 +21,8 @@ use super::{admission::DESERIALIZED_MEM_FACTOR, events::BlockApplyToken, reorder
 /// A received body draining contiguously toward the verified tip, awaiting (or
 /// undergoing) verifier submission.
 ///
-/// Bodies beyond the submission window are held in their serialized wire form
-/// (`BufferedBlockBody::RawFramePayload`) and only decoded at `prepare_submit`,
+/// IO keeps bodies beyond the submission window in their serialized wire form
+/// and decodes them before reporting a materialized submission,
 /// so the decoded heap footprint of the apply backlog is bounded by the
 /// submission window instead of the whole backlog (the incident mode was tens
 /// of thousands of decoded bodies resident at once).
@@ -35,7 +35,7 @@ pub(super) struct ApplyingBlock {
     /// `previous_block_hash` captured at receipt, so reset-conflict checks never
     /// need to decode a backlog body.
     pub(super) previous_block_hash: block::Hash,
-    pub(super) body: BufferedBlockBody,
+    pub(super) body: BodyFacts,
     pub(super) bytes: u64,
     /// The size estimate the body's request reserved at admission, carried from
     /// the reorder buffer. `None` for a body admitted on its wire size.
@@ -60,8 +60,8 @@ pub(super) enum AcceptOutcome {
     Redundant { release_bytes: u64 },
 }
 
-/// A body the Sequencer has assigned a token and marked submitted; the reactor
-/// dispatches the matching `SubmitBlock` action.
+/// A body identity that policy marked submitted. IO attaches its payload to
+/// the matching `SubmitBlock` action.
 #[derive(Clone, Debug)]
 pub(super) struct SubmitItem {
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -69,7 +69,7 @@ pub(super) struct SubmitItem {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) token: BlockApplyToken,
-    pub(super) block: Arc<block::Block>,
+    pub(super) body_id: BodyId,
     /// The decoded block's attributed size, measured at submission.
     pub(super) decoded_bytes: u64,
 }
@@ -116,12 +116,24 @@ struct InFlightSubmission {
 #[cfg(any(test, zakura_sim))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SequencerOwnership {
+    /// Every payload in runtime storage, including entries absent from policy.
+    pub payloads: Vec<PayloadOwnership>,
     /// Each reorder-buffer body.
     pub reorder: Vec<RetainedBody>,
     /// Each `applying` body.
     pub applying: Vec<RetainedBody>,
     /// Each decoded submission the driver can still retain.
     pub submissions: Vec<SubmissionOwnership>,
+}
+
+/// One runtime payload, read independently of policy membership.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PayloadOwnership {
+    /// Runtime identity assigned before policy acceptance.
+    pub id: u64,
+    /// Attributed decoded size read from the actual block, or zero for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
 }
 
 /// One decoded submission and its wire bytes.
@@ -160,6 +172,7 @@ pub(super) struct AdvanceOutcome {
 #[derive(Clone, Debug)]
 pub(super) struct Sequencer {
     reorder: ReorderBuffer,
+    payload_changes: Vec<PayloadChange>,
     applying: BTreeMap<block::Height, ApplyingBlock>,
     submitted_applies: BTreeMap<block::Height, Vec<SubmittedApply>>,
     in_flight_submissions: BTreeMap<BlockApplyToken, InFlightSubmission>,
@@ -197,9 +210,28 @@ struct DecodedWindowCap {
 }
 
 impl Sequencer {
+    #[cfg(test)]
+    pub(super) fn retained_ids(&self) -> impl Iterator<Item = BodyId> + '_ {
+        self.reorder
+            .retained_ids()
+            .chain(self.applying.values().map(|entry| entry.body.id))
+    }
+
+    pub(super) fn take_payload_changes(&mut self) -> Vec<PayloadChange> {
+        let mut changes = std::mem::take(&mut self.payload_changes);
+        changes.extend(
+            self.reorder
+                .take_released()
+                .into_iter()
+                .map(PayloadChange::Release),
+        );
+        changes
+    }
+
     pub(super) fn new(verified_block_tip: block::Height, submitted_apply_limit: usize) -> Self {
         Self {
             reorder: ReorderBuffer::new(),
+            payload_changes: Vec::new(),
             applying: BTreeMap::new(),
             submitted_applies: BTreeMap::new(),
             in_flight_submissions: BTreeMap::new(),
@@ -259,12 +291,12 @@ impl Sequencer {
         self.verified_block_tip
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn reorder_contains(&self, height: block::Height) -> bool {
         self.reorder.contains(height)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn applying_contains(&self, height: block::Height) -> bool {
         self.applying.contains_key(&height)
     }
@@ -288,11 +320,9 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
-    /// Update the applying-byte total and its gauge together.
+    /// Update the applying-byte total.
     fn set_applying_buffered_bytes(&mut self, bytes: u64) {
         self.applying_buffered_bytes = bytes;
-        // This lossy cast is metrics-only; the sequencer keeps the integer value.
-        metrics::gauge!("sync.block.applying.buffered_bytes").set(bytes as f64);
     }
 
     pub(super) fn applying_decoded_attributed_memory_bytes(&self) -> u64 {
@@ -362,11 +392,9 @@ impl Sequencer {
         self.in_flight_submission_bytes
     }
 
-    /// Update the in-flight submission total and its gauge together.
+    /// Update the in-flight submission total.
     fn set_in_flight_submission_bytes(&mut self, bytes: u64) {
         self.in_flight_submission_bytes = bytes;
-        // This lossy cast is metrics-only; the sequencer keeps the integer value.
-        metrics::gauge!("sync.block.submission.in_flight_bytes").set(bytes as f64);
     }
 
     /// Number of decoded submissions the driver can still retain.
@@ -390,20 +418,32 @@ impl Sequencer {
 
     /// Every body held in `applying` or by an in-flight submission.
     #[cfg(any(test, zakura_sim))]
-    pub(super) fn ownership_snapshot(&self) -> SequencerOwnership {
+    pub(super) fn ownership_snapshot(
+        &self,
+        payloads: &BTreeMap<BodyId, BufferedBlockBody>,
+    ) -> SequencerOwnership {
         SequencerOwnership {
-            reorder: self.reorder.ownership(),
+            payloads: payloads
+                .iter()
+                .map(|(id, body)| PayloadOwnership {
+                    id: id.0,
+                    decoded_attributed_memory_bytes: body
+                        .measured_decoded_attributed_memory_bytes(),
+                })
+                .collect(),
+            reorder: self.reorder.ownership(payloads),
             applying: self
                 .applying
                 .iter()
                 .map(|(height, applying)| RetainedBody {
+                    payload_id: applying.body.id.0,
+                    policy_decoded_bytes: applying.body.decoded_bytes,
                     height: *height,
                     owner: applying.owner,
                     bytes: applying.bytes,
                     admitted_estimate_bytes: applying.admitted_estimate_bytes,
-                    allocation: applying.body.allocation(),
-                    decoded_attributed_memory_bytes: applying
-                        .body
+                    allocation: payloads[&applying.body.id].allocation(),
+                    decoded_attributed_memory_bytes: payloads[&applying.body.id]
                         .measured_decoded_attributed_memory_bytes(),
                 })
                 .collect(),
@@ -514,32 +554,6 @@ impl Sequencer {
 
     // ---- body acceptance ----
 
-    /// Offer a received body to the commit pipeline. Runs the redundancy checks
-    /// and (when not redundant) buffers it in the reorder buffer with its wire
-    /// `bytes` for the retained-size accounting.
-    #[cfg(test)]
-    pub(super) fn accept_body(
-        &mut self,
-        height: block::Height,
-        hash: block::Hash,
-        block: Arc<block::Block>,
-        bytes: u64,
-        source_peer: ZakuraPeerId,
-    ) -> AcceptOutcome {
-        let previous_block_hash = block.header.previous_block_hash;
-        self.accept_buffered_body(
-            super::test_work_owner(),
-            zakura_header_chain::SourceId::from_digest([1; 32]),
-            height,
-            hash,
-            previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, None),
-            bytes,
-            None,
-            source_peer,
-        )
-    }
-
     /// Includes detached submissions so a late response cannot replace live work.
     pub(super) fn already_retains(&self, height: block::Height, hash: block::Hash) -> bool {
         height <= self.body_download_floor
@@ -556,7 +570,7 @@ impl Sequencer {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        body: BufferedBlockBody,
+        mut body: BodyFacts,
         bytes: u64,
         admitted_estimate_bytes: Option<u64>,
         source_peer: ZakuraPeerId,
@@ -571,11 +585,11 @@ impl Sequencer {
         // buffer.
         // If height is the next block in the sequence, we can keep the whole body.
         // Otherwise, we need to retain the body for the backlog.
-        let body = if next_height(self.body_download_floor) == Some(height) {
-            body
-        } else {
-            body.retain_for_backlog()
-        };
+        if next_height(self.body_download_floor) != Some(height)
+            && body.retain_for_backlog_in_place()
+        {
+            self.payload_changes.push(PayloadChange::KeepRaw(body.id));
+        }
 
         match self.reorder.insert_body(
             owner,
@@ -629,7 +643,9 @@ impl Sequencer {
             } else {
                 // Keep the decoded copies a contiguous prefix of this drain.
                 free_submit_slots = 0;
-                body.retain_for_backlog_in_place();
+                if body.retain_for_backlog_in_place() {
+                    self.payload_changes.push(PayloadChange::KeepRaw(body.id));
+                }
             }
             self.body_download_floor = drained.height;
             covered.push(drained.height);
@@ -769,48 +785,38 @@ impl Sequencer {
         }
     }
 
-    /// Assign a token to `height`, mark it submitted, and return the dispatch
-    /// item. `None` if the height is no longer applying (the token counter is
-    /// not consumed in that case).
-    ///
-    /// Submission is the decode point: a body still held as raw bytes is decoded
-    /// here (and cached on the entry until apply-finished or unsubmit), so at
-    /// most `submitted_apply_limit` decoded bodies are resident at once, within
-    /// the decoded-byte cap above the last checkpoint (see `submittable_heights`).
-    pub(super) fn prepare_submit(&mut self, height: block::Height) -> Option<SubmitItem> {
-        if self
-            .applying
-            .get(&height)
-            .is_none_or(|applying| applying.submitted)
-        {
+    /// Return the current body identity before IO materializes its payload.
+    pub(super) fn submission_body(&self, height: block::Height) -> Option<BodyFacts> {
+        self.next_apply_token?;
+        let applying = self.applying.get(&height)?;
+        (!applying.submitted).then_some(applying.body)
+    }
+
+    /// Record IO's measured materialization and assign an apply token.
+    pub(super) fn prepare_submit(
+        &mut self,
+        height: block::Height,
+        body_id: BodyId,
+        decoded_bytes: u64,
+    ) -> Option<SubmitItem> {
+        let body = self.submission_body(height)?;
+        if body.id != body_id {
             return None;
         }
         let token = self.next_apply_token()?;
-        let (
-            owner,
-            source,
-            hash,
-            bytes,
-            block,
-            decoded_attributed_memory_size_bytes,
-            newly_decoded_attributed_memory_bytes,
-        ) = {
-            let applying = self.applying.get_mut(&height)?;
-            let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
-            let block = applying.body.decoded_block();
-            let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
-            applying.token = token;
-            applying.submitted = true;
-            (
-                applying.owner,
-                applying.source,
-                applying.hash,
-                applying.bytes,
-                block,
-                decoded_after,
-                decoded_after.saturating_sub(decoded_before),
-            )
-        };
+        let applying = self.applying.get_mut(&height)?;
+        let newly_decoded_attributed_memory_bytes =
+            decoded_bytes.saturating_sub(applying.body.decoded_bytes);
+        applying.body.decoded_bytes = decoded_bytes;
+        applying.token = token;
+        applying.submitted = true;
+        let (owner, source, hash, bytes) = (
+            applying.owner,
+            applying.source,
+            applying.hash,
+            applying.bytes,
+        );
+        let decoded_attributed_memory_size_bytes = decoded_bytes;
         self.applying_decoded_attributed_memory_bytes = self
             .applying_decoded_attributed_memory_bytes
             .saturating_add(newly_decoded_attributed_memory_bytes);
@@ -835,7 +841,7 @@ impl Sequencer {
             height,
             hash,
             token,
-            block,
+            body_id,
             decoded_bytes: decoded_attributed_memory_size_bytes,
         })
     }
@@ -858,7 +864,10 @@ impl Sequencer {
             // The body leaves the decode window: drop the decoded copy so a
             // rolled-back submission does not grow the decoded backlog.
             let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
-            applying.body.retain_for_backlog_in_place();
+            if applying.body.retain_for_backlog_in_place() {
+                self.payload_changes
+                    .push(PayloadChange::KeepRaw(applying.body.id));
+            }
             let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
             was_submitted.then_some((
                 applying.hash,
@@ -994,7 +1003,10 @@ impl Sequencer {
             return false;
         }
         let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
-        applying.body.retain_for_backlog_in_place();
+        if applying.body.retain_for_backlog_in_place() {
+            self.payload_changes
+                .push(PayloadChange::KeepRaw(applying.body.id));
+        }
         let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
         self.applying_decoded_attributed_memory_bytes = self
             .applying_decoded_attributed_memory_bytes
@@ -1079,6 +1091,8 @@ impl Sequencer {
 
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
         let removed = self.applying.remove(&height)?;
+        self.payload_changes
+            .push(PayloadChange::Release(removed.body.id));
         let decoded_attributed_memory_bytes = removed.body.decoded_attributed_memory_size_bytes();
         self.set_applying_buffered_bytes(
             self.applying_buffered_bytes.saturating_sub(removed.bytes),
@@ -1212,6 +1226,11 @@ impl Sequencer {
         if !keep_submitted_applies {
             self.clear_submitted_applies_from(block::Height::MIN);
         }
+        self.payload_changes.extend(
+            self.applying
+                .values()
+                .map(|entry| PayloadChange::Release(entry.body.id)),
+        );
         self.applying.clear();
         self.set_applying_buffered_bytes(0);
         self.applying_decoded_attributed_memory_bytes = 0;

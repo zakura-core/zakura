@@ -1210,7 +1210,7 @@ async fn block_gossip_slot_tracks_connection_write() {
         .expect_request(Request::BlocksByHash(IndexSet::from([hash])))
         .await
         .respond(Response::Blocks(vec![InventoryResponse::Available((
-            block.clone(),
+            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
             None,
         ))]));
     tokio::task::yield_now().await;
@@ -1219,7 +1219,12 @@ async fn block_gossip_slot_tracks_connection_write() {
     tokio::task::yield_now().await;
     assert_eq!(slots.available_permits(), 0);
     assert!(!advertisement.is_finished());
-    assert_eq!(outbound.next().await.unwrap(), Message::Block(block));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::Block(zakura_node_services::block_memory::BlockHandle::Shared(
+            block
+        ))
+    );
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(749)).await;
     tokio::task::yield_now().await;

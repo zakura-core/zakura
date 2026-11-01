@@ -230,7 +230,9 @@ async fn test_get_block(
     mock_read_service
         .expect_request(ReadRequest::Block(HashOrHeight::Height(height)))
         .await
-        .respond(ReadResponse::Block(Some(block.clone())));
+        .respond(ReadResponse::Block(Some(
+            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+        )));
 
     let response = request_task
         .await?
@@ -334,7 +336,7 @@ async fn test_get_block_range(
                 expected_height,
             ))))
             .await
-            .respond(ReadResponse::Block(Some(expected_block.clone())));
+            .respond(ReadResponse::Block(Some(expected_block.clone().into())));
 
         let get_block_response = get_block_task
             .await?
@@ -679,12 +681,12 @@ async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()
         for change in [
             NonFinalizedBlock {
                 hash,
-                block: block.clone(),
+                block: zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
                 receipt_order: Some(2),
             },
             NonFinalizedBlock {
                 hash,
-                block: block.clone(),
+                block: zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
                 receipt_order: Some(1),
             },
         ] {

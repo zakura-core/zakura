@@ -114,7 +114,7 @@ fn block_response_bounds_allocation_by_payload_length() {
     };
     assert!(matches!(
         blocks.as_slice(),
-        [InventoryResponse::Available((received, None))] if **received == block
+        [InventoryResponse::Available((received, None))] if received == &zakura_node_services::block_memory::BlockHandle::from(Arc::new(block))
     ));
 
     let frame = response_frame(MSG_RESPONSE_BLOCK, &truncated_block());

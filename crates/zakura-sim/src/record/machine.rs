@@ -17,6 +17,40 @@ pub enum MachineStep {
     Work(WorkStep),
     /// Runtime block-work funding and retained request/receipt owners.
     WorkFunding(WorkFundingStep),
+    /// Decoded allocations retained by block, header, and transaction owners.
+    DecodedRetention(DecodedRetentionStep),
+}
+
+/// Decoder-v1 evidence for the decoded-block runtime owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodedRetentionStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// Whether this boundary follows explicit handle drain.
+    pub drain: bool,
+    /// Independent allocation reads and actual pool counters.
+    pub actual: Option<zakura_node_services::block_memory::model::RetentionView>,
+    /// The independent model's retained handle graph and expected pool charges.
+    pub expected: zakura_node_services::block_memory::model::RetentionView,
+    /// Unavailable capture or a driver panic, never a property detection.
+    pub failure: Option<MachineFailure>,
+}
+
+impl From<zakura_node_services::block_memory::model::RetentionStep> for DecodedRetentionStep {
+    fn from(value: zakura_node_services::block_memory::model::RetentionStep) -> Self {
+        Self {
+            input: value.input,
+            drain: value.drain,
+            actual: value.actual,
+            expected: value.expected,
+            failure: value.capture_error.map(|message| MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message,
+            }),
+        }
+    }
 }
 
 /// Body-work authority, including every generation that controls eligibility.

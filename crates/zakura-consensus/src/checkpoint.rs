@@ -29,7 +29,7 @@ use tracing::instrument;
 
 use zakura_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
-    block::{self, Block},
+    block::{self},
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{
@@ -646,9 +646,9 @@ where
     /// whether the transaction hashes are unique.
     fn check_block(
         &self,
-        block: Arc<Block>,
+        block: zakura_node_services::block_memory::BlockHandle,
     ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
-        let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
+        let hash = zakura_header_chain::validate_encoding_version_hash(block.header())
             .map_err(BlockError::from)?;
         let height = block
             .coinbase_height()
@@ -659,14 +659,19 @@ where
             .map_err(VerifyBlockError::from)?;
         if pow_policy.is_authenticated_custom_waiver() {
             crate::block::check::difficulty_threshold_is_valid(
-                &block.header,
+                block.header(),
                 &self.network,
                 &height,
                 &hash,
             )?;
         } else {
-            crate::block::check::difficulty_is_valid(&block.header, &self.network, &height, &hash)?;
-            crate::block::check::equihash_solution_is_valid(&block.header, &self.network)?;
+            crate::block::check::difficulty_is_valid(
+                block.header(),
+                &self.network,
+                &height,
+                &hash,
+            )?;
+            crate::block::check::equihash_solution_is_valid(block.header(), &self.network)?;
         }
 
         // The commit task calculates this value after the parent commits at ZIP 234 heights.
@@ -699,7 +704,10 @@ where
     /// If the block does not pass basic validity checks,
     /// returns an error immediately.
     #[allow(clippy::unwrap_in_result)]
-    fn queue_block(&mut self, block: Arc<Block>) -> Result<RequestBlock, VerifyCheckpointError> {
+    fn queue_block(
+        &mut self,
+        block: zakura_node_services::block_memory::BlockHandle,
+    ) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
@@ -715,9 +723,7 @@ where
         };
         let req_block = RequestBlock { block, rx };
 
-        // Since we're using Arc<Block>, each entry is a single pointer to the
-        // Arc. But there are a lot of QueuedBlockLists in the queue, so we keep
-        // allocations as small as possible.
+        // Most heights have one queued block, so start with one slot.
         let qblocks = self
             .queued
             .entry(height)
@@ -893,7 +899,7 @@ where
         for current_height in range_heights {
             let valid_qblock = self.process_height(current_height, expected_hash);
             if let Some(qblock) = valid_qblock {
-                expected_hash = qblock.block.block.header.previous_block_hash;
+                expected_hash = qblock.block.block.header().previous_block_hash;
                 // Add the block to the end of the pending block list
                 // (since we're walking the chain backwards, the list is
                 // in reverse chain order)
@@ -1229,7 +1235,7 @@ impl VerifyCheckpointError {
 /// The CheckpointVerifier service implementation.
 ///
 /// After verification, the block futures resolve to their hashes.
-impl<S> Service<Arc<Block>> for CheckpointVerifier<S>
+impl<S> Service<zakura_node_services::block_memory::BlockHandle> for CheckpointVerifier<S>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
@@ -1244,7 +1250,7 @@ where
     }
 
     #[instrument(name = "checkpoint", skip(self, block))]
-    fn call(&mut self, block: Arc<Block>) -> Self::Future {
+    fn call(&mut self, block: zakura_node_services::block_memory::BlockHandle) -> Self::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();
@@ -1254,8 +1260,8 @@ where
             // A peer can rewrite the coinbase input and expiry heights without changing the header hash.
             // Reject the changed transaction IDs before returning the unscored Finished error.
             let transaction_hashes = block
-                .transactions
-                .iter()
+                .view()
+                .transactions()
                 .map(|tx| tx.hash())
                 .collect::<Vec<_>>();
             if let Err(error) = crate::block::check::merkle_root_validity(
@@ -1320,7 +1326,7 @@ where
                 let hash = queued_result.result?;
 
                 if is_zip234_active(&network, req_block.block.height) {
-                    let parent_hash = req_block.block.block.header.previous_block_hash;
+                    let parent_hash = req_block.block.block.header().previous_block_hash;
                     let response = state_service
                         .clone()
                         .oneshot(zs::Request::AwaitBlockInfo(parent_hash))

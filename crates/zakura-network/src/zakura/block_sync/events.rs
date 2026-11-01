@@ -251,7 +251,7 @@ pub enum BlockSyncAction {
         /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].
         token: BlockApplyToken,
         /// Block body that is contiguous above `verified_block_tip`.
-        block: Arc<block::Block>,
+        block: zakura_node_services::block_memory::BlockHandle,
     },
     /// Persist one completion-gated transient body result.
     RecordBodyUnavailable {

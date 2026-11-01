@@ -653,7 +653,13 @@ fn rebuild_history_tree_from_upgrade_activation(
         let (block, sapling_root, orchard_root, ironwood_root) =
             history_rebuild_inputs_at_height(db, height)?;
 
-        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+        history_tree.push(
+            network,
+            &block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+        )?;
     }
 
     Ok(history_tree)
@@ -724,7 +730,13 @@ fn rebuild_treestate_to_height(
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
         let ironwood_root = note_commitment_trees.ironwood.root();
-        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+        history_tree.push(
+            network,
+            &block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+        )?;
     }
 
     Ok(RebuiltTreestate {

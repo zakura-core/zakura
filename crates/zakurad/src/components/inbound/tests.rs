@@ -26,7 +26,9 @@ async fn peer_block_lookup_queries_all_active_chains() {
         let expected_block = expected_block.clone();
         async move {
             assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
-            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(expected_block)))
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(
+                zakura_node_services::block_memory::BlockHandle::Shared(expected_block),
+            )))
         }
     });
     let state = Buffer::new(BoxService::new(state), 1);
@@ -35,7 +37,7 @@ async fn peer_block_lookup_queries_all_active_chains() {
         block_by_hash_or_pending(state, PendingBlockRegistry::default(), hash)
             .await
             .expect("the state lookup succeeds"),
-        Some(block),
+        Some(block.into()),
     );
 }
 
@@ -70,7 +72,7 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
         block_by_hash_or_pending(state, pending_blocks, hash)
             .await
             .expect("the pending lookup succeeds"),
-        Some(block),
+        Some(block.into()),
     );
     assert!(!state_called.load(Ordering::SeqCst));
 }
@@ -141,7 +143,9 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
             .iter()
             .find(|block| block.hash() == hash)
             .cloned();
-        async move { Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(block)) }
+        async move {
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(block.map(Into::into)))
+        }
     });
 
     let sidecar: SocketAddr = "127.0.0.1:18233".parse()?;
@@ -184,7 +188,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
         Response::Blocks(
             blocks
                 .iter()
-                .map(|block| Available((block.clone(), None)))
+                .map(|block| Available((block.clone().into(), None)))
                 .collect(),
         )
     };

@@ -15,6 +15,7 @@ header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
 block_work_ownership = "block/work-ownership"
 block_work_funding = "block/work-funding"
+block_decoded_retention = "block/decoded-retention"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -72,6 +73,13 @@ bench = false
 [[bin]]
 name = "block_work_funding"
 path = "fuzz_targets/block_work_funding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_decoded_retention"
+path = "fuzz_targets/block_decoded_retention.rs"
 test = false
 doc = false
 bench = false

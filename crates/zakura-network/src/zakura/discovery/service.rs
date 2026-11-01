@@ -1377,6 +1377,9 @@ mod tests {
                 },
                 (block::Height(5), block::Hash([5; 32])),
                 tip_rx,
+                ZakuraBlockSyncConfig::default()
+                    .decoded_block_pool(10_000)
+                    .expect("fixture decoded allowance fits"),
                 ZakuraBlockSyncConfig::default(),
             ))
             .expect("valid block-sync config");

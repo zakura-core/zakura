@@ -478,7 +478,7 @@ impl NonFinalizedState {
         finalized_state: &ZakuraDb,
         contextual_metrics: ContextualMetrics,
     ) -> Result<(), ValidateContextError> {
-        let parent_hash = prepared.block.header.previous_block_hash;
+        let parent_hash = prepared.block.header().previous_block_hash;
         let (height, hash) = (prepared.height, prepared.hash);
 
         let parent_chain_start = Instant::now();
@@ -652,7 +652,7 @@ impl NonFinalizedState {
             .first()
             .ok_or(ReconsiderError::InvalidatedBlocksEmpty)?;
 
-        let root_parent_hash = invalidated_root.block.header.previous_block_hash;
+        let root_parent_hash = invalidated_root.block.header().previous_block_hash;
 
         // If the parent is the tip of the finalized_state we create a new chain and insert it
         // into the non finalized state
@@ -857,7 +857,7 @@ impl NonFinalizedState {
         let contextual_block_start = Instant::now();
         let height = prepared.height;
         let block_hash = prepared.hash;
-        let transaction_count = prepared.block.transactions.len();
+        let transaction_count = prepared.block.view().transactions().len();
         let spent_utxo_count = spent_utxos.len();
         let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
             &self.network,

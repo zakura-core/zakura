@@ -10,7 +10,6 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
-    sync::Arc,
     time::Duration,
 };
 
@@ -682,7 +681,7 @@ impl Storage {
     pub fn reject_and_remove_same_effects(
         &mut self,
         mined_ids: &HashSet<transaction::Hash>,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<impl AsRef<Transaction>>,
     ) -> RemovedTransactionIds {
         let removed_mined = self
             .verified
@@ -690,23 +689,23 @@ impl Storage {
 
         let spent_outpoints: HashSet<_> = transactions
             .iter()
-            .flat_map(|tx| tx.spent_outpoints())
+            .flat_map(|tx| tx.as_ref().spent_outpoints())
             .collect();
         let sprout_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.sprout_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().sprout_nullifiers())
             .collect();
         let sapling_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.sapling_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().sapling_nullifiers())
             .collect();
         let orchard_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.orchard_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().orchard_nullifiers())
             .collect();
         let ironwood_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.ironwood_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().ironwood_nullifiers())
             .collect();
 
         let duplicate_spend_ids: HashSet<_> = self

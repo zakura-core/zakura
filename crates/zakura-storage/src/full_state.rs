@@ -52,6 +52,7 @@ use zakura_header_chain::{
     VerifiedHeaderRef,
 };
 use zakura_network::zakura::{BlockSizeEstimate, BlockSyncBlockMeta};
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_rt::sync::watch;
 
 /// The most headers one page or one bounded path covers, and the most
@@ -105,7 +106,7 @@ impl From<CommittedTransitionError> for StateError {
 /// One committed block.
 #[derive(Clone, Debug)]
 struct Committed {
-    block: Arc<block::Block>,
+    block: BlockHandle,
     /// The block's hash, kept so lookups don't rehash its header.
     hash: block::Hash,
     height: block::Height,
@@ -148,7 +149,7 @@ impl VerifiedChain {
         VerifiedChain {
             genesis: Committed {
                 hash: genesis.hash(),
-                block: genesis,
+                block: genesis.into(),
                 height,
                 receipt: 0,
             },
@@ -167,7 +168,7 @@ impl VerifiedChain {
     }
 
     /// The committed block `hash`, finalized or not.
-    pub fn block(&self, hash: block::Hash) -> Option<&Arc<block::Block>> {
+    pub fn block(&self, hash: block::Hash) -> Option<&BlockHandle> {
         self.get(hash).map(|committed| &committed.block)
     }
 
@@ -195,7 +196,7 @@ impl VerifiedChain {
         let parents: BTreeSet<[u8; 32]> = self
             .blocks
             .values()
-            .map(|committed| committed.block.header.previous_block_hash.0)
+            .map(|committed| committed.block.header().previous_block_hash.0)
             .collect();
         // The map is keyed by hash bytes, so this is already sorted.
         self.blocks
@@ -241,7 +242,7 @@ impl VerifiedChain {
         let mut current = self.blocks.get(&hash.0)?;
         loop {
             path.push(current);
-            let parent = current.block.header.previous_block_hash;
+            let parent = current.block.header().previous_block_hash;
             if parent == self.genesis.hash {
                 break;
             }
@@ -285,7 +286,7 @@ impl VerifiedChain {
     ) -> Option<block::Hash> {
         let mut current = self.get(tip.hash).filter(|tip| tip.height >= height)?;
         while current.height > height {
-            current = self.get(current.block.header.previous_block_hash)?;
+            current = self.get(current.block.header().previous_block_hash)?;
         }
         Some(current.hash)
     }
@@ -307,12 +308,7 @@ impl VerifiedChain {
     /// If the best chain would hold more than `MAX_BLOCK_REORG_HEIGHT`
     /// blocks. Production finalizes there, and full state here never does,
     /// so a scenario must stay within that window.
-    pub(crate) fn with(
-        &self,
-        block: Arc<block::Block>,
-        height: block::Height,
-        receipt: u64,
-    ) -> Self {
+    pub(crate) fn with(&self, block: BlockHandle, height: block::Height, receipt: u64) -> Self {
         let mut after = self.clone();
         let inserted = block.hash();
         after.blocks.insert(
@@ -351,11 +347,11 @@ impl VerifiedChain {
     fn evict_branch(&mut self, tip: block::Hash) {
         let mut current = tip;
         while let Some(committed) = self.blocks.remove(&current.0) {
-            let parent = committed.block.header.previous_block_hash;
+            let parent = committed.block.header().previous_block_hash;
             let shared = self
                 .blocks
                 .values()
-                .any(|other| other.block.header.previous_block_hash == parent);
+                .any(|other| other.block.header().previous_block_hash == parent);
             if shared {
                 break;
             }
@@ -372,11 +368,11 @@ fn header_ref(committed: &Committed) -> VerifiedHeaderRef {
     VerifiedHeaderRef {
         height: committed.height,
         hash: committed.hash,
-        header: committed.block.header.clone(),
+        header: Arc::new(*committed.block.header()),
     }
 }
 
-fn serialized_size(block: &block::Block) -> u32 {
+fn serialized_size(block: &BlockHandle) -> u32 {
     use zakura_chain::serialization::ZcashSerialize;
     u32::try_from(block.zcash_serialized_size()).expect("a block fits MAX_BLOCK_BYTES")
 }

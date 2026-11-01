@@ -170,6 +170,9 @@ fn startup(
         },
         (frontiers.header_best.height, frontiers.header_best.hash),
         views,
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.state_queries_enabled, "the constructor's default");

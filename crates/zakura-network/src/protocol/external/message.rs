@@ -1,11 +1,16 @@
 //! Definitions of network messages.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt};
 
 use chrono::{DateTime, Utc};
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "proptest-impl"))]
+use zakura_chain::block::Block;
+
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     transaction::UnminedTx,
 };
 
@@ -13,6 +18,8 @@ use crate::{meta_addr::MetaAddr, BoxError};
 
 use super::{addr::AddrInVersion, inv::InventoryHash, types::*};
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -205,7 +212,13 @@ pub enum Message {
     /// A `block` message.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#block)
-    Block(Arc<Block>),
+    Block(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "any::<Arc<Block>>().prop_map(Into::into)")
+        )]
+        zakura_node_services::block_memory::BlockHandle,
+    ),
 
     /// A `tx` message.
     ///

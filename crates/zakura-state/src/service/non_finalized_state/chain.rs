@@ -25,10 +25,7 @@ use zakura_chain::{
     serialization::ZcashSerialize as _,
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
-    transaction::{
-        self,
-        Transaction::{self, *},
-    },
+    transaction::{self, Transaction::*},
     transparent,
     value_balance::ValueBalance,
     work::difficulty::PartialCumulativeWork,
@@ -471,12 +468,19 @@ impl Chain {
     pub fn transaction(
         &self,
         hash: transaction::Hash,
-    ) -> Option<(&Arc<Transaction>, block::Height, DateTime<Utc>)> {
+    ) -> Option<(
+        zakura_node_services::block_memory::TransactionHandle,
+        block::Height,
+        DateTime<Utc>,
+    )> {
         self.tx_loc_by_hash.get(&hash).map(|tx_loc| {
             (
-                &self.blocks[&tx_loc.height].block.transactions[tx_loc.index.as_usize()],
+                self.blocks[&tx_loc.height]
+                    .block
+                    .transaction(tx_loc.index.as_usize())
+                    .expect("transaction location indexes its retained block"),
                 tx_loc.height,
-                self.blocks[&tx_loc.height].block.header.time,
+                self.blocks[&tx_loc.height].block.header().time,
             )
         })
     }
@@ -1685,7 +1689,7 @@ impl Chain {
         history_tree_mut
             .push(
                 &self.network,
-                contextually_valid.block.clone(),
+                &contextually_valid.block,
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
@@ -1716,7 +1720,7 @@ impl Chain {
             transaction_hashes,
             chain_value_pool_change,
         ) = (
-            contextually_valid.block.as_ref(),
+            contextually_valid.block.view(),
             contextually_valid.hash,
             contextually_valid.height,
             contextually_valid.new_outputs.as_ref(),
@@ -1726,7 +1730,7 @@ impl Chain {
         );
 
         let block_work = block
-            .header
+            .header()
             .difficulty_threshold
             .to_work()
             .expect("work has already been validated");
@@ -1749,8 +1753,7 @@ impl Chain {
 
         // for each transaction in block
         for (transaction_index, (transaction, transaction_hash)) in block
-            .transactions
-            .iter()
+            .transactions()
             .zip(transaction_hashes.iter().cloned())
             .enumerate()
         {
@@ -1762,7 +1765,7 @@ impl Chain {
                 sapling_shielded_data_shared_anchor,
                 orchard_shielded_data,
                 ironwood_shielded_data,
-            ) = match transaction.deref() {
+            ) = match transaction {
                 // The V6 arm that gives this slot its concrete type is cfg-gated.
                 // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
@@ -1935,7 +1938,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             transaction_hashes,
             chain_value_pool_change,
         ) = (
-            contextually_valid.block.as_ref(),
+            contextually_valid.block.view(),
             contextually_valid.hash,
             contextually_valid.height,
             contextually_valid.new_outputs.as_ref(),
@@ -1953,16 +1956,14 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
         // TODO: move this to a Work or block header UpdateWith.revert...()?
         // remove work from partial_cumulative_work
         let block_work = block
-            .header
+            .header()
             .difficulty_threshold
             .to_work()
             .expect("work has already been validated");
         self.partial_cumulative_work -= block_work;
 
         // for each transaction in block
-        for (transaction, transaction_hash) in
-            block.transactions.iter().zip(transaction_hashes.iter())
-        {
+        for (transaction, transaction_hash) in block.transactions().zip(transaction_hashes.iter()) {
             let (
                 inputs,
                 outputs,
@@ -1971,7 +1972,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 sapling_shielded_data_shared_anchor,
                 orchard_shielded_data,
                 ironwood_shielded_data,
-            ) = match transaction.deref() {
+            ) = match transaction {
                 // The V6 arm that gives this slot its concrete type is cfg-gated.
                 // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {

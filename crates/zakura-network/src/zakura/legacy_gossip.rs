@@ -710,7 +710,7 @@ impl LegacyResponseCodec {
                                 return Err(LegacyGossipError::UnsolicitedBlock(hash));
                             }
                         }
-                        blocks.push(InventoryResponse::Available((block, None)));
+                        blocks.push(InventoryResponse::Available((block.into(), None)));
                     }
                 }
                 MSG_RESPONSE_TRANSACTION => {
@@ -3524,7 +3524,7 @@ mod tests {
                             .into_iter()
                             .map(|hash| {
                                 if hash == self.block.hash() {
-                                    InventoryResponse::Available((self.block.clone(), None))
+                                    InventoryResponse::Available((self.block.clone().into(), None))
                                 } else {
                                     InventoryResponse::Missing(hash)
                                 }
@@ -3560,7 +3560,7 @@ mod tests {
 
         fn call(&mut self, _request: Request) -> Self::Future {
             std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
-                self.block.clone(),
+                zakura_node_services::block_memory::BlockHandle::Shared(self.block.clone()),
                 None,
             ))])))
         }
@@ -3588,7 +3588,7 @@ mod tests {
                 return std::future::ready(Ok(Response::Nil));
             }
             std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
-                self.block.clone(),
+                zakura_node_services::block_memory::BlockHandle::Shared(self.block.clone()),
                 None,
             ))])))
         }
@@ -3930,7 +3930,7 @@ mod tests {
                             .into_iter()
                             .map(|hash| {
                                 if hash == self.block.hash() {
-                                    InventoryResponse::Available((self.block.clone(), None))
+                                    InventoryResponse::Available((self.block.clone().into(), None))
                                 } else {
                                     InventoryResponse::Missing(hash)
                                 }
@@ -6350,7 +6350,10 @@ mod tests {
             u32::try_from(FRAME_HEADER_BYTES + RESPONSE_CHUNK_HEADER_BYTES + 256)?;
         let frames = LegacyResponseCodec::encode_response(
             7,
-            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            Response::Blocks(vec![InventoryResponse::Available((
+                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                None,
+            ))]),
             max_frame_bytes,
             max_frame_bytes,
         )?;
@@ -6399,7 +6402,10 @@ mod tests {
 
         let frames = LegacyResponseCodec::encode_response(
             7,
-            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            Response::Blocks(vec![InventoryResponse::Available((
+                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                None,
+            ))]),
             max_frame_bytes,
             max_message_bytes,
         )?;
@@ -6496,7 +6502,10 @@ mod tests {
         let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
         let frames = LegacyResponseCodec::encode_response(
             7,
-            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            Response::Blocks(vec![InventoryResponse::Available((
+                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                None,
+            ))]),
             frame_cap,
             frame_cap,
         )?;
@@ -6648,7 +6657,10 @@ mod tests {
         // A single available block is well within budget and still encodes.
         LegacyResponseCodec::encode_response(
             1,
-            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            Response::Blocks(vec![InventoryResponse::Available((
+                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                None,
+            ))]),
             frame_cap,
             frame_cap,
         )?;
@@ -6658,7 +6670,7 @@ mod tests {
         let block_copies = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
         let many_blocks = Response::Blocks(
             (0..block_copies)
-                .map(|_| InventoryResponse::Available((block.clone(), None)))
+                .map(|_| InventoryResponse::Available((block.clone().into(), None)))
                 .collect(),
         );
         assert!(
@@ -7364,7 +7376,10 @@ mod tests {
 
         record_block_response_source(
             &trace,
-            Response::Blocks(vec![InventoryResponse::Available((block, None))]),
+            Response::Blocks(vec![InventoryResponse::Available((
+                zakura_node_services::block_memory::BlockHandle::Shared(block),
+                None,
+            ))]),
             BlockBodySource::Legacy,
             Some(&requested_hashes),
         );

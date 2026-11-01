@@ -1734,8 +1734,14 @@ mod tests {
             history.session(session, session);
         }
         history.sync(BlockSyncFact::Sequencer {
+            payloads: vec![crate::observe::BlockSyncPayload {
+                id: 1,
+                decoded_attributed_memory_bytes: applying,
+            }],
             reorder: Vec::new(),
             applying: vec![BlockSyncRetained {
+                payload_id: 1,
+                policy_decoded_bytes: applying,
                 body: BlockSyncBody {
                     height: HEIGHT - 1,
                     owner: owner(1, 1, 1),

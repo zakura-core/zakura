@@ -40,7 +40,8 @@ fn assert_selected_header_matches_full_state(
         .map(|block| {
             block
                 .block
-                .header
+                .view()
+                .header()
                 .difficulty_threshold
                 .to_work()
                 .expect("generated block targets have exact work")
@@ -458,7 +459,7 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
             history_tree
                 .push(
                     network,
-                    block.clone(),
+                    &block,
                     &sapling_root,
                     &orchard_root,
                     &ironwood_root,

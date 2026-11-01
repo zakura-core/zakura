@@ -415,6 +415,51 @@ impl ZakuraBlockSyncConfig {
             .max(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
     }
 
+    /// Fund decoded allocations through the pipeline and the caller's backend allowance.
+    /// Four submission windows cover input, applying, driver overlap, and replacement
+    /// headroom. Peer slots cover synchronous handoffs outside those collections.
+    /// Retiring holders keep their slots. The count covers all holders, and
+    /// [`Self::decoded_pipeline_byte_bound`] limits the bytes before backend retention.
+    pub fn decoded_block_pool(
+        &self,
+        backend_blocks: u64,
+    ) -> Result<zakura_node_services::block_memory::DecodedBlockPool, &'static str> {
+        let windows = u64::try_from(self.submitted_apply_limit())
+            .ok()
+            .and_then(|count| count.checked_mul(4));
+        let peers = self
+            .peer_limits
+            .max_inbound_peers
+            .checked_add(self.peer_limits.max_outbound_peers)
+            .and_then(|count| u64::try_from(count).ok());
+        let limit = windows
+            .zip(peers)
+            .and_then(|(windows, peers)| windows.checked_add(peers))
+            .and_then(|count| count.checked_add(backend_blocks))
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or("decoded block-count allowance overflow")?;
+        Ok(
+            zakura_node_services::block_memory::DecodedBlockPool::for_pipeline(
+                limit,
+                self.decoded_pipeline_byte_bound(),
+            ),
+        )
+    }
+
+    /// Decoded bytes the pipeline may hold before gated work must wait or stay raw.
+    ///
+    /// This derives from what the reactor can request: the resident look-ahead budget,
+    /// one commit window of maximum-size blocks, and one response. The last two can
+    /// pass the look-ahead gate, so they carry the decoded multiple. The commit window
+    /// itself is exempt at submission and receipts fall back to raw bytes, so reaching
+    /// this bound delays only submissions above the window until earlier work finishes.
+    pub fn decoded_pipeline_byte_bound(&self) -> u64 {
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR
+            .saturating_add(u64::from(self.max_response_bytes))
+            .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR)
+            .saturating_add(self.effective_max_reorder_lookahead_bytes())
+    }
+
     /// Return the resident look-ahead byte cap.
     ///
     /// Currently the raw configured value; kept as an accessor for the semantic

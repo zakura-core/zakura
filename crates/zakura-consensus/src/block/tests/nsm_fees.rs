@@ -129,7 +129,9 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
             );
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                verifier.oneshot(Request::Commit(Arc::new(block))),
+                verifier.oneshot(Request::Commit(
+                    zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
+                )),
             )
             .await
             .unwrap();
@@ -218,7 +220,7 @@ proptest::proptest! {
                 });
                 let verifier = SemanticBlockVerifier::new(&network, crate::transaction::boxed_state(state), crate::transaction::boxed_transaction_verifier(transaction));
                 let result = tokio::time::timeout(std::time::Duration::from_secs(10),
-                    verifier.oneshot(Request::Commit(Arc::new(block)))).await.unwrap();
+                    verifier.oneshot(Request::Commit(zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block))))).await.unwrap();
                 if excess > 0 {
                     assert!(matches!(result, Err(VerifyBlockError::Block {
                         source: BlockError::SummingMinerFees { .. },

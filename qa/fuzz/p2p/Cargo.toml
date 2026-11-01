@@ -33,3 +33,17 @@ path = "fuzz_targets/block_retry_authority.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_fill"
+path = "fuzz_targets/block_fill.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_request_lifecycle"
+path = "fuzz_targets/block_request_lifecycle.rs"
+test = false
+doc = false
+bench = false

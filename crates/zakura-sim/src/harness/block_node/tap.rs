@@ -680,6 +680,7 @@ fn phase(phase: RequestWritePhase) -> &'static str {
 /// `dropped-<phase>`.
 fn step(step: RequestStep) -> String {
     match step {
+        RequestStep::Funded => "funded".to_owned(),
         RequestStep::Published => "published".to_owned(),
         RequestStep::Started => "started".to_owned(),
         RequestStep::Written => "written".to_owned(),

@@ -790,6 +790,10 @@ impl StateCollector {
                     return;
                 };
                 self.epoch(epoch);
+                // Funding precedes publication and changes no request progress.
+                if step == "funded" {
+                    return;
+                }
                 let key = (owner.session_id, owner.request_id);
                 let progress = match step.as_str() {
                     "published" => Some(RequestProgress::Published),

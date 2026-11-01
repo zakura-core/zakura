@@ -5,8 +5,6 @@
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
-    convert,
-    future::Future,
     pin::Pin,
     task::Poll,
     time::{Duration, Instant},
@@ -21,7 +19,6 @@ use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
-    task::JoinError,
     time::{sleep, sleep_until, timeout},
 };
 use tower::{
@@ -42,6 +39,7 @@ use crate::{
     components::sync::downloads::BlockDownloadVerifyError, config::ZakuradConfig, BoxError,
 };
 
+mod discovery;
 mod downloads;
 pub mod end_of_support;
 mod gossip;
@@ -53,6 +51,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+use discovery::{Discovery, Event as DiscoveryEvent};
 use downloads::{AlwaysHedge, Downloads, NotFoundKind};
 use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
@@ -1476,29 +1475,12 @@ where
         }
 
         info!(?state_tip, "starting sync, obtaining new tips");
-        let checkpoint_bootstrap = header_runtime_status.is_some();
-        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
-            .await
-            .map_err(Into::into)
-            // TODO: replace with flatten() when it stabilises (#70142)
-            .and_then(convert::identity)
-            .map_err(|e| {
-                info!("temporary error obtaining tips: {:#}", e);
-                e
-            });
-        let extra_hashes = match extra_hashes {
-            Ok(extra_hashes) => extra_hashes,
-            Err(error) => {
-                self.trace
-                    .round_finish("obtain_tips_error", state_tip, Some(&error));
-                return Err(error);
-            }
-        };
-        self.update_metrics();
-        self.trace
-            .tips_obtained(extra_hashes.len(), self.prospective_tips.len());
+        let discovery = timeout(SYNC_RESTART_DELAY, self.obtain_tips()).await??;
 
-        if let Err(error) = self.sync_round(extra_hashes, header_runtime_status).await {
+        if let Err(error) = self
+            .sync_round(IndexSet::new(), Some(discovery), header_runtime_status)
+            .await
+        {
             self.trace_sync_snapshot("round_error_snapshot", 0);
             self.trace.round_finish(
                 "sync_error",
@@ -1519,30 +1501,28 @@ where
     /// continuously refills the hash reserve by extending tips *concurrently* with draining and
     /// dispatch.
     ///
-    /// `reserve` is the set of discovered-but-not-yet-dispatched block hashes (initially the
-    /// leftovers from `obtain_tips`).
+    /// `reserve` contains discovered hashes waiting for download capacity. Initial discovery and
+    /// later extensions add batches to it while other peer replies and downloads remain pending.
     ///
     /// Returns `Ok(())` once the round is exhausted: nothing in flight, nothing queued, and no tips
     /// left to extend. Returns `Err` if an unrecoverable error means the sync should restart.
-    #[instrument(skip(self, reserve))]
+    #[instrument(skip(self, reserve, extend))]
     async fn sync_round(
         &mut self,
         mut reserve: IndexSet<block::Hash>,
+        mut extend: Option<Discovery>,
         header_runtime_status: Option<
             &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
         >,
     ) -> Result<(), Report> {
         let checkpoint_bootstrap = header_runtime_status.is_some();
 
-        // The type of the in-flight tip-extension future.
-        type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
-
-        // The currently running request for more block hashes, if any.
-        //
-        // This future only asks peers for hashes. It does not request or verify
-        // full blocks. We keep at most one extension request in flight so the
-        // syncer cannot build up an unbounded backlog of undispatched hashes.
-        let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
+        // Initial discovery and later extensions use the same event loop, so neither can
+        // hold completed downloads behind a slow peer. Only one round runs at a time.
+        let mut initial_discovery = extend.is_some();
+        let mut refreshing = false;
+        let mut discovered_hashes = IndexSet::new();
+        let mut hints = IndexSet::new();
 
         // The last time this sync round made observable progress.
         //
@@ -1556,6 +1536,9 @@ where
                 .as_ref()
                 .is_some_and(|status| status.borrow().is_ready())
             {
+                drop(extend.take());
+                hints.clear();
+                self.downloads.cancel_hints();
                 reserve.clear();
                 self.prospective_tips.clear();
                 self.registry_miss_retry.clear();
@@ -1617,7 +1600,10 @@ where
                 let tip_network = self.tip_network.clone();
                 let state = self.state.clone();
                 let tips = std::mem::take(&mut self.prospective_tips);
-                extend = Some(Box::pin(Self::build_extend(tip_network, state, tips)));
+                initial_discovery = false;
+                refreshing = false;
+                discovered_hashes.clear();
+                extend = Some(Self::build_extend(tip_network, state, tips));
             }
 
             // Dispatch from the reserve while we're below the lookahead limit.
@@ -1663,6 +1649,7 @@ where
             // waiting for them to drain can wait forever, and the only way out is to keep looking
             // for the rest of the range. Refresh the tip set so a peer can supply it.
             if reserve.is_empty()
+                && hints.is_empty()
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
                 && self.registry_miss_retry.is_empty()
@@ -1709,22 +1696,13 @@ where
                         );
                         metrics::counter!("sync.tip.refresh").increment(1);
 
-                        let refreshed =
-                            timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
-                                .await;
-
-                        // A refresh is not progress, even when it returns hashes.
-                        //
-                        // Peers will happily keep returning hashes for blocks we already hold: an
-                        // incomplete checkpoint range is parked in the verifier, not committed to
-                        // the state, so `obtain_tips` rediscovers those same blocks every time and
-                        // `request_blocks` drops them as duplicates. Treating that as progress would
-                        // hold off the stall detector forever, so a range that can never complete
-                        // would refresh every `TIP_REFRESH_INTERVAL` instead of restarting the round
-                        // and re-downloading. Only a completed block or a finished extension counts,
-                        // which is what the arms below record.
-                        match refreshed {
-                            Ok(hashes) => reserve.extend(hashes?),
+                        // Refresh requests also stream results; polling them here would delay
+                        // completion handling for the checkpoint downloads already in flight.
+                        initial_discovery = true;
+                        refreshing = true;
+                        discovered_hashes.clear();
+                        match timeout(SYNC_RESTART_DELAY, self.obtain_tips()).await {
+                            Ok(round) => extend = Some(round?),
                             Err(_) => info!(
                                 "tip refresh timed out while blocks remain in flight; retrying"
                             ),
@@ -1740,6 +1718,7 @@ where
             // discover, and no critical block waiting to be retried after a registry-miss backoff.
             if self.downloads.in_flight() == 0
                 && reserve.is_empty()
+                && hints.is_empty()
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
                 && self.registry_miss_retry.is_empty()
@@ -1752,9 +1731,12 @@ where
             // then either an extension is running or a registry-miss retry is pending. A stall
             // restarts the round.
             let has_inflight = self.downloads.in_flight() > 0;
+            let can_queue_hint =
+                !past_lookahead && !head_of_line_starved && reserve.is_empty() && !hints.is_empty();
             // Copy the earliest backoff deadline out so the timer future doesn't borrow `self`
             // across the `select!` while other arms borrow `self.downloads`.
             let registry_retry_at = self.registry_miss_retry.values().min().copied();
+            let mut selected_hint = false;
             let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
@@ -1809,31 +1791,84 @@ where
                         self.update_metrics();
                     }
 
-                    extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (mut download_set, mut new_tips, _discovered) =
-                            extended.expect("only polled while an extension is in flight")?;
-                        let reached_checkpoint = self.cap_checkpoint_bootstrap_downloads(
-                            &mut download_set,
-                            checkpoint_bootstrap,
-                        );
-                        if reached_checkpoint {
-                            new_tips.clear();
+                    extended = OptionFuture::from(extend.as_mut().map(|round| round.next())),
+                        if extend.is_some() =>
+                    {
+                        match extended.expect("discovery is present").expect("round ends with a completion event")? {
+                            DiscoveryEvent::Batch(mut hashes) => {
+                                self.cap_checkpoint_bootstrap_downloads(&mut hashes, checkpoint_bootstrap);
+                                for &hash in &hashes {
+                                    self.downloads.promote(&hash);
+                                    hints.shift_remove(&hash);
+                                }
+                                discovered_hashes.extend(hashes.iter().copied());
+                                if initial_discovery {
+                                    // The state can advance between discovery and dispatch.
+                                    let mut missing = IndexSet::new();
+                                    for hash in hashes {
+                                        if !self.state_contains(hash).await? {
+                                            missing.insert(hash);
+                                        }
+                                    }
+                                    hashes = missing;
+                                }
+                                hashes.retain(|hash| !self.downloads.contains(hash));
+                                reserve.extend(hashes);
+                            }
+                            DiscoveryEvent::Hint(hash) => {
+                                // Unanchored hashes do not extend tips or affect caught-up status.
+                                // Native sync owns bodies above the checkpoint at bootstrap.
+                                if !checkpoint_bootstrap
+                                    && hints.len() + self.downloads.hint_count() < FANOUT
+                                    && !reserve.contains(&hash)
+                                    && !self.downloads.contains(&hash)
+                                {
+                                    hints.insert(hash);
+                                }
+                            }
+                            DiscoveryEvent::Finished(mut tips) => {
+                                if checkpoint_bootstrap {
+                                    let mut remaining = discovered_hashes.clone();
+                                    if self.cap_checkpoint_bootstrap_downloads(&mut remaining, true) {
+                                        tips.clear();
+                                    }
+                                }
+                                self.prospective_tips = tips;
+                                let count = discovered_hashes.len();
+                                if initial_discovery {
+                                    self.trace.tips_obtained(count, self.prospective_tips.len());
+                                    self.recent_syncs.push_obtain_tips_length(count);
+                                } else {
+                                    self.trace.tips_extended(count, self.prospective_tips.len());
+                                    self.recent_syncs.push_extend_tips_length(count);
+                                }
+                                extend = None;
+                                if !refreshing {
+                                    last_progress = Instant::now();
+                                }
+                            }
                         }
-                        let discovered = download_set.len();
-                        self.trace.tips_extended(discovered, new_tips.len());
-                        self.prospective_tips = new_tips;
-                        // security: use the actual number of new downloads from all peers, so the
-                        // last peer to respond can't toggle our mempool.
-                        self.recent_syncs.push_extend_tips_length(discovered);
-                        reserve.extend(download_set);
-                        extend = None;
-                        last_progress = Instant::now();
                     }
+                    // A ready validated reply wins over optional work. If all remaining peers
+                    // are still pending, hints can use otherwise idle download capacity.
+                    () = std::future::ready(()), if can_queue_hint => {
+                        selected_hint = true;
+                    }
+
                 }
 
                 Ok::<(), Report>(())
             })
             .await;
+
+            if selected_hint {
+                let hash = hints.shift_remove_index(0).expect("hint queue is nonempty");
+                if !self.downloads.contains(&hash) && !self.state_contains(hash).await? {
+                    if let Err(error) = self.downloads.download_hint(hash).await {
+                        debug!(?hash, ?error, "could not queue optional discovery hint");
+                    }
+                }
+            }
 
             match step {
                 Ok(result) => result?,
@@ -1851,313 +1886,26 @@ where
         Ok(())
     }
 
-    async fn first_unknown_in_find_blocks_response(
-        &mut self,
-        hashes: &[block::Hash],
-    ) -> Result<Option<usize>, Report> {
-        let mut seen = HashSet::new();
-        let mut first_unknown = None;
-
-        for (index, &hash) in hashes.iter().enumerate() {
-            if !seen.insert(hash) {
-                debug!(?hash, "discarding FindBlocks response with duplicate hash");
-                return Ok(None);
-            }
-
-            if first_unknown.is_none() {
-                if !self.state_contains(hash).await? {
-                    first_unknown = Some(index);
-                }
-                continue;
-            }
-
-            if self.state_contains(hash).await? {
-                debug!(
-                    ?hash,
-                    "discarding FindBlocks response with known hash in advertised suffix"
-                );
-                return Ok(None);
-            }
-        }
-
-        Ok(first_unknown)
-    }
-
-    async fn validate_extend_find_blocks_response<'a>(
-        state: &mut ZS,
-        hashes: &'a [block::Hash],
-        locator: block::Hash,
-        expected_next: block::Hash,
-    ) -> Result<Option<&'a [block::Hash]>, Report> {
-        let matched_hashes = match hashes {
-            [expected_hash, _rest @ ..] if *expected_hash == expected_next => hashes,
-            [first_hash, expected_hash, _rest @ ..] if *expected_hash == expected_next => {
-                debug!(?first_hash, ?expected_next, ?locator, "unexpected first hash, but the second matches: using the hashes after the match");
-                &hashes[1..]
-            }
-            [] => return Ok(None),
-            [single_hash] => {
-                debug!(
-                    ?single_hash,
-                    ?expected_next,
-                    ?locator,
-                    "discarding response containing a single unexpected hash"
-                );
-                return Ok(None);
-            }
-            [first_hash, second_hash, rest @ ..] => {
-                debug!(?first_hash, ?second_hash, rest_len = ?rest.len(), ?expected_next, ?locator, "discarding response that starts with two unexpected hashes");
-                return Ok(None);
-            }
-        };
-
-        // We use the last hash for the tip, and we want to avoid bad tips.
-        // Discard it unless that would also discard the only unknown hash.
-        let matched_hashes = match matched_hashes {
-            [] => unreachable!("matched FindBlocks response contains the expected hash"),
-            [expected_hash, _only_unknown] if *expected_hash == expected_next => matched_hashes,
-            [rest @ .., _last] => rest,
-        };
-
-        let unknown_hashes = match matched_hashes {
-            [expected_hash, rest @ ..] if *expected_hash == expected_next => rest,
-            [] => return Ok(Some(&[])),
-            _ => unreachable!("matched FindBlocks response starts with the expected hash"),
-        };
-
-        // Apply the count guard before scanning peer-controlled hashes or
-        // querying state, so oversized responses cannot amplify state work.
-        if !has_valid_tips_response_hash_count(unknown_hashes) {
-            debug!(
-                hashes.len = unknown_hashes.len(),
-                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
-                "discarding oversized FindBlocks response"
-            );
-            return Ok(None);
-        }
-
-        let mut seen = HashSet::new();
-        if matched_hashes.iter().any(|hash| !seen.insert(*hash)) {
-            debug!(
-                ?matched_hashes,
-                "discarding FindBlocks extension response with duplicate hash"
-            );
-            return Ok(None);
-        }
-
-        if unknown_hashes.contains(&locator) {
-            debug!(
-                ?locator,
-                "discarding FindBlocks extension response with locator hash in advertised suffix"
-            );
-            return Ok(None);
-        }
-
-        for &hash in unknown_hashes {
-            if Self::state_contains_service(state, hash).await? {
-                debug!(
-                    ?hash,
-                    "discarding FindBlocks extension response with known hash in advertised suffix"
-                );
-                return Ok(None);
-            }
-        }
-
-        Ok(Some(unknown_hashes))
-    }
-
-    /// Given a block_locator list fan out request for subsequent hashes to
-    /// multiple peers
-    #[instrument(skip(self))]
-    async fn obtain_tips(
-        &mut self,
-        checkpoint_bootstrap: bool,
-    ) -> Result<IndexSet<block::Hash>, Report> {
-        let stage_start = std::time::Instant::now();
-
-        let block_locator = self
+    /// Starts discovery from the current chain without waiting for any peer reply.
+    async fn obtain_tips(&mut self) -> Result<Discovery, Report> {
+        let locator = match self
             .state
             .ready()
             .await
             .map_err(|e| eyre!(e))?
-            .call(zakura_state::Request::BlockLocator)
+            .call(zs::Request::BlockLocator)
             .await
-            .map(|response| match response {
-                zakura_state::Response::BlockLocator(block_locator) => block_locator,
-                _ => unreachable!(
-                    "GetBlockLocator request can only result in Response::BlockLocator"
-                ),
-            })
-            .map_err(|e| eyre!(e))?;
-
-        debug!(
-            tip = ?block_locator.first().expect("we have at least one block locator object"),
-            ?block_locator,
-            "got block locator and trying to obtain new chain tips"
-        );
-
-        let mut requests = FuturesUnordered::new();
-        for attempt in 0..FANOUT {
-            if attempt > 0 {
-                // Let other tasks run, so we're more likely to choose a different peer.
-                //
-                // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
-                tokio::task::yield_now().await;
-            }
-
-            let ready_tip_network = self.tip_network.ready().await;
-            requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                zn::Request::FindBlocks {
-                    known_blocks: block_locator.clone(),
-                    stop: None,
-                },
-            )));
-        }
-
-        let mut download_set = IndexSet::new();
-        while let Some(res) = requests.next().await {
-            match res
-                .unwrap_or_else(|e @ JoinError { .. }| {
-                    if e.is_panic() {
-                        panic!("panic in obtain tips task: {e:?}");
-                    } else {
-                        info!(
-                            "task error during obtain tips task: {e:?},\
-                     is Zakura shutting down?"
-                        );
-                        Err(e.into())
-                    }
-                })
-                .map_err::<Report, _>(|e| eyre!(e))
-            {
-                Ok(zn::Response::BlockHashes(hashes)) => {
-                    trace!(?hashes);
-
-                    // zcashd sometimes appends an unrelated hash at the start
-                    // or end of its response.
-                    //
-                    // We can't discard the first hash, because it might be a
-                    // block we want to download. So we just accept any
-                    // out-of-order first hashes.
-
-                    // We use the last hash for the tip, and we want to avoid bad
-                    // tips from zcashd's quirk of appending an unrelated hash.
-                    // So we discard the last hash on mainnet/testnet, unless it
-                    // is the response's only hash and therefore might be the
-                    // next block we need to download.
-                    // (We don't need to worry about missed downloads, because we
-                    // will pick them up again in ExtendTips.)
-                    //
-                    // In regtest we only connect to Zebra nodes, not zcashd,
-                    // so we trust all hashes in the response and keep them all.
-                    let hashes = if self.is_regtest {
-                        hashes.as_slice()
-                    } else {
-                        match hashes.as_slice() {
-                            [] => continue,
-                            [_only_unknown] => hashes.as_slice(),
-                            [rest @ .., _last] => rest,
-                        }
-                    };
-                    if hashes.is_empty() {
-                        continue;
-                    }
-
-                    // Apply the count guard after stripping zcashd's trailing
-                    // hash so a full 500-hash chain plus one appended hash is
-                    // still usable.
-                    if !has_valid_tips_response_hash_count(hashes) {
-                        debug!(
-                            hashes.len = hashes.len(),
-                            max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
-                            "discarding oversized FindBlocks response"
-                        );
-                        continue;
-                    }
-
-                    let first_unknown = self.first_unknown_in_find_blocks_response(hashes).await?;
-
-                    debug!(hashes.len = ?hashes.len(), ?first_unknown);
-
-                    let unknown_hashes = if let Some(index) = first_unknown {
-                        &hashes[index..]
-                    } else {
-                        continue;
-                    };
-
-                    trace!(?unknown_hashes);
-
-                    if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
-                        let new_tip = CheckedTip {
-                            tip: end[0],
-                            expected_next: end[1],
-                        };
-
-                        // Make sure we get the same tips, regardless of the
-                        // order of peer responses
-                        if !download_set.contains(&new_tip.expected_next) {
-                            debug!(?new_tip,
-                                            "adding new prospective tip, and removing existing tips in the new block hash list");
-                            self.prospective_tips
-                                .retain(|t| !unknown_hashes.contains(&t.expected_next));
-                            self.prospective_tips.insert(new_tip);
-                        } else {
-                            debug!(
-                                ?new_tip,
-                                "discarding prospective tip: already in download set"
-                            );
-                        }
-                    } else {
-                        debug!("downloading response that extends only one block");
-                    }
-
-                    // security: the first response determines our download order
-                    //
-                    // TODO: can we make the download order independent of response order?
-                    let prev_download_len = download_set.len();
-                    download_set.extend(unknown_hashes);
-                    let new_download_len = download_set.len();
-                    let new_hashes = new_download_len - prev_download_len;
-                    debug!(new_hashes, "added hashes to download set");
-                    metrics::histogram!("sync.obtain.response.hash.count")
-                        .record(new_hashes as f64);
-                }
-                Ok(_) => unreachable!("network returned wrong response"),
-                // We ignore this error because we made multiple fanout requests.
-                Err(e) => debug!(?e),
-            }
-        }
-
-        let reached_checkpoint =
-            self.cap_checkpoint_bootstrap_downloads(&mut download_set, checkpoint_bootstrap);
-        if reached_checkpoint {
-            self.prospective_tips.clear();
-        }
-
-        debug!(?self.prospective_tips);
-
-        // Check that the new tips we got are actually unknown.
-        for hash in &download_set {
-            debug!(?hash, "checking if state contains hash");
-            if self.state_contains(*hash).await? {
-                return Err(eyre!("queued download of hash behind our chain tip"));
-            }
-        }
-
-        let new_downloads = download_set.len();
-        debug!(new_downloads, "queueing new downloads");
-        metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
-
-        // security: use the actual number of new downloads from all peers,
-        // so the last peer to respond can't toggle our mempool
-        self.recent_syncs.push_obtain_tips_length(new_downloads);
-
-        let response = self.request_blocks(download_set).await;
-
-        metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
-            .record(stage_start.elapsed().as_secs_f64());
-
-        Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+            .map_err(|e| eyre!(e))?
+        {
+            zs::Response::BlockLocator(locator) => locator,
+            _ => unreachable!("BlockLocator returns a block locator"),
+        };
+        Ok(discovery::discover(
+            self.tip_network.clone(),
+            self.state.clone(),
+            vec![(locator, None)],
+            self.is_regtest,
+        ))
     }
 
     /// Limit compatibility downloads to the final checkpoint during initial block-apply ownership.
@@ -2180,129 +1928,16 @@ where
         )
     }
 
-    /// Asks peers to extend the given prospective `tips`, returning the newly discovered block
-    /// hashes in download order (the `download_set`), the new prospective tip set, and the count of
-    /// discovered hashes — *without* dispatching anything or touching `self`.
-    ///
-    /// Self-contained (owns a clone of the tip network and the taken tips) so the caller can poll it
-    /// concurrently with draining completed downloads and dispatching new ones, overlapping the
-    /// FindBlocks round-trip with the still-draining download buffer instead of stalling the
-    /// pipeline once the reserve empties.
-    #[instrument(skip_all)]
-    async fn build_extend(
-        mut tip_network: Timeout<ZN>,
-        mut state: ZS,
-        tips: HashSet<CheckedTip>,
-    ) -> Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report> {
-        let stage_start = std::time::Instant::now();
-
-        let mut prospective_tips: HashSet<CheckedTip> = HashSet::new();
-        let mut download_set = IndexSet::new();
-        debug!(tips = ?tips.len(), "trying to extend chain tips");
-        for tip in tips {
-            debug!(?tip, "asking peers to extend chain tip");
-            let mut responses = FuturesUnordered::new();
-            for attempt in 0..FANOUT {
-                if attempt > 0 {
-                    // Let other tasks run, so we're more likely to choose a different peer.
-                    //
-                    // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
-                    tokio::task::yield_now().await;
-                }
-
-                let ready_tip_network = tip_network.ready().await;
-                responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                    zn::Request::FindBlocks {
-                        known_blocks: vec![tip.tip],
-                        stop: None,
-                    },
-                )));
-            }
-            while let Some(res) = responses.next().await {
-                match res
-                    .expect("panic in spawned extend tips request")
-                    .map_err::<Report, _>(|e| eyre!(e))
-                {
-                    Ok(zn::Response::BlockHashes(hashes)) => {
-                        debug!(first = ?hashes.first(), len = ?hashes.len());
-                        trace!(?hashes);
-
-                        // zcashd sometimes appends an unrelated hash at the
-                        // start or end of its response. Check the first hash
-                        // against the previous response, and discard mismatches.
-                        let Some(unknown_hashes) = Self::validate_extend_find_blocks_response(
-                            &mut state,
-                            hashes.as_slice(),
-                            tip.tip,
-                            tip.expected_next,
-                        )
-                        .await?
-                        else {
-                            continue;
-                        };
-
-                        if unknown_hashes.is_empty() {
-                            debug!(
-                                ?tip.tip,
-                                "response contained no new hashes after the expected overlap"
-                            );
-                            continue;
-                        }
-
-                        trace!(?unknown_hashes);
-
-                        if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
-                            let new_tip = CheckedTip {
-                                tip: end[0],
-                                expected_next: end[1],
-                            };
-
-                            // Make sure we get the same tips, regardless of the
-                            // order of peer responses
-                            if !download_set.contains(&new_tip.expected_next) {
-                                debug!(?new_tip,
-                                                "adding new prospective tip, and removing any existing tips in the new block hash list");
-                                prospective_tips
-                                    .retain(|t| !unknown_hashes.contains(&t.expected_next));
-                                prospective_tips.insert(new_tip);
-                            } else {
-                                debug!(
-                                    ?new_tip,
-                                    "discarding prospective tip: already in download set"
-                                );
-                            }
-                        } else {
-                            debug!("downloading response that extends only one block");
-                        }
-
-                        // security: the first response determines our download order
-                        //
-                        // TODO: can we make the download order independent of response order?
-                        let prev_download_len = download_set.len();
-                        download_set.extend(unknown_hashes);
-                        let new_download_len = download_set.len();
-                        let new_hashes = new_download_len - prev_download_len;
-                        debug!(new_hashes, "added hashes to download set");
-                        metrics::histogram!("sync.extend.response.hash.count")
-                            .record(new_hashes as f64);
-                    }
-                    Ok(_) => unreachable!("network returned wrong response"),
-                    // We ignore this error because we made multiple fanout requests.
-                    Err(e) => debug!(?e),
-                }
-            }
-        }
-
-        let new_downloads = download_set.len();
-        debug!(new_downloads, "discovered new hashes to download");
-        metrics::gauge!("sync.extend.queued.hash.count").set(new_downloads as f64);
-
-        metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
-            .record(stage_start.elapsed().as_secs_f64());
-
-        // The caller records `new_downloads` via `recent_syncs.push_extend_tips_length` on
-        // write-back, preserving the "last peer can't toggle our mempool" security property.
-        Ok((download_set, prospective_tips, new_downloads))
+    /// Streams validated extension replies without dispatching block downloads.
+    fn build_extend(tip_network: Timeout<ZN>, state: ZS, tips: HashSet<CheckedTip>) -> Discovery {
+        discovery::discover(
+            tip_network,
+            state,
+            tips.into_iter()
+                .map(|tip| (vec![tip.tip], Some(tip)))
+                .collect(),
+            false,
+        )
     }
 
     /// Download and verify the genesis block, if it isn't currently known to
@@ -2401,7 +2036,6 @@ where
 
     /// Queue download and verify tasks for each block that isn't currently known to our node.
     ///
-    /// TODO: turn obtain and extend tips into a separate task, which sends hashes via a channel?
     async fn request_blocks(
         &mut self,
         mut hashes: IndexSet<block::Hash>,
@@ -2474,57 +2108,39 @@ where
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), BlockDownloadVerifyError> {
-        match response {
+        match &response {
             Ok((height, hash)) => {
                 trace!(?height, ?hash, "verified and committed block to state");
-                self.verify_timeout_retry_counts.remove(&hash);
+                self.verify_timeout_retry_counts.remove(hash);
                 self.utxo_race_drops = 0;
-                return Ok(());
             }
-
-            Err(BlockDownloadVerifyError::Invalid {
-                ref error,
-                advertiser_addr: Some(advertiser_addr),
-                ..
-            }) if error.misbehavior_score() != 0 => {
-                let _ = self
-                    .misbehavior_sender
-                    .try_send((advertiser_addr, error.misbehavior_score()));
-            }
-
-            // Unlike `AboveLookaheadHeightLimit` below, this one *is* scored. The
-            // claimed height is checked against our own committed tip, so the body
-            // is provably malformed, and the peer being scored is the one that
-            // served that body — not a peer that merely supplied a hash. There is
-            // no misattribution to avoid here.
-            Err(BlockDownloadVerifyError::TipChildHeightMismatch {
-                advertiser_addr: Some(advertiser_addr),
-                ..
-            }) => {
-                let _ = self
-                    .misbehavior_sender
-                    .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
-            }
-
-            Err(BlockDownloadVerifyError::InvalidHeight {
-                advertiser_addr: Some(advertiser_addr),
-                ..
-            }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
-            }
-
-            // `AboveLookaheadHeightLimit` is deliberately unscored. Its
-            // `advertiser_addr` is the peer that served a block this node
-            // requested, but the height came from whichever peer supplied the
-            // hash in a `FindBlocks` response. Those are usually different
-            // peers, and `Response::BlockHashes` carries no address, so the
-            // responsible peer is unknown here. The download task has already
-            // discarded the block without verifying it; scoring the server as
-            // well would ban a peer for honestly answering our own request.
-            Err(_) => {}
-        };
-
+            Err(error) => self.score_download_failure(error),
+        }
         Self::handle_response(response, self.expose_peer_addresses)
+    }
+
+    /// Scores the supplier of a provably invalid body, whether the fetch was optional or required.
+    /// An above-lookahead body is unscored: its supplier may differ from the peer that advertised
+    /// the hash, so an honest response to our request is not evidence of misbehavior.
+    fn score_download_failure(&self, error: &BlockDownloadVerifyError) {
+        let (address, score) = match error {
+            BlockDownloadVerifyError::Invalid {
+                error,
+                advertiser_addr: Some(address),
+                ..
+            } if error.misbehavior_score() != 0 => (*address, error.misbehavior_score()),
+            // The expected height comes from our committed tip, independently of the peer body.
+            BlockDownloadVerifyError::TipChildHeightMismatch {
+                advertiser_addr: Some(address),
+                ..
+            } => (*address, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE),
+            BlockDownloadVerifyError::InvalidHeight {
+                advertiser_addr: Some(address),
+                ..
+            } => (*address, 100),
+            _ => return,
+        };
+        let _ = self.misbehavior_sender.try_send((address, score));
     }
 
     /// Handles a downloaded block response and requeues a required hash when retrying one block can
@@ -2567,6 +2183,14 @@ where
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), Report> {
+        if let Err(BlockDownloadVerifyError::HintFailed { error }) = response {
+            self.score_download_failure(&error);
+            debug!(
+                ?error,
+                "optional discovery hint failed; keeping required downloads"
+            );
+            return Ok(());
+        }
         let response = match response {
             Err(BlockDownloadVerifyError::Invalid {
                 ref error,

@@ -54,7 +54,7 @@ use crate::{
 
 use InventoryResponse::*;
 
-type TestChainSync = ChainSync<
+pub(super) type TestChainSync = ChainSync<
     MockService<zn::Request, zn::Response, PanicAssertion>,
     MockService<zs::Request, zs::Response, PanicAssertion>,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
@@ -62,7 +62,7 @@ type TestChainSync = ChainSync<
 >;
 
 #[derive(Clone, Debug)]
-struct NeverReadyNetwork;
+pub(super) struct NeverReadyNetwork;
 
 impl Service<zn::Request> for NeverReadyNetwork {
     type Response = zn::Response;
@@ -2058,7 +2058,7 @@ async fn transient_download_failure_has_eight_peer_request_ceiling() -> Result<(
     tokio::time::advance(2 * sync::SYNC_RESTART_DELAY).await;
 
     let failed_hash = block::Hash::from([0xCF; 32]);
-    let sync_round = chain_sync.sync_round(iter::once(failed_hash).collect(), None);
+    let sync_round = chain_sync.sync_round(iter::once(failed_hash).collect(), None, None);
     let fail_peer_requests = async {
         let request = zn::Request::BlocksByHash(iter::once(failed_hash).collect());
         let queue_attempts = sync::TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT + 1;
@@ -2115,7 +2115,7 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
     let unrelated_hash = unrelated_block.hash();
     let reserve = [retried_hash, unrelated_hash].into_iter().collect();
 
-    let sync_round = chain_sync.sync_round(reserve, None);
+    let sync_round = chain_sync.sync_round(reserve, None, None);
     let drive_services = async {
         // Fail one download queue attempt. The unrelated request can arrive first because the sync
         // round dispatches both hashes concurrently.
@@ -2206,7 +2206,8 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
     let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
     let parent_hash = parent.hash();
     let child_hash = child.hash();
-    let sync_round = chain_sync.sync_round([parent_hash, child_hash].into_iter().collect(), None);
+    let sync_round =
+        chain_sync.sync_round([parent_hash, child_hash].into_iter().collect(), None, None);
     let drive_services = async {
         for block in [parent, child.clone()] {
             peers
@@ -2655,6 +2656,24 @@ async fn short_verify_timeout_starts_after_final_checkpoint() -> Result<(), crat
     Ok(())
 }
 
+/// Collects a discovery stream for validation tests that intentionally wait for a whole round.
+async fn collect_discovery(
+    mut discovery: sync::Discovery,
+) -> Result<(IndexSet<block::Hash>, HashSet<sync::CheckedTip>, usize), Report> {
+    let mut hashes = IndexSet::new();
+    while let Some(event) = discovery.next().await {
+        match event? {
+            sync::DiscoveryEvent::Batch(batch) => hashes.extend(batch),
+            sync::DiscoveryEvent::Hint(_) => {}
+            sync::DiscoveryEvent::Finished(tips) => {
+                let count = hashes.len();
+                return Ok((hashes, tips, count));
+            }
+        }
+    }
+    panic!("discovery must finish explicitly")
+}
+
 /// Unit test for the refactored [`ChainSync::build_extend`]: it must *discover* the next batch of
 /// download hashes from a prospective tip, performing the FindBlocks fan-out and parsing the
 /// response, **without** dispatching any block downloads or otherwise touching syncer state.
@@ -2698,11 +2717,11 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
 
     // `build_extend` owns a clone of the tip network so it can run without borrowing `self`.
     let tip_network = Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+    let extend_handle = tokio::spawn(collect_discovery(TestChainSync::build_extend(
         tip_network,
         state_service.clone(),
         tips,
-    ));
+    )));
 
     // One peer extends the tip. The response starts with the expected hash (the match anchor) and
     // ends with a possibly-incorrect trailing hash that the syncer discards.
@@ -2828,11 +2847,13 @@ async fn obtain_tips_ignores_known_hash_after_first_unknown() -> Result<(), crat
         Ok::<_, crate::BoxError>(())
     };
 
-    let (extra_hashes, responded) =
-        futures::join!(chain_sync.obtain_tips(false), respond_to_requests);
+    let (extra_hashes, responded) = futures::join!(
+        async { collect_discovery(chain_sync.obtain_tips().await?).await },
+        respond_to_requests
+    );
     responded?;
     let extra_hashes = extra_hashes?;
-    assert!(extra_hashes.is_empty());
+    assert!(extra_hashes.0.is_empty());
 
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
@@ -2860,11 +2881,11 @@ async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), cr
     let random = block::Hash::from([0x15; 32]);
 
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+    let extend_handle = tokio::spawn(collect_discovery(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
         state_service.clone(),
         tips,
-    ));
+    )));
 
     peer_set
         .expect_request(zn::Request::FindBlocks {
@@ -2948,11 +2969,11 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
         .collect();
 
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+    let extend_handle = tokio::spawn(collect_discovery(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
         state_service.clone(),
         tips,
-    ));
+    )));
 
     peer_set
         .expect_request(zn::Request::FindBlocks {
@@ -3004,11 +3025,11 @@ async fn build_extend_rejects_locator_echo_before_state_queries() -> Result<(), 
     let unknown = block::Hash::from([0x22; 32]);
     let trailing = block::Hash::from([0x23; 32]);
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+    let extend_handle = tokio::spawn(collect_discovery(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
         state_service.clone(),
         tips,
-    ));
+    )));
 
     peer_set
         .expect_request(zn::Request::FindBlocks {
@@ -3064,11 +3085,11 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
     let unknown_b = block::Hash::from([0x23; 32]);
 
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+    let extend_handle = tokio::spawn(collect_discovery(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
         state_service.clone(),
         tips,
-    ));
+    )));
 
     peer_set
         .expect_request(zn::Request::FindBlocks {
@@ -3470,7 +3491,7 @@ fn setup() -> (
     )
 }
 
-fn setup_chain_sync() -> (
+pub(super) fn setup_chain_sync() -> (
     TestChainSync,
     SyncStatus,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,

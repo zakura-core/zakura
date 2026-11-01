@@ -192,3 +192,69 @@ fn high_sync_lengths() {
 
     assert!(!status.is_close_to_tip());
 }
+
+/// A full window tolerates a short discovery burst, but sustained large replies still pause it.
+#[test]
+fn short_discovery_burst_preserves_readiness() {
+    let (status, mut recent_sync_lengths) = SyncStatus::new();
+
+    for _ in 0..5 {
+        recent_sync_lengths.push_obtain_tips_length(0);
+    }
+
+    recent_sync_lengths.push_obtain_tips_length(500);
+    assert!(status.is_close_to_tip());
+    recent_sync_lengths.push_extend_tips_length(500);
+    assert!(status.is_close_to_tip());
+    recent_sync_lengths.push_obtain_tips_length(500);
+    assert!(
+        status.is_close_to_tip(),
+        "three 500-hash samples and two zeros average exactly 300"
+    );
+
+    recent_sync_lengths.push_extend_tips_length(500);
+    assert!(
+        !status.is_close_to_tip(),
+        "four 500-hash samples and one zero exceed the readiness bound"
+    );
+}
+
+/// Clean discovery updates restore readiness as large replies age out of the window.
+#[test]
+fn readiness_recovers_after_sustained_large_replies() {
+    let (status, mut recent_sync_lengths) = SyncStatus::new();
+
+    for _ in 0..5 {
+        recent_sync_lengths.push_extend_tips_length(500);
+    }
+    assert!(!status.is_close_to_tip());
+
+    recent_sync_lengths.push_obtain_tips_length(0);
+    assert!(
+        !status.is_close_to_tip(),
+        "one zero leaves four 500-hash samples in the window"
+    );
+    recent_sync_lengths.push_extend_tips_length(0);
+    assert!(
+        status.is_close_to_tip(),
+        "two zeros leave three 500-hash samples, averaging exactly 300"
+    );
+}
+
+/// Startup averages only observed samples; missing history must not count as zero.
+#[test]
+fn partial_discovery_window_is_not_padded_with_zeros() {
+    let (status, mut recent_sync_lengths) = SyncStatus::new();
+    assert!(!status.is_close_to_tip());
+
+    recent_sync_lengths.push_obtain_tips_length(500);
+    assert!(
+        !status.is_close_to_tip(),
+        "the first 500-hash sample retains its full weight"
+    );
+    recent_sync_lengths.push_extend_tips_length(0);
+    assert!(
+        status.is_close_to_tip(),
+        "the two observed samples average 250"
+    );
+}

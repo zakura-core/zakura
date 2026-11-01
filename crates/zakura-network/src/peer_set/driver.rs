@@ -12,12 +12,13 @@ use futures::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::{CancellationToken, PollSender};
 use tower::{discover::Discover, util::BoxCloneSyncService, Service};
+use tracing::debug;
 use zakura_chain::chain_tip::ChainTip;
 
 use super::PeerSet;
 use crate::{
     constants::PEERSET_BUFFER_SIZE,
-    peer::{block_gossip::BlockAdvertiser, LoadTrackedClient},
+    peer::{block_gossip::BlockAdvertiser, LoadTrackedClient, MinimumPeerVersion},
     BoxError, PeerSocketAddr, Request, Response,
 };
 
@@ -117,8 +118,11 @@ where
     let (refresh, mut refreshes) = mpsc::channel::<oneshot::Sender<()>>(PEERSET_BUFFER_SIZE);
     let mut advertiser = peers.block_advertiser();
     advertiser.refresh = Some(refresh);
-    let (bans, mut tip) = peers.authorization();
+    let (bans, minimum) = peers.authorization();
     let mut bans_changed = bans.subscribe();
+    let mut version_changed = watch_minimum_version(minimum, shutdown.clone());
+    // Once the version watcher ends, the last minimum version stays in force.
+    let mut version_watch_open = true;
     let (failed, error) = watch::channel(None);
     let client = Client {
         sender: PollSender::new(requests),
@@ -132,7 +136,9 @@ where
                     biased;
                     _ = shutdown.cancelled() => break,
                     changed = bans_changed.changed() => { changed?; }
-                    changed = tip.best_tip_changed() => { changed?; }
+                    changed = version_changed.changed(), if version_watch_open => {
+                        version_watch_open = changed.is_ok();
+                    }
                     running = poll_fn(|cx| {
                         peers.maintain(cx)?;
                         // Bounded channel polling participates in Tokio's cooperative budget.
@@ -140,6 +146,7 @@ where
                             // Discovery may have arrived between the first maintenance pass and
                             // this refresh. Process it after receiving the barrier, before acking.
                             peers.maintain(cx)?;
+                            peers.demand_peers_if_none_advertisable();
                             let _ = reply.send(());
                         }
                         if pending.is_none() {
@@ -154,7 +161,8 @@ where
                             pending.take();
                             return Poll::Ready(Ok(true));
                         }
-                        futures::ready!(peers.poll_ready(cx))?;
+                        // Maintenance already ran in this poll, so only check routing readiness.
+                        futures::ready!(peers.poll_routing_readiness(cx))?;
                         let request = pending.take().expect("readiness does not remove the request");
                         let response = request.span.in_scope(|| peers.call(request.request));
                         let _ = request.reply.send(response);
@@ -169,4 +177,42 @@ where
         // Closing queues and dropping the peer set cancels peers and wakes all waiters.
     });
     (BoxCloneSyncService::new(client), advertiser)
+}
+
+/// Reports minimum peer version changes on the returned channel, from a task of its own.
+///
+/// Every block changes the chain tip, but maintenance only needs to rerun when the minimum peer
+/// version changes, so the owner must not wake on each block. The task ends on shutdown, or once
+/// the chain tip can no longer change, which leaves the last minimum version in force.
+fn watch_minimum_version<C>(
+    mut minimum: MinimumPeerVersion<C>,
+    shutdown: CancellationToken,
+) -> watch::Receiver<()>
+where
+    C: ChainTip + Clone + Send + Sync + 'static,
+{
+    let (changed_tx, changed_rx) = watch::channel(());
+    // A cloned tracker reports the current version as a change; mark it seen so that only later
+    // version changes are reported.
+    let _ = minimum.changed();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = changed_tx.closed() => break,
+                changed = minimum.wait_for_change() => match changed {
+                    Ok(version) => {
+                        debug!(?version, "minimum peer version changed");
+                        changed_tx.send_replace(());
+                    }
+                    Err(error) => {
+                        debug!(%error, "chain tip watch closed, keeping the last minimum peer version");
+                        break;
+                    }
+                },
+            }
+        }
+    });
+    changed_rx
 }

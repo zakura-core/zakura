@@ -21,7 +21,10 @@ use crate::{
     peer::{
         ClientRequest, ClientTestHarness, ConnectedAddr, LoadTrackedClient, MinimumPeerVersion,
     },
-    peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
+    peer_set::{
+        inventory_registry::{InventoryChange, InventoryStatus},
+        stall_tracker::FIND_RESPONSE_STALL_THRESHOLD,
+    },
     protocol::external::{types::Version, InventoryHash},
     BannedIps, BoxError, PeerSocketAddr, PeerSource, Request, Response, SharedPeerError,
 };
@@ -1962,5 +1965,225 @@ async fn driver_yields_when_idle() {
         tokio::task::yield_now().await;
     }
     assert_eq!(polls.load(Ordering::Relaxed), before);
+    shutdown.cancel();
+}
+
+/// Inventory from peers does not wake maintenance: only request routing reads the inventory
+/// registry, so it is refreshed there instead.
+#[tokio::test(start_paused = true)]
+async fn driver_ignores_inventory_wakes() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _init = zakura_test::init();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let count = polls.clone();
+    let discovered = stream::poll_fn(move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+        std::task::Poll::<Option<Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>>::Pending
+    });
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (peers, mut guard) = PeerSetBuilder::new()
+        .with_discover(discovered)
+        .with_minimum_peer_version(minimum)
+        .build();
+    let inventory = guard
+        .inventory_sender()
+        .take()
+        .expect("the builder creates an inventory channel");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (_ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+    let (done, ready) = tokio::sync::oneshot::channel();
+    adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+    timeout(Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = polls.load(Ordering::Relaxed);
+    let peer: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+    for index in 0..10u8 {
+        inventory
+            .send(InventoryChange::new_available(
+                InventoryHash::Block(block::Hash([index; 32])),
+                peer,
+            ))
+            .expect("the peer set holds the inventory receiver");
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        polls.load(Ordering::Relaxed),
+        before,
+        "inventory alone does not run maintenance"
+    );
+    shutdown.cancel();
+}
+
+/// A chain tip change that keeps the minimum peer version does not rerun maintenance; one that
+/// changes it does.
+#[tokio::test(start_paused = true)]
+async fn driver_reruns_maintenance_only_on_minimum_version_change() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _init = zakura_test::init();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let count = polls.clone();
+    let discovered = stream::poll_fn(move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+        std::task::Poll::<Option<Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>>::Pending
+    });
+    let (minimum, tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (peers, _guard) = PeerSetBuilder::new()
+        .with_discover(discovered)
+        .with_minimum_peer_version(minimum)
+        .build();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (_ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+    let (done, ready) = tokio::sync::oneshot::channel();
+    adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+    timeout(Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Crossing an upgrade boundary raises the minimum version, which reruns maintenance.
+    let activation = NetworkUpgrade::Nu6_3
+        .activation_height(&Network::Mainnet)
+        .unwrap();
+    let before = polls.load(Ordering::Relaxed);
+    tip.send_best_tip_height(Some(activation));
+    timeout(Duration::from_secs(1), async {
+        while polls.load(Ordering::Relaxed) == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a minimum version change reruns maintenance");
+
+    // A later block in the same upgrade keeps the minimum version, so maintenance stays idle.
+    let after_change = polls.load(Ordering::Relaxed);
+    tip.send_best_tip_height(Some(block::Height(activation.0 + 1)));
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        polls.load(Ordering::Relaxed),
+        after_change,
+        "a tip change within one upgrade does not rerun maintenance"
+    );
+    shutdown.cancel();
+}
+
+/// Losing the chain tip watch keeps the peer set serving requests and advert refreshes, with the
+/// last minimum peer version in force.
+#[tokio::test(start_paused = true)]
+async fn driver_survives_a_closed_chain_tip_watch() {
+    let _init = zakura_test::init();
+    let (minimum, tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (peers, _guard) = PeerSetBuilder::new()
+        .with_discover(stream::pending::<
+            Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>,
+        >())
+        .with_minimum_peer_version(minimum)
+        .build();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (mut ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+    drop(tip);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let (done, ready) = tokio::sync::oneshot::channel();
+    adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+    timeout(Duration::from_secs(1), ready)
+        .await
+        .expect("refreshes are still served")
+        .unwrap();
+    assert!(ordinary
+        .ready()
+        .now_or_never()
+        .expect("the request queue has capacity")
+        .is_ok());
+    shutdown.cancel();
+}
+
+/// A peer that reconnects before the health sweep removes its closed connection takes that
+/// connection's place, instead of being rejected as a duplicate of it.
+#[tokio::test(start_paused = true)]
+async fn reconnect_replaces_a_closed_ready_connection() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        let (first, first_handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, first.into())))
+            .unwrap();
+        peers
+            .ready()
+            .await
+            .expect("the first connection becomes ready");
+        assert_eq!(peers.ready_services.len(), 1);
+
+        // The first connection closes, and the peer reconnects before the next poll.
+        first_handle.stop_connection_task().await;
+        let (second, _second_handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        let second_sender = second.block_advert_tx.clone();
+        discovery
+            .unbounded_send(Ok(Change::Insert(address, second.into())))
+            .unwrap();
+
+        peers
+            .ready()
+            .await
+            .expect("the reconnected peer becomes ready");
+        assert!(peers.block_gossip_peers[&address]
+            .sender
+            .same_channel(&second_sender));
+    })
+    .await
+    .expect("the reconnect is admitted in place of the closed connection");
+}
+
+/// A block advert refresh that finds no usable peer asks the crawler for more, since adverts never
+/// reach the request path that normally sends that demand.
+#[tokio::test(start_paused = true)]
+async fn empty_advert_refresh_demands_more_peers() {
+    let _init = zakura_test::init();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (peers, mut guard) = PeerSetBuilder::new()
+        .with_discover(stream::pending::<
+            Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>,
+        >())
+        .with_minimum_peer_version(minimum)
+        .build();
+    let mut demand = guard
+        .demand_receiver()
+        .take()
+        .expect("the builder creates a demand channel");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (_ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+    let (done, ready) = tokio::sync::oneshot::channel();
+    adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+    timeout(Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(demand.next().now_or_never(), Some(Some(_))),
+        "an empty refresh demands more peers"
+    );
     shutdown.cancel();
 }

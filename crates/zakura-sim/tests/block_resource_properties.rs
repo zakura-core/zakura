@@ -264,14 +264,14 @@ fn asks_for_the_withheld_floor_before_the_reset(report: &RunReport) -> bool {
 }
 
 /// The floor churn with routines paused in their handoffs from height 5,
-/// stopped at 16,000 steps, after the reset at about 13,000.
+/// stopped at 20,000 steps, after the reset at about 16,000.
 fn floor_churn_from_height_5() -> BlockScenario {
     BlockScenario {
         handoff_pause: Some(HandoffPause {
             from_height: 5,
             steps: 20_000,
         }),
-        steps: Some(16_000),
+        steps: Some(20_000),
         ..BlockScenario::floor_churn()
     }
 }

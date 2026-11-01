@@ -870,10 +870,17 @@ where
                 }
 
                 if block_height > max_checkpoint_height {
-                    parent_attempt.admit(state, ParentDeferred {
+                    let admission = parent_attempt.admit(state, ParentDeferred {
                         hash, parent: block.header.previous_block_hash, height: block_height,
                         routing_source: None, parent_recovery: false,
-                    }).await?;
+                    });
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => {
+                            return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash });
+                        }
+                        result = admission => result?,
+                    }
                 }
 
                 // Wait for the verifier service to be ready.

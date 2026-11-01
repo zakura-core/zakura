@@ -86,6 +86,24 @@ class CapacityQualification(unittest.TestCase):
         self.assertEqual(measured["sync"]["verdict"], "incomplete")
         self.assertIsNone(monitor.capacity_metrics("")["sync"]["limit_reached_count"])
 
+    def test_partial_gauges_report_incomplete_without_crashing(self):
+        broken = self.observation(0)
+        broken["missing_parent"]["sync"]["active"] = None
+        measured = monitor.summarize_capacity([broken, self.observation(1)], 1)
+        self.assertEqual(measured["sync"]["verdict"], "failed")
+
+    def test_duration_metrics_keep_reasons_and_quantiles(self):
+        measured = monitor.duration_metrics('''sync_missing_parent_charge_duration_seconds_sum{reason="parent_available"} 6
+sync_missing_parent_charge_duration_seconds_count{reason="parent_available"} 3
+sync_missing_parent_charge_duration_seconds{reason="parent_available",quantile="0.95"} 4
+''')
+        self.assertEqual(measured["sync"]["charge"]["parent_available"], {"sum": 6, "count": 3, "0.95": 4})
+
+    def test_work_before_the_window_does_not_satisfy_semantic_coverage(self):
+        self.assertEqual(monitor.counter_window([{"semantic_commits": 2000}, {"semantic_commits": 2100}],
+                                                "semantic_commits"),
+                         {"baseline": 2000, "final": 2100, "delta": 100})
+
 
 class StartupHeight(unittest.TestCase):
     def read(self, text: str):

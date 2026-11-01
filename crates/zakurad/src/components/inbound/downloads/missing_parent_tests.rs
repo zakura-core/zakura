@@ -132,6 +132,14 @@ impl Harness {
 
     /// [`Self::new`], on `network`.
     fn on_network(chain_network: Network, blocks: impl IntoIterator<Item = Arc<Block>>) -> Self {
+        Self::with_capacity(chain_network, blocks, MAX_INBOUND_CONCURRENCY)
+    }
+
+    fn with_capacity(
+        chain_network: Network,
+        blocks: impl IntoIterator<Item = Arc<Block>>,
+        capacity: usize,
+    ) -> Self {
         let genesis = genesis();
         let genesis_hash = genesis.hash();
 
@@ -216,9 +224,13 @@ impl Harness {
             async move {
                 match request {
                     // Gossip always fetches the body, so the state never reports it present.
-                    zs::Request::CheckParentInputs { .. } => {
-                        Ok(zs::Response::ParentInputs(zs::ParentInputs::Available))
-                    }
+                    zs::Request::CheckParentInputs { parent, .. } => Ok(
+                        zs::Response::ParentInputs(if known.borrow().contains(&parent) {
+                            zs::ParentInputs::Available
+                        } else {
+                            zs::ParentInputs::ParentUnavailable
+                        }),
+                    ),
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
                         known
@@ -238,7 +250,7 @@ impl Harness {
         tip_sender.set_finalized_tip(tip_block);
 
         let downloads = Downloads::new(
-            MAX_INBOUND_CONCURRENCY,
+            capacity,
             false,
             network,
             verifier,
@@ -297,6 +309,52 @@ impl Harness {
 
 fn unavailable(byte: u8) -> block::Hash {
     block::Hash([byte; 32])
+}
+
+/// Saturated parent waits release an excess child's slot, then recover it from
+/// parent progress without another advertisement while unrelated waits remain.
+#[tokio::test(start_paused = true)]
+async fn deferred_child_releases_its_slot_and_commits_after_its_parent_arrives() {
+    let parent = block_2();
+    let child = block_3();
+    let orphans: Vec<_> = (0..3)
+        .map(|index| with_parent(&block_3(), unavailable(100 + index)))
+        .collect();
+    let mut blocks = orphans.clone();
+    blocks.extend([block_1(), parent.clone(), child.clone()]);
+    let mut harness = Harness::with_capacity(Network::new_regtest(Default::default()), blocks, 4);
+    for (index, orphan) in orphans.iter().enumerate() {
+        harness.downloads.download_and_verify(
+            orphan.hash(),
+            Some(legacy(u8::try_from(index + 10).unwrap())),
+        );
+        assert_eq!(requested_hash(&harness.next_request().await), orphan.hash());
+    }
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    harness
+        .downloads
+        .download_and_verify(child.hash(), Some(legacy(20)));
+    assert_eq!(requested_hash(&harness.next_request().await), child.hash());
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(harness.downloads.spawner.admission().queue_len(), 3);
+    assert!(harness
+        .downloads
+        .spawner
+        .parent_budget
+        .is_deferred(&child.hash()));
+    for (block, source) in [(block_1(), legacy(21)), (parent.clone(), legacy(22))] {
+        assert_eq!(
+            harness
+                .downloads
+                .download_and_verify(block.hash(), Some(source)),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(requested_hash(&harness.next_request().await), block.hash());
+        assert_eq!(harness.next_commit().await, block.hash());
+    }
+    assert_eq!(requested_hash(&harness.next_request().await), child.hash());
+    assert_eq!(harness.next_commit().await, child.hash());
+    assert_eq!(harness.downloads.spawner.admission().queue_len(), 3);
 }
 
 impl Harness {

@@ -45,6 +45,7 @@ pub struct Deferred {
 struct Entry {
     block: Deferred,
     first: Instant,
+    next_retry: Instant,
     retries: usize,
     dispatched: bool,
     ready: bool,
@@ -60,6 +61,7 @@ struct Charge {
 #[derive(Debug)]
 struct Accounting {
     capacity: usize,
+    generation: u64,
     next_attempt: u64,
     charges: HashMap<u64, Charge>,
     deferred: indexmap::IndexMap<block::Hash, Entry>,
@@ -84,6 +86,7 @@ pub(super) struct Budget(Arc<Inner>);
 pub(super) struct Attempt {
     budget: Budget,
     id: u64,
+    generation: u64,
     hash: block::Hash,
     transferred: bool,
     outcome: &'static str,
@@ -95,6 +98,7 @@ impl Budget {
             path,
             accounting: Mutex::new(Accounting {
                 capacity: capacity.max(1),
+                generation: 0,
                 next_attempt: 0,
                 charges: HashMap::new(),
                 deferred: indexmap::IndexMap::new(),
@@ -150,13 +154,12 @@ impl Budget {
             if band >= 2 && state.band < 2 {
                 self.count("near_90.count");
             }
-            if band == 3 {
-                self.count(if capacity_change {
-                    "capacity_reduction_overage.count"
-                } else {
-                    "limit_reached.count"
-                });
+            if band == 3 && !capacity_change {
+                self.count("limit_reached.count");
             }
+        }
+        if capacity_change && active > 0 && active >= limit {
+            self.count("capacity_reduction_overage.count");
         }
         state.band = band;
         for (name, value) in [
@@ -174,6 +177,13 @@ impl Budget {
             // Counts and configured capacities are small enough for exact f64 integers.
             metrics::gauge!(self.metric(name)).set(value as f64);
         }
+        let oldest = state
+            .deferred
+            .values()
+            .filter(|e| !e.dispatched)
+            .map(|e| e.first.elapsed().as_secs_f64())
+            .fold(0.0, f64::max);
+        metrics::gauge!(self.metric("deferred.oldest_age_seconds")).set(oldest);
         // A new process exposes zero counters even before its first admission.
         for name in [
             "limit_reached.count",
@@ -225,11 +235,15 @@ impl Budget {
             .expect("a downloader cannot start u64::MAX attempts in its lifetime");
         let id = state.next_attempt;
         if let Some(entry) = state.deferred.get_mut(&hash) {
+            if entry.dispatched {
+                self.count("retried.count");
+            }
             entry.owner = id;
         }
         Attempt {
             budget: self.clone(),
             id,
+            generation: state.generation,
             hash,
             transferred: false,
             outcome: "cancelled",
@@ -261,12 +275,12 @@ impl Budget {
             if ready.len() >= slots {
                 break;
             }
-            if entry.ready && !entry.dispatched {
+            if entry.ready && !entry.dispatched && entry.next_retry <= Instant::now() {
                 entry.dispatched = true;
                 entry.ready = false;
+                entry.next_retry = Instant::now() + CHECK_INTERVAL;
                 entry.retries += 1;
                 ready.push(entry.block.clone());
-                self.count("retried.count");
             }
         }
         self.publish(&mut state, false);
@@ -288,6 +302,8 @@ impl Budget {
             };
             if let Some(reason) = reason {
                 self.count(reason);
+                metrics::histogram!(self.metric("deferred.duration_seconds"), "reason" => reason)
+                    .record(now.duration_since(entry.first).as_secs_f64());
                 state.rediscover = true;
                 false
             } else {
@@ -315,6 +331,10 @@ impl Budget {
 
     pub fn reset(&self) {
         let mut state = self.lock();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("a downloader cannot reset u64::MAX rounds in its lifetime");
         state.deferred.clear();
         state.next_checks.clear();
         state.rediscover = false;
@@ -332,10 +352,16 @@ impl Budget {
     {
         tip.mark_best_tip_seen();
         let mut force = false;
+        let mut tip_open = true;
         loop {
             let parents = {
                 let mut inner = self.lock();
+                let previous_len = inner.deferred.len();
                 self.expire(&mut inner);
+                if previous_len != inner.deferred.len() {
+                    self.publish(&mut inner, false);
+                    return;
+                }
                 let mut parents: HashSet<_> = inner.charges.values().map(|c| c.parent).collect();
                 parents.extend(
                     inner
@@ -387,9 +413,9 @@ impl Budget {
             tokio::select! {
                 _ = tokio::time::sleep(CHECK_INTERVAL) => { force = false; }
                 _ = self.0.changed.notified() => { force = false; }
-                changed = tip.best_tip_changed() => {
-                    if changed.is_err() { return; }
-                    force = true;
+                changed = tip.best_tip_changed(), if tip_open => {
+                    tip_open = changed.is_ok();
+                    force = tip_open;
                 }
             }
         }
@@ -454,6 +480,9 @@ impl Attempt {
                 self.budget.count("inconclusive.count");
             }
             let mut inner = self.budget.lock();
+            if self.generation != inner.generation {
+                return Err(block);
+            }
             if inner.charges.len() < Budget::limit(inner.capacity) {
                 inner.charges.insert(
                     self.id,
@@ -475,6 +504,9 @@ impl Attempt {
 
     fn defer(&mut self, block: Deferred) {
         let mut inner = self.budget.lock();
+        if self.generation != inner.generation {
+            return;
+        }
         if let Some(entry) = inner.deferred.get_mut(&self.hash) {
             entry.dispatched = false;
             entry.ready = false;
@@ -485,6 +517,7 @@ impl Attempt {
                 Entry {
                     block,
                     first: Instant::now(),
+                    next_retry: Instant::now(),
                     retries: 0,
                     dispatched: false,
                     ready: false,

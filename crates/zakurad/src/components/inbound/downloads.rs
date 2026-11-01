@@ -876,6 +876,7 @@ where
                         continue;
                     }
                     if admission.cancel_handles.contains_key(&entry.hash) {
+                        spawner.parent_budget.dispatch_refused(&entry.hash);
                         continue;
                     }
                     let task = spawner.spawn_download_task(

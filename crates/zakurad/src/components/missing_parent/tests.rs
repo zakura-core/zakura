@@ -136,7 +136,7 @@ async fn deferred_hash_waits_for_parent_and_keeps_its_original_deadline() {
     assert!(budget.take_rediscovery());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn metadata_overflow_and_retry_limit_are_bounded() {
     let budget = Budget::new("sync", 1);
     for byte in 1..=2 {
@@ -148,6 +148,7 @@ async fn metadata_overflow_and_retry_limit_are_bounded() {
     }
     assert_eq!(budget.lock().deferred.len(), 1);
     for _ in 0..RETRY_LIMIT {
+        tokio::time::advance(CHECK_INTERVAL).await;
         budget.parent_ready(block(1).parent);
         assert_eq!(budget.take_ready(1).len(), 1);
         let mut attempt = budget.attempt(block(1).hash);
@@ -157,6 +158,49 @@ async fn metadata_overflow_and_retry_limit_are_bounded() {
             .is_err());
     }
     assert!(!budget.is_deferred(&block(1).hash));
+}
+
+#[tokio::test(start_paused = true)]
+async fn refused_retry_keeps_metadata_eligible_after_old_task_cleanup() {
+    let budget = Budget::new("sync", 1);
+    let mut first = budget.attempt(block(1).hash);
+    first
+        .admit(state(zs::ParentInputs::ParentUnavailable), block(1))
+        .await
+        .unwrap_err();
+    budget.parent_ready(block(1).parent);
+    assert_eq!(budget.take_ready(1).len(), 1);
+    budget.dispatch_refused(&block(1).hash);
+    drop(first);
+    assert!(budget.take_ready(1).is_empty());
+    tokio::time::advance(CHECK_INTERVAL).await;
+    assert_eq!(budget.take_ready(1).len(), 1);
+    let mut retry = budget.attempt(block(1).hash);
+    retry
+        .admit(state(zs::ParentInputs::Available), block(1))
+        .await
+        .unwrap();
+    drop(retry);
+    assert!(!budget.has_pending());
+    assert!(budget.lock().deferred.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn reset_during_a_state_read_cannot_restore_old_round_metadata() {
+    let budget = Budget::new("sync", 1);
+    let mut old = budget.attempt(block(1).hash);
+    let (started, observed) = tokio::sync::oneshot::channel();
+    let started = Arc::new(Mutex::new(Some(started)));
+    let state = service_fn(move |_| {
+        started.lock().unwrap().take().unwrap().send(()).unwrap();
+        futures::future::pending::<Result<zs::Response, BoxError>>()
+    });
+    let admission = tokio::spawn(async move { old.admit(state, block(1)).await });
+    observed.await.unwrap();
+    budget.reset();
+    assert!(admission.await.unwrap().is_err());
+    assert!(budget.lock().deferred.is_empty());
+    assert!(budget.lock().charges.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

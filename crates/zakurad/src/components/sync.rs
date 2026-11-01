@@ -1556,8 +1556,14 @@ where
         // extension finished, or more full-block downloads were queued. If none
         // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
         let mut last_progress = Instant::now();
+        let mut next_tip_refresh = Instant::now() + TIP_REFRESH_INTERVAL;
 
         'sync_round: loop {
+            if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
+                return Err(eyre!(
+                    "sync round stalled: no block completed or tips extended within timeout"
+                ));
+            }
             if futures::poll!(&mut parent_observer).is_ready() {
                 parent_observer = parent_budget
                     .observe(self.state.clone(), self.latest_chain_tip.clone())
@@ -1569,8 +1575,10 @@ where
                 parent_budget.take_ready(capacity.saturating_sub(self.downloads.in_flight()))
             {
                 match self.downloads.download_and_verify(entry.hash).await {
-                    Ok(())
-                    | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {}
+                    Ok(()) => {}
+                    Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                        parent_budget.dispatch_refused(&entry.hash);
+                    }
                     Err(error) => {
                         parent_budget.dispatch_refused(&entry.hash);
                         self.handle_block_response(Err(error))?;
@@ -1703,7 +1711,14 @@ where
             {
                 // Give the in-flight blocks a chance to finish on their own first, so a healthy
                 // sync doesn't re-run the fanout.
-                let completed = timeout(TIP_REFRESH_INTERVAL, self.downloads.next()).await;
+                let completed = tokio::select! {
+                    completed = tokio::time::timeout_at(next_tip_refresh.into(), self.downloads.next()) => completed,
+                    _ = &mut parent_observer => {
+                        parent_observer = parent_budget.observe(self.state.clone(), self.latest_chain_tip.clone()).boxed();
+                        continue;
+                    }
+                };
+                next_tip_refresh = Instant::now() + TIP_REFRESH_INTERVAL;
 
                 match completed {
                     Ok(Some(rsp)) => {
@@ -1795,7 +1810,7 @@ where
             // Copy the earliest backoff deadline out so the timer future doesn't borrow `self`
             // across the `select!` while other arms borrow `self.downloads`.
             let registry_retry_at = self.registry_miss_retry.values().min().copied();
-            let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
+            let step = tokio::time::timeout_at((last_progress + BLOCK_VERIFY_TIMEOUT).into(), async {
                 tokio::select! {
                     biased;
 

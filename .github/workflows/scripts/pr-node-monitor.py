@@ -68,6 +68,29 @@ def capacity_metrics(text: str) -> dict:
                    for field in CAPACITY_FIELDS} for path in ("sync", "gossip")}
 
 
+def duration_metrics(text: str) -> dict:
+    """Preserve exported duration summaries by bounded path and release reason."""
+    result = {}
+    for match in re.finditer(
+        r'^(sync|gossip)_missing_parent_(charge|deferred)_duration_seconds'
+        r'(_sum|_count)?(?:\{([^}]*)\})?\s+([-+0-9.eE]+)$', text, re.MULTILINE
+    ):
+        path, kind, suffix, labels, value = match.groups()
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', labels or ""))
+        reason = labels.get("reason", "all")
+        field = (suffix or "").lstrip("_") or labels.get("quantile", "value")
+        result.setdefault(path, {}).setdefault(kind, {}).setdefault(reason, {})[field] = float(value)
+    return result
+
+
+def counter_window(samples: list[dict], field: str) -> dict:
+    """Count work strictly between the first and last observed counter values."""
+    values = [s[field] for s in samples if s.get(field) is not None]
+    return {"baseline": values[0] if values else None,
+            "final": values[-1] if values else None,
+            "delta": values[-1] - values[0] if values else 0}
+
+
 def summarize_capacity(samples: list[dict], interval: float) -> dict:
     """Combine sampled utilization with event counters that capture brief saturation."""
     result = {}
@@ -119,8 +142,16 @@ def summarize_capacity(samples: list[dict], interval: float) -> dict:
             "peak": max((v.get("peak") or 0) for v in values),
             "minimum_headroom": min((v["headroom"] for v in values if v.get("headroom") is not None), default=None),
             "utilization_p50": quantile(.50), "utilization_p95": quantile(.95), "utilization_p99": quantile(.99),
-            "sampled_seconds_above_80_percent": sum(gap for gap, value in zip(gaps, values) if (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .8),
-            "sampled_seconds_above_90_percent": sum(gap for gap, value in zip(gaps, values) if (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .9),
+            "sampled_seconds_above_80_percent": sum(gap for gap, value in zip(gaps, values) if value.get("active") is not None and (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .8),
+            "sampled_seconds_above_90_percent": sum(gap for gap, value in zip(gaps, values) if value.get("active") is not None and (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .9),
+            "counter_baseline": {key: values[0].get(key) for key in CAPACITY_FIELDS if key.endswith("_count")},
+            "counter_delta": {key: values[-1][key] - values[0][key] if values[-1].get(key) is not None and values[0].get(key) is not None else None
+                              for key in CAPACITY_FIELDS if key.endswith("_count")},
+            "capacity_deferral_rate_per_second": (
+                (values[-1]["capacity_deferred_count"] - values[0]["capacity_deferred_count"])
+                / (observations[-1]["elapsed"] - observations[0]["elapsed"])
+                if len(observations) > 1 and observations[-1]["elapsed"] > observations[0]["elapsed"]
+                and values[-1].get("capacity_deferred_count") is not None and values[0].get("capacity_deferred_count") is not None else None),
             "events_since_process_start": {key: values[-1].get(key) for key in CAPACITY_FIELDS if key.endswith("_count")},
         }
     return result
@@ -173,6 +204,7 @@ def take_sample(args) -> dict:
         with gzip.open(Path(args.out) / "metrics-scrapes.jsonl.gz", "at") as archive:
             archive.write(json.dumps({"time": time.time(), "metrics": metrics}) + "\n")
         sample["missing_parent"] = capacity_metrics(metrics)
+        sample["missing_parent_durations"] = duration_metrics(metrics)
         sample["semantic_commits"] = sum(metric_value(metrics, f"{path}_semantic_committed_count") or 0
                                           for path in ("sync", "gossip"))
         sample["body_downloads"] = sum(metric_value(metrics, f"{path}_downloaded_block_count") or 0
@@ -523,6 +555,10 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--out", required=True, help="output directory")
     args = parser.parse_args(argv)
+    if args.interval <= 0 or args.duration_minutes <= 0:
+        parser.error("duration and sampling interval must be positive")
+    if args.required_semantic_blocks < 0 or args.required_observation_seconds < 0:
+        parser.error("required coverage cannot be negative")
     if args.expected_snapshot_height is not None and (
         not args.require_startup_height or args.expected_snapshot_height < 0
     ):
@@ -631,8 +667,12 @@ def main(argv=None) -> int:
         startup_height_error=startup_error,
     )
     summary["missing_parent"] = summarize_capacity(samples, args.interval)
-    summary["semantic_commits"] = max((s.get("semantic_commits", 0) for s in samples), default=0)
-    summary["body_downloads"] = max((s.get("body_downloads", 0) for s in samples), default=0)
+    summary["missing_parent_durations"] = next((s["missing_parent_durations"] for s in reversed(samples)
+                                                if s.get("missing_parent_durations")), {})
+    summary["work_counter_windows"] = {field: counter_window(samples, field)
+                                        for field in ("semantic_commits", "body_downloads")}
+    summary["semantic_commits"] = summary["work_counter_windows"]["semantic_commits"]["delta"]
+    summary["body_downloads"] = summary["work_counter_windows"]["body_downloads"]["delta"]
     if args.require_capacity:
         reasons = []
         if any(v["verdict"] != "ok" for v in summary["missing_parent"].values()):

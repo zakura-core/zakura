@@ -872,7 +872,7 @@ where
                 if block_height > max_checkpoint_height {
                     parent_attempt.admit(state, ParentDeferred {
                         hash, parent: block.header.previous_block_hash, height: block_height,
-                        source: None, parent_recovery: false,
+                        routing_source: None, parent_recovery: false,
                     }).await?;
                 }
 

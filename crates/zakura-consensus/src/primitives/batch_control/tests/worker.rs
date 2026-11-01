@@ -432,3 +432,74 @@ async fn overflowing_request_weight_still_flushes() {
         .expect("heavy item response should complete")
         .expect("heavy item should verify");
 }
+
+/// A partial batch flushes once no item has arrived for the idle bound, long before its
+/// latency bound.
+#[tokio::test]
+async fn idle_partial_batch_flushes_before_its_latency() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<BatchControl<()>, ()>();
+    // A batch this large and slow only flushes early through the idle bound.
+    let (mut service, worker) = Batch::pair_with_idle(
+        service,
+        100,
+        1,
+        Duration::from_secs(1000),
+        Duration::from_millis(10),
+    );
+    tokio::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let response = service.call(());
+
+    let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("item should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Item(())));
+    send_item.send_response(());
+
+    let (request, send_flush) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("the idle bound should flush the partial batch")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Flush));
+    send_flush.send_response(());
+
+    timeout(Duration::from_secs(5), response)
+        .await
+        .expect("item response should complete")
+        .expect("item should verify");
+}
+
+/// Without an idle bound, a partial batch waits for its latency bound.
+#[tokio::test]
+async fn partial_batch_without_idle_bound_waits_for_its_latency() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<BatchControl<()>, ()>();
+    let (mut service, worker) = Batch::pair(service, 100, 1, Duration::from_secs(1000));
+    tokio::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let _response = service.call(());
+
+    let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("item should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Item(())));
+    send_item.send_response(());
+
+    assert!(
+        timeout(Duration::from_millis(200), handle.next_request())
+            .await
+            .is_err(),
+        "the batch must not flush before its latency bound"
+    );
+}

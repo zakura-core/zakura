@@ -23,6 +23,10 @@ const MAX_BATCH_SIZE: usize = 64;
 /// The maximum latency bound for any of the batch verifiers.
 const MAX_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long a partial batch waits for another item before it flushes, for any of the batch
+/// verifiers. [`MAX_BATCH_LATENCY`] still bounds the whole wait.
+const MAX_BATCH_IDLE: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Forgets every shielded bundle verification this process has cached.
 ///
 /// # Benchmarks only

@@ -307,11 +307,12 @@ pub static VERIFIER: LazyLock<VerifierService> = LazyLock::new(|| {
 /// Builds the uncached batching-and-fallback stack.
 fn batch_fallback_verifier() -> BatchFallbackService {
     Fallback::new(
-        Batch::new(
+        Batch::new_with_idle(
             Verifier::default(),
             super::MAX_BATCH_SIZE,
             None,
             super::MAX_BATCH_LATENCY,
+            super::MAX_BATCH_IDLE,
         ),
         tower::service_fn(verify_single as fn(Item) -> _),
     )

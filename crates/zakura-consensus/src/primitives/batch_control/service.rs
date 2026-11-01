@@ -127,8 +127,41 @@ where
         T::Error: Send + Sync,
         Request: Send + 'static,
     {
-        let (mut batch, worker) =
-            Self::pair(service, max_items_weight_in_batch, max_batches, max_latency);
+        Self::new_with_idle(
+            service,
+            max_items_weight_in_batch,
+            max_batches,
+            max_latency,
+            max_latency,
+        )
+    }
+
+    /// Like [`Batch::new`], but a pending batch also flushes once no item has arrived for
+    /// `max_idle`, if that comes before `max_latency`.
+    ///
+    /// A short idle bound flushes a partial batch soon after its callers stop adding to it,
+    /// instead of holding it for the full `max_latency`.
+    pub fn new_with_idle(
+        service: T,
+        max_items_weight_in_batch: usize,
+        max_batches: impl Into<Option<usize>>,
+        max_latency: std::time::Duration,
+        max_idle: std::time::Duration,
+    ) -> Self
+    where
+        T: Send + 'static,
+        T::Future: Send,
+        T::Response: Send,
+        T::Error: Send + Sync,
+        Request: Send + 'static,
+    {
+        let (mut batch, worker) = Self::pair_with_idle(
+            service,
+            max_items_weight_in_batch,
+            max_batches,
+            max_latency,
+            max_idle,
+        );
 
         let span = info_span!("batch worker", kind = std::any::type_name::<T>());
 
@@ -149,6 +182,29 @@ where
         max_items_weight_in_batch: usize,
         max_batches: impl Into<Option<usize>>,
         max_latency: std::time::Duration,
+    ) -> (Self, Worker<T, Request>)
+    where
+        T: Send + 'static,
+        T::Error: Send + Sync,
+        Request: Send + 'static,
+    {
+        Self::pair_with_idle(
+            service,
+            max_items_weight_in_batch,
+            max_batches,
+            max_latency,
+            max_latency,
+        )
+    }
+
+    /// Like [`Batch::pair`], but a pending batch also flushes once no item has arrived for
+    /// `max_idle`, if that comes before `max_latency`.
+    pub fn pair_with_idle(
+        service: T,
+        max_items_weight_in_batch: usize,
+        max_batches: impl Into<Option<usize>>,
+        max_latency: std::time::Duration,
+        max_idle: std::time::Duration,
     ) -> (Self, Worker<T, Request>)
     where
         T: Send + 'static,
@@ -189,6 +245,7 @@ where
             max_items_weight_in_batch,
             max_batches,
             max_latency,
+            max_idle,
             semaphore.clone(),
         );
 

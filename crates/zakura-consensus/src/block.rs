@@ -728,14 +728,11 @@ where
             )?;
 
             // Finally, submit the block for contextual verification.
-            let new_outputs = Arc::into_inner(known_utxos)
-                .expect("all verification tasks using known_utxos are complete");
-
             let prepared_block = zs::SemanticallyVerifiedBlock {
                 block,
                 hash,
                 height,
-                new_outputs,
+                new_outputs: known_utxos,
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
                 auth_data_root: None,

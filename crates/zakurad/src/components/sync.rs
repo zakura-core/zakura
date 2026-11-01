@@ -114,6 +114,33 @@ const BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT: usize = 3;
 /// unconfirmed, including state readiness. The state's own limit only covers the request.
 const UNCONFIRMED_BINDING_PARENT_WAIT: Duration = zs::constants::AWAIT_BLOCK_INFO_TIMEOUT;
 
+/// Returns a [`ParentWait`] that asks `state` to wait for a block to commit, bounded by
+/// [`UNCONFIRMED_BINDING_PARENT_WAIT`].
+fn state_parent_wait<ZS>(state: ZS) -> ParentWait
+where
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ZS::Future: Send + 'static,
+{
+    ParentWait(Arc::new(move |parent| {
+        let state = state.clone();
+        // Boxing lets rustc prove this future is `Send` for spawned callers.
+        futures::FutureExt::boxed(async move {
+            matches!(
+                timeout(
+                    UNCONFIRMED_BINDING_PARENT_WAIT,
+                    state.oneshot(zs::Request::AwaitBlockInfo(parent)),
+                )
+                .await,
+                Ok(Ok(zs::Response::BlockInfo(Some(_))))
+            )
+        })
+    }))
+}
+
 /// Minimum UTXO lookup timeouts without a verified block before the syncer restarts.
 const MIN_UTXO_RACE_DROPS_BEFORE_RESTART: usize = 4;
 
@@ -1072,21 +1099,7 @@ where
             expose_peer_addresses,
         );
 
-        let parent_wait_state = state.clone();
-        let parent_wait = ParentWait(Arc::new(move |parent| {
-            let state = parent_wait_state.clone();
-            // Boxing lets rustc prove this future is `Send` for spawned callers.
-            futures::FutureExt::boxed(async move {
-                matches!(
-                    timeout(
-                        UNCONFIRMED_BINDING_PARENT_WAIT,
-                        state.oneshot(zs::Request::AwaitBlockInfo(parent)),
-                    )
-                    .await,
-                    Ok(Ok(zs::Response::BlockInfo(Some(_))))
-                )
-            })
-        }));
+        let parent_wait = state_parent_wait(state.clone());
 
         let downloads = Box::pin(Downloads::new(
             block_network,

@@ -3966,6 +3966,95 @@ async fn unconfirmed_binding_reverifies_after_the_parent_commits() {
     }
 }
 
+/// Cancelling the pipeline ends a download task that is waiting for the parent of an
+/// unconfirmed binding.
+#[tokio::test]
+async fn cancel_all_ends_a_parent_wait() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let hash = block.hash();
+    let parent = block.header.previous_block_hash;
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_hash(parent);
+
+    // The wait holds `guard` until the task drops it, and reports when it starts.
+    let (guard, mut guard_dropped) = tokio::sync::oneshot::channel::<()>();
+    let (started, wait_started) = tokio::sync::oneshot::channel::<()>();
+    let handles = std::sync::Mutex::new(Some((guard, started)));
+    let parent_wait = ParentWait(Arc::new(move |_| {
+        let (guard, started) = handles
+            .lock()
+            .expect("the lock is never poisoned")
+            .take()
+            .expect("the task waits for its parent once");
+        let _ = started.send(());
+        async move {
+            let _guard = guard;
+            std::future::pending::<bool>().await
+        }
+        .boxed()
+    }));
+    let mut downloads = setup_downloads_with_parent_wait(
+        peer_set.clone(),
+        verifier.clone(),
+        chain_tip,
+        parent_wait,
+    );
+    downloads
+        .download_and_verify(hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+    verifier
+        .expect_request(zakura_consensus::Request::Commit(block))
+        .await
+        .respond(Err(unconfirmed_verifier_error(parent)));
+    wait_started.await.expect("the task waits for the parent");
+
+    downloads.cancel_all();
+    tokio::time::timeout(Duration::from_secs(10), &mut guard_dropped)
+        .await
+        .expect("the waiting task ends after cancellation")
+        .expect_err("the task drops the wait instead of finishing it");
+    assert_eq!(downloads.in_flight(), 0);
+    verifier.expect_no_requests().await;
+}
+
+/// The parent wait gives up at its own limit when the state never answers, so a stalled state
+/// can't hold a download task past that limit.
+#[tokio::test(start_paused = true)]
+async fn parent_wait_times_out_when_the_state_never_answers() {
+    let mut state = MockService::build().for_unit_tests::<zs::Request, zs::Response, _>();
+    let parent = block::Hash([0xAA; 32]);
+    let wait = sync::state_parent_wait(state.clone());
+
+    let start = tokio::time::Instant::now();
+    let ((committed, waited), ()) =
+        tokio::join!(async { ((wait.0)(parent).await, start.elapsed()) }, async {
+            // Hold the request unanswered well past the limit.
+            let _unanswered = state
+                .expect_request(zs::Request::AwaitBlockInfo(parent))
+                .await;
+            tokio::time::sleep(sync::UNCONFIRMED_BINDING_PARENT_WAIT * 2).await;
+        });
+    assert!(
+        !committed,
+        "an unanswered wait counts as the parent not committing"
+    );
+    assert_eq!(waited, sync::UNCONFIRMED_BINDING_PARENT_WAIT);
+}
+
 /// A block whose binding is still unconfirmed after the download task waited is dropped without
 /// a retry, a restart, or a score for its supplier.
 #[tokio::test]

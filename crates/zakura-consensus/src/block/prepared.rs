@@ -67,6 +67,8 @@ pub(super) enum InsertOutcome {
 
 struct Entry {
     id: CandidateId,
+    /// The digest of the candidate's transactions, for blocks that share them.
+    body: BodyDigest,
     prepared: Arc<SemanticallyVerifiedBlock>,
     size: usize,
     expires_at: Instant,
@@ -119,6 +121,28 @@ impl PreparedCandidateCache {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns the body digest of a cached candidate whose transactions are `block`'s own
+    /// transaction allocations.
+    ///
+    /// A solved block rebuilt from this node's template shares the template's parsed
+    /// transactions. Shared allocations hold the same immutable transactions, so they have the
+    /// same digest, and the solved block need not serialize and hash its body again.
+    pub(super) fn shared_body_digest(&self, block: &Block) -> Option<BodyDigest> {
+        let shares_transactions = |entry: &&Entry| {
+            let cached = &entry.prepared.block.transactions;
+            cached.len() == block.transactions.len()
+                && cached
+                    .iter()
+                    .zip(&block.transactions)
+                    .all(|(cached, submitted)| Arc::ptr_eq(cached, submitted))
+        };
+        self.lock()
+            .iter()
+            .flat_map(|partition| &partition.entries)
+            .find(shares_transactions)
+            .map(|entry| entry.body)
     }
 
     /// Returns the prepared verification for `block`'s content, if some source prepared it.
@@ -177,12 +201,16 @@ impl PreparedCandidateCache {
     }
 
     /// Stores `prepared` under `id` in `source`'s partition.
+    ///
+    /// `body` is the digest of `prepared`'s transactions.
     pub(super) fn insert(
         &self,
-        id: CandidateId,
+        body: BodyDigest,
         source: PreparedCandidateSource,
         prepared: SemanticallyVerifiedBlock,
+        network: &Network,
     ) -> InsertOutcome {
+        let id = CandidateId::with_body(&prepared.block.header, &body, network);
         let size = retained_size(&prepared);
         let mut cache = self.lock();
         let partition = &mut cache[source.index()];
@@ -205,6 +233,7 @@ impl PreparedCandidateCache {
         }
         partition.push(Entry {
             id,
+            body,
             prepared: Arc::new(prepared),
             size,
             expires_at: Instant::now() + ENTRY_TTL,
@@ -336,9 +365,10 @@ mod tests {
         network: &Network,
     ) -> InsertOutcome {
         cache.insert(
-            CandidateId::of(block, network),
+            BodyDigest::of(block),
             source,
             SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
+            network,
         )
     }
 
@@ -572,5 +602,38 @@ mod tests {
             assert!(partition.entries.is_empty());
             assert_eq!(partition.bytes, 0);
         }
+    }
+
+    #[test]
+    fn blocks_sharing_cached_transactions_share_their_body_digest() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let candidate = test_block();
+        insert(
+            &cache,
+            &candidate,
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+        let cached = cache.lock()[PreparedCandidateSource::ServerTemplate.index()].entries[0]
+            .prepared
+            .block
+            .clone();
+
+        let mut solved = Block::clone(&cached);
+        Arc::make_mut(&mut solved.header).nonce = [7; 32].into();
+        assert_eq!(
+            cache.shared_body_digest(&solved),
+            Some(BodyDigest::of(&solved)),
+            "a block built from the cached transactions gets their digest"
+        );
+
+        let mut copied = solved.clone();
+        copied.transactions[0] = Arc::new(copied.transactions[0].as_ref().clone());
+        assert_eq!(
+            cache.shared_body_digest(&copied),
+            None,
+            "equal but separately parsed transactions are hashed again"
+        );
     }
 }

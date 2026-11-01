@@ -73,6 +73,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "block-work-funding" => value(zakura_sim::harness::block_work::Scenario {
             input: include_bytes!("fixtures/block-work-funding.bin").to_vec(),
         }),
+        "block-decoded-retention" => value(zakura_sim::harness::block_work::Scenario {
+            input: include_bytes!("fixtures/block-decoded-retention.bin").to_vec(),
+        }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
         "block-sync-handoff" => value(BlockScenario::default()),
         "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),

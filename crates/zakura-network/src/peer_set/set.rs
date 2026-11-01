@@ -983,32 +983,35 @@ where
         }
     }
 
-    /// Performs P2C on the ready block `advertisers` whose connections can write a request now.
+    /// Performs P2C on the ready block `advertisers` that are preferred block sources.
     ///
     /// A ready client only has space in its request channel. If its connection is awaiting a
     /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
     /// waits for that response. Load does not capture this: an advertiser with a lower round-trip
     /// estimate can be less loaded even with a request outstanding.
     ///
-    /// Falls back to P2C over all `advertisers` if none of them can write a request now. In that
-    /// case the block request still waits behind the selected connection's current response.
+    /// Falls back to P2C over all `advertisers` if none of them is preferred. If the selected
+    /// connection is busy, the block request still waits behind its current response.
     fn select_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
-        let free_advertisers: HashSet<D::Key> = advertisers
+        let preferred_advertisers: HashSet<D::Key> = advertisers
             .iter()
             .filter(|key| {
                 self.ready_services
                     .get(*key)
-                    .is_some_and(|svc| svc.can_send_request_now())
+                    .is_some_and(|svc| svc.is_preferred_block_source())
             })
             .copied()
             .collect();
 
-        if let Some(peer) = self.select_p2c_peer_from_list(&free_advertisers) {
+        if let Some(peer) = self.select_p2c_peer_from_list(&preferred_advertisers) {
             return Some(peer);
         }
 
         let peer = self.select_p2c_peer_from_list(advertisers);
-        if peer.is_some() {
+        let selected_busy_peer = peer
+            .and_then(|key| self.ready_services.get(&key))
+            .is_some_and(|svc| !svc.can_send_request_now());
+        if selected_busy_peer {
             metrics::counter!("pool.route_inv.advertiser.awaiting_response.count").increment(1);
         }
         peer

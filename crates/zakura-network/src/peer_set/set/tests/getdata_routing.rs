@@ -343,6 +343,98 @@ async fn block_getdata_routes_to_idle_alternate_advertiser() {
     );
 }
 
+/// A client marks an idle connection's slot busy when it sends a request.
+///
+/// Once the connection takes the request, the client is ready again, and the peer set can read the
+/// slot before the connection task runs its next instruction.
+#[tokio::test(start_paused = true)]
+async fn sending_a_request_marks_an_idle_connection_busy() {
+    let _init_guard = zakura_test::init();
+
+    let mut peer = TestPeer::spawn(1);
+    assert_eq!(peer.written_now().await, None);
+
+    let client = peer.client.as_mut().expect("peer is not in a peer set");
+    assert!(client.can_send_request_now());
+
+    let _response = client
+        .ready()
+        .await
+        .expect("test connection is ready")
+        .call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()));
+
+    // This test task has not yielded, so the connection task has not run.
+    assert!(!client.can_send_request_now());
+}
+
+/// A peer that left its last block request unanswered does not win over a busy advertiser.
+///
+/// The peer's connection is free again after the request times out. Load balancing still applies,
+/// and the timeout gave the peer a high load, so the block request goes to the busy advertiser.
+#[tokio::test(start_paused = true)]
+async fn withholding_advertiser_is_not_preferred_over_busy_advertiser() {
+    let _init_guard = zakura_test::init();
+
+    let mut busy = TestPeer::spawn(1);
+    let mut withholder = TestPeer::spawn(2);
+    let tx = test_transaction();
+
+    // Let the default RTT estimates decay, so the timeout decides the load difference.
+    tokio::time::advance(Duration::from_secs(1000)).await;
+
+    let (withheld_response, withheld_getdata) = withholder
+        .send_direct(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()))
+        .await;
+    assert_eq!(withheld_getdata, Message::GetData(vec![BLOCK_HASH.into()]));
+    tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+    assert!(withheld_response.await.is_err());
+
+    let (tx_response, _tx_getdata) = busy
+        .send_direct(Request::TransactionsById(iter::once(tx.id()).collect()))
+        .await;
+
+    let inventory = InventoryHash::Block(BLOCK_HASH);
+    let (minimum_peer_version, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (mut peer_set, mut guard) = PeerSetBuilder::new()
+        .with_discover(discover(vec![busy.discovered(), withholder.discovered()]))
+        .with_minimum_peer_version(minimum_peer_version)
+        .max_conns_per_ip(2)
+        .build();
+    for addr in [busy.addr, withholder.addr] {
+        guard
+            .inventory_sender()
+            .as_mut()
+            .expect("guard has an inventory sender")
+            .send(InventoryStatus::new_available(inventory, addr))
+            .expect("peer set receives inventory");
+        peer_set.ready().await.expect("peer set is ready");
+    }
+    assert!(peer_set.ready_services[&withholder.addr].can_send_request_now());
+    assert!(!peer_set.ready_services[&busy.addr].can_send_request_now());
+
+    let _block_response = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()));
+
+    assert_eq!(
+        withholder.written_now().await,
+        None,
+        "the withholding advertiser does not receive the retry",
+    );
+
+    busy.peer_inbound
+        .send(Ok(Message::Tx(tx.clone())))
+        .await
+        .expect("connection is open");
+    assert!(matches!(tx_response.await, Ok(Response::Transactions(_))));
+    assert_eq!(
+        busy.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+    );
+}
+
 /// Transaction requests keep today's load-based routing, so they still use a busy advertiser.
 ///
 /// Only block requests avoid connections that are awaiting a response, so transaction downloads

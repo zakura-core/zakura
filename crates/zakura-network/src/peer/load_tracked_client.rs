@@ -94,8 +94,20 @@ impl LoadTrackedClient {
     /// Only meaningful after `poll_ready` has returned ready, which means this client has no request
     /// of its own still queued. Requests that the heartbeat or block gossip tasks have queued, but
     /// the connection has not taken yet, are not visible here.
+    ///
+    /// A connection that is between two iterations of its event loop when this client sends a
+    /// request can briefly report free after it takes that request.
     pub(crate) fn can_send_request_now(&self) -> bool {
         self.request_slot.is_free()
+    }
+
+    /// Returns true if block routing should prefer this advertiser over its busy advertisers.
+    ///
+    /// A connection can write a request now, and the peer did not leave its last block request
+    /// unanswered. Otherwise routing only offers this advertiser through ordinary load balancing,
+    /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
+    pub(crate) fn is_preferred_block_source(&self) -> bool {
+        self.can_send_request_now() && !self.request_slot.block_request_unanswered()
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

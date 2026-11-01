@@ -90,6 +90,10 @@ pub struct Client {
 pub(crate) struct RequestSlot {
     /// True while the connection is handling a client request, or after either half shuts down.
     busy: Arc<AtomicBool>,
+
+    /// True if the connection's last block request ended unanswered, until a peer delivers a
+    /// requested block on this connection.
+    block_request_unanswered: Arc<AtomicBool>,
 }
 
 impl RequestSlot {
@@ -101,6 +105,17 @@ impl RequestSlot {
     /// Returns true if the connection is waiting for its next client request.
     pub(crate) fn is_free(&self) -> bool {
         !self.busy.load(Ordering::Acquire)
+    }
+
+    /// Records whether the connection's last block request ended unanswered.
+    pub(crate) fn set_block_request_unanswered(&self, unanswered: bool) {
+        self.block_request_unanswered
+            .store(unanswered, Ordering::Release);
+    }
+
+    /// Returns true if the connection's last block request ended unanswered.
+    pub(crate) fn block_request_unanswered(&self) -> bool {
+        self.block_request_unanswered.load(Ordering::Acquire)
     }
 }
 
@@ -680,6 +695,10 @@ impl Service<Request> for Client {
         // when it's handling messages in the context of processing this
         // request.
         let span = tracing::Span::current();
+
+        // Taking the request makes this client ready again, possibly before the connection task
+        // marks itself busy. So an idle connection's slot must be busy before the request is sent.
+        self.request_slot.set_busy(true);
 
         match self.server_tx.try_send(ClientRequest {
             request,

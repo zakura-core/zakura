@@ -1619,6 +1619,81 @@ async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
     let _ = connection_task.await;
 }
 
+/// A block request that spends half its timeout unanswered is recorded on the request slot, and a
+/// delivered block clears the record. Early cancellations and other requests leave it unset.
+#[tokio::test(start_paused = true)]
+async fn request_slot_records_unanswered_block_requests() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (tx, block) = response_vectors();
+    let txid = tx.id();
+    let half_timeout = crate::constants::REQUEST_TIMEOUT / 2;
+
+    // A transaction request that times out says nothing about blocks.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+    assert!(response.await.expect("connection responds").is_err());
+    settle().await;
+    assert!(!slot.block_request_unanswered());
+
+    // An early cancellation says nothing about the peer.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(half_timeout - Duration::from_secs(1)).await;
+    drop(response);
+    settle().await;
+    assert!(slot.is_free());
+    assert!(!slot.block_request_unanswered());
+
+    // A downloader's own timeout usually cancels just before the connection's timer fires.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(half_timeout).await;
+    drop(response);
+    settle().await;
+    assert!(slot.is_free());
+    assert!(slot.block_request_unanswered());
+
+    // A delivered block clears the record.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    peer_tx
+        .send(Ok(Message::Block(block.clone())))
+        .await
+        .expect("connection is open");
+    response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    settle().await;
+    assert!(!slot.block_request_unanswered());
+
+    // The connection's own timeout also records the request.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+    assert!(response.await.expect("connection responds").is_err());
+    settle().await;
+    assert!(slot.block_request_unanswered());
+
+    connection_task.abort();
+}
+
 /// Returns a block advert for `hash`, and the receiver for its write result.
 fn block_advert(
     hash: block::Hash,

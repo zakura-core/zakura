@@ -103,7 +103,7 @@ impl QueuedBlocks {
             .map(|(hash, since)| (*since, *hash))
             .collect();
         // Hashes break ties deterministically when cancellations are observed together.
-        abandoned.sort_unstable();
+        abandoned.sort_unstable_by_key(|(since, hash)| (*since, hash.0));
         let mut removed = Vec::new();
         for (since, hash) in abandoned {
             if now.duration_since(since) < ABANDONED_BLOCK_GRACE

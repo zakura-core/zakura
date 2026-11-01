@@ -45,10 +45,48 @@ const LAST_BLOCK_HEIGHT: u32 = 10;
 /// A dropped buffered response must propagate cancellation through the real service future.
 #[tokio::test(flavor = "multi_thread")]
 async fn abandoned_buffered_commits_reclaim_capacity_across_cancelled_waves() -> Result<()> {
+    // KnownBlock intentionally excludes the orphan queue. Observe that queue at the service
+    // boundary without changing the real request, readiness, or response future.
+    struct ObservedState {
+        state: StateService,
+        queued: Arc<std::sync::Mutex<std::collections::HashMap<block::Hash, bool>>>,
+    }
+    impl Service<Request> for ObservedState {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = <StateService as Service<Request>>::Future;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), BoxError>> {
+            self.state.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            if let Request::KnownBlock(hash) = &request {
+                self.queued.lock().unwrap().insert(
+                    *hash,
+                    self.state
+                        .non_finalized_state_queued_blocks
+                        .get_mut(hash)
+                        .is_some(),
+                );
+            }
+            self.state.call(request)
+        }
+    }
     let _init_guard = zakura_test::init();
     let (state, _, _, _) =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0).await?;
-    let mut service = Buffer::new(BoxService::new(state), 1);
+    let queued = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut service = Buffer::new(
+        ObservedState {
+            state,
+            queued: queued.clone(),
+        },
+        1,
+    );
     let original: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
     let mut responses = Vec::new();
@@ -70,36 +108,40 @@ async fn abandoned_buffered_commits_reclaim_capacity_across_cancelled_waves() ->
             responses.push(
                 service
                     .ready()
-                    .await?
+                    .await
+                    .map_err(|error| eyre::eyre!(error))?
                     .call(Request::CommitSemanticallyVerifiedBlock(prepared)),
             );
         }
         // This query is behind the commits in the buffer, so every response now owns a queued request.
         let last = *hashes.last().unwrap();
-        assert!(matches!(
-            timeout(
-                Duration::from_secs(10),
-                service.clone().oneshot(Request::KnownBlock(last))
-            )
-            .await??,
-            Response::KnownBlock(Some(crate::KnownBlock::Queue))
-        ));
+        timeout(
+            Duration::from_secs(10),
+            service.clone().oneshot(Request::KnownBlock(last)),
+        )
+        .await?
+        .map_err(|error| eyre::eyre!(error))?;
+        assert!(queued.lock().unwrap()[&last]);
         if let Some(hash) = previous_hash {
+            service
+                .clone()
+                .oneshot(Request::KnownBlock(hash))
+                .await
+                .map_err(|error| eyre::eyre!(error))?;
             assert!(
-                matches!(
-                    service.clone().oneshot(Request::KnownBlock(hash)).await?,
-                    Response::KnownBlock(None)
-                ),
+                !queued.lock().unwrap()[&hash],
                 "later admissions reclaim cancelled entries even before grace expires"
             );
         }
         previous_hash = Some(last);
         responses.clear();
         // No new block is needed to observe cancellation during normal service activity.
-        assert!(matches!(
-            service.clone().oneshot(Request::KnownBlock(last)).await?,
-            Response::KnownBlock(Some(crate::KnownBlock::Queue))
-        ));
+        service
+            .clone()
+            .oneshot(Request::KnownBlock(last))
+            .await
+            .map_err(|error| eyre::eyre!(error))?;
+        assert!(queued.lock().unwrap()[&last]);
     }
     Ok(())
 }
@@ -133,7 +175,9 @@ async fn first_admission_after_idle_reclaims_expired_entries_and_preserves_its_p
         .get_mut(&parent.hash)
         .is_none());
     tokio::time::advance(Duration::from_secs(30)).await;
-    let unrelated = original.make_fake_child().prepare();
+    let mut unrelated = (*original).clone();
+    Arc::make_mut(&mut unrelated.header).previous_block_hash = block::Hash([0x77; 32]);
+    let unrelated = Arc::new(unrelated).prepare();
     let _response = state.queue_and_commit_to_non_finalized_state(unrelated, None);
     assert!(
         state
@@ -890,6 +934,73 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
         "the released descendant leaves the queue",
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pressure_evicted_intermediate_can_be_redelivered_and_committed() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let mut chain: Vec<Arc<Block>> = Vec::new();
+    for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=3) {
+        let mut block: Block = bytes.zcash_deserialize_into()?;
+        block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+            &block.transactions[0],
+        ))];
+        if let Some(parent) = chain.last() {
+            Arc::make_mut(&mut block.header).previous_block_hash = parent.hash();
+        }
+        chain.push(Arc::new(block));
+    }
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0).await?;
+    state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(chain[0].clone()))
+        .await??;
+    drop(state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None));
+    state.prune_abandoned_queued_blocks(None, false);
+    drop(state.queue_and_commit_to_non_finalized_state(chain[3].clone().prepare(), None));
+
+    let mut live = Vec::new();
+    for index in 2..super::queued_blocks::MAX_QUEUED_BLOCKS {
+        let mut orphan = (*chain[2]).clone();
+        let header = Arc::make_mut(&mut orphan.header);
+        header.previous_block_hash = block::Hash([0x55; 32]);
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+        header.nonce = bytes.into();
+        live.push(state.queue_and_commit_to_non_finalized_state(Arc::new(orphan).prepare(), None));
+    }
+    assert!(state.non_finalized_state_queued_blocks.is_full());
+    let mut unrelated = (*chain[2]).clone();
+    Arc::make_mut(&mut unrelated.header).previous_block_hash = block::Hash([0x66; 32]);
+    live.push(state.queue_and_commit_to_non_finalized_state(Arc::new(unrelated).prepare(), None));
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .get_mut(&chain[2].hash())
+        .is_none());
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(chain[2].hash()));
+
+    // Redelivery makes the descendant live again before restoring the missing intermediate.
+    let descendant =
+        state.queue_and_commit_to_non_finalized_state(chain[3].clone().prepare(), None);
+    let parent = state.queue_and_commit_to_non_finalized_state(chain[1].clone().prepare(), None);
+    assert_eq!(
+        timeout(Duration::from_secs(10), parent).await???,
+        chain[1].hash()
+    );
+    let intermediate =
+        state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None);
+    for (response, expected) in [
+        (intermediate, chain[2].hash()),
+        (descendant, chain[3].hash()),
+    ] {
+        assert_eq!(
+            timeout(Duration::from_secs(10), response).await???,
+            expected
+        );
+    }
     Ok(())
 }
 

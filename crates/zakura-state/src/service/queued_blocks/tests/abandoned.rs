@@ -36,15 +36,28 @@ fn enqueue(queue: &mut QueuedBlocks, block: SemanticallyVerifiedBlock) -> Receiv
 fn assert_consistent(queue: &QueuedBlocks) {
     assert_eq!(
         queue.blocks.len(),
-        queue.by_parent.values().map(|hashes| hashes.len()).sum()
+        queue
+            .by_parent
+            .values()
+            .map(|hashes| hashes.len())
+            .sum::<usize>()
     );
     assert_eq!(
         queue.blocks.len(),
-        queue.by_height.values().map(|hashes| hashes.len()).sum()
+        queue
+            .by_height
+            .values()
+            .map(|hashes| hashes.len())
+            .sum::<usize>()
     );
     for (hash, queued) in &queue.blocks {
         assert!(queue.by_parent[&queued.0.block.header.previous_block_hash].contains(hash));
         assert!(queue.by_height[&queued.0.height].contains(hash));
+        assert!(queued
+            .0
+            .new_outputs
+            .keys()
+            .all(|outpoint| queue.utxo(outpoint).is_some()));
     }
     for (outpoint, shared) in &queue.known_utxos {
         assert_eq!(

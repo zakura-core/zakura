@@ -1237,7 +1237,7 @@ async fn sync_checkpoints_local() -> Result<()> {
         &checkpoint_stop_regex,
         LARGE_CHECKPOINT_TIMEOUT,
         None,
-        MempoolBehavior::ShouldNotActivate,
+        MempoolBehavior::MayActivate,
         true,
         consumer_config.clone(),
     )?;

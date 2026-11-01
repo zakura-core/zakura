@@ -38,6 +38,9 @@ independently.
   tip's block time is more than 6 hours old. The threshold is now a fixed
   duration rather than a block count, so it no longer shrinks when block
   spacing changes ([#1911](https://github.com/zakura-core/zakura/pull/1911)).
+- Require a minimum claimed proof-of-work difficulty for recent Mainnet block
+  downloads as a defense-in-depth admission policy
+  ([#1915](https://github.com/zakura-core/zakura/pull/1915)).
 
 ### Fixed
 

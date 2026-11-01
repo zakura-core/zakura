@@ -1473,3 +1473,82 @@ fn queued_pages_never_exceed_the_unspent_credit() {
     }
     assert!(admitting.check(message_type::PAGE, 1).is_err());
 }
+
+/// The ledger returns what an `Open` found and leaves reporting to its owner:
+/// the margin's admission is a value it counts and hands back.
+#[test]
+fn the_ledger_returns_an_admission_above_the_limit_as_a_fact() {
+    let row = limits(1);
+    let mut slots = PublicationSlots::new(&row);
+    let mut ledger: PublicationLedger<u8, u32> = PublicationLedger::new(row);
+
+    let first = ledger.open(1, 0, LIMIT, 0, slots.offer()).unwrap();
+    assert_eq!(
+        first,
+        PublicationOpened {
+            held: 0,
+            over_limit: false
+        }
+    );
+    assert_eq!(ledger.over_limit_count(), 0);
+
+    let second = ledger.open(2, 0, LIMIT, 0, slots.offer()).unwrap();
+    assert_eq!(
+        second,
+        PublicationOpened {
+            held: 1,
+            over_limit: true
+        }
+    );
+    assert_eq!(ledger.over_limit_count(), 1);
+}
+
+/// A refused `Open` frees its offered slot, and a slot is held from `Open`
+/// until its terminal permit drops, even when a new subscription reuses the
+/// key while the old terminal outcome is still being written.
+#[test]
+fn a_slot_stays_with_its_terminal_when_the_key_returns() {
+    let row = limits(1);
+    let mut slots = PublicationSlots::new(&row);
+    let mut ledger: PublicationLedger<u8, u32> = PublicationLedger::new(row);
+
+    let offer = slots.offer();
+    assert_eq!(
+        slots.held(),
+        1,
+        "the owner reserves before the ledger decides"
+    );
+    assert_eq!(
+        ledger.open(1, 1, LIMIT, 0, offer),
+        Err(SubscriptionFault::Sequence {
+            expected: 0,
+            got: 1
+        })
+    );
+    slots.refused(offer);
+    assert_eq!(slots.held(), 0, "a refused Open holds nothing");
+
+    ledger.open(1, 0, LIMIT, 0, slots.offer()).unwrap();
+    let first = ledger.end(&1).expect("subscription 1 is live");
+    let first = slots.terminal(first).expect("the owner holds the slot");
+    assert_eq!(slots.held(), 1, "the terminal permit holds the slot");
+
+    // With one live subscription allowed, the next `Open` clears the tombstone,
+    // so key 1 can return while its old terminal outcome is still being written.
+    ledger.open(2, 0, LIMIT, 0, slots.offer()).unwrap();
+    let second = ledger.end(&2).expect("subscription 2 is live");
+    drop(slots.terminal(second).expect("the owner holds the slot"));
+    ledger.open(1, 0, LIMIT, 0, slots.offer()).unwrap();
+    assert_eq!(slots.held(), 2, "the old terminal and the new subscription");
+
+    drop(first);
+    assert_eq!(slots.held(), 1, "the old terminal frees only its own slot");
+    let live = ledger.end(&1).expect("the new subscription 1 is live");
+    let live_permit = slots.terminal(live).expect("the owner holds the slot");
+    assert!(
+        slots.terminal(live).is_none(),
+        "a slot moves to one terminal"
+    );
+    drop(live_permit);
+    assert_eq!(slots.held(), 0);
+}

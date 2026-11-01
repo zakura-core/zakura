@@ -548,8 +548,10 @@ fn resume_task_panic<T>(
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use header_sync::{
-    replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
-    HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
+    replay_header_publisher_bytes, replay_header_reactor_bytes, trace_header_publisher_bytes,
+    trace_header_reactor_bytes, HeaderMachineFailure, HeaderMachinePhase, HeaderPublisherHistory,
+    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
+    HeaderPublisherView, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
     HeaderReactorSessionView, HeaderReactorStep, HeaderReactorView,
 };
 #[cfg(test)]

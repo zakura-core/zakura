@@ -122,3 +122,10 @@ fn replay<M: WireMessage<Error = WireError>>(frame: &Frame) -> bool {
     );
     true
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use publisher::{
+    replay_header_publisher_bytes, trace_header_publisher_bytes, HeaderPublisherHistory,
+    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
+    HeaderPublisherView,
+};

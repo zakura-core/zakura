@@ -67,6 +67,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-reactor-policy" => value(zakura_sim::harness::header_work::Scenario {
             input: include_bytes!("fixtures/header-reactor-policy.bin").to_vec(),
         }),
+        "header-publisher-policy" => value(zakura_sim::harness::header_work::Scenario {
+            input: include_bytes!("fixtures/header-publisher-policy.bin").to_vec(),
+        }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
         "block-sync-handoff" => value(BlockScenario::default()),
         "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),

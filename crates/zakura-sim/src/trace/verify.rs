@@ -206,15 +206,21 @@ mod machine_tests {
             assert_eq!(decoded, Record::Step(record.clone()));
             assert_eq!(step_difference(&record, &record), None);
             let mut changed = record.clone();
-            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            let Some(MachineStep::HeaderReactor(work)) = changed.machine.as_deref_mut() else {
+                panic!("the record holds a reactor step");
+            };
             work.actual.revision += 1;
             assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            let Some(MachineStep::HeaderReactor(work)) = changed.machine.as_deref_mut() else {
+                panic!("the record holds a reactor step");
+            };
             work.input[0] ^= 1;
             assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            let Some(MachineStep::HeaderReactor(work)) = changed.machine.as_deref_mut() else {
+                panic!("the record holds a reactor step");
+            };
             work.failure = Some(MachineFailure {
                 property_failure: true,
                 phase: FailurePhase::Invariant,

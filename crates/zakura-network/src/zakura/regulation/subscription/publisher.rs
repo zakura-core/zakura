@@ -1,6 +1,19 @@
 //! The publisher's side: subscriptions a peer opened on this session.
+//!
+//! [`PublicationLedger`] holds the protocol rules as values: credit, cursors,
+//! update sequences, and tombstones. [`PublicationSlots`] owns the runtime
+//! slot permits, and names each one by a [`SlotId`] the ledger can hold. A
+//! pure owner keeps the ledger in its state and its runtime owner keeps the
+//! slots. [`PublicationReporter`] turns the ledger's returned facts into
+//! metrics, logs, and transition events for the runtime owner.
+//! [`Publications`] joins all three for an owner with no such split.
 
-use std::{collections::VecDeque, hash::Hash, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    hash::Hash,
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use zakura_rt::collections::HashMap;
 
@@ -37,6 +50,90 @@ pub(crate) enum PageStall {
     HistoryFull,
     /// A page must carry at least one object.
     EmptyPage,
+}
+
+/// What the ledger found when it applied an `Open`, for its runtime owner to
+/// report.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicationOpened {
+    /// Slots held before this `Open`.
+    pub(super) held: usize,
+    /// Whether the margin admitted this `Open` above `max_live`.
+    pub(super) over_limit: bool,
+}
+
+/// The identity of one held subscription slot, unique within its
+/// [`PublicationSlots`]. A reused subscription key gets a new one.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct SlotId(u64);
+
+/// What the slot owner found for one `Open`: the slots held before it, and
+/// the slot it reserved, if one was free. The owner reserves the slot before
+/// the ledger decides, so a snapshot never grants capacity.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SlotOffer {
+    held: usize,
+    slot: Option<SlotId>,
+}
+
+/// The slots of one session's subscriptions: `2 × max_live` permits, each
+/// held from `Open` until its terminal outcome's write finishes.
+#[derive(Debug)]
+pub(crate) struct PublicationSlots {
+    budget: SlotBudget,
+    next: u64,
+    owned: BTreeMap<SlotId, SlotPermit>,
+    capacity: usize,
+}
+
+impl PublicationSlots {
+    /// The slots for the subscription row `limits`.
+    pub(crate) fn new(limits: &SubscriptionLimits) -> Self {
+        let capacity = limits.max_live().saturating_mul(2);
+        Self {
+            budget: SlotBudget::new(capacity)
+                .expect("the validator requires max_live >= 1, and twice it fits a semaphore"),
+            next: 0,
+            owned: BTreeMap::new(),
+            capacity,
+        }
+    }
+
+    /// Reserve a slot for one `Open`, if one is free. Give an offer the ledger
+    /// refused back to [`Self::refused`].
+    pub(crate) fn offer(&mut self) -> SlotOffer {
+        let held = self.held();
+        let slot = self.budget.try_reserve().map(|permit| {
+            let id = SlotId(self.next);
+            self.next = self.next.wrapping_add(1);
+            self.owned.insert(id, permit);
+            id
+        });
+        SlotOffer { held, slot }
+    }
+
+    /// Free the slot of the latest `offer`, which the ledger refused. Nothing
+    /// else named its identity, so the next offer reuses it, and a refused
+    /// `Open` changes nothing.
+    pub(crate) fn refused(&mut self, offer: SlotOffer) {
+        if let Some(slot) = offer.slot {
+            self.owned.remove(&slot);
+            self.next = slot.0;
+        }
+    }
+
+    /// Move held slot `slot` into its terminal outcome's permit.
+    pub(crate) fn terminal(&mut self, slot: SlotId) -> Option<TerminalPermit> {
+        self.owned
+            .remove(&slot)
+            .map(|permit| TerminalPermit { _slot: permit })
+    }
+
+    /// Slots held now: by a subscription, or by a terminal outcome until its
+    /// write finishes.
+    pub(crate) fn held(&self) -> usize {
+        self.capacity - self.budget.available()
+    }
 }
 
 /// A terminal outcome's reserved output, and the subscription's slot.
@@ -76,7 +173,7 @@ struct Published<C> {
     /// consumed totals through it.
     sent: VecDeque<(C, Totals)>,
     closing: bool,
-    slot: SlotPermit,
+    slot: SlotId,
 }
 
 /// An ended subscription; see the module docs for the rules it enforces.
@@ -91,85 +188,53 @@ struct Tombstone<K> {
     close_received: bool,
 }
 
-/// The subscriptions a peer opened on one session, keyed by `K`, with
-/// cursors `C`.
+/// The protocol rules of the subscriptions a peer opened on one session,
+/// keyed by `K`, with cursors `C`. It holds values only: each subscription
+/// names its slot by [`SlotId`], and the slot's owner holds the permit.
 ///
-/// Cursors of one subscription must be distinct; the tools compare them by
+/// Cursors of one subscription must be distinct; the ledger compares them by
 /// equality only.
 #[derive(Debug)]
-pub(crate) struct Publications<K, C> {
+pub(crate) struct PublicationLedger<K, C> {
     limits: SubscriptionLimits,
     live: HashMap<K, Published<C>>,
     /// Ended subscriptions, oldest first.
     tombstones: VecDeque<Tombstone<K>>,
-    /// Live and closing subscriptions: `2 × max_live` slots.
-    slots: SlotBudget,
-    slot_count: usize,
     over_limit: u64,
-    /// Reports this table's transitions, in test and simulator builds.
-    #[cfg(any(test, zakura_sim))]
-    tap: Option<crate::zakura::RegulationTap<K>>,
 }
 
-impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
-    /// An empty table for the subscription row `limits`.
+impl<K: Eq + Hash + Clone, C: Clone + Eq> PublicationLedger<K, C> {
+    /// An empty ledger for the subscription row `limits`.
     pub(crate) fn new(limits: SubscriptionLimits) -> Self {
-        let slots = limits.max_live().saturating_mul(2);
         Self {
             limits,
             live: HashMap::new(),
             tombstones: VecDeque::new(),
-            slots: SlotBudget::new(slots)
-                .expect("the validator requires max_live >= 1, and twice it fits a semaphore"),
-            slot_count: slots,
             over_limit: 0,
-            #[cfg(any(test, zakura_sim))]
-            tap: None,
         }
     }
 
-    /// This table, reporting its transitions through `tap` if there is one.
-    /// Attach it before sharing the table, since locking a shared table is a
-    /// scheduling point in a simulated run.
-    #[cfg(any(test, zakura_sim))]
-    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
-        self.tap = tap;
-        self
-    }
-
-    /// Report `transition` if a tap is attached. `transition` is built only
-    /// then.
-    #[cfg(any(test, zakura_sim))]
-    fn regulated(
-        &self,
-        transition: impl FnOnce(&crate::zakura::RegulationTap<K>) -> crate::zakura::Transition,
-    ) {
-        if let Some(tap) = &self.tap {
-            tap.stream().regulated(transition(tap));
-        }
-    }
-
-    /// Apply `Open`.
+    /// Apply `Open` under the slot `offer`. On success the subscription holds
+    /// the offered slot. On a refusal, give the offer back to its owner.
     pub(crate) fn open(
         &mut self,
         key: K,
         sequence: u32,
         credit: Credit,
         start: C,
-    ) -> Result<(), SubscriptionFault> {
-        let message_type = self.limits.message_type;
-        let fault = move |fault: SubscriptionFault| fault.counted(message_type);
+        offer: SlotOffer,
+    ) -> Result<PublicationOpened, SubscriptionFault> {
         if sequence != 0 {
-            return Err(fault(SubscriptionFault::Sequence {
+            return Err(SubscriptionFault::Sequence {
                 expected: 0,
                 got: sequence,
-            }));
+            });
         }
         if self.live.contains_key(&key) || self.tombstones.iter().any(|dead| dead.key == key) {
-            return Err(fault(SubscriptionFault::ReusedKey));
+            return Err(SubscriptionFault::ReusedKey);
         }
         if credit.objects == 0 || credit.bytes == 0 {
-            return Err(fault(SubscriptionFault::EmptyCredit));
+            return Err(SubscriptionFault::EmptyCredit);
         }
         let mut granted = ResponseCredit::new(Credit {
             objects: 0,
@@ -177,16 +242,17 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         });
         granted
             .grant(credit, Totals::default(), self.limits.credit)
-            .map_err(|_| fault(SubscriptionFault::AboveWindow))?;
-        let held = self.slot_count - self.slots.available();
-        let Some(slot) = self.slots.try_reserve() else {
-            return Err(fault(SubscriptionFault::NoSlot {
+            .map_err(|_| SubscriptionFault::AboveWindow)?;
+        let held = offer.held;
+        let Some(slot) = offer.slot else {
+            return Err(SubscriptionFault::NoSlot {
                 held,
                 limit: self.limits.max_live,
-            }));
+            });
         };
-        if held >= self.limits.max_live() {
-            self.count_over_limit(held);
+        let over_limit = held >= self.limits.max_live();
+        if over_limit {
+            self.over_limit += 1;
         }
         // The subscriber received the oldest terminal outcomes; see the
         // module docs.
@@ -198,13 +264,6 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         while self.tombstones.len() > keep {
             self.tombstones.pop_front();
         }
-        #[cfg(any(test, zakura_sim))]
-        self.regulated(|tap| crate::zakura::Transition::OpenApplied {
-            subscription: tap.id(&key),
-            objects: credit.objects,
-            bytes: credit.bytes,
-            seq: tap.stream().serving(),
-        });
         self.live.insert(
             key,
             Published {
@@ -216,7 +275,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
                 slot,
             },
         );
-        Ok(())
+        Ok(PublicationOpened { held, over_limit })
     }
 
     /// Apply `Grant`: check the sequence and the acknowledgement, then add
@@ -228,36 +287,25 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         acknowledged: &C,
         added: Credit,
     ) -> Result<Applied, SubscriptionFault> {
-        let message_type = self.limits.message_type;
         let limit = self.limits.credit;
-        let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let Some(published) = self.live.get_mut(key) else {
             return self.crossed(key, sequence, Some(added));
         };
         if published.closing {
-            return Err(fault(SubscriptionFault::AfterClose));
+            return Err(SubscriptionFault::AfterClose);
         }
-        next_sequence(published.sequence, sequence).map_err(fault)?;
-        let through = find_acknowledged(published, acknowledged).map_err(fault)?;
+        next_sequence(published.sequence, sequence)?;
+        let through = find_acknowledged(published, acknowledged)?;
         if is_empty(added) {
-            return Err(fault(SubscriptionFault::EmptyCredit));
+            return Err(SubscriptionFault::EmptyCredit);
         }
         let totals = through.map_or(published.acknowledged.1, |index| published.sent[index].1);
         published
             .credit
             .grant(added, totals, limit)
-            .map_err(|_| fault(SubscriptionFault::AboveWindow))?;
+            .map_err(|_| SubscriptionFault::AboveWindow)?;
         published.sequence = sequence;
         acknowledge(published, through);
-        #[cfg(any(test, zakura_sim))]
-        if let Some(tap) = &self.tap {
-            tap.stream()
-                .regulated(crate::zakura::Transition::GrantApplied {
-                    subscription: tap.id(key),
-                    objects: added.objects,
-                    bytes: added.bytes,
-                });
-        }
         Ok(Applied::Live)
     }
 
@@ -270,26 +318,17 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         sequence: u32,
         acknowledged: &C,
     ) -> Result<Applied, SubscriptionFault> {
-        let message_type = self.limits.message_type;
-        let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let Some(published) = self.live.get_mut(key) else {
             return self.crossed(key, sequence, None);
         };
         if published.closing {
-            return Err(fault(SubscriptionFault::AfterClose));
+            return Err(SubscriptionFault::AfterClose);
         }
-        next_sequence(published.sequence, sequence).map_err(fault)?;
-        let through = find_acknowledged(published, acknowledged).map_err(fault)?;
+        next_sequence(published.sequence, sequence)?;
+        let through = find_acknowledged(published, acknowledged)?;
         published.sequence = sequence;
         published.closing = true;
         acknowledge(published, through);
-        #[cfg(any(test, zakura_sim))]
-        if let Some(tap) = &self.tap {
-            tap.stream()
-                .regulated(crate::zakura::Transition::CloseApplied {
-                    subscription: tap.id(key),
-                });
-        }
         Ok(Applied::Live)
     }
 
@@ -301,32 +340,30 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         sequence: u32,
         added: Option<Credit>,
     ) -> Result<Applied, SubscriptionFault> {
-        let message_type = self.limits.message_type;
         let limit = self.limits.credit;
-        let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let index = self
             .tombstones
             .iter()
             .position(|dead| dead.key == *key)
-            .ok_or_else(|| fault(SubscriptionFault::Unknown))?;
+            .ok_or(SubscriptionFault::Unknown)?;
         let dead = &mut self.tombstones[index];
         if dead.close_received {
-            return Err(fault(SubscriptionFault::AfterClose));
+            return Err(SubscriptionFault::AfterClose);
         }
-        next_sequence(dead.sequence, sequence).map_err(fault)?;
+        next_sequence(dead.sequence, sequence)?;
         let Some(added) = added else {
             self.tombstones.remove(index);
             return Ok(Applied::Crossed);
         };
         if is_empty(added) {
-            return Err(fault(SubscriptionFault::EmptyCredit));
+            return Err(SubscriptionFault::EmptyCredit);
         }
         // The subscriber acknowledged at most every page sent before the end,
         // so its window starts at or before the consumed credit.
         let consumed = dead.credit.consumed();
         dead.credit
             .grant(added, consumed, limit)
-            .map_err(|_| fault(SubscriptionFault::CrossedAboveWindow))?;
+            .map_err(|_| SubscriptionFault::CrossedAboveWindow)?;
         dead.sequence = sequence;
         Ok(Applied::Crossed)
     }
@@ -372,10 +409,10 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
 
     /// End the subscription, after `Close` or on this node's own outcome.
     ///
-    /// Free the key, keep a tombstone, and return the terminal permit. Write
-    /// terminal outcomes in the order this returns them. The outcome spends
-    /// no credit.
-    pub(crate) fn end(&mut self, key: &K) -> Option<TerminalPermit> {
+    /// Free the key, keep a tombstone, and return the subscription's slot.
+    /// Write terminal outcomes in the order this returns them. The outcome
+    /// spends no credit.
+    pub(crate) fn end(&mut self, key: &K) -> Option<SlotId> {
         let published = self.live.remove(key)?;
         self.tombstones.push_back(Tombstone {
             key: key.clone(),
@@ -387,13 +424,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         while self.tombstones.len() > bound {
             self.tombstones.pop_front();
         }
-        #[cfg(any(test, zakura_sim))]
-        self.regulated(|tap| crate::zakura::Transition::PublicationEnded {
-            subscription: tap.id(key),
-        });
-        Some(TerminalPermit {
-            _slot: published.slot,
-        })
+        Some(published.slot)
     }
 
     /// The cursor of the last page sent, or the acknowledged cursor if none
@@ -447,20 +478,270 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
     pub(crate) fn credit(&self, key: &K) -> Option<&ResponseCredit> {
         self.live.get(key).map(|published| &published.credit)
     }
+}
 
-    fn count_over_limit(&mut self, held: usize) {
-        self.over_limit += 1;
-        metrics::counter!(
-            "zakura.p2p.subscription.over_limit",
-            "message_type" => self.limits.message_type.to_string(),
+/// Reports what a [`PublicationLedger`] returned: metrics and logs, and in
+/// test and simulator builds its transitions. The ledger's runtime owner holds
+/// this and calls it under the lock that orders the ledger.
+#[derive(Debug)]
+pub(crate) struct PublicationReporter<K> {
+    limits: SubscriptionLimits,
+    /// Reports the transitions, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<crate::zakura::RegulationTap<K>>,
+    key: PhantomData<fn(&K)>,
+}
+
+impl<K> PublicationReporter<K> {
+    /// A reporter for the subscription row `limits`.
+    pub(crate) fn new(limits: SubscriptionLimits) -> Self {
+        Self {
+            limits,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
+            key: PhantomData,
+        }
+    }
+
+    /// This reporter, sending its transitions through `tap` if there is one.
+    /// Attach it before sharing the owner, since locking a shared owner is a
+    /// scheduling point in a simulated run.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
+        self.tap = tap;
+        self
+    }
+
+    /// Report a fault the ledger returned, and return it.
+    pub(crate) fn refused(&self, fault: SubscriptionFault) -> SubscriptionFault {
+        fault.counted(self.limits.message_type)
+    }
+
+    /// Report the `Open` of `key` with `credit`, which the ledger applied.
+    #[cfg_attr(
+        not(any(test, zakura_sim)),
+        expect(
+            unused_variables,
+            reason = "only the transition reads the key and the credit"
         )
-        .increment(1);
-        tracing::debug!(
-            message_type = self.limits.message_type,
-            held,
-            limit = self.limits.max_live,
-            "peer holds more subscriptions than the limit; admitting within the margin"
-        );
+    )]
+    pub(crate) fn opened(&self, key: &K, credit: Credit, opened: PublicationOpened) {
+        if opened.over_limit {
+            metrics::counter!(
+                "zakura.p2p.subscription.over_limit",
+                "message_type" => self.limits.message_type.to_string(),
+            )
+            .increment(1);
+            tracing::debug!(
+                message_type = self.limits.message_type,
+                held = opened.held,
+                limit = self.limits.max_live,
+                "peer holds more subscriptions than the limit; admitting within the margin"
+            );
+        }
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::OpenApplied {
+                    subscription: tap.id(key),
+                    objects: credit.objects,
+                    bytes: credit.bytes,
+                    seq: tap.stream().serving(),
+                });
+        }
+    }
+
+    /// Report that the ledger answered a `Grant` of `added` for `key` with
+    /// `applied`.
+    #[cfg_attr(
+        not(any(test, zakura_sim)),
+        expect(unused_variables, reason = "only the transition reads these")
+    )]
+    pub(crate) fn granted(&self, key: &K, added: Credit, applied: Applied) {
+        #[cfg(any(test, zakura_sim))]
+        if let (Applied::Live, Some(tap)) = (applied, &self.tap) {
+            tap.stream()
+                .regulated(crate::zakura::Transition::GrantApplied {
+                    subscription: tap.id(key),
+                    objects: added.objects,
+                    bytes: added.bytes,
+                });
+        }
+    }
+
+    /// Report that the ledger answered a `Close` for `key` with `applied`.
+    #[cfg_attr(
+        not(any(test, zakura_sim)),
+        expect(unused_variables, reason = "only the transition reads these")
+    )]
+    pub(crate) fn closed(&self, key: &K, applied: Applied) {
+        #[cfg(any(test, zakura_sim))]
+        if let (Applied::Live, Some(tap)) = (applied, &self.tap) {
+            tap.stream()
+                .regulated(crate::zakura::Transition::CloseApplied {
+                    subscription: tap.id(key),
+                });
+        }
+    }
+
+    /// Report that the ledger ended `key`.
+    #[cfg_attr(
+        not(any(test, zakura_sim)),
+        expect(unused_variables, reason = "only the transition reads the key")
+    )]
+    pub(crate) fn ended(&self, key: &K) {
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::PublicationEnded {
+                    subscription: tap.id(key),
+                });
+        }
+    }
+}
+
+/// The subscriptions a peer opened on one session: a [`PublicationLedger`],
+/// the [`PublicationSlots`] it names, and its [`PublicationReporter`], under
+/// one owner.
+#[derive(Debug)]
+pub(crate) struct Publications<K, C> {
+    ledger: PublicationLedger<K, C>,
+    slots: PublicationSlots,
+    reporter: PublicationReporter<K>,
+}
+
+impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
+    /// An empty table for the subscription row `limits`.
+    pub(crate) fn new(limits: SubscriptionLimits) -> Self {
+        Self {
+            slots: PublicationSlots::new(&limits),
+            reporter: PublicationReporter::new(limits),
+            ledger: PublicationLedger::new(limits),
+        }
+    }
+
+    /// This table, reporting its transitions through `tap` if there is one.
+    /// Attach it before sharing the table, since locking a shared table is a
+    /// scheduling point in a simulated run.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
+        self.reporter = self.reporter.observed_by(tap);
+        self
+    }
+
+    /// Apply `Open`: reserve a slot, then apply the ledger's rules. A refused
+    /// `Open` frees the slot.
+    pub(crate) fn open(
+        &mut self,
+        key: K,
+        sequence: u32,
+        credit: Credit,
+        start: C,
+    ) -> Result<(), SubscriptionFault> {
+        let offer = self.slots.offer();
+        match self
+            .ledger
+            .open(key.clone(), sequence, credit, start, offer)
+        {
+            Ok(opened) => {
+                self.reporter.opened(&key, credit, opened);
+                Ok(())
+            }
+            Err(fault) => {
+                self.slots.refused(offer);
+                Err(self.reporter.refused(fault))
+            }
+        }
+    }
+
+    /// See [`PublicationLedger::grant`].
+    pub(crate) fn grant(
+        &mut self,
+        key: &K,
+        sequence: u32,
+        acknowledged: &C,
+        added: Credit,
+    ) -> Result<Applied, SubscriptionFault> {
+        let applied = self
+            .ledger
+            .grant(key, sequence, acknowledged, added)
+            .map_err(|fault| self.reporter.refused(fault))?;
+        self.reporter.granted(key, added, applied);
+        Ok(applied)
+    }
+
+    /// See [`PublicationLedger::close`].
+    pub(crate) fn close(
+        &mut self,
+        key: &K,
+        sequence: u32,
+        acknowledged: &C,
+    ) -> Result<Applied, SubscriptionFault> {
+        let applied = self
+            .ledger
+            .close(key, sequence, acknowledged)
+            .map_err(|fault| self.reporter.refused(fault))?;
+        self.reporter.closed(key, applied);
+        Ok(applied)
+    }
+
+    /// See [`PublicationLedger::reserve_page`].
+    pub(crate) fn reserve_page(
+        &mut self,
+        key: &K,
+        objects: u32,
+        bytes: usize,
+        cursor: C,
+    ) -> Result<(), PageStall> {
+        self.ledger.reserve_page(key, objects, bytes, cursor)
+    }
+
+    /// End the subscription, after `Close` or on this node's own outcome, and
+    /// return the terminal permit. See [`PublicationLedger::end`].
+    pub(crate) fn end(&mut self, key: &K) -> Option<TerminalPermit> {
+        let slot = self.ledger.end(key)?;
+        self.reporter.ended(key);
+        self.slots.terminal(slot)
+    }
+
+    /// See [`PublicationLedger::last_sent`].
+    pub(crate) fn last_sent(&self, key: &K) -> Option<&C> {
+        self.ledger.last_sent(key)
+    }
+
+    /// See [`PublicationLedger::unspent`].
+    pub(crate) fn unspent(&self, key: &K) -> Option<Totals> {
+        self.ledger.unspent(key)
+    }
+
+    /// See [`PublicationLedger::is_closing`].
+    pub(crate) fn is_closing(&self, key: &K) -> bool {
+        self.ledger.is_closing(key)
+    }
+
+    /// See [`PublicationLedger::keys`].
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
+        self.ledger.keys()
+    }
+
+    /// See [`PublicationLedger::unacknowledged`].
+    pub(crate) fn unacknowledged(&self, key: &K) -> Option<usize> {
+        self.ledger.unacknowledged(key)
+    }
+
+    /// See [`PublicationLedger::tombstones`].
+    pub(crate) fn tombstones(&self) -> usize {
+        self.ledger.tombstones()
+    }
+
+    /// See [`PublicationLedger::over_limit_count`].
+    pub(crate) fn over_limit_count(&self) -> u64 {
+        self.ledger.over_limit_count()
+    }
+
+    /// See [`PublicationLedger::credit`].
+    pub(crate) fn credit(&self, key: &K) -> Option<&ResponseCredit> {
+        self.ledger.credit(key)
     }
 }
 

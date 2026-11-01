@@ -34,6 +34,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
+    download_work::has_sufficient_work,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -161,6 +162,16 @@ pub enum BlockDownloadVerifyError {
 
     #[error("downloaded block was too far behind the chain tip: {height:?} {hash:?}")]
     BehindTipHeightLimit {
+        height: block::Height,
+        hash: block::Hash,
+    },
+
+    /// A downloaded header claims a target easier than the Mainnet admission floor.
+    /// This is an unscored resource-policy rejection, not a consensus verdict.
+    #[error(
+        "downloaded block target is easier than the Mainnet admission floor: {height:?} {hash:?}"
+    )]
+    BelowMinimumWork {
         height: block::Height,
         hash: block::Hash,
     },
@@ -830,6 +841,11 @@ where
                     metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
 
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
+                }
+
+                if !has_sufficient_work(&chain_network, block_height, block.header.difficulty_threshold) {
+                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
+                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }
 
                 // Wait for the verifier service to be ready.

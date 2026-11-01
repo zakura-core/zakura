@@ -47,6 +47,9 @@ mod tests;
 /// Bounds the optional read that can prove an input missing at the block's parent.
 const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bounds the failure-path read that checks a body's authorizing data binding.
+const AUTH_DATA_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -321,20 +324,18 @@ where
         block,
         auth_data_root: None,
     };
-    match state_service
-        .oneshot(zs::Request::CheckAuthDataCommitment(commitment))
-        .await
-    {
-        Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)) => error,
-        Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Mismatch(mismatch))) => {
+    let check = state_service.oneshot(zs::Request::CheckAuthDataCommitment(commitment));
+    match tokio::time::timeout(AUTH_DATA_CHECK_TIMEOUT, check).await {
+        Ok(Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound))) => error,
+        Ok(Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Mismatch(mismatch)))) => {
             VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(Box::new(
                 zs::ValidateContextError::InvalidBlockCommitment(mismatch),
             )))
         }
-        Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Unavailable)) | Err(_) => {
-            unconfirmed(error)
-        }
-        Ok(_) => unreachable!("wrong response to Request::CheckAuthDataCommitment"),
+        Ok(Ok(zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Unavailable)))
+        | Ok(Err(_))
+        | Err(_) => unconfirmed(error),
+        Ok(Ok(_)) => unreachable!("wrong response to Request::CheckAuthDataCommitment"),
     }
 }
 

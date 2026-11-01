@@ -200,8 +200,9 @@ async fn missing_input_requires_committed_parent_evidence() {
 /// commitment mismatch rather than the rule the differing data fails.
 ///
 /// The check must not wait for the parent: a parent that failed semantic verification never
-/// reaches state, so the state mock panics on `AwaitBlockInfo`.
-#[tokio::test]
+/// reaches state, so the state mock panics on `AwaitBlockInfo`. A stalled check leaves the
+/// binding unconfirmed.
+#[tokio::test(start_paused = true)]
 async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
     use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
@@ -210,6 +211,7 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
         Bound,
         Mismatch,
         Unavailable,
+        Stalled,
     }
 
     let _init_guard = zakura_test::init();
@@ -219,12 +221,20 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
         Some(LockTime::unlocked()),
     ));
 
-    for binding in [Binding::Bound, Binding::Mismatch, Binding::Unavailable] {
+    for binding in [
+        Binding::Bound,
+        Binding::Mismatch,
+        Binding::Unavailable,
+        Binding::Stalled,
+    ] {
         let state = service_fn(move |request: zs::Request| async move {
             Ok::<_, BoxError>(match request {
                 zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                 zs::Request::CheckParentInputs { .. } => {
                     zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                }
+                zs::Request::CheckAuthDataCommitment(_) if matches!(binding, Binding::Stalled) => {
+                    std::future::pending().await
                 }
                 zs::Request::CheckAuthDataCommitment(_) => {
                     zs::Response::AuthDataCommitment(match binding {
@@ -235,7 +245,9 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
                                 expected: [0x24; 32],
                             },
                         ),
-                        Binding::Unavailable => zs::AuthDataCommitment::Unavailable,
+                        Binding::Unavailable | Binding::Stalled => {
+                            zs::AuthDataCommitment::Unavailable
+                        }
                     })
                 }
                 _ => panic!("unexpected state request: {request:?}"),
@@ -275,7 +287,7 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
                 );
                 assert!(error.is_auth_commitment_mismatch(), "{error:?}");
             }
-            Binding::Unavailable => {
+            Binding::Unavailable | Binding::Stalled => {
                 assert_eq!(
                     class,
                     BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext),

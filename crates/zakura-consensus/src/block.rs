@@ -585,8 +585,12 @@ where
                 block.transactions.len(),
             );
 
-            for (&transaction_hash, transaction) in
-                transaction_hashes.iter().zip(block.transactions.iter())
+            // Dispatch shielded transactions first: their proof batches are the longest checks, so
+            // starting them before the transparent checks shortens the block's critical path.
+            let transactions = || transaction_hashes.iter().zip(block.transactions.iter());
+            for (&transaction_hash, transaction) in transactions()
+                .filter(|(_, tx)| tx.has_shielded_data())
+                .chain(transactions().filter(|(_, tx)| !tx.has_shielded_data()))
             {
                 let rsp = transaction_verifier
                     .ready()

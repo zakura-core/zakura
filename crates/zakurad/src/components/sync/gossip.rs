@@ -99,8 +99,7 @@ pub enum BlockGossipError {
 /// In particular, if a lot of blocks are committed at the same time,
 /// gossips will be disabled or skipped until the state reaches the latest tip.
 ///
-/// Each advertisement carries the block's height and serialized size, which size the legacy
-/// broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
+/// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
 ///
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN, RS>(
@@ -264,9 +263,8 @@ where
         });
         tokio::spawn(async move {
             let block = match size {
-                Some(size) => zn::AdvertisedBlock::new(hash, height, size),
+                Some(size) => zn::AdvertisedBlock::new(hash, size),
                 None => zn::AdvertisedBlock {
-                    height: Some(height),
                     size: committed_block_size(read_state, hash).await,
                     ..hash.into()
                 },

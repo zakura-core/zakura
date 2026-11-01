@@ -30,16 +30,10 @@ use crate::components::sync::{self, gossip::BLOCK_GOSSIP_TIMEOUT, BlockGossipErr
 
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
-/// The advertisement of `block` with its height and serialized size, as mined-block events and
-/// committed tips that the state can size carry it.
+/// The advertisement of `block` with its serialized size, as mined-block events and committed
+/// tips that the state can size carry it.
 fn with_size(block: &Block) -> AdvertisedBlock {
-    AdvertisedBlock::new(
-        block.hash(),
-        block
-            .coinbase_height()
-            .expect("test vectors have a coinbase height"),
-        block.zcash_serialized_size(),
-    )
+    AdvertisedBlock::new(block.hash(), block.zcash_serialized_size())
 }
 
 /// The advertisement of a committed tip whose size the state does not have.

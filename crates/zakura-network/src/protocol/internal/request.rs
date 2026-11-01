@@ -36,28 +36,25 @@ impl From<PeerSocketAddr> for PeerSource {
     }
 }
 
-/// A block to advertise, with what the advertiser needs to size and order the broadcast.
+/// A block to advertise, with what the advertiser needs to size the broadcast.
 ///
-/// Local callers that hold the block fill in `height` and `size`. An `inv` received from a peer
-/// carries only the hash, so both are `None` there.
+/// Local callers that hold the block fill in `size`. An `inv` received from a peer carries only
+/// the hash, so it is `None` there.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct AdvertisedBlock {
     /// The block hash.
     pub hash: block::Hash,
-    /// The block height, if known. A broadcast supersedes broadcasts of lower blocks.
-    pub height: Option<block::Height>,
     /// The block's serialized size in bytes, if known. Legacy gossip sizes the broadcast's
     /// advert window from it.
     pub size: Option<u32>,
 }
 
 impl AdvertisedBlock {
-    /// Returns an advertisement of the block with `hash`, `height`, and serialized `size`.
-    pub fn new(hash: block::Hash, height: block::Height, size: usize) -> Self {
+    /// Returns an advertisement of the block with `hash` and serialized `size`.
+    pub fn new(hash: block::Hash, size: usize) -> Self {
         Self {
             hash,
-            height: Some(height),
             // A size that does not fit is unknown, rather than a misleadingly small block.
             size: u32::try_from(size).ok(),
         }
@@ -65,11 +62,10 @@ impl AdvertisedBlock {
 }
 
 impl From<block::Hash> for AdvertisedBlock {
-    /// Returns an advertisement of the block with `hash` and unknown height and size.
+    /// Returns an advertisement of the block with `hash` and unknown size.
     fn from(hash: block::Hash) -> Self {
         Self {
             hash,
-            height: None,
             size: None,
         }
     }

@@ -62,15 +62,9 @@ async fn wait_for_gossip() {
     tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
 }
 
-/// The committed-tip advertisement of `block`, with the height and size the state reads.
+/// The committed-tip advertisement of `block`, with the size the state reads.
 fn advertised(block: &Block) -> zakura_network::AdvertisedBlock {
-    zakura_network::AdvertisedBlock::new(
-        block.hash(),
-        block
-            .coinbase_height()
-            .expect("test blocks have a coinbase height"),
-        block.zcash_serialized_size(),
-    )
+    zakura_network::AdvertisedBlock::new(block.hash(), block.zcash_serialized_size())
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -151,6 +151,8 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
                 failures.append(f"Nonzero {name}: {max(counters):g}.")
         utilization = sorted(v["active"] / v["limit"] for v in values
                              if v.get("active") is not None and (v.get("limit") or 0) > 0)
+        allowances = {v["limit"] for v in values if v.get("limit") is not None}
+        peak = max((v.get("peak") or 0) for v in values)
 
         def quantile(fraction):
             if not utilization:
@@ -165,8 +167,9 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
             "samples": len(observations),
             "capacities": sorted({v["capacity"] for v in values}),
             "allowances": sorted({v["limit"] for v in values if v.get("limit") is not None}),
-            "peak": max((v.get("peak") or 0) for v in values),
-            "minimum_headroom": min((v["headroom"] for v in values if v.get("headroom") is not None), default=None),
+            "peak": peak,
+            "minimum_headroom": max(0, next(iter(allowances)) - peak) if len(allowances) == 1 else None,
+            "minimum_sampled_headroom": min((v["headroom"] for v in values if v.get("headroom") is not None), default=None),
             "utilization_p50": quantile(.50), "utilization_p95": quantile(.95), "utilization_p99": quantile(.99),
             "sampled_seconds_above_80_percent": sum(gap for gap, value in zip(gaps, values) if value.get("active") is not None and (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .8),
             "sampled_seconds_above_90_percent": sum(gap for gap, value in zip(gaps, values) if value.get("active") is not None and (value.get("limit") or 0) > 0 and value["active"] / value["limit"] >= .9),

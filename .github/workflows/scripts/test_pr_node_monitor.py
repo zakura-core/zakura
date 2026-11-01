@@ -73,6 +73,8 @@ class CapacityQualification(unittest.TestCase):
             self.observation(0), self.observation(1, saturation=1, peak=15)], 1)
         self.assertEqual(measured["sync"]["verdict"], "failed")
         self.assertEqual(measured["sync"]["peak"], 15)
+        self.assertEqual(measured["sync"]["minimum_headroom"], 0)
+        self.assertEqual(measured["sync"]["minimum_sampled_headroom"], 15)
 
     def test_near_limit_is_not_exhaustion(self):
         measured = monitor.summarize_capacity([

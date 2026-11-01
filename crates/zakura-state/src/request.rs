@@ -654,33 +654,49 @@ impl ContextuallyVerifiedBlock {
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
+        let chain_value_pool_change = semantically_verified
+            .block
+            .chain_value_pool_change_from_ordered_utxos(
+                network,
+                &spent_outputs,
+                semantically_verified.deferred_pool_balance_change,
+            )?;
+
+        Ok(Self::with_spends_and_value_change(
+            semantically_verified,
+            Arc::new(spent_outputs),
+            chain_value_pool_change,
+        ))
+    }
+
+    /// Creates a [`ContextuallyVerifiedBlock`] from the spent outputs and chain value pool
+    /// change already computed for a block with the same parent and transactions.
+    pub(crate) fn with_spends_and_value_change(
+        semantically_verified: SemanticallyVerifiedBlock,
+        spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+        chain_value_pool_change: ValueBalance<NegativeAllowed>,
+    ) -> Self {
         let SemanticallyVerifiedBlock {
             block,
             hash,
             height,
             new_outputs,
             transaction_hashes,
-            deferred_pool_balance_change,
+            deferred_pool_balance_change: _,
             auth_data_root: _,
             receipt_order,
         } = semantically_verified;
 
-        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
-            network,
-            &spent_outputs,
-            deferred_pool_balance_change,
-        )?;
-
-        Ok(Self {
+        Self {
             block,
             hash,
             height,
             new_outputs: Arc::new(new_outputs),
-            spent_outputs: Arc::new(spent_outputs),
+            spent_outputs,
             transaction_hashes,
             chain_value_pool_change,
             receipt_order,
-        })
+        }
     }
 }
 

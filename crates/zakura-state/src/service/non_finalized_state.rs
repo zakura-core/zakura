@@ -824,8 +824,10 @@ impl NonFinalizedState {
         }
 
         let transparent_spend_start = Instant::now();
-        let spent_utxos = match self.proposal_spends.take(&prepared) {
-            Some(spent_utxos) => Ok(spent_utxos),
+        // A validated proposal with the same parent and transactions already checked the spends.
+        let checked_spends = self.proposal_spends.take(&prepared);
+        let spent_utxos = match checked_spends {
+            Some(_) => Ok(HashMap::new()),
             None => check::utxo::transparent_spend(
                 &prepared,
                 &new_chain.created_utxos,
@@ -833,9 +835,6 @@ impl NonFinalizedState {
                 finalized_state,
             ),
         };
-        if let (true, Ok(spent_utxos)) = (self.records_proposal_spends, &spent_utxos) {
-            self.proposal_spends.remember(&prepared, spent_utxos);
-        }
         contextual_metrics.record_duration(
             "state.contextual.transparent_spend.duration_seconds",
             "state.contextual.mined.transparent_spend.duration_seconds",
@@ -877,26 +876,36 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
-            &self.network,
-            prepared,
-            spent_utxos,
-        )
-        .map_err(|value_balance_error| {
-            ValidateContextError::CalculateBlockChainValueChange {
-                value_balance_error,
-                height,
-                block_hash,
-                transaction_count,
-                spent_utxo_count,
-            }
-        });
+        let contextual = match checked_spends {
+            Some(checked) => Ok(ContextuallyVerifiedBlock::with_spends_and_value_change(
+                prepared,
+                checked.spent_outputs,
+                checked.chain_value_pool_change,
+            )),
+            None => ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+                &self.network,
+                prepared,
+                spent_utxos,
+            )
+            .map_err(|value_balance_error| {
+                ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error,
+                    height,
+                    block_hash,
+                    transaction_count,
+                    spent_utxo_count,
+                }
+            }),
+        };
         contextual_metrics.record_duration(
             "state.contextual.block_construction.duration_seconds",
             "state.contextual.mined.block_construction.duration_seconds",
             contextual_block_start.elapsed(),
         );
         let contextual = contextual?;
+        if self.records_proposal_spends {
+            self.proposal_spends.remember(&contextual);
+        }
 
         let parallel_update_start = Instant::now();
         let result = Self::validate_and_update_parallel(

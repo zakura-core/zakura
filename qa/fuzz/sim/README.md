@@ -252,6 +252,63 @@ bundle give. It counts minimized bundles on their own line.
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
 
+## Target readiness
+
+`cargo xtask sim-targets` checks each target `qa/suite.toml` declares in
+this package, or each `--target`:
+
+```console
+cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|none] [--child-secs <s>]
+```
+
+For each target, it resolves the harness through
+`[package.metadata.zakura-sim.targets]`, runs each of the harness's admitted
+seeds in the `zakura-sim` process, builds the target with the pinned
+nightly, and runs the built target once on the seeds, with the suite row's
+libFuzzer arguments and `ZAKURA_SIM_STATS` set. The target's stats file
+must name the harness the table maps it to, so a target whose
+`sim_target!` runs another harness fails. Each target gets one status:
+
+- `ready`: the target accepted every seed, its stats name its harness and
+  count every seed, and a seed's run applied a property of the harness's
+  own, not only `sim/no-task-panic` or `sim/no-livelock`;
+- `no-applicable-property`: all of that, except that no seed's run applied
+  a property of the harness's own;
+- `unresolved`: the table maps the target to no registered harness;
+- `seeds-rejected`: a required seed of the harness, or a seed whose sidecar
+  doesn't say a registered harness, failed validation;
+- `no-seeds`: the harness has no admitted seed;
+- `build-failed`: `cargo fuzz build` failed;
+- `seeds-failed`: the target failed on the seeds, with a panic, a crash, a
+  sanitizer report, a timeout or an error exit;
+- `wrong-harness`: the stats name another harness;
+- `unaccounted`: the target exited cleanly, but its output and stats don't
+  account for every seed, or a seed is longer than the row's `-max_len`,
+  which libFuzzer cuts it to.
+
+It prints each target's status, the harness's own properties that applied
+and those that didn't, the optional seeds it quarantined, and the retained
+bypasses under `qa/planted/` whose input runs on the harness, or that there
+are none. `<dir>/readiness.json` holds the same report, with each built
+target's commit, dirty state and toolchain from its build identity, and
+`<dir>/<target>/` holds the binary, the seeds, the log and the stats. The
+command exits 0 only if every target is `ready`. A seed run shows that a
+target builds and runs its harness. It says nothing about how well the
+target searches.
+
+`cargo xtask planted --targets` runs each retained bypass whose input runs
+on a target's harness, and also confirms the patched input through that
+target in fresh processes, as `sim-minimize` confirms an original: the
+patched target must crash with the property alone and name the harness,
+`zakura-sim confirm` must find the property's trigger history, and a fresh
+replay must match Exact. It builds the patched `zakura-sim` and target in
+`target/planted/confirm-builds/`, outside the scratch worktree, so later
+runs reuse the builds, and both binaries must embed the patched checkout's
+source digest. It prints each target's bypasses, or that it has none.
+
+The nightly `zakura_sim targets` job in `tests-unit.yml` runs both
+commands. It also runs on manual dispatch, never on pull requests.
+
 ## Seeds
 
 Curated seeds live in `crates/zakura-sim/tests/fixtures/` as `<name>.bin`

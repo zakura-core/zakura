@@ -3036,6 +3036,7 @@ async fn rpc_getpeerinfo() {
             addr: outbound_mock_peer_address.addr(),
             user_agent: Arc::from("/Zakura:1.0.3/"),
             version: Version(170_160),
+            start_height: Height(3_500_000),
             is_inbound: false,
             rtt: None,
             ping_sent_at: None,
@@ -3044,6 +3045,7 @@ async fn rpc_getpeerinfo() {
             addr: inbound_mock_peer_address.addr(),
             user_agent: Arc::from("/MagicBean:2.1.1/"),
             version: Version(170_120),
+            start_height: Height(3_499_990),
             is_inbound: true,
             rtt: None,
             ping_sent_at: None,
@@ -5213,6 +5215,8 @@ async fn rpc_addnode() {
         [PeerInfo {
             addr,
             inbound: false,
+            // Address book peers have no handshake height.
+            startingheight: -1,
             // TODO: Fix this when mock address book provides other values
             pingtime: Some(0.1f64),
             pingwait: None,

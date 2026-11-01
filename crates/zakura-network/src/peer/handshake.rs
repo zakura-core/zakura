@@ -41,8 +41,8 @@ use crate::{
     constants,
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
-        MinimumPeerVersion, PeerError,
+        CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
+        HandshakeError, MinimumPeerVersion, PeerError,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -57,7 +57,7 @@ use crate::{
         P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
-    BoxError, Config, PeerSocketAddr, VersionMessage,
+    BannedIps, BoxError, Config, PeerSocketAddr, VersionMessage,
 };
 
 #[cfg(test)]
@@ -94,6 +94,9 @@ where
     /// drop (operator-configured block-gossip / zcashd-compat sidecars),
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
+
+    /// The live ban list, rechecked by each connection before it writes a block advert.
+    bans: BannedIps,
 
     parent_span: Span,
 }
@@ -141,6 +144,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            bans: self.bans.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -498,6 +502,7 @@ where
     peer_registry: Option<PeerRegistry>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
+    bans: Option<BannedIps>,
 }
 
 impl<S, C> Builder<S, C>
@@ -582,6 +587,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
+            bans: self.bans,
         }
     }
 
@@ -608,6 +614,14 @@ where
     /// exempted and every connection behaves exactly as before.
     pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
         self.protected_peer_ips = Some(protected_peer_ips);
+        self
+    }
+
+    /// Share the live ban list with connection advert delivery. Optional.
+    ///
+    /// If this is unset, block adverts are not checked against bans when they are written.
+    pub fn with_bans(mut self, bans: BannedIps) -> Self {
+        self.bans = Some(bans);
         self
     }
 
@@ -660,6 +674,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            bans: self.bans.unwrap_or_default(),
             parent_span: Span::current(),
         })
     }
@@ -687,6 +702,7 @@ where
             peer_registry: None,
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
+            bans: None,
         }
     }
 }
@@ -1552,6 +1568,7 @@ where
         let our_services = self.our_services;
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
+        let bans = self.bans.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
 
@@ -1588,7 +1605,7 @@ where
                 user_agent,
                 our_services,
                 relay,
-                minimum_peer_version,
+                minimum_peer_version.clone(),
                 is_protected_peer,
             )
             .boxed()
@@ -1715,6 +1732,9 @@ where
             // and between the different connection tasks. We create separate tasks and channels
             // for each new connection.
             let (server_tx, server_rx) = futures::channel::mpsc::channel(0);
+            // Bound pending adverts; slow peers can catch up through later tip gossip.
+            let (block_advert_tx, block_advert_rx) =
+                tokio::sync::mpsc::channel(super::block_gossip::BLOCK_ADVERT_QUEUE);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1837,7 +1857,12 @@ where
 
             let server = Connection::new(
                 inbound_service,
-                server_rx,
+                ConnectionRequests {
+                    client_rx: server_rx,
+                    block_advert_rx,
+                    minimum_peer_version,
+                    bans,
+                },
                 error_slot.clone(),
                 peer_tx,
                 connection_tracker,
@@ -1876,6 +1901,7 @@ where
                 connection_info,
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,
+                block_advert_tx,
                 inv_collector,
                 error_slot,
                 connection_task,

@@ -144,7 +144,7 @@ fn duplicate_ironwood_nullifier_error(
 /// > disjoint, even if they have the same bit pattern.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#nullifierset>
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn tx_no_duplicates_in_chain(
     finalized_chain: &ZakuraDb,
     non_finalized_chain: Option<&Arc<Chain>>,
@@ -233,7 +233,7 @@ where
 /// with same bit pattern, they won't be considered the same when determining
 /// uniqueness. This is enforced by the callers of this function.
 ///
-#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
+#[tracing::instrument(level = "trace", skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn add_to_non_finalized_chain_unique<'block, NullifierT>(
     chain_nullifiers: &mut SharedMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
@@ -250,7 +250,7 @@ where
     )
 }
 
-#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
+#[tracing::instrument(level = "trace", skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
     chain_nullifiers: &mut SharedMap<ironwood::Nullifier, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block ironwood::Nullifier>,
@@ -286,7 +286,7 @@ pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
 /// Blocks with duplicate nullifiers are rejected by
 /// [`add_to_non_finalized_chain_unique`], so this shielded data should be the
 /// only shielded data that added this nullifier to this [`Chain`].
-#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
+#[tracing::instrument(level = "trace", skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn remove_from_non_finalized_chain<'block, NullifierT>(
     chain_nullifiers: &mut SharedMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,

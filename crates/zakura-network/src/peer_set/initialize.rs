@@ -31,7 +31,11 @@ use tokio::{
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
 use tower::{
-    buffer::Buffer, discover::Change, layer::Layer, util::BoxService, Service, ServiceExt,
+    buffer::Buffer,
+    discover::Change,
+    layer::Layer,
+    util::{BoxCloneService, BoxService},
+    Service, ServiceExt,
 };
 use tracing::Instrument;
 
@@ -211,6 +215,11 @@ where
         Vec::new(),
     )
     .await
+    .map(
+        |(peer_set, address_book, misbehavior_tx, zakura_endpoint, _block_adverts)| {
+            (peer_set, address_book, misbehavior_tx, zakura_endpoint)
+        },
+    )
     .expect("Zakura endpoint should start when P2P v2 is enabled")
 }
 
@@ -231,6 +240,7 @@ pub async fn init_with_zakura<S, C>(
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,
+        BoxCloneService<Request, Response, BoxError>,
     ),
     BoxError,
 >
@@ -332,6 +342,7 @@ where
             .with_latest_chain_tip(latest_chain_tip.clone())
             .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
+            .with_bans(bans.clone())
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {
@@ -384,6 +395,8 @@ where
         .as_ref()
         .map(ZakuraEndpoint::background_shutdown_token)
         .unwrap_or_default();
+    // Block advertisements must reach busy peers, so they bypass the buffer's readiness wait.
+    let block_advertiser = peer_set.block_advertiser();
     // Using Buffer::pair returns the background service, letting us inject our cancellation
     let (peer_set, worker) =
         Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
@@ -525,18 +538,31 @@ where
     // originated gossip and inventory fetches also flow over Zakura. The internal
     // candidate set and crawler keep using the unwrapped legacy peer set above;
     // only the service handed to the syncer/mempool/inbound becomes dual-stack.
-    let peer_set = match zakura_supervisor_and_trace {
+    //
+    // Block advertisements get their own service, so they reach busy peers without waiting for an
+    // idle one, while every other request keeps the peer set's readiness backpressure.
+    let (peer_set, block_adverts) = match zakura_supervisor_and_trace {
         Some((supervisor, trace)) => {
             let dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
                 peer_set,
+                supervisor.clone(),
+                config.legacy_p2p(),
+                trace.clone(),
+                config.zakura.stream_open_rate_per_second,
+            );
+            let advert_dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
+                block_advertiser,
                 supervisor,
                 config.legacy_p2p(),
                 trace,
                 config.zakura.stream_open_rate_per_second,
             );
-            spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
+            (
+                spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE),
+                BoxCloneService::new(advert_dual_stack),
+            )
         }
-        None => peer_set,
+        None => (peer_set, BoxCloneService::new(block_advertiser)),
     };
 
     if let Some(shutdown) = zakura_startup_shutdown {
@@ -548,6 +574,7 @@ where
         address_book,
         misbehavior_tx,
         returned_zakura_endpoint,
+        block_adverts,
     ))
 }
 

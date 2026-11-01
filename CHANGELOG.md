@@ -11,6 +11,141 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.0-rc0] - 2026-11-01
+
+### Added
+
+- Added an `indexer-rpc` cargo feature that controls whether the indexer gRPC
+  server is compiled into `zakurad`. It is enabled by default, so default and
+  release builds still serve the indexer when `rpc.indexer_listen_addr` is set.
+  A build without the feature drops the gRPC dependencies, and refuses to start
+  if `rpc.indexer_listen_addr` is configured
+  ([#1729](https://github.com/zakura-core/zakura/pull/1729)).
+- Added five block-sync byte gauges: `sync.block.applying.buffered_bytes`,
+  `sync.block.sequencer_input.queued_bytes`,
+  `sync.block.submission.in_flight_bytes`,
+  `sync.block.work.reserved_above_floor_bytes`, and
+  `sync.block.work.reserved_bytes`. The above-floor gauge reports the value the
+  latest block-request admission read; the others follow their owners' values
+  ([#1736](https://github.com/zakura-core/zakura/pull/1736)).
+- `getpeerinfo` reports each peer's `startingheight`, the best chain height it
+  advertised when it connected, as zcashd does
+  ([#1875](https://github.com/zakura-core/zakura/pull/1875)).
+
+### Changed
+
+- Updated the Common cryptography libraries to `5.0.0-rc.2` and aligned
+  transparent script parsing with Common’s `zakura-zcash-script` crate
+  ([#1897](https://github.com/zakura-core/zakura/pull/1897)).
+- The Prometheus metrics endpoint is now built into `zakurad` instead of using
+  `metrics-exporter-prometheus`. Metric names and the output format are unchanged.
+  Histogram quantiles now use every sample from the last minute, within 0.1%, so some
+  values change: the previous exporter left out samples from before a histogram's first
+  scrape, and lost accuracy for samples spanning more than a factor of about 700
+  ([#1559](https://github.com/zakura-core/zakura/pull/1559)).
+- The `tracing.filter` setting now applies only `level`, `target` and
+  `target=level` directives. `zakurad` prints a warning and ignores span and
+  field directives such as `[span{field=value}]=trace`, which it previously
+  applied ([#1634](https://github.com/zakura-core/zakura/pull/1634)).
+- `zakurad` no longer forwards records from the `log` crate into its logs, so
+  internal `rustls` TLS log messages are no longer shown. TLS handshake
+  failures on the RPC listener are still logged
+  ([#1698](https://github.com/zakura-core/zakura/pull/1698)).
+- Zakura P2P trace `closed.neutral` rows now split the `ordered_read_error`
+  and `request_read_error` reasons into `ordered_read_*` and `request_read_*`
+  reasons ending in `_rejected`, `_timeout`, or `_transport`. Only the
+  `_rejected` reasons mean the peer broke the protocol. Ordered-stream
+  oversize and rate-limit closes now always report `ordered_oversize` and
+  `ordered_rate_limited`
+  ([#1707](https://github.com/zakura-core/zakura/pull/1707)).
+- `zakurad` builds its bundled RocksDB without the features it doesn't use,
+  such as SST file ingestion, remote compaction, and tracing, again, with
+  `zakura-rocksdb` 0.24.4. This leaves out more than 500 KB of code and
+  shortens clean builds. RocksDB's behavior for Zakura and the on-disk
+  database format are unchanged. The release build no longer fails to link
+  with GCC 16, which is why the trimmed build was turned off in 1.7.0
+  ([#1728](https://github.com/zakura-core/zakura/pull/1728)).
+- Building `zakurad` no longer needs libclang: the RocksDB bindings are no
+  longer generated with bindgen at build time
+  ([#1728](https://github.com/zakura-core/zakura/pull/1728)).
+- `sync.block.budget.reserved_bytes` and `sync.block.reorder.buffered_bytes`
+  now change whenever their owners change them, instead of at each block-sync
+  reactor metrics publication
+  ([#1736](https://github.com/zakura-core/zakura/pull/1736)).
+- Reduced transaction memory use by moving Sprout, Sapling, and Orchard bundles
+  out of every transaction's inline storage
+  ([#1795](https://github.com/zakura-core/zakura/pull/1795)).
+- On x86-64, `zakurad` exits at startup with an error naming the missing
+  extensions when it was built to use the BMI2 and ADX Pasta field assembly
+  and the CPU lacks them, instead of crashing with an illegal instruction
+  ([#1869](https://github.com/zakura-core/zakura/pull/1869)).
+- Release binaries and Docker images no longer force the `portable` feature.
+  They still use portable Pasta arithmetic and run on any x86-64 CPU
+  ([#1869](https://github.com/zakura-core/zakura/pull/1869)).
+
+### Fixed
+
+- Accept compatible peers on custom testnets using the active upgrade's protocol version
+  ([#1590](https://github.com/zakura-core/zakura/pull/1590)).
+- Fixed histogram quantiles losing recent samples when concurrent writers record
+  across a metrics window boundary, and restored the metrics endpoint's `/health`
+  response to `OK`
+  ([#1655](https://github.com/zakura-core/zakura/pull/1655)).
+- Checkpoint sync now recovers retained VCT root pairs at the blocked commit boundary
+  before waiting for more headers. Missing-successor waits process header changes
+  without polling ([#1660](https://github.com/zakura-core/zakura/pull/1660)).
+- Fixed a discovery race where a node could wait out the 2 s initial-exchange
+  timeout after a peer had already answered, which closed discovery-only
+  connections as timed out
+  ([#1673](https://github.com/zakura-core/zakura/pull/1673)).
+- Fixed managed zcashd sidecar sync stalls after out-of-order block announcements by pinning zcashd v1.3.1 ([#1689](https://github.com/zakura-core/zakura/pull/1689)).
+- Fixed `z_gettreestate` on nodes in pruned storage mode, so that it returns
+  the note commitment tree state for heights below the prune height
+  ([#1725](https://github.com/zakura-core/zakura/pull/1725)).
+- Block sync no longer lets a reset or a failed parent free room under its
+  512 MiB decoded submission target while the detached bodies are still held,
+  so repeated resets can't grow decoded block memory past the target
+  ([#1802](https://github.com/zakura-core/zakura/pull/1802)).
+- Fixed a block sync stall where bodies waited for submission after a reset's
+  detached submissions completed and freed their slots
+  ([#1805](https://github.com/zakura-core/zakura/pull/1805)).
+- Fixed a block-sync stall after a reorg when storage committed a block that
+  the reorg had replaced
+  ([#1808](https://github.com/zakura-core/zakura/pull/1808)).
+- Refused stream preludes whose frame cap cannot carry a payload, and kept a
+  frame that doesn't fit its stream from closing the whole connection
+  ([#1819](https://github.com/zakura-core/zakura/pull/1819)).
+- Refused a Zakura control ack that accepts a capability the dialer didn't
+  offer ([#1821](https://github.com/zakura-core/zakura/pull/1821)).
+- Fixed a block sync stall where a peer with no round-trip sample deferred
+  the lowest missing block to peers blocked on a full sequencer queue
+  ([#1823](https://github.com/zakura-core/zakura/pull/1823)).
+- `sendrawtransaction` and other local mempool submissions no longer wait an
+  extra 50 ms per transaction before the verified transaction enters the
+  mempool and block templates
+  ([#1866](https://github.com/zakura-core/zakura/pull/1866)).
+- New blocks are announced to connected peers within milliseconds instead of
+  waiting up to several seconds for a pending `getblocks` request to time out
+  ([#1871](https://github.com/zakura-core/zakura/pull/1871)).
+- Peers now receive an empty inventory reply when the mempool is empty instead
+  of waiting for their request to time out, avoiding block relay delays of up to
+  6 seconds on links with few connections
+  ([#1879](https://github.com/zakura-core/zakura/pull/1879)).
+- A new block announced while the node is waiting for a `getblocks` reply on
+  the same connection is now downloaded right away, instead of after the
+  syncer's whole discovery round, which could take up to 6 seconds
+  ([#1881](https://github.com/zakura-core/zakura/pull/1881)).
+
+### Security
+
+- Block sync caps the decoded block bodies in the sequencer input queue. A peer
+  routine keeps its decoded copy in the handoff only while the queue's and the
+  apply window's decoded bytes leave room for it under the 512 MiB decoded
+  window cap. Otherwise it forwards raw bytes, and the sequencer decodes the
+  body when it submits it. A slow verifier can no longer let the queue hold
+  hundreds of decoded blocks, and a tip block is still decoded once
+  ([#1804](https://github.com/zakura-core/zakura/pull/1804)).
+
 ## [1.7.0] - 2026-10-21
 
 ### Added

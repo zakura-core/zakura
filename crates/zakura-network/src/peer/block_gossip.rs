@@ -471,17 +471,26 @@ pub(crate) struct BlockAdvertiser<C> {
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
 }
 
-impl<C: ChainTip> BlockAdvertiser<C> {
-    /// Returns true if `request` is a block advertisement this advertiser sends.
-    pub(crate) fn handles(request: &Request) -> bool {
-        matches!(
-            request,
-            Request::AdvertiseBlock(..)
-                | Request::AdvertiseBlockToAll(_)
-                | Request::AdvertiseMinedBlock(_)
-        )
+/// Always ready: an advertisement waits inside its own future for a connected peer, never for
+/// an idle one. Requests other than block advertisements fail.
+impl<C: ChainTip> tower::Service<Request> for BlockAdvertiser<C> {
+    type Response = Response;
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<Response, BoxError>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        std::task::Poll::Ready(Ok(()))
     }
 
+    fn call(&mut self, request: Request) -> Self::Future {
+        self.advertise(request)
+    }
+}
+
+impl<C: ChainTip> BlockAdvertiser<C> {
     /// Advertises the block in `request` to every eligible connected peer.
     ///
     /// Waits until at least one connected peer meets the minimum protocol version, so the latest
@@ -1237,6 +1246,7 @@ mod tests {
                     addr: format!("127.0.0.1:{}", i + 1).parse().unwrap(),
                     user_agent: "test".into(),
                     version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+                    start_height: zakura_chain::block::Height(0),
                     is_inbound: false,
                     rtt: millis.map(Duration::from_millis),
                     ping_sent_at: None,

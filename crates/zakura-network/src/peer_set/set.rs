@@ -1350,9 +1350,7 @@ where
             Request::AdvertiseMinedBlock(hash) => (hash, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
-        self.block_gossip_peers.retain(|key, _| {
-            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
-        });
+        self.prune_block_gossip_peers();
         // A minimum version increase cancels busy outdated peers only after their current work.
         let minimum_version = self.minimum_peer_version.current();
         let peers = self
@@ -1366,6 +1364,16 @@ where
             mined,
             self.block_gossip_scheduler.start(hash),
         )
+    }
+
+    /// Drops the block gossip peers of connections that left the peer set, and marks the
+    /// published peer list stale if any were dropped.
+    fn prune_block_gossip_peers(&mut self) {
+        let before = self.block_gossip_peers.len();
+        self.block_gossip_peers.retain(|key, _| {
+            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
+        });
+        self.block_gossip_peers_changed |= self.block_gossip_peers.len() != before;
     }
 
     /// Publishes the block gossip peers to block advertisers, if they changed.
@@ -1558,11 +1566,7 @@ where
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
         let ready_peers = self.poll_peers(cx)?;
-        let block_gossip_peers = self.block_gossip_peers.len();
-        self.block_gossip_peers.retain(|key, _| {
-            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
-        });
-        self.block_gossip_peers_changed |= self.block_gossip_peers.len() != block_gossip_peers;
+        self.prune_block_gossip_peers();
         self.publish_block_gossip_peers();
 
         // Peers leave the set through many paths. Pruning here, instead of at each

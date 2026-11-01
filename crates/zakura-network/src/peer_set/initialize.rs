@@ -31,7 +31,11 @@ use tokio::{
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
 use tower::{
-    buffer::Buffer, discover::Change, layer::Layer, util::BoxService, Service, ServiceExt,
+    buffer::Buffer,
+    discover::Change,
+    layer::Layer,
+    util::{BoxCloneService, BoxService},
+    Service, ServiceExt,
 };
 use tracing::Instrument;
 
@@ -211,6 +215,11 @@ where
         Vec::new(),
     )
     .await
+    .map(
+        |(peer_set, address_book, misbehavior_tx, zakura_endpoint, _block_adverts)| {
+            (peer_set, address_book, misbehavior_tx, zakura_endpoint)
+        },
+    )
     .expect("Zakura endpoint should start when P2P v2 is enabled")
 }
 
@@ -231,6 +240,7 @@ pub async fn init_with_zakura<S, C>(
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,
+        BoxCloneService<Request, Response, BoxError>,
     ),
     BoxError,
 >
@@ -524,32 +534,35 @@ where
         )
         .unwrap();
 
-    // Send block advertisements through the advertiser, so they don't wait for a ready peer.
-    // The crawler and candidate set above keep using the unwrapped peer set.
-    let peer_set = spawn_buffer(
-        BoxService::new(RouteBlockAdverts {
-            peer_set,
-            block_advertiser,
-        }),
-        constants::PEERSET_BUFFER_SIZE,
-    );
-
     // When the Zakura endpoint is active, wrap the legacy peer set so locally
     // originated gossip and inventory fetches also flow over Zakura. The internal
     // candidate set and crawler keep using the unwrapped legacy peer set above;
     // only the service handed to the syncer/mempool/inbound becomes dual-stack.
-    let peer_set = match zakura_supervisor_and_trace {
+    //
+    // Block advertisements get their own service, so they reach busy peers without waiting for an
+    // idle one, while every other request keeps the peer set's readiness backpressure.
+    let (peer_set, block_adverts) = match zakura_supervisor_and_trace {
         Some((supervisor, trace)) => {
             let dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
                 peer_set,
+                supervisor.clone(),
+                config.legacy_p2p(),
+                trace.clone(),
+                config.zakura.stream_open_rate_per_second,
+            );
+            let advert_dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
+                block_advertiser,
                 supervisor,
                 config.legacy_p2p(),
                 trace,
                 config.zakura.stream_open_rate_per_second,
             );
-            spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
+            (
+                spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE),
+                BoxCloneService::new(advert_dual_stack),
+            )
         }
-        None => peer_set,
+        None => (peer_set, BoxCloneService::new(block_advertiser)),
     };
 
     if let Some(shutdown) = zakura_startup_shutdown {
@@ -561,6 +574,7 @@ where
         address_book,
         misbehavior_tx,
         returned_zakura_endpoint,
+        block_adverts,
     ))
 }
 
@@ -1688,44 +1702,4 @@ async fn report_failed(
 
     // Ignore send errors on Zebra shutdown.
     let _ = address_book_updater.send(addr).await;
-}
-
-/// Routes block advertisements to a [`BlockAdvertiser`], and every other request to the
-/// buffered peer set.
-///
-/// The peer set only accepts a request once it has a ready peer, and a peer awaiting a response
-/// is not ready. Block advertisements don't expect a response, so they must not wait for one.
-///
-/// [`BlockAdvertiser`]: crate::peer::block_gossip::BlockAdvertiser
-#[derive(Clone)]
-struct RouteBlockAdverts<P, C> {
-    peer_set: P,
-    block_advertiser: crate::peer::block_gossip::BlockAdvertiser<C>,
-}
-
-impl<P, C> Service<Request> for RouteBlockAdverts<P, C>
-where
-    P: Service<Request, Response = Response, Error = BoxError> + Clone + Send + 'static,
-    P::Future: Send + 'static,
-    C: ChainTip,
-{
-    type Response = Response;
-    type Error = BoxError;
-    type Future = futures::future::BoxFuture<'static, Result<Response, BoxError>>;
-
-    /// Always ready: each request waits for the peer set inside its own future, so a block
-    /// advertisement is never queued behind a request that is waiting for a ready peer.
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), BoxError>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request) -> Self::Future {
-        if crate::peer::block_gossip::BlockAdvertiser::<C>::handles(&request) {
-            return self.block_advertiser.advertise(request);
-        }
-        self.peer_set.clone().oneshot(request).boxed()
-    }
 }

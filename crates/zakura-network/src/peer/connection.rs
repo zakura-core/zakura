@@ -140,6 +140,10 @@ impl Handler {
     ///
     /// Unexpected messages are left unprocessed, and may be rejected later.
     ///
+    /// A one-hash block `inv` answers a pending `FindBlocks` request and is also
+    /// returned, because it may be a block announcement that the caller still
+    /// has to handle as a request.
+    ///
     /// `addr` responses are limited to avoid peer set takeover. Any excess
     /// addresses are stored in `cached_addrs`.
     fn process_message(
@@ -400,16 +404,28 @@ impl Handler {
                 }
             }
 
-            // TODO:
-            // - use `any(inv)` rather than `all(inv)`?
+            // An empty inventory can be a late mempool reply after cancellation.
+            // Zakura and zcashd send no message for an empty getblocks result.
+            //
+            // Peers announce a new block with a one-hash `inv`, and a `getblocks` reply is
+            // also an `inv`, so a one-hash `inv` here can be either. It answers the request
+            // either way, and it is also returned so the run loop handles it as a block
+            // advert: the gossip downloader then fetches the block right away, instead of
+            // the syncer fetching it only once its whole discovery round has finished.
+            // A genuine one-hash reply takes the same path, so it also counts as an inbound
+            // `AdvertiseBlock` request in the metrics and starts one extra block download,
+            // which the inbound downloader drops when the block is already in the state.
             (Handler::FindBlocks, Message::Inv(items))
-                if items
-                    .iter()
-                    .all(|item| matches!(item, InventoryHash::Block(_))) =>
+                if !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
-                )))
+                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                if let [InventoryHash::Block(_)] = items[..] {
+                    ignored_msg = Some(Message::Inv(items));
+                }
+                Handler::Finished(Ok(response))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
                 Handler::Finished(Ok(Response::BlockHeaders(headers)))
@@ -827,45 +843,8 @@ where
                 // because the response might be `Nil` or synthetic.
                 State::AwaitingResponse {
                     handler: Handler::Finished(_),
-                    ref span,
                     ..
-                } => {
-                    // We have to get rid of the span reference so we can tamper with the state.
-                    let span = span.clone();
-                    trace!(
-                        parent: &span,
-                        "returning completed response to client request"
-                    );
-
-                    // Replace the state with a temporary value,
-                    // so we can take ownership of the response sender.
-                    let tmp_state = std::mem::replace(&mut self.state, State::Failed);
-
-                    if let State::AwaitingResponse {
-                        handler: Handler::Finished(response),
-                        tx,
-                        ..
-                    } = tmp_state
-                    {
-                        if let Ok(response) = response.as_ref() {
-                            debug!(%response, "finished receiving peer response to Zakura request");
-                            // Add a metric for inbound responses to outbound requests.
-                            metrics::counter!(
-                                "zakura.net.in.responses",
-                                "command" => response.command(),
-                            )
-                            .increment(1);
-                        } else {
-                            debug!(error = ?response, "error in peer response to Zakura request");
-                        }
-
-                        let _ = tx.send(response.map_err(Into::into));
-                    } else {
-                        unreachable!("already checked for AwaitingResponse");
-                    }
-
-                    self.state = State::AwaitingRequest;
-                }
+                } => self.deliver_finished_response(),
 
                 // We're awaiting a response to a client request,
                 // so also wait on cancellation, timeout, and response-free block adverts.
@@ -971,8 +950,24 @@ where
 
                             self.update_state_metrics(None);
 
-                            // If the message was not consumed as a response,
-                            // check whether it can be handled as a request.
+                            // A message can finish the response and still need inbound handling:
+                            // a one-block inv can also be an announcement, and an unsolicited
+                            // transaction ends the pending transaction batch. Deliver the reply
+                            // first, so inbound service load cannot cost the client its response.
+                            if request_msg.is_some()
+                                && matches!(
+                                    self.state,
+                                    State::AwaitingResponse {
+                                        handler: Handler::Finished(_),
+                                        ..
+                                    }
+                                )
+                            {
+                                self.deliver_finished_response();
+                            }
+
+                            // If the handler returned the message, check whether it can also
+                            // be handled as a request.
                             let unused_msg = if let Some(request_msg) = request_msg {
                                 // do NOT instrument with the request span, this is
                                 // independent work
@@ -1116,8 +1111,11 @@ where
 
         let new_handler = match (&self.state, request) {
             (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
+            // Block adverts reach the connection through its advert queue, which the peer set's
+            // block advertiser fills. A `Client` caller that sends one as an ordinary request,
+            // such as an isolated connection, gets an error instead of an `inv`.
             (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
-                unreachable!("the peer set sends block adverts through the connection's advert queue")
+                Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
             }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
@@ -1401,7 +1399,7 @@ where
                 [] => {
                     debug!(%msg, "ignoring empty inv");
 
-                    // This might be a minor protocol error, or it might mean "not found".
+                    // A reply can arrive after its mempool or block-locator request was canceled.
                     Unused
                 }
                 [InventoryHash::Block(_), InventoryHash::Block(_), ..] => {
@@ -1498,6 +1496,48 @@ where
             Consumed => None,
             Unused => Some(msg),
         }
+    }
+
+    /// Sends the finished response of the pending client request to the client, and makes the
+    /// connection idle.
+    ///
+    /// # Panics
+    ///
+    /// If the state is not `AwaitingResponse` with a `Finished` handler.
+    fn deliver_finished_response(&mut self) {
+        // Replace the state with a temporary value,
+        // so we can take ownership of the response sender.
+        let tmp_state = std::mem::replace(&mut self.state, State::Failed);
+
+        if let State::AwaitingResponse {
+            handler: Handler::Finished(response),
+            tx,
+            span,
+        } = tmp_state
+        {
+            trace!(
+                parent: &span,
+                "returning completed response to client request"
+            );
+
+            if let Ok(response) = response.as_ref() {
+                debug!(%response, "finished receiving peer response to Zakura request");
+                // Add a metric for inbound responses to outbound requests.
+                metrics::counter!(
+                    "zakura.net.in.responses",
+                    "command" => response.command(),
+                )
+                .increment(1);
+            } else {
+                debug!(error = ?response, "error in peer response to Zakura request");
+            }
+
+            let _ = tx.send(response.map_err(Into::into));
+        } else {
+            unreachable!("the caller checked for AwaitingResponse with a Finished handler");
+        }
+
+        self.state = State::AwaitingRequest;
     }
 
     /// Given a `req` originating from the peer, drive it to completion and send

@@ -68,6 +68,9 @@ without an open PR skip the comment.
 The same collector supports an isolated foreground follower through `--pid-file`.
 Write the follower's PID to that file and capture both stdout and stderr in
 `--log-file`; the collector then checks that process instead of a systemd unit.
+Supply that follower's RPC and metrics URLs explicitly. Before and during each
+measurement, verify and retain the PID's executable identity and ownership of
+both listeners; a live PID alone does not bind the sampled endpoints to it.
 Keep its binary, configuration, and fresh state clone in a run-owned directory.
 Obtain maintenance authorization before pausing a host's existing workload, and
 restore that workload after measurement. Do not compare throughput on a host

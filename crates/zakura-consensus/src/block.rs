@@ -356,7 +356,11 @@ where
         };
         // Solved blocks are identified twice below, for receipt order and for prepared
         // candidates, so hash their transactions once for both.
-        let body = (!request.is_proposal()).then(|| body_digest::BodyDigest::of(&block));
+        let body = (!request.is_proposal()).then(|| {
+            self.prepared_candidates
+                .shared_body_digest(&block)
+                .unwrap_or_else(|| body_digest::BodyDigest::of(&block))
+        });
         let receipt = body
             .as_ref()
             .map(|body| self.receipt_orders.register(&block, body));
@@ -852,8 +856,8 @@ where
     };
 
     if let (Ok(_), Some(source), Some(cache_copy)) = (&response, prepared_source, cache_copy) {
-        let id = prepared::CandidateId::of(&cache_copy.block, network);
-        prepared_candidates.insert(id, source, cache_copy);
+        let body = body_digest::BodyDigest::of(&cache_copy.block);
+        prepared_candidates.insert(body, source, cache_copy, network);
         metrics::histogram!("mining.preparation.duration_seconds")
             .record(preparation_start.elapsed().as_secs_f64());
     }

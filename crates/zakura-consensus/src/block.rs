@@ -626,7 +626,12 @@ where
             let mut first_error = None;
 
             use futures::StreamExt;
-            while let Some(result) = async_checks.next().await {
+            // Collect results outside Tokio's cooperative budget. Each result is a channel
+            // receive that spends budget; once it runs out, every other ready result reports
+            // pending and wakes itself again, so a block with thousands of transactions
+            // re-wakes thousands of futures per poll. The loop does a little bookkeeping per
+            // result and still yields whenever no result is ready.
+            while let Some(result) = tokio::task::unconstrained(async_checks.next()).await {
                 tracing::trace!(?result, remaining = async_checks.len());
                 let response = match result {
                     Ok(response) => response,

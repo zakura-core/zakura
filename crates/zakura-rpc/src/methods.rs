@@ -3401,7 +3401,6 @@ where
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
-        let sync_status = self.gbt.sync_status();
         let read_state = self.read_state.clone();
 
         if let Some(HexData(block_proposal_bytes)) = parameters
@@ -3413,7 +3412,6 @@ where
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
-                sync_status,
                 parameters
                     .as_ref()
                     .and_then(|params| params.work_id.as_deref())
@@ -3459,7 +3457,7 @@ where
                 //
                 // Optional TODO:
                 // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                check_synced_to_tip(&self.network, latest_chain_tip.clone())?;
                 // TODO: return an error if we have no peers, like `zcashd` does,
                 //       and add a developer config that mines regardless of how many peers we have.
                 // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880

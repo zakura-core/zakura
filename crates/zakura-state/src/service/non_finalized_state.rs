@@ -833,8 +833,8 @@ impl NonFinalizedState {
         } else {
             self.proposal_spends.take(&prepared)
         };
-        let spent_utxos = match cached_spends {
-            Some(spent_utxos) => Ok(spent_utxos),
+        let spent_utxos = match &cached_spends {
+            Some(checked) => Ok(Arc::clone(&checked.spent_outputs)),
             None => check::utxo::transparent_spend(
                 &prepared,
                 &new_chain.created_utxos,
@@ -884,20 +884,27 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual = ContextuallyVerifiedBlock::with_block_and_shared_spent_utxos(
-            &self.network,
-            prepared,
-            spent_utxos,
-        )
-        .map_err(|value_balance_error| {
-            ValidateContextError::CalculateBlockChainValueChange {
-                value_balance_error,
-                height,
-                block_hash,
-                transaction_count,
-                spent_utxo_count,
-            }
-        });
+        let contextual = match cached_spends {
+            Some(checked) => Ok(ContextuallyVerifiedBlock::with_spends_and_value_change(
+                prepared,
+                checked.spent_outputs,
+                checked.chain_value_pool_change,
+            )),
+            None => ContextuallyVerifiedBlock::with_block_and_shared_spent_utxos(
+                &self.network,
+                prepared,
+                spent_utxos,
+            )
+            .map_err(|value_balance_error| {
+                ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error,
+                    height,
+                    block_hash,
+                    transaction_count,
+                    spent_utxo_count,
+                }
+            }),
+        };
         contextual_metrics.record_duration(
             "state.contextual.block_construction.duration_seconds",
             "state.contextual.mined.block_construction.duration_seconds",

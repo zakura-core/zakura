@@ -10,7 +10,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use zakura_chain::{block, transaction, transparent};
+use zakura_chain::{
+    amount::NegativeAllowed, block, transaction, transparent, value_balance::ValueBalance,
+};
 
 use crate::{ContextuallyVerifiedBlock, SemanticallyVerifiedBlock};
 
@@ -18,11 +20,18 @@ use crate::{ContextuallyVerifiedBlock, SemanticallyVerifiedBlock};
 /// latest few can still be solved.
 const MAX_ENTRIES: usize = 4;
 
-/// The spent outputs of one validated proposal.
+/// The spent outputs and value pool change computed for a fully validated proposal.
+#[derive(Debug)]
+pub(crate) struct CheckedSpends {
+    pub(crate) spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
+}
+
+/// The cached results and matching inputs of one fully validated proposal.
 struct Entry {
     parent_hash: block::Hash,
     transaction_hashes: Arc<[transaction::Hash]>,
-    spent_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    spends: CheckedSpends,
 }
 
 /// Spend check results shared by a non-finalized state and its clones.
@@ -35,14 +44,17 @@ struct Entry {
 pub(crate) struct ProposalSpends(Arc<Mutex<VecDeque<Entry>>>);
 
 impl ProposalSpends {
-    /// Shares a proposal's spent outputs without copying them.
+    /// Shares a proposal's spent outputs and retains its value pool change.
     ///
     /// Call only after all contextual checks and the proposal's chain update succeed.
     pub(crate) fn remember(&self, proposal: &ContextuallyVerifiedBlock) {
         let entry = Entry {
             parent_hash: proposal.block.header.previous_block_hash,
             transaction_hashes: proposal.transaction_hashes.clone(),
-            spent_utxos: Arc::clone(&proposal.spent_outputs),
+            spends: CheckedSpends {
+                spent_outputs: Arc::clone(&proposal.spent_outputs),
+                chain_value_pool_change: proposal.chain_value_pool_change,
+            },
         };
         let mut entries = self.lock();
         entries.retain(|old| !old.matches(entry.parent_hash, &entry.transaction_hashes));
@@ -52,12 +64,9 @@ impl ProposalSpends {
         entries.push_back(entry);
     }
 
-    /// Removes and returns the spent outputs of a proposal with `block`'s parent and
+    /// Removes and returns the checked results of a proposal with `block`'s parent and
     /// transactions, if one was validated.
-    pub(crate) fn take(
-        &self,
-        block: &SemanticallyVerifiedBlock,
-    ) -> Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>> {
+    pub(crate) fn take(&self, block: &SemanticallyVerifiedBlock) -> Option<CheckedSpends> {
         let mut entries = self.lock();
         let index = entries.iter().position(|entry| {
             entry.matches(
@@ -65,7 +74,7 @@ impl ProposalSpends {
                 &block.transaction_hashes,
             )
         })?;
-        entries.remove(index).map(|entry| entry.spent_utxos)
+        entries.remove(index).map(|entry| entry.spends)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Entry>> {
@@ -330,10 +339,18 @@ mod tests {
             .commit_block(child.clone().prepare(), &finalized_state)
             .expect("the proposal is valid");
 
-        let recorded = state
+        let checked = state
             .proposal_spends
             .take(&child.clone().prepare())
             .expect("the proposal clone shares its results with the original state");
+        assert_eq!(
+            checked.chain_value_pool_change,
+            proposal_state
+                .best_tip_block()
+                .expect("the proposal committed")
+                .chain_value_pool_change,
+        );
+        let recorded = checked.spent_outputs;
         assert_eq!(recorded.as_ref(), &HashMap::from([(outpoint, expected)]));
         assert!(Arc::ptr_eq(
             &recorded,
@@ -402,6 +419,7 @@ mod tests {
         let recorded = state
             .proposal_spends
             .take(&child.clone().prepare())
+            .map(|checked| checked.spent_outputs)
             .expect("a repeated proposal must leave the writer's cached result available");
         assert_eq!(recorded.as_ref(), &HashMap::from([(outpoint, expected)]));
         state.proposal_spends.remember(
@@ -485,6 +503,7 @@ mod tests {
         let recorded = state
             .proposal_spends
             .take(&valid.clone().prepare())
+            .map(|checked| checked.spent_outputs)
             .expect("a fully validated proposal records its spent outputs");
         state.proposal_spends.remember(
             proposal_state
@@ -501,6 +520,7 @@ mod tests {
         let retained = state
             .proposal_spends
             .take(&invalid.clone().prepare())
+            .map(|checked| checked.spent_outputs)
             .expect("the rejected proposal leaves the earlier successful result available");
         assert!(Arc::ptr_eq(&recorded, &retained));
         state.proposal_spends.remember(
@@ -569,7 +589,12 @@ mod tests {
                 .map(Arc::new),
                 Ok(recorded.clone())
             );
-            assert_eq!(spends.take(&authorized.prepare()), Some(recorded.clone()));
+            assert_eq!(
+                spends
+                    .take(&authorized.prepare())
+                    .map(|checked| checked.spent_outputs),
+                Some(recorded.clone())
+            );
 
             for change_input in [true, false] {
                 spends.remember(&contextual(proposal.clone().prepare(), &recorded));
@@ -589,7 +614,9 @@ mod tests {
                 );
                 assert!(spends.take(&changed.prepare()).is_none());
                 assert_eq!(
-                    spends.take(&proposal.clone().prepare()),
+                    spends
+                        .take(&proposal.clone().prepare())
+                        .map(|checked| checked.spent_outputs),
                     Some(recorded.clone())
                 );
             }

@@ -496,6 +496,10 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
+            // This is the only check on Sapling `cv` encodings before proof
+            // verification: librustzcash keeps `cv` as bytes when it parses, so
+            // `to_librustzcash` no longer rejects an invalid one. Keep it here,
+            // ahead of every conversion and proof.
             check::sapling_point_encodings_are_valid(&tx)?;
 
             // A transaction whose own shielded counts exceed a per-block ZIP 218

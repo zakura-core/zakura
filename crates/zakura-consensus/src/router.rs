@@ -94,15 +94,32 @@ where
 }
 
 /// Routes transaction-verifier reads around the serialized read-write state buffer.
-#[derive(Clone, Debug)]
+///
+/// The transaction verifier clones this router for every transaction, and most block
+/// transactions never read state through it. The read service is shared, so that clone stays
+/// cheap, and copied only for a read request. The mutex makes the shared service `Sync`
+/// without requiring it of the service itself; it is held only to copy the service.
+#[derive(Debug)]
 struct TransactionStateRouter<S, R> {
     state: S,
-    read_state: R,
+    read_state: Arc<std::sync::Mutex<R>>,
+}
+
+impl<S: Clone, R> Clone for TransactionStateRouter<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            read_state: Arc::clone(&self.read_state),
+        }
+    }
 }
 
 impl<S, R> TransactionStateRouter<S, R> {
     fn new(state: S, read_state: R) -> Self {
-        Self { state, read_state }
+        Self {
+            state,
+            read_state: Arc::new(std::sync::Mutex::new(read_state)),
+        }
     }
 }
 
@@ -141,7 +158,11 @@ where
             request => return self.state.clone().oneshot(request).boxed(),
         };
 
-        let read_state = self.read_state.clone();
+        let read_state = self
+            .read_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         async move {
             let response = read_state.oneshot(read_request).await?;
             response.try_into().map_err(BoxError::from)

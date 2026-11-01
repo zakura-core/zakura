@@ -799,9 +799,10 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
         let mut replacement = (*candidate).clone();
         Arc::make_mut(&mut replacement.header).version = index.saturating_add(5);
         verifier.prepared_candidates.insert(
-            prepared::CandidateId::of(&replacement, &network),
+            super::body_digest::BodyDigest::of(&replacement),
             PreparedCandidateSource::ServerTemplate,
             zs::SemanticallyVerifiedBlock::from(Arc::new(replacement)),
+            &network,
         );
     }
     assert!(verifier

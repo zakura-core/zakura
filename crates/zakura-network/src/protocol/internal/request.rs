@@ -173,7 +173,10 @@ pub enum Request {
     /// is no way for the network layer to distinguish them. For this reason, the
     /// response may occasionally contain a single hash of a new chain tip rather
     /// than a list of hashes of subsequent blocks. We believe that unsolicited
-    /// `inv` messages will always have exactly one block hash.
+    /// `inv` messages will always have exactly one block hash, so the connection
+    /// also hands a one-hash response to the inbound service as a
+    /// [`Request::AdvertiseBlock`], and the gossip downloader may fetch that
+    /// block as well.
     FindBlocks {
         /// Hashes of known blocks, ordered from highest height to lowest height.
         //
@@ -266,8 +269,7 @@ pub enum Request {
     /// Returns [`Response::Nil`](super::Response::Nil).
     AdvertiseBlock(block::Hash, Option<PeerSource>),
 
-    /// Advertise a block to all connected peers without upload pacing.
-    /// The peer set queues delivery to busy peers.
+    /// Advertise a block to connected peers, paced like [`Request::AdvertiseBlock`].
     /// Tip gossip uses [`Request::AdvertiseBlock`] or [`Request::AdvertiseMinedBlock`].
     AdvertiseBlockToAll(block::Hash),
 

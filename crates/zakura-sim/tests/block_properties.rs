@@ -592,9 +592,8 @@ fn a_stale_query_after_a_reset_is_asked_again() {
 /// fork's height 3 again. Before that rule, block sync retired the fork's
 /// height 3 by height as the verified tip passed it, and most schedules
 /// stalled at the replaced block (`lane3-issues/case3-stall.md`). Every
-/// input converges on the fork's tip. Some schedules never move the
-/// verified tip to the replaced block, so the case asks only that at least
-/// one late verdict starts an epoch.
+/// input converges on the fork's tip. The case asks that at least one late
+/// verdict starts an epoch.
 #[test]
 #[allow(clippy::print_stdout)]
 fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {

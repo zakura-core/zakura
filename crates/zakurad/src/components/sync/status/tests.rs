@@ -173,7 +173,7 @@ fn threshold_sync_lengths() {
     let (status, mut recent_sync_lengths) = SyncStatus::new();
 
     for _ in 0..RecentSyncLengths::MAX_RECENT_LENGTHS {
-        recent_sync_lengths.push_extend_tips_length(100);
+        recent_sync_lengths.push_extend_tips_length(300);
     }
 
     assert!(status.is_close_to_tip());

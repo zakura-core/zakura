@@ -1,4 +1,4 @@
-//! Typed JSONL events for native discovery.
+//! Typed CSV events for native discovery.
 
 use serde::Serialize;
 

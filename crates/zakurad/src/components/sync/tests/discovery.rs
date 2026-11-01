@@ -20,11 +20,73 @@ use zakura_network as zn;
 use zakura_state as zs;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use super::vectors::{setup_chain_sync, TestChainSync};
+use super::vectors::{setup_chain_sync, NeverReadyNetwork, TestChainSync};
 use crate::{
     components::sync::{self, discovery::Event, CheckedTip, FANOUT, TIPS_RESPONSE_TIMEOUT},
     BoxError,
 };
+
+#[tokio::test(start_paused = true)]
+async fn optional_hint_does_not_wait_for_network_readiness() {
+    let (_sync, _, verifier, _peers, state, tip_sender) = setup_chain_sync();
+    let (tip, _tip_sender) = zakura_chain::chain_tip::mock::MockChainTip::new();
+    let (misbehavior, _receiver) = tokio::sync::mpsc::channel(1);
+    let (mut sync, _) = sync::ChainSync::new(
+        &crate::config::ZakuradConfig::default(),
+        Height(0),
+        NeverReadyNetwork,
+        verifier,
+        state,
+        tip,
+        misbehavior,
+    );
+    sync.downloads
+        .download_hint(block::Hash([7; 32]))
+        .now_or_never()
+        .expect("optional work must not wait for network capacity")
+        .unwrap();
+    assert_eq!(sync.downloads.in_flight(), 0);
+    assert_eq!(sync.downloads.hint_count(), 0);
+    drop(tip_sender);
+}
+
+#[tokio::test(start_paused = true)]
+async fn verified_and_cancelled_hints_release_their_slots() {
+    let (mut sync, _, mut verifier, mut peers, _, _) = setup_chain_sync();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    sync.downloads.download_hint(hash).await.unwrap();
+    peers
+        .expect_request(zn::Request::BlocksByHash(IndexSet::from([hash])))
+        .await
+        .respond(zn::Response::Blocks(vec![
+            zn::InventoryResponse::Available((block.clone(), None)),
+        ]));
+    verifier
+        .expect_request(zakura_consensus::Request::Commit(block))
+        .await
+        .respond(hash);
+    assert!(
+        matches!(sync.downloads.next().await.unwrap(), Ok((Height(1), returned)) if returned == hash)
+    );
+    assert_eq!(sync.downloads.hint_count(), 0);
+    let hash = block::Hash([7; 32]);
+    sync.downloads.download_hint(hash).await.unwrap();
+    let pending = peers
+        .expect_request(zn::Request::BlocksByHash(IndexSet::from([hash])))
+        .await;
+    sync.downloads.cancel_hints();
+    let result = sync.downloads.next().await.unwrap();
+    sync.handle_block_response_with_missing_retry(result)
+        .await
+        .unwrap();
+    assert_eq!(sync.downloads.hint_count(), 0);
+    assert_eq!(sync.downloads.in_flight(), 0);
+    assert!(!sync.downloads.contains(&hash));
+    pending.respond(Err(BoxError::from("request cancelled")));
+}
 
 #[tokio::test(start_paused = true)]
 async fn round_accounting_waits_for_every_reply_and_keeps_the_aggregate() {

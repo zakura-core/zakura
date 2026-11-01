@@ -941,6 +941,15 @@ where
         if self.contains(&hash) || self.hints.len() >= super::FANOUT {
             return Ok(());
         }
+        // Optional work must not hold the sync loop waiting for a peer while a validated reply
+        // or required block can become ready. A ready service retains its reservation until call.
+        match futures::poll!(self.network.ready()) {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(error)) => {
+                return Err(BlockDownloadVerifyError::NetworkServiceError { error });
+            }
+            Poll::Pending => return Ok(()),
+        }
         self.download_and_verify(hash).await?;
         self.hints.insert(hash);
         Ok(())

@@ -62,7 +62,7 @@ pub(super) type TestChainSync = ChainSync<
 >;
 
 #[derive(Clone, Debug)]
-struct NeverReadyNetwork;
+pub(super) struct NeverReadyNetwork;
 
 impl Service<zn::Request> for NeverReadyNetwork {
     type Response = zn::Response;

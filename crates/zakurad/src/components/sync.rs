@@ -1501,8 +1501,8 @@ where
     /// continuously refills the hash reserve by extending tips *concurrently* with draining and
     /// dispatch.
     ///
-    /// `reserve` is the set of discovered-but-not-yet-dispatched block hashes (initially the
-    /// leftovers from `obtain_tips`).
+    /// `reserve` contains discovered hashes waiting for download capacity. Initial discovery and
+    /// later extensions add batches to it while other peer replies and downloads remain pending.
     ///
     /// Returns `Ok(())` once the round is exhausted: nothing in flight, nothing queued, and no tips
     /// left to extend. Returns `Err` if an unrecoverable error means the sync should restart.

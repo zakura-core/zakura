@@ -191,7 +191,21 @@ async fn saturated_waits_allow_a_real_connected_state_commit() {
         .current()
         .0;
     let genesis = blocks[0].clone();
-    let child = blocks[1].clone();
+    // The chain generator can include shielded spends whose anchors are not in
+    // this tiny state. Use a transparent coinbase-only child for the commit.
+    let mut child = (*blocks[1]).clone();
+    let coinbase = &child.transactions[0];
+    child.transactions = vec![Arc::new(zakura_chain::transaction::Transaction::V4 {
+        inputs: coinbase.inputs().to_vec(),
+        outputs: coinbase.outputs().to_vec(),
+        lock_time: zakura_chain::transaction::LockTime::unlocked(),
+        expiry_height: Height(0),
+        joinsplit_data: None,
+        sapling_shielded_data: None,
+    })];
+    Arc::make_mut(&mut child.header).merkle_root =
+        child.transactions.iter().map(|tx| tx.hash()).collect();
+    let child = Arc::new(child);
     let (service, _, _, _) = zs::init(zs::Config::ephemeral(), &network, Height(0), 0)
         .await
         .unwrap();

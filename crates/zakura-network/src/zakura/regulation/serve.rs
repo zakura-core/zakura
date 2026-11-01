@@ -636,6 +636,12 @@ impl<P: Produce> Dispatch<P> {
                 Arc::new(grants),
                 job.commitment,
             );
+            // Capacity that was already free skips the cancellation wait, so the
+            // session can end during `acquire`. Start nothing for a cancelled
+            // session. Returning releases the grants.
+            if self.cancel.is_cancelled() {
+                return;
+            }
             #[cfg(any(test, zakura_sim))]
             let slots = slots.reporting_release(self.produce.observe_lease(&job.request));
             self.tasks.spawn(task.run(job.request, core, slots));

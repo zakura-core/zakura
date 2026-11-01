@@ -29,9 +29,9 @@ use crate::{
     lifecycle_trace::ConnectionTrace,
     meta_addr::MetaAddr,
     peer::{
-        connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
-        ConnectionInfo, ErrorSlot, InProgressClientRequest, MustUseClientResponseSender, PeerError,
-        SharedPeerError,
+        connection::peer_tx::PeerTx, error::AlreadyErrored, tcp_progress::UploadProgress,
+        ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
+        MustUseClientResponseSender, PeerError, SharedPeerError,
     },
     peer_set::ConnectionTracker,
     protocol::{
@@ -675,6 +675,15 @@ where
             last_overload_time: None,
             trace,
         }
+    }
+
+    /// Records the delivery of every block body this connection sends with `progress`.
+    ///
+    /// The connection becomes the only owner of `progress` and its socket handle, which close
+    /// when the connection's message sender drops.
+    pub(crate) fn with_upload_progress(mut self, progress: Option<UploadProgress>) -> Self {
+        self.peer_tx.set_upload_progress(progress);
+        self
     }
 }
 

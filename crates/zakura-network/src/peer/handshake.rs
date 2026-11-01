@@ -42,6 +42,7 @@ use crate::{
     lifecycle_trace::{LifecycleTrace, RequestTrace},
     meta_addr::MetaAddrChange,
     peer::{
+        tcp_progress::{TcpSocket, UploadProgress},
         CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
         MinimumPeerVersion, PeerError,
     },
@@ -1593,6 +1594,14 @@ where
             // Start timing the handshake for metrics
             let handshake_start = Instant::now();
 
+            // Capture the socket before the stream is wrapped and split. Upload progress is
+            // only sampled for the `p2p` trace table, so without it no descriptor is duplicated.
+            let upload_progress = lifecycle_trace
+                .records_p2p()
+                .then(|| TcpSocket::from_transport(&data_stream))
+                .flatten()
+                .map(UploadProgress::new);
+
             let mut peer_conn = Framed::new(
                 data_stream,
                 Codec::builder().for_network(&config.network).finish(),
@@ -1866,7 +1875,8 @@ where
                 addr_label,
                 alternate_addrs.collect(),
                 connection_trace.clone(),
-            );
+            )
+            .with_upload_progress(upload_progress);
 
             let block_uploads = server.block_uploads.clone();
             let client_peer_registry_updater = peer_registry_updater.clone();

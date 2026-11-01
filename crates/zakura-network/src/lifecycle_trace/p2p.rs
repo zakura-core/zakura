@@ -4,8 +4,12 @@
 //! once the write and flush return. The interval between them is the time the connection task
 //! spent handing the message to the socket, which includes waiting for socket buffer space.
 //!
-//! Transport samples (TCP RTT, congestion window, queued bytes) belong on `send_done` rows: add
-//! their fields to [`P2pRow`] and their columns to `tables::P2P`.
+//! A block body send on a connection with upload progress also records the kernel's TCP state
+//! on its `send_done` row (`tcp_*` columns), and a third row with the same `seq` when the watch
+//! of its delivery ends: `body_acked` once the peer acknowledged every byte, or
+//! `body_ack_timeout` if the connection closed or the watch timed out first. The interval from
+//! `send_done` to `body_acked` is time the bytes spent in the kernel and on the network after the
+//! write returned.
 
 use std::{fmt, sync::atomic::Ordering, time::Instant};
 
@@ -15,6 +19,7 @@ use zakura_jsonl_trace::{impl_jsonl_trace_event, saturating_count, saturating_mi
 
 use super::{ConnectionState, ConnectionTrace};
 use crate::{
+    peer::tcp_progress::{TcpInfo, UploadOutcome, UploadReport},
     protocol::external::{InventoryHash, Message, Nonce},
     PeerError,
 };
@@ -35,6 +40,13 @@ pub(crate) struct SendTrace {
     started: Instant,
 }
 
+impl SendTrace {
+    /// The send's sequence number on its connection.
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 #[derive(Serialize)]
 struct P2pRow<'a> {
     event: &'static str,
@@ -48,6 +60,20 @@ struct P2pRow<'a> {
     summary: Option<MessageSummary<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     write_us: Option<u64>,
+    #[serde(flatten)]
+    tcp: Option<TcpColumns>,
+    /// Time from the start of the write to the peer's acknowledgement of the last byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_us: Option<u64>,
+    /// Bytes of the encoded message the peer acknowledged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acked_bytes: Option<u64>,
+    /// Segments retransmitted on the connection while the message was being delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_retrans: Option<u32>,
+    /// Socket samples taken while watching the delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    samples: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +103,32 @@ struct MessageSummary<'a> {
     nonce: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body_bytes: Option<u64>,
+}
+
+/// A connection's kernel TCP state; see [`TcpInfo`].
+#[derive(Serialize)]
+struct TcpColumns {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_notsent_bytes: Option<u32>,
+    tcp_unacked: u32,
+    tcp_cwnd: u32,
+    tcp_rtt_us: u32,
+    tcp_total_retrans: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_delivery_rate: Option<u64>,
+}
+
+impl From<&TcpInfo> for TcpColumns {
+    fn from(info: &TcpInfo) -> Self {
+        Self {
+            tcp_notsent_bytes: info.notsent_bytes,
+            tcp_unacked: info.unacked,
+            tcp_cwnd: info.snd_cwnd,
+            tcp_rtt_us: info.rtt_us,
+            tcp_total_retrans: info.total_retrans,
+            tcp_delivery_rate: info.delivery_rate,
+        }
+    }
 }
 
 /// A value serialized with its [`fmt::Display`] representation.
@@ -131,8 +183,14 @@ impl ConnectionTrace {
         })
     }
 
-    /// Records that the write started by [`Self::p2p_send_start`] returned `result`.
-    pub(crate) fn p2p_send_done(&self, send: Option<SendTrace>, result: &Result<(), PeerError>) {
+    /// Records that the write started by [`Self::p2p_send_start`] returned `result`, with the
+    /// connection's TCP state when it returned, if it was sampled.
+    pub(crate) fn p2p_send_done(
+        &self,
+        send: Option<SendTrace>,
+        result: &Result<(), PeerError>,
+        tcp: Option<&TcpInfo>,
+    ) {
         let (Some(state), Some(send)) = (self.p2p(), send) else {
             return;
         };
@@ -140,9 +198,33 @@ impl ConnectionTrace {
         let write_us = saturating_micros(send.started.elapsed());
         state.emitter.emit_event(|| P2pRow {
             write_us: Some(write_us),
+            tcp: tcp.map(TcpColumns::from),
             result: Some(if result.is_ok() { "ok" } else { "error" }),
             error: result.as_ref().err().map(ToString::to_string),
             ..state.row(self.id, "send_done", Some(send.seq), send.msg)
+        });
+    }
+
+    /// Records how the delivery of the block body sent with sequence number `seq` ended.
+    pub(crate) fn p2p_body_upload(&self, seq: u64, report: &UploadReport) {
+        let Some(state) = self.p2p() else {
+            return;
+        };
+
+        let (event, result) = match report.outcome {
+            UploadOutcome::Acked => ("body_acked", "acked"),
+            UploadOutcome::TimedOut => ("body_ack_timeout", "timeout"),
+            UploadOutcome::Closed => ("body_ack_timeout", "closed"),
+        };
+        state.emitter.emit_event(|| P2pRow {
+            tcp: report.last().map(TcpColumns::from),
+            ack_us: (report.outcome == UploadOutcome::Acked)
+                .then(|| saturating_micros(report.elapsed)),
+            acked_bytes: Some(report.acked_message_bytes()),
+            tcp_retrans: report.retransmits(),
+            samples: Some(report.sample_count),
+            result: Some(result),
+            ..state.row(self.id, event, Some(seq), "block")
         });
     }
 
@@ -176,6 +258,11 @@ impl ConnectionState {
             msg,
             summary: None,
             write_us: None,
+            tcp: None,
+            ack_us: None,
+            acked_bytes: None,
+            tcp_retrans: None,
+            samples: None,
             result: None,
             error: None,
         }

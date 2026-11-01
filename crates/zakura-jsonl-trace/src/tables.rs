@@ -471,10 +471,14 @@ pub const MINING: JsonlTraceTable = JsonlTraceTable::csv(
     ],
 );
 
-/// Legacy P2P wire messages: send attempt, write completion, and decoded receipt.
+/// Legacy P2P wire messages: send attempt, write completion, decoded receipt, and, for block
+/// bodies on Linux, the peer's acknowledgement of the body.
 ///
 /// Rows share `conn` with `p2p_request` and `block_gossip`, and `seq` orders sends on one
-/// connection. Transport samples for a connection join on `conn`.
+/// connection. The `tcp_*` columns are the kernel's TCP state: on a block body's `send_done`
+/// row when the write returned, and on its `body_acked` or `body_ack_timeout` row when the
+/// delivery watch ended. `tcp_retrans` counts retransmitted segments during the delivery;
+/// `tcp_total_retrans` counts them since the connection opened.
 pub const P2P: JsonlTraceTable = JsonlTraceTable::csv(
     "p2p",
     "p2p.csv",
@@ -493,6 +497,16 @@ pub const P2P: JsonlTraceTable = JsonlTraceTable::csv(
         "nonce",
         "body_bytes",
         "write_us",
+        "tcp_notsent_bytes",
+        "tcp_unacked",
+        "tcp_cwnd",
+        "tcp_rtt_us",
+        "tcp_total_retrans",
+        "tcp_delivery_rate",
+        "ack_us",
+        "acked_bytes",
+        "tcp_retrans",
+        "samples",
         "result",
         "error",
     ],

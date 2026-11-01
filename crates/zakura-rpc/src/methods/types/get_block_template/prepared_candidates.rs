@@ -131,11 +131,7 @@ impl PreparedCandidateResolver {
         source: PreparedCandidateSource,
         _network: &Network,
     ) {
-        let transaction_bytes: Arc<[u8]> = block
-            .transactions
-            .zcash_serialize_to_vec()
-            .expect("serialization to memory cannot fail")
-            .into();
+        let transaction_bytes = serialized_transactions(&block);
         let size = candidate_size(&block);
         let alias_size = work_id_alias_size(work_id);
         let now = Instant::now();
@@ -215,6 +211,31 @@ impl PreparedCandidateResolver {
 }
 
 impl PreparedCandidateResolver {
+    /// Retains a validated candidate that has no work ID, so a full submission of it can reuse
+    /// its parsed transactions. It is evicted like any other candidate of its source.
+    pub(crate) fn retain(&self, block: Arc<Block>, source: PreparedCandidateSource) {
+        let transaction_bytes = serialized_transactions(&block);
+        let size = candidate_size(&block);
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune_expired(now);
+        let partition = inner.partition(source);
+        if partition.limits.max_entries == 0 || size > partition.limits.max_bytes {
+            return;
+        }
+        let existing = partition
+            .entries
+            .iter()
+            .find(|entry| candidates_match(&entry.block, &block))
+            .map(|entry| entry.id);
+        match existing {
+            Some(entry_id) => partition.touch_candidate(entry_id, now),
+            None => {
+                partition.insert_candidate(block, transaction_bytes, size, 0, now);
+            }
+        }
+    }
+
     /// Decodes a submitted block whose transactions are byte-for-byte those of a retained
     /// candidate with the same preserved header fields, sharing that candidate's parsed
     /// transactions. Returns `None` for any other bytes, which the caller parses in full.
@@ -432,6 +453,15 @@ fn preserved_header_fields_match(cached: &Header, submitted: &Header) -> bool {
         && cached.difficulty_threshold == submitted.difficulty_threshold
 }
 
+/// The serialized transaction list of `block`, as a submitted block carries it after the header.
+fn serialized_transactions(block: &Block) -> Arc<[u8]> {
+    block
+        .transactions
+        .zcash_serialize_to_vec()
+        .expect("serialization to memory cannot fail")
+        .into()
+}
+
 /// The memory an entry for `block` retains: the parsed block and its serialized transactions.
 fn candidate_size(block: &Block) -> usize {
     size_of::<Entry>()
@@ -539,6 +569,28 @@ mod tests {
         assert!(Arc::ptr_eq(
             &decoded.transactions[0],
             &candidate.transactions[0]
+        ));
+    }
+
+    #[test]
+    fn proposals_without_a_work_id_are_retained_for_full_submissions() {
+        let cache = PreparedCandidateResolver::default();
+        let proposal = test_block();
+        cache.retain(proposal.clone(), ClientProposal);
+        cache.retain(proposal.clone(), ClientProposal);
+        assert_eq!(
+            cache.lock().proposals.entries.len(),
+            1,
+            "a repeated proposal is kept once"
+        );
+        assert_accounting(&cache.lock().proposals);
+
+        let decoded = cache
+            .decode_submitted(&submitted_bytes(&proposal))
+            .expect("a retained proposal decodes from the cache");
+        assert!(Arc::ptr_eq(
+            &decoded.transactions[0],
+            &proposal.transactions[0]
         ));
     }
 

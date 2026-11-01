@@ -1035,7 +1035,8 @@ pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
-    prepared_work: Option<(PreparedCandidateResolver, &str)>,
+    prepared_candidates: PreparedCandidateResolver,
+    work_id: Option<&str>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -1079,13 +1080,18 @@ where
         .await;
 
     if block_verifier_router_response.is_ok() {
-        if let Some((prepared_candidates, work_id)) = prepared_work {
-            prepared_candidates.insert(
+        // Keep the proposal so that submitting it solved, by work ID or in full, reuses it.
+        match work_id {
+            Some(work_id) => prepared_candidates.insert(
                 block,
                 work_id,
                 zakura_consensus::PreparedCandidateSource::ClientProposal,
                 net,
-            );
+            ),
+            None => prepared_candidates.retain(
+                block,
+                zakura_consensus::PreparedCandidateSource::ClientProposal,
+            ),
         }
     }
 

@@ -100,7 +100,8 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
                   and (s.get("peers") or 0) > 0 and not s.get("rpc_error")
                   and (not at_tip or (s.get("reference_height") is not None and s.get("height") is not None
                                       and abs(s["reference_height"] - s["height"]) <= 2))]
-        start = starts[0]["elapsed"] if starts else None
+        raw = [s for s in samples if s.get("missing_parent", {}).get(path, {}).get("capacity") is not None]
+        start = starts[0]["elapsed"] if starts else (raw[0]["elapsed"] if raw else None)
         observations = [s for s in samples if start is not None and s["elapsed"] >= start
                         and s.get("missing_parent", {}).get(path, {}).get("capacity") is not None]
         if not observations:
@@ -108,6 +109,8 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
             continue
         values = [s["missing_parent"][path] for s in observations]
         failures = []
+        if not starts:
+            failures.append("No connected observation established the requested phase.")
         window = [s for s in samples if s.get("elapsed", 0) >= observations[0]["elapsed"]]
         if len(window) != len(observations):
             failures.append("Metrics missing inside the observation window.")

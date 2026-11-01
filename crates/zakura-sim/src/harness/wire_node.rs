@@ -33,9 +33,10 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        HeaderCheck, HeaderSyncService, Service, ServiceRegistry, Transition, TransportEvent,
-        TransportObserver, ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig,
-        ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
+        HeaderCheck, HeaderSyncService, Service, ServiceRegistry, SessionStep, Transition,
+        TransportEvent, TransportObserver, ZakuraConnectionLimits, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle,
+        ZakuraTrace,
     },
     Config,
 };
@@ -50,7 +51,7 @@ use super::header_node::HeaderNode;
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
-    observe::{HeaderCheckFact, TransitionFact, TransportFact, TransportLimits},
+    observe::{HeaderCheckFact, SessionStepFact, TransitionFact, TransportFact, TransportLimits},
     peer::{key_index, peer_addr, peer_of, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -508,10 +509,53 @@ impl TransportTap {
                 self.remote(conn_id)?,
                 TransportFact::TornDown,
             ),
+            TransportEvent::SessionLifecycle {
+                conn_id,
+                kind,
+                step,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::SessionLifecycle {
+                    kind,
+                    step: session_step(step),
+                },
+            ),
             // The enum is non-exhaustive, and an event the log can't hold would
             // leave the evidence silently incomplete.
             unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
         })
+    }
+}
+
+/// `step` in plain fields.
+fn session_step(step: SessionStep) -> SessionStepFact {
+    match step {
+        SessionStep::AttemptStarted { attempt } => SessionStepFact::AttemptStarted { attempt },
+        SessionStep::AttemptFailed { attempt } => SessionStepFact::AttemptFailed { attempt },
+        SessionStep::MemberArrived { wire_id, member } => {
+            SessionStepFact::MemberArrived { wire_id, member }
+        }
+        SessionStep::OfferExpired { wire_id } => SessionStepFact::OfferExpired { wire_id },
+        SessionStep::GenerationInstalled {
+            generation,
+            attempt,
+        } => SessionStepFact::GenerationInstalled {
+            generation,
+            attempt,
+        },
+        SessionStep::GenerationParked { generation } => {
+            SessionStepFact::GenerationParked { generation }
+        }
+        SessionStep::GenerationExited {
+            generation,
+            opened_locally,
+            current,
+        } => SessionStepFact::GenerationExited {
+            generation,
+            opened_locally,
+            current,
+        },
     }
 }
 

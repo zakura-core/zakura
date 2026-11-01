@@ -101,6 +101,27 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test startup CPU requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=crates/zakurad/src/bin/zakurad/cpu_features.rs
+          for mode in minimal default portable; do
+            flags=()
+            case "$mode" in
+              default) flags=(--cfg 'feature="x86_64-asm"') ;;
+              portable) flags=(--cfg 'feature="x86_64-asm"' --cfg 'feature="portable"') ;;
+            esac
+            rustc --edition=2021 --test "$source" "${flags[@]}" -o "$RUNNER_TEMP/cpu-tests"
+            "$RUNNER_TEMP/cpu-tests"
+          done
+          rustc --edition=2021 --test "$source" --cfg 'feature="portable"' \
+            -C target-feature=+bmi2,+adx -o "$RUNNER_TEMP/cpu-target-tests"
+          if grep -qw bmi2 /proc/cpuinfo && grep -qw adx /proc/cpuinfo; then
+            "$RUNNER_TEMP/cpu-target-tests"
+          else
+            echo "Compiled target-feature tests; runner lacks BMI2/ADX for execution."
+          fi
       - uses: ./.github/actions/setup-zakura-build
         with:
           # `cargo xtask check-rpc-artifacts` below regenerates the gRPC code.
@@ -110,6 +131,16 @@ jobs:
       - name: Check locked all-feature build
         if: ${{ !cancelled() }}
         run: cargo check --locked --all-features --all-targets
+      - name: Check default x86 assembly features
+        if: ${{ !cancelled() }}
+        run: |
+          cargo tree --locked --package zakura --target x86_64-unknown-linux-gnu \
+            -e features -i zakura-pasta-curves > "$RUNNER_TEMP/pasta-default-features"
+          grep -F 'zakura-pasta-curves feature "x86_64-asm"' "$RUNNER_TEMP/pasta-default-features"
+          if grep -F 'zakura-pasta-curves feature "portable"' "$RUNNER_TEMP/pasta-default-features"; then
+            echo "Default builds must select assembly, not the portable override." >&2
+            exit 1
+          fi
       - name: Check generated RPC artifacts
         if: ${{ !cancelled() }}
         run: cargo xtask check-rpc-artifacts

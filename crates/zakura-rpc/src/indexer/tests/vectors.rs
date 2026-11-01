@@ -31,6 +31,15 @@ use crate::{
     sync::{IndexerClientConfig, IndexerClientTlsConfig},
 };
 
+/// A funded serialized block for a mocked state response.
+#[cfg(feature = "indexer")]
+fn raw_block(bytes: Vec<u8>) -> zakura_node_services::block_memory::OwnedRawBlock {
+    zakura_node_services::block_memory::DecodedPayloadPool::new(std::num::NonZeroU16::MIN)
+        .try_decode(|| Some(bytes))
+        .expect("a new pool has capacity")
+        .expect("the mock supplies the payload")
+}
+
 #[tokio::test]
 async fn rpc_server_spawn() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -301,8 +310,8 @@ async fn test_get_block_range(
         })
         .await
         .respond(ReadResponse::RawBlocks(vec![
-            (Height(1), block1.zcash_serialize_to_vec()?),
-            (Height(2), block2.zcash_serialize_to_vec()?),
+            (Height(1), raw_block(block1.zcash_serialize_to_vec()?)),
+            (Height(2), raw_block(block2.zcash_serialize_to_vec()?)),
         ]));
 
     let mut stream = request_task
@@ -377,8 +386,8 @@ async fn test_get_block_range(
         })
         .await
         .respond(ReadResponse::RawBlocks(vec![
-            (Height(1), block1.zcash_serialize_to_vec()?),
-            (Height(2), block2.zcash_serialize_to_vec()?),
+            (Height(1), raw_block(block1.zcash_serialize_to_vec()?)),
+            (Height(2), raw_block(block2.zcash_serialize_to_vec()?)),
         ]));
 
     let mut stream = request_task
@@ -428,7 +437,9 @@ async fn test_get_block_range(
                     .await
                     .respond(ReadResponse::RawBlocks(
                         (start..start + count)
-                            .map(|height| (Height(height), height.to_be_bytes().to_vec()))
+                            .map(|height| {
+                                (Height(height), raw_block(height.to_be_bytes().to_vec()))
+                            })
                             .collect(),
                     ));
             }
@@ -481,7 +492,7 @@ async fn test_get_block_range(
         .await
         .respond(ReadResponse::RawBlocks(
             (0..10)
-                .map(|height| (Height(height), height.to_be_bytes().to_vec()))
+                .map(|height| (Height(height), raw_block(height.to_be_bytes().to_vec())))
                 .collect(),
         ));
 

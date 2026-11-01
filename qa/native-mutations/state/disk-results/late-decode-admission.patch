@@ -1,0 +1,14 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -115,10 +115,10 @@
+         if !matches!(self.0.limit, RetentionLimit::Blocks(_)) {
+             return Err(AdmissionFailure::DecodeRequiresCountLimit);
+         }
+-        let mut charge = self.reserve(0, Admission::WithinLimit)?;
+         let Some(mut block) = decode() else {
+             return Ok(None);
+         };
++        let mut charge = self.reserve(0, Admission::WithinLimit)?;
+         if Arc::get_mut(&mut block.header).is_none()
+             || block
+                 .transactions

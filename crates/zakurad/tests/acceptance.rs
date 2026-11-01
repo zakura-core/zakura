@@ -3528,7 +3528,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
         let block = block.expect("should have block with latest_chain_tip hash");
 
-        let spends_with_spending_tx_hashes = block.transactions().flat_map(|tx| {
+        let spends_with_spending_tx_hashes = block.view().transactions().flat_map(|tx| {
             let tx_hash = tx.hash();
             tx.inputs()
                 .iter()

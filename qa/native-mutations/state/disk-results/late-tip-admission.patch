@@ -1,0 +1,19 @@
+--- a/crates/zakura-state/src/service/write.rs
++++ b/crates/zakura-state/src/service/write.rs
+@@ -3042,8 +3042,6 @@
+                 } => {
+                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
+                     let result = (|| {
+-                        // Acquire the fallback before committing any operator change.
+-                        let finalized_tip = super::finalized_chain_tip(&finalized_state.db)?;
+                         let result = if let Some(writer) = header_chain.as_ref() {
+                             let mut staged = non_finalized_state.clone();
+                             staged.invalidate_block(hash).and_then(|result| {
+@@ -3064,6 +3062,7 @@
+                         } else {
+                             non_finalized_state.invalidate_block(hash)
+                         };
++                        let finalized_tip = super::finalized_chain_tip(&finalized_state.db)?;
+                         if result.is_ok() {
+                             update_channels_after_operator_change(
+                                 non_finalized_state,

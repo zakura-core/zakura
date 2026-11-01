@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -290,7 +290,7 @@
+         &self,
+         hash_or_height: HashOrHeight,
+     ) -> Result<Option<OwnedRawBlock>, PayloadAdmissionFailure> {
+-        self.read_raw_blocks
++        zakura_node_services::block_memory::DecodedPayloadPool::new(self.config.read_raw_block_limit)
+             .try_decode(|| self.raw_block_bytes_within(hash_or_height, usize::MAX))
+     }
+ 

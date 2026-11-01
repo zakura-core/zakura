@@ -1551,6 +1551,38 @@ mod tests {
         }
     }
 
+    /// Removal leaves no index entry for a removed node, including empty sets.
+    #[test]
+    fn removing_nodes_leaves_no_residual_index_entries() {
+        let mut store = anchor_store();
+        let root = store.finalized_frontier;
+        let first = insert_child(&mut store, root.hash, 1);
+        let fork = insert_child(&mut store, root.hash, 2);
+        let tip = insert_child(&mut store, first.hash, 3);
+        let dead_fork = insert_child(&mut store, fork.hash, 4);
+
+        store.remove_header_leaf(dead_fork.hash).unwrap();
+        assert!(!store.children.contains_key(&dead_fork.hash));
+        assert!(!store.children.contains_key(&fork.hash));
+        assert!(!store.eligible_header_tips.contains(&dead_fork.hash));
+        assert!(store.heights[&dead_fork.height].contains(&tip.hash));
+
+        store.advance_finalized_frontier(first).unwrap();
+        assert_eq!(store.header_node_count(), 2);
+        assert_eq!(store.heights.len(), 2);
+        assert!(!store.heights.contains_key(&root.height));
+        assert_eq!(store.children.len(), 1);
+        assert!(store.children.contains_key(&first.hash));
+        assert!(store
+            .nodes
+            .keys()
+            .all(|hash| *hash == first.hash || *hash == tip.hash));
+        assert!(store
+            .eligible_header_tips
+            .iter()
+            .all(|hash| *hash == tip.hash));
+    }
+
     fn rebuild_finalized_reference(
         store: &mut MemHeaderStore,
         finalized: Frontier,

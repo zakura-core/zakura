@@ -1,0 +1,10 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -214,6 +214,7 @@
+         hash_or_height: HashOrHeight,
+         pool: &zakura_node_services::block_memory::DecodedBlockPool,
+     ) -> Result<Option<BlockHandle>, AdmissionFailure> {
++        let pool = &zakura_node_services::block_memory::DecodedBlockPool::for_block_count(self.config.read_block_limit.into());
+         pool.try_decode(|| {
+             let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
+             let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());

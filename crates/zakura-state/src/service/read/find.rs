@@ -28,11 +28,11 @@ use zakura_chain::{
 use crate::{
     constants,
     service::{
-        block_iter::any_ancestor_blocks,
+        block_iter::any_chain_ancestor_iter,
         check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
         finalized_state::ZakuraDb,
         non_finalized_state::{Chain, NonFinalizedState},
-        read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
+        read::{self, block::block_header_result, FINALIZED_STATE_QUERY_RETRIES},
     },
     BoxError, KnownBlock,
 };
@@ -70,7 +70,10 @@ where
 pub fn tip_block<C>(
     chain: Option<C>,
     db: &ZakuraDb,
-) -> Option<zakura_node_services::block_memory::BlockHandle>
+) -> Result<
+    Option<zakura_node_services::block_memory::BlockHandle>,
+    zakura_node_services::block_memory::AdmissionFailure,
+>
 where
     C: AsRef<Chain>,
 {
@@ -80,9 +83,11 @@ where
     // where the finalized tip is above the non-finalized tip,
     // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
     // so it is acceptable to return either tip.
-    chain
-        .and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
-        .or_else(|| db.tip_block().map(Into::into))
+    if let Some(block) = chain.and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
+    {
+        return Ok(Some(block));
+    }
+    db.tip_block()
 }
 
 /// Returns the tip [`Height`] of `chain`.
@@ -534,14 +539,18 @@ where
 /// Returns a list of [`block::Header`]s in the chain,
 /// following the `intersection` with the chain.
 ///
-/// See [`find_chain_hashes()`] for details.
+/// See [`find_chain_hashes()`] for details. Exhausted capacity shortens a non-empty
+/// response, which the Find protocol permits, and fails an empty one.
 fn collect_chain_headers<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     intersection: Option<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<zakura_node_services::block_memory::HeaderHandle>
+) -> Result<
+    Vec<zakura_node_services::block_memory::HeaderHandle>,
+    zakura_node_services::block_memory::PayloadAdmissionFailure,
+>
 where
     C: AsRef<Chain>,
 {
@@ -555,8 +564,13 @@ where
 
     // All the headers should be in the chain.
     // If they are not, we don't want to return them.
-    height_range.into_iter().map_while(|height| {
-        let header = block_header(chain, db, Height(height).into());
+    let mut headers = Vec::new();
+    for height in height_range {
+        let header = match block_header_result(chain, db, Height(height).into()) {
+            Ok(header) => header,
+            Err(_) if !headers.is_empty() => break,
+            Err(error) => return Err(error),
+        };
 
         // A recently committed block dropped the intersection we previously found
         if header.is_none() {
@@ -576,8 +590,12 @@ where
             "adding header to peer Find response",
         );
 
-        header
-    }).collect()
+        let Some(header) = header else {
+            break;
+        };
+        headers.push(header);
+    }
+    Ok(headers)
 }
 
 /// Finds the first hash that's in the peer's `known_blocks` and the chain.
@@ -629,7 +647,10 @@ pub fn find_chain_headers<C>(
     known_blocks: Vec<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<zakura_node_services::block_memory::HeaderHandle>
+) -> Result<
+    Vec<zakura_node_services::block_memory::HeaderHandle>,
+    zakura_node_services::block_memory::PayloadAdmissionFailure,
+>
 where
     C: AsRef<Chain>,
 {
@@ -684,13 +705,16 @@ pub fn next_median_time_past(
 fn best_relevant_chain(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-) -> Result<Vec<zakura_node_services::block_memory::BlockHandle>, BoxError> {
+) -> Result<Vec<zakura_node_services::block_memory::HeaderHandle>, BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
-    let best_relevant_chain =
-        any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
+    let best_relevant_chain = any_chain_ancestor_iter::<block::Header>(
+        non_finalized_state,
+        db,
+        state_tip_before_queries.1,
+    );
     let best_relevant_chain: Vec<_> = best_relevant_chain
         .into_iter()
         .take(POW_MEDIAN_BLOCK_SPAN)
@@ -718,12 +742,10 @@ fn best_relevant_chain(
 ///
 /// See [`next_median_time_past()`] for details.
 pub(crate) fn calculate_median_time_past(
-    relevant_chain: Vec<zakura_node_services::block_memory::BlockHandle>,
+    relevant_chain: Vec<zakura_node_services::block_memory::HeaderHandle>,
 ) -> DateTime32 {
-    let relevant_data: Vec<DateTime<Utc>> = relevant_chain
-        .iter()
-        .map(|block| block.header().time)
-        .collect();
+    let relevant_data: Vec<DateTime<Utc>> =
+        relevant_chain.iter().map(|header| header.time).collect();
 
     // > Define the median-time-past of a block to be the median of the nTime fields of the
     // > preceding PoWMedianBlockSpan blocks (or all preceding blocks if there are fewer than

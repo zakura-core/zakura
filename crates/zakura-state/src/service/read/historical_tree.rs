@@ -102,6 +102,14 @@ impl DerivedFrontiers {
 /// path, and a node that cannot derive simply cannot answer the request.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HistoricalTreeDerivationError {
+    /// A standalone disk transaction could not acquire decode admission.
+    #[error("disk transaction admission failed: {0}")]
+    PayloadAdmission(#[from] zakura_node_services::block_memory::PayloadAdmissionFailure),
+
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// A subtree audit endpoint is not above its anchor, so there is no replay range.
     #[error(
         "cannot verify note commitment subtrees in ({from:?}, {to:?}]: the endpoint must be above \
@@ -559,7 +567,7 @@ pub fn replay_with_subtrees(
             error: error.to_string(),
         };
 
-        let Some((first_location, first_transaction)) = transactions.next() else {
+        let Some((first_location, first_transaction)) = transactions.next().transpose()? else {
             return Err(HistoricalTreeDerivationError::MissingBlockBody {
                 height,
                 missing: block_height,
@@ -583,13 +591,20 @@ pub fn replay_with_subtrees(
             &mut orchard_commitments,
             &mut ironwood_commitments,
         );
+        drop(first_transaction);
         while transactions
             .peek()
-            .is_some_and(|(location, _)| location.height == block_height)
+            .map(|item| {
+                item.as_ref()
+                    .map(|(location, _)| location.height == block_height)
+                    .map_err(|error| *error)
+            })
+            .transpose()?
+            .unwrap_or(false)
         {
             let (_, transaction) = transactions
                 .next()
-                .expect("a transaction observed through peek is available");
+                .expect("a transaction observed through peek is available")?;
             extend_commitments(
                 &transaction,
                 &mut sapling_commitments,
@@ -699,7 +714,7 @@ pub(crate) fn verify_against_available_roots(
     height: Height,
     frontiers: &DerivedFrontiers,
 ) -> Result<(), HistoricalTreeDerivationError> {
-    let roots = serve_block_roots(db, height..=height)
+    let roots = serve_block_roots(db, height..=height)?
         .into_iter()
         .next()
         .filter(|roots| roots.height == height)

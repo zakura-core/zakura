@@ -714,6 +714,83 @@ pub struct Config {
     pub debug_blocksync_throughput_target_height: Option<u32>,
 }
 
+/// The most block verifications that every sync and gossip path can submit together.
+///
+/// The verifier router has no admission of its own, so its callers hold the shared bound
+/// as a static partition. This allowance keeps a configured limit from turning the
+/// partition into an unbounded backlog.
+pub const MAX_BACKEND_BLOCK_VERIFICATIONS: usize = 100_000;
+
+/// Block verifications that each path can hold in the shared verifier router.
+///
+/// The verifier router is one backend. Legacy sync, native block sync, and gossip each
+/// hold their own limit. This partition proves that their sum fits one node allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendExecutionPartition {
+    /// Legacy sync's checkpoint verifications, including its pipeline scaling.
+    pub legacy_checkpoint: usize,
+    /// Legacy sync's full verifications.
+    pub legacy_full: usize,
+    /// Native block sync's combined applies.
+    pub native_apply: usize,
+    /// Gossiped block downloads that can reach verification.
+    pub inbound_gossip: usize,
+}
+
+impl BackendExecutionPartition {
+    /// Sum every path. The constructor proved that this cannot overflow.
+    pub fn total(&self) -> usize {
+        self.legacy_checkpoint + self.legacy_full + self.native_apply + self.inbound_gossip
+    }
+}
+
+/// Why configured verification limits do not fit the node's shared allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BackendExecutionError {
+    /// The limits overflow when the partition scales or adds them.
+    #[error("block verification concurrency limits overflow")]
+    Overflow,
+    /// The sum of the limits exceeds [`MAX_BACKEND_BLOCK_VERIFICATIONS`].
+    #[error(
+        "block verification concurrency limits total {total}, \
+         above the {MAX_BACKEND_BLOCK_VERIFICATIONS} node allowance"
+    )]
+    AboveAllowance {
+        /// Configured sum.
+        total: usize,
+    },
+}
+
+impl Config {
+    /// Check that the sync and gossip paths fit one verifier allowance.
+    pub fn backend_execution_partition(
+        &self,
+    ) -> Result<BackendExecutionPartition, BackendExecutionError> {
+        let partition = BackendExecutionPartition {
+            legacy_checkpoint: self
+                .checkpoint_verify_concurrency_limit
+                .checked_mul(VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
+                .ok_or(BackendExecutionError::Overflow)?,
+            legacy_full: self.full_verify_concurrency_limit,
+            native_apply: self.zakura_block_apply_concurrency_limit,
+            inbound_gossip: crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY,
+        };
+        let total = [
+            partition.legacy_checkpoint,
+            partition.legacy_full,
+            partition.native_apply,
+            partition.inbound_gossip,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(BackendExecutionError::Overflow)?;
+        if total > MAX_BACKEND_BLOCK_VERIFICATIONS {
+            return Err(BackendExecutionError::AboveAllowance { total });
+        }
+        Ok(partition)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {

@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/block_range.rs
++++ b/crates/zakura-state/src/service/block_range.rs
+@@ -173,7 +173,7 @@
+         ReadRequest::BlocksByHeightRange { start, count }.count_metric();
+         let state = self.clone();
+         spawn_owned_block_range(
+-            self.db.read_worker_capacity(),
++            Arc::new(tokio::sync::Semaphore::new(1)),
+             start,
+             count,
+             max_response_bytes,

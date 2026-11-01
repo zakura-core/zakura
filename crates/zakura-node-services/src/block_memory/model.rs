@@ -13,6 +13,31 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+/// Weak reads of the actual standalone payload allocation.
+pub struct PayloadProbe<T>(Weak<RetainedPayload<T>>);
+
+impl<T> PayloadProbe<T> {
+    /// Observe a returned allocation without extending its lifetime.
+    pub fn new(payload: &OwnedPayload<T>) -> Self {
+        Self(Arc::downgrade(&payload.0))
+    }
+
+    /// Count actual retained handles at a stable boundary.
+    pub fn holders(&self) -> usize {
+        self.0.strong_count()
+    }
+}
+
+impl<T: ZcashSerialize> PayloadProbe<T> {
+    /// Measure the live payload's serialization independently of admission bookkeeping.
+    /// This measures content, not the allocation's decoded memory size.
+    pub fn serialized_bytes(&self) -> Option<usize> {
+        self.0
+            .upgrade()
+            .map(|allocation| allocation.payload.zcash_serialized_size())
+    }
+}
+
 const SLOTS: usize = 8;
 
 /// One pool's current counters, read after a completed operation.

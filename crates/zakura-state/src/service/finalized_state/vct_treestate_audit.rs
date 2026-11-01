@@ -427,7 +427,11 @@ pub struct ReplayInputs {
 }
 
 /// Returns what the blocks in `[from, to]` contain, for cost-model fitting.
-pub fn replay_inputs(db: &ZakuraDb, from: Height, to: Height) -> ReplayInputs {
+pub fn replay_inputs(
+    db: &ZakuraDb,
+    from: Height,
+    to: Height,
+) -> Result<ReplayInputs, zakura_node_services::block_memory::AdmissionFailure> {
     let mut inputs = ReplayInputs::default();
 
     for height in from.0..=to.0 {
@@ -437,16 +441,16 @@ pub fn replay_inputs(db: &ZakuraDb, from: Height, to: Height) -> ReplayInputs {
             .block_info(height.into())
             .map_or(0, |info| u64::from(info.size()));
 
-        if let Some(block) = db.block(height.into()) {
+        if let Some(block) = db.block(height.into())? {
             // Cast is safe: one block holds far fewer commitments than fit in a u64.
-            inputs.commitments += (block.sapling_note_commitments().count()
-                + block.orchard_note_commitments().count()
-                + block.ironwood_note_commitments().count())
+            inputs.commitments += (block.view().sapling_note_commitments().count()
+                + block.view().orchard_note_commitments().count()
+                + block.view().ironwood_note_commitments().count())
                 as u64;
         }
     }
 
-    inputs
+    Ok(inputs)
 }
 
 #[cfg(test)]

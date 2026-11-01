@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service.rs
++++ b/crates/zakura-state/src/service.rs
+@@ -2873,7 +2873,7 @@
+             ReadRequest::Tip
+             | ReadRequest::FinalizedTip
+             | ReadRequest::Depth(_)
+-            | ReadRequest::BestChainNextMedianTimePast => self.db.control_read_worker_capacity(),
++            | ReadRequest::BestChainNextMedianTimePast => self.db.read_worker_capacity(),
+             _ => self.db.read_worker_capacity(),
+         };
+ 

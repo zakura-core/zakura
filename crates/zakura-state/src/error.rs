@@ -164,6 +164,14 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
+    /// The configured read limits cannot fund their workers and one legal result.
+    #[error("invalid read capacity configuration: {0}")]
+    ReadCapacity(#[from] crate::config::ReadCapacityError),
+
     /// The configured historical frontier artifact could not be read or decoded.
     ///
     /// Only nodes that derive historical trees reach this. A node that does not derive ignores an
@@ -558,6 +566,10 @@ impl From<ValidateContextError> for CommitCheckpointVerifiedError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum InvalidateError {
+    /// The fallback finalized tip could not acquire disk-result capacity.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The state is currently checkpointing blocks and cannot accept invalidation requests.
     #[error("cannot invalidate blocks while still committing checkpointed blocks")]
     ProcessingCheckpointedBlocks,
@@ -591,6 +603,10 @@ pub enum InvalidateError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ReconsiderError {
+    /// The fallback finalized tip could not acquire disk-result capacity.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The block is not found in the list of invalidated blocks.
     #[error("Block with hash {0} was not previously invalidated")]
     MissingInvalidatedBlock(block::Hash),

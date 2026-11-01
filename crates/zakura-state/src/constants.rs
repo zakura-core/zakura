@@ -152,6 +152,17 @@ pub const MAX_FIND_BLOCK_HASHES_RESULTS: u32 = 500;
 /// The maximum number of block headers allowed in `getheaders` responses in the Zcash network protocol.
 pub const MAX_FIND_BLOCK_HEADERS_RESULTS: u32 = 160;
 
+/// Read-service slots reserved for bounded chain-tip and depth queries.
+/// Bulk reads cannot occupy this admission pool.
+pub(crate) const CONTROL_READ_CONCURRENCY: usize = 4;
+
+/// Callers that can wait for a control read worker.
+pub(crate) const CONTROL_READ_WAITERS: usize = 1024;
+
+/// Full disk blocks retained by chain-tip publication, separate from ordinary results.
+/// Old tip subscribers keep their charge; exhaustion refuses operator changes before commit.
+pub(crate) const CHAIN_TIP_BLOCK_RETENTION: u64 = 4;
+
 /// The maximum number of headers returned by native Zakura header-sync range reads.
 ///
 /// This must match `zakura-network`'s stream-5 hard cap, but lives here to avoid

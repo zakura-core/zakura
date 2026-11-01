@@ -1105,7 +1105,7 @@ where
                     );
 
                 if parent_is_missing {
-                    let header = block.header().clone();
+                    let header = *block.header();
                     let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
                         zakura_consensus::proof_of_work_is_valid(
                             &header,

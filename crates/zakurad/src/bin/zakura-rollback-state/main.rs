@@ -7,8 +7,15 @@
 use clap::Parser;
 use zakurad::commands::rollback_state::RollbackStateCmd;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "../zakurad/cpu_features.rs"]
+mod cpu_features;
+
 /// Process entry point for `zakura-rollback-state`.
 fn main() {
+    #[cfg(target_arch = "x86_64")]
+    cpu_features::exit_if_cpu_lacks_pasta_assembly_features();
+
     let command = RollbackStateCmd::parse();
 
     if let Err(error) = command.run_with_config(

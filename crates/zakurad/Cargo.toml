@@ -69,10 +69,10 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc"]
+default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc", "x86_64-asm"]
 
 
-# Local builds use the compiler's target features for Pasta arithmetic.
+# Standard builds enable Pasta assembly; `portable` is the explicit override.
 default = ["default-release-binaries"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
@@ -81,8 +81,12 @@ howudoin = []
 indicatif = []
 
 # Disable x86-64 Pasta assembly for redistributable binaries.
-# Local builds can use BMI2+ADX when enabled by the Rust target.
+# Overrides both `x86_64-asm` and compiler-selected Pasta assembly.
 portable = ["dep:orchard", "orchard/portable"]
+
+# Force BMI2+ADX Pasta arithmetic without changing global compiler target flags.
+# The startup CPU check rejects unsupported x86-64 machines; `portable` wins.
+x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
@@ -158,7 +162,7 @@ zakura-state = { path = "../zakura-state", version = "11.1.0-rc0" }
 zakura-script = { path = "../zakura-script", version = "5.0.1-rc0" }
 zcash_script = { workspace = true }
 
-# Only used to forward portable arithmetic through Orchard and Halo 2. Cargo
+# Only used to forward arithmetic features through Orchard and Halo 2. Cargo
 # feature unification applies it to the existing transitive dependencies.
 orchard = { workspace = true, optional = true }
 

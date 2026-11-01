@@ -110,6 +110,34 @@ fn assert_tip_and_utxos(cache_dir: &Path, pruned: bool, blocks: &[Arc<Block>], h
     }
 }
 
+/// Unsupported x86 hosts must fail before opening or creating a state database.
+#[cfg(all(
+    target_arch = "x86_64",
+    feature = "x86_64-asm",
+    not(feature = "portable")
+))]
+#[test]
+fn standalone_rollback_rejects_unsupported_cpu_before_opening_state() {
+    if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("adx") {
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("disposable directory exists");
+    let cache_dir = dir.path().join("state");
+    let output = rollback(&cache_dir, &["--dry-run"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("This Zakura binary requires CPU features this machine lacks"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !cache_dir.exists(),
+        "CPU rejection must not create a state database"
+    );
+}
+
 #[test]
 fn standalone_pruned_rollback_previews_then_removes_tip_and_outputs() {
     let dir = tempfile::tempdir().expect("disposable directory exists");

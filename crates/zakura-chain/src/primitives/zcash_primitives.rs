@@ -1,7 +1,7 @@
 //! Contains code that interfaces with the zcash_primitives crate from
 //! librustzcash.
 
-use std::{io, ops::Deref, sync::Arc};
+use std::{io, sync::Arc};
 
 use zcash_primitives::transaction::{self as zp_tx, TxDigests};
 use zcash_protocol::value::{BalanceError, ZatBalance, Zatoshis};
@@ -256,12 +256,12 @@ impl PrecomputedTxData {
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
-        let tx = tx.to_librustzcash(nu)?;
+        let tx = tx.to_librustzcash_data(nu)?;
 
         let txid_parts = match tx.version() {
             zp_tx::TxVersion::Sprout(_) | zp_tx::TxVersion::V3 | zp_tx::TxVersion::V4 => None,
             zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
-                Some(tx.deref().digest(zp_tx::txid::TxIdDigester))
+                Some(tx.digest(zp_tx::txid::TxIdDigester))
             }
         };
 
@@ -271,7 +271,7 @@ impl PrecomputedTxData {
             },
         };
 
-        let tx_data: zp_tx::TransactionData<PrecomputedAuth> = tx.into_data().map_authorization(
+        let tx_data: zp_tx::TransactionData<PrecomputedAuth> = tx.map_authorization(
             f_transparent,
             IdentityMap,
             IdentityMap,

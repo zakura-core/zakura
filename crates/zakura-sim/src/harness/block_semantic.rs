@@ -29,6 +29,9 @@ use super::{
 /// The fuzz prefix that draws [`BlockScenario::reset_mid_flight`].
 pub const RESET_MID_FLIGHT_TAG: [u8; 2] = [0xFF, 0x0C];
 
+/// The fuzz prefix that draws [`BlockScenario::reset_past_tip`].
+pub const RESET_PAST_TIP_TAG: [u8; 2] = [0xFF, 0x0E];
+
 /// The fuzz prefix that draws [`BlockScenario::stale_beside_current`].
 pub const STALE_BESIDE_CURRENT_TAG: [u8; 2] = [0xFF, 0x06];
 
@@ -93,6 +96,38 @@ impl BlockScenario {
                         apply_when: None,
                     },
                     when: Some(Trigger::Submitted(Select::nth(BlockKind::Apply, 3))),
+                },
+                relink("mirror-0"),
+            ],
+            ..BlockScenario::default()
+        }
+    }
+
+    /// Sixteen blocks from two mirrors, one dialing each way. Once storage
+    /// answers the node's tenth submission, every actor switches to a fork
+    /// from height 4, the node first. The verified tip is then above the fork
+    /// on any schedule, so storage installs a verified reset, which
+    /// [`BlockScenario::reset_mid_flight`]'s earlier and higher fork reaches
+    /// only on some schedules.
+    pub fn reset_past_tip() -> Self {
+        BlockScenario {
+            blocks: 16,
+            mirrors: vec![
+                MirrorSpec::new(Dialer::Mirror),
+                MirrorSpec::new(Dialer::Node),
+            ],
+            control: vec![
+                ControlStep {
+                    action: ControlAction::Reset {
+                        fork: Fork {
+                            branch: 1,
+                            at: 4,
+                            len: 14,
+                        },
+                        node_first: true,
+                        apply_when: None,
+                    },
+                    when: Some(Trigger::Completed(Select::nth(BlockKind::Apply, 10))),
                 },
                 relink("mirror-0"),
             ],
@@ -322,6 +357,7 @@ impl BlockScenario {
     pub fn semantic_drawn(prefix: &[u8]) -> Option<Self> {
         match prefix.get(..2)? {
             tag if tag == RESET_MID_FLIGHT_TAG => Some(BlockScenario::reset_mid_flight()),
+            tag if tag == RESET_PAST_TIP_TAG => Some(BlockScenario::reset_past_tip()),
             tag if tag == STALE_BESIDE_CURRENT_TAG => Some(BlockScenario::stale_beside_current()),
             tag if tag == CAPACITY_RELEASE_TAG => Some(BlockScenario::capacity_release()),
             tag if tag == STALLED_RESET_TAG => Some(BlockScenario::stalled_reset()),

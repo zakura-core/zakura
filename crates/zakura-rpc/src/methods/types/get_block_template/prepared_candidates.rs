@@ -1,4 +1,5 @@
-//! Bounded work-ID lookup for reconstructing compact mined-block submissions.
+//! Bounded work-ID lookup for reconstructing compact mined-block submissions, and for decoding
+//! full submissions of retained candidates without parsing their transactions again.
 //!
 //! Entries retain block content only. Resolving a work ID does not establish validity or relay
 //! authorization; the reconstructed block still goes through the consensus verifier.
@@ -13,6 +14,7 @@ use std::{
 use zakura_chain::{
     block::{Block, Header},
     parameters::Network,
+    serialization::{ZcashDeserialize, ZcashSerialize},
 };
 use zakura_consensus::PreparedCandidateSource;
 
@@ -97,6 +99,9 @@ struct Partition {
 struct Entry {
     id: EntryId,
     block: Arc<Block>,
+    /// The serialized transaction list of `block`, including its count, as a submitted block
+    /// carries it after the header.
+    transaction_bytes: Arc<[u8]>,
     size: usize,
     expires_at: Instant,
 }
@@ -126,6 +131,11 @@ impl PreparedCandidateResolver {
         source: PreparedCandidateSource,
         _network: &Network,
     ) {
+        let transaction_bytes: Arc<[u8]> = block
+            .transactions
+            .zcash_serialize_to_vec()
+            .expect("serialization to memory cannot fail")
+            .into();
         let size = candidate_size(&block);
         let alias_size = work_id_alias_size(work_id);
         let now = Instant::now();
@@ -173,7 +183,9 @@ impl PreparedCandidateResolver {
             partition.touch_candidate(entry_id, now);
             entry_id
         } else {
-            let Some(entry_id) = partition.insert_candidate(block, size, alias_size, now) else {
+            let Some(entry_id) =
+                partition.insert_candidate(block, transaction_bytes, size, alias_size, now)
+            else {
                 return;
             };
             entry_id
@@ -198,6 +210,34 @@ impl PreparedCandidateResolver {
         Ok(Arc::new(Block {
             header: Arc::new(solved_header),
             transactions: entry.block.transactions.clone(),
+        }))
+    }
+}
+
+impl PreparedCandidateResolver {
+    /// Decodes a submitted block whose transactions are byte-for-byte those of a retained
+    /// candidate with the same preserved header fields, sharing that candidate's parsed
+    /// transactions. Returns `None` for any other bytes, which the caller parses in full.
+    ///
+    /// The result equals what parsing `bytes` would give: the header is parsed from them, and
+    /// parsing the identical transaction bytes gives the candidate's transactions.
+    pub(crate) fn decode_submitted(&self, bytes: &[u8]) -> Option<Arc<Block>> {
+        let mut transaction_bytes = bytes;
+        let header = Header::zcash_deserialize(&mut transaction_bytes).ok()?;
+        let inner = self.lock();
+        let transactions = [&inner.server, &inner.proposals]
+            .into_iter()
+            .flat_map(|partition| &partition.entries)
+            .find(|entry| {
+                preserved_header_fields_match(&entry.block.header, &header)
+                    && *entry.transaction_bytes == *transaction_bytes
+            })?
+            .block
+            .transactions
+            .clone();
+        Some(Arc::new(Block {
+            header: Arc::new(header),
+            transactions,
         }))
     }
 }
@@ -268,6 +308,7 @@ impl Partition {
     fn insert_candidate(
         &mut self,
         block: Arc<Block>,
+        transaction_bytes: Arc<[u8]>,
         size: usize,
         alias_size: usize,
         now: Instant,
@@ -287,6 +328,7 @@ impl Partition {
         self.entries.push_back(Entry {
             id,
             block,
+            transaction_bytes,
             size,
             expires_at: now + ENTRY_TTL,
         });
@@ -390,9 +432,11 @@ fn preserved_header_fields_match(cached: &Header, submitted: &Header) -> bool {
         && cached.difficulty_threshold == submitted.difficulty_threshold
 }
 
+/// The memory an entry for `block` retains: the parsed block and its serialized transactions.
 fn candidate_size(block: &Block) -> usize {
     size_of::<Entry>()
         .saturating_add(usize::try_from(block.attributed_memory_size_bytes()).unwrap_or(usize::MAX))
+        .saturating_add(block.transactions.zcash_serialized_size())
 }
 
 fn work_id_alias_size(work_id: &str) -> usize {
@@ -463,6 +507,71 @@ mod tests {
         for work_id in &partition.work_id_order {
             assert!(partition.entry_for_work_id(work_id).is_some());
         }
+    }
+
+    /// Serializes `block` the way a miner submits it.
+    fn submitted_bytes(block: &Block) -> Vec<u8> {
+        block
+            .zcash_serialize_to_vec()
+            .expect("serialization to memory cannot fail")
+    }
+
+    #[test]
+    fn exact_submissions_reuse_retained_transactions() {
+        let cache = PreparedCandidateResolver::default();
+        let candidate = test_block();
+        insert(&cache, &candidate, "candidate", ServerTemplate);
+
+        let mut solved = Block::clone(&candidate);
+        let header = Arc::make_mut(&mut solved.header);
+        header.nonce.0[0] ^= 1;
+        header.time += chrono::Duration::seconds(1);
+        let bytes = submitted_bytes(&solved);
+
+        let decoded = cache
+            .decode_submitted(&bytes)
+            .expect("a retained candidate's solved block decodes from the cache");
+        assert_eq!(
+            *decoded,
+            Block::zcash_deserialize(&bytes[..]).expect("the submitted bytes parse"),
+            "decoding from the cache gives the same block as parsing"
+        );
+        assert!(Arc::ptr_eq(
+            &decoded.transactions[0],
+            &candidate.transactions[0]
+        ));
+    }
+
+    #[test]
+    fn inexact_submissions_are_parsed_in_full() {
+        let cache = PreparedCandidateResolver::default();
+        let candidate = test_block();
+        insert(&cache, &candidate, "candidate", ServerTemplate);
+        let bytes = submitted_bytes(&candidate);
+        let header_len = submitted_bytes(&Block {
+            header: candidate.header.clone(),
+            transactions: Vec::new(),
+        })
+        .len()
+            - 1;
+
+        let mut changed_transaction = bytes.clone();
+        *changed_transaction
+            .last_mut()
+            .expect("blocks are not empty") ^= 1;
+        assert!(cache.decode_submitted(&changed_transaction).is_none());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(cache.decode_submitted(&trailing).is_none());
+
+        assert!(cache.decode_submitted(&bytes[..bytes.len() - 1]).is_none());
+        assert!(cache.decode_submitted(&bytes[..header_len - 1]).is_none());
+
+        let changed_parent = distinct_block(7);
+        assert!(cache
+            .decode_submitted(&submitted_bytes(&changed_parent))
+            .is_none());
     }
 
     #[test]

@@ -35,6 +35,15 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
   in data, with a collector that turns each run's end time into a feature.
   It checks the feedback transport and searches for nothing.
 
+`discovery_record_book` and `discovery_session_installation` use the shared trace
+and replay pipeline without starting QUIC. Each consumes at most 512 causal
+bytes under its own decoder-v2 identity. They compare the real owner with its
+independent model after each completed operation. They do not establish
+asynchronous races or teardown. `discovery_verification_capacity` runs the real
+handle under the scheduler and checks that unsettled verification results stay
+within the slots while a slow holder keeps the state lock. Run long campaigns
+manually or nightly; these targets add no blocking PR fuzz campaign.
+
 ## Semantic feedback
 
 A target with a collector, `sim_target!(Harness, collector)`, adds abstract

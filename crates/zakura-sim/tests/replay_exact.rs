@@ -1156,3 +1156,138 @@ fn a_foreign_storage_failure_replays_exactly() {
     .expect("the trace replays");
     assert!(report.verified(), "{report:?}");
 }
+
+const DISCOVERY_BOOK_INPUT: &[u8] = include_bytes!("fixtures/discovery-record-book.bin");
+const DISCOVERY_STATE_INPUT: &[u8] = include_bytes!("fixtures/discovery-session-installation.bin");
+
+#[test]
+fn discovery_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_DISCOVERY_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+    }
+}
+
+/// Replays the trace in `dir` in a fresh process.
+fn replay_in_child(dir: &Path) {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "discovery_machine_replay_child"])
+        .env("ZAKURA_DISCOVERY_MACHINE_CHILD", dir)
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+}
+
+#[test]
+fn discovery_book_records_and_replays_signed_samples() {
+    use zakura_sim::record::machine::MachineStep;
+    let entry = harness::find("discovery/record-book").unwrap();
+    let dir = record(entry, DISCOVERY_BOOK_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "discovery/record-book",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.meta.generator, 2);
+    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 4);
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:discovery-book:") && step.draws.is_empty()));
+    let books = || {
+        trace
+            .steps
+            .iter()
+            .filter_map(|step| match step.machine.as_deref() {
+                Some(MachineStep::DiscoveryBook(book)) => Some(book),
+                _ => None,
+            })
+    };
+    let sampled = books().find(|book| !book.sample.is_empty()).unwrap();
+    assert!(sampled.sample.len() <= 3, "a window holds three records");
+    assert!(books().all(|book| book.actual == book.expected));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    assert!(
+        matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable == u32::try_from(trace.steps.len()).unwrap())
+    );
+    replay_in_child(dir.path());
+
+    // A changed signed sample or a changed eviction fact cannot replay.
+    let sampled_step = u64::try_from(sampled.step).unwrap();
+    edit(dir.path(), |lines| {
+        let sample = &mut step(lines, sampled_step)["machine"]["step"]["sample"][0];
+        *sample = json!("00");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            field: "machine",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn discovery_state_records_and_replays_installations() {
+    let entry = harness::find("discovery/session-installation").unwrap();
+    let dir = record(entry, DISCOVERY_STATE_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "discovery/session-installation",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), DISCOVERY_STATE_INPUT.len() / 4);
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    replay_in_child(dir.path());
+    edit(dir.path(), |lines| {
+        step(lines, 1).as_object_mut().unwrap().remove("machine");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 1,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn discovery_machines_preserve_empty_and_short_inputs() {
+    for name in ["discovery/record-book", "discovery/session-installation"] {
+        for input in [&[][..], &[0, 0][..], &[0; 512][..]] {
+            let entry = harness::find(name).unwrap();
+            let dir = record(entry, input);
+            let trace = open(dir.path());
+            let mut sink = zakura_sim::MemorySink::default();
+            let explored = (entry.run_bytes)(input, &mut sink, None);
+            assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+            assert_eq!(trace.steps.len(), input.len().div_ceil(4));
+            assert!(replayed(dir.path(), ReplayOptions::default())
+                .unwrap()
+                .verified());
+        }
+    }
+}
+
+#[test]
+fn verification_capacity_replays_in_a_fresh_process() {
+    let dir = record_named("discovery/verification-capacity", &[]);
+    assert!(replayed(dir.path(), ReplayOptions::default())
+        .unwrap()
+        .verified());
+    replay_in_child(dir.path());
+}

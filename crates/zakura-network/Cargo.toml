@@ -47,6 +47,7 @@ howudoin = []
 sync-metrics = []
 
 # Testing features that activate extra dependencies
+p2p-fuzz = []
 header-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []

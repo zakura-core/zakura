@@ -15,6 +15,7 @@ pub mod block_semantic;
 pub mod block_sync;
 pub mod coverage;
 pub mod discovery;
+pub mod discovery_machine;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
@@ -352,6 +353,8 @@ pub struct HarnessEntry {
     pub generator: u32,
     /// [`Subsystem::SCENARIO_BYTES`].
     pub scenario_bytes: usize,
+    /// Whether short scenario prefixes receive zero padding before decoding.
+    pub pad_scenario: bool,
     /// [`Subsystem::COMPOSES`].
     pub composes: &'static [&'static str],
     /// [`Subsystem::PLANTED`].
@@ -363,7 +366,7 @@ pub struct HarnessEntry {
     /// [`run_config`] for a serialized scenario.
     pub config: fn(&Value) -> Result<RunConfig, HarnessError>,
     /// [`Subsystem::draw`], serialized. The prefix must be exactly
-    /// `scenario_bytes` long.
+    /// `scenario_bytes` long when `pad_scenario` is true.
     pub draw: fn(&[u8]) -> Value,
     /// Every property the harness checks in any scenario, with its status.
     pub properties: fn() -> Vec<PropertyRef>,
@@ -380,6 +383,18 @@ pub type WitnessFn =
     fn(&Value, PlanInput, &str, Expect, &mut dyn RecordSink) -> Result<(), WitnessError>;
 
 impl HarnessEntry {
+    /// Decode the causal prefix, preserving short machine histories.
+    pub fn scenario(&self, input: &[u8]) -> Value {
+        let prefix = &input[..input.len().min(self.scenario_bytes)];
+        if self.pad_scenario && prefix.len() < self.scenario_bytes {
+            let mut padded = prefix.to_vec();
+            padded.resize(self.scenario_bytes, 0);
+            (self.draw)(&padded)
+        } else {
+            (self.draw)(prefix)
+        }
+    }
+
     /// Property `id`'s status in this harness, as the explorer's classifier
     /// reads it. `None` if the harness never reports `id`.
     pub fn status(&self, id: &str) -> Option<Status> {
@@ -407,6 +422,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         name: S::NAME,
         generator: S::GENERATOR,
         scenario_bytes: S::SCENARIO_BYTES,
+        pad_scenario: true,
         composes: S::COMPOSES,
         planted: S::PLANTED,
         run: run_value::<S>,
@@ -421,6 +437,9 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 
 /// Every harness, by name.
 pub static HARNESSES: &[HarnessEntry] = &[
+    discovery_machine::BOOK_ENTRY,
+    discovery_machine::STATE_ENTRY,
+    entry::<discovery::VerificationCapacity>(),
     entry::<fixtures::Race<fixtures::LostUpdate>>(),
     entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
     entry::<fixtures::Race<fixtures::MissedNotify>>(),

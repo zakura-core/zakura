@@ -230,6 +230,30 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/ab-ba", "ab_ba_witness"),
     race("race/abort-without-join", "abort_without_join_witness"),
     Coverage {
+        property: "discovery/record-book",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_book_records_and_replays_signed_samples",
+        ),
+        bypass: Bypass::Planted("skip-book-eviction"),
+    },
+    Coverage {
+        property: "discovery/session-installation",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_state_records_and_replays_installations",
+        ),
+        bypass: Bypass::Planted("install-superseded-result"),
+    },
+    Coverage {
+        property: crate::domain::discovery::VERIFICATION_CAPACITY,
+        passing: passes(
+            "tests/discovery.rs",
+            "verification_results_keep_their_slots",
+        ),
+        bypass: Bypass::Planted("release-before-install"),
+    },
+    Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: passes("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
         bypass: Bypass::Planted("lost-wakeup"),

@@ -3714,6 +3714,60 @@ fn setup_downloads(
     )
 }
 
+/// Parent progress can race the stream collecting a completed deferral. The
+/// duplicate handle must leave its retry eligible, with no retained block body.
+#[tokio::test(start_paused = true)]
+async fn parent_progress_before_collecting_a_deferral_preserves_the_retry() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let mut peers = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(Height(1_687_105));
+    let mut downloads = setup_downloads(peers.clone(), verifier.clone(), tip.clone());
+    downloads.state = tower::util::BoxCloneSyncService::new(tower::service_fn(|_| async {
+        Ok::<_, crate::BoxError>(zs::Response::ParentInputs(
+            zs::ParentInputs::ParentUnavailable,
+        ))
+    }));
+    downloads.download_and_verify(hash).await.unwrap();
+    peers
+        .expect_request(zn::Request::BlocksByHash(IndexSet::from([hash])))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(Arc::strong_count(&block), 1, "deferral retains no body");
+    let budget = downloads.parent_budget.clone();
+    budget.observe(available_parent_state(), tip).await;
+    assert_eq!(budget.take_ready(1).len(), 1);
+    assert!(matches!(
+        downloads.download_and_verify(hash).await,
+        Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. })
+    ));
+    budget.dispatch_refused(&hash);
+    assert!(matches!(
+        downloads.next().await,
+        Some(Err(BlockDownloadVerifyError::MissingParentDeferred(_)))
+    ));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(budget.take_ready(1).len(), 1);
+    downloads.state = available_parent_state();
+    downloads.download_and_verify(hash).await.unwrap();
+    peers
+        .expect_request(zn::Request::BlocksByHash(IndexSet::from([hash])))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block, None))]));
+    verifier
+        .expect_request_that(|request| request.block().hash() == hash)
+        .await
+        .respond(hash);
+    assert!(downloads.next().await.unwrap().is_ok());
+    assert!(!budget.has_pending());
+}
+
 /// A peer that rewrites the coinbase height of a canonical tip child still answers under the
 /// canonical block hash, but must be rejected and attributed instead of silently dropped by the
 /// behind-tip height policy.

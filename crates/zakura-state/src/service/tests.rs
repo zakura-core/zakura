@@ -2870,6 +2870,12 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
     check_parent_inputs(
         &mut state,
         [
+            (blocks[1].hash(), vec![], ParentInputs::Available),
+            (
+                block::Hash([255; 32]),
+                vec![],
+                ParentInputs::ParentUnavailable,
+            ),
             (blocks[1].hash(), vec![coinbase(1)], ParentInputs::Available),
             (
                 blocks[1].hash(),

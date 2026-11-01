@@ -2934,6 +2934,17 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
                 vec![coinbase(5)],
                 ParentInputs::Missing(coinbase(5)),
             ),
+            // Multiple missing inputs still report the first in request order.
+            (
+                blocks[4].hash(),
+                vec![coinbase(3), missing, coinbase(5)],
+                ParentInputs::Missing(missing),
+            ),
+            (
+                blocks[4].hash(),
+                vec![coinbase(5), missing],
+                ParentInputs::Missing(coinbase(5)),
+            ),
             // The finalized tip excludes non-finalized outputs.
             (
                 blocks[1].hash(),
@@ -2961,21 +2972,23 @@ async fn check_parent_inputs(
 ) {
     use tower::{Service, ServiceExt};
     for (parent, outpoints, expected) in cases {
-        let response = state
-            .ready()
-            .await
-            .expect("state is ready")
-            .call(Request::CheckParentInputs {
-                parent,
-                outpoints: outpoints.into(),
-            })
-            .await
-            .expect("the input read succeeds");
-        assert_eq!(
-            response,
-            Response::ParentInputs(expected),
-            "parent {parent:?}"
-        );
+        for outpoints in [outpoints.clone(), outpoints.repeat(64)] {
+            let response = state
+                .ready()
+                .await
+                .expect("state is ready")
+                .call(Request::CheckParentInputs {
+                    parent,
+                    outpoints: outpoints.into(),
+                })
+                .await
+                .expect("the input read succeeds");
+            assert_eq!(
+                response,
+                Response::ParentInputs(expected),
+                "parent {parent:?}"
+            );
+        }
     }
 }
 

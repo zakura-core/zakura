@@ -54,3 +54,17 @@ path = "fuzz_targets/block_sequencer_evidence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "service_session"
+path = "fuzz_targets/service_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cadence"
+path = "fuzz_targets/cadence.rs"
+test = false
+doc = false
+bench = false

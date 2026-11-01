@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -1235,6 +1236,63 @@ async fn block_gossip_slot_tracks_connection_write() {
     connection_task.abort();
 }
 
+/// A `headers` response keeps its state read slots until the wire send finishes.
+#[tokio::test(start_paused = true)]
+async fn tcp_headers_response_holds_read_admission_through_the_send() {
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_node_services::block_memory::{DecodedPayloadPool, HeaderHandle};
+
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let pool = DecodedPayloadPool::new(std::num::NonZeroU16::MIN);
+    let header = pool
+        .try_decode(|| Some(*block.header))
+        .unwrap()
+        .expect("the decoder returned a header");
+
+    let known_blocks = vec![block.hash()];
+    peer_tx
+        .send(Ok(Message::GetHeaders {
+            known_blocks: known_blocks.clone(),
+            stop: None,
+        }))
+        .await
+        .unwrap();
+    inbound
+        .expect_request(Request::FindHeaders {
+            known_blocks,
+            stop: None,
+        })
+        .await
+        .respond(Response::BlockHeaders(vec![HeaderHandle::from(header)]));
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pool.available_slots(),
+        0,
+        "the zero-capacity sink cannot flush until the test reads it"
+    );
+    let Message::Headers(sent) = outbound.next().await.unwrap() else {
+        panic!("a headers response becomes a headers message")
+    };
+    assert_eq!(sent[0].header, block.header);
+    // The connection task finishes its flush and drops the handles on a later turn.
+    for _ in 0..16 {
+        if pool.available_slots() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(pool.available_slots(), 1);
+    connection_task.abort();
+}
+
 /// A block the inbound service leaves out of its response cannot hold a gossip slot.
 #[tokio::test(start_paused = true)]
 async fn truncated_block_request_releases_gossip_slot() {
@@ -1271,4 +1329,305 @@ async fn truncated_block_request_releases_gossip_slot() {
     assert!(!advertisement.await.unwrap());
     assert_eq!(slots.available_permits(), 1);
     connection_task.abort();
+}
+
+/// A short bound for the tests below, whose connections use real time.
+const RESOURCE_TEST_BOUND: Duration = Duration::from_secs(5);
+
+/// Waits for the connection task to bring `budget`'s charge to `bytes`.
+async fn budget_reaches(budget: &crate::inbound_resources::InboundBudget, bytes: u64) {
+    while budget.used() != bytes {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn mainnet_blocks() -> [zakura_chain::block::Block; 2] {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    ]
+}
+
+/// L.objects: a response to this node's own request charges every decoded block until
+/// its handoff. It never refuses, even above the budget's capacity.
+#[tokio::test]
+async fn tcp_response_blocks_charge_until_handoff_without_refusing() {
+    use zakura_node_services::block_memory::BlockHandle;
+
+    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
+        let _init_guard = zakura_test::init();
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (mut connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+        let budget = crate::inbound_resources::InboundBudget::new(1);
+        connection.inbound_budget = budget.clone();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let [first, second] = mainnet_blocks().map(|block| BlockHandle::from(Arc::new(block)));
+        let first_bytes = first.decoded_bytes();
+        let (request_tx, mut response) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::BlocksByHash([first.hash(), second.hash()].into_iter().collect()),
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .expect("the connection accepts its first request");
+        assert!(matches!(
+            outbound.next().await,
+            Some(Message::GetData(items)) if items.len() == 2
+        ));
+
+        peer_tx.send(Ok(Message::Block(first))).await.unwrap();
+        budget_reaches(&budget, first_bytes).await;
+        assert!(matches!(response.try_recv(), Ok(None)));
+
+        peer_tx.send(Ok(Message::Block(second))).await.unwrap();
+        assert!(matches!(
+            response.await.unwrap().unwrap(),
+            Response::Blocks(blocks) if blocks.len() == 2
+        ));
+        budget_reaches(&budget, 0).await;
+        connection_task.abort();
+    })
+    .await
+    .expect("the connection handles its messages");
+}
+
+/// A cancelled request ends the charge for the payloads it already received.
+#[tokio::test]
+async fn cancelling_a_tcp_request_ends_its_response_charge() {
+    use zakura_node_services::block_memory::BlockHandle;
+
+    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
+        let _init_guard = zakura_test::init();
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (mut connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+        let budget = crate::inbound_resources::InboundBudget::new(1);
+        connection.inbound_budget = budget.clone();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let [first, second] = mainnet_blocks().map(|block| BlockHandle::from(Arc::new(block)));
+        let first_bytes = first.decoded_bytes();
+        let (request_tx, response) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::BlocksByHash([first.hash(), second.hash()].into_iter().collect()),
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .expect("the connection accepts its first request");
+        outbound.next().await.expect("the request reaches the peer");
+
+        peer_tx.send(Ok(Message::Block(first))).await.unwrap();
+        budget_reaches(&budget, first_bytes).await;
+        drop(response);
+        budget_reaches(&budget, 0).await;
+        connection_task.abort();
+    })
+    .await
+    .expect("the connection handles its messages");
+}
+
+/// L.objects: an unsolicited block has no retained owner, so it takes no charge.
+/// An unsolicited transaction drops on a saturated budget without faulting the peer,
+/// and otherwise holds its charge until its handler ends.
+#[tokio::test]
+async fn unsolicited_tcp_transactions_respect_the_budget() {
+    use zakura_chain::transaction::UnminedTx;
+
+    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
+        let _init_guard = zakura_test::init();
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (mut connection, _client_tx, mut inbound, mut outbound, error) = new_test_connection();
+        let budget = crate::inbound_resources::InboundBudget::new(1);
+        connection.inbound_budget = budget.clone();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let [block, _] = mainnet_blocks();
+        let transaction = UnminedTx::from(block.transactions[0].clone());
+
+        peer_tx
+            .send(Ok(Message::Block(Arc::new(block).into())))
+            .await
+            .unwrap();
+        let held = budget.try_charge(1).expect("the budget is idle");
+        peer_tx
+            .send(Ok(Message::Tx(transaction.clone())))
+            .await
+            .unwrap();
+
+        // A ping proves the connection finished the refused transaction and stays open.
+        peer_tx
+            .send(Ok(Message::Ping(Nonce::default())))
+            .await
+            .unwrap();
+        assert!(matches!(outbound.next().await, Some(Message::Pong(_))));
+        inbound.expect_no_requests().await;
+        assert!(error.try_get_error().is_none());
+        drop(held);
+
+        peer_tx
+            .send(Ok(Message::Tx(transaction.clone())))
+            .await
+            .unwrap();
+        let request = inbound
+            .expect_request(Request::PushTransaction(transaction, None))
+            .await;
+        assert_eq!(budget.used(), 1, "the oversized item clamps to the budget");
+        request.respond(Response::Nil);
+        budget_reaches(&budget, 0).await;
+        connection_task.abort();
+    })
+    .await
+    .expect("the connection handles its messages");
+}
+
+/// L.headers: a `headers` response charges only its new allocations. A read handle
+/// keeps its own slot and is copied. A shared header has no slot and is not copied.
+#[tokio::test]
+async fn tcp_header_copies_charge_only_their_new_allocations() {
+    use zakura_node_services::block_memory::{DecodedPayloadPool, HeaderHandle};
+
+    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
+        let _init_guard = zakura_test::init();
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (mut connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+        let budget = crate::inbound_resources::InboundBudget::new(1);
+        connection.inbound_budget = budget.clone();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let [first, second] = mainnet_blocks();
+        let shared_header = second.header.clone();
+        let pool = DecodedPayloadPool::new(std::num::NonZeroU16::MIN);
+        let read_header = pool
+            .try_decode(|| Some(*first.header))
+            .unwrap()
+            .expect("the decoder returned a header");
+        let headers = vec![
+            HeaderHandle::from(read_header),
+            HeaderHandle::from(shared_header.clone()),
+        ];
+
+        let (wire, copied_bytes) = crate::peer::connection::wire_headers(&headers);
+        assert!(Arc::ptr_eq(&wire[1].header, &shared_header));
+        assert_eq!(
+            copied_bytes,
+            crate::peer::connection::COPIED_HEADER_BYTES
+                + crate::inbound_resources::vec_retained_bytes(&wire)
+        );
+        drop(wire);
+
+        let known_blocks = vec![first.hash()];
+        peer_tx
+            .send(Ok(Message::GetHeaders {
+                known_blocks: known_blocks.clone(),
+                stop: None,
+            }))
+            .await
+            .unwrap();
+        inbound
+            .expect_request(Request::FindHeaders {
+                known_blocks,
+                stop: None,
+            })
+            .await
+            .respond(Response::BlockHeaders(headers));
+
+        budget_reaches(&budget, copied_bytes).await;
+        assert_eq!(pool.available_slots(), 0, "the handle keeps its read slot");
+
+        let Some(Message::Headers(sent)) = outbound.next().await else {
+            panic!("a headers response becomes a headers message")
+        };
+        assert_eq!(sent.len(), 2);
+        drop(sent);
+        budget_reaches(&budget, 0).await;
+        while pool.available_slots() != 1 {
+            tokio::task::yield_now().await;
+        }
+        connection_task.abort();
+    })
+    .await
+    .expect("the connection handles its messages");
+}
+
+/// C.3, C.4, C.9, C.10, and L.mempool: a row refusal ends the request without an
+/// overload's random disconnect, however often it repeats.
+#[tokio::test]
+async fn a_row_refusal_does_not_fault_a_tcp_peer() {
+    use crate::inbound_resources::{InboundRow, InboundRowRefused};
+
+    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
+        let _init_guard = zakura_test::init();
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (connection, _client_tx, mut inbound, mut outbound, error) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        for _ in 0..16 {
+            peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+            inbound
+                .expect_request(Request::MempoolTransactionIds)
+                .await
+                .respond_error(InboundRowRefused(InboundRow::MempoolTransactionIds).into());
+        }
+        peer_tx
+            .send(Ok(Message::Ping(Nonce::default())))
+            .await
+            .unwrap();
+        assert!(matches!(outbound.next().await, Some(Message::Pong(_))));
+        assert!(error.try_get_error().is_none());
+        connection_task.abort();
+    })
+    .await
+    .expect("the connection handles its messages");
+}
+
+/// L.mempool: an empty snapshot sends nothing, and a larger snapshot than one message
+/// allows sends exactly one message of the protocol's limit.
+#[tokio::test]
+async fn a_tcp_mempool_response_is_bounded() {
+    use zakura_chain::transaction::{self, UnminedTxId};
+
+    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
+        let _init_guard = zakura_test::init();
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await
+            .respond(Response::Nil);
+        peer_tx
+            .send(Ok(Message::Ping(Nonce::default())))
+            .await
+            .unwrap();
+        assert!(matches!(outbound.next().await, Some(Message::Pong(_))));
+
+        let limit = usize::try_from(crate::MAX_TX_INV_IN_SENT_MESSAGE).unwrap();
+        let ids = vec![UnminedTxId::Legacy(transaction::Hash([1; 32])); limit + 1];
+        peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await
+            .respond(Response::TransactionIds(ids));
+        assert!(matches!(
+            outbound.next().await,
+            Some(Message::Inv(items)) if items.len() == limit
+        ));
+        connection_task.abort();
+    })
+    .await
+    .expect("the connection handles its messages");
 }

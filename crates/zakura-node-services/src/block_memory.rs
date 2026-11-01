@@ -658,6 +658,14 @@ impl BlockHandle {
         }
     }
 
+    /// Attributed decoded bytes of this block. A shared block measures them on each call.
+    pub fn decoded_bytes(&self) -> u64 {
+        match self {
+            Self::Shared(block) => block.attributed_memory_size_bytes(),
+            Self::Owned(block) => block.decoded_bytes(),
+        }
+    }
+
     /// End the pipeline byte share when this handle owns a charge.
     pub fn leave_pipeline(&self) {
         if let Self::Owned(block) = self {

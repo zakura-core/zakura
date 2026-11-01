@@ -333,6 +333,68 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     assert_eq!(pool.available_slots(), 1);
 }
 
+/// Legacy `FindBlockHeaders` results keep their read admission beyond the state
+/// boundary, with no unfunded copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_block_headers_results_keep_their_read_admission() {
+    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use std::{num::NonZeroU16, time::Duration};
+    use tokio::time::timeout;
+    use tower::ServiceExt;
+    use zakura_node_services::block_memory::HeaderHandle;
+
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let limit = NonZeroU16::new(2).unwrap();
+    let config = Config {
+        read_header_limit: limit,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    for bytes in [
+        &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
+        &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
+    ] {
+        let block: Arc<Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
+        timeout(
+            deadline,
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let response = timeout(
+        deadline,
+        read.clone().oneshot(ReadRequest::FindBlockHeaders {
+            known_blocks: vec![genesis.hash()],
+            stop: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let ReadResponse::BlockHeaders(headers) = response else {
+        panic!("FindBlockHeaders answers with block headers")
+    };
+    assert_eq!(headers.len(), 1);
+    assert!(matches!(headers[0], HeaderHandle::Standalone(_)));
+    let pool = read.db.read_headers.clone();
+    assert_eq!(
+        pool.available_slots(),
+        usize::from(limit.get()) - 1,
+        "a returned response retains each header's slot"
+    );
+    drop(headers);
+    assert_eq!(pool.available_slots(), usize::from(limit.get()));
+}
+
 /// Header and serialized block results retain shared admission through final holders.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_header_and_raw_block_results_keep_shared_admission() {

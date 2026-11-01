@@ -1,8 +1,8 @@
 //! Zebra Mempool queue checker.
 //!
-//! The queue checker periodically sends a request to the mempool,
-//! so that newly verified transactions are added to the mempool,
-//! and gossiped to peers.
+//! The queue checker sends a request to the mempool whenever a transaction
+//! verification finishes, and periodically as a fallback, so that newly
+//! verified transactions are added to the mempool, and gossiped to peers.
 //!
 //! The mempool performs these actions on every request,
 //! but we can't guarantee that requests will arrive from peers
@@ -11,16 +11,16 @@
 //! Crawler queue requests are also too infrequent,
 //! and they only happen if peers respond within the timeout.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tower::{BoxError, Service, ServiceExt};
 use tracing::Instrument;
 use zakura_node_services::task::spawn_erased;
 
 use crate::components::mempool;
 
-/// The delay between queue check events.
+/// The longest delay between queue check events.
 ///
 /// This interval is chosen so that there are a significant number of
 /// queue checks in each target block interval.
@@ -35,6 +35,9 @@ const RATE_LIMIT_DELAY: Duration = Duration::from_secs(5);
 pub struct QueueChecker<Mempool> {
     /// The mempool service that receives crawled transaction IDs.
     mempool: Mempool,
+
+    /// Signalled after each mempool transaction verification finishes.
+    verification_finished: Arc<Notify>,
 }
 
 impl<Mempool> QueueChecker<Mempool>
@@ -44,13 +47,23 @@ where
     Mempool::Future: Send,
 {
     /// Spawn an asynchronous task to run the mempool queue checker.
-    pub fn spawn(mempool: Mempool) -> JoinHandle<Result<(), BoxError>> {
-        let queue_checker = QueueChecker { mempool };
+    ///
+    /// `verification_finished` must be the signal returned by the mempool's
+    /// `verification_finished` method.
+    pub fn spawn(
+        mempool: Mempool,
+        verification_finished: Arc<Notify>,
+    ) -> JoinHandle<Result<(), BoxError>> {
+        let queue_checker = QueueChecker {
+            mempool,
+            verification_finished,
+        };
 
         spawn_erased(queue_checker.run().in_current_span())
     }
 
-    /// Periodically check if the mempool has newly verified transactions.
+    /// Check if the mempool has newly verified transactions, after each
+    /// verification finishes, or after [`RATE_LIMIT_DELAY`] at the latest.
     ///
     /// Runs until the mempool returns an error,
     /// which happens when Zebra is shutting down.
@@ -58,7 +71,12 @@ where
         info!("initializing mempool queue checker task");
 
         loop {
-            sleep(RATE_LIMIT_DELAY).await;
+            // `Notify` keeps one permit, so signals sent during a check
+            // start one more check rather than being lost.
+            tokio::select! {
+                _ = self.verification_finished.notified() => {}
+                _ = sleep(RATE_LIMIT_DELAY) => {}
+            }
             self.check_queue().await?;
         }
     }
@@ -84,5 +102,32 @@ where
         };
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_test::mock_service::MockService;
+
+    use super::*;
+
+    /// A finished verification starts a queue check well before the periodic
+    /// fallback, so `sendrawtransaction` callers don't wait for it.
+    #[tokio::test]
+    async fn verification_finished_starts_queue_check() {
+        let _init_guard = zakura_test::init();
+
+        let mut mempool = MockService::build().for_unit_tests();
+        let verification_finished = Arc::new(Notify::new());
+        let _queue_checker = QueueChecker::spawn(mempool.clone(), verification_finished.clone());
+
+        mempool.expect_no_requests().await;
+        verification_finished.notify_one();
+
+        // The mock waits far less than `RATE_LIMIT_DELAY` for this request.
+        mempool
+            .expect_request(mempool::Request::CheckForVerifiedTransactions)
+            .await
+            .respond(mempool::Response::CheckedForVerifiedTransactions);
     }
 }

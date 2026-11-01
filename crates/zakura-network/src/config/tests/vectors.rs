@@ -1652,3 +1652,15 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
         assert!(error.contains("at most 3,633"), "unexpected error: {error}");
     }
 }
+
+/// The TCP ingress partition follows the connection limit and cannot overflow.
+#[test]
+fn tcp_ingress_bound_follows_the_connection_limit() {
+    let config = Config::default();
+    assert_eq!(
+        config.tcp_ingress_bound_bytes(),
+        config.peerset_total_connection_limit() as u64
+            * crate::protocol::external::MAX_INCOMPLETE_MESSAGE_BYTES as u64,
+    );
+    assert!(config.tcp_ingress_bound_bytes() > 0);
+}

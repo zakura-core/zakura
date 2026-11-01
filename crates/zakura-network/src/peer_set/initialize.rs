@@ -44,6 +44,7 @@ use zakura_node_services::task::{erased, spawn_buffer};
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
     constants,
+    inbound_resources::InboundRowAdmission,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
         self, address_is_valid_for_inbound_listeners, HandshakeRequest, MinimumPeerVersion,
@@ -249,6 +250,16 @@ where
     // Clone the inbound service for the Zakura legacy-gossip sink before the
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
+    // TCP and compatibility ingress reach the backend through clones of this one
+    // service, so its rows and load-shedding buffer are their shared admission.
+    let inbound_service = InboundRowAdmission::new(
+        inbound_service,
+        config
+            .peerset_total_connection_limit()
+            .saturating_add(crate::zakura::LEGACY_INBOUND_CALLERS),
+    );
+    metrics::gauge!("zcash.net.tcp.ingress.bound.bytes")
+        .set(config.tcp_ingress_bound_bytes() as f64);
     let inbound_for_zakura_sink = inbound_service.clone();
     let peer_registry = PeerRegistry::default();
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(

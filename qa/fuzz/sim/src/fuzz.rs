@@ -102,9 +102,10 @@ pub fn fuzz_one_with(entry: &'static HarnessEntry, collector: NewCollector, inpu
 }
 
 /// Runs `input` on `entry`'s harness on this thread's worker, with
-/// `feedback`'s collector if there is one, and calls `then` on the worker's
-/// thread with the run and its class. Then panics with `abandoned:` if the
-/// process has reached its abandonment limit.
+/// `feedback`'s collector if there is one, counts the run in the process's
+/// stats, and calls `then` on the worker's thread with the run and its
+/// class. Then panics with `abandoned:` if the process has reached its
+/// abandonment limit.
 ///
 /// Under `ZAKURA_SIM_EXPECT` the limit doesn't apply: `tmin` must crash
 /// only on the expected property, and its own run count bounds it.
@@ -114,15 +115,19 @@ fn run(
     feedback: Option<Feedback>,
     then: fn(&'static HarnessEntry, &[u8], &ExploreRun, &Classified),
 ) {
+    let counters = feedback.as_ref().map(Feedback::counters);
+    crate::stats::begin(entry);
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
         worker.explore_with(entry, input, feedback, move |input, run, classified| {
+            let _acting = crate::stats::record(entry, run, classified, counters);
             then(entry, input, run, classified)
         });
         let limit = abandon_limit();
         if expected().is_none() && worker.abandoned() >= limit {
             // The count grows only on an abandoned run, so this input is
             // the one that reached the limit.
+            crate::stats::checkpoint();
             panic!(
                 "{ABANDON_LIMIT_PANIC}: {} runs abandoned their cleanup, and {ABANDON_LIMIT_VAR} \
                  is {limit}; \

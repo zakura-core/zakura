@@ -7,6 +7,7 @@ mod clock;
 mod frame;
 mod guard;
 mod io;
+mod lifetime;
 mod message_rule;
 #[cfg(any(test, zakura_sim))]
 mod observe;
@@ -34,9 +35,16 @@ pub use guard::{BudgetChange, BudgetChangeKind};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
-    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedFrameSlot,
-    GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
-    ResponseFrameSlot,
+    worker_framed_channel, AdmittedFrame, FrameGuard, FrameWriteClaim, FramedWorkerRecv,
+    GuardedFrameSlot, GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause,
+    QueuedFrame, ResponseFrameSlot,
+};
+#[cfg(test)]
+pub(crate) use lifetime::OwnerCounts;
+pub(crate) use lifetime::{
+    frame_wire_bytes, CompatResponseGrant, ConnectionResources, FrameGate, NodeResources,
+    OwnerPhase, ResourceEnvelope, StreamResources, TransportLimits,
+    COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]
@@ -61,8 +69,8 @@ pub use service::CloseCauseReader;
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
-    SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream, StreamMode,
-    StreamQueueDepths, StreamWritePolicy,
+    SessionOpening, SessionPolicy, SessionResources, SessionStep, Sink, SinkReject, Source, Stream,
+    StreamMode, StreamQueueDepths, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};
 #[cfg(any(test, zakura_sim))]

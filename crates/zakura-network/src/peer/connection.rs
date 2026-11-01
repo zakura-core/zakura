@@ -26,6 +26,7 @@ use crate::{
         self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
         OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
+    inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge, InboundRowRefused},
     meta_addr::MetaAddr,
     peer::{
         connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
@@ -409,7 +410,12 @@ impl Handler {
                 )))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
-                Handler::Finished(Ok(Response::BlockHeaders(headers)))
+                Handler::Finished(Ok(Response::BlockHeaders(
+                    headers
+                        .into_iter()
+                        .map(|counted| counted.header.into())
+                        .collect(),
+                )))
             }
 
             (Handler::MempoolTransactionIds, Message::Inv(items))
@@ -617,6 +623,12 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Funds decoded TCP payloads across this node's connections.
+    pub(super) inbound_budget: InboundBudget,
+
+    /// Funds the payloads of the current client request's response until its handoff.
+    response_charge: Option<InboundCharge>,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -638,6 +650,50 @@ where
     }
 }
 
+/// Convert retained headers into their TCP wire form, and return the bytes this copies.
+///
+/// A shared header has no read admission to keep, so its wire form shares its
+/// allocation. A header with read admission keeps its slot for the original, and the
+/// returned bytes cover only the new allocations. No allocation is charged twice.
+fn wire_headers(
+    headers: &[zakura_node_services::block_memory::HeaderHandle],
+) -> (Vec<block::CountedHeader>, u64) {
+    use zakura_node_services::block_memory::HeaderHandle;
+
+    let mut copied_headers = 0u64;
+    let wire: Vec<_> = headers
+        .iter()
+        .map(|handle| {
+            let header = match handle {
+                HeaderHandle::Shared(header) => header.clone(),
+                HeaderHandle::Block(_) | HeaderHandle::Standalone(_) => {
+                    copied_headers = copied_headers.saturating_add(1);
+                    Arc::new(**handle)
+                }
+            };
+            block::CountedHeader { header }
+        })
+        .collect();
+    let copied_bytes = copied_headers
+        .saturating_mul(COPIED_HEADER_BYTES)
+        .saturating_add(vec_retained_bytes(&wire));
+    (wire, copied_bytes)
+}
+
+/// The bytes of one `Arc<Header>` allocation: the header and its two reference counts.
+// Widening usize to u64 is lossless on supported targets.
+const COPIED_HEADER_BYTES: u64 =
+    (std::mem::size_of::<block::Header>() + 2 * std::mem::size_of::<usize>()) as u64;
+
+/// The decoded bytes a `block` or `tx` message retains while a handler holds it.
+fn decoded_payload_bytes(message: &Message) -> u64 {
+    match message {
+        Message::Block(block) => block.decoded_bytes(),
+        Message::Tx(transaction) => transaction.transaction().retained_memory_size_bytes(),
+        _ => 0,
+    }
+}
+
 impl<S, Tx> Connection<S, Tx>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
@@ -653,6 +709,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        inbound_budget: InboundBudget,
     ) -> Self {
         Connection {
             connection_info,
@@ -668,6 +725,8 @@ where
             addr_label,
             last_metrics_state: None,
             last_overload_time: None,
+            inbound_budget,
+            response_charge: None,
         }
     }
 }
@@ -709,6 +768,12 @@ where
         // TODO: turn this comment into a module-level comment, after splitting the module.
         loop {
             self.update_state_metrics(None);
+
+            // Each way out of a client request reaches this point before the next one
+            // starts, so one place ends the charge for its response's payloads.
+            if !matches!(self.state, State::AwaitingResponse { .. }) {
+                self.response_charge = None;
+            }
 
             match self.state {
                 State::AwaitingRequest => {
@@ -868,6 +933,7 @@ where
                         Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Right((Some(Ok(peer_msg)), _cancel)) => {
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
+                            let payload_bytes = decoded_payload_bytes(&peer_msg);
 
                             // Try to process the message using the handler.
                             // This extremely awkward construction avoids
@@ -888,6 +954,17 @@ where
                             };
 
                             self.update_state_metrics(None);
+
+                            // The handler retains a consumed payload until its handoff.
+                            // A response to this node's own request never refuses, or
+                            // the conformant peer sending it would time out.
+                            if request_msg.is_none() && payload_bytes > 0 {
+                                let charge = self.inbound_budget.charge_committed(payload_bytes);
+                                match &mut self.response_charge {
+                                    Some(retained) => retained.merge(charge),
+                                    None => self.response_charge = Some(charge),
+                                }
+                            }
 
                             // If the message was not consumed as a response,
                             // check whether it can be handled as a request.
@@ -1199,6 +1276,20 @@ where
 
         use InboundMessage::*;
 
+        // An unsolicited transaction holds its charge until its handler ends. Nothing
+        // waits for it, so a saturated budget drops it, as a full queue does.
+        let _pushed_transaction_charge = if matches!(msg, Message::Tx(_)) {
+            let Some(charge) = self.inbound_budget.try_charge(decoded_payload_bytes(&msg)) else {
+                metrics::counter!("zcash.net.in.discarded", "reason" => "inbound_budget")
+                    .increment(1);
+                debug!("TCP inbound bytes exhausted: dropping unsolicited transaction");
+                return None;
+            };
+            Some(charge)
+        } else {
+            None
+        };
+
         let req = match msg {
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");
@@ -1446,7 +1537,12 @@ where
         // Inbound service request timeouts are handled by the timeout layer in `start::start()`.
         let rsp = match self.svc.call(req.clone()).await {
             Err(e) => {
-                if e.is::<tower::load_shed::error::Overloaded>() {
+                if e.is::<InboundRowRefused>() {
+                    // A row refuses only when a caller exceeds its own limit, which says
+                    // nothing about this peer.
+                    tracing::debug!(%e, %req, "inbound row refused a peer request");
+                    self.update_state_metrics(format!("In::Req::{}/Rsp::Refused", req.command()));
+                } else if e.is::<tower::load_shed::error::Overloaded>() {
                     // # Security
                     //
                     // The peer request queue must have a limited length.
@@ -1571,7 +1667,15 @@ where
                 }
             }
             Response::BlockHeaders(headers) => {
-                if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
+                // The handles keep their read admission until the send ends. The budget
+                // funds only the copies. This response answers a request the node
+                // already accepted, so its copies never refuse.
+                let (wire, copied_bytes) = wire_headers(&headers);
+                let copies = self.inbound_budget.charge_committed(copied_bytes);
+                let sent = self.peer_tx.send(Message::Headers(wire)).await;
+                drop(copies);
+                drop(headers);
+                if let Err(e) = sent {
                     self.fail_with(e).await
                 }
             }

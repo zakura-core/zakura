@@ -159,6 +159,7 @@ pub mod constants;
 
 mod address_book;
 mod address_book_updater;
+mod inbound_resources;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod isolated;
 mod meta_addr;

@@ -3,7 +3,7 @@
 //! Checkers read only the [`ObservationLog`]. Each entry carries the step
 //! that appended it. Step 0 is setup, before the first pick.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::Label;
 
@@ -449,6 +449,10 @@ pub enum StorageFact {
         request: StorageRequest,
         /// A digest of the request.
         digest: String,
+        /// The header-sync reactor's port call that submitted it, or `None`
+        /// for an operation no reactor call's poll submitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
     },
     /// The caller dropped its call while the operation was pending.
     CallerDropped {
@@ -659,11 +663,15 @@ pub enum StorageFact {
         /// defers actions.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         deferred: Vec<StorageRequest>,
+        /// Those of `dropped` whose call still existed, which can leave no
+        /// drop receipt. Only header storage reports them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        callers_alive: Vec<u64>,
     },
 }
 
 /// A work owner with every field of its typed form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkOwner {
     /// `header`, `body-repair`, or `body` for block sync's body work.
     pub kind: String,
@@ -714,7 +722,7 @@ pub struct BodyScope {
 }
 
 /// A header work scope: a generation and the branch it pursues.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkScope {
     /// The header generation.
     pub header_generation: u64,
@@ -723,7 +731,7 @@ pub struct WorkScope {
 }
 
 /// A branch, by its anchor and target hashes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageBranch {
     /// The anchor's hash.
     pub anchor: String,
@@ -1160,10 +1168,9 @@ pub enum ReactorFact {
         /// The call's number.
         call: u64,
         /// How it ended: `replied`, `port-error`, `timed-out`,
-        /// `not-submitted` or `port-panicked`.
+        /// `not-submitted`, `port-panicked` or `dropped`.
         end: String,
-        /// The storage operation the call is paired with. The tap doesn't
-        /// pair calls, so it always logs `None`.
+        /// The storage operation the call is paired with.
         op: Option<u64>,
     },
     /// The reactor finished processing a call's completion.
@@ -1172,6 +1179,20 @@ pub enum ReactorFact {
         call: u64,
         /// Whether the call's future was caught panicking.
         panicked: bool,
+    },
+    /// A request joined a locator call in flight.
+    StorageJoined {
+        /// The call in flight.
+        call: u64,
+    },
+    /// The reactor refused a storage call before it started.
+    StorageRefused {
+        /// The refused call's number.
+        call: u64,
+        /// `locator`, `vct-context`, `prepare` or `apply`.
+        kind: String,
+        /// `locator-capacity`, `local-operation-busy` or `external-queue`.
+        cause: String,
     },
     /// An active request started.
     Started {

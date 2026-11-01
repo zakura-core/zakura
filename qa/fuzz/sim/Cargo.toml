@@ -13,6 +13,7 @@ cargo-fuzz = true
 discovery_wait_complete = "discovery/wait-complete"
 header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
+header_reactor_policy = "header/reactor-policy"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -59,3 +60,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "header_reactor_policy"
+path = "fuzz_targets/header_reactor_policy.rs"
+test = false
+doc = false
+bench = false

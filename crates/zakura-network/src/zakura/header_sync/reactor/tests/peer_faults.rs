@@ -248,7 +248,10 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
 
             assert_eq!(connection.is_cancelled(), faulted);
             assert_eq!(
-                reactor.unproductive_peer_cooldowns.contains_key(&peer),
+                reactor
+                    .state
+                    .unproductive_peer_cooldowns
+                    .contains_key(&peer),
                 faulted
             );
             if !faulted {
@@ -280,7 +283,10 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
     let failure = invalid_header_failure(source, owner);
     reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
-    assert!(!reactor.unproductive_peer_cooldowns.contains_key(&peer));
+    assert!(!reactor
+        .state
+        .unproductive_peer_cooldowns
+        .contains_key(&peer));
     assert!(
         !connection.is_cancelled(),
         "the replacement stays connected"

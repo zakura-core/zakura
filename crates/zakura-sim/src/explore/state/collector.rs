@@ -482,7 +482,9 @@ impl StateCollector {
                     hit,
                 );
             }
-            StorageFact::ShutDown { dropped, deferred } => {
+            StorageFact::ShutDown {
+                dropped, deferred, ..
+            } => {
                 self.acknowledged(
                     service,
                     instance,

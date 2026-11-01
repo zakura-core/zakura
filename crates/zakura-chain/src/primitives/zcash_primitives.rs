@@ -517,12 +517,20 @@ fn sighash_inner(
         )
         .as_ref(),
         // `signature_hash` sends these versions to the same function, without the digests.
-        None => zp_tx::sighash_v4::v4_signature_hash(&precomputed_tx_data.tx_data, &signable_input)
-            .as_bytes()
-            .try_into()
-            .expect("ZIP-243 signature hashes are 32 bytes"),
+        None => v4_signature_hash(&precomputed_tx_data.tx_data, &signable_input),
     };
     Ok(SigHash(sighash))
+}
+
+/// Returns the ZIP-243 signature hash of a pre-v5 transaction.
+fn v4_signature_hash(
+    tx_data: &zp_tx::TransactionData<PrecomputedAuth>,
+    signable_input: &zp_tx::sighash::SignableInput<'_>,
+) -> [u8; 32] {
+    zp_tx::sighash_v4::v4_signature_hash(tx_data, signable_input)
+        .as_bytes()
+        .try_into()
+        .expect("ZIP-243 signature hashes are 32 bytes")
 }
 
 /// Compute the authorizing data commitment of this transaction as specified in [ZIP-244].

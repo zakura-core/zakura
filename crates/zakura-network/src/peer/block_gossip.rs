@@ -7,9 +7,9 @@
 //! peer waiting for a slot keeps its window entry, so busy uploads still slow each broadcast's
 //! fan-out, but they cannot delay another block's first `inv`s.
 //!
-//! A broadcast for a different block supersedes older broadcasts: they advertise to no further
-//! peers, and drop their adverts that are not yet written. Their written adverts still track, and
-//! account for, the uploads that peers request.
+//! A newer block does not stop an older block's broadcast. A peer that has not received the parent
+//! needs it to accept the child, and the newer block might be a side-chain or provisional block
+//! that never becomes the tip.
 
 use std::{
     collections::HashMap,
@@ -218,10 +218,11 @@ impl BlockGossipPeer {
     /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.
     ///
     /// Writing the `inv` takes no upload slot. The peer takes one only once it requests the
-    /// block, and keeps it through the block write and the drain allowance. Returns false if the
-    /// `inv` was not written, including when a newer broadcast superseded it first.
-    pub(crate) async fn advertise(self, broadcast: BlockBroadcast) -> bool {
-        let hash = broadcast.hash;
+    /// block, and keeps it through the block write and the drain allowance.
+    ///
+    /// Returns false if the `inv` was not written, or if the peer requested the block and the
+    /// upload failed or did not finish in time.
+    pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
@@ -237,7 +238,7 @@ impl BlockGossipPeer {
                     break false;
                 }
             };
-            if succeeded || retried || self.sender.is_closed() || broadcast.is_superseded() {
+            if succeeded || retried || self.sender.is_closed() {
                 return succeeded;
             }
             // The joined upload can fail without reaching this peer, for example when early
@@ -254,18 +255,12 @@ impl BlockGossipPeer {
         } else {
             BLOCK_REQUEST_WAIT
         };
-        // Dropping `written` makes the connection skip an advert that is still queued.
-        let advertised = tokio::select! {
-            biased;
-            advertised = timeout(inventory_wait, async {
-                self.sender.send(advert).await.ok()?;
-                written.await.ok()?.ok()
-            }) => advertised,
-            () = broadcast.superseded() => {
-                metrics::counter!("peer.block_gossip.advert_superseded").increment(1);
-                return false;
-            }
-        };
+        // Dropping `written` makes the connection skip an advert that it has not started writing.
+        let advertised = timeout(inventory_wait, async {
+            self.sender.send(advert).await.ok()?;
+            written.await.ok()?.ok()
+        })
+        .await;
         if !matches!(advertised, Ok(Some(_))) {
             return false;
         }
@@ -285,10 +280,11 @@ impl BlockGossipPeer {
                     // window entry until it gets one, so busy uploads pace every broadcast's
                     // further fan-out.
                     if upload.is_none() {
-                        upload = Some(broadcast.scheduler.upload_slot().await);
+                        upload = Some(slots.acquire().await);
                     }
                     sleep_until(written + BLOCK_WRITE_GRACE).await;
-                    break true;
+                    // A disconnect during the grace can discard the body in the send queue.
+                    break !matches!(*progress.borrow(), UploadState::Finished(false));
                 }
                 UploadState::Finished(succeeded) => break succeeded,
             };
@@ -296,14 +292,15 @@ impl BlockGossipPeer {
             tokio::select! {
                 biased;
                 changed = progress.changed() => if changed.is_err() { break false; },
-                slot = broadcast.scheduler.upload_slot(), if requested && upload.is_none() => {
+                slot = slots.acquire(), if requested && upload.is_none() => {
                     upload = Some(slot);
                 }
                 _ = sleep_until(deadline) => {
                     let reason = if matches!(state, UploadState::Waiting) { "no_request" } else { "upload_timeout" };
                     metrics::counter!("peer.block_gossip.slot_timeout", "reason" => reason).increment(1);
-                    // Advertisement completion does not promise that the peer requested the block.
-                    break true;
+                    // A peer that already has the block never requests it, so the advert still
+                    // succeeded. A requested upload that did not finish was not delivered.
+                    break matches!(state, UploadState::Waiting);
                 }
             }
         };
@@ -313,48 +310,23 @@ impl BlockGossipPeer {
     }
 }
 
-/// Shared by every legacy block broadcast: the upload slots, and which broadcast is the newest.
+/// The upload slots that every legacy block broadcast shares.
 #[derive(Clone, Debug)]
-pub(crate) struct BlockGossipScheduler(Arc<SchedulerState>);
+pub(crate) struct BlockUploadSlots(Arc<UploadSlotsState>);
 
 #[derive(Debug)]
-struct SchedulerState {
+struct UploadSlotsState {
     uploads: Arc<Semaphore>,
     upload_capacity: usize,
-    /// The newest broadcast's generation and block.
-    newest: watch::Sender<(u64, Option<block::Hash>)>,
 }
 
-impl BlockGossipScheduler {
-    /// Returns a scheduler that accounts for at most `upload_capacity` concurrent uploads.
+impl BlockUploadSlots {
+    /// Returns slots that account for at most `upload_capacity` concurrent uploads.
     pub(crate) fn new(upload_capacity: usize) -> Self {
-        Self(Arc::new(SchedulerState {
+        Self(Arc::new(UploadSlotsState {
             uploads: Arc::new(Semaphore::new(upload_capacity)),
             upload_capacity,
-            newest: watch::channel((0, None)).0,
         }))
-    }
-
-    /// Starts a broadcast of `hash`, which supersedes broadcasts of other blocks started earlier.
-    ///
-    /// Back-to-back broadcasts of the same block, such as its early and committed broadcasts,
-    /// share a generation, so neither drops the other's adverts.
-    pub(crate) fn start(&self, hash: block::Hash) -> BlockBroadcast {
-        let mut generation = 0;
-        self.0.newest.send_if_modified(|(newest, newest_hash)| {
-            let supersedes = *newest_hash != Some(hash);
-            if supersedes {
-                *newest += 1;
-                *newest_hash = Some(hash);
-            }
-            generation = *newest;
-            supersedes
-        });
-        BlockBroadcast {
-            hash,
-            generation,
-            scheduler: self.clone(),
-        }
     }
 
     /// Returns the number of upload slots not held by a requested upload.
@@ -363,18 +335,18 @@ impl BlockGossipScheduler {
     }
 
     /// Waits for an upload slot, which is returned when the slot is dropped.
-    async fn upload_slot(&self) -> UploadSlot {
+    async fn acquire(&self) -> UploadSlot {
         let permit = self
             .0
             .uploads
             .clone()
             .acquire_owned()
             .await
-            .expect("the scheduler never closes its upload semaphore");
+            .expect("upload slots never close their semaphore");
         self.record_uploads_in_use();
         UploadSlot {
             permit: Some(permit),
-            scheduler: self.clone(),
+            slots: self.clone(),
         }
     }
 
@@ -388,56 +360,30 @@ impl BlockGossipScheduler {
 /// One accounted upload, held from the peer's getdata through the drain allowance.
 struct UploadSlot {
     permit: Option<OwnedSemaphorePermit>,
-    scheduler: BlockGossipScheduler,
+    slots: BlockUploadSlots,
 }
 
 impl Drop for UploadSlot {
     fn drop(&mut self) {
         drop(self.permit.take());
-        self.scheduler.record_uploads_in_use();
+        self.slots.record_uploads_in_use();
     }
 }
 
-/// One block broadcast, and the generation that a broadcast of a different block supersedes.
-#[derive(Clone, Debug)]
-pub(crate) struct BlockBroadcast {
-    hash: block::Hash,
-    generation: u64,
-    scheduler: BlockGossipScheduler,
-}
-
-impl BlockBroadcast {
-    /// Returns true if a broadcast of a different block started after this one.
-    fn is_superseded(&self) -> bool {
-        self.scheduler.0.newest.borrow().0 > self.generation
-    }
-
-    /// Resolves once a broadcast of a different block starts after this one.
-    async fn superseded(&self) {
-        let mut newest = self.scheduler.0.newest.subscribe();
-        // The scheduler, and so the sender, outlives this broadcast.
-        let _ = newest
-            .wait_for(|(newest, _)| *newest > self.generation)
-            .await;
-    }
-}
-
-/// Advertises `broadcast`'s block to `peers`, at most [`BLOCK_ADVERT_WINDOW`] at a time, paced
-/// through their block uploads.
+/// Advertises `hash` to `peers`, at most [`BLOCK_ADVERT_WINDOW`] at a time, paced through their
+/// block uploads.
 ///
-/// Advertises to no further peers once a newer broadcast supersedes this one. Succeeds if at
-/// least one peer was advertised to.
+/// Succeeds if at least one peer was advertised to.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
+    hash: block::Hash,
     mined: bool,
-    broadcast: BlockBroadcast,
+    slots: BlockUploadSlots,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
     let peers = order_peers(peers, mined, &mut rand_10::rng());
     async move {
-        let superseded = broadcast.clone();
         let mut sends = futures::stream::iter(peers)
-            .take_until(async move { superseded.superseded().await }.boxed())
-            .map(|peer| peer.advertise(broadcast.clone()))
+            .map(|peer| peer.advertise(hash, slots.clone()))
             .buffer_unordered(BLOCK_ADVERT_WINDOW);
         let mut succeeded = false;
         while let Some(sent) = sends.next().await {
@@ -445,11 +391,6 @@ pub(crate) fn broadcast_block(
         }
         if succeeded {
             Ok(Response::Nil)
-        } else if broadcast.is_superseded() {
-            Err(
-                std::io::Error::other("block broadcast was superseded before reaching a peer")
-                    .into(),
-            )
         } else {
             Err(std::io::Error::other("block broadcast reached no peers").into())
         }
@@ -467,7 +408,7 @@ pub(crate) struct BlockAdvertiser<C> {
     /// Every connected peer's block advert queue, as last published by the peer set.
     pub(crate) peers: watch::Receiver<Vec<BlockGossipPeer>>,
     /// Shared with the peer set's own block broadcasts.
-    pub(crate) scheduler: BlockGossipScheduler,
+    pub(crate) slots: BlockUploadSlots,
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
 }
 
@@ -516,8 +457,7 @@ impl<C: ChainTip> BlockAdvertiser<C> {
             peer.version >= minimum_version && !peer.sender.is_closed()
         };
         let mut peers = self.peers.clone();
-        // Start the broadcast now, so broadcasts supersede each other in request order.
-        let broadcast = self.scheduler.start(hash);
+        let slots = self.slots.clone();
         async move {
             let peers: Vec<_> = peers
                 .wait_for(|peers| peers.iter().any(eligible))
@@ -527,7 +467,7 @@ impl<C: ChainTip> BlockAdvertiser<C> {
                 .filter(|peer| eligible(peer))
                 .cloned()
                 .collect();
-            broadcast_block(peers, mined, broadcast).await
+            broadcast_block(peers, hash, mined, slots).await
         }
         .boxed()
     }
@@ -689,18 +629,20 @@ mod tests {
     ) -> Duration {
         let parent = block::Hash([0xa0; 32]);
         let child = block::Hash([0xb0; 32]);
-        let scheduler = BlockGossipScheduler::new(BLOCK_UPLOAD_CONCURRENCY);
+        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
         let (peers, mut writes) = connected_peers(BLOCK_UPLOAD_CONCURRENCY);
         let mut broadcasts = vec![tokio::spawn(broadcast_block(
             peers.clone(),
+            parent,
             true,
-            scheduler.start(parent),
+            slots.clone(),
         ))];
         if early_and_committed {
             broadcasts.push(tokio::spawn(broadcast_block(
                 peers.clone(),
+                parent,
                 true,
-                scheduler.start(parent),
+                slots.clone(),
             )));
         }
         for _ in 0..BLOCK_UPLOAD_CONCURRENCY {
@@ -721,13 +663,14 @@ mod tests {
             OlderBroadcastPeers::NeverRequest => BLOCK_UPLOAD_CONCURRENCY,
             OlderBroadcastPeers::Uploading | OlderBroadcastPeers::InWriteGrace => 0,
         };
-        assert_eq!(scheduler.available_uploads(), expected_uploads);
+        assert_eq!(slots.available_uploads(), expected_uploads);
 
         let mined = Instant::now();
         broadcasts.push(tokio::spawn(broadcast_block(
             peers,
+            child,
             true,
-            scheduler.start(child),
+            slots.clone(),
         )));
         let wait = loop {
             let (_, hash) = writes.recv().await.expect("mock connections stay open");
@@ -762,28 +705,28 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn upload_slot_is_taken_on_request_and_held_through_grace() {
         let hash = block::Hash([1; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (first, mut first_rx) = peer();
         let uploads = first.uploads.clone();
         let (second, mut second_rx) = peer();
-        let first_task = tokio::spawn(first.advertise(scheduler.start(hash)));
+        let first_task = tokio::spawn(first.advertise(hash, slots.clone()));
         accept(&mut first_rx, hash).await;
         assert_eq!(
-            scheduler.available_uploads(),
+            slots.available_uploads(),
             1,
             "written inventory takes no upload slot"
         );
         uploads.requested(hash);
         tokio::task::yield_now().await;
-        assert_eq!(scheduler.available_uploads(), 0);
+        assert_eq!(slots.available_uploads(), 0);
         // Another peer's inventory does not wait for the upload.
-        let second_task = tokio::spawn(second.advertise(scheduler.start(hash)));
+        let second_task = tokio::spawn(second.advertise(hash, slots.clone()));
         accept(&mut second_rx, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert!(second_task.await.unwrap(), "the unrequested advert ends");
         assert_eq!(
-            scheduler.available_uploads(),
+            slots.available_uploads(),
             0,
             "getdata keeps the slot beyond the no-request timeout"
         );
@@ -791,54 +734,54 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(BLOCK_WRITE_GRACE - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
-        assert_eq!(scheduler.available_uploads(), 0);
+        assert_eq!(slots.available_uploads(), 0);
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(first_task.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn unrequested_inventory_holds_no_upload_slot() {
         let hash = block::Hash([2; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (first, mut first_rx) = peer();
-        let task = tokio::spawn(first.advertise(scheduler.start(hash)));
+        let task = tokio::spawn(first.advertise(hash, slots.clone()));
         accept(&mut first_rx, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert!(!task.is_finished(), "the advert waits for a request");
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(task.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn duplicate_announcements_share_upload_and_slot() {
         let hash = block::Hash([3; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
-        let second = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let second = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         assert!(receiver.recv().now_or_never().is_none());
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(first.await.unwrap());
         assert!(second.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
         assert!(receiver.recv().now_or_never().is_none());
     }
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_wakes_duplicate_and_returns_permit() {
         let hash = block::Hash([4; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
@@ -847,17 +790,17 @@ mod tests {
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(duplicate.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn joined_announcement_readvertises_after_unavailable_upload() {
         let hash = block::Hash([7; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
-        let committed = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         peer.uploads.requested(hash);
         peer.uploads.unavailable(hash);
@@ -866,68 +809,82 @@ mod tests {
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(committed.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn joined_announcement_does_not_retry_after_disconnect() {
         let hash = block::Hash([8; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         drop(receiver);
         peer.uploads.disconnected();
         assert!(!first.await.unwrap());
         assert!(!duplicate.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn upload_timeout_and_disconnect_release_slots() {
         for disconnect in [false, true] {
             let hash = block::Hash([5; 32]);
-            let scheduler = BlockGossipScheduler::new(1);
+            let slots = BlockUploadSlots::new(1);
             let (peer, mut receiver) = peer();
             let uploads = peer.uploads.clone();
-            let task = tokio::spawn(peer.advertise(scheduler.start(hash)));
+            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
             accept(&mut receiver, hash).await;
             uploads.requested(hash);
             tokio::task::yield_now().await;
-            assert_eq!(
-                scheduler.available_uploads(),
-                0,
-                "the upload holds its slot"
-            );
+            assert_eq!(slots.available_uploads(), 0, "the upload holds its slot");
             if disconnect {
                 uploads.disconnected();
             } else {
                 tokio::time::advance(BLOCK_UPLOAD_WAIT).await;
             }
-            assert_eq!(task.await.unwrap(), !disconnect);
-            assert_eq!(scheduler.available_uploads(), 1);
+            assert!(!task.await.unwrap(), "the upload did not finish");
+            assert_eq!(slots.available_uploads(), 1);
         }
+    }
+
+    /// A disconnect during the drain allowance can discard the written body, so the upload fails.
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_during_write_grace_fails_the_upload() {
+        let hash = block::Hash([19; 32]);
+        let slots = BlockUploadSlots::new(1);
+        let (peer, mut receiver) = peer();
+        let uploads = peer.uploads.clone();
+        let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+        accept(&mut receiver, hash).await;
+        uploads.requested(hash);
+        uploads.written(hash);
+        tokio::task::yield_now().await;
+        uploads.disconnected();
+        tokio::time::advance(BLOCK_WRITE_GRACE).await;
+        assert!(!task.await.unwrap());
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     /// Requested uploads of different blocks share the cap, but inventory does not wait for it.
     #[tokio::test(start_paused = true)]
     async fn requested_uploads_of_different_blocks_share_the_cap() {
-        let scheduler = BlockGossipScheduler::new(2);
+        let slots = BlockUploadSlots::new(2);
         let mut tasks = Vec::new();
         let mut uploads = Vec::new();
         for i in 0..3 {
             let hash = block::Hash([20 + i; 32]);
             let (peer, mut receiver) = peer();
             let upload = peer.uploads.clone();
-            tasks.push(tokio::spawn(peer.advertise(scheduler.start(hash))));
+            tasks.push(tokio::spawn(peer.advertise(hash, slots.clone())));
             accept(&mut receiver, hash).await;
             upload.requested(hash);
             uploads.push((hash, upload));
             tokio::task::yield_now().await;
         }
-        assert_eq!(scheduler.available_uploads(), 0);
+        assert_eq!(slots.available_uploads(), 0);
         // The third upload waits for a slot, not for the first upload's timers.
         let (hash, first) = &uploads[0];
         first.written(*hash);
@@ -936,7 +893,7 @@ mod tests {
         assert!(tasks.remove(0).await.unwrap());
         tokio::task::yield_now().await;
         assert_eq!(
-            scheduler.available_uploads(),
+            slots.available_uploads(),
             0,
             "the waiting upload takes the slot"
         );
@@ -948,20 +905,20 @@ mod tests {
         for task in tasks {
             assert!(task.await.unwrap());
         }
-        assert_eq!(scheduler.available_uploads(), 2);
+        assert_eq!(slots.available_uploads(), 2);
     }
 
     /// A peer that requested while every slot was held, then disconnected, holds nothing.
     #[tokio::test(start_paused = true)]
     async fn disconnect_while_waiting_for_an_upload_slot_takes_none() {
         let hash = block::Hash([12; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (holder, mut holder_rx) = peer();
         let (waiter, mut waiter_rx) = peer();
         let holder_uploads = holder.uploads.clone();
         let waiter_uploads = waiter.uploads.clone();
-        let holder = tokio::spawn(holder.advertise(scheduler.start(hash)));
-        let waiter = tokio::spawn(waiter.advertise(scheduler.start(hash)));
+        let holder = tokio::spawn(holder.advertise(hash, slots.clone()));
+        let waiter = tokio::spawn(waiter.advertise(hash, slots.clone()));
         accept(&mut holder_rx, hash).await;
         accept(&mut waiter_rx, hash).await;
         holder_uploads.requested(hash);
@@ -974,102 +931,65 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(BLOCK_WRITE_GRACE).await;
         assert!(holder.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
-    /// A newer block's broadcast drops the older broadcast's unwritten adverts and advertises it
-    /// to no further peers, but still accounts for the parent uploads that peers request.
+    /// A newer block must not stop an older block's fan-out: the peers still need the parent, and
+    /// the newer block might never become the tip.
     #[tokio::test(start_paused = true)]
-    async fn newer_block_supersedes_unsent_adverts_but_tracks_requested_parent() {
+    async fn newer_block_does_not_stop_older_broadcast() {
         let parent = block::Hash([13; 32]);
         let child = block::Hash([14; 32]);
-        let scheduler = BlockGossipScheduler::new(BLOCK_UPLOAD_CONCURRENCY);
+        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
 
         // A busy connection has not written the parent advert yet.
         let (busy, mut busy_rx) = peer();
-        let queued = tokio::spawn(busy.advertise(scheduler.start(parent)));
+        let queued = tokio::spawn(busy.advertise(parent, slots.clone()));
         tokio::task::yield_now().await;
 
         // A parent broadcast with more peers than its window, which never request.
         let (peers, mut writes) = connected_peers(BLOCK_ADVERT_WINDOW + 8);
-        let parent_broadcast = tokio::spawn(broadcast_block(
-            peers.clone(),
-            true,
-            scheduler.start(parent),
-        ));
+        let parent_broadcast =
+            tokio::spawn(broadcast_block(peers.clone(), parent, true, slots.clone()));
         for _ in 0..BLOCK_ADVERT_WINDOW {
             assert_eq!(writes.recv().await.unwrap().1, parent);
         }
-        // One peer that got the parent inventory requests it only after the child is mined.
-        let (requester, mut requester_rx) = peer();
-        let requester_uploads = requester.uploads.clone();
-        let requested = tokio::spawn(requester.advertise(scheduler.start(parent)));
-        accept(&mut requester_rx, parent).await;
 
+        let mined = Instant::now();
         let child_broadcast =
-            tokio::spawn(broadcast_block(peers.clone(), true, scheduler.start(child)));
-        assert!(
-            !queued.await.unwrap(),
-            "the unwritten parent advert is dropped"
-        );
-        let dropped = busy_rx.recv().await.expect("the advert stays queued");
-        assert!(
-            dropped.result.is_closed(),
-            "the connection skips the superseded advert"
-        );
+            tokio::spawn(broadcast_block(peers.clone(), child, true, slots.clone()));
+        for _ in 0..BLOCK_ADVERT_WINDOW {
+            assert_eq!(writes.recv().await.unwrap().1, child);
+            assert_eq!(mined.elapsed(), Duration::ZERO, "the child waited");
+        }
+        accept(&mut busy_rx, parent).await;
+        assert!(queued.await.unwrap(), "the queued parent advert is written");
 
-        requester_uploads.requested(parent);
-        tokio::task::yield_now().await;
-        assert_eq!(
-            scheduler.available_uploads(),
-            BLOCK_UPLOAD_CONCURRENCY - 1,
-            "the requested parent upload is still accounted for"
-        );
-
-        // Every peer gets the child; no further peer gets the parent.
-        let mut children = 0;
-        while children < peers.len() {
-            let (_, hash) = writes.recv().await.unwrap();
-            assert_eq!(
-                hash, child,
-                "a superseded broadcast writes no further inventory"
-            );
-            children += 1;
+        // Every peer also gets the rest of the parent fan-out once its window entries expire.
+        let (mut parents, mut children) = (BLOCK_ADVERT_WINDOW, BLOCK_ADVERT_WINDOW);
+        while parents < peers.len() || children < peers.len() {
+            let write = timeout(Duration::from_secs(60), writes.recv())
+                .await
+                .expect("each window entry expires, so the fan-out reaches every peer");
+            if write.unwrap().1 == parent {
+                parents += 1;
+            } else {
+                children += 1;
+            }
         }
         assert!(parent_broadcast.await.unwrap().is_ok());
         assert!(child_broadcast.await.unwrap().is_ok());
-
-        requester_uploads.written(parent);
-        tokio::task::yield_now().await;
-        tokio::time::advance(BLOCK_WRITE_GRACE).await;
-        assert!(requested.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), BLOCK_UPLOAD_CONCURRENCY);
-    }
-
-    /// Early and committed broadcasts of one block share a generation; a different block
-    /// supersedes both, and a later broadcast of an older block supersedes it in turn.
-    #[test]
-    fn broadcasts_supersede_in_request_order_except_repeats() {
-        let scheduler = BlockGossipScheduler::new(1);
-        let (x, y) = (block::Hash([15; 32]), block::Hash([16; 32]));
-        let early = scheduler.start(x);
-        let committed = scheduler.start(x);
-        assert!(!early.is_superseded() && !committed.is_superseded());
-        let child = scheduler.start(y);
-        assert!(early.is_superseded() && committed.is_superseded());
-        let late = scheduler.start(x);
-        assert!(child.is_superseded() && !late.is_superseded());
     }
 
     /// A committed broadcast does not drop its early broadcast's queued adverts.
     #[tokio::test(start_paused = true)]
     async fn committed_broadcast_keeps_early_adverts() {
         let hash = block::Hash([17; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
-        let committed = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         accept(&mut receiver, hash).await;
         assert!(
@@ -1088,12 +1008,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_early_advert_is_sent_by_the_committed_broadcast() {
         let hash = block::Hash([18; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
         let early = tokio::spawn(broadcast_block(
             vec![peer.clone()],
+            hash,
             true,
-            scheduler.start(hash),
+            slots.clone(),
         ));
         let advert = receiver.recv().await.unwrap();
         advert
@@ -1101,7 +1022,7 @@ mod tests {
             .send(Err(BlockAdvertError::AuthorizationRevoked))
             .unwrap();
         assert!(early.await.unwrap().is_err());
-        let committed = tokio::spawn(broadcast_block(vec![peer], true, scheduler.start(hash)));
+        let committed = tokio::spawn(broadcast_block(vec![peer], hash, true, slots.clone()));
         accept(&mut receiver, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT).await;
         assert!(committed.await.unwrap().is_ok());
@@ -1109,51 +1030,46 @@ mod tests {
 
     /// Sustained relay: a block every second to peers that request every block, with bodies
     /// that take two seconds to write. Each block's first inventory is still immediate, upload
-    /// slots never exceed the cap, and body writes stay within the cap plus one advert window.
+    /// slots never exceed the cap, and busy uploads stop each broadcast's fan-out at its window.
     #[tokio::test(start_paused = true)]
     async fn sustained_relay_keeps_uploads_bounded() {
         const BLOCKS: u8 = 8;
-        let scheduler = BlockGossipScheduler::new(BLOCK_UPLOAD_CONCURRENCY);
+        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
         let (peers, mut writes, bodies) =
             requesting_peers(2 * BLOCK_ADVERT_WINDOW, Some(Duration::from_secs(2)));
         let mut broadcasts = Vec::new();
-        let mut advertised = Vec::new();
         for block in 0..BLOCKS {
             let hash = block::Hash([0xc0 + block; 32]);
             let mined = Instant::now();
             broadcasts.push(tokio::spawn(broadcast_block(
                 peers.clone(),
+                hash,
                 false,
-                scheduler.start(hash),
+                slots.clone(),
             )));
-            let (_, first) = writes.recv().await.unwrap();
-            assert_eq!(
-                first, hash,
-                "older blocks write no inventory after a newer one"
-            );
-            assert_eq!(mined.elapsed(), Duration::ZERO, "block {block} waited");
-            let mut count = 1;
             let next_block = mined + Duration::from_secs(1);
+            let mut first = None;
+            let mut count = 0;
             while let Ok(Some((_, written))) =
                 tokio::time::timeout_at(next_block, writes.recv()).await
             {
-                assert_eq!(
-                    written, hash,
-                    "older blocks write no inventory after a newer one"
-                );
-                count += 1;
-                assert!(scheduler.available_uploads() <= BLOCK_UPLOAD_CONCURRENCY);
+                if written == hash {
+                    first.get_or_insert(mined.elapsed());
+                    count += 1;
+                }
+                assert!(slots.available_uploads() <= BLOCK_UPLOAD_CONCURRENCY);
             }
-            advertised.push(count);
+            assert_eq!(first, Some(Duration::ZERO), "block {block} waited");
+            assert!(
+                count <= BLOCK_ADVERT_WINDOW,
+                "block {block} advertised to {count} peers during busy uploads"
+            );
         }
         let max_bodies = bodies.max.load(std::sync::atomic::Ordering::SeqCst);
+        // A body write lasts two block intervals, so the windows of three broadcasts can overlap.
         assert!(
-            max_bodies <= BLOCK_UPLOAD_CONCURRENCY + BLOCK_ADVERT_WINDOW,
+            max_bodies <= BLOCK_UPLOAD_CONCURRENCY + 3 * BLOCK_ADVERT_WINDOW,
             "{max_bodies} concurrent body writes"
-        );
-        assert!(
-            advertised.iter().all(|count| *count <= BLOCK_ADVERT_WINDOW),
-            "busy upload slots stop each broadcast's fan-out after its window: {advertised:?}"
         );
         broadcasts.iter().for_each(|broadcast| broadcast.abort());
     }
@@ -1161,27 +1077,27 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unavailable_early_block_can_be_advertised_again_after_commit() {
         let hash = block::Hash([6; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.unavailable(hash);
         assert!(!early.await.unwrap());
-        let committed = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(committed.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn events_before_inventory_do_not_finish_the_advertisement() {
         let hash = block::Hash([9; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let task = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         // A getdata that follows an earlier inventory resolves before this inventory is written.
         peer.uploads.requested(hash);
@@ -1192,31 +1108,31 @@ mod tests {
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(task.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn unwritten_requested_hash_fails_when_the_request_finishes() {
         let hash = block::Hash([10; 32]);
-        let scheduler = BlockGossipScheduler::new(1);
+        let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let task = tokio::spawn(peer.clone().advertise(scheduler.start(hash)));
+        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         // The inbound service truncated the request before reaching this hash.
         peer.uploads.request_finished(&[hash]);
         assert!(!task.await.unwrap());
-        assert_eq!(scheduler.available_uploads(), 1);
+        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn only_sidecars_wait_for_busy_connections_to_write_inventory() {
         for sidecar in [false, true] {
             let hash = block::Hash([11; 32]);
-            let scheduler = BlockGossipScheduler::new(1);
+            let slots = BlockUploadSlots::new(1);
             let (mut peer, mut receiver) = peer();
             peer.sidecar = sidecar;
-            let task = tokio::spawn(peer.advertise(scheduler.start(hash)));
+            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
             tokio::task::yield_now().await;
             tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
@@ -1228,7 +1144,7 @@ mod tests {
             } else {
                 assert!(!task.await.unwrap());
             }
-            assert_eq!(scheduler.available_uploads(), 1);
+            assert_eq!(slots.available_uploads(), 1);
         }
     }
 

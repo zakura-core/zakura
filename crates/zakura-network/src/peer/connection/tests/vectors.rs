@@ -1338,8 +1338,8 @@ async fn block_gossip_slot_tracks_connection_write() {
         .zcash_deserialize_into()
         .unwrap();
     let hash = block.hash();
-    let scheduler = crate::peer::block_gossip::BlockGossipScheduler::new(1);
-    let advertisement = tokio::spawn(gossip.advertise(scheduler.start(hash)));
+    let slots = crate::peer::block_gossip::BlockUploadSlots::new(1);
+    let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])
@@ -1359,16 +1359,16 @@ async fn block_gossip_slot_tracks_connection_write() {
     // The zero-capacity sink cannot flush its block until we read it below.
     tokio::time::advance(Duration::from_secs(4)).await;
     tokio::task::yield_now().await;
-    assert_eq!(scheduler.available_uploads(), 0);
+    assert_eq!(slots.available_uploads(), 0);
     assert!(!advertisement.is_finished());
     assert_eq!(outbound.next().await.unwrap(), Message::Block(block));
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(749)).await;
     tokio::task::yield_now().await;
-    assert_eq!(scheduler.available_uploads(), 0);
+    assert_eq!(slots.available_uploads(), 0);
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(advertisement.await.unwrap());
-    assert_eq!(scheduler.available_uploads(), 1);
+    assert_eq!(slots.available_uploads(), 1);
     connection_task.abort();
 }
 
@@ -1393,8 +1393,8 @@ async fn truncated_block_request_releases_gossip_slot() {
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let decoy = block::Hash([1; 32]);
     let hash = block::Hash([2; 32]);
-    let scheduler = crate::peer::block_gossip::BlockGossipScheduler::new(1);
-    let advertisement = tokio::spawn(gossip.advertise(scheduler.start(hash)));
+    let slots = crate::peer::block_gossip::BlockUploadSlots::new(1);
+    let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])
@@ -1408,7 +1408,7 @@ async fn truncated_block_request_releases_gossip_slot() {
         .await
         .respond(Response::Blocks(Vec::new()));
     assert!(!advertisement.await.unwrap());
-    assert_eq!(scheduler.available_uploads(), 1);
+    assert_eq!(slots.available_uploads(), 1);
     connection_task.abort();
 }
 

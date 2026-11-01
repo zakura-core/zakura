@@ -49,11 +49,11 @@ fn task_of(identity: &str) -> Option<&str> {
     Some(&rest[..rest.rfind(':')?])
 }
 
-/// An enabled action other than the source, when the source's next point is
-/// its `notified` in the waiting code and a mark is still to come.
+/// An enabled action other than the source, when the source stands between
+/// its check and its `notified` and a mark is still to come.
 fn hold_source(state: &WaitState, enabled: &[String]) -> Option<usize> {
     let source_enabled = enabled.iter().filter_map(|e| task_of(e)).any(is_source);
-    if !source_enabled || !state.source_at_notified() || state.all_marked() {
+    if !source_enabled || !state.source_between_check_and_notified() || state.all_marked() {
         return None;
     }
     enabled
@@ -160,14 +160,14 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
 }
 
 /// The committed input that holds the source back, from
-/// [`hold_source_back`] on the code before the fix. `tests/witness.rs`
-/// runs it as S4.7's witness test.
+/// [`hold_source_back`] on the fixed code. `tests/witness.rs` runs it as S4.7's
+/// witness test, and the lost-wakeup planted case runs it on the reverted code.
 const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
 
 #[test]
-#[ignore = "rewrites the committed input; needs qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch applied"]
+#[ignore = "rewrites the committed input"]
 fn regenerate_wait_complete_input() {
-    let bytes = hold_source_back().expect("the reverted code misses the wakeup");
+    let bytes = hold_source_back().expect_err("the fix wakes the source");
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/discovery-wait-complete.bin"

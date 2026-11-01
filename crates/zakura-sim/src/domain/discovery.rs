@@ -327,6 +327,14 @@ impl WaitState {
         self.source_waits_at(|at| at.starts_with("notified"))
     }
 
+    /// True if the source finished the first of the two operations
+    /// [`final_mark_raced_the_wait`] names and the second is its next point:
+    /// the `notified` after a failed check, or the check after a `notified`.
+    pub fn source_between_check_and_notified(&self) -> bool {
+        (self.check_failed && self.source_at_notified())
+            || (self.created_notified && self.source_waits_at(|at| at.starts_with("lock")))
+    }
+
     /// True if the source's next point is in the waiting code, at a point
     /// whose kind `at` accepts.
     fn source_waits_at(&self, at: impl Fn(&str) -> bool) -> bool {

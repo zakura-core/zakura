@@ -377,12 +377,16 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask sim-triage --sim <name> --out <dir> [--child-secs <s>] <input>..."
+        "  cargo xtask sim-triage --sim <name> --out <dir> [--child-secs <s>]"
+    )?;
+    writeln!(
+        output,
+        "      [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>..."
     )?;
     writeln!(output, "  cargo xtask sim-verify-archive <dir>")?;
     writeln!(
         output,
-        "  cargo xtask sim-campaign (build|start|resume|close|status|verify) --store <dir> ..."
+        "  cargo xtask sim-campaign (build|start|resume|close|status|verify|evidence) --store <dir> ..."
     )?;
     writeln!(output)?;
     writeln!(
@@ -495,17 +499,26 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "limit, replays the first trace Exact, and archives the input with its runs."
+        "limit, replays the first trace Exact, and archives the input with its runs. With"
+    )?;
+    writeln!(
+        output,
+        "--target, it also runs sim-minimize on each confirmed Active failure, and archives"
+    )?;
+    writeln!(
+        output,
+        "the accepted candidate in a minimized bundle beside the failure's bundle."
     )?;
     writeln!(output)?;
     writeln!(
         output,
-        "Checks every bundle in a triage archive against its checksums, and counts the"
+        "Checks every bundle in a triage archive against its checksums, and each minimized"
     )?;
     writeln!(
         output,
-        "bundles under each harness, provenance and signature."
+        "bundle against its failure's bundle, and counts the bundles under each harness,"
     )?;
+    writeln!(output, "provenance and signature.")?;
     writeln!(output)?;
     writeln!(
         output,

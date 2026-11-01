@@ -66,7 +66,10 @@ mod cli {
 
     use serde_json::{json, Value};
     use zakura_sim::{
-        explore::triage::{self, SimChildren, TriageOptions, TRIAGE_FILE},
+        explore::triage::{
+            self, Minimization, PinnedBinary, SimChildren, SimMinimize, TriageOptions,
+            MINIMIZED_FILE, TRIAGE_FILE,
+        },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
         seed::{self, Failed, SeedReport},
@@ -102,7 +105,8 @@ mod cli {
              zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
              [--against <confirmation.json>]\n  \
              zakura-sim properties --sim <name>\n  \
-             zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...\n  \
+             zakura-sim triage --sim <name> --out <dir> [--child-secs <s>]\n      \
+             [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
              zakura-sim verify-archive <dir>\n",
         );
         text.push_str(super::campaign::USAGE);
@@ -149,10 +153,14 @@ mod cli {
              --child-secs seconds (default 60), replays the first trace Exact in a third,\n\
              and archives the input with its runs under --out. It exits 1 only if an input\n\
              couldn't be archived. Each harness, generator and build gets its own\n\
-             directory under --out.\n\
+             directory under --out. With --target, it also runs `cargo xtask sim-minimize`\n\
+             with --runs, --wall-secs, --child-secs and --sanitizer on each confirmed\n\
+             Active failure, and archives the accepted candidate in a bundle beside the\n\
+             failure's bundle, named after it with `.minimized`.\n\
              `verify-archive` checks every bundle under a triage archive against its\n\
-             SHA256SUMS, counts the bundles under each harness, provenance and\n\
-             signature, and exits 1 if any bundle doesn't match.\n",
+             SHA256SUMS, and each minimized bundle against its failure's bundle, counts\n\
+             the bundles under each harness, provenance and signature, and exits 1 if any\n\
+             bundle doesn't match.\n",
         );
         text.push_str(super::campaign::HELP);
         text.push_str("\nHarnesses:\n");
@@ -856,14 +864,26 @@ mod cli {
     }
 
     /// `triage`: confirms each input's failure in fresh processes and
-    /// archives it. Fails only if an input couldn't be archived.
+    /// archives it, and with `--target` minimizes each confirmed `Active`
+    /// failure. Fails only if an input couldn't be archived.
     #[allow(clippy::print_stdout, clippy::print_stderr)]
     fn triage(args: Vec<String>) -> Result<(), Error> {
         let mut sim = None;
         let mut out = None;
         let mut options = TriageOptions::default();
+        let mut target = None;
+        let mut runs = None;
+        let mut wall = None;
+        let mut sanitizer = None;
         let mut inputs = Vec::new();
         let mut seen = Vec::new();
+        let positive = |arg: &str, value: &str| {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| Error::Usage(format!("{arg}: expected a positive whole number")))
+        };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             if !arg.starts_with('-') {
@@ -880,14 +900,20 @@ mod cli {
                 "--sim" => sim = Some(value),
                 "--out" => out = Some(PathBuf::from(value)),
                 "--child-secs" => {
-                    let secs = value
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|secs| *secs > 0)
-                        .ok_or_else(|| {
-                            Error::Usage(format!("{arg}: expected a positive whole number"))
-                        })?;
-                    options.child_timeout = Duration::from_secs(secs);
+                    options.child_timeout = Duration::from_secs(u64::from(positive(&arg, &value)?));
+                }
+                "--target" => target = Some(value),
+                "--runs" => runs = Some(positive(&arg, &value)?),
+                "--wall-secs" => {
+                    wall = Some(Duration::from_secs(u64::from(positive(&arg, &value)?)))
+                }
+                "--sanitizer" if ["address", "none"].contains(&value.as_str()) => {
+                    sanitizer = Some(value);
+                }
+                "--sanitizer" => {
+                    return Err(Error::Usage(format!(
+                        "--sanitizer is address or none, not {value}"
+                    )))
                 }
                 _ => return Err(Error::Usage(format!("unknown flag `{arg}`"))),
             }
@@ -898,11 +924,35 @@ mod cli {
         if inputs.is_empty() {
             return Err(Error::Usage("`triage` needs at least one input".to_owned()));
         }
+        // `cargo xtask sim-minimize` takes every budget explicitly.
+        let minimize = match (target, runs, wall) {
+            (None, None, None) if sanitizer.is_none() => None,
+            (Some(target), Some(runs), Some(wall)) => Some(SimMinimize {
+                // The workspace this binary was built from, so the
+                // minimizer builds the same source.
+                workspace: Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".."),
+                target,
+                runs,
+                wall,
+                child: options.child_timeout,
+                sanitizer,
+            }),
+            _ => {
+                return Err(Error::Usage(
+                    "--target, --runs and --wall-secs go together, and --sanitizer needs them"
+                        .to_owned(),
+                ))
+            }
+        };
         let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
+        // Every input's children run one copy of this binary, even after
+        // the minimizer rebuilds it.
+        let pinned = PinnedBinary::new(&out)
+            .map_err(|error| Error::Failed(format!("pinning this binary: {error}")))?;
         let children = SimChildren {
-            exe: std::env::current_exe()
-                .map_err(|error| Error::Failed(format!("finding this binary: {error}")))?,
+            exe: pinned.exe().to_owned(),
             harness: sim,
+            minimize,
         };
         let mut failed = 0;
         for input in &inputs {
@@ -914,17 +964,34 @@ mod cli {
                         }
                         _ => String::new(),
                     };
-                    let kept = if triaged.archived {
-                        "archived in"
-                    } else {
-                        "already archived in"
+                    let kept = |archived| {
+                        if archived {
+                            "archived in"
+                        } else {
+                            "already archived in"
+                        }
                     };
                     println!(
-                        "{}: {}{class}; {kept} {}",
+                        "{}: {}{class}; {} {}",
                         input.display(),
                         triaged.status.name(),
+                        kept(triaged.archived),
                         triaged.bundle.display()
                     );
+                    match &triaged.minimization {
+                        None => {}
+                        Some(Minimization::Kept { bundle, archived }) => println!(
+                            "{}: minimized; {} {}",
+                            input.display(),
+                            kept(*archived),
+                            bundle.display()
+                        ),
+                        Some(Minimization::NotKept { reason, staging }) => println!(
+                            "{}: not minimized: {reason}; the minimizer's output is in {}",
+                            input.display(),
+                            staging.display()
+                        ),
+                    }
                 }
                 Err(error) => {
                     failed += 1;
@@ -954,27 +1021,35 @@ mod cli {
         };
         let bundles = triage::bundles(&dir).map_err(read)?;
         let mut bad = 0;
-        let mut groups: std::collections::BTreeMap<PathBuf, (usize, String)> =
+        let mut groups: std::collections::BTreeMap<(PathBuf, bool), (usize, String)> =
             std::collections::BTreeMap::new();
         for bundle in &bundles {
-            let problems = triage::verify_bundle(bundle).map_err(read)?;
+            let problems = triage::verify(bundle).map_err(read)?;
             for problem in &problems {
                 eprintln!("{}: {problem}", bundle.display());
             }
             bad += usize::from(!problems.is_empty());
-            let report: Value = std::fs::read(bundle.join(TRIAGE_FILE))
+            let minimized = triage::is_minimized(bundle);
+            let file = if minimized {
+                MINIMIZED_FILE
+            } else {
+                TRIAGE_FILE
+            };
+            let report: Value = std::fs::read(bundle.join(file))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or(Value::Null);
-            let name = report["signature"]
+            let mut name = report["signature"]
                 .as_str()
                 .or(report["status"].as_str())
-                .unwrap_or("unreadable triage.json")
-                .to_owned();
+                .map_or_else(|| format!("unreadable {file}"), str::to_owned);
+            if minimized {
+                name.push_str(", minimized");
+            }
             let group = bundle.parent().unwrap_or(&dir).to_owned();
-            groups.entry(group).or_insert((0, name)).0 += 1;
+            groups.entry((group, minimized)).or_insert((0, name)).0 += 1;
         }
-        for (group, (count, name)) in &groups {
+        for ((group, _), (count, name)) in &groups {
             let group = group.strip_prefix(&dir).unwrap_or(group);
             println!("{count} {}: {name}", group.display());
         }

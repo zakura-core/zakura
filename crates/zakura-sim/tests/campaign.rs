@@ -7,9 +7,13 @@
 //! the supervisor passes, writes a corpus file every 50 ms until its
 //! `-max_total_time`, and does what the files in its control directory
 //! say: crash once or always, end at the abandonment limit, exit 0 early,
-//! log 8 MiB, log a feedback line, hang in a merge, or leave a merge process behind
-//! that writes a crash file later. It exits when its parent does, as a real
-//! fuzzer does when a terminal's interrupt reaches its process group.
+//! exit 1 once after its stats file is complete, log 8 MiB, log a feedback
+//! line, hang in a merge, or leave a merge process behind that writes a
+//! crash file later. With a `stats` control file, it writes
+//! that file to `$ZAKURA_SIM_STATS` as its stats file, incomplete at start
+//! and complete at a clean exit, as a real target does. It exits when its
+//! parent does, as a real fuzzer does when a terminal's interrupt reaches
+//! its process group.
 #![cfg(zakura_sim)]
 
 use std::{
@@ -25,12 +29,16 @@ use std::{
 use tempfile::TempDir;
 use zakura_sim::{
     campaign::{
-        self, AttemptEnd, Budget, BuildIdentity, CampaignError, Compaction, Digest, End, Migration,
-        Recorder, ResumeOptions, RunState, StartOptions, Status, Store, WorkerOutcome, WorkerPlan,
-        ATTEMPTS_FILE, FUZZ_PACKAGE,
+        self, AttemptEnd, Budget, BuildIdentity, CampaignError, Compaction, Digest, End,
+        Incomplete, Migration, Recorder, ResumeOptions, RunState, StartOptions, Status, Store,
+        WorkerOutcome, WorkerPlan, ATTEMPTS_FILE, FUZZ_PACKAGE,
     },
-    explore::{ProcessFailure, ABANDON_LIMIT_PANIC, EXPECT_VAR},
+    explore::{
+        stats::{CleanupCounts, Counts, ProcessStats, PropertyCounts, STATS_VAR, STATS_VERSION},
+        ProcessFailure, ABANDON_LIMIT_PANIC, EXPECT_VAR,
+    },
     harness,
+    property::Status as PropertyStatus,
     trace::BuildInfo,
 };
 
@@ -57,11 +65,20 @@ touch "$control/ran"
 echo "asan=$ASAN_OPTIONS" >&2
 echo "expect=$ZAKURA_SIM_EXPECT" >&2
 alive() { kill -0 "$parent" 2>/dev/null; }
+stats() {
+  if [ -n "$ZAKURA_SIM_STATS" ] && [ -e "$control/stats" ]; then
+    mkdir -p "$ZAKURA_SIM_STATS"
+    sed -e "s/@PID@/$$/" -e "s/@COMPLETE@/$1/" -e "s/@STARTED@/$started/" "$control/stats" \
+      > "$ZAKURA_SIM_STATS/.partial-$$"
+    mv "$ZAKURA_SIM_STATS/.partial-$$" "$ZAKURA_SIM_STATS/stats-$$.json"
+  fi
+}
 if [ -e "$control/feedback" ]; then
   echo "zakura-sim feedback: backend=stub version=7 features=1 mode=on" >&2
 fi
 if [ "$runs" = 0 ]; then exit 0; fi
 if [ "$merge" = 1 ]; then
+  if [ -n "$ZAKURA_SIM_STATS" ]; then touch "$control/merge-had-stats"; fi
   if [ -e "$control/merge-orphan" ]; then
     # libFuzzer's outer merge runs an inner process, which can outlive it.
     ( sleep 2; printf 'late %s' "$BASHPID" > "${prefix}crash-late-$BASHPID" ) &
@@ -91,6 +108,8 @@ fi
 if [ -e "$control/chatty" ]; then
   yes 'a chatty target line' | head -c 8388608 >&2
 fi
+started=$(date +%s)
+stats false
 out=${dirs[0]}
 end=$(( $(date +%s%N) + time * 1000000000 ))
 i=0
@@ -109,6 +128,7 @@ while [ "$(date +%s%N)" -lt "$end" ]; do
     fi
     if [ -e "$control/exit-early" ]; then
       echo "Done $i runs in 0 second(s)" >&2
+      stats true
       exit 0
     fi
     if mv "$control/abandon" "$control/abandon-taken-$$" 2>/dev/null; then
@@ -119,6 +139,10 @@ while [ "$(date +%s%N)" -lt "$end" ]; do
   sleep 0.05
 done
 echo "Done $i runs in $time second(s)" >&2
+stats true
+if mv "$control/fail-after-stats" "$control/fail-after-stats-taken-$$" 2>/dev/null; then
+  exit 1
+fi
 exit 0
 "#;
 
@@ -1168,6 +1192,7 @@ fn close_reads_past_a_garbled_attempts_line() {
         attempt: 0,
         seed: 1,
         max_total_time: 60,
+        pid: None,
         started_unix: 0,
         millis: 5,
         code: Some(1),
@@ -1263,4 +1288,583 @@ fn a_running_run_is_left_alone() {
         .workers
         .iter()
         .all(|worker| worker.outcome == WorkerOutcome::Unfinished));
+}
+
+/// The counts every stand-in process writes: one property applied, with
+/// an assumption loss, one never applied, and features in two families
+/// and outside them.
+fn template_counts() -> Counts {
+    let mut applied = PropertyCounts::new(PropertyStatus::Active);
+    applied.held = 2;
+    applied.evaluations = 5;
+    applied.inconclusive.insert("assumption-lost".to_owned(), 1);
+    applied.violated = 1;
+    let mut unapplied = PropertyCounts::new(PropertyStatus::Draft);
+    unapplied.not_applicable = 3;
+    Counts {
+        runs: 3,
+        outcomes: [("clean".to_owned(), 2), ("fail".to_owned(), 1)].into(),
+        ends: [("budget".to_owned(), 1), ("idle/quiescent".to_owned(), 2)].into(),
+        drains_exhausted: 1,
+        cleanup: CleanupCounts {
+            abandoned: 1,
+            leaked_tasks: 2,
+            unwound: 1,
+            panicked: 1,
+            unwind_failures: 1,
+        },
+        properties: [
+            ("p/applied".to_owned(), applied),
+            ("p/unapplied".to_owned(), unapplied),
+        ]
+        .into(),
+        features: [(0, 2), (16384, 1), (65280, 3)].into(),
+    }
+}
+
+/// [`template_counts`] as a stats file of `harness`, whose process ID,
+/// start and completeness the stand-in fills in.
+fn stats_template(harness: &str) -> String {
+    let stats = ProcessStats {
+        version: STATS_VERSION,
+        harness: harness.to_owned(),
+        pid: 0,
+        started_unix: 0,
+        written_unix: 0,
+        complete: false,
+        counts: template_counts(),
+    };
+    let text = serde_json::to_string(&stats).unwrap();
+    text.replace("\"pid\":0", "\"pid\":@PID@")
+        .replace("\"started_unix\":0", "\"started_unix\":@STARTED@")
+        .replace("\"complete\":false", "\"complete\":@COMPLETE@")
+}
+
+/// The properties no complete file saw apply when every file holds
+/// [`template_counts`]: the harness's own, which no file names, and
+/// `p/unapplied`, plus `p/applied` if `applied` is false.
+fn unapplied(applied: bool) -> Vec<String> {
+    let entry = harness::find(SIM).unwrap();
+    let mut ids: Vec<String> = (entry.properties)()
+        .into_iter()
+        .map(|property| property.id)
+        .chain(["p/unapplied".to_owned()])
+        .chain((!applied).then(|| "p/applied".to_owned()))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Worker `worker`'s attempts log in run `run`.
+fn attempts_log(store: &Store, run: &Digest, worker: usize) -> PathBuf {
+    store
+        .run_dir(run)
+        .join("workers")
+        .join(worker.to_string())
+        .join(ATTEMPTS_FILE)
+}
+
+/// Worker `worker`'s logged attempts in run `run`.
+fn read_attempts(store: &Store, run: &Digest, worker: usize) -> Vec<campaign::Attempt> {
+    fs::read_to_string(attempts_log(store, run, worker))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Rewrites worker `worker`'s attempts log in run `run` with `attempts`.
+fn write_attempts(store: &Store, run: &Digest, worker: usize, attempts: &[campaign::Attempt]) {
+    let text: String = attempts
+        .iter()
+        .map(|attempt| serde_json::to_string(attempt).unwrap() + "\n")
+        .collect();
+    fs::write(attempts_log(store, run, worker), text).unwrap();
+}
+
+/// `counts` added up `n` times.
+fn times(counts: &Counts, n: usize) -> Counts {
+    let mut sum = Counts::default();
+    for _ in 0..n {
+        sum.add(counts);
+    }
+    sum
+}
+
+impl Fixture {
+    /// Makes the stand-in write [`template_counts`] as its stats file.
+    fn write_stats(&self) {
+        fs::write(self.control.join("stats"), stats_template(SIM)).unwrap();
+    }
+}
+
+/// E4b-min: a run's evidence sums each worker's process counts, and the
+/// run's, and passes every count through: outcomes, ends, budget exits,
+/// cleanup, property applicability and assumption losses, and features.
+/// The compaction's merge counts nothing, and `evidence --out` writes the
+/// same evidence the library reads.
+#[test]
+fn evidence_sums_each_workers_processes() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    let mut args = fixture.start_args("1");
+    args.extend(["--compact-secs", "10"]);
+    // A stats directory the supervisor inherits reaches no fuzzer process.
+    let inherited = fixture.dir.path().join("inherited");
+    let output = Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .arg("campaign")
+        .args(&args)
+        .arg("--store")
+        .arg(fixture.store.root())
+        .env(STATS_VAR, &inherited)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let run = leaf(&fixture.store);
+    let end = campaign::read_end(&fixture.store, &run).unwrap();
+    assert!(matches!(end.compaction, Some(Compaction::Compacted { .. })));
+    assert!(
+        !fixture.control.join("merge-had-stats").exists(),
+        "the compaction's merge gets no stats directory"
+    );
+    assert!(!inherited.exists());
+
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.run, run);
+    assert_eq!(evidence.harness, SIM);
+    assert_eq!(evidence.status, Some(Status::Complete));
+    let template = template_counts();
+    assert_eq!(evidence.workers.len(), 2);
+    for (index, worker) in evidence.workers.iter().enumerate() {
+        assert_eq!(worker.index, index);
+        assert_eq!(worker.outcome, Some(WorkerOutcome::BudgetSpent));
+        assert_eq!(worker.attempts, [(AttemptEnd::Finished, 1)].into());
+        assert_eq!(worker.processes, 1);
+        assert_eq!(worker.counts, template);
+    }
+    let doubled = times(&template, 2);
+    assert_eq!(evidence.totals, doubled);
+    assert_eq!(evidence.complete_totals, doubled);
+    assert_eq!(evidence.unapplied, unapplied(true));
+    assert_eq!(evidence.incomplete, []);
+
+    let totals = &evidence.totals;
+    assert_eq!(totals.runs, 6);
+    assert_eq!(totals.outcomes["clean"], 4);
+    assert_eq!(totals.outcomes["fail"], 2);
+    assert_eq!(totals.ends["idle/quiescent"], 4);
+    assert_eq!(totals.budget_exits(), 2);
+    assert_eq!(totals.drains_exhausted, 2);
+    assert_eq!(totals.cleanup.abandoned, 2);
+    assert_eq!(totals.cleanup.leaked_tasks, 4);
+    assert_eq!(totals.cleanup.unwound, 2);
+    assert_eq!(totals.cleanup.panicked, 2);
+    assert_eq!(totals.cleanup.unwind_failures, 2);
+    let applied = &totals.properties["p/applied"];
+    assert_eq!((applied.held, applied.evaluations), (4, 10));
+    assert_eq!(applied.assumption_losses(), 2);
+    assert_eq!(applied.violated, 2);
+    assert_eq!(applied.status, PropertyStatus::Active);
+    assert_eq!(totals.properties["p/unapplied"].not_applicable, 6);
+    assert_eq!(
+        totals.properties["p/unapplied"].status,
+        PropertyStatus::Draft
+    );
+    assert_eq!(totals.features, [(0, 4), (16384, 2), (65280, 6)].into());
+    assert_eq!(
+        totals.feature_totals(),
+        (
+            3,
+            [
+                ("feature/budget", 1),
+                ("feature/request-reset", 1),
+                ("other", 1)
+            ]
+            .into()
+        )
+    );
+
+    let out = fixture.dir.path().join("evidence.json");
+    let output = fixture.cli(&["evidence", "--out", out.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    assert_eq!(written, serde_json::to_value(&evidence).unwrap());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let unapplied_line = format!("unapplied: {}", unapplied(true).join(", "));
+    for line in [
+        "worker 0: budget-spent; processes: finished 1; stats files: 1; 3 runs (clean 2, fail 1)",
+        "total: 6 runs (clean 4, fail 2)",
+        "budget exits: 2; drains exhausted: 2",
+        "cleanup: abandoned 2 (4 tasks leaked), unwound 2, panicked 2, unwind failures 2",
+        "features: 3 distinct (feature/budget 1, feature/request-reset 1, other 1)",
+        "property p/applied [active]: held 4 (10 evaluations), not applicable 0, inconclusive 2 \
+         (assumption-lost 2), assumption losses 2, violated 2",
+        &unapplied_line,
+    ] {
+        assert!(stdout.lines().any(|got| got == line), "{line}\n{stdout}");
+    }
+}
+
+/// E4b-min: the evidence lists every way a run's counts fall short. A
+/// crashed process's file is partial and stays out of the complete totals.
+/// A stats file the attempts log doesn't list, a process that left no
+/// file, an unreadable file and another harness's file are each listed,
+/// and only the complete files decide which properties applied.
+#[test]
+fn evidence_lists_incomplete_processes() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    fixture.set("crash");
+    let (run, end) = start(&fixture.store, fixture.options(1, 2));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let attempts = read_attempts(&fixture.store, &run, 0);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].end, AttemptEnd::Failure);
+    let crashed = attempts[0].pid.unwrap();
+    let finished = attempts[1].pid.unwrap();
+
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    let template = template_counts();
+    assert_eq!(
+        evidence.incomplete,
+        [Incomplete::PartialStats {
+            worker: 0,
+            pid: crashed
+        }]
+    );
+    let worker = &evidence.workers[0];
+    assert_eq!(
+        worker.attempts,
+        [(AttemptEnd::Finished, 1), (AttemptEnd::Failure, 1)].into()
+    );
+    assert_eq!(worker.processes, 2);
+    assert_eq!(evidence.totals, times(&template, 2));
+    assert_eq!(evidence.complete_totals, template);
+
+    let stats = fixture.store.run_dir(&run).join("workers/0/stats");
+    let stray = 999_999;
+    fs::write(
+        stats.join(format!("stats-{stray}.json")),
+        stats_template(SIM)
+            .replace("@PID@", &stray.to_string())
+            .replace("@STARTED@", "0")
+            .replace("@COMPLETE@", "true"),
+    )
+    .unwrap();
+    fs::write(stats.join("stats-7.json"), b"{").unwrap();
+    fs::write(
+        stats.join("stats-8.json"),
+        stats_template("other/harness")
+            .replace("@PID@", "8")
+            .replace("@STARTED@", "0")
+            .replace("@COMPLETE@", "true"),
+    )
+    .unwrap();
+    fs::remove_file(stats.join(format!("stats-{finished}.json"))).unwrap();
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    let mut reasons = evidence.incomplete.iter();
+    assert_eq!(
+        reasons.next(),
+        Some(&Incomplete::MissingStats {
+            worker: 0,
+            attempt: 1,
+            pid: Some(finished)
+        })
+    );
+    assert_eq!(
+        reasons.next(),
+        Some(&Incomplete::PartialStats {
+            worker: 0,
+            pid: crashed
+        })
+    );
+    assert_eq!(
+        reasons.next(),
+        Some(&Incomplete::UnloggedProcess {
+            worker: 0,
+            pid: stray
+        })
+    );
+    let Some(Incomplete::UnreadableStats { file, error, .. }) = reasons.next() else {
+        panic!("{:?}", evidence.incomplete);
+    };
+    assert_eq!(file, "stats-7.json");
+    assert!(error.contains("parsing"), "{error}");
+    let Some(Incomplete::UnreadableStats { file, error, .. }) = reasons.next() else {
+        panic!("{:?}", evidence.incomplete);
+    };
+    assert_eq!(file, "stats-8.json");
+    assert!(error.contains("other/harness"), "{error}");
+    assert_eq!(reasons.next(), None);
+    assert_eq!(evidence.totals, times(&template, 2));
+    assert_eq!(
+        evidence.complete_totals,
+        Counts::default(),
+        "the stray file is complete, but no logged process wrote it"
+    );
+    // Without a complete file a logged process wrote, no property applied.
+    assert_eq!(evidence.unapplied, unapplied(false));
+}
+
+/// E4b-min: a stats file counts only for the logged process that wrote
+/// it. A process ID an earlier attempt also had, and a stale copy from
+/// before the attempt started, leave that attempt's file missing and the
+/// file unlogged. A file named like a stats file, but not as a process
+/// writes one, is unreadable rather than a second file for the same
+/// process.
+#[test]
+fn evidence_matches_each_file_to_the_process_that_wrote_it() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    fixture.set("crash");
+    let (run, end) = start(&fixture.store, fixture.options(1, 2));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let mut attempts = read_attempts(&fixture.store, &run, 0);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    let stats = fixture.store.run_dir(&run).join("workers/0/stats");
+    let (crashed, finished) = (attempts[0].pid.unwrap(), attempts[1].pid.unwrap());
+    let template = template_counts();
+
+    // The finished process reused the crashed one's ID, and overwrote its
+    // file.
+    fs::rename(
+        stats.join(format!("stats-{finished}.json")),
+        stats.join(format!("stats-{crashed}.json")),
+    )
+    .unwrap();
+    let text = fs::read_to_string(stats.join(format!("stats-{crashed}.json"))).unwrap();
+    fs::write(
+        stats.join(format!("stats-{crashed}.json")),
+        text.replace(
+            &format!("\"pid\":{finished}"),
+            &format!("\"pid\":{crashed}"),
+        ),
+    )
+    .unwrap();
+    attempts[1].pid = Some(crashed);
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.incomplete,
+        [Incomplete::MissingStats {
+            worker: 0,
+            attempt: 0,
+            pid: Some(crashed)
+        }]
+    );
+    assert_eq!(evidence.workers[0].processes, 1);
+    assert_eq!(evidence.totals, template);
+    assert_eq!(evidence.complete_totals, template);
+
+    // A stale copy: its process started before either attempt did.
+    for attempt in &mut attempts {
+        attempt.started_unix += 3600;
+    }
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.incomplete,
+        [
+            Incomplete::MissingStats {
+                worker: 0,
+                attempt: 0,
+                pid: Some(crashed)
+            },
+            Incomplete::MissingStats {
+                worker: 0,
+                attempt: 1,
+                pid: Some(crashed)
+            },
+            Incomplete::UnloggedProcess {
+                worker: 0,
+                pid: crashed
+            },
+        ]
+    );
+    assert_eq!(evidence.totals, template);
+    assert_eq!(evidence.complete_totals, Counts::default());
+    assert_eq!(evidence.unapplied, unapplied(false));
+
+    // A second name for the same process.
+    for attempt in &mut attempts {
+        attempt.started_unix -= 3600;
+    }
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    fs::copy(
+        stats.join(format!("stats-{crashed}.json")),
+        stats.join(format!("stats-0{crashed}.json")),
+    )
+    .unwrap();
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    let Some(Incomplete::UnreadableStats { file, error, .. }) = evidence.incomplete.last() else {
+        panic!("{:?}", evidence.incomplete);
+    };
+    assert_eq!(file, &format!("stats-0{crashed}.json"));
+    assert!(error.contains("stats-<pid>.json"), "{error}");
+    assert_eq!(evidence.incomplete.len(), 2, "{:?}", evidence.incomplete);
+    assert_eq!(evidence.totals, template);
+}
+
+/// E4b-min: a complete stats file counts only if its process exited
+/// cleanly: with code 0 and no failure in its output. A process that marks
+/// its file complete and then exits 1, or exits 0 after a sanitizer
+/// report, lists its attempt as an unclean exit, and its file stays out of
+/// the complete totals.
+#[test]
+fn evidence_counts_a_complete_file_only_after_a_clean_exit() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    fixture.set("fail-after-stats");
+    let (run, end) = start(&fixture.store, fixture.options(1, 1));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let mut attempts = read_attempts(&fixture.store, &run, 0);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].code, Some(1));
+    assert_eq!(attempts[0].end, AttemptEnd::Failure);
+    let pid = attempts[0].pid.unwrap();
+    let file = fixture
+        .store
+        .run_dir(&run)
+        .join(format!("workers/0/stats/stats-{pid}.json"));
+    assert!(ProcessStats::read(&file).unwrap().complete);
+    let template = template_counts();
+    let unclean = [Incomplete::UncleanExit {
+        worker: 0,
+        attempt: 0,
+        pid,
+    }];
+
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, unclean);
+    assert_eq!(evidence.totals, template);
+    assert_eq!(evidence.complete_totals, Counts::default());
+    assert_eq!(evidence.unapplied, unapplied(false));
+
+    // Exit code 0 with a failure in the output is still unclean.
+    attempts[0].code = Some(0);
+    attempts[0].failure = Some(ProcessFailure::Sanitizer {
+        report: "==1==ERROR: AddressSanitizer: heap-use-after-free".to_owned(),
+    });
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, unclean);
+    assert_eq!(evidence.complete_totals, Counts::default());
+
+    attempts[0].failure = None;
+    attempts[0].end = AttemptEnd::Finished;
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, []);
+    assert_eq!(evidence.complete_totals, template);
+    assert_eq!(evidence.unapplied, unapplied(true));
+}
+
+/// E4b-min: a run whose processes wrote no stats files, and an attempts
+/// log written before attempts recorded process IDs, list every attempt as
+/// missing its stats, and leave every one of the harness's properties
+/// unapplied.
+#[test]
+fn evidence_without_stats_files_leaves_every_property_unapplied() {
+    let fixture = Fixture::new();
+    let (run, end) = start(&fixture.store, fixture.options(1, 1));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let mut attempts = read_attempts(&fixture.store, &run, 0);
+    let pid = attempts[0].pid;
+    assert!(pid.is_some());
+    let missing = [Incomplete::MissingStats {
+        worker: 0,
+        attempt: 0,
+        pid,
+    }];
+    let entry = harness::find(SIM).unwrap();
+    let mut harness_ids: Vec<String> = (entry.properties)()
+        .into_iter()
+        .map(|property| property.id)
+        .collect();
+    harness_ids.sort();
+    assert!(!harness_ids.is_empty());
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(evidence.incomplete, missing);
+    assert_eq!(evidence.totals, Counts::default());
+    assert_eq!(evidence.unapplied, harness_ids);
+
+    attempts[0].pid = None;
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let line = fs::read_to_string(attempts_log(&fixture.store, &run, 0)).unwrap();
+    let line = line.replace(",\"pid\":null", "");
+    assert!(!line.contains("pid"), "{line}");
+    fs::write(attempts_log(&fixture.store, &run, 0), line).unwrap();
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.incomplete,
+        [Incomplete::MissingStats {
+            worker: 0,
+            attempt: 0,
+            pid: None
+        }]
+    );
+    assert_eq!(evidence.unapplied, harness_ids);
+}
+
+/// E4b-min: a worker that stops at its restart limit, and the workers of a
+/// run whose supervisor was killed, are incomplete, before and after
+/// `close`.
+#[test]
+fn evidence_lists_unfinished_workers() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    fixture.set("always-crash");
+    let (run, end) = start(&fixture.store, fixture.options(1, 60));
+    assert_eq!(end.status, Status::WorkerStopped, "{end:?}");
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.workers[0].outcome,
+        Some(WorkerOutcome::RestartLimit)
+    );
+    assert_eq!(
+        evidence.workers[0].attempts,
+        [(AttemptEnd::Failure, 3)].into()
+    );
+    assert_eq!(
+        evidence.incomplete[0],
+        Incomplete::RestartLimit { worker: 0 }
+    );
+    assert_eq!(evidence.incomplete.len(), 4, "{:?}", evidence.incomplete);
+    assert!(evidence.incomplete[1..]
+        .iter()
+        .all(|reason| matches!(reason, Incomplete::PartialStats { worker: 0, .. })));
+    assert_eq!(evidence.complete_totals, Counts::default());
+
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    let run = start_and_kill(&fixture.store, &fixture.start_args("60"), || true);
+    for closed in [false, true] {
+        if closed {
+            campaign::close(&fixture.store, &run).unwrap();
+        }
+        let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+        let expected = closed.then_some(Status::Interrupted);
+        assert_eq!(evidence.status, expected);
+        let outcome = closed.then_some(WorkerOutcome::Unfinished);
+        assert!(evidence
+            .workers
+            .iter()
+            .all(|worker| worker.outcome == outcome));
+        let unfinished: Vec<&Incomplete> = evidence
+            .incomplete
+            .iter()
+            .filter(|reason| matches!(reason, Incomplete::Unfinished { .. }))
+            .collect();
+        assert_eq!(
+            unfinished,
+            [
+                &Incomplete::Unfinished { worker: 0 },
+                &Incomplete::Unfinished { worker: 1 }
+            ]
+        );
+        assert!(evidence
+            .incomplete
+            .iter()
+            .any(|reason| matches!(reason, Incomplete::PartialStats { .. })));
+    }
 }

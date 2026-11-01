@@ -1474,7 +1474,7 @@ fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
             .with_block_gossip_peer_ips(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
             .build();
         peer_set.ready().await.unwrap();
-        let mut advertiser = peer_set.block_advertiser();
+        let advertiser = peer_set.block_advertiser();
 
         // Every peer is busy, so the peer set would not accept an ordinary request.
         for addr in [sidecar_addr, ordinary_addr] {
@@ -1484,8 +1484,8 @@ fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
         assert!(peer_set.ready_services.is_empty());
 
         let hash = block::Hash([8; 32]);
-        let broadcast =
-            tokio::spawn(advertiser.advertise(Request::AdvertiseMinedBlock(hash.into())));
+        // Called through `Service`, as the node's block gossip task does.
+        let broadcast = tokio::spawn(advertiser.oneshot(Request::AdvertiseMinedBlock(hash.into())));
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1499,7 +1499,7 @@ fn block_advertiser_peer_list_is_republished_only_on_membership_change() {
     let (runtime, _init_guard) = zakura_test::init_async();
     let _guard = runtime.enter();
     tokio::time::pause();
-    let (discovered, sidecar_addr, _ordinary_addr, _sidecar_handle, _ordinary_handle) =
+    let (discovered, sidecar_addr, ordinary_addr, _sidecar_handle, _ordinary_handle) =
         sidecar_and_ordinary_discovery();
     let (minimum_peer_version, _best_tip_height) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
@@ -1527,6 +1527,21 @@ fn block_advertiser_peer_list_is_republished_only_on_membership_change() {
         peer_set.ready().await.unwrap();
         assert!(advertiser.peers.has_changed().unwrap());
         assert_eq!(advertiser.peers.borrow_and_update().len(), 1);
+
+        // A peer set broadcast drops the removed peer before the next poll. The poll stays
+        // pending with no peer left, but still publishes the removal.
+        peer_set.remove(&ordinary_addr);
+        drop(
+            peer_set
+                .route_block_broadcast(Request::AdvertiseBlock(block::Hash([7; 32]).into(), None)),
+        );
+        std::future::poll_fn(|cx| {
+            assert!(peer_set.poll_ready(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(advertiser.peers.has_changed().unwrap());
+        assert!(advertiser.peers.borrow_and_update().is_empty());
     });
 }
 

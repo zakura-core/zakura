@@ -637,7 +637,15 @@ fn an_interrupted_reduction_keeps_the_original() {
     let started = Instant::now();
     let report = thread::scope(|scope| {
         scope.spawn(|| {
-            thread::sleep(Duration::from_millis(500));
+            // Interrupt once `tmin` has written its output, not after a fixed delay: a slow
+            // runner can take longer than any fixed delay to start the script.
+            let output = fake.out(TMIN_DIR).join("minimized-from-00");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read(&output).is_ok_and(|bytes| bytes == b"good")
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
             interrupt.store(true, Ordering::SeqCst);
         });
         fake.run_with(

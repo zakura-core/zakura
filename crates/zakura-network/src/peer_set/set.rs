@@ -129,7 +129,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
         advert_fanout::{AdvertFanout, UploadBandwidth},
-        block_gossip::{BlockGossipPeer, BlockGossipScheduler, BLOCK_UPLOAD_CONCURRENCY},
+        block_gossip::{BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{
@@ -243,9 +243,10 @@ where
     block_gossip_peers_tx: watch::Sender<Vec<BlockGossipPeer>>,
     /// Whether `block_gossip_peers` changed since it was last published.
     block_gossip_peers_changed: bool,
-    /// Shares upload slots across early, committed, and concurrent block broadcasts, and lets a
-    /// newer block's broadcast supersede older ones.
-    block_gossip_scheduler: BlockGossipScheduler,
+    /// Share the upload slots across early, committed, and concurrent block broadcasts.
+    block_gossip_slots: BlockUploadSlots,
+    /// Sizes each block broadcast's advert window.
+    block_gossip_fanout: AdvertFanout,
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
@@ -385,10 +386,8 @@ where
             block_gossip_peers: HashMap::new(),
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
-            block_gossip_scheduler: BlockGossipScheduler::new(
-                BLOCK_UPLOAD_CONCURRENCY,
-                AdvertFanout::from_config(config, upload_bandwidth),
-            ),
+            block_gossip_slots: BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY),
+            block_gossip_fanout: AdvertFanout::from_config(config, upload_bandwidth),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
 
@@ -1359,9 +1358,7 @@ where
             Request::AdvertiseMinedBlock(block) => (block, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
-        self.block_gossip_peers.retain(|key, _| {
-            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
-        });
+        self.prune_block_gossip_peers();
         // A minimum version increase cancels busy outdated peers only after their current work.
         let minimum_version = self.minimum_peer_version.current();
         let peers = self
@@ -1372,9 +1369,21 @@ where
             .collect();
         crate::peer::block_gossip::broadcast_block(
             peers,
+            block.hash,
+            self.block_gossip_fanout.window(block.size),
             mined,
-            self.block_gossip_scheduler.start(block),
+            self.block_gossip_slots.clone(),
         )
+    }
+
+    /// Drops the block gossip peers of connections that left the peer set, and marks the
+    /// published peer list stale if any were dropped.
+    fn prune_block_gossip_peers(&mut self) {
+        let before = self.block_gossip_peers.len();
+        self.block_gossip_peers.retain(|key, _| {
+            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
+        });
+        self.block_gossip_peers_changed |= self.block_gossip_peers.len() != before;
     }
 
     /// Publishes the block gossip peers to block advertisers, if they changed.
@@ -1393,7 +1402,8 @@ where
     {
         crate::peer::block_gossip::BlockAdvertiser {
             peers: self.block_gossip_peers_tx.subscribe(),
-            scheduler: self.block_gossip_scheduler.clone(),
+            slots: self.block_gossip_slots.clone(),
+            fanout: self.block_gossip_fanout.clone(),
             minimum_peer_version: self.minimum_peer_version.clone(),
         }
     }
@@ -1567,11 +1577,7 @@ where
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
         let ready_peers = self.poll_peers(cx)?;
-        let block_gossip_peers = self.block_gossip_peers.len();
-        self.block_gossip_peers.retain(|key, _| {
-            self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
-        });
-        self.block_gossip_peers_changed |= self.block_gossip_peers.len() != block_gossip_peers;
+        self.prune_block_gossip_peers();
         self.publish_block_gossip_peers();
 
         // Peers leave the set through many paths. Pruning here, instead of at each

@@ -298,14 +298,29 @@ fn lock(path: &Path) -> Result<Option<File>, CampaignError> {
 
 /// True if no process holds the exclusive lock on the file at `path`. It
 /// takes a shared lock for a moment, which [`lock`] waits out.
+///
+/// A refused probe retries until [`LOCK_WAIT`]. A lock belongs to its open
+/// file, which stays open while any process has a descriptor for it, and a
+/// child has a copy of its parent's descriptors from its fork until its exec
+/// closes them. So a holder that closes the lock while another thread of its
+/// process starts a child holds the lock until that exec. In parallel tests,
+/// a child still in its fork held a finished run's lock for tens of
+/// milliseconds, which reported that run as still going.
 fn probe(path: &Path) -> Result<bool, CampaignError> {
-    match open_lock(path)?.try_lock_shared() {
-        Ok(()) => Ok(true),
-        Err(TryLockError::WouldBlock) => Ok(false),
-        Err(TryLockError::Error(error)) => Err(CampaignError::Io {
-            context: format!("locking {}", path.display()),
-            error,
-        }),
+    let file = open_lock(path)?;
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(LOCK_RETRY),
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Error(error)) => {
+                return Err(CampaignError::Io {
+                    context: format!("locking {}", path.display()),
+                    error,
+                })
+            }
+        }
     }
 }
 

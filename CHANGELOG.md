@@ -11,6 +11,48 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.0-rc1] - 2026-11-01
+
+### Changed
+
+- Enable BMI2/ADX Pasta assembly in default node and release builds, without
+  global CPU compiler flags or per-operation runtime CPU detection. Default
+  x86-64 binaries now require both CPU extensions and check compatibility at
+  startup, including in the standalone rollback utility. Build with
+  `--features portable` for older x86-64 CPUs
+  ([#1893](https://github.com/zakura-core/zakura/pull/1893)).
+- Committing a block no longer opens INFO tracing spans for each transaction, which made
+  large blocks slower to accept. At INFO, logs from inside block commits lose the
+  per-transaction span names, hashes and indexes; TRACE keeps them
+  ([#1894](https://github.com/zakura-core/zakura/pull/1894)).
+- Sapling value commitments are now held as bytes through librustzcash
+  conversion, following Common's sapling-crypto change; the set of accepted
+  `cv` encodings is unchanged, and an invalid one is still rejected by the
+  semantic verifier before any proof work
+  ([#1907](https://github.com/zakura-core/zakura/pull/1907)).
+- Reduced parent-input check latency for blocks with large batches of transparent inputs by overlapping reads ([#1908](https://github.com/zakura-core/zakura/pull/1908)).
+- Verifying a block the node has not seen before is faster for blocks with many
+  transactions: about a third faster for a 1.9 MB transparent block
+  ([#1909](https://github.com/zakura-core/zakura/pull/1909)).
+- `getblocktemplate` now reports `-10` (not synced) only when the local chain
+  tip's block time is more than 6 hours old. The threshold is now a fixed
+  duration rather than a block count, so it no longer shrinks when block
+  spacing changes ([#1911](https://github.com/zakura-core/zakura/pull/1911)).
+
+### Fixed
+
+- A gossiped block that arrives before its parent now immediately requests the
+  missing parent, or waits on the parent's existing download, instead of waiting
+  for another peer or the next sync round. The request goes to a peer that
+  advertised the parent, or otherwise to the peer that sent the block. The block
+  must have valid proof of work to start a request
+  ([#1873](https://github.com/zakura-core/zakura/pull/1873)).
+- A newly mined or received block is announced to peers right away, instead of
+  waiting up to several seconds for an earlier block's announcements to
+  finish ([#1874](https://github.com/zakura-core/zakura/pull/1874)).
+- Smoothed short-term variation in sync progress reporting
+  ([#1913](https://github.com/zakura-core/zakura/pull/1913)).
+
 ## [1.8.0-rc0] - 2026-11-01
 
 ### Added

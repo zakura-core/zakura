@@ -132,6 +132,13 @@ sync_missing_parent_charge_duration_seconds{reason="parent_available",quantile="
                 self.assertEqual(monitor.scan_logs(str(log), None)["panics"], 1)
                 run.assert_not_called()
 
+    def test_tip_progress_must_occur_in_the_measured_window(self):
+        quiet = [{"height": 100, "reference_height": 100}] * 2
+        self.assertEqual(len(monitor.tip_window_failures(quiet, "reference")), 2)
+        active = [{"height": 100, "reference_height": 100}, {"height": 101, "reference_height": 101}]
+        self.assertEqual(monitor.tip_window_failures(active, "reference"), [])
+        self.assertTrue(monitor.tip_window_failures(active, None))
+
 
 class StartupHeight(unittest.TestCase):
     def read(self, text: str):

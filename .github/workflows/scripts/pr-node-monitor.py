@@ -91,6 +91,21 @@ def counter_window(samples: list[dict], field: str) -> dict:
             "delta": values[-1] - values[0] if values else 0}
 
 
+def tip_window_failures(samples: list[dict], reference_url: str | None) -> list[str]:
+    """Require chain activity inside the at-tip window, independently of startup."""
+    failures = []
+    if not reference_url:
+        failures.append("Tip qualification requires an independent reference.")
+    elif any(s.get("reference_error") or s.get("reference_height") is None
+             or s.get("height") is None or abs(s["reference_height"] - s["height"]) > 2 for s in samples):
+        failures.append("Independent tip coverage is missing or lag exceeded two blocks.")
+    if counter_window(samples, "height")["delta"] < 1:
+        failures.append("The tip observation window contained no committed chain progress.")
+    if counter_window(samples, "reference_height")["delta"] < 1:
+        failures.append("The independent reference observed no block opportunities in the tip window.")
+    return failures
+
+
 def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = False) -> dict:
     """Combine sampled utilization with event counters that capture brief saturation."""
     result = {}
@@ -725,14 +740,7 @@ def main(argv=None) -> int:
                for v in summary["missing_parent"].values()):
             reasons.append("Insufficient uninterrupted observation time.")
         if args.required_observation_seconds:
-            if not args.reference_rpc_url:
-                reasons.append("Tip qualification requires an independent reference.")
-            elif any(s.get("reference_error") or s.get("reference_height") is None
-                     or s.get("height") is None or abs(s["reference_height"] - s["height"]) > 2
-                     for s in measured_samples if s.get("missing_parent")):
-                reasons.append("Independent tip coverage is missing or lag exceeded two blocks.")
-            if (summary.get("blocks_synced") or 0) < 1:
-                reasons.append("The tip run observed no committed chain progress.")
+            reasons.extend(tip_window_failures(measured_samples, args.reference_rpc_url))
         summary["qualification_failures"] = reasons
         if reasons:
             summary["verdict"] = "failed"

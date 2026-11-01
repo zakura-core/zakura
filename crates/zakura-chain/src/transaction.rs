@@ -1858,6 +1858,36 @@ impl Transaction {
         &self,
         nu: NetworkUpgrade,
     ) -> Result<zcash_primitives::transaction::Transaction, crate::Error> {
+        let branch_id = self.librustzcash_branch_id(nu)?;
+        Ok(zcash_primitives::transaction::Transaction::read(
+            &self.zcash_serialize_to_vec()?[..],
+            branch_id,
+        )?)
+    }
+
+    /// Converts [`Transaction`] to the data of a
+    /// [`zcash_primitives::transaction::Transaction`], without computing its transaction ID.
+    ///
+    /// Checks `nu` as [`Self::to_librustzcash`] does.
+    pub(crate) fn to_librustzcash_data(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<
+        zcash_primitives::transaction::TransactionData<zcash_primitives::transaction::Authorized>,
+        crate::Error,
+    > {
+        let branch_id = self.librustzcash_branch_id(nu)?;
+        Ok(zcash_primitives::transaction::TransactionData::read(
+            &self.zcash_serialize_to_vec()?[..],
+            branch_id,
+        )?)
+    }
+
+    /// Returns `nu`'s consensus branch ID, if this transaction can belong to `nu`.
+    fn librustzcash_branch_id(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<consensus::BranchId, crate::Error> {
         if self.network_upgrade().is_some_and(|tx_nu| tx_nu != nu) {
             return Err(crate::Error::InvalidConsensusBranchId);
         }
@@ -1866,14 +1896,7 @@ impl Transaction {
             return Err(crate::Error::InvalidConsensusBranchId);
         };
 
-        let Ok(branch_id) = consensus::BranchId::try_from(branch_id) else {
-            return Err(crate::Error::InvalidConsensusBranchId);
-        };
-
-        Ok(zcash_primitives::transaction::Transaction::read(
-            &self.zcash_serialize_to_vec()?[..],
-            branch_id,
-        )?)
+        consensus::BranchId::try_from(branch_id).map_err(|_| crate::Error::InvalidConsensusBranchId)
     }
 
     // Common Sapling & Orchard Properties

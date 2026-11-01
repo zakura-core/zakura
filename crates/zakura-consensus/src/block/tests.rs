@@ -451,6 +451,104 @@ async fn prepared_mined_commit_rechecks_transaction_lock_time() {
 }
 
 #[tokio::test]
+async fn preparation_rejects_invalid_merkle_content_before_caching() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let candidate = nu5_prepared_test_block(&network, None);
+
+    let mut bad_root = candidate.clone();
+    Arc::make_mut(&mut bad_root.header).merkle_root.0[0] ^= 1;
+    let bad_root_error = BlockError::BadMerkleRoot {
+        actual: candidate.header.merkle_root,
+        expected: bad_root.header.merkle_root,
+    };
+
+    let mut duplicate = candidate.clone();
+    duplicate
+        .transactions
+        .push(duplicate.transactions[0].clone());
+    Arc::make_mut(&mut duplicate.header).merkle_root = duplicate.transactions.iter().collect();
+
+    let mut wrong_upgrade = candidate;
+    let Transaction::V5 {
+        network_upgrade, ..
+    } = Arc::make_mut(&mut wrong_upgrade.transactions[0])
+    else {
+        panic!("the fixture contains a V5 coinbase transaction");
+    };
+    *network_upgrade = NetworkUpgrade::Nu6;
+    Arc::make_mut(&mut wrong_upgrade.header).merkle_root =
+        wrong_upgrade.transactions.iter().collect();
+
+    for (description, candidate, expected) in [
+        ("incorrect Merkle root", bad_root, bad_root_error),
+        (
+            "duplicate transaction with a matching Merkle root",
+            duplicate,
+            BlockError::DuplicateTransaction,
+        ),
+        (
+            "wrong transaction network upgrade with a matching Merkle root",
+            wrong_upgrade,
+            BlockError::WrongTransactionConsensusBranchId,
+        ),
+    ] {
+        for source in [
+            PreparedCandidateSource::ServerTemplate,
+            PreparedCandidateSource::ClientProposal,
+        ] {
+            let candidate = Arc::new(candidate.clone());
+            let state = service_fn(|request: zs::Request| async move {
+                let zs::Request::KnownBlock(hash) = request else {
+                    panic!("invalid content must be rejected before contextual validation");
+                };
+                Ok::<_, BoxError>(zs::Response::KnownBlock(
+                    (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                ))
+            });
+            let transaction =
+                service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+                    panic!("invalid content must be rejected before transaction verification");
+                });
+            let mut verifier = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            );
+
+            for request in [
+                Request::Prepare {
+                    block: candidate.clone(),
+                    source,
+                },
+                Request::CommitMined {
+                    block: candidate.clone(),
+                    admission: zs::BlockAdmission::pending(),
+                },
+            ] {
+                let result = verifier
+                    .ready()
+                    .await
+                    .expect("the verifier is ready")
+                    .call(request)
+                    .await;
+                let Err(VerifyBlockError::Block { source: error }) = result else {
+                    panic!("{description}: expected block rejection, got {result:?}");
+                };
+                assert_eq!(error, expected, "{description}");
+                assert!(
+                    verifier
+                        .prepared_candidates
+                        .lookup(&candidate, &network)
+                        .is_none(),
+                    "{description}: rejected content must not enter the cache",
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_preparation_does_not_populate_the_cache() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -52,9 +52,6 @@ fn prepared_test_verifier(
                 zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
             }
             // A rejected candidate confirms that its header commits to its body.
-            zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(
-                zakura_chain::block_info::BlockInfo::new(Default::default(), 0),
-            )),
             zs::Request::CheckAuthDataCommitment(_) => {
                 zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
             }
@@ -201,8 +198,11 @@ async fn missing_input_requires_committed_parent_evidence() {
 /// From NU5, transaction IDs do not commit to signatures, proofs, or scripts (ZIP 244), so a
 /// body can differ in one of them under the same block hash. The verifier must then report the
 /// commitment mismatch rather than the rule the differing data fails.
+///
+/// The check must not wait for the parent: a parent that failed semantic verification never
+/// reaches state, so the state mock panics on `AwaitBlockInfo`.
 #[tokio::test]
-async fn nu5_semantic_failures_wait_for_the_auth_data_commitment() {
+async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
     use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
     #[derive(Clone, Copy, Debug)]
@@ -210,7 +210,6 @@ async fn nu5_semantic_failures_wait_for_the_auth_data_commitment() {
         Bound,
         Mismatch,
         Unavailable,
-        ParentRejected,
     }
 
     let _init_guard = zakura_test::init();
@@ -220,27 +219,13 @@ async fn nu5_semantic_failures_wait_for_the_auth_data_commitment() {
         Some(LockTime::unlocked()),
     ));
 
-    for binding in [
-        Binding::Bound,
-        Binding::Mismatch,
-        Binding::Unavailable,
-        Binding::ParentRejected,
-    ] {
+    for binding in [Binding::Bound, Binding::Mismatch, Binding::Unavailable] {
         let state = service_fn(move |request: zs::Request| async move {
             Ok::<_, BoxError>(match request {
                 zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                 zs::Request::CheckParentInputs { .. } => {
                     zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
                 }
-                zs::Request::AwaitBlockInfo(hash) => match binding {
-                    Binding::ParentRejected => {
-                        return Err(zs::AwaitBlockInfoError::Rejected { hash }.into())
-                    }
-                    _ => zs::Response::BlockInfo(Some(zakura_chain::block_info::BlockInfo::new(
-                        Default::default(),
-                        0,
-                    ))),
-                },
                 zs::Request::CheckAuthDataCommitment(_) => {
                     zs::Response::AuthDataCommitment(match binding {
                         Binding::Bound => zs::AuthDataCommitment::Bound,
@@ -250,9 +235,7 @@ async fn nu5_semantic_failures_wait_for_the_auth_data_commitment() {
                                 expected: [0x24; 32],
                             },
                         ),
-                        Binding::Unavailable | Binding::ParentRejected => {
-                            zs::AuthDataCommitment::Unavailable
-                        }
+                        Binding::Unavailable => zs::AuthDataCommitment::Unavailable,
                     })
                 }
                 _ => panic!("unexpected state request: {request:?}"),
@@ -292,7 +275,7 @@ async fn nu5_semantic_failures_wait_for_the_auth_data_commitment() {
                 );
                 assert!(error.is_auth_commitment_mismatch(), "{error:?}");
             }
-            Binding::Unavailable | Binding::ParentRejected => {
+            Binding::Unavailable => {
                 assert_eq!(
                     class,
                     BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext),
@@ -620,9 +603,6 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                         (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
                     ),
                     // A mined commit's rejection confirms the auth data binding afterwards.
-                    zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(
-                        zakura_chain::block_info::BlockInfo::new(Default::default(), 0),
-                    )),
                     zs::Request::CheckAuthDataCommitment(_) => {
                         zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
                     }
@@ -2415,11 +2395,9 @@ async fn derived_nsm_crossing_gates_block_verification() {
                         assert_eq!(requested_hash, hash);
                         zs::Response::KnownBlock(None)
                     }
-                    // A rejected block also waits for its parent to confirm its header
-                    // commits to its body.
                     zs::Request::AwaitBlockInfo(requested_parent) => {
                         assert!(
-                            active || !valid,
+                            active,
                             "the pre-crossing block must not request an NSM balance"
                         );
                         assert_eq!(requested_parent, expected_parent);

@@ -315,18 +315,8 @@ where
         parent,
         source: Box::new(error),
     };
-    // The parent's history tree exists once it commits. A rejected parent fails fast, and
-    // the wait has its own limit.
-    if !matches!(
-        state_service
-            .clone()
-            .oneshot(zs::Request::AwaitBlockInfo(parent))
-            .await,
-        Ok(zs::Response::BlockInfo(Some(_)))
-    ) {
-        return unconfirmed(error);
-    }
-
+    // This doesn't wait for the parent to commit. A parent that failed semantic verification
+    // never reaches state, so a wait would hold this verification slot until it timed out.
     let commitment = zs::BlockCommitmentData {
         block,
         auth_data_root: None,

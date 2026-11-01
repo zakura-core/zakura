@@ -3391,14 +3391,34 @@ fn nu5_child_of_genesis(
     genesis: &Arc<Block>,
     extra: Vec<zakura_chain::transaction::Transaction>,
 ) -> Arc<Block> {
+    use zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED;
+
+    nu5_child(
+        network,
+        genesis,
+        Height(1),
+        &CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        extra,
+    )
+}
+
+/// Builds a child of `parent` at `height` with a v5 coinbase followed by `extra`, whose header
+/// commits to its authorizing data over the parent's `history_root`.
+fn nu5_child(
+    network: &Network,
+    parent: &Arc<Block>,
+    height: Height,
+    history_root: &block::ChainHistoryMmrRootHash,
+    extra: Vec<zakura_chain::transaction::Transaction>,
+) -> Arc<Block> {
     use zakura_chain::{
-        block::{ChainHistoryBlockTxAuthCommitmentHash, CHAIN_HISTORY_ACTIVATION_RESERVED},
+        block::ChainHistoryBlockTxAuthCommitmentHash,
         transaction::arbitrary::transaction_to_fake_v5,
     };
 
-    let mut child = genesis.make_fake_child();
+    let mut child = parent.make_fake_child();
     let block = Arc::make_mut(&mut child);
-    let coinbase = transaction_to_fake_v5(&block.transactions[0], network, Height(1));
+    let coinbase = transaction_to_fake_v5(&block.transactions[0], network, height);
     block.transactions = std::iter::once(coinbase)
         .chain(extra)
         .map(Arc::new)
@@ -3407,7 +3427,7 @@ fn nu5_child_of_genesis(
     header.merkle_root = block.transactions.iter().collect();
     header.time += chrono::Duration::seconds(1);
     let commitment: [u8; 32] = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-        &CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        history_root,
         &child.auth_data_root(),
     )
     .into();
@@ -3434,6 +3454,69 @@ fn with_altered_auth_data(block: &Arc<Block>) -> Arc<Block> {
     mismatched
 }
 
+/// Asks `state` whether `block`'s header commits to its authorizing data.
+async fn check(state: &mut StateService, block: Arc<Block>) -> crate::AuthDataCommitment {
+    let call = state.oneshot(Request::CheckAuthDataCommitment(
+        crate::BlockCommitmentData {
+            block,
+            auth_data_root: None,
+        },
+    ));
+    match timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the check completes")
+        .expect("the check succeeds")
+    {
+        Response::AuthDataCommitment(commitment) => commitment,
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// The authorizing data check finds a parent in the non-finalized state, not just at the
+/// finalized tip, and uses that parent's history tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_data_commitment_check_uses_a_non_finalized_parent() {
+    use crate::AuthDataCommitment;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let parent = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    timeout(
+        Duration::from_secs(10),
+        (&mut state).oneshot(Request::CommitSemanticallyVerifiedBlock(
+            parent.clone().prepare(),
+        )),
+    )
+    .await
+    .expect("the parent commit completes")
+    .expect("the parent commits");
+
+    let history_root = state
+        .read_service
+        .latest_non_finalized_state()
+        .best_chain()
+        .expect("the parent is in the non-finalized state")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the parent's history tree is not empty");
+    let child = nu5_child(&network, &parent, Height(2), &history_root, Vec::new());
+
+    assert_eq!(
+        check(&mut state, child.clone()).await,
+        AuthDataCommitment::Bound
+    );
+    let mismatched = check(&mut state, with_altered_auth_data(&child)).await;
+    assert!(
+        matches!(
+            mismatched,
+            AuthDataCommitment::Mismatch(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ),
+        "{mismatched:?}"
+    );
+}
+
 /// The authorizing data check compares a body with its header's NU5 commitment over the
 /// parent's history tree, and reports when that context is unusable.
 #[tokio::test(flavor = "multi_thread")]
@@ -3450,23 +3533,6 @@ async fn auth_data_commitment_check_uses_the_parent_history_tree() {
     // activation that lets an empty tree stand in.
     let mut skipped = Block::clone(&orphan);
     Arc::make_mut(&mut skipped.header).previous_block_hash = genesis.hash();
-
-    async fn check(state: &mut StateService, block: Arc<Block>) -> AuthDataCommitment {
-        let call = state.oneshot(Request::CheckAuthDataCommitment(
-            crate::BlockCommitmentData {
-                block,
-                auth_data_root: None,
-            },
-        ));
-        match timeout(Duration::from_secs(10), call)
-            .await
-            .expect("the check completes")
-            .expect("the check succeeds")
-        {
-            Response::AuthDataCommitment(commitment) => commitment,
-            response => panic!("unexpected response: {response:?}"),
-        }
-    }
 
     assert_eq!(check(&mut state, matching).await, AuthDataCommitment::Bound);
     let mismatched = check(&mut state, mismatched).await;

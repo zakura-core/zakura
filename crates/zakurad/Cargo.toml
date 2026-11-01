@@ -69,10 +69,10 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc"]
+default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc", "x86_64-asm"]
 
 
-# Local builds can select Pasta assembly with target flags or `x86_64-asm`.
+# Standard builds enable Pasta assembly; `portable` is the explicit override.
 default = ["default-release-binaries"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.

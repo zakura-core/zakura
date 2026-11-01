@@ -9,9 +9,9 @@ use zakura_chain::{block::Height, parameters::Network, work::difficulty::Compact
 
 /// Last Mainnet checkpoint when the admission floor was introduced.
 ///
-/// Apply the floor immediately above this boundary so choosing an older height
-/// cannot bypass it on the default full-verification path.
-const MAINNET_WORK_FLOOR_HEIGHT: Height = Height(3_535_411);
+/// Historical downloads are exempt only until the committed tip reaches this
+/// boundary. A peer's claimed height cannot disable the floor after that point.
+pub(super) const MAINNET_WORK_FLOOR_HEIGHT: Height = Height(3_535_411);
 
 /// Target of Mainnet block 3,538,452, observed on November 1, 2026 UTC.
 ///
@@ -27,14 +27,30 @@ const MAINNET_TARGET_MULTIPLIER: u32 = 10;
 /// Whether a downloaded header's claimed target meets the admission work floor.
 ///
 /// This does not verify the header hash or Equihash solution, or replace the
-/// parent-dependent difficulty check. Earlier Mainnet blocks and other networks
-/// retain their existing validation rules.
+/// parent-dependent difficulty check. Historical Mainnet downloads remain exempt
+/// while the committed tip is below the boundary or absent. This preserves
+/// historical sync without trusting a peer's old height claim near the tip.
 pub(super) fn has_sufficient_work(
     network: &Network,
     height: Height,
+    committed_tip_height: Option<Height>,
     target: CompactDifficulty,
 ) -> bool {
-    if !matches!(network, Network::Mainnet) || height <= MAINNET_WORK_FLOOR_HEIGHT {
+    if height <= MAINNET_WORK_FLOOR_HEIGHT
+        && committed_tip_height.is_none_or(|tip| tip < MAINNET_WORK_FLOOR_HEIGHT)
+    {
+        return true;
+    }
+
+    target_meets_work_floor(network, target)
+}
+
+/// Whether the claimed target can authorize Mainnet missing-parent recovery.
+///
+/// Recovery has no historical exemption: an unverified height must never
+/// authorize an extra download. Other networks retain their existing rules.
+pub(super) fn target_meets_work_floor(network: &Network, target: CompactDifficulty) -> bool {
+    if !matches!(network, Network::Mainnet) {
         return true;
     }
 
@@ -61,12 +77,38 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_work_floor_uses_the_committed_tip_despite_an_old_height_claim() {
+        let easiest_target = Network::Mainnet.target_difficulty_limit().to_compact();
+        for height in [Height(0), MAINNET_WORK_FLOOR_HEIGHT] {
+            for tip in [
+                MAINNET_WORK_FLOOR_HEIGHT,
+                MAINNET_WORK_FLOOR_HEIGHT.next().unwrap(),
+            ] {
+                assert!(!has_sufficient_work(
+                    &Network::Mainnet,
+                    height,
+                    Some(tip),
+                    easiest_target,
+                ));
+            }
+            assert!(has_sufficient_work(
+                &Network::Mainnet,
+                height,
+                Some(MAINNET_WORK_FLOOR_HEIGHT.previous().unwrap()),
+                easiest_target,
+            ));
+        }
+        assert!(!target_meets_work_floor(&Network::Mainnet, easiest_target));
+    }
+
+    #[test]
     fn mainnet_work_floor_preserves_earlier_blocks_and_other_networks() {
         let easiest_target = Network::Mainnet.target_difficulty_limit().to_compact();
         for height in [Height(0), MAINNET_WORK_FLOOR_HEIGHT] {
             assert!(has_sufficient_work(
                 &Network::Mainnet,
                 height,
+                None,
                 easiest_target
             ));
         }
@@ -74,13 +116,20 @@ mod tests {
         assert!(!has_sufficient_work(
             &Network::Mainnet,
             height,
+            None,
             easiest_target
         ));
         for network in [
             Network::new_default_testnet(),
             Network::new_regtest(Default::default()),
         ] {
-            assert!(has_sufficient_work(&network, height, easiest_target));
+            assert!(has_sufficient_work(
+                &network,
+                height,
+                Some(height),
+                easiest_target
+            ));
+            assert!(target_meets_work_floor(&network, easiest_target));
         }
     }
 
@@ -97,21 +146,25 @@ mod tests {
         assert!(has_sufficient_work(
             &Network::Mainnet,
             height,
+            None,
             MAINNET_REFERENCE_TARGET
         ));
         assert!(has_sufficient_work(
             &Network::Mainnet,
             height,
+            None,
             easiest_allowed_encoding
         ));
         assert!(!has_sufficient_work(
             &Network::Mainnet,
             height,
+            None,
             easier_encoding
         ));
         assert!(!has_sufficient_work(
             &Network::Mainnet,
             height,
+            None,
             CompactDifficulty::from_le_bytes([0; 4]),
         ));
     }

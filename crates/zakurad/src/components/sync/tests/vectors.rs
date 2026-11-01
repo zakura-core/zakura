@@ -3956,54 +3956,82 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
     use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
     let _init_guard = zakura_test::init();
-    let tip_height = Network::Mainnet.checkpoint_list().max_height();
-    let height = tip_height.next().unwrap();
+    let tip_height = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+    let (_, pause_height, _) = lookahead_heights(
+        Some(tip_height),
+        sync::MIN_CONCURRENCY_LIMIT,
+        sync::lookahead_limit_multiplier(&Network::Mainnet, tip_height),
+    );
     let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
         .zcash_deserialize_into()
         .expect("test vector deserializes");
 
     // Admission must reject both coinbase-only blocks and blocks with external
     // inputs, before either can enter the semantic verifier or its state waits.
-    for coinbase_only in [false, true] {
-        let mut candidate = poison_coinbase_height(&canonical, height);
-        let block = Arc::make_mut(&mut candidate);
-        if coinbase_only {
-            block.transactions.truncate(1);
+    for (height, initially_paused) in [
+        (tip_height.previous().unwrap(), false),
+        (tip_height, false),
+        (tip_height.next().unwrap(), false),
+        (pause_height.next().unwrap(), false),
+        (tip_height, true),
+    ] {
+        for coinbase_only in [false, true] {
+            let mut candidate = poison_coinbase_height(&canonical, height);
+            let block = Arc::make_mut(&mut candidate);
+            if coinbase_only {
+                block.transactions.truncate(1);
+            }
+            *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
+            let header = Arc::make_mut(&mut block.header);
+            header.previous_block_hash = block::Hash([0x55; 32]);
+            header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
+            header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
+            let hash = candidate.hash();
+
+            let mut peer_set =
+                MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+            let mut verifier =
+                MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+            let (chain_tip, tip_sender) = MockChainTip::new();
+            tip_sender.send_best_tip_height(tip_height);
+            tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+            let (pause_sender, pause_receiver) = tokio::sync::watch::channel(initially_paused);
+            let mut downloads = Downloads::new(
+                peer_set.clone(),
+                verifier.clone(),
+                chain_tip,
+                pause_sender,
+                sync::MIN_CONCURRENCY_LIMIT,
+                Network::Mainnet,
+                Height(0),
+                LegacySyncTrace::new(None, false),
+            );
+
+            downloads.download_and_verify(hash).await.unwrap();
+            peer_set
+                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+                .await
+                .respond(zn::Response::Blocks(vec![Available((candidate, None))]));
+            let error = downloads.next().await.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                BlockDownloadVerifyError::BelowMinimumWork { height: rejected_height, hash: rejected_hash }
+                    if rejected_height == height && rejected_hash == hash
+            ));
+            assert_eq!(
+                *pause_receiver.borrow(),
+                initially_paused,
+                "a rejected block must neither pause nor resume downloads",
+            );
+            assert!(!TestChainSync::should_restart_sync(&error, false));
+            verifier.expect_no_requests().await;
+
+            let (mut syncer, _, _, _, _, _) = setup_chain_sync();
+            let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+            syncer.misbehavior_sender = misbehavior_tx;
+            syncer.handle_block_response(Err(error)).unwrap();
+            assert!(misbehavior_rx.try_recv().is_err());
         }
-        *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
-        let header = Arc::make_mut(&mut block.header);
-        header.previous_block_hash = block::Hash([0x55; 32]);
-        header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
-        header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let hash = candidate.hash();
-
-        let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
-        let mut verifier =
-            MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
-        let (chain_tip, tip_sender) = MockChainTip::new();
-        tip_sender.send_best_tip_height(tip_height);
-        tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
-        let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
-
-        downloads.download_and_verify(hash).await.unwrap();
-        peer_set
-            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-            .await
-            .respond(zn::Response::Blocks(vec![Available((candidate, None))]));
-        let error = downloads.next().await.unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            BlockDownloadVerifyError::BelowMinimumWork { height: rejected_height, hash: rejected_hash }
-                if rejected_height == height && rejected_hash == hash
-        ));
-        assert!(!TestChainSync::should_restart_sync(&error, false));
-        verifier.expect_no_requests().await;
-
-        let (mut syncer, _, _, _, _, _) = setup_chain_sync();
-        let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
-        syncer.misbehavior_sender = misbehavior_tx;
-        syncer.handle_block_response(Err(error)).unwrap();
-        assert!(misbehavior_rx.try_recv().is_err());
     }
 }
 

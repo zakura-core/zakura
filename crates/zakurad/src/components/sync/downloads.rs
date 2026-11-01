@@ -784,7 +784,30 @@ where
 
                 if block_height > lookahead_drop_height {
                     Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
-                } else if block_height > lookahead_pause_height {
+                }
+
+                if block_height < min_accepted_height {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        ?tip_height,
+                        ?min_accepted_height,
+                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+                        "synced block height behind the finalized tip: dropped downloaded block"
+                    );
+                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+                    Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
+                }
+
+                // Admission must precede shared flow-control changes: a rejected
+                // body must not pause or resume downloads using its claimed height.
+                if !has_sufficient_work(&chain_network, block_height, tip_height, block.header.difficulty_threshold) {
+                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
+                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
+                }
+
+                if block_height > lookahead_pause_height {
                     // This log can be very verbose, usually hundreds of blocks are dropped.
                     // So we only log at info level for the first above-height block.
                     if !past_lookahead_limit_receiver.cloned_watch_data() {
@@ -827,25 +850,6 @@ where
                     metrics::counter!("sync.max.height.limit.reset.count").increment(1);
 
                     metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
-                }
-
-                if block_height < min_accepted_height {
-                    debug!(
-                        ?hash,
-                        ?block_height,
-                        ?tip_height,
-                        ?min_accepted_height,
-                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                        "synced block height behind the finalized tip: dropped downloaded block"
-                    );
-                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
-
-                    Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
-                }
-
-                if !has_sufficient_work(&chain_network, block_height, block.header.difficulty_threshold) {
-                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
-                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }
 
                 // Wait for the verifier service to be ready.

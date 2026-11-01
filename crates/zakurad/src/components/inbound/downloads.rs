@@ -31,7 +31,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::has_sufficient_work,
+    download_work::{has_sufficient_work, target_meets_work_floor},
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -1091,6 +1091,7 @@ where
             if !has_sufficient_work(
                 &chain_network,
                 block_height,
+                tip_height,
                 block.header.difficulty_threshold,
             ) {
                 metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
@@ -1103,7 +1104,11 @@ where
             // The parent is checked after the height policies, so only blocks this node would
             // verify can start a recovery, and before the source lock, so a recovery is not
             // delayed by earlier blocks from the same source.
-            if kind == DownloadKind::Advertised {
+            // Historical bootstrap can admit easy blocks for verification, but
+            // their unverified heights must not authorize parent downloads.
+            if kind == DownloadKind::Advertised
+                && target_meets_work_floor(&chain_network, block.header.difficulty_threshold)
+            {
                 let parent = block.header.previous_block_hash;
                 let one_hop_from_tip = tip_height
                     .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
@@ -1850,44 +1855,100 @@ mod tests {
     async fn mainnet_work_floor_rejects_gossip_before_parent_recovery() {
         use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
-        let tip_height = Network::Mainnet.checkpoint_list().max_height();
-        let height = tip_height.next().unwrap();
-        let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        let tip_height = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+        // An unrelated parent skips tip-child authentication. Claiming the last
+        // exempt height must not bypass the floor once our committed tip reaches it.
+        for height in [
+            tip_height.previous().unwrap(),
+            tip_height,
+            tip_height.next().unwrap(),
+        ] {
+            let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .expect("test vector deserializes");
+            let mut candidate = poison_coinbase_height(&canonical, height);
+            let block = Arc::make_mut(&mut candidate);
+            *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
+            let header = Arc::make_mut(&mut block.header);
+            header.previous_block_hash = hash(0x55);
+            header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
+            header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
+            let candidate_hash = candidate.hash();
+            let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
+            let (_tip_sender, latest_chain_tip) = chain_tip_at(tip_height, hash(0xAA));
+            let mut downloads = downloads_returning(candidate, advertiser_addr, latest_chain_tip);
+            downloads.spawner.verifier = BoxCloneService::new(service_fn(|_| async {
+                Err::<block::Hash, BoxError>("weak-work block reached semantic verification".into())
+            }));
+
+            assert_eq!(
+                downloads.download_and_verify(
+                    candidate_hash,
+                    Some(zn::PeerSource::LegacySocket(advertiser_addr)),
+                ),
+                DownloadAction::AddedToQueue
+            );
+            let (error, addr) = tokio::time::timeout(Duration::from_secs(5), downloads.next())
+                .await
+                .expect("the work floor rejects without waiting on the parent")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Mainnet admission floor"),
+                "{error}"
+            );
+            assert_eq!(addr, Some(advertiser_addr));
+            assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
+        }
+    }
+
+    /// Historical admission must not authorize a missing-parent download.
+    #[tokio::test]
+    async fn mainnet_work_floor_preserves_historical_gossip_without_parent_recovery() {
+        let historical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .expect("test vector deserializes");
-        let mut candidate = poison_coinbase_height(&canonical, height);
-        let block = Arc::make_mut(&mut candidate);
-        *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
-        let header = Arc::make_mut(&mut block.header);
-        header.previous_block_hash = hash(0x55);
-        header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
-        header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let candidate_hash = candidate.hash();
+        let historical_hash = historical.hash();
+        assert!(!target_meets_work_floor(
+            &Network::Mainnet,
+            historical.header.difficulty_threshold,
+        ));
         let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
-        let (_tip_sender, latest_chain_tip) = chain_tip_at(tip_height, hash(0xAA));
-        let mut downloads = downloads_returning(candidate, advertiser_addr, latest_chain_tip);
-        downloads.spawner.verifier = BoxCloneService::new(service_fn(|_| async {
-            Err::<block::Hash, BoxError>("weak-work block reached semantic verification".into())
+        let (_tip_sender, latest_chain_tip) = chain_tip_at(block::Height(0), hash(0xAA));
+        let mut downloads = downloads_returning(historical, advertiser_addr, latest_chain_tip);
+        downloads.spawner.state = BoxCloneService::new(service_fn(|request| async move {
+            match request {
+                zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                request => panic!("historical gossip must not query its parent: {request:?}"),
+            }
         }));
+        downloads.spawner.verifier = BoxCloneService::new(service_fn(
+            move |request: zakura_consensus::Request| async move {
+                assert_eq!(request.block().hash(), historical_hash);
+                Ok(historical_hash)
+            },
+        ));
 
         assert_eq!(
             downloads.download_and_verify(
-                candidate_hash,
+                historical_hash,
                 Some(zn::PeerSource::LegacySocket(advertiser_addr)),
             ),
-            DownloadAction::AddedToQueue
+            DownloadAction::AddedToQueue,
         );
-        let (error, addr) = tokio::time::timeout(Duration::from_secs(5), downloads.next())
+        let result = tokio::time::timeout(Duration::from_secs(5), downloads.next())
             .await
-            .expect("the work floor rejects without waiting on the parent")
+            .expect("historical gossip reaches verification without parent recovery")
             .unwrap()
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("Mainnet admission floor"),
-            "{error}"
-        );
-        assert_eq!(addr, Some(advertiser_addr));
-        assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
+            .unwrap();
+        assert_eq!(result, historical_hash);
+        assert!(downloads
+            .spawner
+            .admission
+            .lock()
+            .unwrap()
+            .parent_recoveries
+            .is_empty());
     }
 
     /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays

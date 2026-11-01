@@ -48,7 +48,7 @@ use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
+use crate::{error::TransactionError, primitives, BoxError};
 
 use super::{check, Request, Verifier};
 
@@ -1612,13 +1612,12 @@ async fn mempool_request_with_unmined_output_spends_is_accepted() {
         "spent_mempool_outpoints in tx verifier response should match input_outpoint"
     );
 
-    tokio::time::sleep(POLL_MEMPOOL_DELAY * 2).await;
-    // polled before AwaitOutput request and after a mempool transaction with transparent outputs
-    // is successfully verified
+    // Polled only for the AwaitOutput request. The mempool's downloader, not the verifier,
+    // wakes the mempool to add verified transactions.
     assert_eq!(
         mempool.poll_count(),
-        2,
-        "the mempool service should have been polled twice"
+        1,
+        "the mempool service should have been polled once"
     );
 }
 
@@ -1787,13 +1786,12 @@ async fn dont_skip_verification_of_block_transactions_in_mempool() {
         panic!("unexpected response variant from transaction verifier for Block request")
     };
 
-    tokio::time::sleep(POLL_MEMPOOL_DELAY * 2).await;
-    // polled before AwaitOutput request and after a mempool transaction with transparent outputs
-    // is successfully verified.
+    // Polled only for the AwaitOutput request. The mempool's downloader, not the verifier,
+    // wakes the mempool to add verified transactions.
     assert_eq!(
         mempool.poll_count(),
-        2,
-        "the mempool service should have been polled twice"
+        1,
+        "the mempool service should have been polled once"
     );
 }
 

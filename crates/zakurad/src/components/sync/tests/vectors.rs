@@ -41,7 +41,7 @@ use crate::{
         sync::{
             self,
             downloads::{
-                lookahead_heights, BlockDownloadVerifyError, Downloads,
+                lookahead_heights, BlockDownloadVerifyError, Downloads, ParentWait,
                 VERIFICATION_PIPELINE_DROP_LIMIT,
             },
             legacy_trace::LegacySyncTrace,
@@ -2392,146 +2392,6 @@ async fn unavailable_parent_retries_while_parent_can_arrive() -> Result<(), crat
     Ok(())
 }
 
-fn auth_data_unconfirmed(hash: block::Hash, parent: block::Hash) -> BlockDownloadVerifyError {
-    BlockDownloadVerifyError::Invalid {
-        error: RouterError::Block {
-            source: Box::new(VerifyBlockError::AuthDataUnconfirmed {
-                parent,
-                source: Box::new(VerifyBlockError::Transaction(
-                    TransactionError::Halo2VerificationFailed,
-                )),
-            }),
-        },
-        height: Height(42),
-        hash,
-        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
-    }
-}
-
-/// A block whose binding is unconfirmed because its parent is still downloading waits for that
-/// parent without retrying, restarting, or scoring the supplier, and is requeued once the parent
-/// verifies.
-#[tokio::test]
-async fn unconfirmed_binding_waits_for_a_downloading_parent() -> Result<(), crate::BoxError> {
-    let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = sender;
-    let hash = block::Hash([0xCC; 32]);
-    let parent = block::Hash([0xAA; 32]);
-    assert!(!TestChainSync::should_restart_sync(
-        &auth_data_unconfirmed(hash, parent),
-        false
-    ));
-
-    chain_sync.downloads.download_and_verify(parent).await?;
-    let _parent_download = peers
-        .expect_request(zn::Request::BlocksByHash(iter::once(parent).collect()))
-        .await;
-
-    // Repeated fast failures while the parent downloads neither retry nor spend any budget.
-    for _ in 0..=sync::BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT {
-        let (response, _) = tokio::join!(
-            chain_sync
-                .handle_block_response_with_missing_retry(Err(auth_data_unconfirmed(hash, parent))),
-            async {
-                state
-                    .expect_request(zs::Request::KnownBlock(parent))
-                    .await
-                    .respond(zs::Response::KnownBlock(None));
-            },
-        );
-        response?;
-    }
-    assert!(chain_sync.unconfirmed_binding_waits.contains_key(&hash));
-    assert!(chain_sync.verify_timeout_retry_counts.is_empty());
-    assert_eq!(chain_sync.utxo_race_drops, 0);
-    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
-    peers.expect_no_requests().await;
-
-    chain_sync
-        .handle_block_response_with_missing_retry(Ok((Height(41), parent)))
-        .await?;
-    assert!(chain_sync.unconfirmed_binding_waits.is_empty());
-    let _retry = peers
-        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-        .await;
-    Ok(())
-}
-
-/// A block whose binding is unconfirmed is retried at once if its parent has committed since, and
-/// dropped if its parent can't arrive.
-#[tokio::test]
-async fn unconfirmed_binding_retries_after_commit_and_drops_without_parent(
-) -> Result<(), crate::BoxError> {
-    for committed in [true, false] {
-        let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
-        let hash = block::Hash([0xCC; 32]);
-        let parent = block::Hash([0xAA; 32]);
-        let (response, _) = tokio::join!(
-            chain_sync
-                .handle_block_response_with_missing_retry(Err(auth_data_unconfirmed(hash, parent))),
-            async {
-                state
-                    .expect_request(zs::Request::KnownBlock(parent))
-                    .await
-                    .respond(zs::Response::KnownBlock(
-                        committed.then_some(zs::KnownBlock::BestChain),
-                    ));
-            },
-        );
-        response?;
-        assert!(
-            chain_sync.unconfirmed_binding_waits.is_empty(),
-            "{committed}"
-        );
-        if committed {
-            assert_eq!(chain_sync.verify_timeout_retry_counts.get(&hash), Some(&1));
-            let _retry = peers
-                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-                .await;
-        } else {
-            assert!(chain_sync.verify_timeout_retry_counts.is_empty());
-            peers.expect_no_requests().await;
-        }
-    }
-    Ok(())
-}
-
-/// A wait past its deadline requeues the block if its parent committed through another path, and
-/// drops it otherwise.
-#[tokio::test]
-async fn unconfirmed_binding_wait_expiry_requeues_or_drops() -> Result<(), crate::BoxError> {
-    for committed in [true, false] {
-        let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
-        let hash = block::Hash([0xCC; 32]);
-        let parent = block::Hash([0xAA; 32]);
-        chain_sync
-            .unconfirmed_binding_waits
-            .insert(hash, (parent, tokio::time::Instant::now()));
-        let (response, _) = tokio::join!(chain_sync.expire_unconfirmed_binding_waits(), async {
-            state
-                .expect_request(zs::Request::KnownBlock(parent))
-                .await
-                .respond(zs::Response::KnownBlock(
-                    committed.then_some(zs::KnownBlock::Finalized),
-                ));
-        });
-        response?;
-        assert!(
-            chain_sync.unconfirmed_binding_waits.is_empty(),
-            "{committed}"
-        );
-        if committed {
-            let _retry = peers
-                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-                .await;
-        } else {
-            peers.expect_no_requests().await;
-        }
-    }
-    Ok(())
-}
-
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
     BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {
@@ -3751,6 +3611,9 @@ async fn empty_block_response_is_retryable_download_failure() {
         peer_set.clone(),
         verifier,
         chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3799,6 +3662,9 @@ async fn block_download_network_readiness_times_out() {
         NeverReadyNetwork,
         verifier,
         chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3816,11 +3682,33 @@ async fn block_download_network_readiness_times_out() {
     assert_eq!(downloads.in_flight(), 0);
 }
 
-/// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`.
+/// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`, whose parent waits
+/// panic.
 fn setup_downloads(
     peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
     verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     chain_tip: MockChainTip,
+) -> Downloads<
+    MockService<zn::Request, zn::Response, PanicAssertion>,
+    MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    MockChainTip,
+> {
+    setup_downloads_with_parent_wait(
+        peer_set,
+        verifier,
+        chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
+    )
+}
+
+/// Builds a [`Downloads`] like [`setup_downloads`], with `parent_wait` for unconfirmed bindings.
+fn setup_downloads_with_parent_wait(
+    peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
+    verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    chain_tip: MockChainTip,
+    parent_wait: ParentWait,
 ) -> Downloads<
     MockService<zn::Request, zn::Response, PanicAssertion>,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
@@ -3833,6 +3721,7 @@ fn setup_downloads(
         peer_set,
         verifier,
         chain_tip,
+        parent_wait,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3986,6 +3875,129 @@ async fn tip_child_rejects_forged_high_coinbase_height() {
     );
 
     verifier.expect_no_requests().await;
+}
+
+/// Returns a verifier error for a body whose binding couldn't be confirmed before `parent`
+/// committed.
+fn unconfirmed_verifier_error(parent: block::Hash) -> zn::BoxError {
+    RouterError::Block {
+        source: Box::new(VerifyBlockError::AuthDataUnconfirmed {
+            parent,
+            source: Box::new(VerifyBlockError::Transaction(
+                TransactionError::Halo2VerificationFailed,
+            )),
+        }),
+    }
+    .into()
+}
+
+/// A body whose binding is unconfirmed waits for its parent in the download task, then verifies
+/// once more. If the parent never commits, the task returns the unconfirmed error without a
+/// second verification.
+#[tokio::test]
+async fn unconfirmed_binding_reverifies_after_the_parent_commits() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let hash = block.hash();
+    let parent = block.header.previous_block_hash;
+
+    for parent_commits in [true, false] {
+        let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+        let mut verifier =
+            MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+        let (chain_tip, chain_tip_sender) = MockChainTip::new();
+        chain_tip_sender.send_best_tip_height(Height(1_687_106));
+        chain_tip_sender.send_best_tip_hash(parent);
+
+        let waits = Arc::new(AtomicUsize::new(0));
+        let parent_wait = {
+            let waits = waits.clone();
+            ParentWait(Arc::new(move |waited_for| {
+                assert_eq!(waited_for, parent);
+                waits.fetch_add(1, Ordering::SeqCst);
+                async move { parent_commits }.boxed()
+            }))
+        };
+        let mut downloads = setup_downloads_with_parent_wait(
+            peer_set.clone(),
+            verifier.clone(),
+            chain_tip,
+            parent_wait,
+        );
+        downloads
+            .download_and_verify(hash)
+            .await
+            .expect("queuing a fresh hash succeeds");
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+
+        verifier
+            .expect_request(zakura_consensus::Request::Commit(block.clone()))
+            .await
+            .respond(Err(unconfirmed_verifier_error(parent)));
+        if parent_commits {
+            verifier
+                .expect_request(zakura_consensus::Request::Commit(block.clone()))
+                .await
+                .respond(hash);
+        }
+
+        let result = downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking");
+        assert_eq!(waits.load(Ordering::SeqCst), 1, "{parent_commits}");
+        if parent_commits {
+            assert_eq!(result.expect("the second verification succeeds").1, hash);
+        } else {
+            let error = result.expect_err("the binding stays unconfirmed");
+            assert!(
+                TestChainSync::unconfirmed_binding(&error).is_some(),
+                "{error:?}"
+            );
+            assert!(!TestChainSync::should_restart_sync(&error, false));
+        }
+        verifier.expect_no_requests().await;
+    }
+}
+
+/// A block whose binding is still unconfirmed after the download task waited is dropped without
+/// a retry, a restart, or a score for its supplier.
+#[tokio::test]
+async fn unconfirmed_binding_drops_block_without_restart_or_score() {
+    let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+    let error = BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::AuthDataUnconfirmed {
+                parent,
+                source: Box::new(VerifyBlockError::Transaction(
+                    TransactionError::Halo2VerificationFailed,
+                )),
+            }),
+        },
+        height: Height(42),
+        hash,
+        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("an unconfirmed binding does not restart sync");
+    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+    assert_eq!(chain_sync.utxo_race_drops, 0);
+    peers.expect_no_requests().await;
+    state.expect_no_requests().await;
 }
 
 /// The canonical tip child is unaffected: its coinbase height matches the tip, so it reaches

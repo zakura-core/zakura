@@ -8,6 +8,7 @@ use std::{
     convert,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -53,7 +54,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-use downloads::{AlwaysHedge, Downloads, NotFoundKind};
+use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentWait};
 use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
@@ -859,7 +860,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZS::Future: Send,
+    ZS::Future: Send + 'static,
     ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -951,15 +952,6 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
-    /// Blocks waiting for their parent to commit before another verification attempt, keyed by
-    /// hash, with the parent and the time the wait gives up.
-    ///
-    /// The verifier reports an unconfirmed authorizing data binding without waiting for the
-    /// parent, so retrying at once would spend the retry budget while the parent is still
-    /// verifying. A waiting block is requeued when its parent verifies, and dropped at its
-    /// deadline unless the parent has committed by then.
-    unconfirmed_binding_waits: HashMap<block::Hash, (block::Hash, tokio::time::Instant)>,
-
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -990,7 +982,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZS::Future: Send,
+    ZS::Future: Send + 'static,
     ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -1076,10 +1068,23 @@ where
             expose_peer_addresses,
         );
 
+        let parent_wait_state = state.clone();
+        let parent_wait = ParentWait(Arc::new(move |parent| {
+            let state = parent_wait_state.clone();
+            // Boxing lets rustc prove this future is `Send` for spawned callers.
+            futures::FutureExt::boxed(async move {
+                matches!(
+                    state.oneshot(zs::Request::AwaitBlockInfo(parent)).await,
+                    Ok(zs::Response::BlockInfo(Some(_)))
+                )
+            })
+        }));
+
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
             latest_chain_tip.clone(),
+            parent_wait,
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
@@ -1111,7 +1116,6 @@ where
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
-            unconfirmed_binding_waits: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1475,7 +1479,6 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
-        self.unconfirmed_binding_waits.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1766,22 +1769,9 @@ where
             // Copy the earliest backoff deadline out so the timer future doesn't borrow `self`
             // across the `select!` while other arms borrow `self.downloads`.
             let registry_retry_at = self.registry_miss_retry.values().min().copied();
-            let unconfirmed_wait_at = self
-                .unconfirmed_binding_waits
-                .values()
-                .map(|(_, deadline)| *deadline)
-                .min();
             let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
-
-                    // Give up on blocks whose parent didn't verify in time, unless it committed
-                    // through another path.
-                    _ = OptionFuture::from(unconfirmed_wait_at.map(sleep_until)),
-                        if unconfirmed_wait_at.is_some() =>
-                    {
-                        self.expire_unconfirmed_binding_waits().await?;
-                    }
 
                     // Retry required blocks that registry-missed once their backoff elapses. This
                     // is not gated by speculative lookahead dispatch, so the head-of-line block gets
@@ -2551,113 +2541,6 @@ where
         Self::handle_response(response, self.expose_peer_addresses)
     }
 
-    /// Returns where the state knows `hash` from, if anywhere.
-    async fn known_block(&self, hash: block::Hash) -> Result<Option<zs::KnownBlock>, Report> {
-        // Boxing lets rustc prove this future is `Send` for spawned callers.
-        match futures::FutureExt::boxed(self.state.clone().oneshot(zs::Request::KnownBlock(hash)))
-            .await
-            .map_err(|e| eyre!(e))?
-        {
-            zs::Response::KnownBlock(location) => Ok(location),
-            response => unreachable!("wrong response to KnownBlock: {response:?}"),
-        }
-    }
-
-    /// Queues another download and verification of `hash`, handling an immediate queueing error
-    /// like any other block response.
-    async fn requeue_block(&mut self, hash: block::Hash) -> Result<(), Report> {
-        match self.downloads.download_and_verify(hash).await {
-            Ok(()) | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
-                Ok(())
-            }
-            Err(error) => Ok(self.handle_block_response(Err(error))?),
-        }
-    }
-
-    /// Handles a block whose authorizing data binding was unconfirmed because `parent` hadn't
-    /// committed when the block was verified.
-    ///
-    /// The block is retried at once if the parent has committed since, bounded by
-    /// [`BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT`]. It waits in [`Self::unconfirmed_binding_waits`] while
-    /// the parent can still arrive, and is dropped otherwise. None of these restart the round or
-    /// score the supplier, since an unconfirmed binding proves nothing about the body.
-    async fn wait_for_unconfirmed_parent(
-        &mut self,
-        hash: block::Hash,
-        parent: block::Hash,
-    ) -> Result<(), Report> {
-        let location = self.known_block(parent).await?;
-        if matches!(
-            location,
-            Some(zs::KnownBlock::Finalized | zs::KnownBlock::BestChain | zs::KnownBlock::SideChain)
-        ) {
-            let retry_count = self.verify_timeout_retry_counts.entry(hash).or_default();
-            if *retry_count >= BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT {
-                debug!(
-                    ?hash,
-                    ?parent,
-                    "block binding stays unconfirmed after its parent committed, dropping block"
-                );
-                self.verify_timeout_retry_counts.remove(&hash);
-                return Ok(());
-            }
-            *retry_count += 1;
-            return self.requeue_block(hash).await;
-        }
-
-        let parent_can_arrive = location.is_some()
-            || self.downloads.contains(&parent)
-            || self.registry_miss_retry.contains_key(&parent)
-            || self.unconfirmed_binding_waits.contains_key(&parent);
-        if parent_can_arrive {
-            debug!(?hash, ?parent, "block binding awaits its parent");
-            self.unconfirmed_binding_waits.insert(
-                hash,
-                (parent, tokio::time::Instant::now() + BLOCK_VERIFY_TIMEOUT),
-            );
-        } else {
-            debug!(
-                ?hash,
-                ?parent,
-                "block parent is neither committed nor in flight, dropping block"
-            );
-        }
-        Ok(())
-    }
-
-    /// Ends the waits in [`Self::unconfirmed_binding_waits`] that are past their deadline,
-    /// requeueing a block whose parent committed through another path and dropping the rest.
-    async fn expire_unconfirmed_binding_waits(&mut self) -> Result<(), Report> {
-        let now = tokio::time::Instant::now();
-        let due: Vec<(block::Hash, block::Hash)> = self
-            .unconfirmed_binding_waits
-            .iter()
-            .filter(|(_, (_, deadline))| *deadline <= now)
-            .map(|(hash, (parent, _))| (*hash, *parent))
-            .collect();
-
-        for (hash, parent) in due {
-            self.unconfirmed_binding_waits.remove(&hash);
-            if matches!(
-                self.known_block(parent).await?,
-                Some(
-                    zs::KnownBlock::Finalized
-                        | zs::KnownBlock::BestChain
-                        | zs::KnownBlock::SideChain
-                )
-            ) {
-                self.requeue_block(hash).await?;
-            } else {
-                debug!(
-                    ?hash,
-                    ?parent,
-                    "block parent did not commit in time, dropping block"
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// Handles a downloaded block response and requeues a required hash when retrying one block can
     /// preserve the rest of the round.
     ///
@@ -2685,8 +2568,8 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
-    /// A block whose authorizing data binding is unconfirmed waits for its parent instead, see
-    /// [`Self::wait_for_unconfirmed_parent`].
+    /// A block whose authorizing data binding is still unconfirmed after the download task waited
+    /// for its parent is dropped the same way, without scoring its supplier.
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2725,21 +2608,16 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
-            let parent = *hash;
-            let children: Vec<block::Hash> = self
-                .unconfirmed_binding_waits
-                .iter()
-                .filter(|(_, (waiting_for, _))| *waiting_for == parent)
-                .map(|(child, _)| *child)
-                .collect();
-            for child in children {
-                self.unconfirmed_binding_waits.remove(&child);
-                self.requeue_block(child).await?;
-            }
         }
 
+        // The download task already waited for the parent and verified the body again.
         if let Some((hash, parent)) = response.as_ref().err().and_then(Self::unconfirmed_binding) {
-            return self.wait_for_unconfirmed_parent(hash, parent).await;
+            debug!(
+                ?hash,
+                ?parent,
+                "block parent did not commit in time to confirm its binding, dropping block"
+            );
+            return Ok(());
         }
 
         let unavailable_parent = response.as_ref().err().and_then(Self::unavailable_parent);
@@ -3141,7 +3019,7 @@ where
     }
 
     /// Returns the block and parent hashes of a verification failure whose authorizing data
-    /// binding couldn't be confirmed because the parent hadn't committed.
+    /// binding is still unconfirmed after the download task waited for the parent.
     fn unconfirmed_binding(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
         match error {
             BlockDownloadVerifyError::Invalid {
@@ -3187,9 +3065,9 @@ where
         let peer = block_error_peer_label(e, expose_peer_addresses);
 
         match e {
-            // The retry handler waits for the parent instead of restarting the round.
+            // The handler drops the block without restarting the round.
             e if Self::unconfirmed_binding(e).is_some() => {
-                debug!(error = ?e, %peer, "block binding awaits its parent, continuing sync");
+                debug!(error = ?e, %peer, "block binding stays unconfirmed, continuing sync");
                 false
             }
             // The retry handler bounds these races without cancelling the parent's commit.

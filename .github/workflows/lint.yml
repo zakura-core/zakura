@@ -101,6 +101,28 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test startup CPU requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=crates/zakurad/src/bin/zakurad/cpu_features.rs
+          for mode in baseline assembly portable combined; do
+            flags=()
+            case "$mode" in
+              assembly) flags=(--cfg 'feature="x86_64-asm"') ;;
+              portable) flags=(--cfg 'feature="portable"') ;;
+              combined) flags=(--cfg 'feature="x86_64-asm"' --cfg 'feature="portable"') ;;
+            esac
+            rustc --edition=2021 --test "$source" "${flags[@]}" -o "$RUNNER_TEMP/cpu-tests"
+            "$RUNNER_TEMP/cpu-tests"
+          done
+          rustc --edition=2021 --test "$source" --cfg 'feature="portable"' \
+            -C target-feature=+bmi2,+adx -o "$RUNNER_TEMP/cpu-target-tests"
+          if grep -qw bmi2 /proc/cpuinfo && grep -qw adx /proc/cpuinfo; then
+            "$RUNNER_TEMP/cpu-target-tests"
+          else
+            echo "Compiled target-feature tests; runner lacks BMI2/ADX for execution."
+          fi
       - uses: ./.github/actions/setup-zakura-build
         with:
           # `cargo xtask check-rpc-artifacts` below regenerates the gRPC code.
@@ -110,6 +132,9 @@ jobs:
       - name: Check locked all-feature build
         if: ${{ !cancelled() }}
         run: cargo check --locked --all-features --all-targets
+      - name: Check explicit x86 assembly build
+        if: ${{ !cancelled() }}
+        run: cargo check --locked --package zakura --bin zakurad --features x86_64-asm
       - name: Check generated RPC artifacts
         if: ${{ !cancelled() }}
         run: cargo xtask check-rpc-artifacts

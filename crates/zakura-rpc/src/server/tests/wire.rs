@@ -744,3 +744,21 @@ async fn legacy_response_limits_apply_after_conversion() {
         );
     }
 }
+
+#[tokio::test]
+async fn legacy_batch_level_error_uses_client_format() {
+    let _init_guard = zakura_test::init();
+    let addr = start_server(local_config()).await;
+    let request = r#"{"jsonrpc":"1.0","method":"getstandardfee","params":[],"id":1}"#;
+    let body = format!(
+        "[{}]",
+        vec![request; super::super::MAX_RPC_BATCH_REQUESTS + 1].join(",")
+    );
+    let response = send(addr, &Case::post("too many legacy calls", body), None).await;
+    let (_, body) = response.split_once("\n\n").unwrap();
+    let response: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(response["jsonrpc"], "1.0");
+    assert!(response["id"].is_null());
+    assert!(response["result"].is_null());
+    assert_eq!(response["error"]["code"], -32010);
+}

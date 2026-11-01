@@ -17,7 +17,7 @@ use tower::Service;
 use super::{
     cookie::Cookie,
     http::{HttpBody, HttpRequest, HttpResponse},
-    jsonrpc::{BoundedWriter, ErrorObject, Id, MethodResponse},
+    jsonrpc::{to_json_with_limit, ErrorObject, Id, MethodResponse},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -155,6 +155,17 @@ impl<S> HttpRequestMiddleware<S> {
                     version,
                     JsonRpcVersion::Bitcoind | JsonRpcVersion::Lightwalletd
                 ) {
+                    // Keep accepting long whitespace prefixes as before, without
+                    // rewriting the JSON-RPC 2.0 parameters or ID.
+                    let bytes = if version == JsonRpcVersion::TwoPointZero {
+                        let start = bytes
+                            .iter()
+                            .position(|byte| !byte.is_ascii_whitespace())
+                            .unwrap_or(bytes.len());
+                        bytes.slice(start..)
+                    } else {
+                        bytes
+                    };
                     (ClientFormat::Unchanged, bytes)
                 } else {
                     (
@@ -251,9 +262,8 @@ impl<S> HttpRequestMiddleware<S> {
         limit: usize,
         batch: bool,
     ) -> Vec<u8> {
-        let mut writer = BoundedWriter::new(limit);
-        if serde_json::to_writer(&mut writer, response).is_ok() {
-            return writer.into_json().get().as_bytes().to_vec();
+        if let Ok(json) = to_json_with_limit(response, limit) {
+            return json.get().as_bytes().to_vec();
         }
 
         let error = MethodResponse::too_large_response(id, limit, batch);

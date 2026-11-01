@@ -629,10 +629,9 @@ impl MethodResponse {
             ),
         };
 
-        let mut writer = BoundedWriter::new(max_response_size);
-        match serde_json::to_writer(&mut writer, &Response { id: &id, payload }) {
-            Ok(()) => Self {
-                json: writer.into_json(),
+        match to_json_with_limit(&Response { id: &id, payload }, max_response_size) {
+            Ok(json) => Self {
+                json,
                 error_code,
                 is_notification: false,
             },
@@ -805,21 +804,31 @@ impl BatchResponseBuilder {
     }
 }
 
+/// Serializes a complete JSON value without exceeding `limit` bytes.
+pub(super) fn to_json_with_limit<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> serde_json::Result<Box<RawValue>> {
+    let mut writer = BoundedWriter::new(limit);
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.into_json())
+}
+
 /// A writer that fails when more than `max_len` bytes are written.
-pub(super) struct BoundedWriter {
+struct BoundedWriter {
     max_len: usize,
     buf: Vec<u8>,
 }
 
 impl BoundedWriter {
-    pub(super) fn new(max_len: usize) -> Self {
+    fn new(max_len: usize) -> Self {
         Self {
             max_len,
             buf: Vec::with_capacity(128),
         }
     }
 
-    pub(super) fn into_json(self) -> Box<RawValue> {
+    fn into_json(self) -> Box<RawValue> {
         let json = String::from_utf8(self.buf).expect("serde_json writes UTF-8");
         RawValue::from_string(json).expect("serde_json writes valid JSON")
     }

@@ -130,9 +130,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 4
+content-length: 69
 
-null
+{"jsonrpc":"2.0","id":null,"result":{"standard_fee":400,"version":0}}
 
 === zero id
 POST content-type=Some("application/json")
@@ -372,9 +372,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 48160
+content-length: 47216
 
-<48160 bytes, FNV-1a 04091a4323023346>
+<47216 bytes, FNV-1a ba3b0c9a226823d5>
 
 === extra params are ignored
 POST content-type=Some("application/json")

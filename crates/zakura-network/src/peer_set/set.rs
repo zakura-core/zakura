@@ -983,6 +983,40 @@ where
         }
     }
 
+    /// Performs P2C on the ready block `advertisers` that are preferred block sources.
+    ///
+    /// A ready client only has space in its request channel. If its connection is awaiting a
+    /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
+    /// waits for that response. Load does not capture this: an advertiser with a lower round-trip
+    /// estimate can be less loaded even with a request outstanding.
+    ///
+    /// Falls back to P2C over all `advertisers` if none of them is preferred. If the selected
+    /// connection is busy, the block request still waits behind its current response.
+    fn select_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
+        let preferred_advertisers: HashSet<D::Key> = advertisers
+            .iter()
+            .filter(|key| {
+                self.ready_services
+                    .get(*key)
+                    .is_some_and(|svc| svc.is_preferred_block_source())
+            })
+            .copied()
+            .collect();
+
+        if let Some(peer) = self.select_p2c_peer_from_list(&preferred_advertisers) {
+            return Some(peer);
+        }
+
+        let peer = self.select_p2c_peer_from_list(advertisers);
+        let selected_busy_peer = peer
+            .and_then(|key| self.ready_services.get(&key))
+            .is_some_and(|svc| !svc.can_send_request_now());
+        if selected_busy_peer {
+            metrics::counter!("pool.route_inv.advertiser.awaiting_response.count").increment(1);
+        }
+        peer
+    }
+
     /// Randomly chooses `max_peers` ready services, ignoring service load.
     ///
     /// The chosen peers are unique, but their order is not fully random.
@@ -1147,7 +1181,10 @@ where
         // peers would be able to influence our choice by switching addresses.
         // But we need the choice to be random,
         // so that a peer can't provide all our inventory responses.
-        let peer = self.select_p2c_peer_from_list(&advertising_peer_list);
+        let peer = match hash {
+            InventoryHash::Block(_) => self.select_block_advertiser(&advertising_peer_list),
+            _ => self.select_p2c_peer_from_list(&advertising_peer_list),
+        };
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");

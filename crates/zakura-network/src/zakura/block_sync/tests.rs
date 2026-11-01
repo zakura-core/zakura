@@ -13852,78 +13852,98 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
 /// completing sync, so the fuzz completion checks would not catch it. Every
 /// existing `from`-assertion runs with `max_claimed == request_floor`, so this is
 /// the only test that pins the advance itself.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reactor_refill_window_advances_past_claimed_heights() {
-    let best_header_tip = block::Height(50_000);
-    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([50; 32])));
-    // low-water = peers(1) * max_inflight(4) * max_blocks(1) = 4, fanout = 8. Three
-    // claimed heights sit below low-water, so the next refill fires immediately.
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_requests: 4,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let startup = BlockSyncStartup::new(
-        genesis_frontiers(),
-        (best_header_tip, block::Hash([50; 32])),
-        tip_rx,
-        config,
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    // Exercise both queued events and a timer refill explicitly observed before the tip event.
+    for refill_before_tip in [false, true] {
+        let best_header_tip = block::Height(50_000);
+        let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([50; 32])));
+        // Low-water is four blocks and the query window is eight. Three claimed heights
+        // leave room for a refill, including a timer-driven one before the header tip changes.
+        let config = ZakuraBlockSyncConfig {
+            max_inflight_requests: 4,
+            request_timeout: Duration::from_millis(10),
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let startup = BlockSyncStartup::new(
+            genesis_frontiers(),
+            (best_header_tip, block::Hash([50; 32])),
+            tip_rx,
+            config,
+        );
+        let (handle, mut actions, reactor_task) =
+            spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
-    // Startup refill scans from the floor (queue empty → `max_claimed` is None).
-    assert!(matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks {
-            from: block::Height(1),
-            limit: 8,
-            best_header_tip: block::Height(50_000),
-            ..
-        }
-    ));
+        assert!(matches!(
+            next_action(&mut actions).await,
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(1),
+                limit: 8,
+                best_header_tip: block::Height(50_000),
+                ..
+            }
+        ));
 
-    // Populate the work queue with heights 1..=3 (max_claimed = 3), then nudge the
-    // producer. `NeededBlocks` and `HeaderTipChanged` share one FIFO event channel,
-    // so the queue is populated before the re-query runs (no watch race).
-    let metas: Vec<_> = (1..=3)
-        .map(|height| BlockSyncBlockMeta {
-            height: block::Height(height),
-            hash: block::Hash([u8::try_from(height).expect("height fits u8"); 32]),
-            size: BlockSizeEstimate::Advertised(1_000),
-        })
-        .collect();
-    handle
-        .send(BlockSyncEvent::NeededBlocks(metas))
-        .await
-        .expect("needed-blocks event queues");
-    handle
-        .send(BlockSyncEvent::HeaderTipChanged {
-            height: block::Height(50_001),
-            hash: block::Hash([51; 32]),
-        })
-        .await
-        .expect("header-tip event queues");
-
-    // The refill now starts at max_claimed + 1 (= 4), never back at the floor (1).
-    match next_action(&mut actions).await {
-        BlockSyncAction::QueryNeededBlocks {
-            from,
-            limit,
-            best_header_tip,
-            ..
-        } => {
-            assert_eq!(
+        let assert_advanced_refill = |action| match action {
+            BlockSyncAction::QueryNeededBlocks {
                 from,
-                block::Height(4),
-                "refill must advance past the claimed heights, not rescan from the floor",
+                limit,
+                best_header_tip,
+                ..
+            } => {
+                assert_eq!(
+                    from,
+                    block::Height(4),
+                    "refill must advance past the claimed heights, not rescan from the floor",
+                );
+                assert_eq!(limit, 8);
+                best_header_tip
+            }
+            action => panic!("expected the advanced refill query, got {action:?}"),
+        };
+        let metas = (1..=3)
+            .map(|height| BlockSyncBlockMeta {
+                height: block::Height(height),
+                hash: block::Hash([u8::try_from(height).expect("height fits u8"); 32]),
+                size: BlockSizeEstimate::Advertised(1_000),
+            })
+            .collect();
+        handle
+            .send(BlockSyncEvent::NeededBlocks(metas))
+            .await
+            .expect("needed-blocks event queues");
+        if refill_before_tip {
+            assert_eq!(
+                assert_advanced_refill(next_action(&mut actions).await),
+                best_header_tip
             );
-            assert_eq!(limit, 8);
-            assert_eq!(best_header_tip, block::Height(50_001));
         }
-        action => panic!("expected the advanced refill query, got {action:?}"),
-    }
+        handle
+            .send(BlockSyncEvent::HeaderTipChanged {
+                height: block::Height(50_001),
+                hash: block::Hash([51; 32]),
+            })
+            .await
+            .expect("header-tip event queues");
 
-    reactor_task.abort();
+        // FIFO orders the events but does not exclude a timer tick between them. The first
+        // advanced query can carry the old tip; the subsequent tip event must still refresh it.
+        let observed_tip = assert_advanced_refill(next_action(&mut actions).await);
+        if observed_tip == best_header_tip {
+            assert!(
+                !refill_before_tip,
+                "an unchanged pending query must not be dispatched twice"
+            );
+            assert_eq!(
+                assert_advanced_refill(next_action(&mut actions).await),
+                block::Height(50_001)
+            );
+        } else {
+            assert_eq!(observed_tip, block::Height(50_001));
+        }
+        reactor_task.abort();
+        assert!(reactor_task.await.unwrap_err().is_cancelled());
+    }
 }
 
 #[tokio::test]

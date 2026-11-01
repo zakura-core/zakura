@@ -285,10 +285,17 @@ pub(crate) fn auth_data_commitment(
     let parent_hash = block.header.previous_block_hash;
     let parent_chain =
         non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
+    let finalized_parent = parent_chain.is_none();
     let parent_height = read::find::height_by_hash(parent_chain.clone(), db, parent_hash);
     let Some(history_tree) = read::tree::history_tree(parent_chain, db, parent_hash.into()) else {
         return AuthDataCommitment::Unavailable;
     };
+    // `history_tree` reads the finalized tip and its tree separately, so a block finalized
+    // between those reads returns the next block's tree. Only use it if the parent is still
+    // the finalized tip.
+    if finalized_parent && db.tip().map(|(_, hash)| hash) != Some(parent_hash) {
+        return AuthDataCommitment::Unavailable;
+    }
     // The body's coinbase height is not checked yet, and the commitment check below requires
     // a sequential height with a usable parent history tree.
     let height = block.coinbase_height();

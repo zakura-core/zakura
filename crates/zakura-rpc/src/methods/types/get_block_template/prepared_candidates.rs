@@ -12,7 +12,7 @@ use std::{
 };
 
 use zakura_chain::{
-    block::{Block, Header},
+    block::{Block, Header, MAX_BLOCK_BYTES},
     parameters::Network,
     serialization::{ZcashDeserialize, ZcashSerialize},
 };
@@ -238,11 +238,16 @@ impl PreparedCandidateResolver {
 
     /// Decodes a submitted block whose transactions are byte-for-byte those of a retained
     /// candidate with the same preserved header fields, sharing that candidate's parsed
-    /// transactions. Returns `None` for any other bytes, which the caller parses in full.
+    /// transactions. Returns `None` for oversized submissions or any other bytes, which the caller
+    /// parses in full.
     ///
     /// The result equals what parsing `bytes` would give: the header is parsed from them, and
     /// parsing the identical transaction bytes gives the candidate's transactions.
     pub(crate) fn decode_submitted(&self, bytes: &[u8]) -> Option<Arc<Block>> {
+        // Preserve the full block parser's size limit even when the solution grew since preparation.
+        if u64::try_from(bytes.len()).ok()? > MAX_BLOCK_BYTES {
+            return None;
+        }
         let mut transaction_bytes = bytes;
         let header = Header::zcash_deserialize(&mut transaction_bytes).ok()?;
         let inner = self.lock();
@@ -592,6 +597,47 @@ mod tests {
             &decoded.transactions[0],
             &proposal.transactions[0]
         ));
+    }
+
+    #[test]
+    fn full_submissions_enforce_the_block_size_limit_when_the_solution_grows() {
+        use zakura_chain::transparent::Script;
+
+        let limit = usize::try_from(MAX_BLOCK_BYTES).expect("the block limit fits in memory");
+        for submitted_size in [limit - 1, limit, limit + 1] {
+            let cache = PreparedCandidateResolver::default();
+            let mut solved = Block::clone(&test_block());
+            // Keep the script's CompactSize prefix width fixed while sizing the block.
+            let script_len = 65_536;
+            Arc::make_mut(&mut solved.transactions[0]).outputs_mut()[0].lock_script =
+                Script::new(&vec![0; script_len]);
+            let overhead = submitted_bytes(&solved).len() - script_len;
+            Arc::make_mut(&mut solved.transactions[0]).outputs_mut()[0].lock_script =
+                Script::new(&vec![0; submitted_size - overhead]);
+            let bytes = submitted_bytes(&solved);
+            assert_eq!(bytes.len(), submitted_size);
+
+            let mut proposal = solved.clone();
+            Arc::make_mut(&mut proposal.header).solution = Solution::Regtest([0; 36]);
+            let proposal_bytes = submitted_bytes(&proposal);
+            assert!(proposal_bytes.len() < limit);
+            let proposal = Arc::new(
+                Block::zcash_deserialize(&proposal_bytes[..])
+                    .expect("the shorter proposal fits the full parser's limit"),
+            );
+            cache.retain(proposal, ClientProposal);
+
+            let decoded = cache.decode_submitted(&bytes);
+            let parsed = Block::zcash_deserialize(&bytes[..]);
+            assert_eq!(decoded.is_some(), submitted_size <= limit);
+            assert_eq!(parsed.is_ok(), submitted_size <= limit);
+            if let Some(decoded) = decoded {
+                assert_eq!(
+                    *decoded,
+                    parsed.expect("submissions within the limit parse")
+                );
+            }
+        }
     }
 
     #[test]

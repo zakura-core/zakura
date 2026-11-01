@@ -40,7 +40,8 @@ gh release download "$RELEASE_TAG" --repo "$REPOSITORY" \
 fail=0
 while read -r name digest; do
   case "$name" in
-    SHA256SUMS.txt | *.minisig) continue ;;
+    # release-approval.* is the security-key approval, not a checksummed payload.
+    SHA256SUMS.txt | *.minisig | release-approval.*) continue ;;
   esac
   expected="$(awk -v f="./${name}" '$2 == f {print $1}' "${workdir}/SHA256SUMS.txt")"
   if [ -z "$expected" ]; then
@@ -63,7 +64,7 @@ while read -r _ path; do
 done < "${workdir}/SHA256SUMS.txt"
 
 if [ "$fail" -ne 0 ]; then
-  echo "Refusing to sign ${RELEASE_TAG}: fix the release assets first (workflow_dispatch with publish_assets_to_release)." >&2
+  echo "Refusing to sign ${RELEASE_TAG}: fix the release assets first (workflow_dispatch --ref ${RELEASE_TAG} with publish_assets_to_release)." >&2
   exit 1
 fi
 

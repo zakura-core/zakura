@@ -27,8 +27,11 @@ Create a private key for the app. Configure a GitHub Actions environment named
 `release`, add the app's client ID as the environment variable
 `RELEASE_APP_CLIENT_ID`, and add its private key as the environment secret
 `RELEASE_APP_PRIVATE_KEY`. Configure required reviewers for the environment so
-that creating a release requires explicit approval. Restrict this environment
-to the `main` deployment branch.
+that creating a release requires explicit approval. Every reviewer must also
+be a release signer with a security key listed in `.github/release-signers`,
+because the publish job only accepts an approval made with
+`scripts/approve-release.sh` (see [release-approval.md](release-approval.md)).
+Restrict this environment to the `main` deployment branch.
 
 The app private key is a credential. Store its source copy in the team's secret
 manager and do not commit it or paste it into issues, pull requests, or logs.
@@ -68,8 +71,12 @@ ruleset administration must remain limited.
    `ESTIMATED_RELEASE_HEIGHT` readiness problems. Then wait for it to build and
    verify the release assets and no-push Docker builds. Nothing is tagged or
    published during this stage.
-5. Approve the `release` environment deployment. The workflow publishes the
-   complete pre-release, creating the protected tag as its final step.
+5. A release signer approves the `release` environment deployment with
+   `scripts/approve-release.sh <run>` and their security key (see
+   [release-approval.md](release-approval.md)). The GitHub button alone makes
+   the publish job fail before tagging. The workflow verifies the signature,
+   then publishes the complete pre-release with the signature attached,
+   creating the protected tag as its final step.
 6. Confirm that `Release binaries` starts from the new tag, skips rebuilding
    the existing assets, publishes the Docker images, and opens the installer
    metadata update pull request.

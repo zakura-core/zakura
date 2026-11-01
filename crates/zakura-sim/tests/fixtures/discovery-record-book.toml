@@ -1,7 +1,7 @@
 harness = "discovery/record-book"
 generator = 2
-sha256 = "620063b6382f3ad3a867e582d3c637e6a26a7adc5bb39d12b9a988663dd0a43e"
-scenario_sha256 = "ca1f7894a9340e414f0110d8150bf741b363dd1445500ad886ef8bf5505f36db"
+sha256 = "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2"
+scenario_sha256 = "157c7fdf2b6e07b69ae0508a7274b49bb9be9ab5e45249d88a291ce75ed218a4"
 source = "crates/zakura-sim/tests/replay_exact.rs"
 
 [[witness]]

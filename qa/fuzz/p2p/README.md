@@ -28,3 +28,63 @@ Record metadata and session checks compare normalized state and do not depend on
 hash iteration order. These targets check synchronous installation rules;
 `discovery/verification-capacity` checks the real handle's task cancellation and
 verification waits.
+
+## Discovery session and redial targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `discovery_session` | `discovery/session-policy` | `discovery_session_witness_reaches_close_after_recheck` |
+| `discovery_redial` | `discovery/redial-policy` | `redial_witness_exercises_limits_resets_and_lagging_registration` |
+
+Both decoder-v1 targets read at most 512 bytes and reuse their existing
+independent models for proptest and cargo-fuzz. Empty inputs report zero
+applicability.
+
+`discovery_session` decodes hello, admitted answers and operation outcomes.
+It checks exchange completion, single settlement, and ownership checks before
+close. Its witness reaches a close after the answer wait and ownership recheck.
+Two planted failures skip the recheck or discard the success charge.
+
+`discovery_redial` uses three header bytes for policy and backoff bounds.
+Each remaining triple selects an attempt and registration lifetime. Its witness
+checks local limits, backoff growth, registration upgrades, resets and stopping.
+Two planted failures reset a failed attempt or charge a local limit.
+
+These targets check pure policies. They do not check worker cancellation or
+connection ownership across scheduled IO.
+
+## Discovery query and candidate targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `discovery_query` (decoder 1) | `discovery/query-ownership` | `query_witness_exercises_ownership_and_caps` |
+| `discovery_query` (decoder 2) | `discovery/answer-settlement` | `settlement_witness_exercises_holds_and_retirement` |
+| `discovery_candidate` | `discovery/dial-attempts` | `candidate_witness_exercises_identity_backoff_and_local_limits` |
+
+These decoders share their existing proptest models with cargo-fuzz. They read
+at most 512 bytes and report zero applicability for empty histories.
+
+`discovery_query` decodes reservation, queue, release and claim operations.
+Its model calculates wire caps independently and checks that an answer claims
+its own reservation once. Its witness exercises refusal, unsent release, an
+exact-cap answer, an oversized answer and a stale claim. Planted failures lose
+a reservation or release a queued query.
+
+`discovery_query` replays every input under decoder 1 and then decoder 2, so
+its corpus keeps its decoder-1 meaning. Decoder 2 drives the real `Queries` of
+successive sessions on one pool: queries, writes, the transport's admission,
+claims, settlements, `Hello` holds and retirement. Its model checks that each
+claimed answer keeps its pool entry and its kind until it settles, including
+after its session retires. It also checks that the close wait resolves exactly
+when nothing delivered is unsettled, and that retirement closes the connection
+exactly when a written query is unanswered. Its witness exercises each of those
+holds. Planted failures count a settling `Hello` that does not exist or leak a
+pool entry. It does not run a reader, so it does not check that the reader takes
+the `Hello` hold.
+
+`discovery_candidate` decodes triples into dial, completion, duplicate, round
+and logical-time operations. Its model tracks canonical IP reservations and
+per-node backoff. Its witness exercises a duplicate completion, failure backoff
+and a local-limit pause. Planted failures release reservations early or discard
+backoff. Final cleanup settles every remaining logical reservation. This does
+not check that an asynchronous worker releases its admission permit.

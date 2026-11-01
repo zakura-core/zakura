@@ -481,32 +481,27 @@ impl Attempt {
         }
         if result.is_err() {
             self.budget.count("read_failed.count");
-        } else {
-            if matches!(result, Ok(zs::ParentInputs::Inconclusive)) {
-                self.budget.count("inconclusive.count");
-            }
-            let mut inner = self.budget.lock();
-            if self.generation != inner.generation {
-                return Err(block);
-            }
-            if inner.charges.len() < Budget::limit(inner.capacity) {
-                inner.charges.insert(
-                    self.id,
-                    Charge {
-                        parent: block.parent,
-                        since: Instant::now(),
-                    },
-                );
-                self.budget.count("admitted.count");
-                self.budget.publish(&mut inner, false);
-                self.budget.0.changed.notify_one();
-                return Ok(());
-            }
-            self.budget.count("capacity_deferred.count");
+        } else if matches!(result, Ok(zs::ParentInputs::Inconclusive)) {
+            self.budget.count("inconclusive.count");
         }
-        self.defer(block.clone());
-        Err(block)
+        // Qualification baseline: record waiting work without changing admission.
+        let mut inner = self.budget.lock();
+        if self.generation == inner.generation {
+            inner.charges.insert(
+                self.id,
+                Charge {
+                    parent: block.parent,
+                    since: Instant::now(),
+                },
+            );
+            self.budget.count("admitted.count");
+            self.budget.publish(&mut inner, false);
+            self.budget.0.changed.notify_one();
+        }
+        Ok(())
     }
+
+    #[expect(dead_code, reason = "the observation-only baseline never defers work")]
 
     fn defer(&mut self, block: Deferred) {
         let mut inner = self.budget.lock();

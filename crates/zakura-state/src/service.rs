@@ -999,7 +999,7 @@ impl StateService {
             self.non_finalized_block_write_sent_hashes
                 .can_fork_chain_at_hashes = true;
             // Send blocks from non-finalized queue
-            self.send_ready_non_finalized_queued(self.finalized_block_write_last_sent_hash);
+            self.send_ready_non_finalized(self.finalized_block_write_last_sent_hash, None);
             // We've finished committing checkpoint verified blocks to finalized state, so drop any repeated queued blocks.
             self.clear_finalized_block_queue(CommitBlockError::new_duplicate(
                 None,
@@ -1094,6 +1094,10 @@ impl StateService {
             return Self::respond_now(admission, CommitBlockError::MissingMinedParent);
         }
 
+        // A block whose parent the write task can already build on goes straight to the write
+        // task, so it skips the orphan queue's indexes, which would be removed again right away.
+        let mut ready = None;
+
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
@@ -1127,12 +1131,15 @@ impl StateService {
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let attempt = write::start_block_write(&self.block_commit_sender, hash);
-            self.non_finalized_state_queued_blocks.queue((
-                semantically_verified,
-                rsp_tx,
-                admission,
-                attempt,
-            ));
+            let queued = (semantically_verified, rsp_tx, admission, attempt);
+            if self.block_write_sender.finalized.is_none()
+                && self.block_write_sender.non_finalized.is_some()
+                && self.can_fork_chain_at(&parent_hash)
+            {
+                ready = Some(queued);
+            } else {
+                self.non_finalized_state_queued_blocks.queue(queued);
+            }
             rsp_rx
         };
 
@@ -1140,27 +1147,36 @@ impl StateService {
         // semantically verified blocks. This usually already happened in `poll_ready()` once the
         // final checkpoint write became durable, but we also check here in case this block is what
         // completes the handoff condition.
-        if self.try_handoff_to_non_finalized_write() {
+        if let Some(ready) = ready {
+            // The checkpoint handoff already happened, so only this block and any queued
+            // descendants of its parent need sending.
+            self.send_ready_non_finalized(parent_hash, Some(ready));
+            self.prune_non_finalized_queues();
+        } else if self.try_handoff_to_non_finalized_write() {
             // The handoff happened on this call: the queued children, including the block just
             // queued above, were sent to the non-finalized write task.
         } else if !self.can_fork_chain_at(&parent_hash) {
             tracing::trace!("unready to verify, returning early");
         } else if self.block_write_sender.finalized.is_none() {
             // Wait until block commit task is ready to write non-finalized blocks before dequeuing them
-            self.send_ready_non_finalized_queued(parent_hash);
-
-            let finalized_tip_height = self.read_service.db.finalized_tip_height().expect(
-                "Finalized state must have at least one block before committing non-finalized state",
-            );
-
-            self.non_finalized_state_queued_blocks
-                .prune_by_height(finalized_tip_height);
-
-            self.non_finalized_block_write_sent_hashes
-                .prune_by_height(finalized_tip_height);
+            self.send_ready_non_finalized(parent_hash, None);
+            self.prune_non_finalized_queues();
         }
 
         rsp_rx
+    }
+
+    /// Drops queued and sent blocks at or below the finalized tip.
+    fn prune_non_finalized_queues(&mut self) {
+        let finalized_tip_height = self.read_service.db.finalized_tip_height().expect(
+            "Finalized state must have at least one block before committing non-finalized state",
+        );
+
+        self.non_finalized_state_queued_blocks
+            .prune_by_height(finalized_tip_height);
+
+        self.non_finalized_block_write_sent_hashes
+            .prune_by_height(finalized_tip_height);
     }
 
     /// Returns whether queueing a block with this parent lets the rest of this call drain it
@@ -1244,10 +1260,15 @@ impl StateService {
         queued_height >= self.full_verifier_utxo_lookahead
     }
 
-    /// Sends all queued blocks whose parents have recently arrived starting from `new_parent`
-    /// in breadth-first ordering to the block write task which will attempt to validate and commit them
-    #[tracing::instrument(level = "debug", skip(self, new_parent))]
-    fn send_ready_non_finalized_queued(&mut self, new_parent: block::Hash) {
+    /// Sends `ready`, a child of `new_parent` that was never queued, and then all queued blocks
+    /// whose parents have recently arrived starting from `new_parent`, to the block write task
+    /// which will attempt to validate and commit them.
+    #[tracing::instrument(level = "debug", skip(self, new_parent, ready))]
+    fn send_ready_non_finalized(
+        &mut self,
+        new_parent: block::Hash,
+        mut ready: Option<QueuedSemanticallyVerified>,
+    ) {
         use tokio::sync::mpsc::error::SendError;
         if let Some(non_finalized_block_write_sender) = &self.block_write_sender.non_finalized {
             let mut new_parents: Vec<block::Hash> = vec![new_parent];
@@ -1257,7 +1278,7 @@ impl StateService {
                     .non_finalized_state_queued_blocks
                     .dequeue_children(parent_hash);
 
-                for queued_child in queued_children {
+                for queued_child in ready.take().into_iter().chain(queued_children) {
                     let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned()
                     else {
                         Self::send_semantically_verified_block_error(

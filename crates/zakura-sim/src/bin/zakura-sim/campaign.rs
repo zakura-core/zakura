@@ -3,18 +3,20 @@
 
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use zakura_sim::{
     campaign::{
-        self, build_fuzzer, Budget, CampaignError, Compaction, Digest, End, Migration, Prepared,
-        ResumeOptions, RunState, StartOptions, Status, Store, WorkerPlan, FUZZ_PACKAGE,
+        self, build_fuzzer, Budget, CampaignError, Compaction, Digest, End, Evidence, Migration,
+        Prepared, ResumeOptions, RunState, StartOptions, Status, Store, WorkerPlan, FUZZ_PACKAGE,
         SANITIZER_VARS,
     },
-    explore::DEFAULT_ABANDON_LIMIT,
+    explore::{stats::Counts, DEFAULT_ABANDON_LIMIT},
     harness,
+    property::Status as PropertyStatus,
 };
 
 use super::cli::Error;
@@ -32,6 +34,7 @@ pub const USAGE: &str = "\
       [--workers <n>]
   zakura-sim campaign close --store <dir> [--run <sha256>]
   zakura-sim campaign status --store <dir>
+  zakura-sim campaign evidence --store <dir> [--run <sha256>] [--out <file>]
   zakura-sim campaign verify --store <dir>
 ";
 
@@ -53,6 +56,11 @@ build identity, harness or feedback: those start a new segment.
 `close` ends an open run whose supervisor stopped: it saves the snapshot from
 what the workers left, and records the run as interrupted.
 `status` lists every run. `verify` checks every record against its digest.
+`evidence` sums what a run's fuzzer processes counted, per worker and for the
+run: runs by outcome and end, budget exits, cleanup, each property's outcomes
+and assumption losses, and the features reached. It lists the properties no
+complete process saw apply, and every worker, process and stats file whose
+counts fall short. --out also writes it as JSON.
 `start` and `resume` exit 0 for a complete run and 1 otherwise.
 ";
 
@@ -77,6 +85,7 @@ pub fn run(args: Vec<String>) -> Result<(), Error> {
         "resume" => resume(&store, &flags),
         "close" => close(&store, &flags),
         "status" => status(&store, &flags),
+        "evidence" => evidence(&store, &flags),
         "verify" => verify(&store, &flags),
         other => Err(Error::Usage(format!(
             "unknown campaign subcommand `{other}`"
@@ -242,21 +251,146 @@ fn run_prepared(store: &Store, prepared: Prepared) -> Result<(), Error> {
 #[allow(clippy::print_stdout)]
 fn close(store: &Store, flags: &Flags) -> Result<(), Error> {
     flags.only(&["--store", "--run"])?;
-    let run = match flags.one("--run")? {
-        Some(run) => digest(run)?,
-        None => match store.leaves().map_err(failed)?.as_slice() {
-            [leaf] => leaf.clone(),
-            leaves => {
-                return Err(Error::Usage(format!(
-                    "the store holds {} runs that no run continues; name one with --run",
-                    leaves.len()
-                )))
-            }
-        },
-    };
+    let run = named_run(store, flags)?;
     let end = campaign::close(store, &run).map_err(failed)?;
     print_end(&run, &end);
     Ok(())
+}
+
+/// The run `--run` names, else the only run that no run continues.
+fn named_run(store: &Store, flags: &Flags) -> Result<Digest, Error> {
+    match flags.one("--run")? {
+        Some(run) => digest(run),
+        None => match store.leaves().map_err(failed)?.as_slice() {
+            [leaf] => Ok(leaf.clone()),
+            leaves => Err(Error::Usage(format!(
+                "the store holds {} runs that no run continues; name one with --run",
+                leaves.len()
+            ))),
+        },
+    }
+}
+
+/// `evidence`: prints a run's evidence, and writes it as JSON to `--out`.
+#[allow(clippy::print_stdout)]
+fn evidence(store: &Store, flags: &Flags) -> Result<(), Error> {
+    flags.only(&["--store", "--run", "--out"])?;
+    let run = named_run(store, flags)?;
+    let evidence = campaign::evidence(store, &run).map_err(failed)?;
+    if let Some(out) = flags.one("--out")? {
+        let json = serde_json::to_vec_pretty(&evidence)
+            .map_err(|error| Error::Failed(format!("serializing the evidence: {error}")))?;
+        fs::write(out, json).map_err(|error| Error::Failed(format!("writing {out}: {error}")))?;
+    }
+    print!("{}", evidence_text(&evidence));
+    Ok(())
+}
+
+/// `evidence` in words, one fact per line.
+fn evidence_text(evidence: &Evidence) -> String {
+    let mut text = format!(
+        "run {}: {}, {}\n",
+        evidence.run,
+        evidence.harness,
+        evidence.status.map_or("without an end record", status_name)
+    );
+    for worker in &evidence.workers {
+        let attempts: Vec<String> = worker
+            .attempts
+            .iter()
+            .map(|(end, n)| format!("{} {n}", name(end)))
+            .collect();
+        text += &format!(
+            "worker {}: {}; processes: {}; stats files: {}; {}\n",
+            worker.index,
+            worker
+                .outcome
+                .as_ref()
+                .map_or_else(|| "no outcome".to_owned(), name),
+            attempts.join(", "),
+            worker.processes,
+            counts_line(&worker.counts),
+        );
+    }
+    let totals = &evidence.totals;
+    text += &format!("total: {}\n", counts_line(totals));
+    text += &format!(
+        "complete processes: {}\n",
+        counts_line(&evidence.complete_totals)
+    );
+    text += &format!("ends: {}\n", pairs(&totals.ends));
+    text += &format!(
+        "budget exits: {}; drains exhausted: {}\n",
+        totals.budget_exits(),
+        totals.drains_exhausted
+    );
+    let cleanup = &totals.cleanup;
+    text += &format!(
+        "cleanup: abandoned {} ({} tasks leaked), unwound {}, panicked {}, unwind failures {}\n",
+        cleanup.abandoned,
+        cleanup.leaked_tasks,
+        cleanup.unwound,
+        cleanup.panicked,
+        cleanup.unwind_failures
+    );
+    let (distinct, families) = totals.feature_totals();
+    let families: Vec<String> = families
+        .iter()
+        .map(|(family, n)| format!("{family} {n}"))
+        .collect();
+    text += &format!("features: {distinct} distinct ({})\n", families.join(", "));
+    for (id, counts) in &totals.properties {
+        text += &format!(
+            "property {id} [{}]: held {} ({} evaluations), not applicable {}, inconclusive {} \
+             ({}), assumption losses {}, violated {}\n",
+            property_status(counts.status),
+            counts.held,
+            counts.evaluations,
+            counts.not_applicable,
+            counts.inconclusive.values().sum::<u64>(),
+            pairs(&counts.inconclusive),
+            counts.assumption_losses(),
+            counts.violated
+        );
+    }
+    text += &format!("unapplied: {}\n", evidence.unapplied.join(", "));
+    for incomplete in &evidence.incomplete {
+        text += &format!(
+            "incomplete: {}\n",
+            serde_json::to_string(incomplete).expect("a gap holds only strings and integers")
+        );
+    }
+    text
+}
+
+/// A worker's or a run's runs by outcome.
+fn counts_line(counts: &Counts) -> String {
+    format!("{} runs ({})", counts.runs, pairs(&counts.outcomes))
+}
+
+/// `name count` pairs, comma-separated.
+fn pairs(map: &BTreeMap<String, u64>) -> String {
+    map.iter()
+        .map(|(key, n)| format!("{key} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A unit variant's name, as its record holds it.
+fn name(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// A property status in words: `active`, `known #<issue>` or `draft`.
+fn property_status(status: PropertyStatus) -> String {
+    match status {
+        PropertyStatus::Active => "active".to_owned(),
+        PropertyStatus::Known { issue } => format!("known #{issue}"),
+        PropertyStatus::Draft => "draft".to_owned(),
+    }
 }
 
 /// `status`: lists every run, oldest first.

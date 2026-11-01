@@ -1042,6 +1042,14 @@ impl StateService {
         let parent_hash = semantically_verified.block.header.previous_block_hash;
         let hash = semantically_verified.hash;
 
+        let is_replacement = self
+            .non_finalized_state_queued_blocks
+            .get_mut(&hash)
+            .is_some();
+        let reclaim_capacity =
+            !is_replacement && !self.drains_the_non_finalized_queue_now(&parent_hash);
+        self.prune_abandoned_queued_blocks(Some((hash, parent_hash)), reclaim_capacity);
+
         // Drop hashes of any blocks the write task has rejected before checking
         // the SentHashes membership below. Without this, a rejected same-hash
         // block would lock out a later honest re-delivery of a block at the
@@ -1163,6 +1171,23 @@ impl StateService {
         rsp_rx
     }
 
+    /// Releases abandoned queue entries without publishing an invalid-block verdict.
+    fn prune_abandoned_queued_blocks(
+        &mut self,
+        incoming: Option<(block::Hash, block::Hash)>,
+        reclaim_capacity: bool,
+    ) {
+        for (block, _response, admission, attempt) in self
+            .non_finalized_state_queued_blocks
+            .prune_abandoned(incoming, reclaim_capacity)
+        {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            write::forget_block_write(&self.block_commit_sender, block.hash, attempt);
+        }
+    }
+
     /// Returns whether queueing a block with this parent lets the rest of this call drain it
     /// again, so admitting it past the queue bound overshoots by one entry and no more.
     ///
@@ -1249,6 +1274,7 @@ impl StateService {
     #[tracing::instrument(level = "debug", skip(self, new_parent))]
     fn send_ready_non_finalized_queued(&mut self, new_parent: block::Hash) {
         use tokio::sync::mpsc::error::SendError;
+        self.prune_abandoned_queued_blocks(None, false);
         if let Some(non_finalized_block_write_sender) = &self.block_write_sender.non_finalized {
             let mut new_parents: Vec<block::Hash> = vec![new_parent];
 
@@ -1805,6 +1831,8 @@ impl Service<Request> for StateService {
         let poll = self.read_service.poll_ready(cx);
 
         self.poll_non_finalized_write_updates(cx);
+
+        self.prune_abandoned_queued_blocks(None, false);
 
         // A failed checkpoint commit requests Tip during recovery. Consume its
         // queue reset here so a waiting replacement does not need another block.

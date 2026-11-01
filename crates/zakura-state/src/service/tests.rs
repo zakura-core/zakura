@@ -42,6 +42,109 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+/// A dropped buffered response must propagate cancellation through the real service future.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_buffered_commits_reclaim_capacity_across_cancelled_waves() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let (state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0).await?;
+    let mut service = Buffer::new(BoxService::new(state), 1);
+    let original: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
+    let mut responses = Vec::new();
+    let mut previous_hash = None;
+    for wave in 0..3 {
+        let mut hashes = Vec::new();
+        for index in 0..super::queued_blocks::MAX_QUEUED_BLOCKS {
+            let mut block = (*original).clone();
+            block.transactions.truncate(1);
+            let header = Arc::make_mut(&mut block.header);
+            header.previous_block_hash = block::Hash([0x55; 32]);
+            let nonce =
+                u64::try_from(wave * super::queued_blocks::MAX_QUEUED_BLOCKS + index).unwrap();
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&nonce.to_le_bytes());
+            header.nonce = bytes.into();
+            let prepared = Arc::new(block).prepare();
+            hashes.push(prepared.hash);
+            responses.push(
+                service
+                    .ready()
+                    .await?
+                    .call(Request::CommitSemanticallyVerifiedBlock(prepared)),
+            );
+        }
+        // This query is behind the commits in the buffer, so every response now owns a queued request.
+        let last = *hashes.last().unwrap();
+        assert!(matches!(
+            timeout(
+                Duration::from_secs(10),
+                service.clone().oneshot(Request::KnownBlock(last))
+            )
+            .await??,
+            Response::KnownBlock(Some(crate::KnownBlock::Queue))
+        ));
+        if let Some(hash) = previous_hash {
+            assert!(
+                matches!(
+                    service.clone().oneshot(Request::KnownBlock(hash)).await?,
+                    Response::KnownBlock(None)
+                ),
+                "later admissions reclaim cancelled entries even before grace expires"
+            );
+        }
+        previous_hash = Some(last);
+        responses.clear();
+        // No new block is needed to observe cancellation during normal service activity.
+        assert!(matches!(
+            service.clone().oneshot(Request::KnownBlock(last)).await?,
+            Response::KnownBlock(Some(crate::KnownBlock::Queue))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_admission_after_idle_reclaims_expired_entries_and_preserves_its_parent() -> Result<()>
+{
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0).await?;
+    let original: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let parent = original.clone().prepare();
+    let mut child_block = (*original).clone();
+    Arc::make_mut(&mut child_block.header).previous_block_hash = parent.hash;
+    let child = Arc::new(child_block).prepare();
+    drop(state.queue_and_commit_to_non_finalized_state(parent.clone(), None));
+    state.prune_abandoned_queued_blocks(None, false);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let _live_child = state.queue_and_commit_to_non_finalized_state(child.clone(), None);
+    assert!(
+        state
+            .non_finalized_state_queued_blocks
+            .get_mut(&parent.hash)
+            .is_some(),
+        "incoming child protects its expired queued parent"
+    );
+    drop(_live_child);
+    state.prune_abandoned_queued_blocks(None, false);
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .get_mut(&parent.hash)
+        .is_none());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let unrelated = original.make_fake_child().prepare();
+    let _response = state.queue_and_commit_to_non_finalized_state(unrelated, None);
+    assert!(
+        state
+            .non_finalized_state_queued_blocks
+            .get_mut(&child.hash)
+            .is_none(),
+        "admission sweeps entries that expired while the service was idle"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn sent_sibling_removal_keeps_await_utxo_ready() {
     use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};

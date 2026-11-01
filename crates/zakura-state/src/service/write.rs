@@ -1544,6 +1544,25 @@ pub(super) fn start_block_write(
     attempt
 }
 
+/// Forgets an abandoned queued admission without rejecting it or erasing a newer attempt.
+pub(super) fn forget_block_write(
+    sender: &watch::Sender<BlockWriteNotice>,
+    hash: block::Hash,
+    attempt: u64,
+) {
+    sender.send_if_modified(|notice| {
+        if notice
+            .attempts
+            .get(&hash)
+            .is_some_and(|(current, _)| *current == attempt)
+        {
+            notice.attempts.remove(&hash);
+        }
+        // Eviction is not a write verdict and cannot answer AwaitBlockInfo readers.
+        false
+    });
+}
+
 /// Wakes readers after `hash` commits.
 fn notify_block_committed(sender: &watch::Sender<BlockWriteNotice>, hash: block::Hash) {
     sender.send_modify(|notice| {

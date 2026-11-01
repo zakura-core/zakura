@@ -7,6 +7,22 @@ mod full_state_coherence;
 mod selection_and_evidence;
 
 use super::*;
+
+#[test]
+fn forgetting_abandoned_write_does_not_reject_or_erase_a_replacement() {
+    let hash = block::Hash([0x55; 32]);
+    let (sender, _receiver) = watch::channel(BlockWriteNotice::default());
+    let old = start_block_write(&sender, hash);
+    let replacement = start_block_write(&sender, hash);
+    forget_block_write(&sender, hash, old);
+    assert_eq!(
+        sender.borrow().attempts.get(&hash),
+        Some(&(replacement, false))
+    );
+    forget_block_write(&sender, hash, replacement);
+    assert!(!sender.borrow().attempts.contains_key(&hash));
+    assert!(!sender.borrow().is_rejected(&hash));
+}
 use std::{
     collections::VecDeque,
     sync::{

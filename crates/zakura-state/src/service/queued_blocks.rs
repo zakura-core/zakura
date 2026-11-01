@@ -2,10 +2,11 @@
 
 use std::{
     collections::{hash_map::Drain, BTreeMap, HashMap, HashSet, VecDeque},
-    iter, mem,
+    iter,
+    time::Duration,
 };
 
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 use tracing::instrument;
 
 use zakura_chain::{block, transparent};
@@ -21,6 +22,9 @@ mod tests;
 
 /// Bounds semantically verified blocks retained while their parents are unavailable.
 pub(crate) const MAX_QUEUED_BLOCKS: usize = crate::MAX_BLOCK_REORG_HEIGHT as usize;
+
+/// Best-effort retention after first observing that a queued caller has stopped waiting.
+const ABANDONED_BLOCK_GRACE: Duration = Duration::from_secs(30);
 
 /// A checkpoint verified block and its response channel.
 pub type CheckpointCommit = (
@@ -52,11 +56,133 @@ pub struct QueuedBlocks {
     by_parent: HashMap<block::Hash, HashSet<block::Hash>>,
     /// Hashes from `queued_blocks`, indexed by block height.
     by_height: BTreeMap<block::Height, HashSet<block::Hash>>,
-    /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    /// Outputs retained until their last queued block leaves the cache.
+    known_utxos: HashMap<transparent::OutPoint, SharedUtxo>,
+    /// First observed cancellation, including entries protected by live descendants.
+    abandoned_since: HashMap<block::Hash, Instant>,
 }
 
 impl QueuedBlocks {
+    /// Removes abandoned entries whose grace expired, then reclaims admission capacity if needed.
+    ///
+    /// Live callers protect their known queued ancestors. Grace applies to each abandoned entry
+    /// independently and does not protect its ancestors. Incoming hashes temporarily protect a
+    /// replacement and its parents. Already dispatched writes are not in this queue.
+    pub fn prune_abandoned(
+        &mut self,
+        incoming: Option<(block::Hash, block::Hash)>,
+        reclaim_capacity: bool,
+    ) -> Vec<QueuedSemanticallyVerified> {
+        let now = Instant::now();
+        let mut roots = Vec::new();
+        for (hash, queued) in &self.blocks {
+            if queued.1.is_closed() {
+                self.abandoned_since.entry(*hash).or_insert(now);
+            } else {
+                roots.push(*hash);
+            }
+        }
+        if let Some((hash, parent)) = incoming {
+            roots.extend([hash, parent]);
+        }
+
+        let mut protected = HashSet::new();
+        for mut hash in roots {
+            while let Some(queued) = self.blocks.get(&hash) {
+                if !protected.insert(hash) {
+                    break;
+                }
+                hash = queued.0.block.header.previous_block_hash;
+            }
+        }
+
+        let mut abandoned: Vec<_> = self
+            .abandoned_since
+            .iter()
+            .filter(|(hash, _)| !protected.contains(*hash))
+            .map(|(hash, since)| (*since, *hash))
+            .collect();
+        // Hashes break ties deterministically when cancellations are observed together.
+        abandoned.sort_unstable();
+        let mut removed = Vec::new();
+        for (since, hash) in abandoned {
+            if now.duration_since(since) < ABANDONED_BLOCK_GRACE
+                && !(reclaim_capacity && self.is_full())
+            {
+                break;
+            }
+            removed.push(self.remove(&hash));
+        }
+        if !removed.is_empty() {
+            metrics::counter!("state.memory.queued.abandoned.evicted.count")
+                .increment(u64::try_from(removed.len()).expect("queued entries fit in u64"));
+            self.update_metrics();
+        }
+        removed
+    }
+
+    /// Removes one entry without discarding the index bucket for its remaining children.
+    fn remove(&mut self, hash: &block::Hash) -> QueuedSemanticallyVerified {
+        let queued = self
+            .blocks
+            .remove(hash)
+            .expect("the indexed block is queued");
+        let parent = queued.0.block.header.previous_block_hash;
+        let children = self
+            .by_parent
+            .get_mut(&parent)
+            .expect("queued parent is indexed");
+        assert!(children.remove(hash), "queued child is indexed by parent");
+        if children.is_empty() {
+            self.by_parent.remove(&parent);
+        }
+        let heights = self
+            .by_height
+            .get_mut(&queued.0.height)
+            .expect("queued height is indexed");
+        assert!(heights.remove(hash), "queued block is indexed by height");
+        if heights.is_empty() {
+            self.by_height.remove(&queued.0.height);
+        }
+        self.abandoned_since.remove(hash);
+        self.release_outputs(&queued.0);
+        queued
+    }
+
+    fn retain_outputs(&mut self, block: &SemanticallyVerifiedBlock) {
+        for (outpoint, ordered) in &block.new_outputs {
+            self.known_utxos
+                .entry(*outpoint)
+                .and_modify(|shared| {
+                    shared.owners = shared
+                        .owners
+                        .checked_add(1)
+                        .expect("each output owner occupies a queued block entry");
+                    shared.utxo = ordered.utxo.clone();
+                })
+                .or_insert_with(|| SharedUtxo {
+                    utxo: ordered.utxo.clone(),
+                    owners: 1,
+                });
+        }
+    }
+
+    fn release_outputs(&mut self, block: &SemanticallyVerifiedBlock) {
+        for outpoint in block.new_outputs.keys() {
+            let shared = self
+                .known_utxos
+                .get_mut(outpoint)
+                .expect("queued output is cached");
+            shared.owners = shared
+                .owners
+                .checked_sub(1)
+                .expect("a removed block owns each of its cached outputs");
+            if shared.owners == 0 {
+                self.known_utxos.remove(outpoint);
+            }
+        }
+    }
+
     /// Returns true when the orphan queue cannot retain another distinct block.
     pub fn is_full(&self) -> bool {
         self.blocks.len() >= MAX_QUEUED_BLOCKS
@@ -79,10 +205,7 @@ impl QueuedBlocks {
         }
 
         // Track known UTXOs in queued blocks.
-        for (outpoint, ordered_utxo) in new.0.new_outputs.iter() {
-            self.known_utxos
-                .insert(*outpoint, ordered_utxo.utxo.clone());
-        }
+        self.retain_outputs(&new.0);
 
         self.blocks.insert(new_hash, new);
         self.by_height
@@ -111,33 +234,17 @@ impl QueuedBlocks {
         &mut self,
         parent_hash: block::Hash,
     ) -> Vec<QueuedSemanticallyVerified> {
-        let queued_children = self
+        let hashes: Vec<_> = self
             .by_parent
-            .remove(&parent_hash)
-            .unwrap_or_default()
+            .get(&parent_hash)
             .into_iter()
-            .map(|hash| {
-                self.blocks
-                    .remove(&hash)
-                    .expect("block is present if its hash is in by_parent")
-            })
+            .flatten()
+            .copied()
+            .collect();
+        let queued_children = hashes
+            .iter()
+            .map(|hash| self.remove(hash))
             .collect::<Vec<_>>();
-
-        for queued in &queued_children {
-            if let Some(hashes) = self.by_height.get_mut(&queued.0.height) {
-                hashes.remove(&queued.0.hash);
-
-                if hashes.is_empty() {
-                    self.by_height.remove(&queued.0.height);
-                }
-            }
-
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
-            for outpoint in queued.0.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
-            }
-        }
 
         tracing::trace!(
             dequeued = queued_children.len(),
@@ -186,21 +293,14 @@ impl QueuedBlocks {
     /// `finalized_tip_height`.
     #[instrument(skip(self))]
     pub fn prune_by_height(&mut self, finalized_tip_height: block::Height) {
-        // split_off returns the values _greater than or equal to_ the key. What
-        // we need is the keys that are less than or equal to
-        // `finalized_tip_height`. To get this we have split at
-        // `finalized_tip_height + 1` and swap the removed portion of the list
-        // with the remainder.
-        let split_height = finalized_tip_height + 1;
-        let split_height =
-            split_height.expect("height after finalized tip won't exceed max height");
-        let mut by_height = self.by_height.split_off(&split_height);
-        mem::swap(&mut self.by_height, &mut by_height);
+        let hashes: Vec<_> = self
+            .by_height
+            .range(..=finalized_tip_height)
+            .flat_map(|(_, hashes)| hashes.iter().copied())
+            .collect();
 
-        for hash in by_height.into_values().flatten() {
-            let (expired_block, expired_sender, admission, _) =
-                self.blocks.remove(&hash).expect("block is present");
-            let parent_hash = &expired_block.block.header.previous_block_hash;
+        for hash in hashes {
+            let (expired_block, expired_sender, admission, _) = self.remove(&hash);
 
             if let Some(admission) = admission {
                 admission.reject();
@@ -212,33 +312,6 @@ impl QueuedBlocks {
                 KnownBlock::Finalized,
             )
             .into()));
-
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
-            for outpoint in expired_block.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
-            }
-
-            let parent_list = self
-                .by_parent
-                .get_mut(parent_hash)
-                .expect("parent is present");
-
-            if parent_list.len() == 1 {
-                let removed = self
-                    .by_parent
-                    .remove(parent_hash)
-                    .expect("parent is present");
-                assert!(
-                    removed.contains(&hash),
-                    "hash must be present in parent hash list"
-                );
-            } else {
-                assert!(
-                    parent_list.remove(&hash),
-                    "hash must be present in parent hash list"
-                );
-            }
         }
 
         tracing::trace!(num_blocks = %self.blocks.len(), "Finished pruning blocks at or beneath the finalized tip height");
@@ -258,12 +331,9 @@ impl QueuedBlocks {
     ) -> QueuedSemanticallyVerified {
         let old = self
             .blocks
-            .insert(hash, new)
+            .remove(&hash)
             .expect("replacement hash exists in the queue");
-        let replacement = self
-            .blocks
-            .get_mut(&hash)
-            .expect("replacement was inserted under the same hash");
+        let mut replacement = new;
         assert_eq!(old.0.height, replacement.0.height);
         assert_eq!(
             old.0.block.header.previous_block_hash,
@@ -274,13 +344,10 @@ impl QueuedBlocks {
             replacement.0.receipt_order = old.0.receipt_order;
         }
 
-        for outpoint in old.0.new_outputs.keys() {
-            self.known_utxos.remove(outpoint);
-        }
-        for (outpoint, ordered_utxo) in &replacement.0.new_outputs {
-            self.known_utxos
-                .insert(*outpoint, ordered_utxo.utxo.clone());
-        }
+        self.release_outputs(&old.0);
+        self.retain_outputs(&replacement.0);
+        self.abandoned_since.remove(&hash);
+        self.blocks.insert(hash, replacement);
         old
     }
 
@@ -305,7 +372,9 @@ impl QueuedBlocks {
     /// Try to look up this UTXO in any queued block.
     #[instrument(level = "trace", skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
-        self.known_utxos.get(outpoint).cloned()
+        self.known_utxos
+            .get(outpoint)
+            .map(|shared| shared.utxo.clone())
     }
 
     /// Clears known_utxos, by_parent, and by_height, then drains blocks.
@@ -318,15 +387,16 @@ impl QueuedBlocks {
         self.by_parent.clear();
         self.by_parent.shrink_to_fit();
         self.by_height.clear();
+        self.abandoned_since.clear();
 
         self.blocks.drain()
     }
 }
 
 #[derive(Debug)]
-struct SharedSentUtxo {
+struct SharedUtxo {
     utxo: transparent::Utxo,
-    /// Number of distinct sent block hashes that contain this output.
+    /// Number of distinct block hashes that contain this output in this cache.
     owners: usize,
 }
 
@@ -344,7 +414,7 @@ pub(crate) struct SentHashes {
     pub sent: HashMap<block::Hash, Vec<transparent::OutPoint>>,
 
     /// Outputs retained until their last tracked block leaves the cache.
-    known_utxos: HashMap<transparent::OutPoint, SharedSentUtxo>,
+    known_utxos: HashMap<transparent::OutPoint, SharedUtxo>,
 
     /// Whether the hashes in this struct can be used check if the chain can be forked.
     /// This is set to false until all checkpoint-verified block hashes have been pruned.
@@ -415,7 +485,7 @@ impl SentHashes {
                             .expect("each owner occupies an allocated sent block entry");
                         shared.utxo = ordered_utxo.utxo.clone();
                     })
-                    .or_insert_with(|| SharedSentUtxo {
+                    .or_insert_with(|| SharedUtxo {
                         utxo: ordered_utxo.utxo.clone(),
                         owners: 1,
                     });
@@ -510,7 +580,7 @@ impl SentHashes {
     }
 
     fn release_outputs(
-        known_utxos: &mut HashMap<transparent::OutPoint, SharedSentUtxo>,
+        known_utxos: &mut HashMap<transparent::OutPoint, SharedUtxo>,
         outpoints: &[transparent::OutPoint],
     ) {
         for outpoint in outpoints {

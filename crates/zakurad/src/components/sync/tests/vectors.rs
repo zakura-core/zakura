@@ -3520,7 +3520,7 @@ fn setup_chain_sync_with_options(
     let (mock_chain_tip, mock_chain_tip_sender) = MockChainTip::new();
 
     let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
-    let (chain_sync, sync_status) = ChainSync::new(
+    let (mut chain_sync, sync_status) = ChainSync::new(
         &config,
         max_checkpoint_height,
         peer_set.clone(),
@@ -3530,6 +3530,8 @@ fn setup_chain_sync_with_options(
         misbehavior_tx,
     );
 
+    // These fixtures model usable parent context; discovery reads remain independently mocked.
+    chain_sync.downloads.state = available_parent_state();
     (
         chain_sync,
         sync_status,

@@ -159,6 +159,73 @@ async fn metadata_overflow_and_retry_limit_are_bounded() {
     assert!(!budget.is_deferred(&block(1).hash));
 }
 
+#[tokio::test(start_paused = true)]
+async fn failed_state_read_does_not_authorize_a_verification_wait() {
+    let budget = Budget::new("sync", 20);
+    let mut attempt = budget.attempt(block(1).hash);
+    let unavailable = service_fn(|_| futures::future::pending::<Result<zs::Response, BoxError>>());
+    assert!(attempt.admit(unavailable, block(1)).await.is_err());
+    assert!(budget.lock().charges.is_empty());
+    assert!(budget.is_deferred(&block(1).hash));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_waits_allow_a_real_connected_state_commit() {
+    use zakura_chain::{parameters::Network, serialization::ZcashDeserializeInto};
+    let _init_guard = zakura_test::init();
+    let (service, _, _, _) = zs::init(zs::Config::ephemeral(), &Network::Mainnet, Height(0), 0)
+        .await
+        .unwrap();
+    let state = tower::buffer::Buffer::new(tower::util::BoxService::new(service), 1);
+    let genesis: Arc<zakura_chain::block::Block> =
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+    let child: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .clone()
+        .oneshot(zs::Request::CommitCheckpointVerifiedBlock(genesis.into()))
+        .await
+        .unwrap();
+    let budget = Budget::new("sync", 20);
+    let mut waiting = Vec::new();
+    for byte in 0..15 {
+        let mut attempt = budget.attempt(block(byte).hash);
+        attempt.admit(state.clone(), block(byte)).await.unwrap();
+        waiting.push(attempt);
+    }
+    let mut connected = budget.attempt(child.hash());
+    connected
+        .admit(
+            state.clone(),
+            Deferred {
+                hash: child.hash(),
+                parent: child.header.previous_block_hash,
+                height: Height(1),
+                source: None,
+                parent_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    let committed = timeout(
+        Duration::from_secs(10),
+        state
+            .clone()
+            .oneshot(zs::Request::CommitSemanticallyVerifiedBlock(
+                child.clone().into(),
+            )),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(committed, zs::Response::Committed(hash) if hash == child.hash()));
+    assert_eq!(budget.lock().charges.len(), 15);
+    drop(waiting);
+}
+
 #[derive(Default)]
 struct Counters(Mutex<HashMap<String, Arc<AtomicU64>>>);
 

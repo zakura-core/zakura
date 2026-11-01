@@ -44,6 +44,49 @@ def sample(height: int, finalized: int = 100, vct_fast_blocks: int = 1,
 LOGS = {"errors": 0, "warns": 0, "panics": 0, "last_errors": []}
 
 
+class CapacityQualification(unittest.TestCase):
+    def observation(self, elapsed, *, active=0, saturation=0, deferred=0, peak=None):
+        metrics = {field: 0 for field in monitor.CAPACITY_FIELDS}
+        metrics.update(capacity=20, reserved=5, limit=15, active=active,
+                       headroom=15-active, peak=active if peak is None else peak,
+                       limit_reached_count=saturation, capacity_deferred_count=deferred)
+        return {"elapsed": elapsed, "peers": 2, "pid": "123", "missing_parent": {
+            "sync": metrics.copy(), "gossip": metrics.copy()}}
+
+    def test_quiet_run_reports_margin_without_claiming_it_was_exercised(self):
+        measured = monitor.summarize_capacity([self.observation(0), self.observation(1)], 1)
+        self.assertEqual(measured["sync"]["verdict"], "ok")
+        self.assertEqual(measured["sync"]["minimum_headroom"], 15)
+        self.assertEqual(measured["sync"]["events_since_process_start"]["admitted_count"], 0)
+
+    def test_event_counter_catches_a_spike_between_scrapes(self):
+        measured = monitor.summarize_capacity([
+            self.observation(0), self.observation(1, saturation=1, peak=15)], 1)
+        self.assertEqual(measured["sync"]["verdict"], "failed")
+        self.assertEqual(measured["sync"]["peak"], 15)
+
+    def test_near_limit_is_not_exhaustion(self):
+        measured = monitor.summarize_capacity([
+            self.observation(0, active=12), self.observation(1, active=14)], 1)
+        self.assertEqual(measured["sync"]["verdict"], "ok")
+        self.assertEqual(measured["sync"]["minimum_headroom"], 1)
+
+    def test_missing_samples_counter_resets_and_process_changes_fail(self):
+        for broken in (self.observation(5), {"elapsed": 1},
+                       dict(self.observation(1), pid="456")):
+            with self.subTest(broken=broken):
+                measured = monitor.summarize_capacity([self.observation(0), broken], 1)
+                self.assertEqual(measured["sync"]["verdict"], "failed")
+        measured = monitor.summarize_capacity([
+            self.observation(0, saturation=1), self.observation(1)], 1)
+        self.assertTrue(any("Counter reset" in issue for issue in measured["sync"]["failures"]))
+
+    def test_absent_metrics_do_not_mean_no_exhaustion(self):
+        measured = monitor.summarize_capacity([{"elapsed": 0}], 1)
+        self.assertEqual(measured["sync"]["verdict"], "incomplete")
+        self.assertIsNone(monitor.capacity_metrics("")["sync"]["limit_reached_count"])
+
+
 class StartupHeight(unittest.TestCase):
     def read(self, text: str):
         with tempfile.TemporaryDirectory() as out:

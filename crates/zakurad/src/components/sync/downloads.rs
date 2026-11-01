@@ -348,7 +348,7 @@ where
     /// A service that verifies downloaded blocks.
     verifier: ZV,
 
-    state: tower::util::BoxCloneSyncService<zs::Request, zs::Response, BoxError>,
+    pub(super) state: tower::util::BoxCloneSyncService<zs::Request, zs::Response, BoxError>,
 
     pub(super) parent_budget: ParentBudget,
 

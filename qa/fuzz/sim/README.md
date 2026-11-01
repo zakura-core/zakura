@@ -48,6 +48,12 @@ completed operations. It does not establish asynchronous cancellation races,
 decoded-body retention, or backend-worker retention. Run long campaigns manually
 or nightly; this target adds no blocking PR fuzz campaign.
 
+`block_reactor_policy` uses the same pipeline for the reactor's query and view
+policy, with reactor decoder 2 read from at most 512 causal bytes. Each record
+holds the input, the exact identity of each accepted or refused query, and the
+production and model views. The target establishes pure transitions. The real
+action channel, reply routes, and shutdown have witnesses in `zakura-network`.
+
 ## Semantic feedback
 
 A target with a collector, `sim_target!(Harness, collector)`, adds abstract

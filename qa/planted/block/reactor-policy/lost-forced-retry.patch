@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+@@ -689,7 +689,6 @@
+                 self.retry_forced = false;
+             }
+             ActionRefusal::ControlReserve | ActionRefusal::Full => {
+-                self.retry_forced |= proposal.query.forced;
+                 self.schedule_retry(now);
+             }
+         }

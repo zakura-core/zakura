@@ -33,3 +33,17 @@ path = "fuzz_targets/block_retry_authority.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_query"
+path = "fuzz_targets/block_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_reactor"
+path = "fuzz_targets/block_reactor.rs"
+test = false
+doc = false
+bench = false

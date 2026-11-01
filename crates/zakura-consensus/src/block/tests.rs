@@ -539,7 +539,11 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                 assert!(
                     verifier
                         .prepared_candidates
-                        .lookup(&candidate, &network)
+                        .lookup(
+                            &candidate,
+                            &super::body_digest::BodyDigest::of(&candidate),
+                            &network,
+                        )
                         .is_none(),
                     "{description}: rejected content must not enter the cache",
                 );
@@ -802,7 +806,11 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
     }
     assert!(verifier
         .prepared_candidates
-        .lookup(&candidate, &network)
+        .lookup(
+            &candidate,
+            &super::body_digest::BodyDigest::of(&candidate),
+            &network,
+        )
         .is_none());
 
     let mut tampered = (*resolved).clone();

@@ -411,3 +411,36 @@ fn event_metrics_capture_saturation_without_a_rejected_request() {
         0
     );
 }
+
+#[test]
+fn capacity_reduction_events_exclude_increases_while_over_limit() {
+    let recorder = Counters::default();
+    metrics::with_local_recorder(&recorder, || {
+        let budget = Budget::new("sync", 20);
+        {
+            let mut inner = budget.lock();
+            for id in 0..15 {
+                inner.charges.insert(
+                    id,
+                    Charge {
+                        parent: block(1).parent,
+                        since: Instant::now(),
+                    },
+                );
+            }
+            budget.publish(&mut inner, false);
+        }
+        budget.set_capacity(8);
+        budget.set_capacity(10);
+        budget.set_capacity(4);
+    });
+    let counters = recorder.0.lock().unwrap();
+    assert_eq!(
+        counters["sync.missing_parent.capacity_reduction_overage.count"].load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        counters["sync.missing_parent.limit_reached.count"].load(Ordering::Relaxed),
+        1
+    );
+}

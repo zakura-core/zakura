@@ -790,6 +790,8 @@ where
     // No Merkle root check: the hit's `CandidateId` covers the header's Merkle root and every
     // transaction byte, and the cached candidate passed `merkle_root_validity` before it was
     // cached, so the same root, transaction set and branch IDs are already checked.
+    // Preparation check:
+    // https://github.com/zakura-core/zakura/blob/107634e1793ff0c57ef8dd3a1969c29af9b5598c/crates/zakura-consensus/src/block.rs#L483
     metrics::histogram!("mining.solved_header_check.duration_seconds")
         .record(solved_header_start.elapsed().as_secs_f64());
 

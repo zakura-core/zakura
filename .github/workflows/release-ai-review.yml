@@ -49,6 +49,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Install release reviewer dependencies
+        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-review.txt
       - name: Resolve current release PR
         id: resolve
         env:
@@ -82,6 +84,8 @@ jobs:
         with:
           name: release-review-context-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/review-context
+      - name: Install release reviewer dependencies
+        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-review.txt
       - name: Review release Git objects with OpenAI
         if: needs.resolve.outputs.provider == 'openai'
         env:
@@ -140,6 +144,8 @@ jobs:
           pattern: release-review-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/review-report
           merge-multiple: true
+      - name: Install release reviewer dependencies
+        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-review.txt
       - name: Update the advisory PR summary if the head is still current
         env:
           GH_TOKEN: ${{ github.token }}

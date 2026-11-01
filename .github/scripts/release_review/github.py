@@ -10,8 +10,8 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .contracts import ReviewError
-from .repository import SHA
+from .contracts import PROVIDERS, ReviewError
+from .repository import SHA, base_environment
 
 COMMENT_MARKER = "<!-- zakura-release-ai-review -->"
 STATE_MARKER = re.compile(r"<!-- release-review-run: (.*?) -->")
@@ -95,7 +95,7 @@ def resolve_request(github: GitHub, event_name: str, event: dict) -> dict | None
     if not SHA.fullmatch(pr["head"]["sha"]):
         raise ReviewError("GitHub returned an invalid PR head")
     provider = inputs.get("provider", "openai")
-    if provider not in {"openai", "abliterated"}:
+    if provider not in PROVIDERS:
         raise ReviewError("unknown review provider")
     return {"repository": github.repository, "pr_number": number,
             "head_sha": pr["head"]["sha"], "pr_body": pr.get("body") or "",
@@ -111,8 +111,7 @@ def fetch_head(root: Path, context: dict) -> None:
     token = os.environ.get("GH_TOKEN", "")
     if not token:
         raise ReviewError("GitHub read token is unavailable")
-    env = {key: value for key, value in os.environ.items()
-           if key in {"PATH", "HOME", "SYSTEMROOT", "TMPDIR"}}
+    env = base_environment()
     authorization = base64.b64encode(("x-access-token:" + token).encode()).decode()
     env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="1",
                GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",

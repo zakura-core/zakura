@@ -211,7 +211,9 @@ impl From<Script> for zcash_transparent::address::Script {
 #[derive(Debug)]
 pub(crate) struct PrecomputedTxData {
     tx_data: zp_tx::TransactionData<PrecomputedAuth>,
-    txid_parts: TxDigests<blake2b_simd::Hash>,
+    /// The ZIP-244 digests that v5 and later signature hashes commit to. Earlier versions use
+    /// the ZIP-243 signature hash, which does not read them, so they are not computed.
+    txid_parts: Option<TxDigests<blake2b_simd::Hash>>,
     all_previous_outputs: Arc<Vec<transparent::Output>>,
 }
 
@@ -256,7 +258,12 @@ impl PrecomputedTxData {
     ) -> Result<PrecomputedTxData, Error> {
         let tx = tx.to_librustzcash(nu)?;
 
-        let txid_parts = tx.deref().digest(zp_tx::txid::TxIdDigester);
+        let txid_parts = match tx.version() {
+            zp_tx::TxVersion::Sprout(_) | zp_tx::TxVersion::V3 | zp_tx::TxVersion::V4 => None,
+            zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
+                Some(tx.deref().digest(zp_tx::txid::TxIdDigester))
+            }
+        };
 
         let f_transparent = MapTransparent {
             auth: TransparentAuth {
@@ -502,14 +509,20 @@ fn sighash_inner(
         None => zp_tx::sighash::SignableInput::Shielded,
     };
 
-    Ok(SigHash(
-        *zp_tx::sighash::signature_hash(
+    let sighash: [u8; 32] = match &precomputed_tx_data.txid_parts {
+        Some(txid_parts) => *zp_tx::sighash::signature_hash(
             &precomputed_tx_data.tx_data,
             &signable_input,
-            &precomputed_tx_data.txid_parts,
+            txid_parts,
         )
         .as_ref(),
-    ))
+        // `signature_hash` sends these versions to the same function, without the digests.
+        None => zp_tx::sighash_v4::v4_signature_hash(&precomputed_tx_data.tx_data, &signable_input)
+            .as_bytes()
+            .try_into()
+            .expect("ZIP-243 signature hashes are 32 bytes"),
+    };
+    Ok(SigHash(sighash))
 }
 
 /// Compute the authorizing data commitment of this transaction as specified in [ZIP-244].

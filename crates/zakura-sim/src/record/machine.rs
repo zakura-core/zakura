@@ -18,6 +18,10 @@ pub struct MachineScenario {
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a simulator record; boxing adds an allocation per recorded step for no saving"
+)]
 pub enum MachineStep {
     /// A fixture machine's operation. It tests machine-trace support itself, as
     /// [`crate::harness::fixtures`] tests the simulator. No production machine

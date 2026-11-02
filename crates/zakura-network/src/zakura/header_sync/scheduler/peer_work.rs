@@ -1278,4 +1278,33 @@ mod tests {
         assert!(queue.remove(&peer(1)).is_some());
         assert_eq!(queue.repair_episode(owner), None);
     }
+
+    /// An offer that an early check decides never reads its admission facts,
+    /// and a held-back offer never reads its subscription.
+    #[test]
+    fn an_offer_reads_admission_facts_only_when_earlier_checks_pass() {
+        let facts = |covered, work| OfferFacts {
+            pruned_pause: false,
+            covered,
+            eligible: true,
+            work,
+        };
+        let unread = || -> bool { panic!("an earlier check decides this offer") };
+        assert!(matches!(
+            decide_offer(facts(true, OfferedPeerWork::Idle), unread, unread),
+            OfferDecision::Spend { .. }
+        ));
+        assert_eq!(
+            decide_offer(facts(false, OfferedPeerWork::Other), unread, unread),
+            OfferDecision::AlreadyActive { spend: false }
+        );
+        assert_eq!(
+            decide_offer(facts(false, OfferedPeerWork::Idle), || true, unread),
+            OfferDecision::HeldBack
+        );
+        assert_eq!(
+            decide_offer(facts(false, OfferedPeerWork::Idle), || false, || true),
+            OfferDecision::Stage
+        );
+    }
 }

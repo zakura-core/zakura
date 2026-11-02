@@ -8,7 +8,7 @@
 //! publication races without a concurrent scheduler. `GetBlocks` encoding cannot
 //! fail for a valid range, so the encode stop has no case here.
 
-use std::time::Duration;
+use std::{num::NonZeroU64, time::Duration};
 
 use tokio::sync::mpsc;
 use zakura_chain::block;
@@ -253,6 +253,34 @@ async fn a_pass_that_published_keeps_its_retry_deadline() {
     assert_eq!(routine.io.requester.occupancy().len, 1);
     assert_eq!(routine.state.window.outstanding.len(), 1);
     assert!(fixture.outbound.try_recv().is_ok(), "the request was sent");
+}
+
+/// A floor take whose probed height another routine took first starts above
+/// the floor. The floor-only bypass slot refuses it, and the take returns its
+/// run. With an above-floor slot, the same take goes ahead.
+#[tokio::test]
+async fn a_raced_floor_probe_sends_no_above_floor_work_on_the_bypass_slot() {
+    let mut fixture = fixture(2, &[2, 3]);
+    let routine = &fixture.routine;
+    let now = Instant::now();
+    let mut limits = routine.state.fill_limits(&routine.config, now).unwrap();
+    let view = *routine.io.sequencer_view.borrow();
+    let snapshot = routine.io.admission_snapshot(&view);
+    let request_id = NonZeroU64::new(1).unwrap();
+    // The probe saw floor height 1, which another routine then took.
+    let stale_probe = Some(block::Height(1));
+
+    limits.floor_bypass_only = true;
+    let refused = routine.take_selected(&limits, request_id, snapshot, stale_probe);
+    assert_eq!(refused.err(), Some(FillStop::CwndSaturated));
+    fixture.assert_settled(0);
+
+    limits.floor_bypass_only = false;
+    let routine = &fixture.routine;
+    let taken = routine
+        .take_selected(&limits, request_id, snapshot, stale_probe)
+        .unwrap();
+    assert_eq!(taken.request.items()[0].0, block::Height(2));
 }
 
 /// Run one attempt's phases up to publication, let `interfere` change shared

@@ -18,12 +18,14 @@
 //! - no job starts while a terminal outcome waits or after the publisher
 //!   stops, and nothing at all happens after it stops;
 //! - a result of an abandoned or settled job changes nothing;
+//! - each storage reply means what the model's own table says, through state's
+//!   selection functions;
 //! - the owner holds exactly one slot per live subscription and unwritten
 //!   terminal outcome, and one capacity signal per distinct stalled wait.
 //!
-//! [`replay_header_publisher_bytes`] drives the same model from fuzz bytes, and
-//! [`trace_header_publisher_bytes`] records each operation's state read from
-//! the owner beside the state the model derived.
+//! [`trace_header_publisher_bytes`] drives the model from fuzz bytes and records
+//! each operation's state read from the owner beside the state the model
+//! derived.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -42,7 +44,6 @@ use crate::zakura::{
         reactor::{HeaderMachineFailure, HeaderMachinePhase},
         v9::{Cursor, Operation, RegtestMessage, MAX_HS_SUBSCRIPTIONS},
     },
-    regulation::Totals,
     wire_codec::decode_frame,
     Credit,
 };
@@ -198,7 +199,6 @@ impl ModelSub {
 struct ModelTerminal {
     id: u64,
     outcome: HeadersOutcomeCode,
-    abandons: Option<JobKey>,
 }
 
 /// An ended subscription's remains.
@@ -278,21 +278,6 @@ fn model_adjust(outcome: HeadersOutcomeCode, pages: bool, reached: bool) -> Head
     }
 }
 
-/// The publisher's facts the model compares across a stale result.
-fn observe(state: &PublisherState) -> Vec<(u64, Totals, Totals, Option<usize>)> {
-    (1..=IDS)
-        .filter_map(|id| {
-            let credit = state.publications.credit(&id)?;
-            Some((
-                id,
-                credit.granted(),
-                credit.consumed(),
-                state.publications.unacknowledged(&id),
-            ))
-        })
-        .collect()
-}
-
 /// Which update sequence a step sends.
 #[derive(Copy, Clone, Debug)]
 enum Sequence {
@@ -310,6 +295,138 @@ enum Answer {
     Retry,
     Extends,
     ReachedAtOpen,
+    /// A storage reply, which state's selection functions read.
+    Reply(Reply),
+}
+
+/// A storage reply to a job.
+#[derive(Copy, Clone, Debug)]
+enum Reply {
+    ProbeSelected,
+    ProbeNotSelected,
+    ProbeNotRetained,
+    Refused(LeaseRefused),
+    /// A lease from the header the job must extend.
+    Lease,
+    /// A lease from another header.
+    LeaseWrongParent,
+    /// A page with no record for its first header.
+    EmptyPage,
+    CheckExtends,
+    /// A check that finds another header at the last header's hash.
+    CheckElsewhere,
+    CheckNotSelected,
+}
+
+const REPLIES: [Reply; 13] = [
+    Reply::ProbeSelected,
+    Reply::ProbeNotSelected,
+    Reply::ProbeNotRetained,
+    Reply::Refused(LeaseRefused::NoLocatorIntersection),
+    Reply::Refused(LeaseRefused::TargetNotRetained),
+    Reply::Refused(LeaseRefused::HistoryPruned),
+    Reply::Refused(LeaseRefused::Busy),
+    Reply::Lease,
+    Reply::LeaseWrongParent,
+    Reply::EmptyPage,
+    Reply::CheckExtends,
+    Reply::CheckElsewhere,
+    Reply::CheckNotSelected,
+];
+
+/// Whether storage can send `reply` to `job`: only a first page probes, only a
+/// check without a page gets a check's reply, and only a page job leases.
+fn reply_applies(reply: Reply, job: &Job) -> bool {
+    match reply {
+        Reply::ProbeSelected | Reply::ProbeNotSelected | Reply::ProbeNotRetained => job.probe,
+        Reply::CheckExtends | Reply::CheckElsewhere | Reply::CheckNotSelected => job.count == 0,
+        _ => job.count > 0,
+    }
+}
+
+/// What state's selection functions make of `reply` to `record`'s job.
+fn selected_output(reply: Reply, record: &JobRecord) -> Option<Output> {
+    use SelectedChainMembership::{NotRetained, NotSelected, Selected};
+    let job = &record.job;
+    let other = frontier(2, 99);
+    let last = || job.parent.expect("a check's follower has a last header");
+    match reply {
+        Reply::ProbeSelected => on_probe(Selected(record.target)),
+        Reply::ProbeNotSelected => on_probe(NotSelected),
+        Reply::ProbeNotRetained => on_probe(NotRetained),
+        Reply::Refused(refused) => Some(on_lease_refused(refused, job.following)),
+        Reply::Lease | Reply::LeaseWrongParent => {
+            let ancestor = match (reply, job.parent) {
+                (Reply::LeaseWrongParent, Some(_)) => other,
+                (_, Some(parent)) => parent,
+                (_, None) if record.at_target => record.target,
+                (_, None) => record.start,
+            };
+            on_lease_acquired(job.parent, ancestor, record.target)
+        }
+        Reply::EmptyPage => Some(on_empty_page(job.following)),
+        Reply::CheckExtends => Some(on_following_check(
+            Selected(last()),
+            last(),
+            job.lease_target,
+        )),
+        Reply::CheckElsewhere => Some(on_following_check(
+            Selected(other),
+            last(),
+            job.lease_target,
+        )),
+        Reply::CheckNotSelected => Some(on_following_check(NotSelected, last(), job.lease_target)),
+    }
+}
+
+/// The model's own table of what `reply` to `record`'s job means. `None` means
+/// the job goes on, which the machine plays as a lost read.
+fn reply_meaning(reply: Reply, record: &JobRecord) -> Option<Answer> {
+    use HeadersOutcomeCode::*;
+    let following = record.job.following;
+    let parent = record.job.parent;
+    Some(match reply {
+        Reply::ProbeSelected => return None,
+        Reply::ProbeNotSelected => Answer::End(TargetNotSelected),
+        Reply::ProbeNotRetained => Answer::End(TargetNotRetained),
+        Reply::Refused(LeaseRefused::NoLocatorIntersection) if following => {
+            Answer::End(SubscriptionSuperseded)
+        }
+        Reply::Refused(LeaseRefused::NoLocatorIntersection) => Answer::End(NoLocatorIntersection),
+        Reply::Refused(LeaseRefused::TargetNotRetained) if following => Answer::Local,
+        Reply::Refused(LeaseRefused::TargetNotRetained) => Answer::End(TargetNotRetained),
+        Reply::Refused(LeaseRefused::HistoryPruned) => Answer::End(HistoryPruned),
+        Reply::Refused(LeaseRefused::Busy) => Answer::Local,
+        Reply::Lease | Reply::LeaseWrongParent if parent.is_none() && record.at_target => {
+            Answer::ReachedAtOpen
+        }
+        Reply::LeaseWrongParent if parent.is_some() => Answer::Local,
+        Reply::Lease | Reply::LeaseWrongParent => return None,
+        Reply::EmptyPage if following => Answer::Local,
+        Reply::EmptyPage => Answer::End(HistoryPruned),
+        Reply::CheckExtends => Answer::Extends,
+        Reply::CheckElsewhere | Reply::CheckNotSelected => Answer::End(SubscriptionSuperseded),
+    })
+}
+
+/// The output state hears for `answer` to `record`'s job. A capacity refusal
+/// needs the owner's wait, so its caller builds that output.
+fn answer_output(answer: Answer, record: &JobRecord) -> Output {
+    match answer {
+        Answer::End(code) => Output::End(code),
+        Answer::Local => Output::Stall(Stall::Local, "test"),
+        Answer::Extends => Output::Extends(record.job.lease_target),
+        Answer::ReachedAtOpen => Output::ReachedAtOpen(record.target),
+        Answer::Retry | Answer::Capacity | Answer::Reply(_) => Output::Retry,
+    }
+}
+
+/// `output` without its metric label, which only the runtime owner reads.
+fn unlabelled(output: Output) -> Output {
+    match output {
+        Output::Stall(stall, _) => Output::Stall(stall, ""),
+        output => output,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -371,7 +488,7 @@ struct Machine {
 impl Machine {
     fn new() -> Self {
         Self {
-            owner: PublisherOwner::new(PublisherState::new()),
+            owner: PublisherOwner::new(page_limits()),
             model: Model::default(),
             stale: Vec::new(),
             writing: None,
@@ -383,46 +500,6 @@ impl Machine {
         self.model.selected.map(Tip::snapshot)
     }
 
-    fn run(&mut self, step: &Step) {
-        // The task returns once the publisher stops, so no step follows.
-        if self.model.exit.is_some() {
-            return;
-        }
-        self.step(step);
-        self.check_owner();
-    }
-
-    /// The owner's credit totals match the model's until the publisher stops.
-    fn check_ledger(&self) {
-        if self.model.exit.is_some() {
-            return;
-        }
-        let expected: Vec<_> = self
-            .model
-            .subs
-            .iter()
-            .map(|(id, sub)| {
-                (
-                    *id,
-                    Totals {
-                        objects: sub.granted.objects,
-                        bytes: sub.granted.bytes,
-                    },
-                    Totals {
-                        objects: sub.consumed.objects,
-                        bytes: sub.consumed.bytes,
-                    },
-                    Some(sub.sent.len()),
-                )
-            })
-            .collect();
-        assert_eq!(
-            observe(&self.owner.state),
-            expected,
-            "{PROPERTY}: credit ledger"
-        );
-    }
-
     /// The state read from the production owner.
     fn actual_view(&self) -> HeaderPublisherView {
         let state = &self.owner.state;
@@ -430,20 +507,20 @@ impl Machine {
         HeaderPublisherView {
             subscriptions: (1..=IDS)
                 .filter_map(|id| {
-                    let credit = state.publications.credit(&id)?;
-                    let last = state.publications.last_sent(&id)?;
+                    let credit = state.publications().credit(&id)?;
+                    let last = state.publications().last_sent(&id)?;
                     Some(HeaderPublisherSubscriptionView {
                         id,
                         granted: (credit.granted().objects, credit.granted().bytes),
                         consumed: (credit.consumed().objects, credit.consumed().bytes),
-                        unacknowledged: state.publications.unacknowledged(&id)?,
+                        unacknowledged: state.publications().unacknowledged(&id)?,
                         last_height: last.height.0,
                         last_hash: last.hash,
-                        closing: state.publications.is_closing(&id),
+                        closing: state.publications().is_closing(&id),
                     })
                 })
                 .collect(),
-            tombstones: state.publications.tombstones(),
+            tombstones: state.publications().tombstones(),
             job: activity.job,
             terminals: activity.terminals,
             writing: activity.writing,
@@ -481,18 +558,27 @@ impl Machine {
         }
     }
 
-    /// The owner holds a resource only for what the model says is live.
-    fn check_owner(&mut self) {
+    /// The owner matches the model after every operation, in every field of the
+    /// view: credit, cursors, tombstones, the job, terminal outcomes, slots, and
+    /// the exit. A trace's failure reports any difference, so the simulator's
+    /// machine adapter sees it.
+    fn check(&mut self) {
+        assert_eq!(
+            self.actual_view(),
+            self.expected_view(),
+            "{PROPERTY}: the owner's view"
+        );
+        if let Some(record) = &self.model.in_progress {
+            assert!(
+                self.owner.state.is_current(record.job.key),
+                "{PROPERTY}: the job in progress keeps its exact key"
+            );
+        }
         if self.model.exit.is_some() {
             return;
         }
-        let model = &self.model;
-        assert_eq!(
-            self.owner.slots.held(),
-            model.subs.len() + model.held_terminals(),
-            "{PROPERTY}: one slot per live subscription and unwritten outcome"
-        );
-        let mut stalled: Vec<usize> = model
+        let mut stalled: Vec<usize> = self
+            .model
             .subs
             .values()
             .filter_map(|sub| match sub.stall {
@@ -606,11 +692,7 @@ impl Machine {
             } else {
                 Ok(Applied::Live)
             };
-        assert_eq!(
-            self.owner.apply(&update, page_limits()),
-            expected,
-            "{PROPERTY}"
-        );
+        assert_eq!(self.owner.apply(&update), expected, "{PROPERTY}");
         if expected.is_err() {
             return;
         }
@@ -743,11 +825,7 @@ impl Machine {
         } else {
             Err(SubscriptionFault::Unknown.into())
         };
-        assert_eq!(
-            self.owner.apply(&update, page_limits()),
-            expected,
-            "{PROPERTY}"
-        );
+        assert_eq!(self.owner.apply(&update), expected, "{PROPERTY}");
     }
 
     /// The job the model expects next, superseding followers on the way.
@@ -812,10 +890,7 @@ impl Machine {
         let busy = self.model.busy();
         let expected = self.expected_job();
         let selected = self.selected();
-        let job = self
-            .owner
-            .state
-            .next_job::<HB>(selected.as_ref(), page_limits());
+        let job = self.owner.state.next_job::<HB>(selected.as_ref());
         if busy {
             assert!(
                 job.is_none(),
@@ -878,20 +953,26 @@ impl Machine {
         let count = headers.min(job.count).min(end - parent.height.0);
         let last = frontier(branch, parent.height.0 + count);
         let bytes = fixed() + u64::from(count) * entry() - shave;
+        let reaches = reaches_target(job.following, last.hash, job.initial_target);
+        assert_eq!(
+            reaches,
+            !job.following && last == record.target,
+            "{PROPERTY}: whether the page reaches its target"
+        );
         let page = Page {
             parent,
             last,
             target,
             count,
-            reaches_target: !job.following && last == record.target,
+            reaches_target: reaches,
             payload_len: usize::try_from(bytes).expect("small page"),
         };
-        let before = observe(&self.owner.state);
+        let before = self.actual_view();
         let committed = self.owner.state.commit(job.key, &page);
         if is_stale {
             assert!(!committed, "{PROPERTY}: a stale page is never sent");
             assert_eq!(
-                observe(&self.owner.state),
+                self.actual_view(),
                 before,
                 "{PROPERTY}: a stale page spends nothing"
             );
@@ -931,18 +1012,6 @@ impl Machine {
         sub.last = Some(last);
         sub.following |= page.reaches_target;
         sub.checked_tip = None;
-        assert_eq!(
-            self.owner
-                .state
-                .publications
-                .credit(&job.id)
-                .map(|credit| credit.consumed()),
-            Some(Totals {
-                objects: sub.consumed.objects,
-                bytes: sub.consumed.bytes,
-            }),
-            "{PROPERTY}: state's consumed credit matches the model's"
-        );
     }
 
     fn finish(&mut self, answer: Answer, stale: Option<usize>) {
@@ -957,29 +1026,37 @@ impl Machine {
         let job = &record.job;
         let reachable = record.at_target && job.parent.is_none();
         let answer = match answer {
+            Answer::Reply(reply) if reply_applies(reply, job) => {
+                let meaning = reply_meaning(reply, &record);
+                assert_eq!(
+                    selected_output(reply, &record).map(unlabelled),
+                    meaning.map(|meaning| unlabelled(answer_output(meaning, &record))),
+                    "{PROPERTY}: what {reply:?} means for {job:?}"
+                );
+                meaning.unwrap_or(Answer::Retry)
+            }
+            Answer::Reply(_) => Answer::Retry,
+            answer => answer,
+        };
+        let answer = match answer {
             Answer::ReachedAtOpen if !reachable => Answer::Retry,
             Answer::Extends if job.count > 0 => Answer::Retry,
             answer => answer,
         };
-        let output = match answer {
-            Answer::End(code) => Output::End(code),
-            Answer::Local => Output::Stall(Stall::Local, "test"),
-            Answer::Capacity => {
-                let signal = ServingCapacitySignal::default();
-                let wait = self.owner.waits.register(signal.clone());
-                self.signals.push((wait, signal));
-                Output::Stall(Stall::Capacity(wait), "test")
-            }
-            Answer::Retry => Output::Retry("test"),
-            Answer::Extends => Output::Extends(job.lease_target),
-            Answer::ReachedAtOpen => Output::ReachedAtOpen(record.target),
+        let output = if let Answer::Capacity = answer {
+            let signal = ServingCapacitySignal::default();
+            let wait = self.owner.waits.register(signal.clone());
+            self.signals.push((wait, signal));
+            Output::Stall(Stall::Capacity(wait), "test")
+        } else {
+            answer_output(answer, &record)
         };
         let latest = self.selected();
-        let before = observe(&self.owner.state);
+        let before = self.actual_view();
         self.owner.state.finish(job.key, output, latest.as_ref());
         if is_stale {
             assert_eq!(
-                observe(&self.owner.state),
+                self.actual_view(),
                 before,
                 "{PROPERTY}: a stale result changes nothing"
             );
@@ -1045,11 +1122,13 @@ impl Machine {
                 "{PROPERTY}: {outcome:?} is legal for {sub:?}"
             );
             let abandoned = model.in_progress.take_if(|record| record.job.id == id);
-            model.queued.push_back(ModelTerminal {
-                id,
-                outcome,
-                abandons: abandoned.as_ref().map(|record| record.job.key),
-            });
+            if let Some(record) = &abandoned {
+                assert!(
+                    !self.owner.state.is_current(record.job.key),
+                    "{PROPERTY}: ending a subscription abandons its job"
+                );
+            }
+            model.queued.push_back(ModelTerminal { id, outcome });
             self.stale.extend(abandoned);
             model.tombstones.push_back(ModelTombstone {
                 id,
@@ -1078,13 +1157,13 @@ impl Machine {
             else {
                 panic!("a terminal frame is an outcome");
             };
-            (outcome.subscription_id, outcome.outcome, terminal.abandons)
+            (outcome.subscription_id, outcome.outcome)
         });
         assert_eq!(
             found,
             expected
                 .as_ref()
-                .map(|terminal| (terminal.id, terminal.outcome, terminal.abandons)),
+                .map(|terminal| (terminal.id, terminal.outcome)),
             "{PROPERTY}: the next terminal outcome, one at a time and in order"
         );
         if terminal.is_some() {
@@ -1148,10 +1227,7 @@ impl Machine {
         }
         let selected = self.selected();
         assert!(
-            self.owner
-                .state
-                .next_job::<HB>(selected.as_ref(), page_limits())
-                .is_none(),
+            self.owner.state.next_job::<HB>(selected.as_ref()).is_none(),
             "{PROPERTY}: no job starts after the publisher stops"
         );
         assert!(
@@ -1162,25 +1238,6 @@ impl Machine {
 }
 
 const PROPERTY: &str = "header/publisher-policy";
-
-/// Applicable operations in a decoder-v1 publisher history.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct HeaderPublisherReplaySummary {
-    /// Operations executed before publisher shutdown.
-    pub transitions: usize,
-    /// New jobs issued.
-    pub jobs: usize,
-    /// Pages that consumed credit.
-    pub pages: usize,
-    /// Header credit consumed by those pages.
-    pub headers: u64,
-    /// Byte credit consumed by those pages.
-    pub bytes: u64,
-    /// Results delivered for an abandoned or settled job.
-    pub stale_results: usize,
-    /// Successful writes of a pending terminal outcome.
-    pub terminals: usize,
-}
 
 /// One subscription in a [`HeaderPublisherView`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1220,7 +1277,7 @@ pub struct HeaderPublisherView {
     pub exit: Option<&'static str>,
 }
 
-/// One decoder-v1 publisher operation.
+/// One decoder-v2 publisher operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderPublisherStep {
     /// The operation's number, from one.
@@ -1235,7 +1292,7 @@ pub struct HeaderPublisherStep {
     pub failure: Option<HeaderMachineFailure>,
 }
 
-/// A decoder-v1 publisher history. It stops at the first failure or when the
+/// A decoder-v2 publisher history. It stops at the first failure or when the
 /// publisher stops.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderPublisherHistory {
@@ -1251,7 +1308,7 @@ fn exit_name(exit: Exit) -> &'static str {
     }
 }
 
-/// Capture decoder-v1 operations without changing the decoder or starting a
+/// Capture decoder-v2 operations without changing the decoder or starting a
 /// runtime. Driver panics stop the history and stay distinct from property
 /// failures.
 pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
@@ -1264,11 +1321,8 @@ pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.step(&step)))
                 .map_err(|payload| (HeaderMachinePhase::Transition, payload))
                 .and_then(|()| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        machine.check_owner();
-                        machine.check_ledger();
-                    }))
-                    .map_err(|payload| (HeaderMachinePhase::Invariant, payload))
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.check()))
+                        .map_err(|payload| (HeaderMachinePhase::Invariant, payload))
                 });
         let failure = applied.err().map(|(phase, payload)| {
             HeaderMachineFailure::of_panic(PROPERTY, phase, payload.as_ref())
@@ -1288,12 +1342,9 @@ pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
     HeaderPublisherHistory { steps }
 }
 
-/// Replay decoder-v1 quadruples against the existing publisher model.
-/// Read at most 512 bytes. The model derives page sizes from the wire layout.
-pub fn replay_header_publisher_bytes(data: &[u8]) -> HeaderPublisherReplaySummary {
-    run(decode(data), |_, _| {})
-}
-
+/// Decoder v2, the simulator's generator 2 for this machine. Version 1 read every
+/// `Finish` as an [`Answer`] from its second byte. Version 2 reads a `Finish` with an
+/// odd third byte as a [`Reply`], so bytes saved under version 1 can change meaning.
 fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
     data[..data.len().min(512)].chunks(4).map(|chunk| {
         let a = chunk[0];
@@ -1333,6 +1384,10 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
                 shave: u64::from(c % 3),
                 stale,
             },
+            20..=22 if c & 1 == 1 => Step::Finish {
+                answer: Answer::Reply(REPLIES[usize::from(b) % REPLIES.len()]),
+                stale,
+            },
             20..=22 => Step::Finish {
                 answer: match b % 10 {
                     0 => Answer::End(HeadersOutcomeCode::TargetNotRetained),
@@ -1360,58 +1415,4 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
             _ => Step::Closed,
         }
     })
-}
-
-fn run(
-    steps: impl IntoIterator<Item = Step>,
-    mut after_step: impl FnMut(&mut Machine, &Step),
-) -> HeaderPublisherReplaySummary {
-    let mut machine = Machine::new();
-    let mut summary = HeaderPublisherReplaySummary::default();
-    for step in steps {
-        if machine.model.exit.is_some() {
-            break;
-        }
-        summary.transitions += 1;
-        let was_idle = machine.model.in_progress.is_none();
-        let consumed = || {
-            machine
-                .model
-                .subs
-                .values()
-                .fold((0u64, 0u64), |(objects, bytes), sub| {
-                    (objects + sub.consumed.objects, bytes + sub.consumed.bytes)
-                })
-        };
-        let before = consumed();
-        match &step {
-            Step::Page { stale, .. } | Step::Finish { stale, .. } => {
-                summary.stale_results +=
-                    usize::from(machine.answering(*stale).is_some_and(|(_, stale)| stale));
-            }
-            Step::TerminalWritten(true) => {
-                summary.terminals += usize::from(machine.writing.is_some())
-            }
-            _ => {}
-        }
-        machine.run(&step);
-        if matches!(step, Step::NextJob) && was_idle && machine.model.in_progress.is_some() {
-            summary.jobs += 1;
-        }
-        if matches!(step, Step::Page { .. }) {
-            let after = machine
-                .model
-                .subs
-                .values()
-                .fold((0u64, 0u64), |(objects, bytes), sub| {
-                    (objects + sub.consumed.objects, bytes + sub.consumed.bytes)
-                });
-            summary.pages += usize::from(after.0 > before.0);
-            summary.headers += after.0.saturating_sub(before.0);
-            summary.bytes += after.1.saturating_sub(before.1);
-        }
-        after_step(&mut machine, &step);
-        machine.check_ledger();
-    }
-    summary
 }

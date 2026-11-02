@@ -21,7 +21,7 @@ recovery_rows = { decoder = 1, unregistered = "a panic in the recovery replay is
 libfuzzer-sys = "0.4"
 zakura-chain = { path = "../../../crates/zakura-chain" }
 zakura-header-chain = { path = "../../../crates/zakura-header-chain", features = ["fuzz-impl"] }
-zakura-network = { path = "../../../crates/zakura-network", features = ["header-fuzz", "p2p-fuzz"] }
+zakura-network = { path = "../../../crates/zakura-network", features = ["header-fuzz"] }
 zakura-state = { path = "../../../crates/zakura-state", features = ["header-fuzz"] }
 
 [[bin]]
@@ -41,13 +41,6 @@ bench = false
 [[bin]]
 name = "header_pursuit"
 path = "fuzz_targets/header_pursuit.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "header_publisher"
-path = "fuzz_targets/header_publisher.rs"
 test = false
 doc = false
 bench = false

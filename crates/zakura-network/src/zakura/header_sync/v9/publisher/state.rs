@@ -29,11 +29,12 @@ use std::{
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
+use zakura_node_services::header_chain::SelectedChainMembership;
 
 use super::{
     super::{
         entry_bytes, Cursor, HeadersOutcomeCode, Operation, SubscribeHeaders,
-        HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
+        HEADERS_RESPONSE_FIXED_BYTES,
     },
     PageLimits, PublisherFault,
 };
@@ -181,7 +182,7 @@ pub(super) enum Output {
     End(HeadersOutcomeCode),
     Stall(Stall, &'static str),
     /// The page left the selected chain while in progress. Read again.
-    Retry(&'static str),
+    Retry,
     /// A check without page credit found this selected tip extending the
     /// last header sent.
     Extends(block::Hash),
@@ -196,10 +197,6 @@ pub(super) struct Terminal {
     /// The ended subscription's slot, which holds this outcome's reserved
     /// output.
     pub(super) slot: SlotId,
-    /// The job in progress for this subscription, which state abandoned.
-    /// Drop its page when this outcome is written; a running job keeps its
-    /// permit until storage answers.
-    pub(super) abandons: Option<JobKey>,
 }
 
 /// Why the publisher task stops.
@@ -241,7 +238,9 @@ pub(super) struct Activity {
 /// and the publisher task.
 #[derive(Debug)]
 pub(super) struct PublisherState {
-    pub(super) publications: PublicationLedger<u64, Cursor>,
+    /// The serving limits this node advertises, constant for the session.
+    limits: PageLimits,
+    publications: PublicationLedger<u64, Cursor>,
     /// Live and closing subscriptions, in the same set as `publications`.
     subscriptions: BTreeMap<u64, Subscription>,
     /// The subscription served last, so two subscriptions take turns.
@@ -258,12 +257,12 @@ pub(super) struct PublisherState {
 }
 
 impl PublisherState {
-    /// A publisher with no subscription.
-    pub(super) fn new() -> Self {
-        let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
-            .expect("SUBSCRIBE_HEADERS is a subscription row");
+    /// A publisher with no subscription, under its advertised `limits` and its
+    /// subscription row's `subscription_limits`.
+    pub(super) fn new(limits: PageLimits, subscription_limits: SubscriptionLimits) -> Self {
         Self {
-            publications: PublicationLedger::new(limits),
+            limits,
+            publications: PublicationLedger::new(subscription_limits),
             subscriptions: BTreeMap::new(),
             last_served: None,
             in_progress: None,
@@ -279,12 +278,11 @@ impl PublisherState {
     pub(super) fn open(
         &mut self,
         update: &SubscribeHeaders,
-        limits: PageLimits,
         offer: SlotOffer,
     ) -> Result<PublicationOpened, PublisherFault> {
         let id = update.subscription_id;
         let schema = update.tree_aux_schema;
-        if (limits.aux_schema_mask & schema.mask_bit()) != schema.mask_bit() {
+        if (self.limits.aux_schema_mask & schema.mask_bit()) != schema.mask_bit() {
             return Err(PublisherFault::UnadvertisedSchema);
         }
         let opened = self.publications.open(
@@ -376,16 +374,12 @@ impl PublisherState {
                     "the publisher queued {outcome:?} outside its window"
                 );
                 let slot = self.publications.end(&id)?;
-                let abandons = self
-                    .in_progress
-                    .take_if(|job| job.subscription == id)
-                    .map(|job| job.key);
+                self.in_progress.take_if(|job| job.subscription == id);
                 self.terminals.push_back(Terminal {
                     id,
                     target: subscription.fixed.target,
                     outcome,
                     slot,
-                    abandons,
                 });
                 Some((id, outcome))
             })
@@ -472,7 +466,6 @@ impl PublisherState {
     pub(super) fn next_job<const HEADER_BYTES: usize>(
         &mut self,
         selected: Option<&EngineSnapshot>,
-        limits: PageLimits,
     ) -> Option<Job> {
         if self.in_progress.is_some()
             || self.writing.is_some()
@@ -511,7 +504,7 @@ impl PublisherState {
                 }
             }
             let schema = subscription.fixed.schema;
-            let count = page_room(unspent, schema, limits, HEADER_BYTES);
+            let count = page_room(unspent, schema, self.limits, HEADER_BYTES);
             if subscription.stall.is_some() {
                 continue;
             }
@@ -584,6 +577,12 @@ impl PublisherState {
         None
     }
 
+    /// Whether job `key` is the job in progress. After [`Self::end_due`], a job
+    /// that is not has been abandoned, and its page is never sent.
+    pub(super) fn is_current(&self, key: JobKey) -> bool {
+        self.in_progress.as_ref().is_some_and(|job| job.key == key)
+    }
+
     /// Take the job in progress if it is `key`.
     fn settle(&mut self, key: JobKey) -> Option<InProgress> {
         self.in_progress.take_if(|job| job.key == key)
@@ -618,7 +617,7 @@ impl PublisherState {
                     subscription.checked_tip = Some(tip);
                 }
             }
-            Output::Retry(_) => {}
+            Output::Retry => {}
             Output::Stall(stall, _) => {
                 if moved {
                     return;
@@ -704,6 +703,19 @@ impl PublisherState {
         }
     }
 
+    /// The credit, cursors, and tombstones of each subscription, to read.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn publications(&self) -> &PublicationLedger<u64, Cursor> {
+        &self.publications
+    }
+
+    /// End `id` in the ledger alone, which plants lost credit for the model's
+    /// `publisher_witness_rejects_lost_credit`.
+    #[cfg(test)]
+    pub(super) fn lose_publication(&mut self, id: u64) {
+        self.publications.end(&id);
+    }
+
     /// What state is doing now.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn activity(&self) -> Activity {
@@ -749,6 +761,99 @@ pub(super) fn recheck(
         return Recheck::Drop;
     }
     Recheck::Query
+}
+
+/// Why storage refused a job's lease, other than for capacity. A capacity
+/// refusal carries a signal, which only the runtime owner holds.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LeaseRefused {
+    NoLocatorIntersection,
+    TargetNotRetained,
+    HistoryPruned,
+    Busy,
+}
+
+/// What a first page's check of its initial target means: an outcome, or `None`
+/// if the selected chain contains the target and the job goes on.
+pub(super) fn on_probe(reply: SelectedChainMembership) -> Option<Output> {
+    match reply {
+        SelectedChainMembership::Selected(_) => None,
+        SelectedChainMembership::NotSelected => {
+            Some(Output::End(HeadersOutcomeCode::TargetNotSelected))
+        }
+        SelectedChainMembership::NotRetained => {
+            Some(Output::End(HeadersOutcomeCode::TargetNotRetained))
+        }
+    }
+}
+
+/// What a check without a page means, for a follower whose last header sent is
+/// `last`, under the selected tip `tip`. The tip is above `last`, so the chain
+/// extends `last` exactly when it contains it.
+pub(super) fn on_following_check(
+    reply: SelectedChainMembership,
+    last: Frontier,
+    tip: block::Hash,
+) -> Output {
+    match reply {
+        SelectedChainMembership::Selected(found) if found == last => Output::Extends(tip),
+        _ => Output::End(HeadersOutcomeCode::SubscriptionSuperseded),
+    }
+}
+
+/// What a refused lease means. A follower's selected chain no longer extends its
+/// last header when no locator intersects. A follower's target that is not
+/// retained is a stale selected tip, which the next selected-chain change
+/// retries.
+pub(super) fn on_lease_refused(refused: LeaseRefused, following: bool) -> Output {
+    match refused {
+        LeaseRefused::NoLocatorIntersection if following => {
+            Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
+        }
+        LeaseRefused::NoLocatorIntersection => {
+            Output::End(HeadersOutcomeCode::NoLocatorIntersection)
+        }
+        LeaseRefused::TargetNotRetained if following => Output::Stall(Stall::Local, "selected_tip"),
+        LeaseRefused::TargetNotRetained => Output::End(HeadersOutcomeCode::TargetNotRetained),
+        LeaseRefused::HistoryPruned => Output::End(HeadersOutcomeCode::HistoryPruned),
+        LeaseRefused::Busy => Output::Stall(Stall::Local, "acquire"),
+    }
+}
+
+/// What an acquired lease from `ancestor` to `target` means for a job that must
+/// extend `parent`: a result, or `None` if the job goes on to read a page.
+pub(super) fn on_lease_acquired(
+    parent: Option<Frontier>,
+    ancestor: Frontier,
+    target: Frontier,
+) -> Option<Output> {
+    match parent {
+        None if ancestor == target => Some(Output::ReachedAtOpen(target)),
+        Some(parent) if parent != ancestor => Some(Output::Stall(Stall::Local, "lease_parent")),
+        _ => None,
+    }
+}
+
+/// What a schema-1 page with no record for its first header means. A pruned node
+/// never gains records below its index height, so waiting would stall a
+/// subscriber on the path forever, and it ends with `HistoryPruned`. A follower
+/// waits instead, because `HistoryPruned` is past its window.
+pub(super) fn on_empty_page(following: bool) -> Output {
+    if following {
+        Output::Stall(Stall::Local, "aux_unavailable")
+    } else {
+        Output::End(HeadersOutcomeCode::HistoryPruned)
+    }
+}
+
+/// Whether a page ending at `last` reaches a subscription's `initial_target`.
+/// A follower reached it already.
+pub(super) fn reaches_target(
+    following: bool,
+    last: block::Hash,
+    initial_target: block::Hash,
+) -> bool {
+    !following && last == initial_target
 }
 
 /// Whether `outcome` is legal for a subscription that has or has not sent a

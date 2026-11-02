@@ -16,10 +16,9 @@ use crate::{run_command, BoxError};
 
 /// The nightly toolchain cargo-fuzz builds with.
 pub(super) const PINNED_NIGHTLY: &str = "nightly-2026-07-15";
-const TARGETS: [&str; 5] = [
+const TARGETS: [&str; 4] = [
     "fork_transitions",
     "header_codec_v9",
-    "header_publisher",
     "header_pursuit",
     "recovery_rows",
 ];
@@ -134,7 +133,6 @@ fn sha256(bytes: &[u8]) -> String {
 fn render_regression(target: &str, bytes: &[u8]) -> Result<String, BoxError> {
     let replay = match target {
         "fork_transitions" => "zakura_header_chain::replay_fork_transition_bytes",
-        "header_publisher" => "zakura_network::zakura::replay_header_publisher_bytes",
         "header_pursuit" => "zakura_network::zakura::replay_header_pursuit_bytes",
         "recovery_rows" => "zakura_state::replay_recovery_rows_bytes",
         "header_codec_v9" => "zakura_network::zakura::replay_header_sync_v9_codec_bytes",
@@ -157,7 +155,7 @@ fn render_regression(target: &str, bytes: &[u8]) -> Result<String, BoxError> {
 
 fn render_operations(target: &str, bytes: &[u8]) -> String {
     let width = match target {
-        "header_publisher" | "header_pursuit" | "recovery_rows" => 4,
+        "header_pursuit" | "recovery_rows" => 4,
         "fork_transitions" => 1,
         _ => return String::new(),
     };

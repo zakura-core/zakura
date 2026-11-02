@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use zakura_header_chain::{EngineSnapshot, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
+use zakura_header_chain::{EngineSnapshot, Frontier, HeaderSyncWorkOwner, SourceId};
 use zakura_rt::{
     collections::HashMap,
     sync::{
@@ -17,19 +17,20 @@ use zakura_rt::{
 
 mod policy;
 
+pub(in crate::zakura::header_sync) use policy::{
+    decide_offer, page_next, repair_page, OfferDecision, OfferFacts, OfferedPeerWork, PageFacts,
+    PageNext, PeerWorkPriority, QueueWorkResult, RepairPage, SpentOffer, StorageCall, WorkCall,
+    HEADER_CHUNK_BUDGET_CAPACITY_V1, MAX_HEADER_CHUNK_RESERVATION_V1,
+};
 pub use policy::{
     ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase, HeaderTargetPurpose,
     HeaderWorkEnd, StorageCallKind, WorkIncarnation,
 };
 use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
-pub(in crate::zakura::header_sync) use policy::{
-    PeerWorkPriority, QueueWorkResult, StorageCall, WorkCall, HEADER_CHUNK_BUDGET_CAPACITY_V1,
-    MAX_HEADER_CHUNK_RESERVATION_V1,
-};
 
 #[cfg(any(test, zakura_sim))]
 use super::super::observe::{ObserverSlot, ReactorEvent};
-use super::super::ZakuraPeerId;
+use super::super::{events::HeaderPortOperation, v9::Cursor, HeaderEntry, ZakuraPeerId};
 
 #[derive(Debug)]
 struct HeaderChunkBudgetInner {
@@ -90,20 +91,14 @@ impl HeaderChunkBudget {
         }))
     }
 
-    fn release_reserved(&self, count: usize) {
+    /// Return `count` headers through `released`, and wake waiters when any return.
+    fn release(
+        &self,
+        count: usize,
+        released: impl FnOnce(HeaderChunkUsage, usize) -> HeaderChunkUsage,
+    ) {
         let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
-        *usage = usage.release_reserved(count);
-        self.publish(*usage);
-        if count != 0 {
-            self.0
-                .released
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
-        }
-    }
-
-    fn release_owned(&self, count: usize) {
-        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
-        *usage = usage.release_owned(count);
+        *usage = released(*usage, count);
         self.publish(*usage);
         if count != 0 {
             self.0
@@ -158,7 +153,8 @@ impl Drop for HeaderCountReservationInner {
     fn drop(&mut self) {
         let remaining = self.remaining.swap(0, AtomicOrdering::SeqCst);
         if remaining != 0 {
-            self.budget.release_reserved(remaining);
+            self.budget
+                .release(remaining, HeaderChunkUsage::release_reserved);
         }
     }
 }
@@ -182,7 +178,8 @@ impl Eq for HeaderCapacityLease {}
 
 impl Drop for HeaderCapacityLeaseInner {
     fn drop(&mut self) {
-        self.budget.release_owned(self.count);
+        self.budget
+            .release(self.count, HeaderChunkUsage::release_owned);
     }
 }
 
@@ -194,10 +191,13 @@ impl Drop for HeaderCapacityLeaseInner {
 /// the two. Dropping this value ends the call's ownership once.
 #[derive(Debug)]
 pub(in crate::zakura::header_sync) struct RetainedHeaders {
+    #[cfg(any(test, zakura_sim))]
     peer: ZakuraPeerId,
     incarnation: WorkIncarnation,
-    /// The call that holds the headers, once one does.
-    call: Option<StorageCall>,
+    /// The call that holds the headers.
+    call: StorageCall,
+    /// The capacity these headers hold until this value drops.
+    #[cfg_attr(not(any(test, zakura_sim)), allow(dead_code))]
     leases: Vec<HeaderCapacityLease>,
     end: HeaderWorkEnd,
     #[cfg(any(test, zakura_sim))]
@@ -206,19 +206,21 @@ pub(in crate::zakura::header_sync) struct RetainedHeaders {
 
 impl RetainedHeaders {
     /// The peer whose work these headers belong to.
+    #[cfg(test)]
     pub(in crate::zakura::header_sync) fn peer(&self) -> &ZakuraPeerId {
         &self.peer
     }
 
-    /// The round and call holding these headers, once a call does.
-    pub(in crate::zakura::header_sync) fn work(&self) -> Option<WorkCall> {
-        self.call.map(|call| WorkCall {
+    /// The round and call holding these headers.
+    pub(in crate::zakura::header_sync) fn work(&self) -> WorkCall {
+        WorkCall {
             incarnation: self.incarnation,
-            call,
-        })
+            call: self.call,
+        }
     }
 
     /// The number of headers retained.
+    #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::header_sync) fn headers(&self) -> usize {
         self.leases
             .iter()
@@ -226,10 +228,11 @@ impl RetainedHeaders {
             .fold(0usize, usize::saturating_add)
     }
 
-    /// Report this ownership's events to `observer`.
+    /// Report this ownership's events to `observer`, starting with its hold.
     #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::header_sync) fn observed_by(&mut self, observer: &ObserverSlot) {
         self.observer = observer.clone();
+        self.report_held();
     }
 
     /// Record how this ownership will end when it drops.
@@ -237,24 +240,29 @@ impl RetainedHeaders {
         self.end = end;
     }
 
-    /// Move these headers to `call`. A call that already holds them is a prepare,
-    /// and `call` is its apply.
-    pub(in crate::zakura::header_sync) fn enter_call(&mut self, call: StorageCall) {
-        if let Some(previous) = self.call {
-            debug_assert!(
-                previous.kind == StorageCallKind::Prepare && call.kind == StorageCallKind::Apply,
-                "retained headers move only from a prepare to its apply"
-            );
-            self.end = HeaderWorkEnd::HandedToApply { apply: call.number };
-            self.record_end();
-        }
-        self.call = Some(call);
+    /// Move these headers from their prepare to its `apply`, with no release between.
+    pub(in crate::zakura::header_sync) fn hand_to_apply(&mut self, apply: StorageCall) {
+        debug_assert!(
+            self.call.kind == StorageCallKind::Prepare && apply.kind == StorageCallKind::Apply,
+            "retained headers move only from a prepare to its apply"
+        );
+        self.end = HeaderWorkEnd::HandedToApply {
+            apply: apply.number,
+        };
+        self.record_end();
+        self.call = apply;
         self.end = HeaderWorkEnd::Dropped;
         #[cfg(any(test, zakura_sim))]
+        self.report_held();
+    }
+
+    /// Report that this ownership's call holds its headers.
+    #[cfg(any(test, zakura_sim))]
+    fn report_held(&self) {
         if let Some(observer) = &self.observer.0 {
             observer.observe(ReactorEvent::HeadersHeld {
-                call: call.number,
-                kind: call.kind,
+                call: self.call.number,
+                kind: self.call.kind,
                 peer: self.peer.clone(),
                 incarnation: self.incarnation.get(),
                 headers: self.headers(),
@@ -262,28 +270,20 @@ impl RetainedHeaders {
         }
     }
 
-    /// Count this ownership's end and report it before any lease can release.
+    /// Report this ownership's end before any lease can release.
     fn record_end(&self) {
-        let Some(call) = self.call else {
-            return;
-        };
-        metrics::counter!("sync.header.work.retained_end", "end" => self.end.label()).increment(1);
-        metrics::counter!("sync.header.work.retained_end_headers", "end" => self.end.label())
-            .increment(u64::try_from(self.headers()).unwrap_or(u64::MAX));
         #[cfg(any(test, zakura_sim))]
         if let Some(observer) = &self.observer.0 {
             // An unwinding reactor reports nothing, as `HeaderSyncObserver` says.
             if !std::thread::panicking() {
                 observer.observe(ReactorEvent::HeadersEnded {
-                    call: call.number,
+                    call: self.call.number,
                     incarnation: self.incarnation.get(),
                     headers: self.headers(),
                     end: self.end,
                 });
             }
         }
-        #[cfg(not(any(test, zakura_sim)))]
-        let _ = call;
     }
 }
 
@@ -302,39 +302,19 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
 }
 
-impl PeerWorkQueue {
-    /// Changes to target ownership or awaiting/active state invalidate cached offers.
-    /// The reactor separately tracks effective virtual claims using negotiated limits.
-    pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
-        self.policy.scheduling_revision()
-    }
+/// Reads see the value-only policy. Every mutation goes through the queue, which
+/// pairs it with its capacity effect.
+impl std::ops::Deref for PeerWorkQueue {
+    type Target = WorkPolicy;
 
+    fn deref(&self) -> &WorkPolicy {
+        &self.policy
+    }
+}
+
+impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn capacity_releases(&self) -> watch::Receiver<u64> {
         self.budget.0.released.subscribe()
-    }
-
-    pub(in crate::zakura::header_sync) fn len(&self) -> usize {
-        self.policy.len()
-    }
-
-    /// Whether `peer` holds unstarted or active work.
-    pub(in crate::zakura::header_sync) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
-        self.policy.has_work(peer)
-    }
-
-    /// Whether any peer's unstarted or active work pursues `target_tip_hash`.
-    pub(in crate::zakura::header_sync) fn is_target_assigned(
-        &self,
-        target_tip_hash: zakura_chain::block::Hash,
-    ) -> bool {
-        self.policy.is_target_assigned(target_tip_hash)
-    }
-
-    /// Return every peer's target that still waits for its locator.
-    pub(in crate::zakura::header_sync) fn awaiting_targets(
-        &self,
-    ) -> impl Iterator<Item = (&ZakuraPeerId, &AdvertisedHeaderTarget)> {
-        self.policy.awaiting_targets()
     }
 
     /// Retire locator work captured from an obsolete committed snapshot.
@@ -412,25 +392,6 @@ impl PeerWorkQueue {
         self.apply_stage(decision)
     }
 
-    /// Return the peer's current unstarted target, if any.
-    pub(in crate::zakura::header_sync) fn awaiting_target(
-        &self,
-        peer: &ZakuraPeerId,
-    ) -> Option<&AdvertisedHeaderTarget> {
-        self.policy.awaiting_target(peer)
-    }
-
-    pub(in crate::zakura::header_sync) fn awaiting(
-        &self,
-        peer: &ZakuraPeerId,
-        session_id: u64,
-        target_tip_hash: zakura_chain::block::Hash,
-        scope: HeaderWorkAuthority,
-    ) -> Option<&AdvertisedHeaderTarget> {
-        self.policy
-            .awaiting(peer, session_id, target_tip_hash, scope)
-    }
-
     pub(in crate::zakura::header_sync) fn start(&mut self, request: ActiveHeaderRequest) -> bool {
         let reserved = self.request_reservations.contains_key(&request.peer);
         self.policy.start(request, reserved)
@@ -454,14 +415,6 @@ impl PeerWorkQueue {
         }
         self.policy.bind_repair_episode(owner, episode);
         true
-    }
-
-    /// Return the durable evidence episode bound to one active repair request.
-    pub(in crate::zakura::header_sync) fn repair_episode(
-        &self,
-        owner: HeaderSyncWorkOwner,
-    ) -> Option<zakura_header_chain::AuxiliaryRequirementEpisode> {
-        self.policy.repair_episode(owner)
     }
 
     #[cfg(test)]
@@ -490,32 +443,62 @@ impl PeerWorkQueue {
         self.remove(&peer)
     }
 
-    /// Return the active target carrying one exact durable owner.
-    pub(in crate::zakura::header_sync) fn active_owner(
-        &self,
-        owner: HeaderSyncWorkOwner,
-    ) -> Option<&ActiveHeaderRequest> {
-        self.policy.active_owner(owner)
-    }
-
     pub(in crate::zakura::header_sync) fn remove_unstarted(&mut self, peer: &ZakuraPeerId) {
         if self.policy.remove_unstarted(peer) {
             self.release_capacity(peer);
         }
     }
 
-    pub(in crate::zakura::header_sync) fn active(
-        &self,
-        peer: &ZakuraPeerId,
-    ) -> Option<&ActiveHeaderRequest> {
-        self.policy.active(peer)
-    }
-
+    /// Mutable access for tests and models that seed a request's fields directly.
+    #[cfg(any(test, feature = "header-fuzz"))]
     pub(in crate::zakura::header_sync) fn active_mut(
         &mut self,
         peer: &ZakuraPeerId,
     ) -> Option<&mut ActiveHeaderRequest> {
         self.policy.active_mut(peer)
+    }
+
+    /// Charge one admitted page to `peer`'s reservation and stage its entries.
+    ///
+    /// Return false, changing nothing, when `peer`'s work is not receiving or
+    /// the page does not fit the reservation.
+    pub(in crate::zakura::header_sync) fn stage_page(
+        &mut self,
+        peer: &ZakuraPeerId,
+        ancestor: Frontier,
+        entries: Vec<HeaderEntry>,
+        cursor: Cursor,
+    ) -> bool {
+        if !self.policy.is_receiving(peer) || !self.consume_response_capacity(peer, entries.len()) {
+            return false;
+        }
+        self.policy.stage_page(peer, ancestor, entries, cursor);
+        debug_assert_eq!(
+            self.owned_header_count(peer),
+            self.policy
+                .active(peer)
+                .map_or(0, |request| request.entries.len()),
+            "every staged header retains exactly one owned budget unit",
+        );
+        true
+    }
+
+    /// Move `peer`'s staged headers into preparation. See [`WorkPolicy::begin_prepare`].
+    pub(in crate::zakura::header_sync) fn begin_prepare(
+        &mut self,
+        peer: &ZakuraPeerId,
+        bounded_prefix: bool,
+    ) -> Option<HeaderPortOperation> {
+        let operation = self.policy.begin_prepare(peer, bounded_prefix);
+        self.publish_phase_metrics();
+        operation
+    }
+
+    /// Move `peer`'s prepared work to its state call, and return whether it was preparing.
+    pub(in crate::zakura::header_sync) fn begin_apply(&mut self, peer: &ZakuraPeerId) -> bool {
+        let began = self.policy.begin_apply(peer);
+        self.publish_phase_metrics();
+        began
     }
 
     /// Bound one request by its fair share and currently unowned capacity.
@@ -537,18 +520,8 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         count: u32,
     ) -> bool {
-        if self.request_reservations.contains_key(peer) {
-            return false;
-        }
         let count = usize::try_from(count).unwrap_or(usize::MAX);
-        if count > MAX_HEADER_CHUNK_RESERVATION_V1 {
-            return false;
-        }
-        let Some(reservation) = self.budget.reserve(count) else {
-            return false;
-        };
-        self.request_reservations.insert(peer.clone(), reservation);
-        true
+        count <= MAX_HEADER_CHUNK_RESERVATION_V1 && self.reserve(peer, count)
     }
 
     /// Reserve aggregate capacity for one selected auxiliary repair range.
@@ -557,10 +530,14 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         count: u32,
     ) -> bool {
+        self.reserve(peer, usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// Give `peer`, which holds no reservation, one of `count` headers.
+    fn reserve(&mut self, peer: &ZakuraPeerId, count: usize) -> bool {
         if self.request_reservations.contains_key(peer) {
             return false;
         }
-        let count = usize::try_from(count).unwrap_or(usize::MAX);
         let Some(reservation) = self.budget.reserve(count) else {
             return false;
         };
@@ -610,12 +587,14 @@ impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn retain_headers(
         &self,
         peer: &ZakuraPeerId,
+        call: StorageCall,
     ) -> Option<RetainedHeaders> {
-        let incarnation = self.policy.active(peer)?.incarnation;
+        let incarnation = self.policy.active(peer)?.incarnation();
         Some(RetainedHeaders {
+            #[cfg(any(test, zakura_sim))]
             peer: peer.clone(),
             incarnation,
-            call: None,
+            call,
             leases: self.staged_capacity.get(peer).cloned().unwrap_or_default(),
             end: HeaderWorkEnd::Dropped,
             #[cfg(any(test, zakura_sim))]
@@ -730,26 +709,26 @@ impl PeerWorkQueue {
 }
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod model_tests;
 
 #[cfg(test)]
 mod tests {
     use std::{cmp::Ordering, sync::Arc};
 
-    use super::*;
+    use zakura_header_chain::HeaderWorkAuthority;
+
+    use super::{
+        fixtures::{self, hash, peer},
+        *,
+    };
     use crate::zakura::{
-        header_sync::{wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, MAX_HS_RANGE},
+        header_sync::{wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, MAX_HS_RANGE},
         transport::{NodeResources, ResourceEnvelope, TransportLimits},
     };
     use zakura_chain::{block, block::genesis::regtest_genesis_block, work::difficulty::U256};
-    use zakura_header_chain::{
-        AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, HeaderLocator,
-        StateVersion, SuffixWork, VerifiedGeneration, MAX_STAGED_TARGETS_V1,
-    };
-
-    fn hash(byte: u8) -> block::Hash {
-        block::Hash([byte; 32])
-    }
+    use zakura_header_chain::{Frontier, HeaderLocator, MAX_STAGED_TARGETS_V1};
 
     /// The header chunk budget and the transport budgets fund different things, so
     /// saturating either leaves the other's capacity free.
@@ -779,22 +758,7 @@ mod tests {
     }
 
     fn snapshot() -> EngineSnapshot {
-        let finalized = Frontier::new(block::Height(10), hash(10));
-        let tip = Frontier::new(block::Height(100), hash(100));
-        EngineSnapshot {
-            mode: EngineMode::Integrated,
-            state_version: StateVersion::new(1),
-            header_generation: HeaderGeneration::new(1),
-            verified_generation: VerifiedGeneration::new(1),
-            frontiers: FrontierSet {
-                finalized,
-                header_best: tip,
-                verified_best: finalized,
-            },
-            header_best_score: ChainScore::new(SuffixWork::new(U256::from(100_u32)), tip.hash),
-            oldest_retained_height: finalized.height,
-            alarms: AlarmSet::default(),
-        }
+        fixtures::snapshot(1)
     }
 
     fn advertisement(marker: u8) -> AdvertisedHeaderTarget {
@@ -802,23 +766,8 @@ mod tests {
         AdvertisedHeaderTarget {
             scope: HeaderWorkAuthority::for_target(&local, hash(marker)),
             session_id: 7,
-            status: Status {
-                work_anchor_height: block::Height(10),
-                work_anchor_hash: hash(10),
-                selected_tip_height: block::Height(u32::from(marker)),
-                selected_tip_hash: hash(marker),
-                suffix_cumulative_work: U256::from(u32::from(marker)),
-                oldest_retained_height: block::Height(10),
-                max_headers_per_response: 1_000,
-                max_subscriptions: 1,
-                max_message_bytes: 2_000_000,
-                tree_aux_schema_mask: 1,
-            },
+            status: fixtures::status(u32::from(marker), hash(marker), u32::from(marker)),
         }
-    }
-
-    fn peer(marker: u8) -> ZakuraPeerId {
-        ZakuraPeerId::new(vec![marker; 32]).expect("the test peer ID has the required length")
     }
 
     fn active_request(
@@ -829,12 +778,12 @@ mod tests {
     ) -> ActiveHeaderRequest {
         let request_id =
             HeaderSyncRequestId::new(u64::from(marker)).expect("the marker is nonzero");
-        ActiveHeaderRequest {
-            purpose: HeaderTargetPurpose::Normal,
-            peer: peer(marker),
-            source: SourceId::from_digest([marker; 32]),
-            sent_locator: HeaderLocator::for_continuation(local.frontiers.finalized),
-            owner: zakura_header_chain::HeaderWorkOwner {
+        let mut request = ActiveHeaderRequest::new(
+            HeaderTargetPurpose::Normal,
+            peer(marker),
+            SourceId::from_digest([marker; 32]),
+            HeaderLocator::for_continuation(local.frontiers.finalized),
+            zakura_header_chain::HeaderWorkOwner {
                 authority: HeaderWorkAuthority::for_target(local, target.status.selected_tip_hash),
                 session_id: target.session_id,
                 request_id: std::num::NonZeroU64::new(request_id.get())
@@ -843,14 +792,12 @@ mod tests {
             .into(),
             target,
             request_id,
-            common_ancestor: Some(local.frontiers.finalized),
-            entries,
-            phase: HeaderTargetPhase::Receiving,
-            incarnation: WorkIncarnation::UNSTARTED,
-            cursor: None,
-            max_header_count: 1_000,
-            tree_aux_schema: AuxSchema::None,
-        }
+            1_000,
+            AuxSchema::None,
+        );
+        request.common_ancestor = Some(local.frontiers.finalized);
+        request.entries = entries;
+        request
     }
 
     #[test]
@@ -960,14 +907,12 @@ mod tests {
             Ok(Some(hash(marker)))
         })
         .expect("the test projection contains every requested frontier");
-        let request = ActiveHeaderRequest {
-            purpose: HeaderTargetPurpose::Normal,
-            peer: peer(1),
-            source: SourceId::from_digest([1; 32]),
-            target: replacement.clone(),
-            sent_locator: locator.clone(),
-            request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
-            owner: zakura_header_chain::HeaderWorkOwner {
+        let request = ActiveHeaderRequest::new(
+            HeaderTargetPurpose::Normal,
+            peer(1),
+            SourceId::from_digest([1; 32]),
+            locator.clone(),
+            zakura_header_chain::HeaderWorkOwner {
                 authority: HeaderWorkAuthority::for_target(
                     &local,
                     replacement.status.selected_tip_hash,
@@ -976,18 +921,15 @@ mod tests {
                 request_id: std::num::NonZeroU64::new(1).expect("one is nonzero"),
             }
             .into(),
-            common_ancestor: None,
-            entries: Vec::new(),
-            phase: HeaderTargetPhase::Receiving,
-            incarnation: WorkIncarnation::UNSTARTED,
-            cursor: None,
-            max_header_count: 1_000,
-            tree_aux_schema: AuxSchema::None,
-        };
+            replacement.clone(),
+            HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
+            1_000,
+            AuxSchema::None,
+        );
         assert!(queue.reserve_request(&peer(1), 1));
         assert!(queue.start(request.clone()));
         let request = queue.active(&peer(1)).expect("the request started").clone();
-        assert_ne!(request.incarnation, WorkIncarnation::UNSTARTED);
+        assert_ne!(request.incarnation(), WorkIncarnation::UNSTARTED);
         assert_eq!(
             queue.stage(
                 peer(1),

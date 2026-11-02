@@ -13,12 +13,13 @@ use std::cmp::Ordering;
 
 use zakura_header_chain::{
     AuxiliaryRequirementEpisode, EngineSnapshot, Frontier, HeaderLocator, HeaderSyncWorkOwner,
-    HeaderWorkAuthority, SourceId, MAX_STAGED_TARGETS_V1,
+    HeaderWorkAuthority, SourceId, TargetCompletion, VctRepairContext, MAX_STAGED_TARGETS_V1,
 };
 use zakura_rt::collections::HashMap;
 
 use super::super::super::{
-    v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
+    events::HeaderPortOperation, v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Headers,
+    Status, ZakuraPeerId, MAX_HS_RANGE,
 };
 
 /// Exact aggregate header count owned across receiving, preparation, and application.
@@ -39,7 +40,7 @@ pub struct WorkIncarnation(u64);
 
 impl WorkIncarnation {
     /// The value of a request that no queue has started.
-    pub const UNSTARTED: Self = Self(0);
+    pub(super) const UNSTARTED: Self = Self(0);
 
     /// The incarnation's number.
     pub fn get(self) -> u64 {
@@ -102,24 +103,6 @@ pub enum HeaderWorkEnd {
     },
     /// The apply's result retired its work.
     Settled,
-}
-
-impl HeaderWorkEnd {
-    /// The end's metric label.
-    pub(in crate::zakura::header_sync) fn label(self) -> &'static str {
-        match self {
-            Self::Dropped => "dropped",
-            Self::Refused => "refused",
-            Self::Panicked => "panicked",
-            Self::Stale => "stale",
-            Self::NoAuthority => "no_authority",
-            Self::OwnerMismatch => "owner_mismatch",
-            Self::RepairInvalid => "repair_invalid",
-            Self::PrepareFailed => "prepare_failed",
-            Self::HandedToApply { .. } => "handed_to_apply",
-            Self::Settled => "settled",
-        }
-    }
 }
 
 /// One peer's exact, session-bound target claim.
@@ -191,7 +174,7 @@ pub struct ActiveHeaderRequest {
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
     /// The round the queue assigned at start, or [`WorkIncarnation::UNSTARTED`] before it.
-    pub incarnation: WorkIncarnation,
+    incarnation: WorkIncarnation,
     /// The subscription cursor of the last staged page.
     pub cursor: Option<Cursor>,
     /// Negotiated page bound before temporary credit limits.
@@ -228,6 +211,43 @@ pub enum HeaderTargetPhase {
 }
 
 impl ActiveHeaderRequest {
+    /// A request for `target` that has received nothing. Only the queue that
+    /// starts it assigns its incarnation.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::zakura::header_sync) fn new(
+        purpose: HeaderTargetPurpose,
+        peer: ZakuraPeerId,
+        source: SourceId,
+        sent_locator: HeaderLocator,
+        owner: HeaderSyncWorkOwner,
+        target: AdvertisedHeaderTarget,
+        request_id: HeaderSyncRequestId,
+        max_header_count: u32,
+        tree_aux_schema: AuxSchema,
+    ) -> Self {
+        Self {
+            purpose,
+            peer,
+            source,
+            target,
+            sent_locator,
+            request_id,
+            owner,
+            common_ancestor: None,
+            entries: Vec::new(),
+            phase: HeaderTargetPhase::Receiving,
+            incarnation: WorkIncarnation::UNSTARTED,
+            cursor: None,
+            max_header_count,
+            tree_aux_schema,
+        }
+    }
+
+    /// The round the queue assigned at start.
+    pub fn incarnation(&self) -> WorkIncarnation {
+        self.incarnation
+    }
+
     /// Whether one page preserves the active phase, target, and exact ancestry.
     pub fn matches_response_page(
         &self,
@@ -246,6 +266,13 @@ impl ActiveHeaderRequest {
         self.phase == HeaderTargetPhase::Receiving
             && self.target.status.selected_tip_hash == target_tip_hash
             && expected_ancestor == Some(returned_ancestor)
+    }
+
+    /// Whether this work still receives the pages of subscription `id` on `session_id`.
+    pub(in crate::zakura::header_sync) fn awaits_page(&self, id: u64, session_id: u64) -> bool {
+        self.request_id.get() == id
+            && self.owner.session_id() == session_id
+            && self.phase == HeaderTargetPhase::Receiving
     }
 
     /// Whether one explicit outcome exactly matches the active request.
@@ -320,6 +347,275 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
     AlreadyActive,
     TargetAlreadyAssigned,
     AtCapacity,
+}
+
+/// What one peer's started work means for a new offer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum OfferedPeerWork {
+    /// The peer has no started work.
+    Idle,
+    /// The peer's ordinary work already pursues the offered target.
+    SameOrdinaryTarget,
+    /// The peer's started work pursues something else.
+    Other,
+}
+
+/// The facts that decide one peer's offer of a target at one instant.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) struct OfferFacts {
+    /// A `HistoryPruned` pause holds for this peer at the selected header tip.
+    pub(in crate::zakura::header_sync) pruned_pause: bool,
+    /// The target's generation and branch already finished.
+    pub(in crate::zakura::header_sync) covered: bool,
+    /// The status names another target and can carry at least one header.
+    pub(in crate::zakura::header_sync) eligible: bool,
+    /// The peer's started work.
+    pub(in crate::zakura::header_sync) work: OfferedPeerWork,
+    /// A resource stall or missing headroom holds ordinary work back.
+    pub(in crate::zakura::header_sync) held_back: bool,
+    /// The session holds no subscription, or one that a `Grant` can continue
+    /// toward the target.
+    pub(in crate::zakura::header_sync) subscription_ready: bool,
+}
+
+/// Why an offer that cannot yield work is spent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum SpentOffer {
+    /// The same attempt would end `HistoryPruned` again, so another peer's
+    /// status takes the target.
+    PrunedPause,
+    /// The target already finished.
+    Covered,
+    /// The status cannot start a request.
+    Ineligible,
+}
+
+/// What one peer's offer of a target does.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum OfferDecision {
+    /// Spend the offer and end the peer's unstarted work.
+    Spend {
+        /// Why no round can follow.
+        cause: SpentOffer,
+        /// Whether to close an idle subscription kept for the next round, which
+        /// would only hold the session's connection hostage.
+        close_subscription: bool,
+    },
+    /// Started work continues. Exact selected-range repair does not use the
+    /// advertised ordinary offer. A status for another target stays unspent, so
+    /// it starts once this work ends.
+    AlreadyActive {
+        /// Whether the offer names the target this work already pursues.
+        spend: bool,
+    },
+    /// End the peer's unstarted work and keep the offer until the blocker clears.
+    HeldBack,
+    /// Close the live subscription and keep the offer, because the next `Open`
+    /// must follow its terminal outcome.
+    AwaitSubscription,
+    /// Stage the target.
+    Stage,
+}
+
+/// Decide one peer's offer. The checks run in priority order.
+pub(in crate::zakura::header_sync) fn decide_offer(facts: OfferFacts) -> OfferDecision {
+    let spent = if facts.pruned_pause {
+        Some(SpentOffer::PrunedPause)
+    } else if facts.covered {
+        Some(SpentOffer::Covered)
+    } else if !facts.eligible {
+        Some(SpentOffer::Ineligible)
+    } else {
+        None
+    };
+    if let Some(cause) = spent {
+        return OfferDecision::Spend {
+            cause,
+            close_subscription: facts.work == OfferedPeerWork::Idle,
+        };
+    }
+    if facts.work != OfferedPeerWork::Idle {
+        return OfferDecision::AlreadyActive {
+            spend: facts.work == OfferedPeerWork::SameOrdinaryTarget,
+        };
+    }
+    if facts.held_back {
+        return OfferDecision::HeldBack;
+    }
+    if !facts.subscription_ready {
+        return OfferDecision::AwaitSubscription;
+    }
+    OfferDecision::Stage
+}
+
+/// The facts that decide what follows one staged page.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) struct PageFacts {
+    /// Whether the page ends at the initial target.
+    pub(in crate::zakura::header_sync) reaches_target: bool,
+    /// Headers that this round's credit may still deliver.
+    pub(in crate::zakura::header_sync) reserved: usize,
+    /// Whether the aggregate header budget is full.
+    pub(in crate::zakura::header_sync) budget_full: bool,
+    /// Whether the durable prefix has no room for the round's next grant.
+    pub(in crate::zakura::header_sync) durable_prefix_full: bool,
+    /// Whether the staged headers form a whole refill batch for the selected tip.
+    pub(in crate::zakura::header_sync) checkpoint_prefix_ready: bool,
+}
+
+/// What follows one staged page.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum PageNext {
+    /// The rest of this round's credit is still on its way.
+    WaitCredit,
+    /// Validate the staged headers.
+    Prepare {
+        /// Whether they form a prefix of the target, because capacity bounds the round.
+        bounded_prefix: bool,
+    },
+    /// Grant more credit toward the target from `staged_tip`.
+    Continue {
+        /// The last staged header.
+        staged_tip: Frontier,
+    },
+    /// The peer's pages cannot form the target.
+    Malformed {
+        /// Whether the page claimed to reach the target with staged headers.
+        reached_target: bool,
+    },
+}
+
+impl PageNext {
+    /// Whether the page reached its target, so the pages that would follow it
+    /// must stop. Pages already in flight are dropped.
+    pub(in crate::zakura::header_sync) fn closes_subscription(self) -> bool {
+        matches!(
+            self,
+            Self::Prepare {
+                bounded_prefix: false
+            } | Self::Malformed {
+                reached_target: true
+            }
+        )
+    }
+}
+
+/// Decide what follows the page just staged on `active`.
+///
+/// A peer can advertise an arbitrarily distant target. Admitting a validated
+/// prefix at capacity bounds response staging, and a checkpoint-sized minimum
+/// lets a selected extension unblock body validation without letting short peer
+/// pages force tiny prefix commits.
+pub(in crate::zakura::header_sync) fn page_next(
+    active: &ActiveHeaderRequest,
+    facts: PageFacts,
+) -> PageNext {
+    let Some(staged_tip) = active.staged_tip() else {
+        return PageNext::Malformed {
+            reached_target: false,
+        };
+    };
+    if facts.reaches_target {
+        return if staged_tip.hash == active.target.status.selected_tip_hash {
+            PageNext::Prepare {
+                bounded_prefix: false,
+            }
+        } else {
+            PageNext::Malformed {
+                reached_target: true,
+            }
+        };
+    }
+    if facts.reserved != 0 {
+        return PageNext::WaitCredit;
+    }
+    if facts.budget_full || facts.durable_prefix_full || facts.checkpoint_prefix_ready {
+        return PageNext::Prepare {
+            bounded_prefix: true,
+        };
+    }
+    PageNext::Continue { staged_tip }
+}
+
+/// What one selected-range repair page means for its repair.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum RepairPage {
+    /// The page has the exact shape of the selected range and carries new input.
+    Accepted,
+    /// The page does not have the exact shape of the selected range.
+    Malformed,
+    /// The supplier returned auxiliary input that this episode already excludes.
+    ExcludedInput,
+}
+
+/// Judge `response` against `active`'s repair, whose evidence episode is `episode`.
+///
+/// `context` is the repair's assigned context, if it is still assigned.
+pub(in crate::zakura::header_sync) fn repair_page(
+    active: &ActiveHeaderRequest,
+    episode: AuxiliaryRequirementEpisode,
+    context: Option<&VctRepairContext>,
+    response: &Headers,
+    reaches_target: bool,
+) -> RepairPage {
+    let HeaderTargetPurpose::SelectedAuxiliaryRepair {
+        selected_target, ..
+    } = &active.purpose
+    else {
+        return RepairPage::Accepted;
+    };
+    let ancestor = Frontier::new(
+        response.common_ancestor_height,
+        response.common_ancestor_hash,
+    );
+    let returned_range: Option<Vec<_>> = response
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let offset = u32::try_from(index).ok()?.checked_add(1)?;
+            let height = ancestor.height.0.checked_add(offset)?;
+            Some(Frontier::new(
+                zakura_chain::block::Height(height),
+                entry.header.hash(),
+            ))
+        })
+        .collect();
+    let context = context.filter(|context| {
+        context.episode == episode
+            && context.request_target() == *selected_target
+            && returned_range
+                .as_ref()
+                .is_some_and(|range| context.matches_selected_range(range))
+    });
+    let exact_shape = response.initial_target_tip_hash == selected_target.hash
+        && active.sent_locator.entries() == [ancestor]
+        && reaches_target
+        && response.tree_aux_schema == AuxSchema::V1
+        && response
+            .entries
+            .iter()
+            .all(|entry| entry.tree_aux.is_some());
+    let (true, Some(context)) = (exact_shape, context) else {
+        return RepairPage::Malformed;
+    };
+    let inputs: Vec<_> = response
+        .entries
+        .iter()
+        .map(|entry| {
+            entry
+                .tree_aux
+                .expect("a repair response has schema-1 auxiliary input")
+        })
+        .collect();
+    if context.admits_new_input(active.source, &inputs) {
+        RepairPage::Accepted
+    } else {
+        RepairPage::ExcludedInput
+    }
 }
 
 /// Counts claimed against the aggregate header budget.
@@ -432,7 +728,7 @@ impl StageDecision {
 ///
 /// Every field is a plain value. See the module doc.
 #[derive(Clone, Debug, Default)]
-pub(super) struct WorkPolicy {
+pub(in crate::zakura::header_sync) struct WorkPolicy {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
     scheduling_revision: u64,
     repair_episodes: HashMap<HeaderSyncWorkOwner, AuxiliaryRequirementEpisode>,
@@ -441,7 +737,9 @@ pub(super) struct WorkPolicy {
 
 impl WorkPolicy {
     /// Changes whenever target ownership or a peer's awaiting/active state changes.
-    pub(super) fn scheduling_revision(&self) -> u64 {
+    /// These changes invalidate cached offers. The reactor separately tracks effective
+    /// virtual claims using negotiated limits.
+    pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
         self.scheduling_revision
     }
 
@@ -449,17 +747,20 @@ impl WorkPolicy {
         self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::zakura::header_sync) fn len(&self) -> usize {
         self.work_by_peer.len()
     }
 
     /// Whether `peer` holds unstarted or active work.
-    pub(super) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
+    pub(in crate::zakura::header_sync) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
         self.work_by_peer.contains_key(peer)
     }
 
     /// Whether any peer's unstarted or active work pursues `target_tip_hash`.
-    pub(super) fn is_target_assigned(&self, target_tip_hash: zakura_chain::block::Hash) -> bool {
+    pub(in crate::zakura::header_sync) fn is_target_assigned(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> bool {
         self.target_owners(target_tip_hash).next().is_some()
     }
 
@@ -484,7 +785,7 @@ impl WorkPolicy {
     }
 
     /// Return every peer's target that still waits for its locator.
-    pub(super) fn awaiting_targets(
+    pub(in crate::zakura::header_sync) fn awaiting_targets(
         &self,
     ) -> impl Iterator<Item = (&ZakuraPeerId, &AdvertisedHeaderTarget)> {
         self.work_by_peer
@@ -626,14 +927,17 @@ impl WorkPolicy {
     }
 
     /// Return the peer's current unstarted target, if any.
-    pub(super) fn awaiting_target(&self, peer: &ZakuraPeerId) -> Option<&AdvertisedHeaderTarget> {
+    pub(in crate::zakura::header_sync) fn awaiting_target(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<&AdvertisedHeaderTarget> {
         match self.work_by_peer.get(peer) {
             Some(PeerWorkState::AwaitingLocator { target, .. }) => Some(target.as_ref()),
             _ => None,
         }
     }
 
-    pub(super) fn awaiting(
+    pub(in crate::zakura::header_sync) fn awaiting(
         &self,
         peer: &ZakuraPeerId,
         session_id: u64,
@@ -691,7 +995,7 @@ impl WorkPolicy {
     }
 
     /// Return the durable evidence episode bound to one active repair request.
-    pub(super) fn repair_episode(
+    pub(in crate::zakura::header_sync) fn repair_episode(
         &self,
         owner: HeaderSyncWorkOwner,
     ) -> Option<AuxiliaryRequirementEpisode> {
@@ -736,7 +1040,10 @@ impl WorkPolicy {
     }
 
     /// Return the active target carrying one exact durable owner.
-    pub(super) fn active_owner(&self, owner: HeaderSyncWorkOwner) -> Option<&ActiveHeaderRequest> {
+    pub(in crate::zakura::header_sync) fn active_owner(
+        &self,
+        owner: HeaderSyncWorkOwner,
+    ) -> Option<&ActiveHeaderRequest> {
         self.work_by_peer.values().find_map(|work| match work {
             PeerWorkState::Active { request, .. } if request.owner == owner => {
                 Some(request.as_ref())
@@ -757,18 +1064,126 @@ impl WorkPolicy {
         unstarted
     }
 
-    pub(super) fn active(&self, peer: &ZakuraPeerId) -> Option<&ActiveHeaderRequest> {
+    pub(in crate::zakura::header_sync) fn active(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<&ActiveHeaderRequest> {
         match self.work_by_peer.get(peer) {
             Some(PeerWorkState::Active { request, .. }) => Some(request),
             _ => None,
         }
     }
 
+    /// Whether `peer`'s started work still receives pages.
+    pub(super) fn is_receiving(&self, peer: &ZakuraPeerId) -> bool {
+        self.active(peer)
+            .is_some_and(|request| request.phase == HeaderTargetPhase::Receiving)
+    }
+
+    /// Mutable access for tests and models that seed a request's fields directly.
+    #[cfg(any(test, feature = "header-fuzz"))]
     pub(super) fn active_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
+        self.request_mut(peer)
+    }
+
+    fn request_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
         match self.work_by_peer.get_mut(peer) {
             Some(PeerWorkState::Active { request, .. }) => Some(request),
             _ => None,
         }
+    }
+
+    /// Stage one admitted page on `peer`'s receiving work.
+    ///
+    /// The first page fixes the exact `ancestor`. The page's `cursor` replaces
+    /// the last one.
+    pub(super) fn stage_page(
+        &mut self,
+        peer: &ZakuraPeerId,
+        ancestor: Frontier,
+        entries: Vec<HeaderEntry>,
+        cursor: Cursor,
+    ) -> bool {
+        let Some(request) = self
+            .request_mut(peer)
+            .filter(|request| request.phase == HeaderTargetPhase::Receiving)
+        else {
+            return false;
+        };
+        request.common_ancestor.get_or_insert(ancestor);
+        request.entries.extend(entries);
+        request.cursor = Some(cursor);
+        true
+    }
+
+    /// Move `peer`'s staged headers into preparation, and return the storage
+    /// operation that validates them.
+    ///
+    /// A `bounded_prefix` round narrows an ordinary owner to its staged tip,
+    /// since state admits only that prefix. Return `None` unless `peer`'s work
+    /// is receiving and holds staged headers.
+    pub(super) fn begin_prepare(
+        &mut self,
+        peer: &ZakuraPeerId,
+        bounded_prefix: bool,
+    ) -> Option<HeaderPortOperation> {
+        let active = self.active(peer)?;
+        let episode = self.repair_episode(active.owner);
+        let request = self
+            .request_mut(peer)
+            .filter(|request| request.phase == HeaderTargetPhase::Receiving)?;
+        let target = request.staged_tip()?;
+        let common_ancestor = request.common_ancestor?;
+        let completion = match request.purpose {
+            HeaderTargetPurpose::Normal if bounded_prefix => {
+                let owner = request
+                    .owner
+                    .header_owner()
+                    .expect("a normal target has header authority");
+                request.owner = HeaderWorkAuthority {
+                    branch: zakura_header_chain::BranchId {
+                        target_tip_hash: target.hash,
+                        ..owner.authority.branch
+                    },
+                    ..owner.authority
+                }
+                .bind(owner.session_id, owner.request_id)
+                .into();
+                TargetCompletion::TargetPrefix { common_ancestor }
+            }
+            HeaderTargetPurpose::Normal => TargetCompletion::TargetComplete { common_ancestor },
+            HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                selected_target, ..
+            } => TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor,
+                selected_target,
+                episode: episode.expect("an active repair binds its evidence episode"),
+            },
+        };
+        request.phase = HeaderTargetPhase::Preparing;
+        Some(HeaderPortOperation::PrepareHeaderTarget {
+            purpose: request.purpose.clone(),
+            peer: peer.clone(),
+            source: request.source,
+            owner: request.owner,
+            common_ancestor,
+            target,
+            completion,
+            entries: std::mem::take(&mut request.entries),
+        })
+    }
+
+    /// Move `peer`'s prepared work to its one state call, and return whether
+    /// the work was preparing.
+    pub(super) fn begin_apply(&mut self, peer: &ZakuraPeerId) -> bool {
+        let Some(request) = self
+            .request_mut(peer)
+            .filter(|request| request.phase == HeaderTargetPhase::Preparing)
+        else {
+            return false;
+        };
+        request.phase = HeaderTargetPhase::Applying;
+        true
     }
 
     /// Record that `work`'s round on `peer` waits for its call. Another round's

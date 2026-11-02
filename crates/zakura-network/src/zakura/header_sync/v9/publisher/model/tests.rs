@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::header_sync::v9::test_support::OUTCOME_CODES;
+use crate::zakura::{header_sync::v9::test_support::OUTCOME_CODES, regulation::Totals};
 
 fn sequence() -> impl Strategy<Value = Sequence> {
     prop_oneof![4 => Just(Sequence::Next), 1 => Just(Sequence::Repeat)]
@@ -19,13 +19,39 @@ fn answer() -> impl Strategy<Value = Answer> {
         .filter(|code| *code != HeadersOutcomeCode::SubscriptionClosed)
         .collect::<Vec<_>>();
     prop_oneof![
-        prop::sample::select(own).prop_map(Answer::End),
-        Just(Answer::Local),
-        Just(Answer::Capacity),
-        Just(Answer::Retry),
-        Just(Answer::Extends),
-        Just(Answer::ReachedAtOpen),
+        5 => prop::sample::select(own).prop_map(Answer::End),
+        5 => prop::sample::select(REPLIES.to_vec()).prop_map(Answer::Reply),
+        1 => Just(Answer::Local),
+        1 => Just(Answer::Capacity),
+        1 => Just(Answer::Retry),
+        1 => Just(Answer::Extends),
+        1 => Just(Answer::ReachedAtOpen),
     ]
+}
+
+impl Machine {
+    fn run(&mut self, step: &Step) {
+        // The task returns once the publisher stops, so no step follows.
+        if self.model.exit.is_some() {
+            return;
+        }
+        self.step(step);
+        self.check();
+    }
+}
+
+/// Run `steps` over a new machine, calling `after_step` after each and checking
+/// the result.
+fn run(steps: impl IntoIterator<Item = Step>, mut after_step: impl FnMut(&mut Machine, &Step)) {
+    let mut machine = Machine::new();
+    for step in steps {
+        if machine.model.exit.is_some() {
+            break;
+        }
+        machine.run(&step);
+        after_step(&mut machine, &step);
+        machine.check();
+    }
 }
 
 /// Steps that stop the publisher are rare, so most histories run long.
@@ -153,7 +179,7 @@ fn a_stale_page_after_replacement_spends_no_replacement_credit() {
         machine
             .owner
             .state
-            .publications
+            .publications()
             .credit(&a)
             .map(|credit| credit.consumed()),
         Some(Totals::default()),
@@ -324,7 +350,7 @@ fn a_terminal_holds_its_slot_until_its_write_finishes() {
         ack: 0,
     });
     machine.run(&Step::EndDue);
-    assert_eq!(machine.owner.state.publications.keys().count(), 0);
+    assert_eq!(machine.owner.state.publications().keys().count(), 0);
     assert_eq!(machine.owner.slots.held(), 1, "the queued outcome holds it");
     machine.run(&Step::NextTerminal);
     assert_eq!(machine.owner.slots.held(), 1, "the permit holds it");
@@ -405,47 +431,14 @@ fn the_owner_holds_a_capacity_signal_only_while_a_stall_waits() {
     assert!(machine.owner.capacity_signals().is_empty());
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn publisher_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_header_publisher_bytes(&bytes);
-    }
-}
-
 const WITNESS: &[u8] = &[
     0, 0, 4, 35, 10, 0, 0, 0, 15, 0, 0, 0, 8, 0, 0, 0, 23, 0, 0, 0, 24, 0, 0, 0, 25, 0, 0, 0, 15,
     0, 0, 128,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn publisher_witness_exercises_credit_terminal_and_stale_page() {
-    let summary = replay_header_publisher_bytes(WITNESS);
-    assert_eq!(
-        summary,
-        HeaderPublisherReplaySummary {
-            transitions: 8,
-            jobs: 1,
-            pages: 1,
-            headers: 1,
-            bytes: 263,
-            stale_results: 1,
-            terminals: 1
-        }
-    );
-    assert_eq!(
-        replay_header_publisher_bytes(&[]),
-        HeaderPublisherReplaySummary::default()
-    );
-    println!("tier=Machine target=header_publisher decoder=1 {summary:?}");
-}
-
 /// The witness's history records one step per operation, and the owner's view
-/// matches the model's after each.
+/// matches the model's after each. It reaches credit, a terminal write, and a
+/// stale page.
 #[test]
 fn publisher_trace_records_the_witness_with_agreeing_views() {
     let history = trace_header_publisher_bytes(WITNESS);
@@ -464,7 +457,9 @@ fn publisher_trace_records_the_witness_with_agreeing_views() {
     );
     assert_eq!(history.steps[4].expected.terminals, [1]);
     assert!(history.steps[5].expected.writing);
-    assert_eq!(history.steps[7].expected.slots, 0);
+    assert_eq!(history.steps[6].expected.slots, 0);
+    // The last operation's page answers the settled job, so it changes nothing.
+    assert_eq!(history.steps[7].actual, history.steps[6].actual);
     assert_eq!(
         trace_header_publisher_bytes(&[]),
         HeaderPublisherHistory::default()
@@ -506,7 +501,7 @@ proptest! {
 fn publisher_witness_rejects_lost_credit() {
     run(decode(WITNESS), |machine, step| {
         if matches!(step, Step::Open { .. }) {
-            machine.owner.state.publications.end(&1);
+            machine.owner.state.lose_publication(1);
         }
     });
 }
@@ -516,7 +511,7 @@ fn publisher_witness_rejects_lost_credit() {
 fn publisher_witness_rejects_lost_job() {
     run(decode(WITNESS), |machine, step| {
         if matches!(step, Step::Open { .. }) {
-            machine.owner.state.next_job::<HB>(None, page_limits());
+            machine.owner.state.next_job::<HB>(None);
         }
     });
 }

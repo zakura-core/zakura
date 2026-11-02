@@ -19,9 +19,9 @@ mod service;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use reactor::{
-    replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
-    HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
-    HeaderReactorSessionView, HeaderReactorStep, HeaderReactorView,
+    trace_header_reactor_bytes, HeaderMachineFailure, HeaderMachinePhase, HeaderReactorHistory,
+    HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
+    HeaderReactorView,
 };
 #[cfg(test)]
 mod tests;
@@ -60,7 +60,6 @@ pub use wire::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use v9::{
-    replay_header_publisher_bytes, trace_header_publisher_bytes, HeaderPublisherHistory,
-    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
-    HeaderPublisherView,
+    trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView,
 };

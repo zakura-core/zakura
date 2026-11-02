@@ -4604,10 +4604,11 @@ async fn checkpoint_block_skips_the_early_proof_of_work_check() {
     );
 }
 
-/// A block that is rejected before verification leaves the pause flag as it was. Only a block
-/// that passed every early check resets it.
+/// A block that is rejected before verification leaves the pause flag as it was: a rejected
+/// block above the pause height doesn't set it, and one below the reset height doesn't clear it.
+/// Only a block that passed every early check moves it.
 #[tokio::test]
-async fn only_an_accepted_block_resets_the_pause_flag() {
+async fn only_an_accepted_block_moves_the_pause_flag() {
     let _init_guard = zakura_test::init();
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
         .zcash_deserialize_into()
@@ -4639,6 +4640,40 @@ async fn only_an_accepted_block_resets_the_pause_flag() {
         assert_eq!(result.is_ok(), extendable, "{result:?}");
         assert_eq!(paused, !extendable, "parent extendable: {extendable}");
     }
+    // From this tip, the block is above the pause height but below the drop height.
+    let low_tip = Height(1_687_100);
+    let (drop_height, pause_height, _) =
+        lookahead_heights(Some(low_tip), sync::MIN_CONCURRENCY_LIMIT, 1);
+    assert!(Height(1_687_107) > pause_height && Height(1_687_107) <= drop_height);
+    for extendable in [false, true] {
+        let mut verifier =
+            MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+        let ((result, paused), _) = tokio::join!(
+            serve_block(
+                block.clone(),
+                verifier.clone(),
+                parent_extendable_answer(parent, extendable),
+                Height(0),
+                low_tip,
+                false,
+            ),
+            async {
+                if extendable {
+                    verifier
+                        .expect_request_that(|req| req.block().hash() == block.hash())
+                        .await
+                        .respond(block.hash());
+                }
+            },
+        );
+
+        assert_eq!(result.is_ok(), extendable, "{result:?}");
+        assert_eq!(
+            paused, extendable,
+            "a block above the pause height sets the flag only once accepted"
+        );
+    }
+
     let (result, paused) = serve_block(
         block_without_proof_of_work(),
         MockService::build().for_unit_tests(),

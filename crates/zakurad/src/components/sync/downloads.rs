@@ -1165,6 +1165,11 @@ where
     /// doesn't keep its children waiting in the next round. Called when a round starts, with
     /// nothing in flight.
     pub fn start_round(&mut self) {
+        // Clearing while tasks run would make every in-flight parent look absent to its children.
+        debug_assert!(
+            self.cancel_handles.is_empty(),
+            "a sync round starts with no block in flight"
+        );
         self.parent_gate.clear();
     }
 

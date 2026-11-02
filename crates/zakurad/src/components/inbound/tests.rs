@@ -27,7 +27,7 @@ async fn peer_block_lookup_queries_all_active_chains() {
         async move {
             assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
             Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(expected_block),
+                expected_block.into(),
             )))
         }
     });

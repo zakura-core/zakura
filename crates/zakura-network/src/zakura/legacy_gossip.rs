@@ -44,6 +44,7 @@ use crate::{
 };
 
 use super::trace::BlockBodySource;
+use super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
     RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
@@ -109,9 +110,6 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 const LEGACY_INBOUND_RETAINED_BYTES: u64 =
     // Widening usize to u64 is lossless on supported targets.
     (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;
-/// Callers that can run inbound service work at once: every request handler, and the
-/// serial gossip worker.
-pub(crate) const LEGACY_INBOUND_CALLERS: usize = LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1;
 /// Inventory fetches that one request client runs at once, including retries.
 const LEGACY_CLIENT_INVENTORY_SLOTS: usize = 256;
 /// Other requests that one request client runs at once. They have a partition of
@@ -174,19 +172,6 @@ const LEGACY_REQUEST_STREAM_RATE_DIVISOR: u32 = 2;
 /// fetch on the legacy peer set forever, starving the Zakura path.
 const DUAL_STACK_LEGACY_INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
-/// Maximum cumulative response payload bytes the inbound responder will buffer
-/// for a single legacy request before aborting.
-///
-/// A peer can name up to `MAX_TX_INV_IN_SENT_MESSAGE` block/transaction hashes
-/// on one request; without an aggregate cap `encode_response` would serialize
-/// and retain the entire multi-frame `Vec<Frame>` (worst case
-/// `MAX_TX_INV_IN_SENT_MESSAGE * MAX_PROTOCOL_MESSAGE_LEN`, tens of GiB) before
-/// the first byte is written. The outbound reader already enforces a symmetric
-/// per-response cap (`LegacyResponseBudget`); this is the responder-side mirror.
-/// Sized well above any single response the local service emits (zakurad caps
-/// `getdata` at ~1 MiB) yet far below memory-risk thresholds.
-const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
-    super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
@@ -1081,7 +1066,7 @@ impl ResponseEncodeBudget {
     /// budget.
     fn account(&mut self, payload_len: usize) -> Result<(), LegacyGossipError> {
         self.bytes = self.bytes.saturating_add(payload_len);
-        if self.bytes > LEGACY_RESPONSE_MAX_AGGREGATE_BYTES {
+        if self.bytes > COMPAT_RESPONSE_MAX_AGGREGATE_BYTES {
             return Err(LegacyGossipError::ResponseAggregateBudget(self.bytes));
         }
         Ok(())
@@ -3690,7 +3675,7 @@ mod tests {
 
         fn call(&mut self, _request: Request) -> Self::Future {
             std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(self.block.clone()),
+                self.block.clone().into(),
                 None,
             ))])))
         }
@@ -3718,7 +3703,7 @@ mod tests {
                 return std::future::ready(Ok(Response::Nil));
             }
             std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(self.block.clone()),
+                self.block.clone().into(),
                 None,
             ))])))
         }
@@ -3749,16 +3734,24 @@ mod tests {
             .expect("zero bytes always fit")
     }
 
+    /// A sink that sends its work to `inbound_tx` under the production budget.
+    fn test_sink(
+        inbound_tx: mpsc::Sender<LegacyInboundWork>,
+        outbound: LegacyGossipOutbound,
+    ) -> LegacyGossipSink {
+        LegacyGossipSink {
+            inbound_tx,
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            outbound,
+            trace: ZakuraTrace::noop(),
+        }
+    }
+
     /// A sink with a chosen inbound budget, whose queue the test drains itself.
     fn budgeted_sink(capacity: u64) -> (LegacyGossipSink, mpsc::Receiver<LegacyInboundWork>) {
         let (inbound_tx, inbound_rx) = mpsc::channel(8);
-        let supervisor = ZakuraSupervisorHandle::new(8);
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(capacity),
-            outbound: outbound_for_supervisor(&supervisor),
-            trace: ZakuraTrace::noop(),
-        };
+        let mut sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
+        sink.inbound_budget = InboundBudget::new(capacity);
         (sink, inbound_rx)
     }
 
@@ -3831,13 +3824,8 @@ mod tests {
                 _charge: InboundBudget::new(1).try_charge(0).expect("zero fits"),
             }))
             .expect("the queue has one slot");
-        let supervisor = ZakuraSupervisorHandle::new(8);
-        let sink = LegacyGossipSink {
-            inbound_tx: full_tx,
-            inbound_budget: InboundBudget::new(1 << 20),
-            outbound: outbound_for_supervisor(&supervisor),
-            trace: ZakuraTrace::noop(),
-        };
+        let mut sink = test_sink(full_tx, LegacyGossipOutbound::default());
+        sink.inbound_budget = InboundBudget::new(1 << 20);
         let refused = sink
             .request(
                 inbound_peer(),
@@ -3902,19 +3890,6 @@ mod tests {
                 if matches!(&headers[..], [HeaderHandle::Shared(header)] if *header == block.header)
         ));
         Ok(())
-    }
-
-    /// A budget clamps an item larger than itself, so the item enters when idle.
-    #[test]
-    fn the_inbound_budget_clamps_one_oversized_item() {
-        let budget = InboundBudget::new(10);
-        let held = budget
-            .try_charge(u64::MAX)
-            .expect("an idle budget admits it");
-        assert_eq!(budget.available(), 0);
-        assert!(budget.try_charge(1).is_none());
-        drop(held);
-        assert_eq!(budget.available(), 10);
     }
 
     /// Saturated inventory fetches never delay the control partition, and a waiter
@@ -4113,72 +4088,6 @@ mod tests {
         Ok(())
     }
 
-    /// C.3, C.4, and C.9 to C.11: a request refused by its inbound row becomes a local
-    /// failure on its stream. The handler ends, and its queue slot and charge return.
-    #[tokio::test]
-    async fn a_row_refusal_is_a_local_request_failure() -> Result<(), BoxError> {
-        use crate::inbound_resources::{InboundRow, InboundRowAdmission, InboundRowRefused};
-
-        let frames = [
-            (
-                LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
-                InboundRow::BlocksByHash,
-            ),
-            (
-                LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(1)]),
-                InboundRow::TransactionsById,
-            ),
-            (
-                LegacyRequestFrame::FindBlocks {
-                    known_blocks: vec![block_hash(1)],
-                    stop: None,
-                },
-                InboundRow::FindBlocks,
-            ),
-            (
-                LegacyRequestFrame::FindHeaders {
-                    known_blocks: vec![block_hash(1)],
-                    stop: None,
-                },
-                InboundRow::FindHeaders,
-            ),
-            (
-                LegacyRequestFrame::MempoolTransactionIds,
-                InboundRow::MempoolTransactionIds,
-            ),
-        ];
-        for (frame, row) in frames {
-            let inner =
-                tower::service_fn(|_request: Request| async { Ok::<_, BoxError>(Response::Nil) });
-            let inbound = InboundRowAdmission::new(inner, 0);
-            let (response_tx, response_rx) = oneshot::channel();
-            let permits = Arc::new(Semaphore::new(1));
-            let budget = InboundBudget::new(1 << 20);
-            let request = LegacyRequestInbound {
-                peer_id: inbound_peer(),
-                request_id: 1,
-                frame,
-                response_tx,
-                _charge: budget.charge_committed(10),
-            };
-            handle_legacy_request(
-                inbound,
-                request,
-                permits.clone().try_acquire_owned()?,
-                ZakuraTrace::noop(),
-            )
-            .await;
-            let refused = response_rx.await?.expect_err("the row has no slots");
-            assert_eq!(
-                refused.downcast_ref::<InboundRowRefused>(),
-                Some(&InboundRowRefused(row))
-            );
-            assert_eq!(permits.available_permits(), 1);
-            assert_eq!(budget.used(), 0);
-        }
-        Ok(())
-    }
-
     #[derive(Clone, Copy)]
     enum LegacyOwnerRow {
         /// `InboundBudget` funds it from enqueue until its handler ends.
@@ -4216,9 +4125,10 @@ mod tests {
                     sleep(delay).await;
                     let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)
                         .expect("the protocol message limit fits in u32");
-                    LegacyResponseCodec::encode_response(request_id, answer, cap, cap)
-                        .map(ResponseFrames::from)
-                        .map_err(BoxError::from)
+                    match LegacyResponseCodec::encode_response(request_id, answer, cap, cap) {
+                        Ok(frames) => Ok(ResponseFrames::with_zero_grant_for_tests(frames).await),
+                        Err(error) => Err(BoxError::from(error)),
+                    }
                 };
                 let frames = tokio::select! {
                     biased;
@@ -4741,6 +4651,72 @@ mod tests {
             .into());
         }
 
+        Ok(())
+    }
+
+    /// C.1 to C.4, C.9 to C.11, and L.mempool: the real worker runs one backend call per
+    /// request permit, refuses the next request locally, and adds one serial gossip
+    /// call. `inbound_resources` derives its static bound from this boundary.
+    #[tokio::test]
+    async fn the_compat_worker_holds_its_caller_bound() -> Result<(), BoxError> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn(legacy_gossip_worker(
+            CountingPendingService {
+                calls: calls.clone(),
+            },
+            inbound_rx,
+            LegacyGossipForwarder::new(ZakuraSupervisorHandle::new(1)),
+            ZakuraTrace::noop(),
+        ));
+        let calls_reach = |expected| {
+            let calls = calls.clone();
+            tokio::time::timeout(TEST_NET_TIMEOUT, async move {
+                while calls.load(Ordering::SeqCst) != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let mut responses = Vec::new();
+        for request_id in 0..=u64::try_from(LEGACY_REQUEST_IN_FLIGHT_LIMIT)? {
+            let (response_tx, response_rx) = oneshot::channel();
+            inbound_tx
+                .send(LegacyInboundWork::Request(LegacyRequestInbound {
+                    peer_id: inbound_peer(),
+                    request_id,
+                    frame: LegacyRequestFrame::MempoolTransactionIds,
+                    response_tx,
+                    _charge: free_charge(),
+                }))
+                .await?;
+            responses.push(response_rx);
+        }
+        let refused = responses.pop().ok_or("the loop sent a request")?;
+        let refused = tokio::time::timeout(TEST_NET_TIMEOUT, refused)
+            .await??
+            .expect_err("every permit is held");
+        assert!(refused.to_string().contains("concurrency limit"));
+        calls_reach(LEGACY_REQUEST_IN_FLIGHT_LIMIT).await?;
+
+        for byte in [1, 2] {
+            inbound_tx
+                .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    peer_id: inbound_peer(),
+                    frame: LegacyGossipFrame::AdvertiseBlock(block_hash(byte)),
+                    _charge: free_charge(),
+                }))
+                .await?;
+        }
+        calls_reach(LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1,
+            "the second gossip item waits for the first call"
+        );
+
+        worker.abort();
         Ok(())
     }
 
@@ -6051,12 +6027,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![92; 32]).expect("test peer id is within bounds");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, _peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
@@ -6078,12 +6049,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![93; 32]).expect("test peer id is within bounds");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
@@ -6102,12 +6068,7 @@ mod tests {
     async fn stale_legacy_gossip_teardown_keeps_replacement_session() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![94; 32]).expect("test peer id is within bounds");
         let old_conn_id = 1;
         let new_conn_id = 2;
@@ -6204,12 +6165,7 @@ mod tests {
     async fn repeated_no_frame_gossip_sessions_retire_the_service() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![98; 32]).expect("test peer id is within bounds");
         let conn_id = 7;
 
@@ -6260,12 +6216,7 @@ mod tests {
     #[tokio::test]
     async fn a_received_frame_resets_gossip_churn() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: LegacyGossipOutbound::default(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
         let outbound = sink.outbound.clone();
         let peer_id = ZakuraPeerId::new(vec![99; 32]).expect("test peer id is within bounds");
         let conn_id = 7;
@@ -6306,12 +6257,7 @@ mod tests {
     {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![97; 32]).expect("test peer id is within bounds");
         let conn_id = 5;
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -6361,12 +6307,7 @@ mod tests {
         let (inbound_tx, inbound_rx) = mpsc::channel(1);
         drop(inbound_rx);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![95; 32]).expect("test peer id is within bounds");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token);
@@ -6471,12 +6412,7 @@ mod tests {
     #[test]
     fn inbound_queue_full_drops_without_rejecting_peer_but_malformed_rejects() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: LegacyGossipOutbound::default(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
         let peer_id = ZakuraPeerId::new(vec![4; 32]).expect("test peer id is within bounds");
         let frame = LegacyGossipFrame::AdvertiseBlock(block_hash(6))
             .encode_frame()
@@ -6947,7 +6883,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             7,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             max_frame_bytes,
@@ -6999,7 +6935,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             7,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             max_frame_bytes,
@@ -7099,7 +7035,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             7,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             frame_cap,
@@ -7254,7 +7190,7 @@ mod tests {
         LegacyResponseCodec::encode_response(
             1,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             frame_cap,
@@ -7263,7 +7199,7 @@ mod tests {
 
         // Enough available blocks to overflow the cumulative byte budget must be
         // rejected, not fully materialized as a `Vec<Frame>`.
-        let block_copies = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let block_copies = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
         let many_blocks = Response::Blocks(
             (0..block_copies)
                 .map(|_| InventoryResponse::Available((block.clone().into(), None)))
@@ -7279,7 +7215,7 @@ mod tests {
 
         // The same cumulative budget guards the transaction responder path,
         // which shares `push_chunked_response`.
-        let tx_copies = 2 * LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let tx_copies = 2 * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
         let many_transactions = Response::Transactions(
             (0..tx_copies)
                 .flat_map(|_| {
@@ -7972,10 +7908,7 @@ mod tests {
 
         record_block_response_source(
             &trace,
-            Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
-                None,
-            ))]),
+            Response::Blocks(vec![InventoryResponse::Available((block.into(), None))]),
             BlockBodySource::Legacy,
             Some(&requested_hashes),
         );

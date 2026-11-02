@@ -143,6 +143,13 @@ fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
 }
 
 #[cfg(test)]
+fn test_decoded_pool() -> zakura_node_services::block_memory::DecodedBlockPool {
+    ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(10_000)
+        .expect("fixture decoded allowance fits")
+}
+
+#[cfg(test)]
 fn test_work_owner() -> zakura_header_chain::BodyWorkOwner {
     test_work_scope().bind(6, std::num::NonZeroU64::new(7).expect("seven is nonzero"))
 }

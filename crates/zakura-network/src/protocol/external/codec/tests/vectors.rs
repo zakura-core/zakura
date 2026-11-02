@@ -130,6 +130,8 @@ fn deserialize_version_with_time(time: i64) -> Result<Message, Error> {
     })
 }
 
+/// L.ignored: ignored Bloom commands pass their checksum and leave nothing behind. The
+/// decoder continues to the next message in the same turn, as the protocol rule requires.
 #[test]
 fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
     let mut codec = Codec::builder().finish();

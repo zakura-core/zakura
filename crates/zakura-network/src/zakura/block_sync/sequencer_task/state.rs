@@ -10,9 +10,11 @@
 //! it changes current work.
 
 use std::collections::VecDeque;
+use zakura_node_services::block_memory::Admission;
 
 use chrono::{DateTime, Utc};
 
+use super::super::reorder::PayloadChange;
 use super::*;
 use crate::zakura::header_sync::{
     BodyRetryEpisode, BodyRetryQueue, RetryUpdate, SeededRetryJitter,
@@ -169,12 +171,41 @@ pub(super) struct FrontierResetClassified {
 pub(super) struct ControlOutputs {
     /// The reactor must rerun its query and scheduling reaction.
     pub(super) needs_reaction: bool,
+    /// Runtime payload effects, which IO applies before `operations`.
+    pub(super) payload_changes: Vec<PayloadChange>,
     /// Shared-resource effects, in execution order.
     pub(super) operations: Vec<SequencerOperation>,
     /// The classification of a chain-tip reset input.
     pub(super) frontier_reset: Option<FrontierResetClassified>,
     /// Wire bytes of a newly committed body, for commit throughput.
     pub(super) committed_bytes: Option<u64>,
+}
+
+/// The result of offering a received body to the state.
+#[derive(Debug)]
+pub(super) struct BodyAccepted {
+    /// What the state did with the body.
+    pub(super) acceptance: BodyAcceptance,
+    /// Runtime payload effects, including the release of a body the policy did not keep.
+    pub(super) payload_changes: Vec<PayloadChange>,
+}
+
+/// The retained body a submission of one height needs, and how to admit its decode.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SubmissionBody {
+    /// The payload that IO materializes.
+    pub(super) id: super::super::reorder::BodyId,
+    /// The admission class of this height's decode.
+    pub(super) admission: Admission,
+}
+
+/// The result of rolling back a submission the action channel refused.
+#[derive(Debug)]
+pub(super) struct SubmissionRefused {
+    /// Whether the state scheduled a retry.
+    pub(super) retry_scheduled: bool,
+    /// Runtime payload effects of the rollback.
+    pub(super) payload_changes: Vec<PayloadChange>,
 }
 
 /// A submission pass over the heights that were submittable when it began.
@@ -206,7 +237,7 @@ impl zakura_header_chain::Clock for WallClock {
 /// Pure sequencing state of the commit pipeline; see the module docs.
 #[derive(Debug)]
 pub(super) struct SequencerState {
-    pub(super) sequencer: Sequencer,
+    sequencer: Sequencer,
     retained_body_limit: u64,
     /// Tracks the finalized height so the published view carries it forward; the
     /// reactor folds it into its `finalized_height` mirror with a `max`.
@@ -265,6 +296,11 @@ impl SequencerState {
 
     pub(super) fn sequencer(&self) -> &Sequencer {
         &self.sequencer
+    }
+
+    #[cfg(test)]
+    pub(super) fn sequencer_mut(&mut self) -> &mut Sequencer {
+        &mut self.sequencer
     }
 
     #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -353,7 +389,20 @@ impl SequencerState {
 
     /// Offer a received body to the reorder buffer, then drain the ready
     /// contiguous prefix into applying.
-    pub(super) fn accept_body(&mut self, mut body: ReceivedBody) -> BodyAcceptance {
+    pub(super) fn accept_body(&mut self, body: ReceivedBody) -> BodyAccepted {
+        let id = body.body.id;
+        let acceptance = self.offer_body(body);
+        let mut payload_changes = self.sequencer.take_payload_changes();
+        if !matches!(acceptance, BodyAcceptance::Buffered) {
+            payload_changes.push(PayloadChange::Release(id));
+        }
+        BodyAccepted {
+            acceptance,
+            payload_changes,
+        }
+    }
+
+    fn offer_body(&mut self, mut body: ReceivedBody) -> BodyAcceptance {
         let scope_is_current = self.current_scope.is_some_and(|current| {
             current.body_work_epoch == body.owner.authority().body_work_epoch
         });
@@ -500,6 +549,7 @@ impl SequencerState {
         if outputs.needs_reaction {
             self.reaction_epoch = self.reaction_epoch.saturating_add(1);
         }
+        outputs.payload_changes = self.sequencer.take_payload_changes();
         outputs
     }
 
@@ -1085,6 +1135,28 @@ impl SequencerState {
         Some(height)
     }
 
+    /// The body to materialize for a submission of `height`, if one is due.
+    pub(super) fn submission_body(&self, height: block::Height) -> Option<SubmissionBody> {
+        let facts = self.sequencer.submission_body(height)?;
+        Some(SubmissionBody {
+            id: facts.id,
+            admission: super::super::admission::submission_decode_admission(
+                self.sequencer.verified_tip(),
+                height,
+            ),
+        })
+    }
+
+    /// Record the materialized size of the payload `id` and assign an apply token.
+    pub(super) fn prepare_submit(
+        &mut self,
+        height: block::Height,
+        id: super::super::reorder::BodyId,
+        decoded_bytes: u64,
+    ) -> Option<super::super::sequencer::SubmitItem> {
+        self.sequencer.prepare_submit(height, id, decoded_bytes)
+    }
+
     /// The driver accepted the submission of `height`.
     ///
     /// Returns the start of the retry episode this acceptance ends, if any.
@@ -1106,23 +1178,24 @@ impl SequencerState {
     /// The action channel refused the submission of `height` at time `now`, which
     /// ends the pass.
     ///
-    /// Rolls back the exact `token` and returns whether a retry was scheduled. A
-    /// closed action channel schedules no retry.
+    /// Rolls back the exact `token`. A closed action channel schedules no retry.
     pub(super) fn submission_refused(
         &mut self,
         height: block::Height,
         token: BlockApplyToken,
         now: time::Instant,
         actions_closed: bool,
-    ) -> bool {
+    ) -> SubmissionRefused {
         self.sequencer.unsubmit(height, token);
-        if actions_closed {
-            return false;
+        if !actions_closed {
+            self.submission_retry.started_at.get_or_insert(now);
+            self.submission_retry.attempt = self.submission_retry.attempt.saturating_add(1);
+            self.submission_retry.at = Some(now + SUBMISSION_RETRY_DELAY);
         }
-        self.submission_retry.started_at.get_or_insert(now);
-        self.submission_retry.attempt = self.submission_retry.attempt.saturating_add(1);
-        self.submission_retry.at = Some(now + SUBMISSION_RETRY_DELAY);
-        true
+        SubmissionRefused {
+            retry_scheduled: !actions_closed,
+            payload_changes: self.sequencer.take_payload_changes(),
+        }
     }
 
     /// The submission retry deadline passed; the caller runs a submission pass.

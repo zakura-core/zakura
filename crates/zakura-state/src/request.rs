@@ -2442,6 +2442,15 @@ mod derived_allocation_tests {
 mod locator_capacity_tests {
     use super::*;
 
+    /// Spawn one blocking read on `workers`.
+    fn spawn_read<T: Send + 'static>(
+        workers: &ReadWorkerPool,
+        job: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
+    ) -> impl futures::Future<Output = Result<T, BoxError>> {
+        TimedSpan::new(CodeTimer::start_desc("test_read"), tracing::Span::none())
+            .spawn_blocking(workers.clone(), job)
+    }
+
     /// Cancelling delivery cannot make a live blocking job's slot available.
     #[tokio::test]
     async fn blocking_read_slot_survives_caller_drop_and_worker_panic() {
@@ -2461,15 +2470,14 @@ mod locator_capacity_tests {
             let running = active.clone();
             let (started, started_rx) = tokio::sync::oneshot::channel();
             let (release, release_rx) = std::sync::mpsc::channel();
-            let result = TimedSpan::new(CodeTimer::start_desc("read_slot"), tracing::Span::none())
-                .spawn_blocking(workers.clone(), move || {
-                    running.fetch_add(1, Ordering::SeqCst);
-                    let _job = LiveJob(running);
-                    started.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                    assert!(!panic, "test blocking read panic");
-                    Ok(())
-                });
+            let result = spawn_read(&workers, move || {
+                running.fetch_add(1, Ordering::SeqCst);
+                let _job = LiveJob(running);
+                started.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(!panic, "test blocking read panic");
+                Ok(())
+            });
             timeout(Duration::from_secs(10), started_rx)
                 .await
                 .unwrap()
@@ -2516,13 +2524,11 @@ mod locator_capacity_tests {
             let input = PendingInput(released.clone());
             let ran = Arc::new(AtomicBool::new(false));
             let executed = ran.clone();
-            let mut pending =
-                TimedSpan::new(CodeTimer::start_desc("read_waiter"), tracing::Span::none())
-                    .spawn_blocking(workers.clone(), move || {
-                        executed.store(true, Ordering::SeqCst);
-                        drop(input);
-                        Ok(())
-                    });
+            let mut pending = spawn_read(&workers, move || {
+                executed.store(true, Ordering::SeqCst);
+                drop(input);
+                Ok(())
+            });
             if poll {
                 assert!(futures::poll!(&mut pending).is_pending());
             }
@@ -2534,11 +2540,7 @@ mod locator_capacity_tests {
             assert!(!ran.load(Ordering::SeqCst), "unadmitted work never starts");
             assert_eq!(workers.slots.available_permits(), 0);
             drop(occupied);
-            let next = TimedSpan::new(
-                CodeTimer::start_desc("read_after_cancel"),
-                tracing::Span::none(),
-            )
-            .spawn_blocking(workers.clone(), || Ok(7));
+            let next = spawn_read(&workers, || Ok(7));
             assert_eq!(
                 tokio::time::timeout(std::time::Duration::from_secs(10), next)
                     .await
@@ -2555,10 +2557,7 @@ mod locator_capacity_tests {
     async fn waiter_bound_refuses_excess_callers_without_holding_capacity() {
         let workers = ReadWorkerPool::new(1, 1);
         let occupied = workers.slots.clone().try_acquire_owned().unwrap();
-        let read = |workers: &ReadWorkerPool| {
-            TimedSpan::new(CodeTimer::start_desc("read_waiter"), tracing::Span::none())
-                .spawn_blocking(workers.clone(), || Ok(7))
-        };
+        let read = |workers: &ReadWorkerPool| spawn_read(workers, || Ok(7));
 
         let mut waiting = read(&workers);
         assert!(futures::poll!(&mut waiting).is_pending());
@@ -2601,12 +2600,10 @@ mod locator_capacity_tests {
             let workers = ReadWorkerPool::new(1, 16);
             let ran = Arc::new(AtomicBool::new(false));
             let executed = ran.clone();
-            let result =
-                TimedSpan::new(CodeTimer::start_desc("queued_read"), tracing::Span::none())
-                    .spawn_blocking(workers.clone(), move || {
-                        executed.store(true, Ordering::SeqCst);
-                        Ok(())
-                    });
+            let result = spawn_read(&workers, move || {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            });
             drop(result);
             assert!(!ran.load(Ordering::SeqCst));
             assert_eq!(

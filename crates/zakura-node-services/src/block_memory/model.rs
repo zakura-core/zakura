@@ -2,8 +2,10 @@
 //!
 //! Each four-byte operation selects an action, source slot, destination slot,
 //! and pool. Eight slots retain real block, header, and transaction handles.
-//! Three pools have distinct identities; two enforce equal byte limits and one
-//! enforces a count limit. The model derives charges from its own handle graph.
+//! Three pools have distinct identities; two enforce equal pipeline byte limits
+//! and one enforces a count limit. The model derives charges from its own handle
+//! graph. Action 5 retired with charge transfer, so it does nothing and decoder-v1
+//! inputs keep their byte positions.
 //! Weak allocation probes independently read the real payloads and charge owner.
 //! Checks cover completed operations and an explicit drain before pool destruction.
 
@@ -46,8 +48,8 @@ const SLOTS: usize = 8;
 pub struct PoolView {
     /// Attributed decoded bytes.
     pub bytes: u64,
-    /// Allocations, when the pool enforces a count limit.
-    pub blocks: Option<u64>,
+    /// Retained allocations.
+    pub blocks: u64,
     /// Whether this generation has closed admission.
     pub closed: bool,
 }
@@ -64,7 +66,7 @@ pub struct AllocationView {
     pub header_holders: usize,
     /// Strong references to each actual transaction allocation.
     pub transaction_holders: Vec<usize>,
-    /// Current pool identity, read from the allocation's charge.
+    /// The pool that admitted the allocation, read from its charge.
     pub pool: Option<usize>,
     /// The owner's cached quantity, when the owner remains live.
     pub cached_bytes: Option<u64>,
@@ -125,26 +127,21 @@ impl Probe {
         }
     }
 
-    /// Read actual payload references and the current charge owner without waiting.
-    /// A held or poisoned charge lock, or an unknown pool, makes the read unavailable.
+    /// Read actual payload references and the charge owner without waiting.
+    /// An unknown pool makes the read unavailable.
     /// `id` and pool order supply the caller's stable trace identities.
     pub fn read(&self, id: usize, pools: &[DecodedBlockPool]) -> Result<AllocationView, String> {
         let holders = self.owner.strong_count();
         let owner = self.owner.upgrade();
-        let pool = if let Some(owner) = &owner {
-            let charge = owner
-                .charge
-                .try_lock()
-                .map_err(|_| format!("allocation {id} charge is unavailable at this boundary"))?;
-            Some(
+        let pool = owner
+            .as_ref()
+            .map(|owner| {
                 pools
                     .iter()
-                    .position(|pool| Arc::ptr_eq(&pool.0, &charge.pool.0))
-                    .ok_or_else(|| format!("allocation {id} names an unregistered pool"))?,
-            )
-        } else {
-            None
-        };
+                    .position(|pool| Arc::ptr_eq(&pool.0, &owner.charge.pool.0))
+                    .ok_or_else(|| format!("allocation {id} names an unregistered pool"))
+            })
+            .transpose()?;
         Ok(AllocationView {
             id,
             holders,
@@ -160,22 +157,11 @@ impl Probe {
 }
 
 #[derive(Clone)]
+#[allow(dead_code, reason = "a slot retains its handle without reading it")]
 enum Handle {
     Block(BlockHandle),
     Header(HeaderHandle),
     Transaction(TransactionHandle),
-}
-
-impl Handle {
-    fn owner(&self) -> Option<&OwnedBlock> {
-        match self {
-            Self::Block(BlockHandle::Owned(block)) | Self::Header(HeaderHandle::Block(block)) => {
-                Some(block)
-            }
-            Self::Transaction(TransactionHandle::Owned(transaction)) => Some(&transaction.block),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -242,17 +228,7 @@ impl Model {
                 self.slots[destination] = Some(handle);
             }
             4 => self.slots[source] = None,
-            5 => {
-                let Some(handle) = self.slots[source] else {
-                    return "skipped".into();
-                };
-                if self.allocations[&handle.allocation] != pool {
-                    if let Err(reason) = self.admission(pool) {
-                        return reason.into();
-                    }
-                    self.allocations.insert(handle.allocation, pool);
-                }
-            }
+            5 => return "skipped".into(),
             6 => self.closed[pool] = true,
             _ => unreachable!(),
         }
@@ -266,7 +242,7 @@ impl Model {
                     let count = u64::try_from(self.used(pool)).expect("at most eight handles");
                     PoolView {
                         bytes: count * self.bytes,
-                        blocks: (pool == 2).then_some(count),
+                        blocks: count,
                         closed: self.closed[pool],
                     }
                 })
@@ -329,14 +305,7 @@ impl Driver {
                 self.slots[destination] = Some(handle);
             }
             4 => self.slots[source] = None,
-            5 => {
-                let Some(owner) = self.slots[source].as_ref().and_then(Handle::owner) else {
-                    return "skipped".into();
-                };
-                if let Err(reason) = owner.transfer_to(&self.pools[pool], Admission::WithinLimit) {
-                    return reason.to_string();
-                }
-            }
+            5 => return "skipped".into(),
             6 => self.pools[pool].close(),
             _ => unreachable!(),
         }
@@ -366,10 +335,10 @@ impl Driver {
 
 /// Run at most 512 causal bytes through production owners and an independent model.
 ///
-/// Operations are admit, clone, retain header, retain transaction, drop, transfer,
+/// Operations are admit, clone, retain header, retain transaction, drop, nothing,
 /// and close (opcode modulo seven). Short operations are zero-padded for execution
 /// and retained verbatim in evidence. Every successful history ends with a drain.
-/// Driver panics and unavailable charge reads remain capture errors.
+/// Driver panics and unregistered pools remain capture errors.
 pub fn trace_retention_bytes(input: &[u8]) -> Vec<RetentionStep> {
     let fixture = block();
     let bytes = fixture.attributed_memory_size_bytes();
@@ -384,8 +353,8 @@ pub fn trace_retention_bytes(input: &[u8]) -> Vec<RetentionStep> {
     };
     let mut driver = Driver {
         pools: [
-            DecodedBlockPool::new(3 * bytes),
-            DecodedBlockPool::new(3 * bytes),
+            DecodedBlockPool::for_pipeline(NonZeroU64::MAX, 3 * bytes),
+            DecodedBlockPool::for_pipeline(NonZeroU64::MAX, 3 * bytes),
             DecodedBlockPool::for_block_count(NonZeroU64::new(2).unwrap()),
         ],
         slots: std::array::from_fn(|_| None),
@@ -459,9 +428,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn final_parts_follow_transfers_and_settle_before_pool_destruction() {
+    fn final_parts_settle_their_admitting_pool_before_destruction() {
+        // Admit to pool 2, retain a header and a transaction, drop the block handle,
+        // drop the header, and close pool 2 while the transaction holds its charge.
         let input = [
-            0, 0, 0, 0, 2, 0, 1, 0, 3, 0, 2, 0, 4, 0, 0, 0, 5, 1, 0, 2, 4, 1, 0, 0, 6, 0, 0, 2,
+            0, 0, 0, 2, 2, 0, 1, 0, 3, 0, 2, 0, 4, 0, 0, 0, 4, 1, 0, 0, 6, 0, 0, 2,
         ];
         let steps = trace_retention_bytes(&input);
         assert_eq!(steps.len(), input.len() / 4 + 1);
@@ -469,9 +440,9 @@ mod tests {
             assert_eq!(step.actual.as_ref(), Some(&step.expected), "{step:?}");
         }
         assert_eq!(steps[3].expected.allocations[0].holders, 2);
-        assert_eq!(steps[4].expected.pools[2].blocks, Some(1));
-        assert!(steps[6].expected.pools[2].closed);
-        assert!(steps[6].expected.pools[2].bytes > 0);
+        assert_eq!(steps[4].expected.pools[2].blocks, 1);
+        assert!(steps[5].expected.pools[2].closed);
+        assert!(steps[5].expected.pools[2].bytes > 0);
         assert!(steps
             .last()
             .unwrap()
@@ -483,7 +454,7 @@ mod tests {
 
     #[test]
     fn weak_payload_probes_detect_an_ownerless_raw_transaction() {
-        let pool = DecodedBlockPool::new(u64::MAX);
+        let pool = DecodedBlockPool::for_pipeline(NonZeroU64::MAX, u64::MAX);
         let owner = pool.try_admit(block(), Admission::WithinLimit).unwrap();
         let probe = Probe::new(&owner);
         let raw = owner.0.block.transactions[0].clone();
@@ -492,15 +463,6 @@ mod tests {
         assert_eq!(view.holders, 0);
         assert_eq!(view.transaction_holders, vec![1]);
         drop(raw);
-    }
-
-    #[test]
-    fn locked_charge_is_unavailable_without_waiting() {
-        let pool = DecodedBlockPool::new(u64::MAX);
-        let owner = pool.try_admit(block(), Admission::WithinLimit).unwrap();
-        let probe = Probe::new(&owner);
-        let _guard = owner.0.charge.lock().unwrap();
-        assert!(probe.read(1, &[pool]).unwrap_err().contains("unavailable"));
     }
 
     #[test]

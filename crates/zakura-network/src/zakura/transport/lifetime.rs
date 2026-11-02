@@ -32,8 +32,10 @@
 //!
 //! A request stream funds its response from the output budgets before its service
 //! runs, so no materialized result waits unfunded. Each execution also runs on a
-//! stream that holds one of its connection's `max_open_streams` permits, and a
-//! connection keeps its slot until its stream workers settle.
+//! stream that holds one of its connection's `max_open_streams` permits. A
+//! connection keeps its slot until its stream workers settle or teardown's bounded
+//! drain ends. A worker that outlasts the drain stays in the [`OwnerLedger`] until
+//! its task ends.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,10 +52,14 @@ use crate::zakura::{
 };
 use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
-/// The most response frame bytes one compatibility exchange may retain.
+/// The most response frame bytes one compatibility exchange may retain, on either
+/// side.
 ///
-/// The responder caps a response at the same value, so an honest peer never
-/// exceeds it.
+/// A request can name up to `MAX_TX_INV_IN_SENT_MESSAGE` hashes. Without this cap,
+/// `encode_response` would retain a whole multi-frame response before its first write,
+/// and a hostile responder could fill a requester with tens of GiB of accepted frames
+/// before any decode. The local service emits far less, because `zakurad` caps
+/// `getdata` at about 1 MiB, so an honest peer never exceeds it.
 pub(crate) const COMPAT_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
 
 /// The most bytes one compatibility exchange may charge: its frames, plus the
@@ -86,7 +92,7 @@ pub(crate) struct TransportLimits {
     pub(crate) max_frame_bytes: u32,
 }
 
-/// The node's transport byte and worker bounds, derived from its transport limits.
+/// The node's transport byte bounds, derived from its transport limits.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceEnvelope {
     /// Raw inbound frame bytes that one connection may retain.
@@ -97,8 +103,6 @@ pub(crate) struct ResourceEnvelope {
     pub(crate) connection_output_bytes: u64,
     /// Queued frame bytes without another owner that the node may retain.
     pub(crate) node_output_bytes: u64,
-    /// Request-stream executions that open streams allow at once across the node.
-    pub(crate) request_executions: usize,
     /// Outbound compatibility exchange bytes that the node may retain.
     pub(crate) compat_response_bytes: u64,
     /// The frames each stream's raw and output floor slots may retain, in bytes.
@@ -129,7 +133,6 @@ impl ResourceEnvelope {
             node_raw_bytes: node_bytes(connection_raw_bytes),
             connection_output_bytes,
             node_output_bytes: node_bytes(connection_output_bytes),
-            request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
             compat_response_bytes: COMPAT_RESPONSE_EXCHANGES * COMPAT_EXCHANGE_MAX_BYTES,
             floor_frame_bytes: 2 * streams * u128::from(limits.max_frame_bytes),
             transport_credit_bytes: live_connections
@@ -330,6 +333,15 @@ impl ConnectionResources {
 }
 
 #[cfg(test)]
+impl FrameGate {
+    /// A gate over `connection`, under a node budget that never binds.
+    pub(crate) fn over(connection: OutputByteBudget) -> Self {
+        let node = OutputByteBudget::new(1 << 30).expect("the test budget has a valid size");
+        Self::new(connection, node)
+    }
+}
+
+#[cfg(test)]
 impl StreamResources {
     /// Owners that never bind, for tests of other behavior.
     pub(crate) fn unconstrained() -> Self {
@@ -385,16 +397,12 @@ impl FrameGate {
         }
     }
 
-    /// Wait to fund a result of at most `frames` frames and `bytes` bytes.
-    /// Cancelling the wait takes nothing.
+    /// Wait to fund a multi-frame result of at most `bytes` bytes from the shared
+    /// budgets. Cancelling the wait takes nothing.
     ///
-    /// A one-frame result may use the floor slot, because the floor funds one frame.
-    /// A larger result waits for the shared budgets, so a saturated node cannot hide
-    /// a whole multi-frame response behind one floor slot.
-    pub(crate) async fn admit_result(&self, frames: usize, bytes: u64) -> FrameGrant {
-        if frames <= 1 {
-            return self.admit(bytes).await;
-        }
+    /// The floor funds one frame, so a saturated node cannot hide a whole multi-frame
+    /// response behind one floor slot. A one-frame result uses [`Self::admit`].
+    pub(crate) async fn admit_shared(&self, bytes: u64) -> FrameGrant {
         let started = Instant::now();
         let charge = FrameCharge::shared(self.shared(bytes).await);
         FrameGrant {

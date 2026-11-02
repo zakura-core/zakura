@@ -35,10 +35,38 @@ use crate::{
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock,
 };
 
+/// Start a Mainnet state service on `config` with genesis committed to disk.
+async fn genesis_read_state(
+    config: Config,
+) -> (
+    crate::service::StateService,
+    crate::service::ReadStateService,
+    Arc<Block>,
+) {
+    let (mut state, read, _, _) =
+        crate::service::StateService::new(config, &Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    (state, read, genesis)
+}
+
 /// A real disk result keeps admission after its worker and database handles end.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_block_results_keep_shared_admission_through_final_payload_holders() {
-    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use crate::{ReadRequest, ReadResponse};
     use std::{num::NonZeroU16, time::Duration};
     use tokio::time::timeout;
     use tower::ServiceExt;
@@ -50,22 +78,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         read_block_limit: NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (state, read, genesis) = genesis_read_state(config).await;
 
     let ReadResponse::Block(Some(block)) = timeout(
         deadline,
@@ -82,7 +95,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     };
     let probe = Probe::new(owner);
     let bytes = owner.decoded_bytes();
-    let pool = read.db.read_blocks.clone();
+    let pool = read.db.read_capacity.blocks.clone();
     let header = block.retained_header();
     let transaction = block.transaction(0).unwrap();
     drop(block);
@@ -105,7 +118,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
             .unwrap_err(),
         AdmissionFailure::Capacity
     );
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
     assert_eq!(actual.measured_bytes, Some(bytes));
     assert_eq!(actual.header_holders, 1);
@@ -125,21 +138,21 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         .unwrap()
         .unwrap();
     assert_eq!(tip.hash, genesis.hash());
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     drop(tip);
 
     drop(header);
     assert_eq!(transaction.hash(), genesis.transactions[0].hash());
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     drop(transaction);
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
     assert_eq!(pool.reserved_bytes(), 0);
     let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
     assert_eq!(actual.holders, 0);
     assert_eq!(actual.header_holders, 0);
     assert_eq!(actual.transaction_holders, vec![0]);
     assert!(read.db.block(Height(1).into()).unwrap().is_none());
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
 
     let (block, size) = read.db.block_and_size(Height(0).into()).unwrap().unwrap();
     assert_eq!(size, genesis.zcash_serialized_size());
@@ -150,7 +163,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     drop(state);
     drop(read);
     assert_eq!(block.hash(), genesis.hash());
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -159,7 +172,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         Some(bytes)
     );
     drop(block);
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -172,7 +185,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
 /// Direct reads, services, and iterators share final-holder transaction admission.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_transactions_keep_shared_admission_through_clones_and_database_drop() {
-    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use crate::{ReadRequest, ReadResponse};
     use std::{num::NonZeroU16, time::Duration};
     use tokio::time::timeout;
     use tower::ServiceExt;
@@ -186,22 +199,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
         read_transaction_limit: NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (state, read, genesis) = genesis_read_state(config).await;
     let hash = genesis.transactions[0].hash();
     let ReadResponse::Transaction(Some(result)) = timeout(
         deadline,
@@ -214,7 +212,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     };
     assert_eq!(result.tx.hash(), hash);
     assert_eq!(result.height, Height(0));
-    let pool = read.db.read_transactions.clone();
+    let pool = read.db.read_capacity.transactions.clone();
     assert_eq!(
         pool.available_slots(),
         0,
@@ -385,7 +383,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
     };
     assert_eq!(headers.len(), 1);
     assert!(matches!(headers[0], HeaderHandle::Standalone(_)));
-    let pool = read.db.read_headers.clone();
+    let pool = read.db.read_capacity.headers.clone();
     assert_eq!(
         pool.available_slots(),
         usize::from(limit.get()) - 1,
@@ -398,7 +396,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
 /// Header and serialized block results retain shared admission through final holders.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_header_and_raw_block_results_keep_shared_admission() {
-    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use crate::{ReadRequest, ReadResponse};
     use std::{num::NonZeroU16, time::Duration};
     use tokio::time::timeout;
     use tower::ServiceExt;
@@ -413,22 +411,7 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         read_raw_block_limit: NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (state, read, genesis) = genesis_read_state(config).await;
     let height_zero = crate::HashOrHeight::Height(Height(0));
     let header_read = ReadRequest::BlockHeader(height_zero);
     let ReadResponse::BlockHeader { header, .. } =
@@ -440,7 +423,7 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         panic!("the stored genesis header is available")
     };
     assert_eq!(*header, *genesis.header);
-    let pool = read.db.read_headers.clone();
+    let pool = read.db.read_capacity.headers.clone();
     assert_eq!(
         pool.available_slots(),
         0,
@@ -497,7 +480,7 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         .is_none());
     assert_eq!(pool.available_slots(), 1);
 
-    let raw_pool = read.db.read_raw_blocks.clone();
+    let raw_pool = read.db.read_capacity.raw_blocks.clone();
     let raw = read.db.raw_block_result(height_zero).unwrap().unwrap();
     assert_eq!(
         raw.as_slice(),
@@ -603,7 +586,7 @@ fn transaction_index_migrations_progress_with_one_decode_slot() {
         #[cfg(not(feature = "indexer"))]
         upgrade::drop_tx_locs_by_spends::run(Height(31), &db, &receiver).unwrap();
     });
-    assert_eq!(db.read_transactions.available_slots(), 1);
+    assert_eq!(db.read_capacity.transactions.available_slots(), 1);
 }
 
 /// Storage round-trip test for block and transaction data in the finalized state database.
@@ -705,9 +688,7 @@ fn test_block_db_round_trip_with(
                 new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
 
             CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(
-                    original_block.clone(),
-                ),
+                block: original_block.clone().into(),
                 hash,
                 height: Height(0),
                 new_outputs,
@@ -887,34 +868,17 @@ fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
 /// from parser memory, and a refusal is not reported as missing data.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
-    use crate::service::StateService;
-    use std::{num::NonZeroU64, time::Duration};
-    use tokio::time::timeout;
+    use std::num::NonZeroU64;
     use zakura_node_services::block_memory::{
         AdmissionFailure, PayloadAdmissionFailure, ReadMemoryBudget,
     };
 
     let _guard = zakura_test::init();
-    let (mut state, read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (_state, read, genesis) = genesis_read_state(Config::ephemeral()).await;
 
     let mut db = read.db.clone();
     let budget = ReadMemoryBudget::new(NonZeroU64::MAX, NonZeroU64::MIN);
-    db.read_memory = budget.clone();
+    db.read_capacity.memory = budget.clone();
     let height = Height(0).into();
 
     let block = db.block(height).unwrap().unwrap();
@@ -982,34 +946,17 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
 /// The parser limit refuses rows before a read copies the rest of a block.
 #[tokio::test(flavor = "multi_thread")]
 async fn parser_limit_refuses_reads_while_another_parser_holds_it() {
-    use crate::service::StateService;
-    use std::{num::NonZeroU64, time::Duration};
-    use tokio::time::timeout;
+    use std::num::NonZeroU64;
     use zakura_node_services::block_memory::{
         AdmissionFailure, DecodedBlockPool, ReadMemoryBudget,
     };
 
     let _guard = zakura_test::init();
-    let (mut state, read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis)),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (_state, read, _) = genesis_read_state(Config::ephemeral()).await;
 
     let mut db = read.db.clone();
     let budget = ReadMemoryBudget::new(NonZeroU64::new(8).unwrap(), NonZeroU64::MAX);
-    db.read_memory = budget.clone();
+    db.read_capacity.memory = budget.clone();
 
     let pool = DecodedBlockPool::for_block_count(NonZeroU64::new(4).unwrap());
     let outer = pool.try_decode_bounded(&budget, |outer_scope| {

@@ -24,7 +24,7 @@ use super::super::{
     peer_registry::PeerRegistry,
     regulated::{live_requester::LiveRequester, session::ServingSession},
     reorder::BufferedBlockBody,
-    sequencer_task::{charge_decoded_handoff, SequencedBody, SequencerView},
+    sequencer_task::{charge_decoded_handoff, DecodedHandoffCharge, SequencedBody, SequencerView},
     state::{OutstandingBlockRange, RequestKey, ThroughputMeter, WriteOutcome},
     work_queue::{RequestWriteStatus, WorkQueue},
     BlockSyncMisbehavior, BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
@@ -242,7 +242,7 @@ impl PeerIO {
     /// the limiter and the resident snapshot.
     pub(super) fn send_under_receipt(
         &self,
-        body: ReceivedBody<Option<OwnedBlock>>,
+        body: ReceivedBody<Option<AdmittedBody>>,
         owner: zakura_header_chain::BodyWorkOwner,
         funding: ByteReservation,
         admitted_estimate_bytes: Option<u64>,
@@ -254,10 +254,13 @@ impl PeerIO {
 
     /// Adopt the parser's exclusive payloads before retaining a decoded body.
     /// Refusal keeps only the raw frame for a later admission attempt.
+    ///
+    /// The input-queue room check comes first. A pool admission that the check
+    /// then refused would release its charge at once and wake every capacity waiter.
     pub(super) fn admit_decoded_body(
         &self,
         body: ReceivedBody,
-    ) -> Result<(ReceivedBody<Option<OwnedBlock>>, u64), AdmissionFailure> {
+    ) -> Result<(ReceivedBody<Option<AdmittedBody>>, u64), AdmissionFailure> {
         let ReceivedBody {
             height,
             hash,
@@ -285,7 +288,7 @@ impl PeerIO {
     fn admit_block(
         &self,
         block: Arc<block::Block>,
-    ) -> Result<(Option<OwnedBlock>, u64), AdmissionFailure> {
+    ) -> Result<(Option<AdmittedBody>, u64), AdmissionFailure> {
         if self.decoded_pool.is_closed() {
             self.cancel.cancel();
             return Err(AdmissionFailure::Closed);
@@ -294,11 +297,16 @@ impl PeerIO {
             Ok(block) => block,
             Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
         };
+        let bytes = block.attributed_memory_size_bytes();
+        let Some(charge) = charge_decoded_handoff(
+            &self.sequencer_input_decoded_attributed_memory_bytes,
+            &self.sequencer_view,
+            bytes,
+        ) else {
+            return Ok((None, bytes));
+        };
         match self.decoded_pool.try_admit(block, Admission::WithinLimit) {
-            Ok(block) => {
-                let bytes = block.decoded_bytes();
-                Ok((Some(block), bytes))
-            }
+            Ok(block) => Ok((Some(AdmittedBody { block, charge }), bytes)),
             Err(rejected) => {
                 if !matches!(
                     rejected.reason,
@@ -315,7 +323,7 @@ impl PeerIO {
 
     fn forward_body_to_sequencer(
         &self,
-        received: ReceivedBody<Option<OwnedBlock>>,
+        received: ReceivedBody<Option<AdmittedBody>>,
         owner: zakura_header_chain::BodyWorkOwner,
         admitted_estimate_bytes: Option<u64>,
     ) {
@@ -331,15 +339,11 @@ impl PeerIO {
         let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
         // The body owns the decoded charge from here, with no await between.
-        let charged = block.as_ref().is_some_and(|block| {
-            charge_decoded_handoff(
-                &self.sequencer_input_decoded_attributed_memory_bytes,
-                &self.sequencer_view,
-                block.decoded_bytes(),
-            )
-        });
         let body = match block {
-            Some(block) => BufferedBlockBody::for_handoff(block, raw_payload, charged),
+            Some(AdmittedBody { block, charge }) => {
+                charge.hand_over();
+                BufferedBlockBody::for_handoff(block, raw_payload)
+            }
             None => BufferedBlockBody::RawFramePayload(raw_payload),
         };
         let body = SequencedBody::new_handed_off(
@@ -410,6 +414,12 @@ impl PeerIO {
             }
         );
     }
+}
+
+/// A body the decoded pool admitted, with its input-queue charge.
+pub(super) struct AdmittedBody {
+    block: OwnedBlock,
+    charge: DecodedHandoffCharge,
 }
 
 /// A body decoded from an authorized frame, with the sequencer slot acquired

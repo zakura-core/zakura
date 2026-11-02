@@ -1,4 +1,5 @@
 use super::{wire::*, *};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 /// Blocks this node requests per `GetBlocks` message and advertises per response.
 ///
@@ -423,13 +424,9 @@ impl ZakuraBlockSyncConfig {
     pub fn decoded_block_pool(
         &self,
         backend_blocks: u64,
-    ) -> Result<zakura_node_services::block_memory::DecodedBlockPool, &'static str> {
-        self.decoded_block_allowance(backend_blocks).map(|blocks| {
-            zakura_node_services::block_memory::DecodedBlockPool::for_pipeline(
-                blocks,
-                self.decoded_pipeline_byte_bound(),
-            )
-        })
+    ) -> Result<DecodedBlockPool, &'static str> {
+        self.decoded_block_allowance(backend_blocks)
+            .map(|blocks| DecodedBlockPool::for_pipeline(blocks, self.decoded_pipeline_byte_bound()))
     }
 
     /// Return the block count that a [decoded pool](Self::decoded_block_pool) admits.

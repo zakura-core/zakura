@@ -8,6 +8,7 @@ use std::{
     ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
 };
+use zakura_node_services::block_memory::TransactionHandle;
 
 use chrono::{DateTime, Utc};
 use tracing::instrument;
@@ -468,11 +469,7 @@ impl Chain {
     pub fn transaction(
         &self,
         hash: transaction::Hash,
-    ) -> Option<(
-        zakura_node_services::block_memory::TransactionHandle,
-        block::Height,
-        DateTime<Utc>,
-    )> {
+    ) -> Option<(TransactionHandle, block::Height, DateTime<Utc>)> {
         self.tx_loc_by_hash.get(&hash).map(|tx_loc| {
             (
                 self.blocks[&tx_loc.height]

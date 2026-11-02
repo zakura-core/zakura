@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::TransactionHandle;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -2958,8 +2959,7 @@ where
                             Some(mined.block_time),
                         ),
                         _ => {
-                            let raw_tx: zakura_node_services::block_memory::TransactionHandle =
-                                tx.into();
+                            let raw_tx: TransactionHandle = tx.into();
                             (raw_tx, None, None, None)
                         }
                     };
@@ -3023,7 +3023,7 @@ where
                     }
                 }
             } else {
-                let tx: zakura_node_services::block_memory::TransactionHandle = tx.into();
+                let tx: TransactionHandle = tx.into();
                 let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),

@@ -88,6 +88,45 @@ const FUNDING: Machine = Machine {
     },
 };
 
+const DECODED_RETENTION: Machine = Machine {
+    name: "block/decoded-retention",
+    identity: "block-decoded-retention",
+    claim: "At each completed owner operation and before pool destruction, independently read block/header/transaction allocations and exact pool charges agree with the model's handle graph. A closed generation preserves final-holder settlement. This target excludes asynchronous backend-worker coverage.",
+    generator: 1,
+    budget: 129,
+    history: |input| {
+        zakura_node_services::block_memory::model::trace_retention_bytes(input)
+            .into_iter()
+            .map(|step| (step.step, MachineStep::DecodedRetention(step.into())))
+            .collect()
+    },
+    reached: |steps, expect| {
+        let retention = || {
+            steps.iter().filter_map(|step| match step {
+                MachineStep::DecodedRetention(work) => Some(work),
+                _ => None,
+            })
+        };
+        retention().any(|work| work.expected.pools.iter().any(|pool| pool.bytes > 0))
+            && (expect != Expect::Holds
+                || retention().any(|work| {
+                    work.drain
+                        && work.actual.as_ref().is_some_and(|actual| {
+                            actual.pools.iter().all(|pool| pool.bytes == 0)
+                                && actual.allocations.iter().all(|allocation| {
+                                    allocation.holders == 0
+                                        && allocation.header_holders == 0
+                                        && allocation
+                                            .transaction_holders
+                                            .iter()
+                                            .all(|&count| count == 0)
+                                })
+                        })
+                        && work.expected.pools.iter().all(|pool| pool.bytes == 0)
+                }))
+    },
+};
+
 /// Pure policy uses the shared registry, recorder, replay verifier and explorer.
 pub const ENTRY: HarnessEntry = crate::machine_entry!(OWNERSHIP);
 
@@ -100,3 +139,6 @@ pub const REACTOR_ENTRY: HarnessEntry = crate::machine_entry!(REACTOR);
 /// This target establishes completed-operation retention, not asynchronous races
 /// or actual decoded-body/backend-worker lifetime.
 pub const FUNDING_ENTRY: HarnessEntry = crate::machine_entry!(FUNDING);
+
+/// Decoded owners share the registry and exact replay path, without QUIC.
+pub const DECODED_RETENTION_ENTRY: HarnessEntry = crate::machine_entry!(DECODED_RETENTION);

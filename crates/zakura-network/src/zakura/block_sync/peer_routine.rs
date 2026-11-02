@@ -1557,6 +1557,8 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use zakura_node_services::block_memory::BlockHandle;
+    use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
@@ -1676,9 +1678,7 @@ mod tests {
                 view: initial_view(genesis_frontiers()),
                 view_rx: None,
                 input_decoded_bytes: Arc::new(AtomicU64::new(0)),
-                decoded_pool: ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
+                decoded_pool: super::super::test_decoded_pool(),
             }
         }
 
@@ -3640,9 +3640,7 @@ mod tests {
         hand_off_mainnet_block_1_with_pool(
             applying_decoded_bytes,
             queued_decoded_bytes,
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .unwrap(),
+            super::super::test_decoded_pool(),
             false,
             false,
         )
@@ -3653,7 +3651,7 @@ mod tests {
     async fn hand_off_mainnet_block_1_with_pool(
         applying_decoded_bytes: u64,
         queued_decoded_bytes: u64,
-        pool: zakura_node_services::block_memory::DecodedBlockPool,
+        pool: DecodedBlockPool,
         late: bool,
         close_decoded_pool: bool,
     ) -> Option<(u64, SequencedBody, u64)> {
@@ -3888,14 +3886,11 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(queued, bytes);
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             assert_eq!(pool.reserved_bytes(), bytes);
             let block = sequenced
                 .body
-                .decoded_block(
-                    &pool,
-                    zakura_node_services::block_memory::Admission::WithinLimit,
-                )
+                .decoded_block(&pool, Admission::WithinLimit)
                 .unwrap();
             assert!(
                 matches!(block, BlockHandle::Owned(_)),
@@ -3924,10 +3919,10 @@ mod tests {
                 "a full pool retains only the original frame bytes"
             );
             assert_eq!(queued, 0);
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             drop(refused);
             drop(retained);
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
         }
     }
@@ -3953,14 +3948,14 @@ mod tests {
                     .is_none()
             );
             assert!(pool.is_closed());
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             assert_eq!(
                 pool.reserved_bytes(),
                 bytes,
                 "closure preserves earlier holders"
             );
             drop(retained);
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
         }
     }
@@ -3990,6 +3985,26 @@ mod tests {
                 .unwrap();
             assert_eq!(block.view().attributed_memory_size_bytes(), bytes);
             assert_eq!(pool.pipeline_bytes(), bytes);
+        }
+    }
+
+    /// A body without handoff room never enters the pool, so its refusal bumps no
+    /// capacity version and wakes no waiter.
+    #[tokio::test]
+    async fn a_handoff_without_room_wakes_no_capacity_waiter() {
+        use zakura_node_services::block_memory::DecodedBlockPool;
+        let cap = super::super::config::BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+        for late in [false, true] {
+            let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(1).unwrap());
+            let version = pool.capacity_version();
+            let (_, sequenced, queued) =
+                hand_off_mainnet_block_1_with_pool(cap, 0, pool.clone(), late, false)
+                    .await
+                    .unwrap();
+            assert!(!sequenced.body.is_decoded());
+            assert_eq!(queued, 0, "the refused charge returned");
+            assert_eq!(pool.reserved_blocks(), 0);
+            assert_eq!(pool.capacity_version(), version);
         }
     }
 
@@ -4031,12 +4046,7 @@ mod tests {
         // The body holds the routine's decode, so this reads it back.
         let routine_decode = sequenced
             .body
-            .decoded_block(
-                &ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .unwrap(),
-                zakura_node_services::block_memory::Admission::WithinLimit,
-            )
+            .decoded_block(&super::super::test_decoded_pool(), Admission::WithinLimit)
             .unwrap();
 
         let frontiers = genesis_frontiers();
@@ -4062,9 +4072,7 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         body_tx
             .try_send(sequenced)
@@ -4079,10 +4087,7 @@ mod tests {
         let BlockSyncAction::SubmitBlock { block, .. } = action else {
             panic!("expected a body submission, got {action:?}");
         };
-        assert!(matches!(
-            block,
-            zakura_node_services::block_memory::BlockHandle::Owned(_)
-        ));
+        assert!(matches!(block, BlockHandle::Owned(_)));
         assert_eq!(block, routine_decode);
         assert!(std::ptr::eq(block.header(), routine_decode.header()));
         for (submitted, received) in block

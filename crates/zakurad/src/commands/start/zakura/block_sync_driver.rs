@@ -2038,7 +2038,7 @@ mod tests {
             .zcash_deserialize_into()
             .expect("block vector parses");
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let probe = Probe::new(&block);
         let ready_polls = Arc::new(AtomicUsize::new(0));
@@ -2096,7 +2096,7 @@ mod tests {
             .expect("block vector parses");
         let transaction_hash = block.transactions[0].hash();
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let probe = Probe::new(&block);
         let (retained_tx, mut retained_rx) = mpsc::unbounded_channel();

@@ -1,6 +1,7 @@
 //! Get context and calculate difficulty for the next block.
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::HeaderHandle;
 
 use chrono::{DateTime, Utc};
 
@@ -167,15 +168,7 @@ fn best_relevant_chain_and_history_tree(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
     network: &Network,
-) -> Result<
-    (
-        Height,
-        block::Hash,
-        Vec<zakura_node_services::block_memory::HeaderHandle>,
-        Arc<HistoryTree>,
-    ),
-    BoxError,
-> {
+) -> Result<(Height, block::Hash, Vec<HeaderHandle>, Arc<HistoryTree>), BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
@@ -228,7 +221,7 @@ fn best_relevant_chain_and_history_tree(
 ///
 /// See [`get_block_template_chain_info()`] for details.
 fn difficulty_time_and_history_tree(
-    relevant_chain: Vec<zakura_node_services::block_memory::HeaderHandle>,
+    relevant_chain: Vec<HeaderHandle>,
     tip_height: Height,
     tip_hash: block::Hash,
     network: &Network,
@@ -690,10 +683,7 @@ mod tests {
                 (after_tip(BLOCK_MAX_TIME_SINCE_MEDIAN + 1), max_time),
             ] {
                 let result = difficulty_time_and_history_tree(
-                    vec![
-                        zakura_node_services::block_memory::HeaderHandle::Shared(header.clone());
-                        span
-                    ],
+                    vec![HeaderHandle::Shared(header.clone()); span],
                     tip_height,
                     block.hash(),
                     &network,
@@ -731,12 +721,7 @@ mod tests {
                 let required = usize::try_from((tip + 1).min(span)).unwrap();
                 for count in 0..=required {
                     let result = difficulty_time_and_history_tree(
-                        vec![
-                            zakura_node_services::block_memory::HeaderHandle::Shared(
-                                block.header.clone()
-                            );
-                            count
-                        ],
+                        vec![HeaderHandle::Shared(block.header.clone()); count],
                         Height(tip),
                         block.hash(),
                         &network,

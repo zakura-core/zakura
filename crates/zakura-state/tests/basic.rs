@@ -32,9 +32,7 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: LazyLock<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(block2),
-            ))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });
@@ -55,9 +53,7 @@ static COMMIT_FINALIZED_BLOCK_TESTNET: LazyLock<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(block2),
-            ))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });

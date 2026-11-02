@@ -72,22 +72,38 @@ pub struct DecodedRetentionStep {
     pub actual: Option<zakura_node_services::block_memory::model::RetentionView>,
     /// The independent model's retained handle graph and expected pool charges.
     pub expected: zakura_node_services::block_memory::model::RetentionView,
-    /// Unavailable capture or a driver panic, never a property detection.
+    /// The model's disagreement. An unavailable capture or a driver panic is
+    /// marked as no property detection.
     pub failure: Option<MachineFailure>,
 }
 
 impl From<zakura_node_services::block_memory::model::RetentionStep> for DecodedRetentionStep {
+    /// A capture error is driver evidence. A captured view that differs from the
+    /// model is the property's failure.
     fn from(value: zakura_node_services::block_memory::model::RetentionStep) -> Self {
+        let failure = match (&value.capture_error, &value.actual) {
+            (Some(message), _) => Some(MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message: message.clone(),
+            }),
+            (None, None) => Some(MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message: "decoded owner allocation capture is missing".into(),
+            }),
+            (None, Some(actual)) => (actual != &value.expected).then(|| MachineFailure {
+                property_failure: true,
+                phase: FailurePhase::Invariant,
+                message: format!("expected {:?}, actual {actual:?}", value.expected),
+            }),
+        };
         Self {
             input: value.input,
             drain: value.drain,
             actual: value.actual,
             expected: value.expected,
-            failure: value.capture_error.map(|message| MachineFailure {
-                property_failure: false,
-                phase: FailurePhase::Invariant,
-                message,
-            }),
+            failure,
         }
     }
 }
@@ -100,6 +116,7 @@ impl MachineStep {
             Self::Work(step) => step.failure.clone(),
             Self::WorkFunding(step) => step.failure.clone(),
             Self::Reactor(step) => step.failure.clone(),
+            Self::DecodedRetention(step) => step.failure.clone(),
         }
     }
 }
@@ -926,5 +943,44 @@ impl From<zakura_network::zakura::HeaderPublisherStep> for HeaderPublisherStep {
             expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_node_services::block_memory::model::{trace_retention_bytes, RetentionStep};
+
+    use super::*;
+
+    fn retention_step() -> RetentionStep {
+        trace_retention_bytes(&[0, 0, 0, 0]).remove(0)
+    }
+
+    #[test]
+    fn missing_allocation_capture_is_not_a_resource_violation() {
+        let mut step = retention_step();
+        step.actual = None;
+        let failure = MachineStep::DecodedRetention(step.into())
+            .failure()
+            .unwrap();
+        assert!(!failure.property_failure);
+        assert_eq!(
+            failure.message,
+            "decoded owner allocation capture is missing"
+        );
+    }
+
+    #[test]
+    fn a_retention_view_mismatch_is_the_property_failure() {
+        let mut step = retention_step();
+        assert_eq!(
+            MachineStep::DecodedRetention(step.clone().into()).failure(),
+            None
+        );
+        step.actual.as_mut().unwrap().pools[0].bytes += 1;
+        let failure = MachineStep::DecodedRetention(step.into())
+            .failure()
+            .unwrap();
+        assert!(failure.property_failure);
     }
 }

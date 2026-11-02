@@ -5,21 +5,15 @@ use std::{collections::HashMap, future::Future};
 use tokio::sync::broadcast;
 
 use zakura_chain::transparent;
+use zakura_node_services::prune_cadence::PruneCadence;
 
 use crate::{BoxError, Response};
 
-/// The fewest `queue` calls between scans for abandoned waiters.
-///
-/// A scan costs the live waiters plus the calls since the last scan, so it runs after at
-/// least as many calls as the live waiters it kept. This
-/// keeps the cost of each call constant. Live waiters stay: verification owners bound them.
-const MIN_QUEUES_BETWEEN_PRUNES: usize = 1_024;
-
+/// Pending UTXO waiters. A prune keeps live waiters: verification owners bound them.
 #[derive(Debug, Default)]
 pub struct PendingUtxos {
     waiting: HashMap<transparent::OutPoint, broadcast::Sender<transparent::Utxo>>,
-    queued_since_prune: usize,
-    live_after_prune: usize,
+    prune_cadence: PruneCadence,
 }
 
 impl PendingUtxos {
@@ -29,8 +23,7 @@ impl PendingUtxos {
         &mut self,
         outpoint: transparent::OutPoint,
     ) -> impl Future<Output = Result<Response, BoxError>> {
-        self.queued_since_prune = self.queued_since_prune.saturating_add(1);
-        if self.queued_since_prune >= self.live_after_prune.max(MIN_QUEUES_BETWEEN_PRUNES) {
+        if self.prune_cadence.queued() {
             self.prune();
         }
         let mut receiver = self
@@ -79,8 +72,7 @@ impl PendingUtxos {
     /// have been dropped and remove the corresponding sender.
     pub fn prune(&mut self) {
         self.waiting.retain(|_, chan| chan.receiver_count() > 0);
-        self.queued_since_prune = 0;
-        self.live_after_prune = self.waiting.len();
+        self.prune_cadence.pruned(self.waiting.len());
     }
 
     /// Returns the number of utxos that are being waited on.
@@ -93,6 +85,7 @@ impl PendingUtxos {
 mod capacity_tests {
     use super::*;
     use zakura_chain::transaction;
+    use zakura_node_services::prune_cadence::MIN_QUEUES_BETWEEN_PRUNES;
 
     #[test]
     fn queue_removes_abandoned_waiters_between_periodic_prunes() {

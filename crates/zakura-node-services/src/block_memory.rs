@@ -2,7 +2,7 @@
 //!
 //! Block ingress reserves parser transients separately from retained admission.
 //! Block and derived transaction handles share one allocation and charge.
-//! A backend transfer reserves its destination before releasing the source charge.
+//! A charge never changes pool, so its last holder settles the pool that admitted it.
 //! Disk reads reserve count admission before materialization. Standalone
 //! results keep their own slot through their final holder. A count bounds bytes
 //! only for payloads with a fixed maximum size, such as headers and serialized
@@ -30,9 +30,19 @@
 //! Disk retention has no representation here. Store policies own durable limits,
 //! and a memory lease says nothing about what a commit wrote.
 //!
-//! A pipeline pool also limits the bytes its pipeline still holds. A block leaves
-//! that share when its pipeline work ends, so downstream retention can never
-//! refuse the work that would let downstream stores release their blocks.
+//! # Decoded limits
+//!
+//! Three limits bound decoded blocks in block sync, and each has one enforcer.
+//!
+//! | Limit | Bounds | Enforcer |
+//! | --- | --- | --- |
+//! | Handoff cap, `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` | Decoded bytes in the sequencer input queue and `applying`. | `charge_decoded_handoff`, before admission. Refusal hands over raw bytes. |
+//! | Pipeline bound, `decoded_pipeline_byte_bound` | Decoded bytes the pipeline still holds. | This pool's [`Admission::WithinLimit`]. [`Admission::PipelineExempt`] passes it for the commit window. |
+//! | Count allowance, [`DecodedBlockPool::for_block_count`] and [`DecodedBlockPool::for_pipeline`] | Allocations with any holder, including holders past the pipeline. | This pool, for every admission. |
+//!
+//! A block leaves the pipeline bound when its pipeline work ends, so downstream
+//! retention can never refuse the work that would let downstream stores release
+//! their blocks.
 
 use std::{
     fmt, io,
@@ -48,7 +58,7 @@ use zakura_chain::{
 };
 use zakura_rt::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Mutex, Notify, OwnedSemaphorePermit, Semaphore,
+    Notify, OwnedSemaphorePermit, Semaphore,
 };
 
 #[cfg(any(test, zakura_sim, feature = "test-support"))]
@@ -60,8 +70,11 @@ pub struct DecodedBlockPool(Arc<Pool>);
 
 #[derive(Debug)]
 struct Pool {
-    limit: RetentionLimit,
+    /// The most allocations this pool retains.
+    block_limit: u64,
+    /// Allocations this pool currently retains.
     reserved: AtomicU64,
+    /// Attributed decoded bytes of those allocations.
     counted_bytes: AtomicU64,
     capacity_version: AtomicU64,
     closed: AtomicBool,
@@ -70,25 +83,17 @@ struct Pool {
     pipeline_bytes: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum RetentionLimit {
-    Bytes(u64),
-    Blocks(NonZeroU64),
-}
-
 /// Admission rule selected by the owning pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admission {
     /// Admit only within the pool's configured limit.
     WithinLimit,
-    /// Permit one oversized block only while this pool has no other charge.
-    SingleOversized,
     /// Pass the pipeline byte limit and keep every other limit.
     /// The caller's own count window bounds these blocks, and they stay charged.
     PipelineExempt,
 }
 
-/// Why a decoded block cannot enter or transfer between pools.
+/// Why a decoded block cannot enter a pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionFailure {
     /// A header or transaction has a holder outside the proposed owner.
@@ -97,9 +102,7 @@ pub enum AdmissionFailure {
     Capacity,
     /// This pool generation has permanently closed admission.
     Closed,
-    /// An interrupted transfer poisoned the block's charge owner.
-    Poisoned,
-    /// Pre-decode admission requires a block-count pool, not a byte pool.
+    /// Pre-decode admission requires a pool without a pipeline byte limit.
     DecodeRequiresCountLimit,
 }
 
@@ -109,7 +112,6 @@ impl fmt::Display for AdmissionFailure {
             Self::AliasedPayload => "decoded block contains shared payloads",
             Self::Capacity => "decoded block capacity exhausted",
             Self::Closed => "decoded block pool closed",
-            Self::Poisoned => "decoded block charge owner poisoned",
             Self::DecodeRequiresCountLimit => "pre-decode admission requires a block-count pool",
         })
     }
@@ -135,16 +137,11 @@ pub struct RejectedBlock {
 }
 
 impl DecodedBlockPool {
-    /// Create one immutable byte-capacity generation.
-    pub fn new(limit: u64) -> Self {
-        Self::with_limit(RetentionLimit::Bytes(limit), None)
-    }
-
     /// Enforce a block-count allowance while tracking its actual decoded bytes.
     /// Checkpoint and backend owners can preserve their existing count contracts.
     /// This constructor does not establish a decoded-byte bound.
     pub fn for_block_count(limit: NonZeroU64) -> Self {
-        Self::with_limit(RetentionLimit::Blocks(limit), None)
+        Self::with_limit(limit, None)
     }
 
     /// Reserve one block before reading or decoding it, then retain that reservation
@@ -165,8 +162,8 @@ impl DecodedBlockPool {
     ///
     /// The steps run in this order: reserve the count, parse under `decode`'s scope,
     /// measure the block, fund its retained bytes, and release the parser charge.
-    /// The retained charge follows the block to its final holder, including after a
-    /// transfer to another pool. Refusal and unwinding release every earlier step.
+    /// The retained charge follows the block to its final holder. Refusal and
+    /// unwinding release every earlier step.
     pub fn try_decode_bounded(
         &self,
         memory: &ReadMemoryBudget,
@@ -186,7 +183,7 @@ impl DecodedBlockPool {
     ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
         // A pipeline pool charges measured bytes at admission, and a decode reserves
         // before it can measure them.
-        if !matches!(self.0.limit, RetentionLimit::Blocks(_)) || self.0.pipeline_limit.is_some() {
+        if self.0.pipeline_limit.is_some() {
             return Err(AdmissionFailure::DecodeRequiresCountLimit);
         }
         let mut charge = self.reserve(0, Admission::WithinLimit)?;
@@ -221,8 +218,8 @@ impl DecodedBlockPool {
         Ok(Some(OwnedBlock(Arc::new(RetainedBlock {
             block,
             _retained: retained,
-            charge: Mutex::new(charge),
             bytes,
+            charge,
         }))))
     }
 
@@ -230,12 +227,12 @@ impl DecodedBlockPool {
     /// bytes their pipeline holds. [`OwnedBlock::leave_pipeline`] ends a block's
     /// byte share while downstream holders keep its count and retained bytes.
     pub fn for_pipeline(blocks: NonZeroU64, pipeline_bytes: u64) -> Self {
-        Self::with_limit(RetentionLimit::Blocks(blocks), Some(pipeline_bytes))
+        Self::with_limit(blocks, Some(pipeline_bytes))
     }
 
-    fn with_limit(limit: RetentionLimit, pipeline_limit: Option<u64>) -> Self {
+    fn with_limit(block_limit: NonZeroU64, pipeline_limit: Option<u64>) -> Self {
         Self(Arc::new(Pool {
-            limit,
+            block_limit: block_limit.get(),
             reserved: AtomicU64::new(0),
             counted_bytes: AtomicU64::new(0),
             capacity_version: AtomicU64::new(0),
@@ -279,17 +276,14 @@ impl DecodedBlockPool {
         Ok(OwnedBlock(Arc::new(RetainedBlock {
             block,
             _retained: None,
-            charge: Mutex::new(charge),
             bytes,
+            charge,
         })))
     }
 
     /// Current attributed decoded bytes, including detached holders.
     pub fn reserved_bytes(&self) -> u64 {
-        match self.0.limit {
-            RetentionLimit::Bytes(_) => self.0.reserved.load(Ordering::Acquire),
-            RetentionLimit::Blocks(_) => self.0.counted_bytes.load(Ordering::Acquire),
-        }
+        self.0.counted_bytes.load(Ordering::Acquire)
     }
 
     /// Attributed decoded bytes the pipeline still holds. Zero without a pipeline limit.
@@ -297,12 +291,9 @@ impl DecodedBlockPool {
         self.0.pipeline_bytes.load(Ordering::Acquire)
     }
 
-    /// Current retained allocations when this pool enforces a block-count allowance.
-    pub fn reserved_blocks(&self) -> Option<u64> {
-        match self.0.limit {
-            RetentionLimit::Bytes(_) => None,
-            RetentionLimit::Blocks(_) => Some(self.0.reserved.load(Ordering::Acquire)),
-        }
+    /// Current retained allocations.
+    pub fn reserved_blocks(&self) -> u64 {
+        self.0.reserved.load(Ordering::Acquire)
     }
 
     /// Whether this generation rejects all further admission.
@@ -353,10 +344,15 @@ impl DecodedBlockPool {
     }
 
     fn reserve(&self, bytes: u64, admission: Admission) -> Result<Charge, AdmissionFailure> {
+        if self.is_closed() {
+            return Err(AdmissionFailure::Closed);
+        }
         let pipeline_bytes = self.charge_pipeline(bytes, admission)?;
-        match self.reserve_retention(bytes, admission) {
-            Ok(mut charge) => {
-                charge.pipeline_bytes = pipeline_bytes;
+        match self.reserve_retention(bytes) {
+            Ok(charge) => {
+                charge
+                    .pipeline_bytes
+                    .store(pipeline_bytes, Ordering::Release);
                 Ok(charge)
             }
             Err(reason) => {
@@ -376,20 +372,14 @@ impl DecodedBlockPool {
         let Some(limit) = self.0.pipeline_limit else {
             return Ok(0);
         };
-        if let RetentionLimit::Blocks(blocks) = self.0.limit {
-            let used = self.0.reserved.load(Ordering::Acquire);
-            if used >= blocks.get() && admission != Admission::SingleOversized {
-                return Err(AdmissionFailure::Capacity);
-            }
+        if self.0.reserved.load(Ordering::Acquire) >= self.0.block_limit {
+            return Err(AdmissionFailure::Capacity);
         }
         self.0
             .pipeline_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 let next = used.checked_add(bytes)?;
-                (next <= limit
-                    || admission == Admission::PipelineExempt
-                    || (used == 0 && admission == Admission::SingleOversized))
-                    .then_some(next)
+                (next <= limit || admission == Admission::PipelineExempt).then_some(next)
             })
             .map_err(|_| AdmissionFailure::Capacity)?;
         Ok(bytes)
@@ -408,24 +398,16 @@ impl DecodedBlockPool {
         }
     }
 
-    fn reserve_retention(
-        &self,
-        bytes: u64,
-        admission: Admission,
-    ) -> Result<Charge, AdmissionFailure> {
-        let (units, limit) = match self.0.limit {
-            RetentionLimit::Bytes(limit) => (bytes, limit),
-            RetentionLimit::Blocks(limit) => (1, limit.get()),
-        };
+    fn reserve_retention(&self, bytes: u64) -> Result<Charge, AdmissionFailure> {
         let mut used = self.0.reserved.load(Ordering::Acquire);
         loop {
             if self.is_closed() {
                 return Err(AdmissionFailure::Closed);
             }
-            let Some(next) = used.checked_add(units) else {
+            let Some(next) = used.checked_add(1) else {
                 return Err(AdmissionFailure::Capacity);
             };
-            if next > limit && !(used == 0 && admission == Admission::SingleOversized) {
+            if next > self.0.block_limit {
                 return Err(AdmissionFailure::Capacity);
             }
             match self.0.reserved.compare_exchange_weak(
@@ -435,28 +417,26 @@ impl DecodedBlockPool {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if matches!(self.0.limit, RetentionLimit::Blocks(_))
-                        && self
-                            .0
-                            .counted_bytes
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                                used.checked_add(bytes)
-                            })
-                            .is_err()
+                    if self
+                        .0
+                        .counted_bytes
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                            used.checked_add(bytes)
+                        })
+                        .is_err()
                     {
                         self.close();
                         let _ = self.0.reserved.fetch_update(
                             Ordering::AcqRel,
                             Ordering::Acquire,
-                            |used| used.checked_sub(units),
+                            |used| used.checked_sub(1),
                         );
                         return Err(AdmissionFailure::Closed);
                     }
                     let charge = Charge {
                         pool: self.clone(),
                         bytes,
-                        units,
-                        pipeline_bytes: 0,
+                        pipeline_bytes: AtomicU64::new(0),
                     };
                     if self.is_closed() {
                         drop(charge);
@@ -474,13 +454,12 @@ impl DecodedBlockPool {
 struct Charge {
     pool: DecodedBlockPool,
     bytes: u64,
-    units: u64,
-    pipeline_bytes: u64,
+    pipeline_bytes: AtomicU64,
 }
 
 impl Charge {
-    fn leave_pipeline(&mut self) {
-        let bytes = std::mem::take(&mut self.pipeline_bytes);
+    fn leave_pipeline(&self) {
+        let bytes = self.pipeline_bytes.swap(0, Ordering::AcqRel);
         if bytes > 0 {
             self.pool.release_pipeline(bytes);
             self.pool.notify_capacity();
@@ -490,18 +469,18 @@ impl Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        if self.pipeline_bytes > 0 {
-            self.pool.release_pipeline(self.pipeline_bytes);
+        let pipeline_bytes = *self.pipeline_bytes.get_mut();
+        if pipeline_bytes > 0 {
+            self.pool.release_pipeline(pipeline_bytes);
         }
-        if matches!(self.pool.0.limit, RetentionLimit::Blocks(_))
-            && self
-                .pool
-                .0
-                .counted_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    used.checked_sub(self.bytes)
-                })
-                .is_err()
+        if self
+            .pool
+            .0
+            .counted_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_sub(self.bytes)
+            })
+            .is_err()
         {
             self.pool.close();
             return;
@@ -511,7 +490,7 @@ impl Drop for Charge {
             .0
             .reserved
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_sub(self.units)
+                used.checked_sub(1)
             })
             .is_err()
         {
@@ -527,8 +506,8 @@ struct RetainedBlock {
     // Fields drop in declaration order: payload destruction precedes settlement.
     block: Block,
     _retained: Option<ByteLease>,
-    charge: Mutex<Charge>,
     bytes: u64,
+    charge: Charge,
 }
 
 /// A shared block whose last block or transaction handle settles its decoded charge.
@@ -577,9 +556,9 @@ impl OwnedBlock {
 
     /// Retain one transaction through verification or a detached worker.
     /// The handle keeps the block's entire decoded charge until it drops.
-    pub fn transaction(&self, index: usize) -> Option<OwnedBlockTransaction> {
+    pub fn transaction(&self, index: usize) -> Option<TransactionHandle> {
         self.0.block.transactions.get(index)?;
-        Some(OwnedBlockTransaction {
+        Some(TransactionHandle::Block {
             block: self.clone(),
             index,
         })
@@ -588,55 +567,7 @@ impl OwnedBlock {
     /// End this block's pipeline byte share. Downstream handles keep its retained
     /// charge. Repeating the call changes nothing.
     pub fn leave_pipeline(&self) {
-        match self.0.charge.lock() {
-            Ok(mut charge) => charge.leave_pipeline(),
-            Err(poisoned) => {
-                let pool = poisoned.get_ref().pool.clone();
-                drop(poisoned);
-                pool.close();
-            }
-        }
-    }
-
-    /// Move the allocation's shared charge to a backend pool.
-    /// All existing handles follow this transfer. Refusal preserves the source.
-    pub fn transfer_to(
-        &self,
-        destination: &DecodedBlockPool,
-        admission: Admission,
-    ) -> Result<(), AdmissionFailure> {
-        let mut current = match self.0.charge.lock() {
-            Ok(current) => current,
-            Err(poisoned) => {
-                let source = poisoned.get_ref().pool.clone();
-                drop(poisoned);
-                source.close();
-                return Err(AdmissionFailure::Poisoned);
-            }
-        };
-        if Arc::ptr_eq(&current.pool.0, &destination.0) {
-            return Ok(());
-        }
-        let next = destination.reserve(self.0.bytes, admission)?;
-        let previous = std::mem::replace(&mut *current, next);
-        drop(current);
-        drop(previous);
-        Ok(())
-    }
-}
-
-/// A transaction handle that cannot outlive its block's decoded charge.
-#[derive(Clone, Debug)]
-pub struct OwnedBlockTransaction {
-    block: OwnedBlock,
-    index: usize,
-}
-
-impl Deref for OwnedBlockTransaction {
-    type Target = Transaction;
-
-    fn deref(&self) -> &Transaction {
-        &self.block.0.block.transactions[self.index]
+        self.0.charge.leave_pipeline();
     }
 }
 
@@ -695,7 +626,7 @@ impl BlockHandle {
     pub fn transaction(&self, index: usize) -> Option<TransactionHandle> {
         match self {
             Self::Shared(block) => block.transactions.get(index).cloned().map(Into::into),
-            Self::Owned(block) => block.transaction(index).map(Into::into),
+            Self::Owned(block) => block.transaction(index),
         }
     }
 
@@ -786,32 +717,6 @@ impl Deref for HeaderHandle {
     }
 }
 
-impl AsRef<Header> for HeaderHandle {
-    fn as_ref(&self) -> &Header {
-        self
-    }
-}
-
-impl std::borrow::Borrow<Header> for HeaderHandle {
-    fn borrow(&self) -> &Header {
-        self
-    }
-}
-
-impl PartialEq for HeaderHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for HeaderHandle {}
-
-impl From<Arc<Header>> for HeaderHandle {
-    fn from(header: Arc<Header>) -> Self {
-        Self::Shared(header)
-    }
-}
-
 impl ZcashSerialize for HeaderHandle {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         self.as_ref().zcash_serialize(writer)
@@ -824,7 +729,13 @@ pub enum TransactionHandle {
     /// A caller whose memory admission has not yet migrated to block ownership.
     Shared(Arc<Transaction>),
     /// A transaction that retains its block's decoded-memory charge.
-    Owned(OwnedBlockTransaction),
+    /// [`OwnedBlock::transaction`] checks `index`, and the block is immutable.
+    Block {
+        /// The block whose charge this handle retains.
+        block: OwnedBlock,
+        /// The transaction's position in `block`.
+        index: usize,
+    },
     /// A separately decoded transaction that retains its own admission.
     Standalone(OwnedTransaction),
 }
@@ -835,43 +746,45 @@ impl Deref for TransactionHandle {
     fn deref(&self) -> &Transaction {
         match self {
             Self::Shared(transaction) => transaction,
-            Self::Owned(transaction) => transaction,
+            Self::Block { block, index } => &block.0.block.transactions[*index],
             Self::Standalone(transaction) => transaction,
         }
     }
 }
 
-impl AsRef<Transaction> for TransactionHandle {
-    fn as_ref(&self) -> &Transaction {
-        self
-    }
+/// The comparison and conversion impls of a handle that derefs to its payload.
+macro_rules! payload_handle {
+    ($handle:ident, $payload:ty) => {
+        impl AsRef<$payload> for $handle {
+            fn as_ref(&self) -> &$payload {
+                self
+            }
+        }
+
+        impl std::borrow::Borrow<$payload> for $handle {
+            fn borrow(&self) -> &$payload {
+                self
+            }
+        }
+
+        impl PartialEq for $handle {
+            fn eq(&self, other: &Self) -> bool {
+                self.as_ref() == other.as_ref()
+            }
+        }
+
+        impl Eq for $handle {}
+
+        impl From<Arc<$payload>> for $handle {
+            fn from(payload: Arc<$payload>) -> Self {
+                Self::Shared(payload)
+            }
+        }
+    };
 }
 
-impl std::borrow::Borrow<Transaction> for TransactionHandle {
-    fn borrow(&self) -> &Transaction {
-        self
-    }
-}
-
-impl PartialEq for TransactionHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for TransactionHandle {}
-
-impl From<Arc<Transaction>> for TransactionHandle {
-    fn from(transaction: Arc<Transaction>) -> Self {
-        Self::Shared(transaction)
-    }
-}
-
-impl From<OwnedBlockTransaction> for TransactionHandle {
-    fn from(transaction: OwnedBlockTransaction) -> Self {
-        Self::Owned(transaction)
-    }
-}
+payload_handle!(HeaderHandle, Header);
+payload_handle!(TransactionHandle, Transaction);
 
 #[derive(Debug)]
 struct RetainedPayload<T> {
@@ -1246,7 +1159,7 @@ mod tests {
         assert_eq!(error, AdmissionFailure::Capacity);
         assert_eq!(budget.parser_bytes(), 100, "only the other reader remains");
         assert_eq!(budget.retained_bytes(), 0);
-        assert_eq!(pool.reserved_blocks(), Some(0), "the count rolled back");
+        assert_eq!(pool.reserved_blocks(), 0, "the count rolled back");
     }
 
     #[test]
@@ -1267,7 +1180,7 @@ mod tests {
         assert_eq!(error, AdmissionFailure::Capacity);
         assert_eq!(budget.parser_bytes(), 0);
         assert_eq!(budget.retained_bytes(), bytes);
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         assert_eq!(pool.reserved_bytes(), bytes);
 
         drop(first);
@@ -1290,7 +1203,7 @@ mod tests {
         assert!(panic.is_err());
         assert_eq!(budget.parser_bytes(), 0);
         assert_eq!(budget.retained_bytes(), 0);
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
     }
 
     #[test]
@@ -1384,7 +1297,7 @@ mod tests {
         let pool = DecodedBlockPool::for_block_count(NonZeroU64::MIN);
         let owner = pool
             .try_decode(|| {
-                assert_eq!(pool.reserved_blocks(), Some(1));
+                assert_eq!(pool.reserved_blocks(), 1);
                 Some(block())
             })
             .unwrap()
@@ -1404,7 +1317,7 @@ mod tests {
         assert!(!called.get(), "refusal precedes disk reads and decoding");
         drop(transaction);
         assert!(actual.upgrade().is_none());
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         assert_eq!(pool.reserved_bytes(), 0);
     }
 
@@ -1412,16 +1325,16 @@ mod tests {
     fn absent_or_panicking_decode_settles_its_reservation() {
         let pool = DecodedBlockPool::for_block_count(NonZeroU64::MIN);
         assert!(pool.try_decode(|| None).unwrap().is_none());
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = pool.try_decode(|| {
                 let _block = block();
-                assert_eq!(pool.reserved_blocks(), Some(1));
+                assert_eq!(pool.reserved_blocks(), 1);
                 panic!("interrupted disk decode")
             });
         }));
         assert!(panic.is_err());
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         assert_eq!(pool.reserved_bytes(), 0);
         assert!(pool.try_decode(|| Some(block())).unwrap().is_some());
     }
@@ -1498,6 +1411,10 @@ mod tests {
         assert_eq!(probe.holders(), 0);
     }
 
+    fn byte_pool(limit: u64) -> DecodedBlockPool {
+        DecodedBlockPool::for_pipeline(NonZeroU64::MAX, limit)
+    }
+
     fn pipeline_pool(limit: u64) -> DecodedBlockPool {
         DecodedBlockPool::for_pipeline(NonZeroU64::new(8).unwrap(), limit)
     }
@@ -1511,15 +1428,8 @@ mod tests {
         let refused = pool.try_admit(block(), Admission::WithinLimit).unwrap_err();
         assert_eq!(refused.reason, AdmissionFailure::Capacity);
         assert_eq!(refused.decoded_bytes, bytes);
-        assert_eq!(
-            pool.try_admit(block(), Admission::SingleOversized)
-                .unwrap_err()
-                .reason,
-            AdmissionFailure::Capacity,
-            "another pipeline holder rules out the oversized exception"
-        );
         assert_eq!(pool.pipeline_bytes(), bytes);
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         assert_eq!(
             pool.capacity_version(),
             version,
@@ -1553,10 +1463,10 @@ mod tests {
             .collect();
         assert_eq!(pool.pipeline_bytes(), 0);
         assert_eq!(pool.reserved_bytes(), 3 * bytes);
-        assert_eq!(pool.reserved_blocks(), Some(3));
+        assert_eq!(pool.reserved_blocks(), 3);
         drop(retained);
         assert_eq!(pool.reserved_bytes(), 0);
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         assert!(!pool.is_closed(), "one owner settles each share once");
     }
 
@@ -1585,25 +1495,14 @@ mod tests {
             pool.try_decode(|| Some(block())).unwrap_err(),
             AdmissionFailure::DecodeRequiresCountLimit
         );
-        assert_eq!(pool.reserved_blocks(), Some(0));
-    }
-
-    #[test]
-    fn pipeline_exempt_keeps_a_byte_pool_limit() {
-        let pool = DecodedBlockPool::new(0);
-        assert_eq!(
-            pool.try_admit(block(), Admission::PipelineExempt)
-                .unwrap_err()
-                .reason,
-            AdmissionFailure::Capacity
-        );
+        assert_eq!(pool.reserved_blocks(), 0);
     }
 
     #[test]
     fn transaction_handle_keeps_the_allocation_and_charge() {
         let block = block();
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = byte_pool(bytes);
         let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let actual = Arc::downgrade(&owner.0.block.transactions[0]);
         let transaction = owner.transaction(0).unwrap();
@@ -1620,14 +1519,14 @@ mod tests {
     fn escaping_block_parts_keep_the_original_charge() {
         let block = block();
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = byte_pool(bytes);
         let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let actual = Arc::downgrade(&owner.0.block.transactions[0]);
         let handle = BlockHandle::from(owner);
         let header = handle.retained_header();
         let transaction = handle.transaction(0).unwrap();
         assert!(matches!(header, HeaderHandle::Block(_)));
-        assert!(matches!(transaction, TransactionHandle::Owned(_)));
+        assert!(matches!(transaction, TransactionHandle::Block { .. }));
         assert_eq!(handle.transactions().len(), 1);
         drop(handle);
         assert_eq!(pool.reserved_bytes(), bytes);
@@ -1641,7 +1540,7 @@ mod tests {
 
     #[test]
     fn admission_rejects_external_payload_aliases_without_charging() {
-        let pool = DecodedBlockPool::new(u64::MAX);
+        let pool = byte_pool(u64::MAX);
         let original = block();
         let alias = original.transactions[0].clone();
         let rejected = pool
@@ -1666,41 +1565,6 @@ mod tests {
     }
 
     #[test]
-    fn transfer_refusal_preserves_both_pools_and_success_preserves_other_owners() {
-        let bytes = block().attributed_memory_size_bytes();
-        let source = DecodedBlockPool::new(2 * bytes);
-        let destination = DecodedBlockPool::new(bytes);
-        let owner = source.try_admit(block(), Admission::WithinLimit).unwrap();
-        let other = source.try_admit(block(), Admission::WithinLimit).unwrap();
-        let blocker = destination
-            .try_admit(block(), Admission::WithinLimit)
-            .unwrap();
-        assert_eq!(
-            owner.transfer_to(&destination, Admission::WithinLimit),
-            Err(AdmissionFailure::Capacity)
-        );
-        assert_eq!(source.reserved_bytes(), 2 * bytes);
-        assert_eq!(destination.reserved_bytes(), bytes);
-        drop(blocker);
-        let copy = owner.clone();
-        owner
-            .transfer_to(&destination, Admission::WithinLimit)
-            .unwrap();
-        owner
-            .transfer_to(&destination, Admission::WithinLimit)
-            .unwrap();
-        assert_eq!(source.reserved_bytes(), bytes);
-        assert_eq!(destination.reserved_bytes(), bytes);
-        drop(owner);
-        assert_eq!(destination.reserved_bytes(), bytes);
-        drop(copy);
-        assert_eq!(destination.reserved_bytes(), 0);
-        assert_eq!(source.reserved_bytes(), bytes);
-        drop(other);
-        assert_eq!(source.reserved_bytes(), 0);
-    }
-
-    #[test]
     fn block_count_admission_retains_bytes_until_the_last_holder() {
         let pool = DecodedBlockPool::for_block_count(NonZeroU64::MIN);
         let bytes = block().attributed_memory_size_bytes();
@@ -1708,21 +1572,21 @@ mod tests {
         let actual = Arc::downgrade(&owner.0.block.transactions[0]);
         let retained = owner.transaction(0).unwrap();
         let version = pool.capacity_version();
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         assert_eq!(pool.reserved_bytes(), bytes);
         assert_eq!(
-            pool.try_admit(block(), Admission::SingleOversized)
+            pool.try_admit(block(), Admission::WithinLimit)
                 .unwrap_err()
                 .reason,
             AdmissionFailure::Capacity
         );
         drop(owner);
         assert!(actual.upgrade().is_some());
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         assert_eq!(pool.capacity_version(), version);
         drop(retained);
         assert!(actual.upgrade().is_none());
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         assert_eq!(pool.reserved_bytes(), 0);
         assert_ne!(
             pool.capacity_version(),
@@ -1734,109 +1598,10 @@ mod tests {
         drop(replacement);
     }
 
-    #[test]
-    fn transfers_between_byte_and_count_allowances_keep_one_owner() {
-        let bytes = block().attributed_memory_size_bytes();
-        let byte_pool = DecodedBlockPool::new(bytes);
-        let count_pool = DecodedBlockPool::for_block_count(NonZeroU64::MIN);
-        let owner = byte_pool
-            .try_admit(block(), Admission::WithinLimit)
-            .unwrap();
-        let transaction = owner.transaction(0).unwrap();
-        owner
-            .transfer_to(&count_pool, Admission::WithinLimit)
-            .unwrap();
-        assert_eq!(byte_pool.reserved_bytes(), 0);
-        assert_eq!(count_pool.reserved_bytes(), bytes);
-        assert_eq!(count_pool.reserved_blocks(), Some(1));
-        let blocker = byte_pool
-            .try_admit(block(), Admission::WithinLimit)
-            .unwrap();
-        assert_eq!(
-            owner.transfer_to(&byte_pool, Admission::WithinLimit),
-            Err(AdmissionFailure::Capacity)
-        );
-        assert_eq!(count_pool.reserved_blocks(), Some(1));
-        drop(blocker);
-        owner
-            .transfer_to(&byte_pool, Admission::WithinLimit)
-            .unwrap();
-        assert_eq!(count_pool.reserved_blocks(), Some(0));
-        assert_eq!(count_pool.reserved_bytes(), 0);
-        assert_eq!(byte_pool.reserved_bytes(), bytes);
-        drop(owner);
-        assert_eq!(byte_pool.reserved_bytes(), bytes);
-        drop(transaction);
-        assert_eq!(byte_pool.reserved_bytes(), 0);
-    }
-
-    #[test]
-    fn simultaneous_transfers_leave_one_charge() {
-        let bytes = block().attributed_memory_size_bytes();
-        let source = DecodedBlockPool::new(bytes);
-        let destinations = [DecodedBlockPool::new(bytes), DecodedBlockPool::new(bytes)];
-        let owner = source.try_admit(block(), Admission::WithinLimit).unwrap();
-        let start = std::sync::Barrier::new(2);
-        std::thread::scope(|threads| {
-            for destination in &destinations {
-                let owner = &owner;
-                let start = &start;
-                threads.spawn(move || {
-                    start.wait();
-                    owner
-                        .transfer_to(destination, Admission::WithinLimit)
-                        .unwrap();
-                });
-            }
-        });
-        assert_eq!(source.reserved_bytes(), 0);
-        assert_eq!(
-            destinations
-                .iter()
-                .map(DecodedBlockPool::reserved_bytes)
-                .sum::<u64>(),
-            bytes
-        );
-        drop(owner);
-        assert!(destinations.iter().all(|pool| pool.reserved_bytes() == 0));
-    }
-
-    #[test]
-    fn oversized_admission_is_exclusive_under_competing_callers() {
-        let bytes = block().attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes - 1);
-        assert_eq!(
-            pool.try_admit(block(), Admission::WithinLimit)
-                .unwrap_err()
-                .reason,
-            AdmissionFailure::Capacity
-        );
-        let barrier = std::sync::Barrier::new(2);
-        let admitted = std::sync::atomic::AtomicUsize::new(0);
-        let observations = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|threads| {
-            for _ in 0..2 {
-                threads.spawn(|| {
-                    let block = block();
-                    barrier.wait();
-                    let owner = pool.try_admit(block, Admission::SingleOversized).ok();
-                    admitted.fetch_add(usize::from(owner.is_some()), Ordering::Relaxed);
-                    barrier.wait();
-                    observations.lock().unwrap().push(pool.reserved_bytes());
-                    barrier.wait();
-                    drop(owner);
-                });
-            }
-        });
-        assert_eq!(admitted.load(Ordering::Relaxed), 1);
-        assert_eq!(*observations.lock().unwrap(), [bytes, bytes]);
-        assert_eq!(pool.reserved_bytes(), 0);
-    }
-
     #[tokio::test]
     async fn closing_and_last_release_wake_registered_waiters() {
         let bytes = block().attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = byte_pool(bytes);
         let owner = pool.try_admit(block(), Admission::WithinLimit).unwrap();
         let closed = pool.capacity().notified();
         tokio::pin!(closed);
@@ -1847,7 +1612,7 @@ mod tests {
             .unwrap();
         assert_eq!(pool.reserved_bytes(), bytes);
         assert_eq!(
-            pool.try_admit(block(), Admission::SingleOversized)
+            pool.try_admit(block(), Admission::WithinLimit)
                 .unwrap_err()
                 .reason,
             AdmissionFailure::Closed
@@ -1866,9 +1631,9 @@ mod tests {
     #[test]
     fn underflow_closes_admission_without_erasing_the_counter() {
         let bytes = block().attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = byte_pool(bytes);
         let owner = pool.try_admit(block(), Admission::WithinLimit).unwrap();
-        pool.0.reserved.store(bytes - 1, Ordering::Release);
+        pool.0.counted_bytes.store(bytes - 1, Ordering::Release);
         drop(owner);
         assert!(pool.is_closed());
         assert_eq!(pool.reserved_bytes(), bytes - 1);
@@ -1878,28 +1643,5 @@ mod tests {
                 .reason,
             AdmissionFailure::Closed
         );
-    }
-
-    #[test]
-    fn poisoned_transfer_closes_source_and_preserves_its_live_charge() {
-        let bytes = block().attributed_memory_size_bytes();
-        let source = DecodedBlockPool::new(bytes);
-        let destination = DecodedBlockPool::new(bytes);
-        let owner = source.try_admit(block(), Admission::WithinLimit).unwrap();
-        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _charge = owner.0.charge.lock().unwrap();
-            panic!("interrupt the transfer owner");
-        }));
-        assert!(interrupted.is_err());
-        assert_eq!(
-            owner.transfer_to(&destination, Admission::WithinLimit),
-            Err(AdmissionFailure::Poisoned)
-        );
-        assert!(source.is_closed());
-        assert_eq!(source.reserved_bytes(), bytes);
-        assert_eq!(destination.reserved_bytes(), 0);
-        drop(owner);
-        assert_eq!(source.reserved_bytes(), 0);
-        assert!(source.is_closed());
     }
 }

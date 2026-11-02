@@ -387,7 +387,7 @@ mod tests {
             drop(normalized);
 
             let charge = block.attributed_memory_size_bytes();
-            let pool = DecodedBlockPool::new(charge);
+            let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, charge);
             let owned = pool.try_admit(block, Admission::WithinLimit).unwrap();
             assert_eq!(
                 CandidateId::of(&owned, &network).0.as_slice(),

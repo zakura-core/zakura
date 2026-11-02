@@ -16,15 +16,6 @@ fn gate(connection: u64, node: u64) -> (FrameGate, OutputByteBudget, OutputByteB
 }
 
 #[test]
-fn a_grant_charges_both_budgets_until_it_drops() {
-    let (gate, connection, node) = gate(100, 200);
-    let grant = gate.try_admit(40).unwrap();
-    assert_eq!((connection.granted(), node.granted()), (40, 40));
-    drop(grant);
-    assert_eq!((connection.granted(), node.granted()), (0, 0));
-}
-
-#[test]
 fn a_saturated_stream_still_has_one_floor_frame() {
     let (gate, connection, _node) = gate(10, 200);
     let shared = gate.try_admit(10).unwrap();
@@ -167,7 +158,6 @@ fn the_envelope_derives_each_bound_from_windows_connections_and_streams() {
     assert_eq!(envelope.connection_output_bytes, 32 << 20);
     assert_eq!(envelope.node_raw_bytes, 256 * (64 << 20));
     assert_eq!(envelope.node_output_bytes, 256 * (32 << 20));
-    assert_eq!(envelope.request_executions, 256 * 1024);
     assert_eq!(envelope.floor_frame_bytes, 2 * 256 * 1024 * (1 << 20));
     assert_eq!(envelope.transport_credit_bytes, 288 * (48 << 20));
     assert_eq!(
@@ -187,11 +177,11 @@ fn only_a_one_frame_result_uses_the_floor() {
     let (gate, connection, _node) = gate(10, 200);
     let saturating = gate.try_admit(10).unwrap();
     assert!(
-        gate.admit_result(2, 10).now_or_never().is_none(),
+        gate.admit_shared(10).now_or_never().is_none(),
         "the floor does not fund a multi-frame result"
     );
     let floor = gate
-        .admit_result(1, 10)
+        .admit(10)
         .now_or_never()
         .expect("the floor funds one frame");
     assert_eq!(
@@ -201,7 +191,7 @@ fn only_a_one_frame_result_uses_the_floor() {
     );
     drop((floor, saturating));
     let shared = gate
-        .admit_result(2, 10)
+        .admit_shared(10)
         .now_or_never()
         .expect("released shared bytes fund the result");
     assert_eq!(connection.granted(), 10);
@@ -214,8 +204,8 @@ fn only_a_one_frame_result_uses_the_floor() {
 #[tokio::test]
 async fn shrinking_a_reservation_frees_room_for_a_waiter() {
     let (gate, connection, node) = gate(100, 200);
-    let mut reservation = gate.admit_result(2, 80).await;
-    let mut waiter = Box::pin(gate.admit_result(2, 50));
+    let mut reservation = gate.admit_shared(80).await;
+    let mut waiter = Box::pin(gate.admit_shared(50));
     assert!(futures::poll!(&mut waiter).is_pending());
     assert_eq!(node.granted(), 80);
 
@@ -253,14 +243,14 @@ fn a_queued_large_reservation_delays_only_multi_frame_results() {
     let [running, large, small, medium] = [0, 1, 2, 3].map(streams);
     let _running = running.try_admit(90).unwrap();
 
-    let mut waiting = Box::pin(large.admit_result(2, 50));
+    let mut waiting = Box::pin(large.admit_shared(50));
     assert!((&mut waiting).now_or_never().is_none());
     assert!(
-        medium.admit_result(2, 1).now_or_never().is_none(),
+        medium.admit_shared(1).now_or_never().is_none(),
         "FIFO order holds a multi-frame result behind the head"
     );
     assert!(
-        small.admit_result(1, 1).now_or_never().is_some(),
+        small.admit(1).now_or_never().is_some(),
         "a one-frame result never waits for its stream's fresh floor"
     );
 }
@@ -341,74 +331,53 @@ fn the_peer_memory_budget_funds_credit_and_no_frame_budget() {
     );
 }
 
-/// Every connection fills both budgets at once. None of it reaches a floor slot
-/// or waits, so no connection's traffic can pause another's.
-#[test]
-fn every_connection_can_fill_its_budgets_at_once() {
-    const CONNECTIONS: usize = 256;
-    let window = 32 * MIB;
-    let envelope = ResourceEnvelope::new(TransportLimits::with_windows(window, CONNECTIONS));
-    let node = NodeResources::new(envelope);
-    let full = 2 * u64::from(window);
-    let streams: Vec<_> = (0..CONNECTIONS)
-        .map(|_| node.connection().stream())
-        .collect();
-    let grants: Vec<_> = streams
-        .iter()
-        .map(|stream| {
-            (
-                stream.raw.try_admit(full).unwrap(),
-                stream.output.try_admit(full).unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(node.raw.granted(), CONNECTIONS as u64 * full);
-    assert_eq!(node.output.granted(), CONNECTIONS as u64 * full);
-    assert_eq!(node.raw.granted(), envelope.node_raw_bytes);
-    drop(grants);
-    assert_eq!(node.raw.granted(), 0);
-}
-
-/// Many connections move several full windows of frames through consumers that
-/// lag one window behind. The node never pauses any of their readers.
+/// Every connection fills both budgets at once, then moves several full budgets
+/// of frames through a consumer that lags one full budget behind. None of it
+/// reaches a floor slot or waits, so no connection's traffic can pause another's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_conformant_connections_at_full_window_make_progress() {
     const CONNECTIONS: usize = 256;
     const FRAME_BYTES: u64 = 1 << 20;
     let window = 32 * MIB;
-    let frames_per_window = u64::from(window) / FRAME_BYTES;
+    let full = 2 * u64::from(window);
+    let frames_per_budget = full / FRAME_BYTES;
     let rounds = 4;
-    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
-        window,
-        CONNECTIONS,
-    )));
+    let envelope = ResourceEnvelope::new(TransportLimits::with_windows(window, CONNECTIONS));
+    let node = NodeResources::new(envelope);
 
-    // Every connection holds a full window before any consumer starts.
-    let all_full = Arc::new(tokio::sync::Barrier::new(CONNECTIONS));
+    // Every connection holds its full budgets while the test reads the node's.
+    let all_full = Arc::new(tokio::sync::Barrier::new(CONNECTIONS + 1));
+    let resume = Arc::new(tokio::sync::Barrier::new(CONNECTIONS + 1));
     let mut connections = Vec::new();
     for _ in 0..CONNECTIONS {
         let stream = node.connection().stream();
-        let all_full = all_full.clone();
+        let (all_full, resume) = (all_full.clone(), resume.clone());
         connections.push(tokio::spawn(async move {
+            let _output = stream.output.try_admit(full).unwrap();
             let mut retained = std::collections::VecDeque::new();
             let mut waited = Duration::ZERO;
-            for frame in 1..=rounds * frames_per_window {
+            for frame in 1..=rounds * frames_per_budget {
+                // The consumer releases the oldest frame of a full budget.
+                // Widening usize to u64 is lossless on supported targets.
+                if retained.len() as u64 == frames_per_budget {
+                    retained.pop_front();
+                }
                 let grant = stream.raw.admit(FRAME_BYTES).await;
                 waited += grant.waited();
                 retained.push_back(grant);
-                if frame == frames_per_window {
+                if frame == frames_per_budget {
                     all_full.wait().await;
-                }
-                // The consumer lags one window behind this reader.
-                // Widening usize to u64 is lossless on supported targets.
-                if retained.len() as u64 > frames_per_window {
-                    retained.pop_front();
+                    resume.wait().await;
                 }
             }
             waited
         }));
     }
     let progress = async {
+        all_full.wait().await;
+        assert_eq!(node.raw.granted(), envelope.node_raw_bytes);
+        assert_eq!(node.output.granted(), envelope.node_output_bytes);
+        resume.wait().await;
         for connection in connections {
             assert_eq!(connection.await.unwrap(), Duration::ZERO);
         }
@@ -417,6 +386,7 @@ async fn many_conformant_connections_at_full_window_make_progress() {
         .await
         .expect("no reader waits, so every connection finishes");
     assert_eq!(node.raw.granted(), 0);
+    assert_eq!(node.output.granted(), 0);
 }
 
 #[derive(Debug, Clone)]

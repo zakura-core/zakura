@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use zakura_chain::block;
 use zakura_rt::{sync::CancellationToken, time::Instant};
 
@@ -19,7 +20,8 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{
-        request::BlockSizeEstimate, test_work_scope, trace::request_owner, BlockSyncStatus,
+        events::RoutineToReactor, request::BlockSizeEstimate, test_work_scope,
+        trace::request_owner, BlockSyncStatus,
     },
     regulation::ReservationPool,
     testkit::{TraceCapture, TraceValue},
@@ -35,13 +37,14 @@ struct Fixture {
     outbound: FramedRecv,
     pool: ReservationPool,
     connection: CancellationToken,
+    events: mpsc::Receiver<RoutineToReactor>,
     heights: Vec<u32>,
 }
 
 fn fixture(max_blocks: u32, heights: &[u32]) -> Fixture {
     let pool = ReservationPool::new(2).unwrap();
     let connection = CancellationToken::new();
-    let (mut routine, outbound, _events) = status_test_routine_with(pool.clone(), &connection);
+    let (mut routine, outbound, events) = status_test_routine_with(pool.clone(), &connection);
     routine.handle_status(BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(10),
@@ -63,6 +66,7 @@ fn fixture(max_blocks: u32, heights: &[u32]) -> Fixture {
         outbound,
         pool,
         connection,
+        events,
         heights: heights.to_vec(),
     }
 }
@@ -293,10 +297,12 @@ fn publish_after(
     )
 }
 
-/// A closed budget stops the pass before it acquires anything.
+/// A closed budget stops the pass before it acquires anything. The pass reports
+/// its own stop, and it asks for no more work.
 #[tokio::test]
 async fn closed_accounting_stops_before_any_acquisition() {
     let mut fixture = fixture(1, &[1]);
+    while fixture.events.try_recv().is_ok() {}
     fixture
         .routine
         .io
@@ -309,6 +315,14 @@ async fn closed_accounting_stops_before_any_acquisition() {
 
     assert_eq!(report.stop, FillStop::AccountingClosed);
     assert_eq!(fixture.next_request_id(), before);
+    let traced = &fixture.routine.io.fill_stop_trace_at;
+    assert!(traced.contains_key("accounting_closed"));
+    assert!(!traced.contains_key("budget"));
+    assert!(
+        fixture.events.try_recv().is_err(),
+        "closed accounting cannot request more work"
+    );
+    assert_eq!(fixture.routine.io.budget.available(), 0);
     fixture.assert_settled(0);
 }
 

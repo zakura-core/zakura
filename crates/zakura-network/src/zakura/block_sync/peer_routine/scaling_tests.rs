@@ -1,4 +1,5 @@
-//! Receipt lifecycle tests and a scaling probe for per-request bookkeeping.
+//! A scaling probe for per-request bookkeeping, and the routine fixture it shares
+//! with the lifecycle tests.
 //!
 //! Run with `cargo test -p zakura-network --release --lib request_bookkeeping_scaling
 //! -- --ignored --nocapture`. Each request event should cost about the same at
@@ -20,11 +21,11 @@ pub(super) struct Probe {
     /// The peer's end of the routine's inbound stream.
     pub(super) inbound: crate::zakura::FramedSend,
     pub(super) bodies: mpsc::Receiver<SequencedBody>,
-    _events: mpsc::Receiver<RoutineToReactor>,
+    pub(super) _events: mpsc::Receiver<RoutineToReactor>,
 }
 
 /// [`probe_in`] with a private pool of `window` entries.
-fn probe(window: u32) -> Probe {
+pub(super) fn probe(window: u32) -> Probe {
     probe_in(
         window,
         ReservationPool::new(usize::try_from(window).unwrap()).unwrap(),
@@ -95,255 +96,12 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     }
 }
 
-async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
+pub(super) async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
     let frame = message.encode_frame().expect("test messages are encodable");
     routine
         .handle_frame(&mut block_sync_guard(), frame)
         .await
         .expect("the routine accepts the frame");
-}
-
-/// Exercise the production receipt future while the sequencer queue is full.
-#[tokio::test(flavor = "current_thread")]
-async fn receipt_waits_for_admission_before_settlement() {
-    for (matched, cancel_handoff) in [(true, false), (true, true), (false, false), (false, true)] {
-        let Probe {
-            budget,
-            mut routine,
-            mut outbound,
-            blocks,
-            bodies: _bodies,
-            inbound: _inbound,
-            _events,
-        } = probe(1);
-        routine.try_fill();
-        outbound.recv().await.unwrap();
-        if !matched {
-            let key = routine
-                .state
-                .window
-                .outstanding_key_for_height(block::Height(1))
-                .unwrap();
-            routine.state.window.outstanding.remove(key).unwrap();
-        }
-        let work = routine.io.work.clone();
-        let charge = work.reserved_bytes();
-        assert!(charge > 0);
-        let unrelated = budget.reserve_owned(17).unwrap();
-        let (sender, mut receiver) = mpsc::channel(1);
-        let slot = sender.clone().reserve_owned().await.unwrap();
-        routine.io.sequencer_input = sender;
-        let resident = routine.io.sequencer_input_bytes.clone();
-        let frame = BlockSyncMessage::Block(blocks[0].clone())
-            .encode_frame()
-            .unwrap();
-        let mut guard = block_sync_guard();
-        let mut handoff = Box::pin(routine.handle_frame(&mut guard, frame));
-
-        assert!(futures::poll!(&mut handoff).is_pending());
-        assert_eq!(
-            work.reserved_bytes(),
-            charge,
-            "waiting for admission preserves the request reservation"
-        );
-        assert_eq!(
-            budget.reserved(),
-            charge + 17,
-            "the request still owns the charge"
-        );
-        assert_eq!(resident.load(std::sync::atomic::Ordering::Relaxed), 0);
-
-        if cancel_handoff {
-            drop(handoff);
-            drop(slot);
-            assert!(receiver.try_recv().is_err());
-            assert_eq!(work.reserved_bytes(), charge);
-            assert_eq!(budget.reserved(), charge + 17);
-            work.reset_above(block::Height(0));
-        } else {
-            drop(slot);
-            tokio::time::timeout(Duration::from_secs(1), handoff)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(work.reserved_bytes(), 0);
-            assert_eq!(budget.reserved(), 17);
-            drop(
-                receiver
-                    .try_recv()
-                    .expect("completed handoff queued the body"),
-            );
-        }
-        assert_eq!(resident.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(
-            budget.reserved(),
-            17,
-            "settlement preserves unrelated charges"
-        );
-        drop(routine);
-        assert_eq!(
-            budget.reserved(),
-            17,
-            "routine cleanup cannot release twice"
-        );
-        drop(unrelated);
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn synchronous_receipts_do_not_wake_floor_rankers() {
-    for matched in [true, false] {
-        let Probe {
-            budget: _,
-            mut routine,
-            mut outbound,
-            blocks,
-            mut bodies,
-            inbound: _inbound,
-            _events,
-        } = probe(3);
-        routine.handle_status(BlockSyncStatus {
-            servable_low: block::Height(1),
-            servable_high: block::Height(2),
-            max_blocks_per_response: 1,
-            max_inflight_requests: 3,
-            ..BlockSyncStatus::default()
-        });
-        routine.try_fill();
-        outbound.recv().await.unwrap();
-        outbound.recv().await.unwrap();
-        assert!(outbound.try_recv().is_err());
-        // Prime the RTT with a real receipt. Paused time keeps the next receipt's
-        // RTT unchanged, so neither slots nor RTT require a ranking notification.
-        deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
-        bodies.try_recv().unwrap();
-        assert!(routine.state.published_free_slots);
-        if !matched {
-            let key = routine
-                .state
-                .window
-                .outstanding_key_for_height(block::Height(2))
-                .unwrap();
-            routine.state.window.outstanding.remove(key).unwrap();
-        }
-        let registry = routine.io.registry.clone();
-        let ranked = registry.subscribe_floor_ranking().notified();
-        tokio::pin!(ranked);
-        assert!(futures::poll!(&mut ranked).is_pending());
-
-        deliver(&mut routine, BlockSyncMessage::Block(blocks[1].clone())).await;
-
-        assert!(bodies.try_recv().is_ok(), "the body reached the sequencer");
-        assert!(
-            futures::poll!(&mut ranked).is_pending(),
-            "a synchronous receipt must not wake floor rankers: matched={matched}"
-        );
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn accounting_closure_has_a_distinct_fill_stop() {
-    let Probe {
-        budget: _,
-        mut routine,
-        mut outbound,
-        _events: mut events,
-        ..
-    } = probe(1);
-    routine.try_fill();
-    outbound.try_recv().unwrap();
-    while events.try_recv().is_ok() {}
-    let retained = routine.io.work.retain_funding_for_test(1);
-    assert!(!routine.io.work.audit_funding());
-    routine.try_fill();
-    assert!(routine
-        .io
-        .fill_stop_trace_at
-        .contains_key("accounting_closed"));
-    assert!(!routine.io.fill_stop_trace_at.contains_key("budget"));
-    assert!(outbound.try_recv().is_err());
-    assert!(
-        events.try_recv().is_err(),
-        "closed accounting cannot request more work"
-    );
-    assert_eq!(routine.io.budget.available(), 0);
-    drop(retained);
-}
-
-/// A receiver wake can race with cancellation before the sender settles funding.
-#[tokio::test(flavor = "current_thread")]
-async fn receipt_keeps_funding_until_the_production_send_completes() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    for matched in [true, false] {
-        let Probe {
-            budget,
-            mut routine,
-            mut outbound,
-            blocks,
-            bodies: _bodies,
-            inbound: _inbound,
-            _events,
-        } = probe(1);
-        routine.try_fill();
-        outbound.recv().await.unwrap();
-        if !matched {
-            let key = routine
-                .state
-                .window
-                .outstanding_key_for_height(block::Height(1))
-                .unwrap();
-            routine.state.window.outstanding.remove(key).unwrap();
-        }
-        let charge = routine.io.work.reserved_bytes();
-        assert!(charge > 0);
-        let unrelated = budget.reserve_owned(17).unwrap();
-        let (sender, mut receiver) = mpsc::channel(1);
-        routine.io.sequencer_input = sender;
-        let resident = routine.io.sequencer_input_bytes.clone();
-        let charge_at_send = Arc::new(AtomicU64::new(0));
-        let resident_at_send = Arc::new(AtomicU64::new(0));
-        let waker = crate::zakura::transport::callback_waker({
-            let budget = budget.clone();
-            let resident = resident.clone();
-            let charge_at_send = charge_at_send.clone();
-            let resident_at_send = resident_at_send.clone();
-            let cancel = routine.io.cancel.clone();
-            move || {
-                charge_at_send.store(budget.reserved(), Ordering::SeqCst);
-                resident_at_send.store(resident.load(Ordering::Relaxed), Ordering::SeqCst);
-                cancel.cancel();
-            }
-        });
-        let mut context = std::task::Context::from_waker(&waker);
-        assert!(receiver.poll_recv(&mut context).is_pending());
-
-        deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
-
-        assert!(
-            routine.io.cancel.is_cancelled(),
-            "the send woke the receiver"
-        );
-        assert_eq!(
-            charge_at_send.load(Ordering::SeqCst),
-            charge + 17,
-            "the request charge survives until the send completes"
-        );
-        assert!(
-            resident_at_send.load(Ordering::SeqCst) > 0,
-            "the body is charged before the receiver can run"
-        );
-        assert_eq!(routine.io.work.reserved_bytes(), 0);
-        assert_eq!(routine.io.budget.reserved(), 17);
-        drop(
-            receiver
-                .try_recv()
-                .expect("cancellation cannot interrupt the admitted send"),
-        );
-        assert_eq!(resident.load(Ordering::Relaxed), 0);
-        drop(unrelated);
-        assert_eq!(routine.io.budget.reserved(), 0);
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -405,62 +163,5 @@ async fn request_bookkeeping_scaling() {
             settle,
             settle / window,
         );
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn accounting_failure_cancels_production_receipt() {
-    for matched in [true, false] {
-        let Probe {
-            budget,
-            mut routine,
-            mut outbound,
-            blocks,
-            mut bodies,
-            inbound: _inbound,
-            _events,
-        } = probe(1);
-        routine.try_fill();
-        outbound.recv().await.unwrap();
-        if !matched {
-            let key = routine
-                .state
-                .window
-                .outstanding_key_for_height(block::Height(1))
-                .unwrap();
-            routine.state.window.outstanding.remove(key).unwrap();
-        }
-        let charge = routine.io.work.reserved_bytes();
-        assert!(charge > 0);
-        // Keep actual funding live while removing it from the queue's settlement pool.
-        let retained = routine.io.work.retain_funding_for_test(charge);
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())),
-        )
-        .await
-        .unwrap();
-        assert!(
-            routine.io.cancel.is_cancelled(),
-            "receipt accounting failure did not cancel the routine"
-        );
-        assert!(budget.is_closed());
-        assert!(
-            bodies.try_recv().is_err(),
-            "failed receipt published a body"
-        );
-        assert_eq!(
-            routine
-                .io
-                .sequencer_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(budget.reserved(), charge);
-        drop(routine);
-        assert_eq!(budget.reserved(), charge);
-        drop(retained);
-        assert_eq!(budget.reserved(), 0);
-        assert!(budget.is_closed());
     }
 }

@@ -45,7 +45,7 @@ use super::{
     regulated::{wire::Outcome, CompletedRange},
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
-    sequencer_task::{charge_decoded_handoff, SequencedBody, SequencerView},
+    sequencer_task::{charge_decoded_handoff, DecodedHandoffCharge, SequencedBody, SequencerView},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker, RequestKey,
         ThroughputMeter,
@@ -334,6 +334,12 @@ enum Disposition {
     Satisfied,
     RetryOriginal,
     RetryMissing,
+}
+
+/// A body the decoded pool admitted, with its input-queue charge.
+struct AdmittedBody {
+    block: OwnedBlock,
+    charge: DecodedHandoffCharge,
 }
 
 /// Keeps a receipt charge live until the synchronous send finishes or unwinds.
@@ -2343,10 +2349,13 @@ impl PeerRoutine {
 
     /// Adopt the parser's exclusive payloads before retaining a decoded body.
     /// Refusal keeps only the raw frame for a later admission attempt.
+    ///
+    /// The input-queue room check comes first. A pool admission that the check
+    /// then refused would release its charge at once and wake every capacity waiter.
     fn admit_decoded_body(
         &self,
         block: Arc<block::Block>,
-    ) -> Result<(Option<OwnedBlock>, u64), AdmissionFailure> {
+    ) -> Result<(Option<AdmittedBody>, u64), AdmissionFailure> {
         if self.decoded_pool.is_closed() {
             self.cancel.cancel();
             return Err(AdmissionFailure::Closed);
@@ -2355,11 +2364,16 @@ impl PeerRoutine {
             Ok(block) => block,
             Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
         };
+        let bytes = block.attributed_memory_size_bytes();
+        let Some(charge) = charge_decoded_handoff(
+            &self.sequencer_input_decoded_attributed_memory_bytes,
+            &self.sequencer_view,
+            bytes,
+        ) else {
+            return Ok((None, bytes));
+        };
         match self.decoded_pool.try_admit(block, Admission::WithinLimit) {
-            Ok(block) => {
-                let bytes = block.decoded_bytes();
-                Ok((Some(block), bytes))
-            }
+            Ok(block) => Ok((Some(AdmittedBody { block, charge }), bytes)),
             Err(rejected) => {
                 if !matches!(
                     rejected.reason,
@@ -2381,7 +2395,7 @@ impl PeerRoutine {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        block: Option<OwnedBlock>,
+        admitted: Option<AdmittedBody>,
         raw_block_payload: Arc<[u8]>,
         serialized_bytes: u64,
         admitted_estimate_bytes: Option<u64>,
@@ -2390,15 +2404,11 @@ impl PeerRoutine {
         let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
         // The body owns the decoded charge from here, with no await between.
-        let charged = block.as_ref().is_some_and(|block| {
-            charge_decoded_handoff(
-                &self.sequencer_input_decoded_attributed_memory_bytes,
-                &self.sequencer_view,
-                block.decoded_bytes(),
-            )
-        });
-        let body = match block {
-            Some(block) => BufferedBlockBody::for_handoff(block, raw_block_payload, charged),
+        let body = match admitted {
+            Some(AdmittedBody { block, charge }) => {
+                charge.hand_over();
+                BufferedBlockBody::for_handoff(block, raw_block_payload)
+            }
             None => BufferedBlockBody::RawFramePayload(raw_block_payload),
         };
         let body = SequencedBody::new_handed_off(
@@ -5649,6 +5659,26 @@ mod tests {
                 .unwrap();
             assert_eq!(block.view().attributed_memory_size_bytes(), bytes);
             assert_eq!(pool.pipeline_bytes(), bytes);
+        }
+    }
+
+    /// A body without handoff room never enters the pool, so its refusal bumps no
+    /// capacity version and wakes no waiter.
+    #[tokio::test]
+    async fn a_handoff_without_room_wakes_no_capacity_waiter() {
+        use zakura_node_services::block_memory::DecodedBlockPool;
+        let cap = super::super::config::BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+        for late in [false, true] {
+            let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(1).unwrap());
+            let version = pool.capacity_version();
+            let (_, sequenced, queued) =
+                hand_off_mainnet_block_1_with_pool(cap, 0, pool.clone(), late, false)
+                    .await
+                    .unwrap();
+            assert!(!sequenced.body.is_decoded());
+            assert_eq!(queued, 0, "the refused charge returned");
+            assert_eq!(pool.reserved_blocks(), 0);
+            assert_eq!(pool.capacity_version(), version);
         }
     }
 

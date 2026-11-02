@@ -276,18 +276,22 @@ impl BenchBodyFeeder {
             .encode()
             .expect("a chain block encodes within the block-sync message limits")
             .into();
-        let body = match Arc::try_unwrap(block).ok().and_then(|block| {
-            self.decoded_pool
+        let admitted = Arc::try_unwrap(block).ok().and_then(|block| {
+            let charge = charge_decoded_handoff(
+                &self.body_input_decoded_attributed_memory_bytes,
+                &self.view,
+                block.attributed_memory_size_bytes(),
+            )?;
+            let block = self
+                .decoded_pool
                 .try_admit(block, Admission::WithinLimit)
-                .ok()
-        }) {
-            Some(block) => {
-                let charged = charge_decoded_handoff(
-                    &self.body_input_decoded_attributed_memory_bytes,
-                    &self.view,
-                    block.decoded_bytes(),
-                );
-                BufferedBlockBody::for_handoff(block, raw_frame_payload, charged)
+                .ok()?;
+            Some((block, charge))
+        });
+        let body = match admitted {
+            Some((block, charge)) => {
+                charge.hand_over();
+                BufferedBlockBody::for_handoff(block, raw_frame_payload)
             }
             None => BufferedBlockBody::RawFramePayload(raw_frame_payload),
         };

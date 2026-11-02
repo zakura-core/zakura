@@ -76,32 +76,59 @@ pub(super) struct SequencedBody {
     queue_accounting: SequencerInputAccounting,
 }
 
+/// A handed-off body's decoded bytes, charged to the input queue before the body
+/// exists. Dropping it returns the charge. [`Self::hand_over`] moves the charge to
+/// the [`SequencedBody`] that holds the decoded block.
+#[derive(Debug)]
+#[must_use = "dropping the charge returns its room"]
+pub(super) struct DecodedHandoffCharge {
+    input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    decoded_bytes: u64,
+}
+
+impl DecodedHandoffCharge {
+    /// End this owner's release obligation, because a new [`SequencedBody`] takes it.
+    pub(super) fn hand_over(mut self) {
+        self.decoded_bytes = 0;
+    }
+}
+
+impl Drop for DecodedHandoffCharge {
+    fn drop(&mut self) {
+        release_atomic_bytes(
+            &self.input_decoded_attributed_memory_bytes,
+            self.decoded_bytes,
+        );
+    }
+}
+
 /// Charges a handed-off body's `decoded_bytes` to the input queue when the
 /// queue, `applying` and the body fit under
-/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns whether it did.
+/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns that charge.
 ///
 /// The charge comes before the check, so routines that hand off at once each
 /// count the others' bodies, and no two take the same room. A routine whose
-/// check fails takes its charge back, and its body keeps only raw bytes.
+/// check fails takes its charge back. Its body keeps only raw bytes and never
+/// enters the decoded pool, so a refusal fires no capacity wakeup.
 ///
 /// The sequencer task publishes a body's decoded bytes in `applying` before it
 /// releases the body's input-queue charge, so a body that moves between the
 /// two is always counted.
 pub(super) fn charge_decoded_handoff(
-    input_decoded_attributed_memory_bytes: &AtomicU64,
+    input_decoded_attributed_memory_bytes: &Arc<AtomicU64>,
     view: &watch::Receiver<SequencerView>,
     decoded_bytes: u64,
-) -> bool {
+) -> Option<DecodedHandoffCharge> {
     let queued = input_decoded_attributed_memory_bytes
         .fetch_add(decoded_bytes, Ordering::AcqRel)
         .saturating_add(decoded_bytes);
-    if queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
-        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
-    {
-        return true;
-    }
-    release_atomic_bytes(input_decoded_attributed_memory_bytes, decoded_bytes);
-    false
+    let charge = DecodedHandoffCharge {
+        input_decoded_attributed_memory_bytes: input_decoded_attributed_memory_bytes.clone(),
+        decoded_bytes,
+    };
+    (queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES)
+        .then_some(charge)
 }
 
 impl SequencedBody {
@@ -2706,15 +2733,18 @@ mod tests {
     #[test]
     fn simultaneous_handoffs_cannot_share_one_body_of_room() {
         const BODY: u64 = 1_000;
-        let input_decoded = AtomicU64::new(0);
+        let input_decoded = Arc::new(AtomicU64::new(0));
         let mut view = initial_view(genesis_frontiers());
         view.applying_decoded_attributed_memory_bytes =
             BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES - BODY;
         let (_view_tx, view_rx) = watch::channel(view);
 
-        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY));
-        assert!(!charge_decoded_handoff(&input_decoded, &view_rx, BODY));
+        let first = charge_decoded_handoff(&input_decoded, &view_rx, BODY);
+        assert!(first.is_some());
+        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY).is_none());
         assert_eq!(input_decoded.load(Ordering::Relaxed), BODY);
+        drop(first);
+        assert_eq!(input_decoded.load(Ordering::Relaxed), 0);
     }
 
     #[test]

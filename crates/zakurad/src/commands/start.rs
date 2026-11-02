@@ -371,7 +371,7 @@ impl StartCmd {
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
             .sync
-            .backend_verification_total()
+            .backend_verification_total(&config.network.network)
             .map_err(|error| eyre!(error))?;
         info!(
             backend_verifications,

@@ -268,13 +268,35 @@ struct ModelEntry {
     last_success: Option<u64>,
 }
 
-/// What the model expects one import to return.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Expected {
-    Outcome(ImportOutcome),
+/// One import's result in a machine step.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportFact {
+    /// A new entry stored the record.
+    Added,
+    /// The record replaced an entry's older record.
+    Updated,
+    /// An equal sequence refreshed the entry's metadata.
+    MetadataUpdated,
+    /// The stored record's sequence is later.
+    IgnoredOlder,
+    /// The record expired before it arrived.
     Expired,
+    /// The supplier's relay quota refused the record.
     RelayFull,
+    /// The book evicted the new record at its record limit.
     BookFull,
+}
+
+impl From<ImportOutcome> for ImportFact {
+    fn from(outcome: ImportOutcome) -> Self {
+        match outcome {
+            ImportOutcome::Added => Self::Added,
+            ImportOutcome::Updated => Self::Updated,
+            ImportOutcome::MetadataUpdated => Self::MetadataUpdated,
+            ImportOutcome::IgnoredOlder => Self::IgnoredOlder,
+        }
+    }
 }
 
 /// An independent restatement of the book's documented rules.
@@ -320,9 +342,9 @@ impl BookModel {
         expires: u64,
         source: Option<NodeId>,
         now: u64,
-    ) -> Expected {
+    ) -> ImportFact {
         if expires.saturating_add(SKEW) < now {
-            return Expected::Expired;
+            return ImportFact::Expired;
         }
         let first_party = source == Some(node_id);
         let relay = Self::relay_of(source, node_id);
@@ -332,7 +354,7 @@ impl BookModel {
             // An expired record no longer orders its node's records.
             let stored_orders = entry.expires >= now;
             if stored_orders && sequence < entry.sequence {
-                return Expected::Outcome(ImportOutcome::IgnoredOlder);
+                return ImportFact::IgnoredOlder;
             }
             let same_sequence = stored_orders && sequence == entry.sequence;
             // A full relay cannot take over an entry.
@@ -346,7 +368,7 @@ impl BookModel {
             entry.last_seen = now;
             entry.confirmed |= first_party;
             if same_sequence {
-                return Expected::Outcome(ImportOutcome::MetadataUpdated);
+                return ImportFact::MetadataUpdated;
             }
             self.changes.push(BookChange::Replaced {
                 node_id,
@@ -356,7 +378,7 @@ impl BookModel {
             });
             entry.sequence = sequence;
             entry.expires = expires;
-            return Expected::Outcome(ImportOutcome::Updated);
+            return ImportFact::Updated;
         }
 
         if let Some(relay) = relay.filter(|_| relay_full) {
@@ -369,7 +391,7 @@ impl BookModel {
                 .map(|(id, _)| *id)
                 .collect();
             if expired.is_empty() {
-                return Expected::RelayFull;
+                return ImportFact::RelayFull;
             }
             expired.sort_unstable_by_key(|id| *id.as_bytes());
             for id in expired {
@@ -407,10 +429,10 @@ impl BookModel {
                 cause: EvictionCause::BookLimit,
             });
             if victim == node_id {
-                return Expected::BookFull;
+                return ImportFact::BookFull;
             }
         }
-        Expected::Outcome(ImportOutcome::Added)
+        ImportFact::Added
     }
 
     /// The documented eviction order: the earliest-expiring expired entry,
@@ -469,17 +491,17 @@ impl BookModel {
     }
 }
 
-fn import_result(result: Result<ImportOutcome, DiscoveryBookError>) -> Expected {
+fn import_result(result: Result<ImportOutcome, DiscoveryBookError>) -> ImportFact {
     match result {
-        Ok(outcome) => Expected::Outcome(outcome),
-        Err(DiscoveryBookError::Record(DiscoveryRecordError::Expired)) => Expected::Expired,
+        Ok(outcome) => outcome.into(),
+        Err(DiscoveryBookError::Record(DiscoveryRecordError::Expired)) => ImportFact::Expired,
         Err(DiscoveryBookError::Limit {
             field: "records per relay",
             ..
-        }) => Expected::RelayFull,
+        }) => ImportFact::RelayFull,
         Err(DiscoveryBookError::Limit {
             field: "records", ..
-        }) => Expected::BookFull,
+        }) => ImportFact::BookFull,
         Err(error) => panic!("the generated records only fail on expiry or limits: {error}"),
     }
 }
@@ -522,9 +544,9 @@ struct BookDriver {
     /// The record changes the book reported for the current operation.
     changes: Vec<BookChange>,
     /// The current import's result, if the operation imported a record.
-    result: Option<Expected>,
+    result: Option<ImportFact>,
     /// What the model predicts for the current import.
-    expected_result: Option<Expected>,
+    expected_result: Option<ImportFact>,
     /// The current sample's signed records, as they would go on the wire.
     sample: Vec<Vec<u8>>,
 }
@@ -699,7 +721,7 @@ impl BookDriver {
                 .map(|(relay, count)| (hex::encode(relay.as_bytes()), count))
                 .collect(),
             changes: self.changes.iter().map(BookFact::from).collect(),
-            result: self.result.map(|result| format!("{result:?}")),
+            result: self.result,
         }
     }
 
@@ -717,7 +739,7 @@ impl BookDriver {
             entries,
             relayed: self.model.relayed_counts(),
             changes: self.model.changes.iter().map(BookFact::from).collect(),
-            result: self.expected_result.map(|result| format!("{result:?}")),
+            result: self.expected_result,
         }
     }
 }
@@ -797,9 +819,19 @@ pub enum BookFact {
         node: String,
         /// The removed record's sequence.
         sequence: u64,
-        /// `relay-quota` or `book-limit`.
-        cause: String,
+        /// Why the entry left.
+        cause: EvictionFact,
     },
+}
+
+/// Why an entry left the book in a machine step.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvictionFact {
+    /// An expired entry gave way to its relay's next record.
+    RelayQuota,
+    /// The book exceeded its record limit.
+    BookLimit,
 }
 
 impl From<&BookChange> for BookFact {
@@ -834,10 +866,9 @@ impl From<&BookChange> for BookFact {
                 node: hex::encode(node_id.as_bytes()),
                 sequence: *sequence,
                 cause: match cause {
-                    EvictionCause::RelayQuota => "relay-quota",
-                    EvictionCause::BookLimit => "book-limit",
-                }
-                .to_owned(),
+                    EvictionCause::RelayQuota => EvictionFact::RelayQuota,
+                    EvictionCause::BookLimit => EvictionFact::BookLimit,
+                },
             },
         }
     }
@@ -858,7 +889,7 @@ pub struct BookView {
     /// The record changes this operation made, in order.
     pub changes: Vec<BookFact>,
     /// The import's result, for an import operation.
-    pub result: Option<String>,
+    pub result: Option<ImportFact>,
 }
 
 /// One decoder-v2 record-book operation.
@@ -1213,9 +1244,9 @@ struct StateDriver {
     hellos: Vec<VerifiedRecord>,
     now: u64,
     /// The current operation's installation result.
-    result: Option<String>,
+    result: Option<InstallFact>,
     /// What the model predicts for the current operation's installation.
-    expected_result: Option<String>,
+    expected_result: Option<InstallFact>,
 }
 
 impl StateDriver {
@@ -1302,20 +1333,20 @@ impl StateDriver {
                     &connected,
                     now,
                 );
-                self.result = Some(install_label(&result));
+                self.result = Some(install_fact(&result));
                 if self.model.is_current(peer, conn_id, session_id) {
                     let expected = if self.model.peers[peer].in_book {
-                        ImportOutcome::MetadataUpdated
+                        ImportFact::MetadataUpdated
                     } else {
-                        ImportOutcome::Added
+                        ImportFact::Added
                     };
-                    self.expected_result = Some(format!("installed:{expected:?}"));
+                    self.expected_result = Some(InstallFact::Installed(expected));
                     // An install first drops what disconnected peers no longer back.
                     self.model.sync(now);
                     self.model.peers[peer].in_book = true;
                     self.model.peers[peer].hinted = true;
                 } else {
-                    self.expected_result = Some("superseded".to_owned());
+                    self.expected_result = Some(InstallFact::Superseded);
                 }
             }
             StateOp::ReceiveServices {
@@ -1468,11 +1499,23 @@ impl StateDriver {
     }
 }
 
-fn install_label(result: &Result<ImportOutcome, SessionRecordError>) -> String {
+/// One verification result's installation in a machine step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallFact {
+    /// The session was current, and the book took the record.
+    Installed(ImportFact),
+    /// A later session replaced the session that delivered the record.
+    Superseded,
+    /// The book refused the record, with this error.
+    Failed(String),
+}
+
+fn install_fact(result: &Result<ImportOutcome, SessionRecordError>) -> InstallFact {
     match result {
-        Ok(outcome) => format!("installed:{outcome:?}"),
-        Err(SessionRecordError::Superseded) => "superseded".to_owned(),
-        Err(SessionRecordError::Import(error)) => format!("failed:{error}"),
+        Ok(outcome) => InstallFact::Installed((*outcome).into()),
+        Err(SessionRecordError::Superseded) => InstallFact::Superseded,
+        Err(SessionRecordError::Import(error)) => InstallFact::Failed(error.to_string()),
     }
 }
 
@@ -1515,7 +1558,7 @@ pub struct SessionView {
     /// Discovered records in the book.
     pub discovered: usize,
     /// The installation's result, for an operation that finished a verification.
-    pub installation: Option<String>,
+    pub installation: Option<InstallFact>,
 }
 
 /// One decoder-v2 session-installation operation.
@@ -1852,18 +1895,24 @@ fn book_trace_reports_exact_install_replacement_and_eviction() {
     let changes = || steps.iter().flat_map(|step| &step.actual.changes);
     assert!(changes().any(|change| matches!(change, BookFact::Installed { .. })));
     assert!(changes().any(|change| matches!(change, BookFact::Replaced { .. })));
-    assert!(changes()
-        .any(|change| matches!(change, BookFact::Evicted { cause, .. } if cause == "book-limit")));
-    assert!(changes()
-        .any(|change| matches!(change, BookFact::Evicted { cause, .. } if cause == "relay-quota")));
+    assert!(changes().any(|change| matches!(
+        change,
+        BookFact::Evicted {
+            cause: EvictionFact::BookLimit,
+            ..
+        }
+    )));
+    assert!(changes().any(|change| matches!(
+        change,
+        BookFact::Evicted {
+            cause: EvictionFact::RelayQuota,
+            ..
+        }
+    )));
     assert!(steps.iter().any(|step| !step.sample.is_empty()));
-    let results = || {
-        steps
-            .iter()
-            .filter_map(|step| step.actual.result.as_deref())
-    };
-    assert!(results().any(|result| result == "RelayFull"));
-    assert!(results().any(|result| result == "Expired"));
+    let results = || steps.iter().filter_map(|step| step.actual.result);
+    assert!(results().any(|result| result == ImportFact::RelayFull));
+    assert!(results().any(|result| result == ImportFact::Expired));
     let entries = || steps.iter().flat_map(|step| &step.actual.entries);
     assert!(entries().any(|entry| entry.last_success.is_some()));
     assert!(entries().any(|entry| entry.failures > 0));
@@ -1884,10 +1933,10 @@ fn session_trace_separates_stale_results_and_retained_hints() {
     let installations = || {
         steps
             .iter()
-            .filter_map(|step| step.actual.installation.as_deref())
+            .filter_map(|step| step.actual.installation.as_ref())
     };
-    assert!(installations().any(|result| result == "superseded"));
-    assert!(installations().any(|result| result.starts_with("installed:")));
+    assert!(installations().any(|result| *result == InstallFact::Superseded));
+    assert!(installations().any(|result| matches!(result, InstallFact::Installed(_))));
     assert!(steps.iter().any(|step| !step.actual.hints.is_empty()));
     assert!(steps.iter().any(|step| !step.actual.admitted.is_empty()));
     let live = |step: &SessionStep| step.actual.hints.iter().any(|hint| hint.live_summaries > 0);

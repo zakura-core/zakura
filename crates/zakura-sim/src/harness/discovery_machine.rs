@@ -7,7 +7,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zakura_network::zakura::BookFact;
+use zakura_network::zakura::{BookFact, InstallFact};
 use zakura_scheduler::{CleanupReport, SimInstant, Status as SchedulerStatus};
 
 use super::{HarnessEntry, HarnessError};
@@ -425,10 +425,9 @@ impl Reached {
                     !book.expected.changes.is_empty() || !book.sample.is_empty();
             }
             MachineStep::DiscoveryState(state) => {
-                let installation = state.expected.installation.as_deref();
-                let stale_result = installation == Some("superseded");
-                let current_result =
-                    installation.is_some_and(|result| result.starts_with("installed:"));
+                let installation = state.expected.installation.as_ref();
+                let stale_result = matches!(installation, Some(InstallFact::Superseded));
+                let current_result = matches!(installation, Some(InstallFact::Installed(_)));
                 let retained_hint = !state.expected.hints.is_empty();
                 self.stale_result |= stale_result;
                 self.current_result |= current_result;

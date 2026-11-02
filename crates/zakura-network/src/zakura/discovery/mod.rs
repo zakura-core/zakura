@@ -19,7 +19,8 @@ mod state_tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state_tests::{
     trace_discovery_book_bytes, trace_discovery_state_bytes, AdmittedFact, BookEntryFact, BookFact,
-    BookStep, BookView, DriverFailure, HintFact, SessionStep, SessionView,
+    BookStep, BookView, DriverFailure, EvictionFact, HintFact, ImportFact, InstallFact,
+    SessionStep, SessionView,
 };
 mod trace;
 mod verified;

@@ -279,15 +279,16 @@ struct Settling {
 }
 
 impl Settling {
-    fn of(&mut self, kind: QueryKind) -> &mut usize {
-        match kind {
-            QueryKind::Peers => &mut self.peers,
-            QueryKind::Services => &mut self.services,
+    fn of(&mut self, held: Held) -> &mut usize {
+        match held {
+            Held::Answer(QueryKind::Peers) => &mut self.peers,
+            Held::Answer(QueryKind::Services) => &mut self.services,
+            Held::Hello => &mut self.hellos,
         }
     }
 
     fn holds(mut self, kind: QueryKind) -> bool {
-        *self.of(kind) > 0
+        *self.of(Held::Answer(kind)) > 0
     }
 
     fn is_empty(self) -> bool {
@@ -295,48 +296,43 @@ impl Settling {
     }
 }
 
-/// One answer that a session has claimed and not settled.
+/// What one [`SettlingHold`] holds.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Held {
+    /// A claimed answer. It also holds its pool entry beside this hold.
+    Answer(QueryKind),
+    /// A `Hello` in verification. It holds a closing session's wait and nothing
+    /// else: no reservation, no pool entry, and no query kind.
+    Hello,
+}
+
+/// One answer or `Hello` that a session's reader has not settled.
 ///
 /// The reader holds it through decode, verification, and import. Dropping it
-/// settles the answer on every path, including a reader cancelled inside
-/// verification. Settlement needs no lock, so a destructor that runs at
-/// shutdown cannot contend with a paused lock holder.
+/// settles on every path, including a reader cancelled inside verification.
+/// Settlement needs no lock, so a destructor that runs at shutdown cannot
+/// contend with a paused lock holder.
 #[derive(Debug)]
-struct SettlingAnswer {
-    kind: QueryKind,
+#[must_use = "dropping the hold settles what it holds"]
+pub(super) struct SettlingHold {
+    held: Held,
     settling: Arc<watch::Sender<Settling>>,
 }
 
-impl SettlingAnswer {
-    fn new(kind: QueryKind, settling: &Arc<watch::Sender<Settling>>) -> Self {
-        settling.send_modify(|settling| *settling.of(kind) += 1);
+impl SettlingHold {
+    fn new(held: Held, settling: &Arc<watch::Sender<Settling>>) -> Self {
+        settling.send_modify(|settling| *settling.of(held) += 1);
         Self {
-            kind,
+            held,
             settling: settling.clone(),
         }
     }
 }
 
-impl Drop for SettlingAnswer {
+impl Drop for SettlingHold {
     fn drop(&mut self) {
         self.settling
-            .send_modify(|settling| *settling.of(self.kind) -= 1);
-    }
-}
-
-/// One `Hello` that a session's reader is verifying.
-///
-/// It holds a closing session's wait and nothing else: no reservation, no pool
-/// entry, and no query kind. Dropping it settles the `Hello` on every path.
-#[derive(Debug)]
-#[must_use = "dropping the hold settles the Hello"]
-pub(super) struct SettlingHello {
-    settling: Arc<watch::Sender<Settling>>,
-}
-
-impl Drop for SettlingHello {
-    fn drop(&mut self) {
-        self.settling.send_modify(|settling| settling.hellos -= 1);
+            .send_modify(|settling| *settling.of(self.held) -= 1);
     }
 }
 
@@ -349,7 +345,7 @@ pub(super) struct ClaimedAnswer {
     /// Frees before `_settling`, so a waiter that settlement wakes finds the
     /// entry free.
     _entry: PoolEntry,
-    _settling: SettlingAnswer,
+    _settling: SettlingHold,
 }
 
 impl ClaimedAnswer {
@@ -511,16 +507,13 @@ impl Queries {
         Ok(Some(ClaimedAnswer {
             admitted,
             _entry: entry,
-            _settling: SettlingAnswer::new(kind, &self.settling),
+            _settling: SettlingHold::new(Held::Answer(kind), &self.settling),
         }))
     }
 
     /// Counts one `Hello` in verification until the returned hold drops.
-    pub(super) fn verifying_hello(&self) -> SettlingHello {
-        self.settling.send_modify(|settling| settling.hellos += 1);
-        SettlingHello {
-            settling: self.settling.clone(),
-        }
+    pub(super) fn verifying_hello(&self) -> SettlingHold {
+        SettlingHold::new(Held::Hello, &self.settling)
     }
 
     /// Resolves once this session holds nothing it read and has not processed:
@@ -1510,7 +1503,7 @@ mod tests {
         /// The kinds of the queued queries that a claim has not abandoned.
         unwritten: VecDeque<QueryKind>,
         answers: Vec<ClaimedAnswer>,
-        hello: Option<SettlingHello>,
+        hello: Option<SettlingHold>,
     }
 
     impl SettlementSession {

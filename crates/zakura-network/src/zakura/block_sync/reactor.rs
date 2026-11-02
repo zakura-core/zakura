@@ -297,7 +297,7 @@ pub fn spawn_block_sync_reactor(
     };
 
     let handle = BlockSyncHandle {
-        accounting: state.work_queue.budget().closure_reader(),
+        accounting: state.work_queue.budget(),
         events: events_tx,
         lifecycle: lifecycle_tx,
         needed_query_failures: needed_query_failure_tx,

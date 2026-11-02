@@ -513,7 +513,7 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
-    budget: super::work_queue::BudgetReader,
+    budget: crate::zakura::transport::BudgetReader,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     received_throughput: Arc<Mutex<ThroughputMeter>>,

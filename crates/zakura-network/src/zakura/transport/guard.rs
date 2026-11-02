@@ -26,19 +26,31 @@ pub(crate) struct ByteBudget {
     inner: Arc<ByteBudgetInner>,
 }
 
-/// A closure signal with no reservation or settlement authority.
+/// Capacity and closure observations without admission or settlement authority.
 #[derive(Clone, Debug)]
-pub(crate) struct BudgetClosureReader(Arc<ByteBudgetInner>);
+pub(crate) struct BudgetReader(ByteBudget);
 
-impl BudgetClosureReader {
+impl BudgetReader {
+    pub(crate) fn available(&self) -> u64 {
+        self.0.available()
+    }
+
+    pub(crate) fn reserved(&self) -> u64 {
+        self.0.reserved()
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
-        self.0.closed.load(Ordering::Acquire)
+        self.0.is_closed()
+    }
+
+    pub(crate) fn subscribe_capacity(&self) -> &Notify {
+        self.0.subscribe_capacity()
     }
 
     /// Wait for permanent closure, including closure before registration.
     pub(crate) async fn closed(&self) {
         loop {
-            let notified = self.0.closure.notified();
+            let notified = self.0.inner.closure.notified();
             zakura_rt::pin!(notified);
             notified.as_mut().enable();
             if self.is_closed() {
@@ -343,8 +355,8 @@ impl ByteBudget {
         }
     }
 
-    pub(crate) fn closure_reader(&self) -> BudgetClosureReader {
-        BudgetClosureReader(self.inner.clone())
+    pub(crate) fn reader(&self) -> BudgetReader {
+        BudgetReader(self.clone())
     }
 
     pub(crate) fn available(&self) -> u64 {
@@ -636,7 +648,7 @@ mod tests {
         let budget = ByteBudget::new(1_000);
         let funding = budget.reserve_owned(400).unwrap();
         let clone = budget.clone();
-        let reader = budget.closure_reader();
+        let reader = budget.reader();
         let mut closed = Box::pin(reader.closed());
         let wake = Arc::new(ClosureWake(std::sync::atomic::AtomicUsize::new(0)));
         let waker = Waker::from(wake.clone());

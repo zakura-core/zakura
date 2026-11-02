@@ -8050,7 +8050,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
-        accounting: ByteBudget::new(config.max_inflight_block_bytes).closure_reader(),
+        accounting: ByteBudget::new(config.max_inflight_block_bytes).reader(),
         events,
         lifecycle,
         needed_query_failures,

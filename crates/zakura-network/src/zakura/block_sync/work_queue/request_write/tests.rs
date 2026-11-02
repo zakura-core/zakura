@@ -1403,7 +1403,7 @@ fn accounting_closure_wakes_its_waiter() {
 
     for operation in 0..6 {
         let mut f = Fixture::new();
-        let reader = f.budget.closure_reader();
+        let reader = f.budget.reader();
         let mut closed = Box::pin(reader.closed());
         let wake = Arc::new(ClosureWake {
             count: AtomicUsize::new(0),

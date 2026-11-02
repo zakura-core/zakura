@@ -37,7 +37,7 @@ use zakura_rt::{
 
 use super::request::BlockSizeEstimate;
 use crate::zakura::transport::{
-    BudgetClosure, ByteBudget, ByteRelease, ByteReservation, ReservationError,
+    BudgetClosure, BudgetReader, ByteBudget, ByteRelease, ByteReservation, ReservationError,
 };
 
 mod request_write;
@@ -167,7 +167,7 @@ impl WorkQueue {
     }
 
     pub(super) fn budget(&self) -> BudgetReader {
-        BudgetReader(self.budget.clone())
+        self.budget.reader()
     }
 
     /// The number of ownership revocations so far. See [`Self::revoke_for_owner`].
@@ -686,29 +686,3 @@ pub use state::{
     WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
     WorkOwnershipView,
 };
-
-/// Capacity and closure observations without admission or settlement authority.
-#[derive(Clone, Debug)]
-pub(super) struct BudgetReader(ByteBudget);
-
-impl BudgetReader {
-    pub(super) fn available(&self) -> u64 {
-        self.0.available()
-    }
-
-    pub(super) fn reserved(&self) -> u64 {
-        self.0.reserved()
-    }
-
-    pub(super) fn is_closed(&self) -> bool {
-        self.0.is_closed()
-    }
-
-    pub(super) fn subscribe_capacity(&self) -> &zakura_rt::sync::Notify {
-        self.0.subscribe_capacity()
-    }
-
-    pub(super) fn closure_reader(&self) -> crate::zakura::transport::BudgetClosureReader {
-        self.0.closure_reader()
-    }
-}

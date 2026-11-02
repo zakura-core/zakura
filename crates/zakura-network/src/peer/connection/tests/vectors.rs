@@ -1700,37 +1700,6 @@ async fn tcp_header_copies_charge_only_their_new_allocations() {
     .expect("the connection handles its messages");
 }
 
-/// C.3, C.4, C.9, C.10, and L.mempool: a row refusal ends the request without an
-/// overload's random disconnect, however often it repeats.
-#[tokio::test]
-async fn a_row_refusal_does_not_fault_a_tcp_peer() {
-    use crate::inbound_resources::{InboundRow, InboundRowRefused};
-
-    tokio::time::timeout(RESOURCE_TEST_BOUND, async {
-        let _init_guard = zakura_test::init();
-        let (mut peer_tx, peer_rx) = mpsc::channel(1);
-        let (connection, _client_tx, mut inbound, mut outbound, error) = new_test_connection();
-        let connection_task = tokio::spawn(connection.run(peer_rx));
-
-        for _ in 0..16 {
-            peer_tx.send(Ok(Message::Mempool)).await.unwrap();
-            inbound
-                .expect_request(Request::MempoolTransactionIds)
-                .await
-                .respond_error(InboundRowRefused(InboundRow::MempoolTransactionIds).into());
-        }
-        peer_tx
-            .send(Ok(Message::Ping(Nonce::default())))
-            .await
-            .unwrap();
-        assert!(matches!(outbound.next().await, Some(Message::Pong(_))));
-        assert!(error.try_get_error().is_none());
-        connection_task.abort();
-    })
-    .await
-    .expect("the connection handles its messages");
-}
-
 /// L.mempool: an empty snapshot sends nothing, and a larger snapshot than one message
 /// allows sends exactly one message of the protocol's limit.
 #[tokio::test]

@@ -28,7 +28,7 @@ use crate::{
         self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
         OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
-    inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge, InboundRowRefused},
+    inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge},
     meta_addr::MetaAddr,
     peer::{
         block_gossip::{BlockAdvert, BlockAdvertError},
@@ -1672,12 +1672,7 @@ where
         // Inbound service request timeouts are handled by the timeout layer in `start::start()`.
         let rsp = match self.svc.call(req.clone()).await {
             Err(e) => {
-                if e.is::<InboundRowRefused>() {
-                    // A row refuses only when a caller exceeds its own limit, which says
-                    // nothing about this peer.
-                    tracing::debug!(%e, %req, "inbound row refused a peer request");
-                    self.update_state_metrics(format!("In::Req::{}/Rsp::Refused", req.command()));
-                } else if e.is::<tower::load_shed::error::Overloaded>() {
+                if e.is::<tower::load_shed::error::Overloaded>() {
                     // # Security
                     //
                     // The peer request queue must have a limited length.

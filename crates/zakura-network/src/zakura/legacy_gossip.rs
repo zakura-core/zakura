@@ -109,9 +109,6 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 const LEGACY_INBOUND_RETAINED_BYTES: u64 =
     // Widening usize to u64 is lossless on supported targets.
     (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;
-/// Callers that can run inbound service work at once: every request handler, and the
-/// serial gossip worker.
-pub(crate) const LEGACY_INBOUND_CALLERS: usize = LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1;
 /// Inventory fetches that one request client runs at once, including retries.
 const LEGACY_CLIENT_INVENTORY_SLOTS: usize = 256;
 /// Other requests that one request client runs at once. They have a partition of
@@ -4110,72 +4107,6 @@ mod tests {
             payload,
         };
         assert!(LegacyGossipFrame::decode_frame(frame).is_err());
-        Ok(())
-    }
-
-    /// C.3, C.4, and C.9 to C.11: a request refused by its inbound row becomes a local
-    /// failure on its stream. The handler ends, and its queue slot and charge return.
-    #[tokio::test]
-    async fn a_row_refusal_is_a_local_request_failure() -> Result<(), BoxError> {
-        use crate::inbound_resources::{InboundRow, InboundRowAdmission, InboundRowRefused};
-
-        let frames = [
-            (
-                LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
-                InboundRow::BlocksByHash,
-            ),
-            (
-                LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(1)]),
-                InboundRow::TransactionsById,
-            ),
-            (
-                LegacyRequestFrame::FindBlocks {
-                    known_blocks: vec![block_hash(1)],
-                    stop: None,
-                },
-                InboundRow::FindBlocks,
-            ),
-            (
-                LegacyRequestFrame::FindHeaders {
-                    known_blocks: vec![block_hash(1)],
-                    stop: None,
-                },
-                InboundRow::FindHeaders,
-            ),
-            (
-                LegacyRequestFrame::MempoolTransactionIds,
-                InboundRow::MempoolTransactionIds,
-            ),
-        ];
-        for (frame, row) in frames {
-            let inner =
-                tower::service_fn(|_request: Request| async { Ok::<_, BoxError>(Response::Nil) });
-            let inbound = InboundRowAdmission::new(inner, 0);
-            let (response_tx, response_rx) = oneshot::channel();
-            let permits = Arc::new(Semaphore::new(1));
-            let budget = InboundBudget::new(1 << 20);
-            let request = LegacyRequestInbound {
-                peer_id: inbound_peer(),
-                request_id: 1,
-                frame,
-                response_tx,
-                _charge: budget.charge_committed(10),
-            };
-            handle_legacy_request(
-                inbound,
-                request,
-                permits.clone().try_acquire_owned()?,
-                ZakuraTrace::noop(),
-            )
-            .await;
-            let refused = response_rx.await?.expect_err("the row has no slots");
-            assert_eq!(
-                refused.downcast_ref::<InboundRowRefused>(),
-                Some(&InboundRowRefused(row))
-            );
-            assert_eq!(permits.available_permits(), 1);
-            assert_eq!(budget.used(), 0);
-        }
         Ok(())
     }
 

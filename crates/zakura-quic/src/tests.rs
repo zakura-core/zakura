@@ -1588,8 +1588,11 @@ async fn drained_connections_leave_the_table() {
         conn.close(VarInt::from_u32(0), b"done");
         inbound.closed().await;
         drop(inbound);
-        // Draining lasts three PTOs, a few milliseconds on loopback.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Draining lasts three PTOs. A loaded host measures a long RTT, so
+        // the test waits for the slot to free instead of a fixed time.
+        while server.endpoint.connection_count() + server.endpoint.closing_connection_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let started = std::time::Instant::now();
         server.endpoint.shutdown().await;
         assert!(

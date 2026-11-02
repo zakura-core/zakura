@@ -1520,6 +1520,14 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
 const REACTOR_INPUT: &[u8] = include_bytes!("fixtures/header-reactor-policy.bin");
 
 #[test]
+fn reactor_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_REACTOR_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+    }
+}
+
+#[test]
 fn reactor_machine_records_and_replays_without_transport() {
     let dir = record_named("header/reactor-policy", REACTOR_INPUT);
     let trace = open(dir.path());

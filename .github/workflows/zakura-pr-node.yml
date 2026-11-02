@@ -160,7 +160,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: zakura-pr-node-${{ inputs.pr_number || inputs.ref }}
@@ -195,6 +194,9 @@ jobs:
 
   node:
     if: ${{ !inputs.evidence_only }}
+    permissions:
+      contents: read
+      pull-requests: write
     runs-on: ubuntu-latest
     outputs:
       target_sha: ${{ steps.target.outputs.sha }}

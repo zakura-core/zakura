@@ -1518,3 +1518,23 @@ async fn a_leaked_lease_clone_delays_the_release_report() {
     .expect("the release reports once the blocking operation ends");
     assert_eq!(logged(), [("acquired", 1), ("released", 0)]);
 }
+
+/// A pushed frame's output stays with its unpolled future, and dropping that
+/// future returns the grants and takes no transport slot.
+#[tokio::test]
+async fn an_unpolled_push_send_returns_its_grants() {
+    let capacity = capacity(LIMITS);
+    let peer = peer(1);
+    let push = capacity.push(&peer);
+    let permit = push.acquire(8).await;
+    assert!(capacity.node_output.granted() > 0);
+    let (send, _output) = crate::zakura::transport::worker_framed_channel(1);
+    let unpolled = permit.reserve_send(&send);
+    assert!(
+        capacity.node_output.granted() > 0,
+        "the future owns the grants"
+    );
+    drop(unpolled);
+    assert_eq!(capacity.node_output.granted(), 0);
+    assert_eq!(send.capacity(), 1);
+}

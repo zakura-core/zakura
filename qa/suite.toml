@@ -224,6 +224,22 @@ args = ["-rss_limit_mb=4096", "-max_len=256", "-detect_leaks=0"]
 env = ["ASAN_OPTIONS=detect_leaks=0"]
 timeout-secs = 2700
 
+# The P2P machine targets, with qa/fuzz/p2p's input limit. Each replay reads
+# at most 512 bytes.
+[[target]]
+package = "p2p"
+name = "service_session"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "cadence"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512"]
+timeout-secs = 1800
+
 [[excluded-target]]
 package = "rpc"
 name = "json_rpc_request"

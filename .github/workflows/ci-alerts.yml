@@ -20,6 +20,7 @@ on:
       - Header-chain fuzzing
       - Legacy Pages redirect
       - Lint
+      - P2P fuzzing
       - PR node reaper
       - RPC fuzzing
       - Semver checks

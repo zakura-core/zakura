@@ -51,17 +51,14 @@ pub(crate) struct TerminalPermit {
 impl TerminalPermit {
     /// Queue the terminal outcome `frame` on `send`, holding this permit
     /// until the frame's transport write finishes. It needs no output grant
-    /// and no execution slot.
+    /// or execution slot, and it waits for no queue slot: this permit's slot,
+    /// held since `Open`, funds the frame's place behind prior data.
     ///
-    /// Returns false if the stream is closed.
+    /// The future owns the permit from its creation, so dropping it unpolled
+    /// frees the subscription's slot. Returns false if the stream is closed.
     pub(crate) async fn send(self, send: &FramedSend, frame: Frame) -> bool {
-        match send.reserve_guarded().await {
-            Ok(slot) => {
-                slot.send(frame, FrameGuard::new(Arc::new(self)));
-                true
-            }
-            Err(_) => false,
-        }
+        send.queue_terminal(frame, FrameGuard::new(Arc::new(self)))
+            .is_ok()
     }
 }
 

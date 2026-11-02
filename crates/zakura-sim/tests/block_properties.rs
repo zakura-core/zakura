@@ -183,7 +183,10 @@ fn stale_query() -> BlockScenario {
 /// The mirror switches to the fork first, so it answers the node's old
 /// requests with fork bodies. Block sync rejects those as incompatible and
 /// closes the link with an unfinished exchange. The harness models no
-/// transport, so a `Relink` on that close stands in for production's redial.
+/// transport, so a `Relink` stands in for production's redial. The relink waits
+/// until after the verdict: virtual time stands still while any task can run, so
+/// a mirror linked at once can serve the whole fork before the five seconds pass,
+/// and the verdict then changes nothing.
 fn delayed_apply() -> BlockScenario {
     BlockScenario {
         blocks: 8,
@@ -213,21 +216,20 @@ fn delayed_apply() -> BlockScenario {
                 },
                 when: Some(Trigger::Submitted(Select::nth(BlockKind::Apply, 1))),
             },
-            relink_on_close(),
+            ControlStep {
+                action: ControlAction::Relink {
+                    peer: "mirror-0".to_owned(),
+                },
+                when: Some(Trigger::VirtualTime(DELAYED_APPLY_RELINK_MS)),
+            },
         ],
         ..BlockScenario::default()
     }
 }
 
-/// Mirror 0 links again each time a link to it closes.
-fn relink_on_close() -> ControlStep {
-    ControlStep {
-        action: ControlAction::Relink {
-            peer: "mirror-0".to_owned(),
-        },
-        when: Some(Trigger::Closed("mirror-0".to_owned())),
-    }
-}
+/// When the delayed-apply case links its mirror again: past the held
+/// verdict at 5 s.
+const DELAYED_APPLY_RELINK_MS: u64 = 6_000;
 
 /// When the late-body case links its mirror again: past the 180 s
 /// no-progress cooldown that parks the session after the late request.
@@ -590,9 +592,8 @@ fn a_stale_query_after_a_reset_is_asked_again() {
 /// fork's height 3 again. Before that rule, block sync retired the fork's
 /// height 3 by height as the verified tip passed it, and most schedules
 /// stalled at the replaced block (`lane3-issues/case3-stall.md`). Every
-/// input converges on the fork's tip. Some schedules never move the
-/// verified tip to the replaced block, so the case asks only that at least
-/// one late verdict starts an epoch.
+/// input converges on the fork's tip. The case asks that at least one late
+/// verdict starts an epoch.
 #[test]
 #[allow(clippy::print_stdout)]
 fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {

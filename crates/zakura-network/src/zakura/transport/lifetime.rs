@@ -295,15 +295,27 @@ impl FrameGate {
     }
 
     fn try_shared(&self, bytes: u64) -> Option<(OutputGrant, OutputGrant)> {
-        let connection = self.connection.try_grant(self.connection.clamp(bytes))?;
-        let node = self.node.try_grant(self.node.clamp(bytes))?;
+        let (connection_bytes, node_bytes) = self.shared_charge(bytes);
+        let connection = self.connection.try_grant(connection_bytes)?;
+        let node = self.node.try_grant(node_bytes)?;
         Some((connection, node))
     }
 
     async fn shared(&self, bytes: u64) -> (OutputGrant, OutputGrant) {
-        let connection = self.connection.grant(self.connection.clamp(bytes)).await;
-        let node = self.node.grant(self.node.clamp(bytes)).await;
+        let (connection_bytes, node_bytes) = self.shared_charge(bytes);
+        let connection = self.connection.grant(connection_bytes).await;
+        let node = self.node.grant(node_bytes).await;
         (connection, node)
+    }
+
+    /// The bytes a frame of `bytes` takes from the connection and the node.
+    ///
+    /// Both take the connection's clamp. A frame above its connection's
+    /// budget then takes one connection's share of the node budget, which
+    /// holds every connection's budget, so it cannot pause other connections.
+    fn shared_charge(&self, bytes: u64) -> (u32, u32) {
+        let connection = self.connection.clamp(bytes);
+        (connection, self.node.clamp(u64::from(connection)))
     }
 }
 

@@ -268,9 +268,6 @@ impl RetainedHeaders {
         let Some(call) = self.call else {
             return;
         };
-        metrics::counter!("sync.header.work.retained_end", "end" => self.end.label()).increment(1);
-        metrics::counter!("sync.header.work.retained_end_headers", "end" => self.end.label())
-            .increment(u64::try_from(self.headers()).unwrap_or(u64::MAX));
         #[cfg(any(test, zakura_sim))]
         if let Some(observer) = &self.observer.0 {
             // An unwinding reactor reports nothing, as `HeaderSyncObserver` says.

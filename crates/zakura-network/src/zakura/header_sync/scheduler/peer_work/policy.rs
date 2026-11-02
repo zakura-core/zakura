@@ -105,24 +105,6 @@ pub enum HeaderWorkEnd {
     Settled,
 }
 
-impl HeaderWorkEnd {
-    /// The end's metric label.
-    pub(in crate::zakura::header_sync) fn label(self) -> &'static str {
-        match self {
-            Self::Dropped => "dropped",
-            Self::Refused => "refused",
-            Self::Panicked => "panicked",
-            Self::Stale => "stale",
-            Self::NoAuthority => "no_authority",
-            Self::OwnerMismatch => "owner_mismatch",
-            Self::RepairInvalid => "repair_invalid",
-            Self::PrepareFailed => "prepare_failed",
-            Self::HandedToApply { .. } => "handed_to_apply",
-            Self::Settled => "settled",
-        }
-    }
-}
-
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedHeaderTarget {

@@ -81,6 +81,8 @@ struct TapState {
     refused: AtomicBool,
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
+    /// Set when the reactor unwound, which leaves its calls and ownership open.
+    unwound: AtomicBool,
     buffer: Mutex<Buffer>,
     /// Checks each call's identity and retained headers as events arrive.
     work: Mutex<WorkCheck>,
@@ -122,6 +124,12 @@ impl TapState {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         work.broken.clone()
     }
+
+    /// The call or retained headers that a finished reactor left open.
+    fn open_work(&self) -> Result<(), String> {
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.ledger.finish()
+    }
 }
 
 /// A tap publishes reactor events.
@@ -155,6 +163,14 @@ struct TapObserver(Arc<TapState>);
 impl std::fmt::Debug for TapObserver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("TapObserver")
+    }
+}
+
+impl Drop for TapObserver {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.unwound.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -233,6 +249,7 @@ impl ReactorTap {
                 observer: observer.clone(),
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
+                unwound: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 work: Mutex::default(),
             }))
@@ -479,7 +496,8 @@ impl ActionSource for ReactorTap {
     /// doesn't pair is still logged, then fails, unless the tap is unhealthy,
     /// which the run reports instead, or records a port panic as the run's
     /// harness failure. Once the reactor's teardown is done, a dropped call still
-    /// waiting for its drop receipt fails as `UnpairedDrop`.
+    /// waiting for its drop receipt fails as `UnpairedDrop`, and an open call or
+    /// ownership fails as the ledger names it, unless the reactor unwound.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -526,6 +544,11 @@ impl ActionSource for ReactorTap {
                      its operation {op} given no drop receipt, and no shutdown removed it while \
                      the call still existed"
                 )),
+                _ if self.state.observer.strong_count() == 0
+                    && !self.state.unwound.load(Ordering::Relaxed) =>
+                {
+                    self.state.open_work()
+                }
                 _ => Ok(()),
             },
             // A reactor that unwound, from a callback or observer panic,

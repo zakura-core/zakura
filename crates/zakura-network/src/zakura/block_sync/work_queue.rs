@@ -37,8 +37,7 @@ use zakura_rt::{
 
 use super::request::BlockSizeEstimate;
 use crate::zakura::transport::{
-    BudgetClosure, BudgetClosureNotification, ByteBudget, ByteRelease, ByteReservation,
-    ReservationError,
+    BudgetClosure, ByteBudget, ByteRelease, ByteReservation, ReservationError,
 };
 
 mod request_write;
@@ -84,9 +83,6 @@ impl WorkQueueInner {
 struct WorkQueueGuard<'a> {
     inner: MutexGuard<'a, WorkQueueInner>,
     reserved_bytes: u64,
-    // Fields drop in declaration order. Notify only after `inner` unlocks,
-    // including when an accounting failure unwinds the transition.
-    _closure_notification: BudgetClosureNotification<'a>,
 }
 
 impl std::ops::Deref for WorkQueueGuard<'_> {
@@ -226,7 +222,6 @@ impl WorkQueue {
         WorkQueueGuard {
             inner,
             reserved_bytes,
-            _closure_notification: self.budget.defer_closure_notification(),
         }
     }
 

@@ -1382,16 +1382,14 @@ fn funding_drift_closes_publication_and_survives_reset() {
 }
 
 #[test]
-fn accounting_closure_wakes_after_the_queue_unlocks() {
+fn accounting_closure_wakes_its_waiter() {
     use std::{
         future::Future,
         task::{Context, Wake, Waker},
     };
-    use zakura_rt::sync::atomic::{AtomicBool, AtomicUsize};
+    use zakura_rt::sync::atomic::AtomicUsize;
 
     struct ClosureWake {
-        work: Arc<WorkQueue>,
-        woke_locked: AtomicBool,
         count: AtomicUsize,
     }
     impl Wake for ClosureWake {
@@ -1399,12 +1397,6 @@ fn accounting_closure_wakes_after_the_queue_unlocks() {
             self.wake_by_ref();
         }
         fn wake_by_ref(self: &Arc<Self>) {
-            if matches!(
-                self.work.inner.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ) {
-                self.woke_locked.store(true, Ordering::SeqCst);
-            }
             self.count.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1414,8 +1406,6 @@ fn accounting_closure_wakes_after_the_queue_unlocks() {
         let reader = f.budget.closure_reader();
         let mut closed = Box::pin(reader.closed());
         let wake = Arc::new(ClosureWake {
-            work: f.work.clone(),
-            woke_locked: AtomicBool::new(false),
             count: AtomicUsize::new(0),
         });
         let waker = Waker::from(wake.clone());
@@ -1483,10 +1473,6 @@ fn accounting_closure_wakes_after_the_queue_unlocks() {
         assert!(
             wake.count.load(Ordering::SeqCst) > 0,
             "closure did not wake its waiter: {operation}"
-        );
-        assert!(
-            !wake.woke_locked.load(Ordering::SeqCst),
-            "closure woke under the queue lock: {operation}"
         );
         assert!(closed.as_mut().poll(&mut cx).is_ready());
         assert!(

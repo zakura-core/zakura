@@ -235,7 +235,6 @@ pub struct DetachedHandleEvents {
 impl DetachedHandleEvents {
     /// Inject a local accounting failure through the real budget closure signal.
     pub fn fail_accounting(&self) {
-        let _notification = self.accounting.defer_closure_notification();
         self.accounting
             .close(crate::zakura::transport::BudgetClosure::Funding {
                 logical: 1,

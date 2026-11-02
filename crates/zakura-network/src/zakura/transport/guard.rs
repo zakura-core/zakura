@@ -122,16 +122,6 @@ pub(crate) struct ByteRelease<'a> {
     bytes: u64,
 }
 
-/// Publishes closure after the caller releases its synchronization guard.
-#[must_use = "retain this notification until the protected lock is released"]
-pub(crate) struct BudgetClosureNotification<'a>(&'a ByteBudget);
-
-impl Drop for BudgetClosureNotification<'_> {
-    fn drop(&mut self) {
-        self.0.publish_closure();
-    }
-}
-
 impl Drop for ByteRelease<'_> {
     fn drop(&mut self) {
         self.budget.release_charge(self.bytes);
@@ -348,9 +338,8 @@ impl ByteBudget {
         self.inner.closed.load(Ordering::Acquire)
     }
 
-    /// Close admission immediately. The caller must retain a deferred closure
-    /// notification until its locks are released. Counter release publishes its
-    /// own closure notification after settlement.
+    /// Close admission immediately and wake closure waiters. A waiter registers
+    /// before it reads the latch, so it cannot miss this wake.
     pub(crate) fn close(&self, cause: BudgetClosure) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             metrics::counter!("sync.block.budget.closed").increment(1);
@@ -360,15 +349,6 @@ impl ByteBudget {
                 limit_bytes = self.inner.max_bytes,
                 "block request accounting closed; retained owners remain charged"
             );
-        }
-    }
-
-    pub(crate) fn defer_closure_notification(&self) -> BudgetClosureNotification<'_> {
-        BudgetClosureNotification(self)
-    }
-
-    fn publish_closure(&self) {
-        if self.is_closed() {
             self.inner.closure.notify_waiters();
         }
     }
@@ -430,10 +410,9 @@ impl ByteBudget {
     }
 
     /// Invoke `released` after the settlement attempt and before waking capacity
-    /// waiters. A zero-byte release only publishes pending closure.
+    /// waiters. A zero-byte release does nothing.
     fn release_then(&self, bytes: u64, released: impl FnOnce()) {
         if bytes == 0 {
-            self.publish_closure();
             return;
         }
         let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
@@ -458,7 +437,6 @@ impl ByteBudget {
             }
         }
         released();
-        self.publish_closure();
         self.inner.capacity.notify_waiters();
     }
 

@@ -2401,7 +2401,7 @@ async fn validate_regtest_genesis_block() {
 
     let genesis_hash = block_verifier_router
         .oneshot(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(regtest_genesis_block()),
+            regtest_genesis_block().into(),
         ))
         .await
         .expect("should validate Regtest genesis block");
@@ -3173,7 +3173,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let genesis_hash = block_verifier_router
         .clone()
         .oneshot(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(regtest_genesis_block()),
+            regtest_genesis_block().into(),
         ))
         .await
         .expect("should validate Regtest genesis block");

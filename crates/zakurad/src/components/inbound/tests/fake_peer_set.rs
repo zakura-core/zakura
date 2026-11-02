@@ -975,7 +975,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         })
         .await
         .respond(Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(poisoned),
+            poisoned.into(),
             Some(advertiser_addr),
         ))]));
 
@@ -1023,10 +1023,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     peer_set
         .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(canonical),
-            None,
-        ))]));
+        .respond(Response::Blocks(vec![Available((canonical.into(), None))]));
 
     tx_verifier.expect_no_requests().await;
 
@@ -1148,10 +1145,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     peer_set
         .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block),
-            None,
-        ))]));
+        .respond(Response::Blocks(vec![Available((block.into(), None))]));
 
     // Wait for the chain tip update
     if let Err(timeout_error) = timeout(
@@ -1187,10 +1181,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     peer_set
         .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block),
-            None,
-        ))]));
+        .respond(Response::Blocks(vec![Available((block.into(), None))]));
 
     let response = state_service
         .clone()

@@ -435,7 +435,7 @@ mod tests {
         let ironwood_root = empty_ironwood_root();
 
         let with_roots = CommitmentRootVerification::with_roots(
-            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+            block.clone().into(),
             sapling_root,
             orchard_root,
             ironwood_root,
@@ -709,11 +709,7 @@ mod tests {
 
         // Positive: the real roots reconstruct a tree the next block's header commits to.
         let ok_items = vec![
-            verification_item(
-                zakura_node_services::block_memory::BlockHandle::Shared(act_block.clone()),
-                act_root,
-                empty_orchard_root,
-            ),
+            verification_item(act_block.clone().into(), act_root, empty_orchard_root),
             CommitmentRootVerification::header_only(
                 next_block.header.clone(),
                 Height(activation + 1),
@@ -728,11 +724,7 @@ mod tests {
         // following block's commitment is checked.
         assert_ne!(act_root, next_root, "test needs two distinct roots");
         let bad_items = vec![
-            verification_item(
-                zakura_node_services::block_memory::BlockHandle::Shared(act_block),
-                next_root,
-                empty_orchard_root,
-            ),
+            verification_item(act_block.into(), next_root, empty_orchard_root),
             CommitmentRootVerification::header_only(
                 next_block.header.clone(),
                 Height(activation + 1),
@@ -841,11 +833,7 @@ mod tests {
                 .orchard_tree_by_height(&Height(h))
                 .expect("archive fork has the per-height Orchard tree")
                 .root();
-            verification_item(
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
-                sapling_root,
-                orchard_root,
-            )
+            verification_item(block.into(), sapling_root, orchard_root)
         };
         let items: Vec<_> = (start..=end + 1).map(item_at).collect();
 
@@ -993,7 +981,7 @@ mod tests {
                 "auth-data root at {height:?}"
             );
             CommitmentRootVerification::with_roots(
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
+                block.into(),
                 roots.sapling_root,
                 roots.orchard_root,
                 roots.ironwood_root,

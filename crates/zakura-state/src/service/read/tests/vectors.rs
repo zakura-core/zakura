@@ -90,15 +90,11 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
         let block_cases = vec![
             (
                 ReadRequest::Block(block.hash().into()),
-                Ok(ReadResponse::Block(Some(
-                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-                ))),
+                Ok(ReadResponse::Block(Some(block.clone().into()))),
             ),
             (
                 ReadRequest::Block(block.coinbase_height().unwrap().into()),
-                Ok(ReadResponse::Block(Some(
-                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-                ))),
+                Ok(ReadResponse::Block(Some(block.clone().into()))),
             ),
         ];
 

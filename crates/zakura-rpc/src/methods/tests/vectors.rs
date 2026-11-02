@@ -2134,10 +2134,7 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
     read_state
         .expect_request_that(|req| matches!(req, ReadRequest::BlockAndSize(_)))
         .await
-        .respond(ReadResponse::BlockAndSize(Some((
-            zakura_node_services::block_memory::BlockHandle::Shared(block),
-            block_size,
-        ))));
+        .respond(ReadResponse::BlockAndSize(Some((block.into(), block_size))));
     read_state
         .expect_request_that(|req| matches!(req, ReadRequest::OrchardTree(_)))
         .await

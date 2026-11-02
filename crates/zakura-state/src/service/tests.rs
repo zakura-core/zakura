@@ -802,7 +802,7 @@ impl Fixture {
             &self.non_finalized,
             &self.finalized.db,
             crate::BlockCommitmentData {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(child),
+                block: child.into(),
                 auth_data_root: None,
             },
         )
@@ -1864,16 +1864,12 @@ async fn test_populated_state_responds_correctly(
 
         transcript.push((
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-            ))),
+            Ok(Response::Block(Some(block.clone().into()))),
         ));
 
         transcript.push((
             Request::Block(height.into()),
-            Ok(Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-            ))),
+            Ok(Response::Block(Some(block.clone().into()))),
         ));
 
         // Spec: transactions in the genesis block are ignored.

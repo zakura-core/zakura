@@ -5694,9 +5694,7 @@ mod zakura_header_sync_driver_tests {
             .find(|(height, _)| height.0 == WITHHELD)
             .expect("withheld block is part of the test chain");
         legacy_verifier
-            .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
-                withheld_block.clone(),
-            ))
+            .oneshot(withheld_block.clone().into())
             .await
             .expect("legacy verifier submission completes the checkpoint range");
 
@@ -6021,13 +6019,7 @@ mod zakura_header_sync_driver_tests {
         let mut commits = FuturesUnordered::new();
         for (_height, block) in chain {
             let checkpoint_verifier = checkpoint_verifier.clone();
-            commits.push(async move {
-                checkpoint_verifier
-                    .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
-                        block,
-                    ))
-                    .await
-            });
+            commits.push(async move { checkpoint_verifier.oneshot(block.into()).await });
         }
         while let Some(result) = commits.next().await {
             result.expect("checkpoint verifier commits the contiguous range");

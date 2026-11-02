@@ -717,7 +717,7 @@ impl Fixture {
             self.history_tree_through(parent),
             vec![
                 CommitmentRootVerification::with_roots(
-                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                    block.clone().into(),
                     record.sapling_root,
                     record.orchard_root,
                     record.ironwood_root,

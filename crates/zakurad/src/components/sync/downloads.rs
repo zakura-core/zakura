@@ -917,9 +917,11 @@ where
                 // parent that may never arrive, so drop it before it takes a verifier slot.
                 if block_height > max_checkpoint_height {
                     let parent = block.header.previous_block_hash;
-                    // A parent leaves this map only after its verification returns, and a
-                    // verified block has already been sent to the state, so there is no window
-                    // in which an honest parent is in neither place.
+                    // A parent normally leaves this map only after its verification returns, by
+                    // when the state already has it, so a connected parent is always in one of
+                    // the two places. It also leaves on a reset, which cancels this task too, or
+                    // when its own download fails, which the syncer handles by retrying it; a
+                    // child dropped meanwhile is retried as well.
                     let parent_in_flight = task_states
                         .lock()
                         .expect("legacy task state lock is only held for synchronous updates")

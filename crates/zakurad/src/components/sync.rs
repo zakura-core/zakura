@@ -2625,7 +2625,8 @@ where
     /// The download task drops a block whose parent is neither committed nor in flight before
     /// verifying it. The syncer drops it too, unless the parent is now committed, in flight or
     /// waiting for a retry: then the block is downloaded again after the registry-miss backoff,
-    /// bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`].
+    /// bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`], with the same pause on new dispatch as
+    /// any registry-miss retry.
     /// A block whose authorizing data binding is still unconfirmed after the download task waited
     /// for its parent is dropped the same way, without scoring its supplier.
     ///
@@ -2704,7 +2705,10 @@ where
 
             // The download task dropped this block before verification, but its parent is now
             // known, in flight, or waiting for a retry. Download the block again after the
-            // registry-miss backoff, by when its parent can usually be found.
+            // registry-miss backoff, by when its parent can usually be found. Like any
+            // registry-miss retry, this pauses new dispatch and tip refreshes until the retry
+            // is sent. That is intended: it only happens when a parent was briefly away from the
+            // downloader, and the child is the next block sync needs.
             if matches!(
                 response,
                 Err(BlockDownloadVerifyError::ParentUnknown { .. })

@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -341,6 +341,26 @@ impl std::fmt::Debug for ParentWait {
     }
 }
 
+/// How far an in-flight block has got through the parent check before verification.
+///
+/// A block's children may wait on it as their parent only once it is [`Admission::Admitted`].
+/// If its task ends first, the watch channel closes while still [`Admission::Pending`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// The block has not been checked yet.
+    Pending,
+    /// The block is on its way to the verifier: its parent can be built on or was itself
+    /// admitted, or it is at or below the last checkpoint.
+    Admitted,
+}
+
+/// Bounds a download task's wait for its in-flight parent to be admitted.
+///
+/// The parent's own task is already bounded: its download by [`BLOCK_DOWNLOAD_TIMEOUT`] (with
+/// at most one hedged request), then its own parent check. This only keeps one stuck task from
+/// stalling its children indefinitely.
+const PARENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Whether a block could be built on this parent: the parent is the finalized tip, in a
 /// non-finalized chain, or being written by the state. Returns `true` when the state can't
 /// answer, so an unanswered question never drops a block.
@@ -438,8 +458,32 @@ where
     /// Current lifecycle phase for each pending legacy block task.
     task_states: Arc<Mutex<HashMap<block::Hash, LegacyTaskState>>>,
 
+    /// Whether each pending task has passed its parent check, so its children can rely on it.
+    admissions: Arc<Mutex<HashMap<block::Hash, watch::Receiver<Admission>>>>,
+
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
+}
+
+fn remove_admission(
+    admissions: &Mutex<HashMap<block::Hash, watch::Receiver<Admission>>>,
+    hash: block::Hash,
+) {
+    admissions
+        .lock()
+        .expect("admission lock is only held for synchronous updates")
+        .remove(&hash);
+}
+
+/// Waits until an in-flight parent is admitted, returning `false` if its task ends first or
+/// [`PARENT_ADMISSION_TIMEOUT`] passes.
+async fn parent_admitted(mut admission: watch::Receiver<Admission>) -> bool {
+    timeout(
+        PARENT_ADMISSION_TIMEOUT,
+        admission.wait_for(|admission| *admission == Admission::Admitted),
+    )
+    .await
+    .is_ok_and(|admitted| admitted.is_ok())
 }
 
 fn take_task_state(
@@ -481,6 +525,7 @@ where
             match join_result.expect("block download and verify tasks must not panic") {
                 Ok((height, hash)) => {
                     this.cancel_handles.remove(&hash);
+                    remove_admission(this.admissions, hash);
                     let state = take_task_state(this.task_states, hash);
                     this.trace
                         .block_finish(hash, LegacyBlockOutcome::Verified(height), state);
@@ -489,6 +534,7 @@ where
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
+                    remove_admission(this.admissions, hash);
                     let state = take_task_state(this.task_states, hash);
                     this.trace
                         .block_finish(hash, LegacyBlockOutcome::Error(&e), state);
@@ -560,6 +606,7 @@ where
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
+            admissions: Arc::new(Mutex::new(HashMap::new())),
             trace,
         }
     }
@@ -687,6 +734,13 @@ where
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
         let task_states = self.task_states.clone();
+        let admissions = self.admissions.clone();
+        let (admission_tx, admission_rx) = watch::channel(Admission::Pending);
+        // Registered before the task starts, so a child that downloads first waits for it.
+        self.admissions
+            .lock()
+            .expect("admission lock is only held for synchronous updates")
+            .insert(hash, admission_rx);
         let trace = self.trace.clone();
 
         let task = tokio::spawn(
@@ -923,26 +977,33 @@ where
                 // the tip, doesn't count.
                 if block_height > max_checkpoint_height {
                     let parent = block.header.previous_block_hash;
-                    // A parent normally leaves this map only after its verification returns, by
-                    // when the state has added it to a chain, so a connected parent is always in
-                    // one of the two places. It also leaves on a reset, which cancels this task too, or
-                    // when its own download fails, which the syncer handles by retrying it; a
-                    // child dropped meanwhile is retried as well.
-                    let parent_in_flight = task_states
+                    // A downloading parent only counts once it has passed this check itself:
+                    // its hash came from a peer, so being requested proves nothing about where
+                    // it connects. Its admission is published before it reaches the verifier, and
+                    // it leaves this map only after its verification returns, by when the state
+                    // has added it to a chain. So a connected parent is always admitted here or
+                    // extendable in the state. If its task ends without being admitted, the state
+                    // decides.
+                    let parent_admission = admissions
                         .lock()
-                        .expect("legacy task state lock is only held for synchronous updates")
-                        .contains_key(&parent);
+                        .expect("admission lock is only held for synchronous updates")
+                        .get(&parent)
+                        .cloned();
 
-                    let parent_is_extendable = parent_in_flight || {
+                    let parent_is_extendable = tokio::select! {
+                        biased;
                         // Prefer the cancel handle if both are ready.
-                        tokio::select! {
-                            biased;
-                            _ = &mut cancel_rx => {
-                                trace!("task cancelled waiting for the parent check");
-                                return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
-                            }
-                            known = (parent_extendable.0)(parent) => known,
+                        _ = &mut cancel_rx => {
+                            trace!("task cancelled waiting for the parent check");
+                            return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
                         }
+                        extendable = async {
+                            let admitted = match parent_admission {
+                                Some(admission) => parent_admitted(admission).await,
+                                None => false,
+                            };
+                            admitted || (parent_extendable.0)(parent).await
+                        } => extendable,
                     };
 
                     if !parent_is_extendable {
@@ -950,7 +1011,7 @@ where
                             ?hash,
                             ?parent,
                             ?block_height,
-                            "synced block's parent is neither known nor in flight: dropped downloaded block"
+                            "synced block's parent can't be built on and wasn't admitted: dropped downloaded block"
                         );
                         metrics::counter!("sync.unknown.parent.dropped.block.count").increment(1);
                         return Err(BlockDownloadVerifyError::ParentUnknown {
@@ -960,6 +1021,8 @@ where
                         });
                     }
                 }
+                // Children waiting on this block can now go ahead.
+                admission_tx.send_replace(Admission::Admitted);
 
                 // A body that fails before its parent commits can't be attributed yet, so wait for
                 // the parent once and verify the same body again. The task keeps its lookahead slot
@@ -1091,6 +1154,10 @@ where
         for (_hash, cancel) in self.cancel_handles.drain() {
             let _ = cancel.send(());
         }
+        self.admissions
+            .lock()
+            .expect("admission lock is only held for synchronous updates")
+            .clear();
         self.task_states
             .lock()
             .expect("legacy task state lock is only held for synchronous updates")

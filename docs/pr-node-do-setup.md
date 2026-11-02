@@ -65,7 +65,9 @@ without an open PR skip the comment.
 
 ## Verification-capacity qualification on existing hosts
 
-The same collector supports an isolated foreground follower through `--pid-file`.
+Use Mainnet fleet nodes for existing-host qualification. Never use or pause
+continuous-sync nodes. The same collector supports an isolated foreground
+follower through `--pid-file`.
 Write the follower's PID to that file and capture both stdout and stderr in
 `--log-file`; the collector then checks that process instead of a systemd unit.
 Supply that follower's RPC and metrics URLs explicitly. Before and during each
@@ -93,6 +95,15 @@ including brief events between scrapes. Retain `samples.jsonl`,
 `metrics-scrapes.jsonl.gz`, both summaries, and the combined node log as workflow
 artifacts. The summaries include interval counter baselines, occupancy
 percentiles, event high-water marks, and minimum headroom.
+
+For externally run measurements, stage a reviewed archive at
+`/root/out/qualification-evidence.tar.gz` on the existing Mainnet deployer.
+Dispatch **PR node** with `evidence_only=true` and its SHA-256 in
+`evidence_sha256`. This path copies and verifies that archive, then uploads it
+through the existing artifact step. It does not provision infrastructure or
+operate a node. Include a manifest identifying the measured binary revisions,
+collector revision, fixture, hosts, and incomplete or failed windows. An artifact
+upload is evidence retention; it does not constitute a qualification pass.
 
 ## Inspecting a kept node
 

@@ -14,6 +14,14 @@ name: PR node
 on:
   workflow_call:
     inputs:
+      evidence_only:
+        description: "Upload an externally collected PR-node archive from the existing Mainnet deployer; provision nothing"
+        type: boolean
+        default: false
+      evidence_sha256:
+        description: "Expected SHA-256 of the staged qualification-evidence.tar.gz; required for evidence_only"
+        type: string
+        default: ""
       image_id:
         description: "Exact image for artifact validation; empty selects a regional image"
         type: string
@@ -92,6 +100,14 @@ on:
         required: true
   workflow_dispatch:
     inputs:
+      evidence_only:
+        description: "Upload an externally collected PR-node archive from the existing Mainnet deployer; provision nothing"
+        type: boolean
+        default: false
+      evidence_sha256:
+        description: "Expected SHA-256 of the staged qualification-evidence.tar.gz; required for evidence_only"
+        type: string
+        default: ""
       image_id:
         description: "Exact image for artifact validation; empty selects a regional image"
         type: string
@@ -151,7 +167,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  evidence:
+    if: inputs.evidence_only
+    runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Verify externally collected qualification evidence
+        env:
+          EXPECTED_SHA256: ${{ inputs.evidence_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/pr-node-evidence"
+          install -m 600 /root/out/qualification-evidence.tar.gz "$RUNNER_TEMP/pr-node-evidence/qualification-evidence.tar.gz"
+          cd "$RUNNER_TEMP/pr-node-evidence"
+          printf '%s  qualification-evidence.tar.gz\n' "$EXPECTED_SHA256" | sha256sum --check
+          printf '%s  qualification-evidence.tar.gz\n' "$EXPECTED_SHA256" > SHA256SUMS
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: zakura-pr-node-${{ github.run_id }}
+          path: ${{ runner.temp }}/pr-node-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
   node:
+    if: ${{ !inputs.evidence_only }}
     runs-on: ubuntu-latest
     outputs:
       target_sha: ${{ steps.target.outputs.sha }}

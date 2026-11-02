@@ -587,13 +587,6 @@ impl Drop for SequencerIO {
         self.payloads.entries.clear();
         #[cfg(any(test, zakura_sim))]
         self.observe_teardown();
-
-        self.view_tx.send_modify(|view| {
-            view.reorder_decoded_attributed_memory_bytes = 0;
-            view.applying_decoded_attributed_memory_bytes = 0;
-            view.sequencer_input_decoded_attributed_memory_bytes = 0;
-            view.active_pipeline_decoded_attributed_memory_bytes = 0;
-        });
     }
 }
 

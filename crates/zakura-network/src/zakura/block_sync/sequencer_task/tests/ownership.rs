@@ -694,6 +694,64 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
     assert_eq!(pool.reserved_bytes(), decoded_bytes);
 }
 
+/// Teardown leaves the decoded view and the pool charged while the driver holds a
+/// submitted block. Only the driver's release settles the pool.
+#[tokio::test]
+async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submission() {
+    let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(8).unwrap());
+    let mut task = retention_test_task(u64::MAX);
+    task.decoded_pool = pool.clone();
+    let (actions, mut actions_rx) = mpsc::channel(1);
+    task.actions = actions;
+    let view = task.view_tx.subscribe();
+    let block = test_block();
+    let raw = BlockSyncMessage::Block(block.clone())
+        .encode()
+        .unwrap()
+        .into();
+    let mut body = SequencedBody::new_queued(
+        super::super::test_work_owner(),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        block::Height(1),
+        block.hash(),
+        block.header.previous_block_hash,
+        BufferedBlockBody::RawFramePayload(raw),
+        BLOCK_MAINNET_1_BYTES.len() as u64,
+        None,
+        ZakuraPeerId::new(vec![1; 32]).unwrap(),
+        Instant::now(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    body.leave_queue();
+    task.handle_accept_body(body);
+    task.submit_pending_blocks().await;
+    let BlockSyncAction::SubmitBlock {
+        block: submitted, ..
+    } = actions_rx.try_recv().expect("the body submits")
+    else {
+        panic!("the body must submit");
+    };
+    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    assert_eq!(
+        view.borrow().applying_decoded_attributed_memory_bytes,
+        decoded_bytes
+    );
+
+    drop(task);
+
+    assert_eq!(
+        view.borrow().applying_decoded_attributed_memory_bytes,
+        decoded_bytes,
+        "teardown must not erase retention the driver still holds"
+    );
+    assert_eq!(pool.reserved_bytes(), decoded_bytes);
+    assert_eq!(pool.reserved_blocks(), 1);
+    drop(submitted);
+    assert_eq!(pool.reserved_bytes(), 0);
+    assert_eq!(pool.reserved_blocks(), 0);
+}
+
 /// Raw bodies cost the decoded pool nothing. A refused decode keeps them raw, an
 /// admitted decode charges the measured size once, and reuse charges nothing more.
 #[test]

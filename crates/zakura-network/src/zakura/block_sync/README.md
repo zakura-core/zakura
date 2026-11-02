@@ -252,7 +252,7 @@ derives the whole-node bound. The plateau can still exceed the budget by:
 
 1. **Commit-window heights are always fundable**, on both lanes, regardless of the
    look-ahead gates — a pinned checkpoint range can always assemble.
-2. **Floor grants never size below one byte**, and `take_in_range_budgeted` always
+2. **Floor grants never size below one byte**, and `take_request` always
    takes its first item regardless of the byte cap — so the floor block is taken even
    when the in-flight budget is exactly full, reaching the floor reservation path…
 3. **…which overdrafts instead of waiting.** When `try_reserve` fails,

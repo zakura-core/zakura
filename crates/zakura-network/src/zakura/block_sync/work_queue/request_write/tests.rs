@@ -1296,7 +1296,7 @@ fn capacity_release_wakes_after_unlocking_the_work_queue() {
         }
     }
 
-    for operation in 0..5 {
+    for operation in 0..4 {
         let mut f = Fixture::new();
         let request = f.take(1);
         let owner = request.owner();
@@ -1321,19 +1321,15 @@ fn capacity_release_wakes_after_unlocking_the_work_queue() {
                 );
             }
             1 => {
-                f.work
-                    .release_and_return_items([block::Height(1), block::Height(2)]);
-            }
-            2 => {
                 f.work.release_reserved_and_return_items_detailed_for_owner(
                     owner,
                     [block::Height(1), block::Height(2)],
                 );
             }
-            3 => {
+            2 => {
                 f.work.advance_floor(block::Height(2));
             }
-            4 => {
+            3 => {
                 f.work.reset_above(block::Height(0));
             }
             _ => unreachable!(),
@@ -1721,6 +1717,61 @@ impl WorkQueue {
         bytes: u64,
     ) -> crate::zakura::transport::ByteReservation {
         self.lock().funding.split(bytes).unwrap()
+    }
+
+    /// Take `heights` for one owner and publish their estimates, without a writer.
+    /// The owner's session is the lowest height, so separate ranges get separate owners.
+    pub(in crate::zakura::block_sync) fn publish_fixture(
+        &self,
+        heights: std::ops::RangeInclusive<u32>,
+    ) -> BodyWorkOwner {
+        let (low, high) = (*heights.start(), *heights.end());
+        let mut inner = self.lock();
+        let items = inner.state.take_budgeted(
+            block::Height(low),
+            block::Height(high),
+            usize::MAX,
+            u64::MAX,
+            (u64::from(low), NonZeroU64::MIN),
+        );
+        assert_eq!(
+            items.len(),
+            heights.count(),
+            "the fixture's heights are pending and contiguous"
+        );
+        let bytes = inner
+            .state
+            .publish_claim(&items)
+            .expect("the fixture just took these items");
+        let mut funding = self
+            .budget
+            .charge_owned(bytes)
+            .expect("fixture charges fit the open budget counter");
+        inner
+            .funding
+            .merge(&mut funding)
+            .expect("fixture charges fit the queue pool");
+        items[0].1.owner.expect("a request take binds an owner")
+    }
+
+    /// End `owner`'s reservation at receipt and release its funding. Returns the
+    /// released bytes, or `None` when `owner` holds no reservation on `height`.
+    pub(in crate::zakura::block_sync) fn receive_fixture(
+        &self,
+        owner: BodyWorkOwner,
+        height: block::Height,
+    ) -> Option<u64> {
+        self.begin_receipt_for_owner(owner, height)
+            .expect("fixture funding matches the queue")
+            .map(|ended| ended.funding.bytes())
+    }
+
+    /// Every queued item with its owner and byte quantities, read from the queue
+    /// maps rather than from the maintained tallies.
+    pub(in crate::zakura::block_sync) fn ownership_snapshot(
+        &self,
+    ) -> Vec<super::super::WorkItemOwnership> {
+        self.lock().state.ownership()
     }
 }
 

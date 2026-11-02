@@ -74,10 +74,10 @@ fn take(
         height(high),
         usize::MAX,
         u64::MAX,
-        Some((
+        (
             session,
             NonZeroU64::new(request).expect("tests use nonzero ids"),
-        )),
+        ),
     )
 }
 
@@ -145,7 +145,7 @@ fn stale_published_return_after_reset_settles_only_the_old_charge() {
     let b = take(&mut state, 1, 2, 2, 1);
     assert_eq!(publish(&mut state, &b), 200);
 
-    let (outcome, wake) = state.return_owned(Some(owner_of(&a)), heights_of(&a));
+    let (outcome, wake) = state.return_owned(owner_of(&a), heights_of(&a));
     assert_eq!(
         outcome.released_bytes, 0,
         "A's charge settled once, at reset"
@@ -154,7 +154,7 @@ fn stale_published_return_after_reset_settles_only_the_old_charge() {
     assert_eq!(outcome.missing_count, 2);
     assert!(!wake.available);
     assert!(state
-        .end_reservation_at_receipt(Some(owner_of(&a)), height(1), false)
+        .end_reservation_at_receipt(owner_of(&a), height(1), false)
         .is_none());
     assert!(state.is_published_claim(owner_of(&b), heights_of(&b)));
     assert_eq!(state.reserved_bytes(), 200);
@@ -168,19 +168,17 @@ fn duplicate_settlement_releases_each_charge_once() {
     let owner = owner_of(&a);
     assert_eq!(publish(&mut state, &a), 150);
 
-    let ended = state
-        .end_reservation_at_receipt(Some(owner), height(1), false)
-        .expect("the owner holds the reservation");
-    assert_eq!(ended.released_bytes, 100);
-    assert_eq!(ended.owner, Some(owner));
+    assert_eq!(
+        state.end_reservation_at_receipt(owner, height(1), false),
+        Some(100),
+        "the owner holds the reservation"
+    );
     assert!(state
-        .end_reservation_at_receipt(Some(owner), height(1), false)
+        .end_reservation_at_receipt(owner, height(1), false)
         .is_none());
-    assert!(state
-        .claim_received(Some(owner), height(1))
-        .is_some_and(|ended| ended.released_bytes == 0));
+    assert_eq!(state.claim_received(owner, height(1)), Some(0));
 
-    let (first, wake) = state.return_owned(Some(owner), heights_of(&a));
+    let (first, wake) = state.return_owned(owner, heights_of(&a));
     assert_eq!(first.released_bytes, 50);
     assert_eq!(first.returned_count, 1);
     assert_eq!(
@@ -188,7 +186,7 @@ fn duplicate_settlement_releases_each_charge_once() {
         "the received height stays in flight"
     );
     assert!(wake.available);
-    let (second, wake) = state.return_owned(Some(owner), heights_of(&a));
+    let (second, wake) = state.return_owned(owner, heights_of(&a));
     assert_eq!(second.released_bytes, 0);
     assert_eq!(second.returned_count, 0);
     assert!(!wake.available);
@@ -203,22 +201,16 @@ fn adjacent_takes_by_two_peers_stay_disjoint() {
         authority(0),
         &[(1, 100), (2, 100), (3, 100), (4, 100)],
     );
-    let a = state.take_budgeted(
-        height(1),
-        height(4),
-        2,
-        u64::MAX,
-        Some((1, NonZeroU64::MIN)),
-    );
+    let a = state.take_budgeted(height(1), height(4), 2, u64::MAX, (1, NonZeroU64::MIN));
     let b = take(&mut state, 1, 4, 2, 1);
     assert_eq!(heights_of(&a), BTreeSet::from([height(1), height(2)]));
     assert_eq!(heights_of(&b), BTreeSet::from([height(3), height(4)]));
     assert_eq!(publish(&mut state, &a), 200);
     assert_eq!(publish(&mut state, &b), 200);
 
-    let (outcome, _) = state.return_owned(Some(owner_of(&a)), heights_of(&a));
+    let (outcome, _) = state.return_owned(owner_of(&a), heights_of(&a));
     assert_eq!(outcome.released_bytes, 200);
-    let (outcome, _) = state.return_owned(Some(owner_of(&a)), heights_of(&b));
+    let (outcome, _) = state.return_owned(owner_of(&a), heights_of(&b));
     assert_eq!(outcome.released_bytes, 0, "A cannot settle B's charge");
     assert_eq!(outcome.missing_count, 2);
     assert!(state.is_published_claim(owner_of(&b), heights_of(&b)));
@@ -674,7 +666,7 @@ fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>,
                 height(high),
                 max_count,
                 max_bytes,
-                Some((session, request)),
+                (session, request),
             );
             let taken: Vec<_> = items.iter().map(|(height, _)| height.0).collect();
             assert_eq!(taken, expected, "{PROPERTY}: take selects the model's run");
@@ -726,15 +718,8 @@ fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>,
             };
             let raw = claim.raw_heights[at % claim.raw_heights.len()];
             let expected = model.receive(claim.owner, raw);
-            let ended = state.end_reservation_at_receipt(Some(claim.owner), height(raw), false);
-            assert_eq!(
-                ended.map(|ended| ended.released_bytes),
-                expected,
-                "{PROPERTY}"
-            );
-            if let Some(ended) = ended {
-                assert_eq!(ended.owner, Some(claim.owner), "{PROPERTY}");
-            }
+            let ended = state.end_reservation_at_receipt(claim.owner, height(raw), false);
+            assert_eq!(ended, expected, "{PROPERTY}");
         }
         Op::Return(index) => {
             let Some(claim) = pick(claims, &index) else {
@@ -779,10 +764,8 @@ fn return_owned(
     raw_heights: BTreeSet<u32>,
 ) {
     let expected = model.return_owned(owner, &raw_heights);
-    let (outcome, wake) = state.return_owned(
-        Some(owner),
-        raw_heights.iter().copied().map(height).collect(),
-    );
+    let (outcome, wake) =
+        state.return_owned(owner, raw_heights.iter().copied().map(height).collect());
     assert_eq!(
         ModelReturn {
             released_bytes: outcome.released_bytes,

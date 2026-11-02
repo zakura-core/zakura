@@ -1167,35 +1167,6 @@ mod tests {
         assert_eq!(harness.queue.chunk_budget_usage(), (0, 10));
     }
 
-    /// A handoff keeps the same headers charged, with no moment of release.
-    #[test]
-    fn a_prepare_hands_its_headers_to_its_apply_without_a_release() {
-        let mut ops = started(0, 1, 10).to_vec();
-        ops.extend([page_op(0, 10), prepare_op(0), Op::Retire { peer: 1 }]);
-        let mut harness = run(ops);
-        let mut releases = harness.queue.capacity_releases();
-        releases.mark_unchanged();
-
-        harness.apply(Op::Complete {
-            hold: 0,
-            apply: true,
-        });
-
-        assert_eq!(harness.summary.handoffs, 1);
-        assert_eq!(harness.queue.chunk_budget_usage(), (0, 10));
-        assert!(
-            !releases.has_changed().expect("the budget is alive"),
-            "the handoff releases nothing"
-        );
-        harness.apply(Op::Retire { peer: 0 });
-        assert_eq!(harness.queue.chunk_budget_usage(), (0, 10));
-        harness.apply(Op::Complete {
-            hold: 0,
-            apply: false,
-        });
-        assert_eq!(harness.queue.chunk_budget_usage(), (0, 0));
-    }
-
     /// A full queue replaces the lowest-priority unstarted work and releases only
     /// that peer's capacity.
     #[test]

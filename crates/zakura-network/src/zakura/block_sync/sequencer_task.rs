@@ -538,7 +538,7 @@ impl SequencerPayloads {
 /// `Arc<WorkQueue>` clone, the peer registry, an action
 /// sender clone, and the committed throughput meter. Runs the state's operations
 /// and emits `SubmitBlock` / `Misbehavior` on the same action channel the reactor
-/// uses.
+/// uses. It settles request bytes only through the work queue.
 pub(super) struct SequencerIO {
     state: SequencerState,
     payloads: SequencerPayloads,
@@ -1492,16 +1492,7 @@ mod tests {
                 ),
             )],
         );
-        let taken = task.work.take_for_request(
-            height,
-            height,
-            1,
-            estimate,
-            u64::from(height.0),
-            std::num::NonZeroU64::new(1).unwrap(),
-        );
-        let owner = taken[0].1.owner.unwrap();
-        task.work.mark_reserved_for_owner(owner, [height]);
+        let owner = task.work.publish_fixture(height.0..=height.0);
         drop(
             task.work
                 .begin_receipt_for_owner(owner, height)
@@ -1551,7 +1542,7 @@ mod tests {
             block::Height(0)
         ));
         task.work.advance_floor(block::Height(1));
-        let retry = task.work.take_for_request(
+        let retry = task.work.take_request(
             block::Height(500),
             block::Height(500),
             1,
@@ -1559,7 +1550,7 @@ mod tests {
             99,
             std::num::NonZeroU64::new(2).unwrap(),
         );
-        assert_eq!(retry[0].1.estimated_bytes, bytes);
+        assert_eq!(retry.items()[0].1.estimated_bytes, bytes);
         assert!(!task.work.defer_received_for_owner(
             owner,
             block::Height(500),

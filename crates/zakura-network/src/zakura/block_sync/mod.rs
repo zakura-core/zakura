@@ -73,9 +73,9 @@ mod work_queue;
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchBudgetReceipts,
-    BenchCommitter, BenchReceiptBatch, BenchSequencerHandle, BenchSubmissions, BenchSubmit,
-    BenchWorkCapacity, BenchWorkChurn, SequencerProgress, WorkRequestEnd,
+    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchReceiptBatch,
+    BenchSequencerHandle, BenchSubmissions, BenchSubmit, BenchWorkCapacity, BenchWorkChurn,
+    SequencerProgress, WorkRequestEnd,
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
@@ -193,11 +193,10 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use work_queue::{
-    replay_work_ownership_bytes, trace_work_funding_bytes, trace_work_ownership_bytes,
-    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
-    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
-    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
-    WorkOwnershipView,
+    trace_work_funding_bytes, trace_work_ownership_bytes, FundingReceiptView, FundingRequestPhase,
+    FundingRequestView, WorkFundingHistory, WorkFundingStep, WorkFundingView, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]

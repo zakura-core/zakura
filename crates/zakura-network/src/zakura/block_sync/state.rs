@@ -210,7 +210,7 @@ impl BodyRetention {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
-    pub(super) accounting: crate::zakura::transport::BudgetClosureReader,
+    pub(super) accounting: crate::zakura::transport::BudgetReader,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
@@ -243,7 +243,6 @@ pub struct DetachedHandleEvents {
 impl DetachedHandleEvents {
     /// Inject a local accounting failure through the real budget closure signal.
     pub fn fail_accounting(&self) {
-        let _notification = self.accounting.defer_closure_notification();
         self.accounting
             .close(crate::zakura::transport::BudgetClosure::Funding {
                 logical: 1,
@@ -283,7 +282,7 @@ impl BlockSyncHandle {
         let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
         let accounting = ByteBudget::new(config.max_inflight_block_bytes);
         let handle = BlockSyncHandle {
-            accounting: accounting.closure_reader(),
+            accounting: accounting.reader(),
             events,
             lifecycle,
             needed_query_failures,

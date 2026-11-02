@@ -46,10 +46,11 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             .expect("fixture decoded allowance fits"),
     );
     let check = |task: &mut SequencerIO, label: &str| {
-        task.payloads.apply(&mut task.state.sequencer);
+        let changes = task.state.sequencer_mut().take_payload_changes();
+        task.payloads.apply(changes);
         let owners = task
             .state
-            .sequencer
+            .sequencer()
             .ownership_snapshot(&task.payloads.entries);
         assert!(
             owners.payloads_match_policy(),
@@ -181,7 +182,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     assert_eq!(check(&mut task, "submission").submissions.len(), 2);
 
     // Height 2 leaves `applying`, but the driver still holds its submission.
-    task.state.sequencer.remove_applying(block::Height(2));
+    task.state.sequencer_mut().remove_applying(block::Height(2));
     let owners = check(&mut task, "detachment");
     assert!(owners
         .submissions
@@ -189,7 +190,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         .any(|owner| owner.height == block::Height(2) && owner.detached));
 
     let (owner, source, token, block) = &submitted[1];
-    assert!(task.state.sequencer.finish_submission(
+    assert!(task.state.sequencer_mut().finish_submission(
         *owner,
         *source,
         *token,
@@ -199,7 +200,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     check(&mut task, "detached completion");
 
     task.state
-        .sequencer
+        .sequencer_mut()
         .advance_verified_tip(block::Height(1), true);
     check(&mut task, "commit");
 
@@ -210,9 +211,13 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     assert!(check(&mut task, "reset").reorder.is_empty());
 
     let (owner, source, token, block) = &submitted[0];
-    task.state
-        .sequencer
-        .finish_submission(*owner, *source, *token, block::Height(1), block.hash());
+    task.state.sequencer_mut().finish_submission(
+        *owner,
+        *source,
+        *token,
+        block::Height(1),
+        block.hash(),
+    );
     let owners = check(&mut task, "final completion");
     assert!(owners.applying.is_empty());
     assert!(owners.submissions.is_empty());
@@ -392,7 +397,7 @@ fn runtime_payload(
         super::super::sequencer::AcceptOutcome::Buffered { .. }
     ));
     policy.drain_ready_into_applying();
-    payloads.apply(&mut policy);
+    payloads.apply(policy.take_payload_changes());
     (policy, payloads, weak)
 }
 
@@ -435,7 +440,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     drop(original);
     let policy_snapshot = policy.clone();
     policy.reset_to(block::Height(0), false);
-    payloads.apply(&mut policy);
+    payloads.apply(policy.take_payload_changes());
     assert!(
         weak.upgrade().is_some(),
         "the driver still holds its submitted copy"
@@ -473,7 +478,7 @@ fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
         .ownership_snapshot(&payloads.entries)
         .payloads_match_policy());
     policy.reset_to(block::Height(0), false);
-    payloads.apply(&mut policy);
+    payloads.apply(policy.take_payload_changes());
     assert!(
         policy
             .ownership_snapshot(&payloads.entries)

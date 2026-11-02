@@ -507,9 +507,9 @@ impl SequencerPayloads {
             .expect("policy releases a retained payload exactly once");
     }
 
-    pub(super) fn apply(&mut self, sequencer: &mut Sequencer) {
+    pub(super) fn apply(&mut self, changes: Vec<super::reorder::PayloadChange>) {
         use super::reorder::PayloadChange;
-        for change in sequencer.take_payload_changes() {
+        for change in changes {
             match change {
                 PayloadChange::KeepRaw(id) => self
                     .entries
@@ -859,7 +859,7 @@ impl SequencerIO {
 
     /// Record one control transition's diagnostics and run its operations.
     async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
-        self.payloads.apply(&mut self.state.sequencer);
+        self.payloads.apply(outputs.payload_changes);
         self.publish_state_metrics();
         if let Some(classified) = outputs.frontier_reset {
             if classified.kind != state::FrontierResetKind::Growth {
@@ -881,7 +881,10 @@ impl SequencerIO {
         let queued_elapsed = body.received_at.elapsed();
         let height = body.height;
         let facts = self.payloads.insert(body.body);
-        let acceptance = self.state.accept_body(ReceivedBody {
+        let state::BodyAccepted {
+            acceptance,
+            payload_changes,
+        } = self.state.accept_body(ReceivedBody {
             owner: body.owner,
             source: body.source,
             height,
@@ -892,10 +895,7 @@ impl SequencerIO {
             admitted_estimate_bytes: body.admitted_estimate_bytes,
             peer: body.peer,
         });
-        if !matches!(acceptance, BodyAcceptance::Buffered) {
-            self.payloads.release(facts.id);
-        }
-        self.payloads.apply(&mut self.state.sequencer);
+        self.payloads.apply(payload_changes);
         if let BodyAcceptance::RetentionDeferred {
             owner,
             height,
@@ -914,7 +914,6 @@ impl SequencerIO {
 
     /// Run one transition's operations in order.
     async fn execute(&mut self, operations: Vec<SequencerOperation>) {
-        self.payloads.apply(&mut self.state.sequencer);
         for operation in operations {
             match operation {
                 SequencerOperation::RefreshWorkAuthority(authority) => {
@@ -1045,16 +1044,17 @@ impl SequencerIO {
             metrics::histogram!("sync.block.submit.queue_wait_seconds")
                 .record(send_started.elapsed().as_secs_f64());
             if !sent {
-                if self.state.submission_refused(
+                let refused = self.state.submission_refused(
                     height,
                     token,
                     time::Instant::now(),
                     self.actions.is_closed(),
-                ) {
+                );
+                if refused.retry_scheduled {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
                     self.trace_submission_retry_scheduled(height);
                 }
-                self.payloads.apply(&mut self.state.sequencer);
+                self.payloads.apply(refused.payload_changes);
                 self.publish_state_metrics();
                 return;
             }

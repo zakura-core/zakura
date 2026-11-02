@@ -351,7 +351,7 @@ fn run_sequencing(
         match step {
             SequencingStep::Deliver(height) => {
                 // Bodies keep the authority their request was issued under.
-                let acceptance = state.accept_body(received(&block, height, 0));
+                let acceptance = state.accept_body(received(&block, height, 0)).acceptance;
                 let expected = if model.received.contains_key(&height) {
                     BodyAcceptance::Redundant
                 } else {
@@ -550,7 +550,7 @@ fn run_authority_reset(
                 model.deliver(height, current);
             }
             ResetStep::DeliverRetired(height) => {
-                let acceptance = state.accept_body(received(&block, height, 0));
+                let acceptance = state.accept_body(received(&block, height, 0)).acceptance;
                 assert_eq!(acceptance, BodyAcceptance::StaleScope, "{RESET_PROPERTY}");
             }
             ResetStep::SubmitCurrent => {
@@ -866,10 +866,14 @@ fn body_without_committed_authority_is_rejected() {
         None,
         SeededRetryJitter::new([0; 32]),
     );
-    assert!(matches!(
-        state.accept_body(received(&test_block(), 1, 0)),
-        BodyAcceptance::StaleScope
-    ));
+    let body = received(&test_block(), 1, 0);
+    let id = body.body.id;
+    let accepted = state.accept_body(body);
+    assert!(matches!(accepted.acceptance, BodyAcceptance::StaleScope));
+    assert!(
+        matches!(accepted.payload_changes[..], [PayloadChange::Release(released)] if released == id),
+        "the state releases the payload of a body it did not keep"
+    );
     assert_eq!(state.sequencer().reorder_len(), 0);
     assert_eq!(state.sequencer().applying_len(), 0);
 }
@@ -897,14 +901,14 @@ fn predecessor_releases_retained_successors_in_order() {
     let now = time::Instant::now();
     for height in [3, 2] {
         assert_eq!(
-            state.accept_body(received(&block, height, 0)),
+            state.accept_body(received(&block, height, 0)).acceptance,
             BodyAcceptance::Buffered
         );
     }
     assert!(submission_pass(&mut state, now, usize::MAX).is_empty());
 
     assert_eq!(
-        state.accept_body(received(&block, 1, 0)),
+        state.accept_body(received(&block, 1, 0)).acceptance,
         BodyAcceptance::Buffered
     );
     let heights: Vec<_> = submission_pass(&mut state, now, usize::MAX)
@@ -1260,7 +1264,10 @@ fn state_histories_do_not_publish_metrics() {
     body.body.decoded_bytes = 0;
     body.body.raw_wire_bytes = Some(include_bytes!("mainnet-block-1.bin").len());
     let id = body.body.id;
-    assert!(matches!(state.accept_body(body), BodyAcceptance::Buffered));
+    assert!(matches!(
+        state.accept_body(body).acceptance,
+        BodyAcceptance::Buffered
+    ));
     let item = state
         .sequencer
         .prepare_submit(block::Height(1), id, block.attributed_memory_size_bytes())

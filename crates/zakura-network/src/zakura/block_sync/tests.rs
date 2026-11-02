@@ -4933,7 +4933,7 @@ impl std::ops::DerefMut for TestSequencer {
 
 impl TestSequencer {
     fn settle_payloads(&mut self) {
-        self.payloads.apply(&mut self.policy);
+        self.payloads.apply(self.policy.take_payload_changes());
         assert_eq!(
             self.payloads.retained_ids().collect::<BTreeSet<_>>(),
             self.policy.retained_ids().collect::<BTreeSet<_>>(),

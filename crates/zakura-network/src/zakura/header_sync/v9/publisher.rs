@@ -230,15 +230,6 @@ impl PublisherOwner {
     /// to its encoded frame and its slot's permit.
     fn next_terminal<const HEADER_BYTES: usize>(&mut self) -> Option<OwnedTerminal> {
         let terminal = self.state.next_terminal()?;
-        Some(self.bind_terminal::<HEADER_BYTES>(terminal))
-    }
-
-    /// Bind a terminal outcome state released to its encoded frame and its
-    /// slot's permit.
-    fn bind_terminal<const HEADER_BYTES: usize>(
-        &mut self,
-        terminal: state::Terminal,
-    ) -> OwnedTerminal {
         let permit = self
             .slots
             .terminal(terminal.slot)
@@ -249,11 +240,11 @@ impl PublisherOwner {
             outcome: terminal.outcome,
         }))
         .expect("an outcome for a nonzero subscription ID always encodes");
-        OwnedTerminal {
+        Some(OwnedTerminal {
             frame,
             permit,
             slot: terminal.slot,
-        }
+        })
     }
 
     /// Report a capacity refusal for job `key` to state, under the wait for
@@ -634,9 +625,12 @@ fn settle(
         }
         Progress::Refused(Refusal::Settled(output)) => {
             match &output {
-                Output::Retry(reason) => {
-                    metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => *reason)
-                        .increment(1);
+                Output::Retry => {
+                    metrics::counter!(
+                        "sync.header.v9.publisher.page_dropped",
+                        "reason" => "left_selected_chain",
+                    )
+                    .increment(1);
                 }
                 Output::Stall(_, reason) => {
                     metrics::counter!("sync.header.v9.publisher.stall", "reason" => *reason)
@@ -728,7 +722,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         if following
             && !still_selected(&*check_port, &push, id, &selected, seen, &encoded.page).await
         {
-            return Progress::Refused(Output::Retry("left_selected_chain").into());
+            return Progress::Refused(Output::Retry.into());
         }
         Progress::Page(Box::new((encoded, slot)))
     })

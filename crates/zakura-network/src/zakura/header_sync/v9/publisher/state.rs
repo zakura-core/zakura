@@ -181,7 +181,7 @@ pub(super) enum Output {
     End(HeadersOutcomeCode),
     Stall(Stall, &'static str),
     /// The page left the selected chain while in progress. Read again.
-    Retry(&'static str),
+    Retry,
     /// A check without page credit found this selected tip extending the
     /// last header sent.
     Extends(block::Hash),
@@ -616,7 +616,7 @@ impl PublisherState {
                     subscription.checked_tip = Some(tip);
                 }
             }
-            Output::Retry(_) => {}
+            Output::Retry => {}
             Output::Stall(stall, _) => {
                 if moved {
                     return;

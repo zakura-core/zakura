@@ -899,7 +899,7 @@ impl Machine {
                 self.signals.push((wait, signal));
                 Output::Stall(Stall::Capacity(wait), "test")
             }
-            Answer::Retry => Output::Retry("test"),
+            Answer::Retry => Output::Retry,
             Answer::Extends => Output::Extends(job.lease_target),
             Answer::ReachedAtOpen => Output::ReachedAtOpen(record.target),
         };

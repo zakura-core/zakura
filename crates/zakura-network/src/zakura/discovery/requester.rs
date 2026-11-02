@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 
+use serde::Serialize;
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
@@ -50,7 +51,8 @@ use crate::zakura::{
 };
 
 /// A discovery query, keying its response's reservation.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum QueryKind {
     Peers,
     Services,
@@ -60,14 +62,6 @@ pub(super) enum QueryKind {
 const QUERY_KINDS: [QueryKind; 2] = [QueryKind::Peers, QueryKind::Services];
 
 impl QueryKind {
-    /// The kind's name in trace rows.
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Peers => "peers",
-            Self::Services => "services",
-        }
-    }
-
     /// The kind that a `message_type` frame answers, if it answers a query.
     fn answered_by(message_type: u16) -> Option<Self> {
         match u8::try_from(message_type) {

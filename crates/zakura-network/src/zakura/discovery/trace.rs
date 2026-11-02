@@ -14,7 +14,8 @@ use crate::{
 
 /// The dial loop that owns an attempt. Each loop numbers its attempts on its
 /// own, so a row's owner and attempt number together name the attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum DialOwner {
     /// The candidate dialer, which numbers attempts across all its peers.
     Candidate,
@@ -22,17 +23,9 @@ pub(super) enum DialOwner {
     Redial,
 }
 
-impl DialOwner {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Candidate => "candidate",
-            Self::Redial => "redial",
-        }
-    }
-}
-
 /// How far one dial attempt got.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum DialPhase {
     /// The attempt's owner recorded it. The candidate dialer has also reserved
     /// its IPs by then.
@@ -49,26 +42,13 @@ pub(super) enum DialPhase {
     WorkerPanicked,
 }
 
-impl DialPhase {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Recorded => "recorded",
-            Self::RegistrationSeen => "registration_seen",
-            Self::RegistrationEnded => "registration_ended",
-            Self::WorkerFinished => "worker_finished",
-            Self::WorkerCancelled => "worker_cancelled",
-            Self::WorkerPanicked => "worker_panicked",
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub(super) struct DiscoveryDialPhaseEvent {
     event: &'static str,
     peer: Option<String>,
-    owner: &'static str,
+    owner: DialOwner,
     attempt: u64,
-    phase: &'static str,
+    phase: DialPhase,
 }
 
 impl DiscoveryDialPhaseEvent {
@@ -79,9 +59,9 @@ impl DiscoveryDialPhaseEvent {
         Self {
             event: d_trace::DISCOVERY_DIAL_PHASE,
             peer,
-            owner: owner.label(),
+            owner,
             attempt,
-            phase: phase.label(),
+            phase,
         }
     }
 }
@@ -167,7 +147,8 @@ impl DiscoveryViolationEvent {
 zakura_jsonl_trace::impl_jsonl_trace_event!(DiscoveryViolationEvent, DISCOVERY_TABLE);
 
 /// How far one claimed query answer got.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum AnswerPhase {
     /// The answer claimed its query, before decode.
     Claimed,
@@ -178,23 +159,13 @@ pub(super) enum AnswerPhase {
     Dropped,
 }
 
-impl AnswerPhase {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Claimed => "claimed",
-            Self::Imported => "imported",
-            Self::Dropped => "dropped",
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub(super) struct DiscoveryAnswerEvent {
     event: &'static str,
     peer: String,
     session_id: u64,
-    query: &'static str,
-    phase: &'static str,
+    query: QueryKind,
+    phase: AnswerPhase,
 }
 
 impl DiscoveryAnswerEvent {
@@ -208,8 +179,8 @@ impl DiscoveryAnswerEvent {
             event: d_trace::DISCOVERY_ANSWER,
             peer: peer_label(peer),
             session_id,
-            query: query.label(),
-            phase: phase.label(),
+            query,
+            phase,
         }
     }
 }

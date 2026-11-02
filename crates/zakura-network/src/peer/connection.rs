@@ -1018,14 +1018,8 @@ where
                             self.update_state_metrics(None);
 
                             // The handler retains a consumed payload until its handoff.
-                            // A response to this node's own request never refuses, or
-                            // the conformant peer sending it would time out.
-                            if request_msg.is_none() && payload_bytes > 0 {
-                                let charge = self.inbound_budget.charge_committed(payload_bytes);
-                                match &mut self.response_charge {
-                                    Some(retained) => retained.merge(charge),
-                                    None => self.response_charge = Some(charge),
-                                }
+                            if request_msg.is_none() {
+                                self.charge_response_payload(payload_bytes);
                             }
 
                             // A message can finish the response and still need inbound handling:
@@ -1369,18 +1363,10 @@ where
 
         use InboundMessage::*;
 
-        // An unsolicited transaction holds its charge until its handler ends. Nothing
-        // waits for it, so a saturated budget drops it, as a full queue does.
-        let _pushed_transaction_charge = if matches!(msg, Message::Tx(_)) {
-            let Some(charge) = self.inbound_budget.try_charge(decoded_payload_bytes(&msg)) else {
-                metrics::counter!("zcash.net.in.discarded", "reason" => "inbound_budget")
-                    .increment(1);
-                debug!("TCP inbound bytes exhausted: dropping unsolicited transaction");
-                return None;
-            };
-            Some(charge)
-        } else {
-            None
+        let Some(_unsolicited_charge) = self.charge_unsolicited(&msg) else {
+            metrics::counter!("zcash.net.in.discarded", "reason" => "inbound_budget").increment(1);
+            debug!("TCP inbound bytes exhausted: dropping unsolicited transaction");
+            return None;
         };
 
         let req = match msg {
@@ -1591,6 +1577,34 @@ where
             Consumed => None,
             Unused => Some(msg),
         }
+    }
+
+    /// Charge a payload that the pending request's handler keeps until its handoff.
+    ///
+    /// A response to this node's own request never refuses, or the conformant peer
+    /// sending it would time out.
+    fn charge_response_payload(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let charge = self.inbound_budget.charge_committed(bytes);
+        match &mut self.response_charge {
+            Some(retained) => retained.merge(charge),
+            None => self.response_charge = Some(charge),
+        }
+    }
+
+    /// Charge an unsolicited message until its handler ends, or refuse it.
+    ///
+    /// Only a transaction carries a charge. An unsolicited block has no retained owner.
+    /// Nothing waits for unsolicited work, so a saturated budget refuses it, as a full
+    /// queue does.
+    fn charge_unsolicited(&self, msg: &Message) -> Option<InboundCharge> {
+        let bytes = match msg {
+            Message::Tx(_) => decoded_payload_bytes(msg),
+            _ => 0,
+        };
+        self.inbound_budget.try_charge(bytes)
     }
 
     /// Sends the finished response of the pending client request to the client, and makes the

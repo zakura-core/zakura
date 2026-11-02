@@ -205,18 +205,15 @@ impl NodeResources {
         }
     }
 
-    /// Publish [`Self::usage`] under fixed metric labels, and count a breach of
-    /// `bound`, so reconnect churn that outlives its admission slot stays visible.
+    /// Count a breach of `bound` in [`Self::usage`], so reconnect churn that
+    /// outlives its admission slot stays visible.
     ///
     /// This only observes. It never refuses an owner, because a stuck worker that
-    /// outlived its drain timeout already holds what it holds.
+    /// outlived its drain timeout already holds what it holds. Connections call it
+    /// when they start and end, so it reports no byte gauges: those would go stale
+    /// on stable connections.
     pub(crate) fn report_usage(&self, bound: OwnerBound) -> NodeUsage {
         let usage = self.usage();
-        for (budget, bytes) in usage.budget_bytes() {
-            // A byte budget's size stays far below 2^53, so f64 represents it exactly.
-            metrics::gauge!("zakura.p2p.resources.held_bytes", "budget" => budget)
-                .set(bytes as f64);
-        }
         if !bound.admits(&usage.owners) {
             metrics::counter!("zakura.p2p.owners.over_bound").increment(1);
             debug!(?usage, ?bound, "Zakura owners exceed their admission bound");
@@ -575,17 +572,6 @@ pub(crate) struct NodeUsage {
     pub(crate) raw_bytes: u64,
     pub(crate) output_bytes: u64,
     pub(crate) compat_response_bytes: u64,
-}
-
-impl NodeUsage {
-    /// Each byte budget's fixed metric label and its held bytes.
-    pub(crate) fn budget_bytes(&self) -> [(&'static str, u64); 3] {
-        [
-            ("raw", self.raw_bytes),
-            ("output", self.output_bytes),
-            ("compat_response", self.compat_response_bytes),
-        ]
-    }
 }
 
 /// The node's count of handshake and stream owners by phase.

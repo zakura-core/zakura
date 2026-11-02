@@ -1,4 +1,5 @@
-//! Bounded work-ID lookup for reconstructing compact mined-block submissions.
+//! Bounded work-ID lookup for reconstructing compact mined-block submissions, and for decoding
+//! full submissions of retained candidates without parsing their transactions again.
 //!
 //! Entries retain block content only. Resolving a work ID does not establish validity or relay
 //! authorization; the reconstructed block still goes through the consensus verifier.
@@ -11,8 +12,9 @@ use std::{
 };
 
 use zakura_chain::{
-    block::{Block, Header},
+    block::{Block, Header, MAX_BLOCK_BYTES},
     parameters::Network,
+    serialization::{ZcashDeserialize, ZcashSerialize},
 };
 use zakura_consensus::PreparedCandidateSource;
 
@@ -97,6 +99,9 @@ struct Partition {
 struct Entry {
     id: EntryId,
     block: Arc<Block>,
+    /// The serialized transaction list of `block`, including its count, as a submitted block
+    /// carries it after the header.
+    transaction_bytes: Arc<[u8]>,
     size: usize,
     expires_at: Instant,
 }
@@ -126,6 +131,7 @@ impl PreparedCandidateResolver {
         source: PreparedCandidateSource,
         _network: &Network,
     ) {
+        let transaction_bytes = serialized_transactions(&block);
         let size = candidate_size(&block);
         let alias_size = work_id_alias_size(work_id);
         let now = Instant::now();
@@ -173,7 +179,9 @@ impl PreparedCandidateResolver {
             partition.touch_candidate(entry_id, now);
             entry_id
         } else {
-            let Some(entry_id) = partition.insert_candidate(block, size, alias_size, now) else {
+            let Some(entry_id) =
+                partition.insert_candidate(block, transaction_bytes, size, alias_size, now)
+            else {
                 return;
             };
             entry_id
@@ -198,6 +206,65 @@ impl PreparedCandidateResolver {
         Ok(Arc::new(Block {
             header: Arc::new(solved_header),
             transactions: entry.block.transactions.clone(),
+        }))
+    }
+}
+
+impl PreparedCandidateResolver {
+    /// Retains a validated candidate that has no work ID, so a full submission of it can reuse
+    /// its parsed transactions. It can evict only candidates without live work IDs; if those cannot
+    /// make enough room, the new candidate is not retained.
+    pub(crate) fn retain(&self, block: Arc<Block>, source: PreparedCandidateSource) {
+        let transaction_bytes = serialized_transactions(&block);
+        let size = candidate_size(&block);
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune_expired(now);
+        let partition = inner.partition(source);
+        if partition.limits.max_entries == 0 || size > partition.limits.max_bytes {
+            return;
+        }
+        let existing = partition
+            .entries
+            .iter()
+            .find(|entry| candidates_match(&entry.block, &block))
+            .map(|entry| entry.id);
+        match existing {
+            Some(entry_id) => partition.touch_candidate(entry_id, now),
+            None => {
+                partition.insert_candidate(block, transaction_bytes, size, 0, now);
+            }
+        }
+    }
+
+    /// Decodes a submitted block whose transactions are byte-for-byte those of a retained
+    /// candidate with the same preserved header fields, sharing that candidate's parsed
+    /// transactions. Returns `None` for oversized submissions or any other bytes, which the caller
+    /// parses in full.
+    ///
+    /// The result equals what parsing `bytes` would give: the header is parsed from them, and
+    /// parsing the identical transaction bytes gives the candidate's transactions.
+    pub(crate) fn decode_submitted(&self, bytes: &[u8]) -> Option<Arc<Block>> {
+        // Preserve the full block parser's size limit even when the solution grew since preparation.
+        if u64::try_from(bytes.len()).ok()? > MAX_BLOCK_BYTES {
+            return None;
+        }
+        let mut transaction_bytes = bytes;
+        let header = Header::zcash_deserialize(&mut transaction_bytes).ok()?;
+        let inner = self.lock();
+        let transactions = [&inner.server, &inner.proposals]
+            .into_iter()
+            .flat_map(|partition| &partition.entries)
+            .find(|entry| {
+                preserved_header_fields_match(&entry.block.header, &header)
+                    && *entry.transaction_bytes == *transaction_bytes
+            })?
+            .block
+            .transactions
+            .clone();
+        Some(Arc::new(Block {
+            header: Arc::new(header),
+            transactions,
         }))
     }
 }
@@ -268,6 +335,7 @@ impl Partition {
     fn insert_candidate(
         &mut self,
         block: Arc<Block>,
+        transaction_bytes: Arc<[u8]>,
         size: usize,
         alias_size: usize,
         now: Instant,
@@ -278,7 +346,18 @@ impl Partition {
         while self.entries.len() >= self.limits.max_entries
             || self.bytes.saturating_add(required) > self.limits.max_bytes
         {
-            let entry_id = self.entries.front()?.id;
+            // Without an alias reservation, caching is optional and must preserve active work.
+            let entry_id = self
+                .entries
+                .iter()
+                .find(|entry| {
+                    alias_size != 0
+                        || !self
+                            .work_ids
+                            .values()
+                            .any(|alias| alias.entry_id == entry.id)
+                })?
+                .id;
             self.remove_entry(entry_id);
         }
         let id = self.next_entry_id;
@@ -287,6 +366,7 @@ impl Partition {
         self.entries.push_back(Entry {
             id,
             block,
+            transaction_bytes,
             size,
             expires_at: now + ENTRY_TTL,
         });
@@ -390,9 +470,20 @@ fn preserved_header_fields_match(cached: &Header, submitted: &Header) -> bool {
         && cached.difficulty_threshold == submitted.difficulty_threshold
 }
 
+/// The serialized transaction list of `block`, as a submitted block carries it after the header.
+fn serialized_transactions(block: &Block) -> Arc<[u8]> {
+    block
+        .transactions
+        .zcash_serialize_to_vec()
+        .expect("serialization to memory cannot fail")
+        .into()
+}
+
+/// The memory an entry for `block` retains: the parsed block and its serialized transactions.
 fn candidate_size(block: &Block) -> usize {
     size_of::<Entry>()
         .saturating_add(usize::try_from(block.attributed_memory_size_bytes()).unwrap_or(usize::MAX))
+        .saturating_add(block.transactions.zcash_serialized_size())
 }
 
 fn work_id_alias_size(work_id: &str) -> usize {
@@ -463,6 +554,216 @@ mod tests {
         for work_id in &partition.work_id_order {
             assert!(partition.entry_for_work_id(work_id).is_some());
         }
+    }
+
+    /// Serializes `block` the way a miner submits it.
+    fn submitted_bytes(block: &Block) -> Vec<u8> {
+        block
+            .zcash_serialize_to_vec()
+            .expect("serialization to memory cannot fail")
+    }
+
+    #[test]
+    fn exact_submissions_reuse_retained_transactions() {
+        let cache = PreparedCandidateResolver::default();
+        let candidate = test_block();
+        insert(&cache, &candidate, "candidate", ServerTemplate);
+
+        let mut solved = Block::clone(&candidate);
+        let header = Arc::make_mut(&mut solved.header);
+        header.nonce.0[0] ^= 1;
+        header.time += chrono::Duration::seconds(1);
+        let bytes = submitted_bytes(&solved);
+
+        let decoded = cache
+            .decode_submitted(&bytes)
+            .expect("a retained candidate's solved block decodes from the cache");
+        assert_eq!(
+            *decoded,
+            Block::zcash_deserialize(&bytes[..]).expect("the submitted bytes parse"),
+            "decoding from the cache gives the same block as parsing"
+        );
+        assert!(Arc::ptr_eq(
+            &decoded.transactions[0],
+            &candidate.transactions[0]
+        ));
+    }
+
+    #[test]
+    fn proposals_without_a_work_id_are_retained_for_full_submissions() {
+        let cache = PreparedCandidateResolver::default();
+        let proposal = test_block();
+        cache.retain(proposal.clone(), ClientProposal);
+        cache.retain(proposal.clone(), ClientProposal);
+        assert_eq!(
+            cache.lock().proposals.entries.len(),
+            1,
+            "a repeated proposal is kept once"
+        );
+        assert_accounting(&cache.lock().proposals);
+
+        let decoded = cache
+            .decode_submitted(&submitted_bytes(&proposal))
+            .expect("a retained proposal decodes from the cache");
+        assert!(Arc::ptr_eq(
+            &decoded.transactions[0],
+            &proposal.transactions[0]
+        ));
+    }
+
+    #[test]
+    fn proposals_without_work_ids_preserve_active_work_under_cache_pressure() {
+        let first = distinct_block(1);
+        let second = distinct_block(2);
+        for limits in [
+            PartitionLimits {
+                max_entries: 2,
+                max_work_ids: 4,
+                max_bytes: usize::MAX,
+            },
+            PartitionLimits {
+                max_entries: 4,
+                max_work_ids: 4,
+                max_bytes: 2 * (candidate_size(&first) + work_id_alias_size("a")),
+            },
+        ] {
+            let cache = with_limits(limits);
+            insert(&cache, &first, "a", ClientProposal);
+            insert(&cache, &second, "b", ClientProposal);
+            for index in 3..12 {
+                let proposal = distinct_block(index);
+                cache.retain(proposal.clone(), ClientProposal);
+                assert!(cache
+                    .decode_submitted(&submitted_bytes(&proposal))
+                    .is_none());
+                assert!(cache.resolve("a", *first.header).is_ok());
+                assert!(cache.resolve("b", *second.header).is_ok());
+                assert_accounting(&cache.lock().proposals);
+            }
+        }
+    }
+
+    #[test]
+    fn proposals_without_work_ids_evict_only_unreferenced_candidates() {
+        let active = distinct_block(1);
+        let old = distinct_block(2);
+        let replacement = distinct_block(3);
+        for limits in [
+            PartitionLimits {
+                max_entries: 2,
+                max_work_ids: 4,
+                max_bytes: usize::MAX,
+            },
+            PartitionLimits {
+                max_entries: 4,
+                max_work_ids: 4,
+                max_bytes: 2 * (candidate_size(&active) + work_id_alias_size("a")),
+            },
+        ] {
+            let cache = with_limits(limits);
+            insert(&cache, &active, "a", ClientProposal);
+            cache.retain(old.clone(), ClientProposal);
+            cache.retain(replacement.clone(), ClientProposal);
+            assert!(cache.resolve("a", *active.header).is_ok());
+            assert!(cache.decode_submitted(&submitted_bytes(&old)).is_none());
+            assert!(cache
+                .decode_submitted(&submitted_bytes(&replacement))
+                .is_some());
+
+            // Giving a retained proposal a work ID protects it from later alias-free proposals.
+            insert(&cache, &replacement, "b", ClientProposal);
+            cache.retain(distinct_block(4), ClientProposal);
+            assert!(cache.resolve("a", *active.header).is_ok());
+            assert!(cache.resolve("b", *replacement.header).is_ok());
+
+            // An expired alias no longer protects its candidate from eviction.
+            cache
+                .lock()
+                .proposals
+                .work_ids
+                .get_mut("a")
+                .unwrap()
+                .expires_at = Instant::now();
+            let next = distinct_block(5);
+            cache.retain(next.clone(), ClientProposal);
+            assert!(cache.decode_submitted(&submitted_bytes(&active)).is_none());
+            assert!(cache.decode_submitted(&submitted_bytes(&next)).is_some());
+            assert!(cache.resolve("b", *replacement.header).is_ok());
+            assert_accounting(&cache.lock().proposals);
+        }
+    }
+
+    #[test]
+    fn full_submissions_enforce_the_block_size_limit_when_the_solution_grows() {
+        use zakura_chain::transparent::Script;
+
+        let limit = usize::try_from(MAX_BLOCK_BYTES).expect("the block limit fits in memory");
+        for submitted_size in [limit - 1, limit, limit + 1] {
+            let cache = PreparedCandidateResolver::default();
+            let mut solved = Block::clone(&test_block());
+            // Keep the script's CompactSize prefix width fixed while sizing the block.
+            let script_len = 65_536;
+            Arc::make_mut(&mut solved.transactions[0]).outputs_mut()[0].lock_script =
+                Script::new(&vec![0; script_len]);
+            let overhead = submitted_bytes(&solved).len() - script_len;
+            Arc::make_mut(&mut solved.transactions[0]).outputs_mut()[0].lock_script =
+                Script::new(&vec![0; submitted_size - overhead]);
+            let bytes = submitted_bytes(&solved);
+            assert_eq!(bytes.len(), submitted_size);
+
+            let mut proposal = solved.clone();
+            Arc::make_mut(&mut proposal.header).solution = Solution::Regtest([0; 36]);
+            let proposal_bytes = submitted_bytes(&proposal);
+            assert!(proposal_bytes.len() < limit);
+            let proposal = Arc::new(
+                Block::zcash_deserialize(&proposal_bytes[..])
+                    .expect("the shorter proposal fits the full parser's limit"),
+            );
+            cache.retain(proposal, ClientProposal);
+
+            let decoded = cache.decode_submitted(&bytes);
+            let parsed = Block::zcash_deserialize(&bytes[..]);
+            assert_eq!(decoded.is_some(), submitted_size <= limit);
+            assert_eq!(parsed.is_ok(), submitted_size <= limit);
+            if let Some(decoded) = decoded {
+                assert_eq!(
+                    *decoded,
+                    parsed.expect("submissions within the limit parse")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inexact_submissions_are_parsed_in_full() {
+        let cache = PreparedCandidateResolver::default();
+        let candidate = test_block();
+        insert(&cache, &candidate, "candidate", ServerTemplate);
+        let bytes = submitted_bytes(&candidate);
+        let header_len = submitted_bytes(&Block {
+            header: candidate.header.clone(),
+            transactions: Vec::new(),
+        })
+        .len()
+            - 1;
+
+        let mut changed_transaction = bytes.clone();
+        *changed_transaction
+            .last_mut()
+            .expect("blocks are not empty") ^= 1;
+        assert!(cache.decode_submitted(&changed_transaction).is_none());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(cache.decode_submitted(&trailing).is_none());
+
+        assert!(cache.decode_submitted(&bytes[..bytes.len() - 1]).is_none());
+        assert!(cache.decode_submitted(&bytes[..header_len - 1]).is_none());
+
+        let changed_parent = distinct_block(7);
+        assert!(cache
+            .decode_submitted(&submitted_bytes(&changed_parent))
+            .is_none());
     }
 
     #[test]

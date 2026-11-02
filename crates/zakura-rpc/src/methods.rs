@@ -3412,10 +3412,10 @@ where
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
+                self.gbt.prepared_candidates(),
                 parameters
                     .as_ref()
-                    .and_then(|params| params.work_id.as_deref())
-                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
+                    .and_then(|params| params.work_id.as_deref()),
             )
             .await;
         }
@@ -3803,23 +3803,26 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block) => block,
-            Err(error) => {
-                tracing::info!(
-                    ?error,
-                    "submit block failed: block bytes could not be deserialized into a structurally valid block"
-                );
+        let block = match self
+            .gbt
+            .prepared_candidates()
+            .decode_submitted(&block_bytes)
+        {
+            Some(block) => block,
+            None => match block_bytes.zcash_deserialize_into::<Block>() {
+                Ok(block) => Arc::new(block),
+                Err(error) => {
+                    tracing::info!(
+                        ?error,
+                        "submit block failed: block bytes could not be deserialized into a structurally valid block"
+                    );
 
-                return Ok(SubmitBlockErrorResponse::Rejected.into());
-            }
+                    return Ok(SubmitBlockErrorResponse::Rejected.into());
+                }
+            },
         };
-        self.run_mined_block_lifecycle(
-            Arc::new(block),
-            submitted_at,
-            MinedBlockSubmission::FullBlock,
-        )
-        .await
+        self.run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::FullBlock)
+            .await
     }
 
     async fn submit_solution(

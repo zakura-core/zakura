@@ -96,7 +96,11 @@ fn paused_handoffs_pass_m_plus_2b_within_the_handoff_allowance() {
     let limits = Limits::of(&witness.scenario.node_config(), 4, 2_000);
     let peak = reserved.peaks["reserved-estimate-bytes"];
     let handoffs = reserved.peaks["open-handoffs"];
-    assert!(peak > limits.reserved_bound(0), "{:?}", reserved.peaks);
+    assert!(
+        peak > limits.reserved_bound(0),
+        "handoff preemption must reach the extra handoff allowance: {:?}",
+        reserved.peaks
+    );
     assert!(
         peak <= limits.reserved_bound(handoffs),
         "{:?}",
@@ -377,6 +381,8 @@ fn every_worker_count_holds_the_resource_bounds() {
         for mirrors in [2, 4] {
             let scenario = BlockScenario {
                 workers: Some(workers),
+                // Receipt availability adds preemption points before quiescence.
+                steps: Some(64_000),
                 mirrors: BlockScenario::short_budget().mirrors[..mirrors].to_vec(),
                 ..BlockScenario::short_budget()
             };

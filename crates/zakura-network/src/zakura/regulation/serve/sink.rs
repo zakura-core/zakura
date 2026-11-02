@@ -98,10 +98,7 @@ pub(super) struct ResponseFrame {
 pub(super) struct SinkCore {
     request: u16,
     rules: &'static [MessageRule],
-    cap: ResponseCap,
-    /// Payload bytes kept for the largest ending, so the ending always fits.
-    ending_reserve: u64,
-    progress: SinkProgress,
+    bound: ResponseBound,
     frames: Option<mpsc::UnboundedSender<ResponseFrame>>,
     /// Output grants, shared with every queued frame.
     grants: Arc<ResponseGrants>,
@@ -113,8 +110,8 @@ impl fmt::Debug for SinkCore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SinkCore")
             .field("request", &self.request)
-            .field("cap", &self.cap)
-            .field("progress", &self.progress)
+            .field("cap", &self.bound.cap)
+            .field("progress", &self.bound.progress)
             .field("ended", &self.frames.is_none())
             .finish_non_exhaustive()
     }
@@ -129,17 +126,10 @@ impl SinkCore {
         grants: Arc<ResponseGrants>,
         commitment: Commitment,
     ) -> Self {
-        let ending_reserve = ending_reserve(request.message_type, rules);
         Self {
             request: request.message_type,
             rules,
-            cap: ResponseCap {
-                // A cap always holds the largest ending.
-                bytes: cap.bytes.max(ending_reserve),
-                ..cap
-            },
-            ending_reserve,
-            progress: SinkProgress::default(),
+            bound: ResponseBound::new(cap, ending_reserve(request.message_type, rules)),
             frames: Some(frames),
             grants,
             commitment: Some(commitment),
@@ -148,11 +138,11 @@ impl SinkCore {
 
     /// The cap, raised to hold the largest ending.
     pub(super) fn cap(&self) -> ResponseCap {
-        self.cap
+        self.bound.cap
     }
 
     pub(super) fn progress(&self) -> SinkProgress {
-        self.progress
+        self.bound.progress
     }
 
     /// Whether the ending entered the ordered output.
@@ -165,41 +155,14 @@ impl SinkCore {
     where
         M::Error: fmt::Display,
     {
-        let message_type = message.message_type();
-        let answers = matches!(
-            MessageRule::find(self.rules, message_type).map(|row| row.role),
-            Some(MessageRole::Response { request, .. }) if request == self.request
-        );
-        let row_ends = matches!(
-            MessageRule::find(self.rules, message_type).map(|row| row.role),
-            Some(MessageRole::Response {
-                ends_exchange: true,
-                ..
-            })
-        );
-        match (answers, row_ends, ends) {
-            (false, ..) => return Err(SinkError::NotAResponse { message_type }),
-            (true, true, false) => return Err(SinkError::EndingOnSend { message_type }),
-            (true, false, true) => return Err(SinkError::NotAnEnding { message_type }),
-            _ => {}
-        }
+        check_role(self.rules, self.request, message.message_type(), ends)?;
         let Some(frames) = &self.frames else {
             return Err(SinkError::Closed);
         };
         let frame = encode_frame(message).map_err(|error| SinkError::Encode(error.to_string()))?;
         // Widening usize to u64 is lossless on supported targets.
         let len = frame.payload.len() as u64;
-        let over = SinkError::OverCap {
-            cap: self.cap,
-            sent: self.progress,
-        };
-        let bytes = self.progress.bytes.checked_add(len).ok_or(over.clone())?;
-        let kept = if ends { 0 } else { self.ending_reserve };
-        if bytes.saturating_add(kept) > self.cap.bytes
-            || (!ends && self.progress.frames >= self.cap.frames)
-        {
-            return Err(over);
-        }
+        let progress = self.bound.admit(len, ends)?;
         let publish = || {
             frames.send(ResponseFrame {
                 frame,
@@ -216,16 +179,90 @@ impl SinkCore {
             publish()
         }
         .map_err(|_| SinkError::Closed)?;
-        self.progress.bytes = bytes;
+        self.bound.progress = progress;
         if ends {
             // The ending is in the ordered output: the exchange is complete on
             // this side, so the peer's commitment is free.
             self.frames = None;
             self.commitment = None;
-        } else {
-            self.progress.frames += 1;
         }
         Ok(())
+    }
+}
+
+/// Check that `message_type` answers `request`, and that it ends the exchange
+/// exactly when the caller says it does.
+fn check_role(
+    rules: &[MessageRule],
+    request: u16,
+    message_type: u16,
+    ends: bool,
+) -> Result<(), SinkError> {
+    let role = MessageRule::find(rules, message_type).map(|row| row.role);
+    let answers = matches!(
+        role,
+        Some(MessageRole::Response { request: answered, .. }) if answered == request
+    );
+    let row_ends = matches!(
+        role,
+        Some(MessageRole::Response {
+            ends_exchange: true,
+            ..
+        })
+    );
+    match (answers, row_ends, ends) {
+        (false, ..) => Err(SinkError::NotAResponse { message_type }),
+        (true, true, false) => Err(SinkError::EndingOnSend { message_type }),
+        (true, false, true) => Err(SinkError::NotAnEnding { message_type }),
+        _ => Ok(()),
+    }
+}
+
+/// What one response may still queue: its cap less what it queued, keeping
+/// room for the largest ending. [`SinkCore`] applies it under the sink lock.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResponseBound {
+    /// The response's cap, raised to hold the largest ending.
+    cap: ResponseCap,
+    /// Payload bytes kept for the largest ending, so the ending always fits.
+    ending_reserve: u64,
+    progress: SinkProgress,
+}
+
+impl ResponseBound {
+    pub(super) fn new(cap: ResponseCap, ending_reserve: u64) -> Self {
+        Self {
+            cap: ResponseCap {
+                // A cap always holds the largest ending.
+                bytes: cap.bytes.max(ending_reserve),
+                ..cap
+            },
+            ending_reserve,
+            progress: SinkProgress::default(),
+        }
+    }
+
+    /// The progress after queuing a frame of `len` payload bytes. A frame that
+    /// is not the ending must leave room for the largest ending and fit the
+    /// frame count. The caller records the progress only once it queued the frame.
+    pub(super) fn admit(&self, len: u64, ends: bool) -> Result<SinkProgress, SinkError> {
+        let over = SinkError::OverCap {
+            cap: self.cap,
+            sent: self.progress,
+        };
+        let bytes = self.progress.bytes.checked_add(len).ok_or(over.clone())?;
+        let kept = if ends { 0 } else { self.ending_reserve };
+        if bytes.saturating_add(kept) > self.cap.bytes
+            || (!ends && self.progress.frames >= self.cap.frames)
+        {
+            return Err(over);
+        }
+        let frames = if ends {
+            self.progress.frames
+        } else {
+            self.progress.frames + 1
+        };
+        Ok(SinkProgress { frames, bytes })
     }
 }
 
@@ -300,3 +337,6 @@ where
         self.core().cap()
     }
 }
+
+#[cfg(test)]
+mod tests;

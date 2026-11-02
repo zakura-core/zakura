@@ -259,7 +259,9 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Body range request sent to a peer.
+    /// Queue admission funded a block request's retained run.
+    pub const BLOCK_REQUEST_FUNDED: &str = "block_request_funded";
+    /// A published body range request entered the peer's transport queue.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted a decoded inbound block-sync wire message.
     pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";

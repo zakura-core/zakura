@@ -46,9 +46,9 @@ pub(super) mod state;
 #[cfg(any(test, zakura_sim))]
 pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
-#[cfg(feature = "internal-bench")]
-pub(super) use request_write::UnpublishedRequest;
-pub(super) use request_write::{AdmitRefusal, RequestWrite, RequestWriteStatus, TakenRequest};
+pub(super) use request_write::{
+    AdmitRefusal, RequestWrite, RequestWriteStatus, TakenRequest, UnpublishedRequest,
+};
 pub(super) use state::{WorkItem, WorkReturnOutcome};
 #[cfg(any(test, zakura_sim))]
 pub use state::{WorkItemOwnership, WorkItemPlace};
@@ -215,6 +215,12 @@ impl WorkQueue {
             self.note_revocation();
         }
         outcome
+    }
+
+    /// The budget this queue owns, so a test can hold an unrelated charge.
+    #[cfg(test)]
+    pub(super) fn budget_for_tests(&self) -> ByteBudget {
+        self.budget.clone()
     }
 
     #[cfg(test)]

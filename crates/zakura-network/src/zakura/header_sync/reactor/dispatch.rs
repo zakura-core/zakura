@@ -802,31 +802,24 @@ impl HeaderSyncReactor {
             let matching = self
                 .peer_work_queue
                 .active(peer)
-                .is_some_and(|active| active.owner == owner);
-            if matching {
-                let repair = self.peer_work_queue.active(peer).and_then(|active| {
-                    matches!(
-                        active.purpose,
-                        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+                .filter(|active| active.owner == owner)
+                .map(|active| {
+                    (
+                        active.source,
+                        matches!(
+                            active.purpose,
+                            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+                        ),
                     )
-                    .then(|| {
-                        (
-                            active
-                                .owner
-                                .body_owner()
-                                .expect("an auxiliary repair has body authority"),
-                            active.source,
-                        )
-                    })
                 });
-                if let Some((owner, source)) = repair {
-                    self.retry_vct_repair(
-                        owner,
-                        VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
-                    );
-                } else {
-                    self.retire_peer_work(peer, HeaderRequestTerminal::LocalError);
-                }
+            if let Some((source, is_repair)) = matching {
+                self.fail_work(
+                    peer,
+                    owner,
+                    is_repair,
+                    VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                    HeaderRequestTerminal::LocalError,
+                );
             }
         }
     }

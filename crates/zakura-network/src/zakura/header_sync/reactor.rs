@@ -1366,41 +1366,57 @@ impl HeaderSyncReactor {
             .peer_work_queue
             .active(peer)
             .expect("the prepare's round stays active");
-        let repair = matches!(
+        let (owner, source) = (active.owner, active.source);
+        let is_repair = matches!(
             active.purpose,
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
-        )
-        .then(|| {
-            (
-                active
-                    .owner
-                    .body_owner()
-                    .expect("an auxiliary repair has body authority"),
-                active.source,
-            )
-        });
-        if let Some((owner, source)) = repair {
-            let Some(task) = self.state.vct_repair.get(owner) else {
+        );
+        if is_repair {
+            let body_owner = owner
+                .body_owner()
+                .expect("an auxiliary repair has body authority");
+            let Some(task) = self.state.vct_repair.get(body_owner) else {
                 self.retire_peer_work(peer, HeaderRequestTerminal::RepairObsolete);
                 return;
             };
             if !matches!(task.state, RepairPolicyState::Assigned { .. }) {
                 self.retry_vct_repair(
-                    owner,
+                    body_owner,
                     VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
                 );
                 return;
             }
         }
         if self.dispatch_action(action).is_refused() {
-            if let Some((owner, source)) = repair {
-                self.retry_vct_repair(
-                    owner,
-                    VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
-                );
-            } else {
-                self.retire_peer_work(peer, HeaderRequestTerminal::LocalError);
-            }
+            self.fail_work(
+                peer,
+                owner,
+                is_repair,
+                VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                HeaderRequestTerminal::LocalError,
+            );
+        }
+    }
+
+    /// End `peer`'s failed work: a repair retries as `retry`, and any other work
+    /// retires as `terminal`.
+    fn fail_work(
+        &mut self,
+        peer: &ZakuraPeerId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        is_repair: bool,
+        retry: VctRepairRetry,
+        terminal: HeaderRequestTerminal,
+    ) {
+        if is_repair {
+            self.retry_vct_repair(
+                owner
+                    .body_owner()
+                    .expect("an auxiliary repair has body authority"),
+                retry,
+            );
+        } else {
+            self.retire_peer_work(peer, terminal);
         }
     }
 
@@ -1567,33 +1583,28 @@ impl HeaderSyncReactor {
             active.purpose,
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
         );
-        let completion_authority = match self
-            .registered_completion_authority(&peer, source, &owner, is_repair)
-        {
-            Ok((authority, outcome)) => {
-                metrics::counter!(
-                    "sync.header.target.completion_gate.total",
-                    "outcome" => outcome
-                )
-                .increment(1);
-                authority
-            }
-            Err(reason) => {
-                Self::record_stale_completion(reason);
-                match active.purpose {
-                    HeaderTargetPurpose::Normal => {
-                        self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
-                    }
-                    HeaderTargetPurpose::SelectedAuxiliaryRepair { .. } => self.retry_vct_repair(
-                        owner
-                            .body_owner()
-                            .expect("an auxiliary repair has body authority"),
-                        VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
-                    ),
+        let completion_authority =
+            match self.registered_completion_authority(&peer, source, &owner, is_repair) {
+                Ok((authority, outcome)) => {
+                    metrics::counter!(
+                        "sync.header.target.completion_gate.total",
+                        "outcome" => outcome
+                    )
+                    .increment(1);
+                    authority
                 }
-                return;
-            }
-        };
+                Err(reason) => {
+                    Self::record_stale_completion(reason);
+                    self.fail_work(
+                        &peer,
+                        owner,
+                        is_repair,
+                        VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
+                        HeaderRequestTerminal::SnapshotObsolete,
+                    );
+                    return;
+                }
+            };
         let repair_generation = match active.purpose {
             HeaderTargetPurpose::Normal => None,
             HeaderTargetPurpose::SelectedAuxiliaryRepair {
@@ -1791,16 +1802,13 @@ impl HeaderSyncReactor {
             self.peer_work_queue.owned_header_count(&peer),
         ) {
             end_retained(&mut retained, HeaderWorkEnd::NoAuthority);
-            if is_repair {
-                self.retry_vct_repair(
-                    owner
-                        .body_owner()
-                        .expect("an auxiliary repair has body authority"),
-                    VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
-                );
-            } else {
-                self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
-            }
+            self.fail_work(
+                &peer,
+                owner,
+                is_repair,
+                VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
+                HeaderRequestTerminal::SnapshotObsolete,
+            );
             return;
         }
         match result {
@@ -1849,16 +1857,13 @@ impl HeaderSyncReactor {
                     retained.take(),
                 );
                 if dispatch.is_refused() {
-                    if is_repair {
-                        self.retry_vct_repair(
-                            owner
-                                .body_owner()
-                                .expect("an auxiliary repair has body authority"),
-                            VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
-                        );
-                    } else {
-                        self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
-                    }
+                    self.fail_work(
+                        &peer,
+                        owner,
+                        is_repair,
+                        VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                        HeaderRequestTerminal::LocalError,
+                    );
                 }
             }
             HeaderTargetPreparationResult::Failed(error) => {
@@ -1870,16 +1875,13 @@ impl HeaderSyncReactor {
                     owner,
                     Some(&error),
                 );
-                if is_repair {
-                    self.retry_vct_repair(
-                        owner
-                            .body_owner()
-                            .expect("an auxiliary repair has body authority"),
-                        vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
-                    );
-                } else {
-                    self.retire_peer_work(&peer, HeaderRequestTerminal::TargetRejected);
-                }
+                self.fail_work(
+                    &peer,
+                    owner,
+                    is_repair,
+                    vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
+                    HeaderRequestTerminal::TargetRejected,
+                );
                 self.handle_typed_failure(peer, source, Some(owner), &error);
             }
         }

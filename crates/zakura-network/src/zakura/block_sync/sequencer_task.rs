@@ -2799,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
+    fn dropping_task_releases_queue_and_leaves_the_published_decoded_view() {
         let frontiers = genesis_frontiers();
         let (body_tx, body_rx) = mpsc::channel(1);
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2855,10 +2855,8 @@ mod tests {
             0
         );
         let terminal = *view_rx.borrow();
-        assert_eq!(terminal.sequencer_input_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.active_pipeline_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 10);
+        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 20);
     }
 
     #[tokio::test(start_paused = true)]

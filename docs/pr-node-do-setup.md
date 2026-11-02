@@ -105,6 +105,40 @@ operate a node. Include a manifest identifying the measured binary revisions,
 collector revision, fixture, hosts, and incomplete or failed windows. An artifact
 upload is evidence retention; it does not constitute a qualification pass.
 
+### Recurring pressure and deferred-entry loss
+
+Use `--require-capacity --continue-after-capacity-failure` for a full diagnostic
+window. The collector continues after limit hits and still returns a failed
+qualification verdict. Record catch-up and fresh-process at-tip windows
+separately; a run stopped at its first event cannot establish a recurring rate.
+
+Each path records saturation transitions with a monotonic clock. Completed
+episodes contribute duration histograms, including episodes entirely between
+scrapes. Gauges expose cumulative saturated time, current and longest episode
+duration, last completed duration, and the matching observation clock. Existing
+downloader activity refreshes open-episode gauges; no new timer task is added.
+The report uses that clock for saturated fraction and events per hour. An episode
+still open at the end has only an elapsed lower bound, not a completed duration.
+Duration histograms distinguish admission saturation from grandfathered capacity
+reductions. Histograms and longest-episode gauges cover the process lifetime;
+interval totals and event rates use boundary deltas.
+
+Report capacity-driven body deferrals separately from deferred metadata evictions:
+
+- `expired.count` and `retry_limit.count` remove retained metadata under its
+  existing lifetime and retry bounds.
+- `capacity_evicted.count` removes retained metadata when its capacity shrinks.
+- `overflow_rejected.count` rejects new metadata without evicting an existing entry.
+- `reset_discarded.count` records round-reset cleanup separately.
+- `deferred_created.count`, `deferred_completed.count`, `deferred_failed.count`,
+  `deferred_cancelled.count`, and `retried.count` describe retained work and its
+  later download attempts.
+
+These counters count entries or attempts, not distinct lifetime block hashes.
+Rediscovery after metadata removal cannot be attributed to its previous entry.
+They do not measure eviction of state-service queued blocks, whose separate
+abandonment policy is unchanged.
+
 ## Inspecting a kept node
 
 The step summary prints the droplet IP. On the droplet:

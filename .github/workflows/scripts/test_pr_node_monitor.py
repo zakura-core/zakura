@@ -120,6 +120,39 @@ sync_missing_parent_charge_duration_seconds{reason="parent_available",quantile="
 ''')
         self.assertEqual(measured["sync"]["charge"]["parent_available"], {"sum": 6, "count": 3, "0.95": 4})
 
+    def test_pressure_uses_event_timers_and_distinguishes_metadata_loss(self):
+        first, last = self.observation(0), self.observation(1, saturation=2, peak=15)
+        for values in last["missing_parent"].values():
+            values.update(saturation_observed_seconds=1, saturation_total_seconds=.15,
+                          saturation_longest_seconds=.1, expired_count=2, retry_limit_count=1,
+                          capacity_evicted_count=3, overflow_rejected_count=4, reset_discarded_count=5,
+                          deferred_created_count=10, retried_count=7)
+        measured = monitor.summarize_capacity([first, last], 1)["sync"]["pressure"]
+        self.assertEqual(measured["saturated_seconds"], .15)
+        self.assertEqual(measured["saturated_fraction"], .15)
+        self.assertEqual(measured["admission_saturation_episodes"], 2)
+        self.assertEqual(measured["metadata_evictions"], {"expired": 2, "retry_limit": 1, "capacity_reduction": 3})
+        self.assertEqual(measured["metadata_overflow_rejections"], 4)
+        self.assertEqual(measured["metadata_discarded_on_reset"], 5)
+        self.assertEqual(measured["deferred_retry_attempts"], 7)
+        self.assertFalse(measured["open_at_end"])
+
+    def test_open_episode_is_reported_without_claiming_its_completed_duration(self):
+        first, last = self.observation(0), self.observation(1, saturation=1, active=15)
+        last["missing_parent"]["sync"].update(saturation_active=1, saturation_observed_seconds=1,
+                                               saturation_total_seconds=.3, saturation_current_duration_seconds=.3)
+        pressure = monitor.summarize_capacity([first, last], 1)["sync"]["pressure"]
+        self.assertTrue(pressure["open_at_end"])
+        self.assertEqual(pressure["open_episode_elapsed_seconds"], .3)
+        self.assertEqual(pressure["last_completed_episode_seconds"], 0)
+
+    def test_diagnostic_continuation_preserves_the_failed_verdict(self):
+        spike = self.observation(1, saturation=1)
+        self.assertTrue(monitor.stop_for_capacity_failure(spike, required=True, continue_after_failure=False))
+        self.assertFalse(monitor.stop_for_capacity_failure(spike, required=True, continue_after_failure=True))
+        measured = monitor.summarize_capacity([self.observation(0), spike], 1)
+        self.assertEqual(measured["sync"]["verdict"], "failed")
+
     def test_work_before_the_window_does_not_satisfy_semantic_coverage(self):
         self.assertEqual(monitor.counter_window([{"semantic_commits": 2000}, {"semantic_commits": 2100}],
                                                 "semantic_commits"),

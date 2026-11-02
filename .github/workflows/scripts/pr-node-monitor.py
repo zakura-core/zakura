@@ -58,7 +58,11 @@ CAPACITY_FIELDS = (
     "limit_reached_count", "capacity_deferred_count", "capacity_reduction_overage_count",
     "near_80_count", "near_90_count", "available_count", "admitted_count",
     "read_failed_count", "inconclusive_count", "expired_count", "overflow_count",
-    "retry_limit_count", "retried_count",
+    "retry_limit_count", "retried_count", "deferred_created_count", "capacity_evicted_count",
+    "overflow_rejected_count", "reset_discarded_count", "deferred_completed_count",
+    "deferred_failed_count", "deferred_cancelled_count",
+    "saturation_total_seconds", "saturation_current_duration_seconds", "saturation_longest_seconds",
+    "saturation_last_completed_duration_seconds", "saturation_observed_seconds", "saturation_active",
 )
 
 
@@ -72,7 +76,7 @@ def duration_metrics(text: str) -> dict:
     """Preserve exported duration summaries by bounded path and release reason."""
     result = {}
     for match in re.finditer(
-        r'^(sync|gossip)_missing_parent_(charge|deferred)_duration_seconds'
+        r'^(sync|gossip)_missing_parent_(charge|deferred|saturation)_duration_seconds'
         r'(_sum|_count)?(?:\{([^}]*)\})?\s+([-+0-9.eE]+)$', text, re.MULTILINE
     ):
         path, kind, suffix, labels, value = match.groups()
@@ -104,6 +108,53 @@ def tip_window_failures(samples: list[dict], reference_url: str | None) -> list[
     if counter_window(samples, "reference_height")["delta"] < 1:
         failures.append("The independent reference observed no block opportunities in the tip window.")
     return failures
+
+
+def summarize_pressure(values: list[dict]) -> dict:
+    """Report transition-timed occupancy and distinguish metadata loss from body deferral.
+
+    Open episodes are censored: their elapsed time is a lower bound, not a
+    completed duration. Exported timers are refreshed by existing downloader
+    activity; their own observation clock supplies the matching denominator.
+    """
+    def delta(field):
+        first, last = values[0].get(field), values[-1].get(field)
+        return last - first if first is not None and last is not None and last >= first else None
+
+    elapsed = delta("saturation_observed_seconds")
+    saturated = delta("saturation_total_seconds")
+    events = delta("limit_reached_count")
+    evictions = {name: delta(field) for name, field in (
+        ("expired", "expired_count"), ("retry_limit", "retry_limit_count"),
+        ("capacity_reduction", "capacity_evicted_count"))}
+    total_evictions = sum(evictions.values()) if all(v is not None for v in evictions.values()) else None
+    return {
+        "timer_observed_seconds": elapsed,
+        "saturated_seconds": saturated,
+        "saturated_fraction": saturated / elapsed if saturated is not None and elapsed else None,
+        "admission_saturation_episodes": events,
+        "admission_saturation_episodes_per_hour": events * 3600 / elapsed if events is not None and elapsed else None,
+        "open_at_start": bool(values[0].get("saturation_active")),
+        "open_at_end": bool(values[-1].get("saturation_active")),
+        "open_episode_elapsed_seconds": values[-1].get("saturation_current_duration_seconds"),
+        "longest_episode_seconds_since_process_start": values[-1].get("saturation_longest_seconds"),
+        "last_completed_episode_seconds": values[-1].get("saturation_last_completed_duration_seconds"),
+        "metadata_evictions": evictions,
+        "metadata_evictions_per_hour": total_evictions * 3600 / elapsed if total_evictions is not None and elapsed else None,
+        "metadata_overflow_rejections": delta("overflow_rejected_count"),
+        "metadata_discarded_on_reset": delta("reset_discarded_count"),
+        "new_deferred_entries": delta("deferred_created_count"),
+        "deferred_retry_attempts": delta("retried_count"),
+        "capacity_body_deferrals": delta("capacity_deferred_count"),
+    }
+
+
+def stop_for_capacity_failure(sample: dict, *, required: bool, continue_after_failure: bool) -> bool:
+    """Diagnostic continuation never changes the final acceptance verdict."""
+    return required and not continue_after_failure and any(
+        (path.get("limit_reached_count") or 0) > 0 or (path.get("capacity_deferred_count") or 0) > 0
+        for path in sample.get("missing_parent", {}).values()
+    )
 
 
 def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = False) -> dict:
@@ -141,13 +192,13 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
             failures.append("RPC or peer connectivity was unavailable.")
         if len({s.get("pid") for s in observations if s.get("pid")}) > 1:
             failures.append("The node process changed.")
-        for name in ("limit_reached_count", "capacity_deferred_count", "capacity_reduction_overage_count"):
+        for name in (field for field in CAPACITY_FIELDS if field.endswith("_count") or field in ("saturation_total_seconds", "saturation_observed_seconds")):
             counters = [v.get(name) for v in values]
             if any(value is None for value in counters):
                 continue
             if any(b < a for a, b in zip(counters, counters[1:])):
                 failures.append(f"Counter reset: {name}.")
-            if name != "capacity_reduction_overage_count" and max(counters) > 0:
+            if name in ("limit_reached_count", "capacity_deferred_count") and max(counters) > 0:
                 failures.append(f"Nonzero {name}: {max(counters):g}.")
         utilization = sorted(v["active"] / v["limit"] for v in values
                              if v.get("active") is not None and (v.get("limit") or 0) > 0)
@@ -165,6 +216,7 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
             "end_elapsed": observations[-1]["elapsed"],
             "observed_seconds": observations[-1]["elapsed"] - observations[0]["elapsed"],
             "samples": len(observations),
+            "pressure": summarize_pressure(values),
             "capacities": sorted({v["capacity"] for v in values}),
             "allowances": sorted({v["limit"] for v in values if v.get("limit") is not None}),
             "peak": peak,
@@ -545,6 +597,17 @@ def write_markdown(out: Path, summary: dict, samples: list[dict], notes_file: st
             lines.append(f"| {path} | {measured['verdict']} | {fmt(measured.get('peak'))} | "
                          f"{fmt(measured.get('minimum_headroom'))} | {fmt(measured.get('utilization_p99'))} | "
                          f"{fmt(events.get('limit_reached_count'))} | {fmt(events.get('capacity_deferred_count'))} |")
+        lines += ["", "| Path | Saturation episodes/h | Saturated seconds | Open at end | Metadata evictions | Retry downloads |",
+                  "| --- | ---: | ---: | --- | ---: | ---: |"]
+        for path, measured in summary["missing_parent"].items():
+            pressure = measured.get("pressure", {})
+            removals = pressure.get("metadata_evictions", {})
+            removed = sum(removals.values()) if removals and all(v is not None for v in removals.values()) else None
+            lines.append(f"| {path} | {fmt(pressure.get('admission_saturation_episodes_per_hour'))} | "
+                         f"{fmt(pressure.get('saturated_seconds'))} | {pressure.get('open_at_end', 'unknown')} | "
+                         f"{fmt(removed)} | {fmt(pressure.get('deferred_retry_attempts'))} |")
+        lines += ["", "Open episode durations are lower bounds. Metadata evictions exclude new-entry overflow rejections,",
+                  "round resets, and successful completion. Capacity body deferrals are reported separately."]
         for reason in summary.get("qualification_failures", []):
             lines.append(f"- {reason}")
 
@@ -559,6 +622,8 @@ def main(argv=None) -> int:
     parser.add_argument("--duration-minutes", type=float, required=True)
     parser.add_argument("--interval", type=float, default=1)
     parser.add_argument("--require-capacity", action="store_true")
+    parser.add_argument("--continue-after-capacity-failure", action="store_true",
+                        help="measure recurring pressure through the full window; nonzero events still fail acceptance")
     parser.add_argument("--required-semantic-blocks", type=int, default=0)
     parser.add_argument("--required-observation-seconds", type=float, default=0)
     parser.add_argument("--reference-rpc-url", help="independent healthy node for tip qualification")
@@ -638,10 +703,8 @@ def main(argv=None) -> int:
             f"state={sample['active_state']}"
         )
         print(status, flush=True)
-        if args.require_capacity and any(
-            (path.get("limit_reached_count") or 0) > 0 or (path.get("capacity_deferred_count") or 0) > 0
-            for path in sample.get("missing_parent", {}).values()
-        ):
+        if stop_for_capacity_failure(sample, required=args.require_capacity,
+                                     continue_after_failure=args.continue_after_capacity_failure):
             print("normal-traffic capacity acceptance failed; preserving this observation", flush=True)
             break
         if args.require_startup_height and not startup_height_checked:
@@ -719,6 +782,7 @@ def main(argv=None) -> int:
         expected_snapshot_height=args.expected_snapshot_height,
         startup_height_error=startup_error,
     )
+    summary["continued_after_capacity_failure"] = args.continue_after_capacity_failure
     summary["missing_parent"] = summarize_capacity(samples, args.interval, at_tip=bool(args.required_observation_seconds))
     summary["missing_parent_durations"] = next((s["missing_parent_durations"] for s in reversed(samples)
                                                 if s.get("missing_parent_durations")), {})

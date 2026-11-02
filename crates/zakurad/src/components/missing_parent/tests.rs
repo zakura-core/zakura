@@ -356,7 +356,18 @@ async fn saturated_waits_allow_a_real_connected_state_commit() {
 }
 
 #[derive(Default)]
-struct Counters(Mutex<HashMap<String, Arc<AtomicU64>>>);
+struct Counters(
+    Mutex<HashMap<String, Arc<AtomicU64>>>,
+    Mutex<HashMap<String, Arc<Mutex<Vec<f64>>>>>,
+);
+
+struct Durations(Arc<Mutex<Vec<f64>>>);
+
+impl metrics::HistogramFn for Durations {
+    fn record(&self, value: f64) {
+        self.0.lock().unwrap().push(value);
+    }
+}
 
 impl Recorder for Counters {
     fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
@@ -375,8 +386,15 @@ impl Recorder for Counters {
     fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
         Gauge::noop()
     }
-    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
-        Histogram::noop()
+    fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
+        Histogram::from_arc(Arc::new(Durations(
+            self.1
+                .lock()
+                .unwrap()
+                .entry(key.name().to_owned())
+                .or_default()
+                .clone(),
+        )))
     }
 }
 
@@ -441,6 +459,93 @@ fn capacity_reduction_events_exclude_increases_while_over_limit() {
     );
     assert_eq!(
         counters["sync.missing_parent.limit_reached.count"].load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn saturation_durations_include_closed_spikes_and_keep_open_episodes() {
+    let recorder = Counters::default();
+    let budget = Budget::new("sync", 2);
+    let mut first = budget.attempt(block(1).hash);
+    first
+        .admit(state(zs::ParentInputs::ParentUnavailable), block(1))
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(250)).await;
+    metrics::with_local_recorder(&recorder, || budget.publish(&mut budget.lock(), false));
+    assert_eq!(
+        budget.lock().saturation.current.unwrap().0.elapsed(),
+        Duration::from_millis(250)
+    );
+    tokio::time::advance(Duration::from_millis(250)).await;
+    metrics::with_local_recorder(&recorder, || drop(first));
+    assert_eq!(
+        budget.lock().saturation.completed,
+        Duration::from_millis(500)
+    );
+    assert!(budget.lock().saturation.current.is_none());
+
+    let mut second = budget.attempt(block(2).hash);
+    second
+        .admit(state(zs::ParentInputs::ParentUnavailable), block(2))
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    metrics::with_local_recorder(&recorder, || budget.set_capacity(4));
+    assert_eq!(budget.lock().saturation.last, Duration::from_secs(2));
+    assert_eq!(budget.lock().saturation.longest, Duration::from_secs(2));
+    metrics::with_local_recorder(&recorder, || budget.set_capacity(2));
+    assert_eq!(
+        budget.lock().saturation.current.unwrap().1,
+        "capacity_reduction"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    metrics::with_local_recorder(&recorder, || budget.parent_ready(block(2).parent));
+    metrics::with_local_recorder(&recorder, || drop(second));
+    assert_eq!(
+        budget.lock().saturation.completed,
+        Duration::from_millis(3500)
+    );
+    assert_eq!(
+        *recorder.1.lock().unwrap()["sync.missing_parent.saturation.duration_seconds"]
+            .lock()
+            .unwrap(),
+        vec![0.5, 2.0, 1.0]
+    );
+}
+
+#[tokio::test]
+async fn metadata_capacity_eviction_is_distinct_from_rejection_and_reset() {
+    let budget = Budget::new("sync", 2);
+    let mut active = budget.attempt(block(1).hash);
+    active
+        .admit(state(zs::ParentInputs::ParentUnavailable), block(1))
+        .await
+        .unwrap();
+    for byte in 2..=3 {
+        let mut attempt = budget.attempt(block(byte).hash);
+        attempt
+            .admit(state(zs::ParentInputs::ParentUnavailable), block(byte))
+            .await
+            .unwrap_err();
+    }
+    let recorder = Counters::default();
+    metrics::with_local_recorder(&recorder, || {
+        budget.set_capacity(1);
+        budget.reset();
+    });
+    let counts = recorder.0.lock().unwrap();
+    assert_eq!(
+        counts["sync.missing_parent.capacity_evicted.count"].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        counts["sync.missing_parent.overflow_rejected.count"].load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        counts["sync.missing_parent.reset_discarded.count"].load(Ordering::Relaxed),
         1
     );
 }

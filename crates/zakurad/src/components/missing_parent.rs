@@ -58,6 +58,16 @@ struct Charge {
     since: Instant,
 }
 
+/// Monotonic episode timing; an open episode is retained until occupancy falls.
+#[derive(Debug)]
+struct Saturation {
+    observed_since: Instant,
+    current: Option<(Instant, &'static str)>,
+    completed: Duration,
+    longest: Duration,
+    last: Duration,
+}
+
 #[derive(Debug)]
 struct Accounting {
     capacity: usize,
@@ -68,6 +78,7 @@ struct Accounting {
     next_checks: HashMap<block::Hash, Instant>,
     peak: usize,
     band: usize,
+    saturation: Saturation,
     rediscover: bool,
 }
 
@@ -105,6 +116,13 @@ impl Budget {
                 next_checks: HashMap::new(),
                 peak: 0,
                 band: 0,
+                saturation: Saturation {
+                    observed_since: Instant::now(),
+                    current: None,
+                    completed: Duration::ZERO,
+                    longest: Duration::ZERO,
+                    last: Duration::ZERO,
+                },
                 rediscover: false,
             }),
             changed: Notify::new(),
@@ -132,6 +150,45 @@ impl Budget {
         metrics::counter!(self.metric(name)).increment(1);
     }
 
+    /// Count transitions where they happen, including episodes entirely between scrapes.
+    fn publish_saturation(&self, timing: &mut Saturation, saturated: bool, capacity_change: bool) {
+        let now = Instant::now();
+        if saturated && timing.current.is_none() {
+            let reason = if capacity_change {
+                "capacity_reduction"
+            } else {
+                "admission"
+            };
+            timing.current = Some((now, reason));
+        } else if !saturated {
+            if let Some((since, reason)) = timing.current.take() {
+                let duration = now.duration_since(since);
+                timing.completed += duration;
+                timing.longest = timing.longest.max(duration);
+                timing.last = duration;
+                metrics::histogram!(self.metric("saturation.duration_seconds"), "reason" => reason)
+                    .record(duration.as_secs_f64());
+            }
+        }
+        let current = timing
+            .current
+            .map(|(since, _)| now.duration_since(since))
+            .unwrap_or_default();
+        for (name, seconds) in [
+            ("saturation.total_seconds", timing.completed + current),
+            ("saturation.current_duration_seconds", current),
+            ("saturation.longest_seconds", timing.longest.max(current)),
+            ("saturation.last_completed_duration_seconds", timing.last),
+            (
+                "saturation.observed_seconds",
+                now.duration_since(timing.observed_since),
+            ),
+        ] {
+            metrics::gauge!(self.metric(name)).set(seconds.as_secs_f64());
+        }
+        metrics::gauge!(self.metric("saturation.active")).set(if saturated { 1.0 } else { 0.0 });
+    }
+
     fn publish(&self, state: &mut Accounting, capacity_change: bool) {
         let active = state.charges.len();
         let limit = Self::limit(state.capacity);
@@ -147,6 +204,7 @@ impl Budget {
         } else {
             0
         };
+        self.publish_saturation(&mut state.saturation, band == 3, capacity_change);
         if band > state.band {
             if state.band < 1 {
                 self.count("near_80.count");
@@ -196,6 +254,13 @@ impl Budget {
             "overflow.count",
             "retry_limit.count",
             "retried.count",
+            "deferred_created.count",
+            "capacity_evicted.count",
+            "overflow_rejected.count",
+            "reset_discarded.count",
+            "deferred_completed.count",
+            "deferred_failed.count",
+            "deferred_cancelled.count",
         ] {
             metrics::counter!(self.metric(name)).increment(0);
         }
@@ -220,7 +285,12 @@ impl Budget {
                 .iter()
                 .rposition(|(_, entry)| !entry.dispatched)
             {
-                state.deferred.shift_remove_index(index);
+                let (_, entry) = state.deferred.shift_remove_index(index).expect(
+                    "the selected deferred entry is still present under the accounting lock",
+                );
+                self.count("capacity_evicted.count");
+                metrics::histogram!(self.metric("deferred.duration_seconds"), "reason" => "capacity_reduction")
+                    .record(entry.first.elapsed().as_secs_f64());
                 state.rediscover = true;
                 self.count("overflow.count");
             } else {
@@ -339,6 +409,9 @@ impl Budget {
             .generation
             .checked_add(1)
             .expect("a downloader cannot reset u64::MAX rounds in its lifetime");
+        metrics::counter!(self.metric("reset_discarded.count")).increment(
+            u64::try_from(state.deferred.len()).expect("the bounded registry length fits in u64"),
+        );
         state.deferred.clear();
         state.next_checks.clear();
         state.rediscover = false;
@@ -518,6 +591,7 @@ impl Attempt {
             entry.ready = false;
             entry.owner = self.id;
         } else if inner.deferred.len() < inner.capacity {
+            self.budget.count("deferred_created.count");
             inner.deferred.insert(
                 self.hash,
                 Entry {
@@ -533,6 +607,7 @@ impl Attempt {
         } else {
             inner.rediscover = true;
             self.budget.count("overflow.count");
+            self.budget.count("overflow_rejected.count");
         }
         self.transferred = true;
         self.budget.expire(&mut inner);
@@ -559,6 +634,11 @@ impl Drop for Attempt {
                     .deferred
                     .shift_remove(&self.hash)
                     .expect("this attempt still owns the deferred entry");
+                self.budget.count(match self.outcome {
+                    "completed" => "deferred_completed.count",
+                    "failed" => "deferred_failed.count",
+                    _ => "deferred_cancelled.count",
+                });
                 metrics::histogram!(self.budget.metric("deferred.duration_seconds"), "reason" => self.outcome)
                     .record(entry.first.elapsed().as_secs_f64());
             }

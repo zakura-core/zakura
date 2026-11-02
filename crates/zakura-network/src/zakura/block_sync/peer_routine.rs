@@ -1563,7 +1563,7 @@ mod tests {
         session::{Serving, ServingSession},
     };
     use super::super::request::BlockSizeEstimate;
-    use super::super::sequencer_task::{initial_view, SequencedBody};
+    use super::super::sequencer_task::{initial_view, SequencedBody, SequencerView};
     use super::super::source::EmptyBlockRangeSource;
     use super::super::state::{ByteBudget, ThroughputMeter};
     use super::super::tests::genesis_frontiers;
@@ -1612,6 +1612,133 @@ mod tests {
         (requester, serving)
     }
 
+    /// A routine under test, built by the production constructor. A test
+    /// overrides the fields it cares about and leaves the rest to [`Self::new`].
+    pub(super) struct TestRoutine {
+        pub(super) config: ZakuraBlockSyncConfig,
+        pub(super) peer: ZakuraPeerId,
+        pub(super) conn_id: u64,
+        pub(super) allow_no_progress_park: bool,
+        /// The session's generation. `None` admits the session to `registry`.
+        pub(super) generation: Option<u64>,
+        /// The work queue. `None` builds one with the config's byte budget.
+        pub(super) work: Option<Arc<WorkQueue>>,
+        pub(super) registry: Arc<PeerRegistry>,
+        pub(super) pool: ReservationPool,
+        pub(super) connection: CancellationToken,
+        pub(super) cancel: CancellationToken,
+        pub(super) out_send: crate::zakura::FramedSend,
+        pub(super) failure_cause: Option<crate::zakura::transport::OrderedStreamFailureCause>,
+        /// Capacity of the inbound stream, sequencer input, and reactor channels.
+        pub(super) channels: usize,
+        pub(super) view: SequencerView,
+        /// A view channel that another owner drives. It replaces `view`.
+        pub(super) view_rx: Option<watch::Receiver<SequencerView>>,
+        pub(super) input_decoded_bytes: Arc<AtomicU64>,
+    }
+
+    /// The other ends of a [`TestRoutine`]'s channels. They live as long as a
+    /// test holds them.
+    pub(super) struct RoutineEnds {
+        pub(super) inbound: crate::zakura::FramedSend,
+        pub(super) bodies: mpsc::Receiver<SequencedBody>,
+        pub(super) events: mpsc::Receiver<RoutineToReactor>,
+        pub(super) view: watch::Sender<SequencerView>,
+    }
+
+    impl TestRoutine {
+        /// An admitted routine for peer `[7; 32]` with default config, a private
+        /// pool and connection, writing its requests to `out_send`.
+        pub(super) fn new(out_send: crate::zakura::FramedSend) -> Self {
+            Self {
+                config: ZakuraBlockSyncConfig::default(),
+                peer: ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds"),
+                conn_id: 0,
+                allow_no_progress_park: true,
+                generation: None,
+                work: None,
+                registry: Arc::new(PeerRegistry::new()),
+                pool: test_request_pool(),
+                connection: CancellationToken::new(),
+                cancel: CancellationToken::new(),
+                out_send,
+                failure_cause: None,
+                channels: 16,
+                view: initial_view(genesis_frontiers()),
+                view_rx: None,
+                input_decoded_bytes: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        pub(super) fn build(self) -> (PeerRoutine, RoutineEnds) {
+            let (inbound, in_recv) = framed_channel(self.channels);
+            let in_recv = match self.failure_cause {
+                Some(cause) => in_recv.with_failure_cause(cause),
+                None => in_recv,
+            };
+            let session = BlockSyncPeerSession::for_test(
+                self.peer.clone(),
+                self.out_send,
+                self.cancel.clone(),
+            );
+            let generation = self.generation.unwrap_or_else(|| {
+                self.registry
+                    .admit_session(
+                        &self.peer,
+                        session.direction(),
+                        &self.config,
+                        self.conn_id,
+                        Instant::now(),
+                    )
+                    .generation()
+            });
+            let work = self.work.unwrap_or_else(|| {
+                let budget = ByteBudget::new(self.config.max_inflight_block_bytes);
+                Arc::new(WorkQueue::new(block::Height(0), budget))
+            });
+            let (sequencer_input, bodies) = mpsc::channel(self.channels);
+            let (routine_to_reactor, events) = mpsc::channel(self.channels);
+            let (view, own_view_rx) = watch::channel(self.view);
+            let (requester, serving) = test_authorization(
+                &session,
+                &in_recv,
+                &self.config,
+                self.pool,
+                &self.connection,
+            );
+            let routine = PeerRoutine::new(
+                self.peer,
+                self.conn_id,
+                session,
+                in_recv,
+                requester,
+                serving,
+                self.config,
+                self.allow_no_progress_park,
+                generation,
+                work,
+                self.registry,
+                Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+                sequencer_input,
+                Arc::new(AtomicU64::new(0)),
+                self.input_decoded_bytes,
+                routine_to_reactor,
+                self.view_rx.unwrap_or(own_view_rx),
+                self.cancel,
+                ZakuraTrace::noop(),
+            );
+            (
+                routine,
+                RoutineEnds {
+                    inbound,
+                    bodies,
+                    events,
+                    view,
+                },
+            )
+        }
+    }
+
     /// [`status_test_routine_with`] using a private pool and connection.
     pub(super) fn status_test_routine() -> (
         PeerRoutine,
@@ -1631,45 +1758,14 @@ mod tests {
         crate::zakura::FramedRecv,
         mpsc::Receiver<RoutineToReactor>,
     ) {
-        let config = ZakuraBlockSyncConfig::default();
-        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
-        let cancel = CancellationToken::new();
         let (out_send, out_recv) = framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-        let registry = Arc::new(PeerRegistry::new());
-        let generation = registry
-            .admit_session(&peer, session.direction(), &config, 0, Instant::now())
-            .generation();
-        let budget = ByteBudget::new(config.max_inflight_block_bytes);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let (requester, serving) =
-            test_authorization(&session, &in_recv, &config, pool, connection);
-        let routine = PeerRoutine::new(
-            peer.clone(),
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
-            config.clone(),
-            true,
-            generation,
-            Arc::clone(&work),
-            Arc::clone(&registry),
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view_rx,
-            cancel,
-            ZakuraTrace::noop(),
-        );
-        (routine, out_recv, routine_to_reactor_rx)
+        let (routine, ends) = TestRoutine {
+            pool,
+            connection: connection.clone(),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
+        (routine, out_recv, ends.events)
     }
 
     #[tokio::test]
@@ -2124,11 +2220,8 @@ mod tests {
             [(block::Height(1), hash, BlockSizeEstimate::Advertised(1_000))],
         );
 
-        let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
         let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let registry = Arc::new(PeerRegistry::new());
         let until = Instant::now() + Duration::from_secs(60);
         registry.defer_body_retry(
@@ -2138,37 +2231,15 @@ mod tests {
             until,
         );
 
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer,
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
+        let (mut routine, _ends) = TestRoutine {
             config,
-            true,
-            0,
-            Arc::clone(&work),
+            peer,
+            generation: Some(0),
+            work: Some(work.clone()),
             registry,
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view_rx,
-            cancel,
-            ZakuraTrace::noop(),
-        );
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.state.received_status = true;
         routine.state.servable_low = block::Height(1);
         routine.state.servable_high = block::Height(10);
@@ -2237,44 +2308,17 @@ mod tests {
             1,
         );
 
-        let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
         let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
+        let (mut routine, _ends) = TestRoutine {
+            config: config.clone(),
             peer,
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
-            config,
-            true,
-            0,
-            work.clone(),
-            Arc::new(PeerRegistry::new()),
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view_rx,
-            cancel,
-            ZakuraTrace::noop(),
-        );
+            generation: Some(0),
+            work: Some(work.clone()),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         // The routine learns these from a `Status` frame in production; set them directly
         // so a single `try_fill` pass exercises the floor arm.
         routine.state.received_status = true;
@@ -2346,51 +2390,16 @@ mod tests {
         registry: &Arc<PeerRegistry>,
         view: watch::Receiver<super::super::sequencer_task::SequencerView>,
     ) -> (PeerRoutine, crate::zakura::FramedRecv) {
-        let config = ZakuraBlockSyncConfig::default();
-        let cancel = CancellationToken::new();
         let (out_send, out_recv) = framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
-        let peer = ZakuraPeerId::new(vec![id; 32]).expect("test peer id is within bounds");
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-        let generation = registry
-            .admit_session(
-                &peer,
-                session.direction(),
-                &config,
-                u64::from(id),
-                Instant::now(),
-            )
-            .generation();
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer,
-            u64::from(id),
-            session,
-            in_recv,
-            requester,
-            serving,
-            config,
-            true,
-            generation,
-            Arc::clone(work),
-            Arc::clone(registry),
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view,
-            cancel,
-            ZakuraTrace::noop(),
-        );
+        let (mut routine, _ends) = TestRoutine {
+            peer: ZakuraPeerId::new(vec![id; 32]).expect("test peer id is within bounds"),
+            conn_id: u64::from(id),
+            work: Some(Arc::clone(work)),
+            registry: Arc::clone(registry),
+            view_rx: Some(view),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.state.received_status = true;
         routine.state.servable_low = block::Height(1);
         routine.state.servable_high = block::Height(10);
@@ -2575,50 +2584,17 @@ mod tests {
         work.set_estimate_floor_for_tests(1);
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
         let peer = ZakuraPeerId::new(vec![9u8; 32]).unwrap();
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let registry = Arc::new(PeerRegistry::new());
-        let generation = registry
-            .admit_session(
-                &peer,
-                crate::zakura::ServicePeerDirection::Outbound,
-                &config,
-                0,
-                Instant::now(),
-            )
-            .generation();
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer.clone(),
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
+        let (mut routine, _ends) = TestRoutine {
             config,
-            true,
-            generation,
-            work.clone(),
-            registry.clone(),
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view_rx,
-            cancel.clone(),
-            ZakuraTrace::noop(),
-        );
+            peer: peer.clone(),
+            work: Some(work.clone()),
+            registry: registry.clone(),
+            cancel: cancel.clone(),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
             servable_high: block::Height(10),
@@ -2858,50 +2834,17 @@ mod tests {
         add_work(2);
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
         let peer = ZakuraPeerId::new(vec![9u8; 32]).unwrap();
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let registry = Arc::new(PeerRegistry::new());
-        let generation = registry
-            .admit_session(
-                &peer,
-                crate::zakura::ServicePeerDirection::Outbound,
-                &config,
-                0,
-                Instant::now(),
-            )
-            .generation();
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer.clone(),
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
+        let (mut routine, ends) = TestRoutine {
             config,
-            true,
-            generation,
-            work.clone(),
-            registry.clone(),
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view_rx,
-            cancel.clone(),
-            ZakuraTrace::noop(),
-        );
+            peer: peer.clone(),
+            work: Some(work.clone()),
+            registry: registry.clone(),
+            cancel: cancel.clone(),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
             servable_high: block::Height(10),
@@ -2964,7 +2907,8 @@ mod tests {
             ReceiptCleanup::Writer => {}
             ReceiptCleanup::CommittedGc => {
                 work.advance_floor(block::Height(2));
-                view_tx.send_modify(|view| view.download_floor = block::Height(2));
+                ends.view
+                    .send_modify(|view| view.download_floor = block::Height(2));
                 routine.gc_committed_outstanding();
             }
             ReceiptCleanup::ObsoleteGc => {
@@ -3058,44 +3002,17 @@ mod tests {
             1,
         );
 
-        let cancel = CancellationToken::new();
         let (out_send, _out_recv) = framed_channel(16);
-        let (_in_send, in_recv) = framed_channel(16);
         let peer = ZakuraPeerId::new(vec![9u8; 32]).expect("test peer id is within bounds");
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
-        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer,
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
+        let (mut routine, _ends) = TestRoutine {
             config,
-            true,
-            0,
-            Arc::clone(&work),
-            Arc::new(PeerRegistry::new()),
-            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-            sequencer_input_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            routine_to_reactor_tx,
-            view_rx,
-            cancel,
-            ZakuraTrace::noop(),
-        );
+            peer: peer.clone(),
+            generation: Some(0),
+            work: Some(work.clone()),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.state.received_status = true;
         routine.state.servable_low = block::Height(1);
         routine.state.servable_high = block::Height(10);
@@ -3369,10 +3286,20 @@ mod tests {
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
         let fill_outbound = out_send.clone();
-        let (in_send, in_recv) = framed_channel(4);
         let cause = OrderedStreamFailureCause::default();
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let (mut routine, mut ends) = TestRoutine {
+            config: config.clone(),
+            peer: peer.clone(),
+            work: Some(work.clone()),
+            registry: registry.clone(),
+            cancel: cancel.clone(),
+            channels: 4,
+            failure_cause: Some(cause.clone()),
+            allow_no_progress_park: !readmitted,
+            generation: Some(generation),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         let mut held_capacity = Vec::new();
         if matches!(
             buffered,
@@ -3383,40 +3310,16 @@ mod tests {
                 | BufferedResponse::MalformedBlockAlreadyProcessing
         ) {
             for _ in 0..4 {
-                held_capacity.push(sequencer_input.clone().try_reserve_owned().unwrap());
+                held_capacity.push(
+                    routine
+                        .io
+                        .sequencer_input
+                        .clone()
+                        .try_reserve_owned()
+                        .unwrap(),
+                );
             }
         }
-        let (reactor_input, _reactor_recv) = mpsc::channel(4);
-        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let in_recv = in_recv.with_failure_cause(cause.clone());
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer.clone(),
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
-            config.clone(),
-            !readmitted,
-            generation,
-            work.clone(),
-            registry.clone(),
-            Arc::new(Mutex::new(ThroughputMeter::new(now))),
-            sequencer_input,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            reactor_input,
-            view_rx,
-            cancel.clone(),
-            ZakuraTrace::noop(),
-        );
         if unanswered {
             routine.handle_status(super::BlockSyncStatus {
                 servable_low: block::Height(1),
@@ -3448,7 +3351,7 @@ mod tests {
             | BufferedResponse::Backpressured
             | BufferedResponse::AlreadyProcessing
             | BufferedResponse::ResetDuringBackpressure => {
-                in_send
+                ends.inbound
                     .send(
                         super::super::BlockSyncMessage::Block(body.clone())
                             .encode_frame()
@@ -3456,7 +3359,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                in_send
+                ends.inbound
                     .send(
                         super::super::BlockSyncMessage::BlocksDone {
                             start_height: block::Height(1),
@@ -3469,7 +3372,7 @@ mod tests {
                     .unwrap();
             }
             BufferedResponse::StatusOnly => {
-                in_send
+                ends.inbound
                     .send(
                         super::super::BlockSyncMessage::Status(super::BlockSyncStatus::default())
                             .encode_frame()
@@ -3479,7 +3382,7 @@ mod tests {
                     .unwrap();
             }
             BufferedResponse::Malformed => {
-                in_send
+                ends.inbound
                     .send(crate::zakura::Frame {
                         message_type: u16::MAX,
                         flags: 0,
@@ -3501,7 +3404,7 @@ mod tests {
                     payload,
                 };
                 assert!(super::super::BlockSyncMessage::decode_frame(frame.clone()).is_err());
-                in_send.send(frame).await.unwrap();
+                ends.inbound.send(frame).await.unwrap();
             }
             BufferedResponse::None => {}
         }
@@ -3526,7 +3429,7 @@ mod tests {
             // capacity. Cancellation must not turn that wait into a peer fault.
             assert!(futures::poll!(running.as_mut()).is_pending());
             assert_eq!(
-                in_send.capacity(),
+                ends.inbound.capacity(),
                 if buffered == BufferedResponse::MalformedBlockAlreadyProcessing {
                     4
                 } else {
@@ -3545,11 +3448,11 @@ mod tests {
             );
             assert!(work.in_flight_contains(block::Height(1)));
             assert!(budget.reserved() > 0);
-            assert!(sequencer_recv.try_recv().is_err());
+            assert!(ends.bodies.try_recv().is_err());
             assert!(!registry.is_peer_parked(&peer, Instant::now()));
             if buffered == BufferedResponse::ResetDuringBackpressure {
                 work.reset_above(block::Height(0));
-                view_tx.send_modify(|view| view.reset_epoch += 1);
+                ends.view.send_modify(|view| view.reset_epoch += 1);
             }
             drop(held_capacity);
         }
@@ -3611,8 +3514,8 @@ mod tests {
             unanswered && !received && buffered != BufferedResponse::ResetDuringBackpressure
         );
         assert_eq!(work.in_flight_contains(block::Height(1)), received);
-        assert_eq!(sequencer_recv.try_recv().is_ok(), received);
-        assert!(sequencer_recv.try_recv().is_err());
+        assert_eq!(ends.bodies.try_recv().is_ok(), received);
+        assert!(ends.bodies.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3620,7 +3523,6 @@ mod tests {
         use zakura_chain::serialization::ZcashDeserializeInto;
 
         use crate::zakura::transport::OrderedStreamFailureCause;
-        use crate::zakura::ServicePeerDirection;
 
         let body: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -3643,47 +3545,20 @@ mod tests {
         );
         let peer = ZakuraPeerId::new(vec![23; 32]).unwrap();
         let registry = Arc::new(PeerRegistry::new());
-        let now = Instant::now();
-        let generation = registry
-            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
-            .generation();
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
-        let (in_send, in_recv) = framed_channel(4);
         let cause = OrderedStreamFailureCause::default();
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
-        let (reactor_input, mut reactor_recv) = mpsc::channel(4);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
-        let in_recv = in_recv.with_failure_cause(cause);
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
-            peer.clone(),
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
-            config.clone(),
-            true,
-            generation,
-            work.clone(),
-            registry.clone(),
-            Arc::new(Mutex::new(ThroughputMeter::new(now))),
-            sequencer_input,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            reactor_input,
-            view_rx,
-            cancel.clone(),
-            ZakuraTrace::noop(),
-        );
+        let (mut routine, mut ends) = TestRoutine {
+            config,
+            peer,
+            work: Some(work.clone()),
+            registry,
+            cancel: cancel.clone(),
+            channels: 4,
+            failure_cause: Some(cause),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),
             servable_high: block::Height(1),
@@ -3699,7 +3574,7 @@ mod tests {
             .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
             .await
             .unwrap();
-        in_send
+        ends.inbound
             .send(
                 BlockSyncMessage::Block(body.clone())
                     .encode_frame()
@@ -3707,7 +3582,7 @@ mod tests {
             )
             .await
             .unwrap();
-        in_send
+        ends.inbound
             .send(
                 BlockSyncMessage::BlocksDone {
                     start_height: block::Height(1),
@@ -3721,14 +3596,14 @@ mod tests {
 
         let mut running = Box::pin(routine.run());
         let sequenced = tokio::select! {
-            sequenced = sequencer_recv.recv() => sequenced,
+            sequenced = ends.bodies.recv() => sequenced,
             _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
         };
         assert!(
             sequenced.is_some(),
             "a hash-matched body is sequenced even though it exceeds its size hint"
         );
-        let reported = std::iter::from_fn(|| reactor_recv.try_recv().ok())
+        let reported = std::iter::from_fn(|| ends.events.try_recv().ok())
             .any(|message| matches!(message, RoutineToReactor::Misbehavior { .. }));
         assert!(
             !reported,
@@ -3751,8 +3626,6 @@ mod tests {
     ) -> (u64, SequencedBody, u64) {
         use zakura_chain::serialization::ZcashDeserializeInto;
 
-        use crate::zakura::ServicePeerDirection;
-
         let body: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES
                 .zcash_deserialize_into()
@@ -3773,48 +3646,23 @@ mod tests {
         );
         let peer = ZakuraPeerId::new(vec![24; 32]).unwrap();
         let registry = Arc::new(PeerRegistry::new());
-        let now = Instant::now();
-        let generation = registry
-            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
-            .generation();
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
-        let (in_send, in_recv) = framed_channel(4);
-        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
-        let (reactor_input, _reactor_recv) = mpsc::channel(4);
         let mut view = initial_view(genesis_frontiers());
         view.applying_decoded_attributed_memory_bytes = applying_decoded_bytes;
-        let (_view_tx, view_rx) = watch::channel(view);
         let input_decoded_bytes = Arc::new(AtomicU64::new(queued_decoded_bytes));
-        let (requester, serving) = test_authorization(
-            &session,
-            &in_recv,
-            &config,
-            test_request_pool(),
-            &CancellationToken::new(),
-        );
-        let mut routine = PeerRoutine::new(
+        let (mut routine, mut ends) = TestRoutine {
+            config,
             peer,
-            0,
-            session,
-            in_recv,
-            requester,
-            serving,
-            config.clone(),
-            true,
-            generation,
-            work,
+            work: Some(work.clone()),
             registry,
-            Arc::new(Mutex::new(ThroughputMeter::new(now))),
-            sequencer_input,
-            Arc::new(AtomicU64::new(0)),
-            input_decoded_bytes.clone(),
-            reactor_input,
-            view_rx,
-            cancel.clone(),
-            ZakuraTrace::noop(),
-        );
+            cancel: cancel.clone(),
+            channels: 4,
+            view,
+            input_decoded_bytes: input_decoded_bytes.clone(),
+            ..TestRoutine::new(out_send)
+        }
+        .build();
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),
             servable_high: block::Height(1),
@@ -3829,7 +3677,7 @@ mod tests {
             .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
             .await
             .unwrap();
-        in_send
+        ends.inbound
             .send(
                 BlockSyncMessage::Block(body.clone())
                     .encode_frame()
@@ -3840,7 +3688,7 @@ mod tests {
 
         let mut running = Box::pin(routine.run());
         let sequenced = tokio::select! {
-            sequenced = sequencer_recv.recv() => sequenced,
+            sequenced = ends.bodies.recv() => sequenced,
             _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
         }
         .expect("the routine sequences the requested body");

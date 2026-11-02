@@ -44,55 +44,18 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         max_requests_without_block_progress: window,
         ..ZakuraBlockSyncConfig::default()
     };
-    let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
-    let cancel = CancellationToken::new();
     let capacity = usize::try_from(window).unwrap() + 16;
     let (out_send, outbound) = crate::zakura::framed_channel(capacity);
-    let (inbound, in_recv) = crate::zakura::framed_channel(16);
-    let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-    let registry = Arc::new(PeerRegistry::new());
-    let generation = registry
-        .admit_session(&peer, session.direction(), &config, 0, Instant::now())
-        .generation();
     let budget = ByteBudget::new(config.max_inflight_block_bytes);
     let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
-    let (sequencer_input_tx, bodies) = mpsc::channel(capacity);
-    let (routine_to_reactor_tx, events) = mpsc::channel(capacity);
-    let (_view_tx, view_rx) = watch::channel(super::super::sequencer_task::initial_view(
-        super::super::BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-    ));
-    let (requester, serving) = super::tests::test_authorization(
-        &session,
-        &in_recv,
-        &config,
+    let (mut routine, ends) = super::tests::TestRoutine {
+        config,
+        work: Some(Arc::clone(&work)),
         pool,
-        &CancellationToken::new(),
-    );
-    let mut routine = PeerRoutine::new(
-        peer,
-        0,
-        session,
-        in_recv,
-        requester,
-        serving,
-        config.clone(),
-        true,
-        generation,
-        Arc::clone(&work),
-        registry,
-        Arc::new(std::sync::Mutex::new(ThroughputMeter::new(Instant::now()))),
-        sequencer_input_tx,
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        routine_to_reactor_tx,
-        view_rx,
-        cancel,
-        crate::zakura::trace::ZakuraTrace::noop(),
-    );
+        channels: capacity,
+        ..super::tests::TestRoutine::new(out_send)
+    }
+    .build();
     routine.handle_status(BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(window),
@@ -126,9 +89,9 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         routine,
         outbound,
         blocks,
-        inbound,
-        bodies,
-        _events: events,
+        inbound: ends.inbound,
+        bodies: ends.bodies,
+        _events: ends.events,
     }
 }
 

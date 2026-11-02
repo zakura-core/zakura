@@ -2459,36 +2459,78 @@ async fn parent_unknown_drops_block_when_parent_cannot_arrive() {
     }
 }
 
-/// A block the download task dropped for an unknown parent is downloaded again after the
-/// registry-miss backoff when its parent can now arrive, and restarts sync once that retry budget
-/// runs out.
+/// A block the download task dropped for an unknown parent waits, without being downloaded
+/// again, while its parent is still pending: waiting for a retry, or itself waiting for its own
+/// parent. It doesn't pause new downloads, and never restarts sync.
 #[tokio::test]
-async fn parent_unknown_retries_after_backoff_while_parent_can_arrive() {
+async fn parent_unknown_waits_while_its_parent_is_pending() {
     #[derive(Clone, Copy, Debug)]
     enum Parent {
         RegistryRetry,
+        AwaitingItsParent,
+    }
+    for parent_state in [Parent::RegistryRetry, Parent::AwaitingItsParent] {
+        let (mut chain_sync, _, _, mut peers, _state, _) = setup_chain_sync();
+        let hash = block::Hash([0xCC; 32]);
+        let parent = block::Hash([0xAA; 32]);
+        match parent_state {
+            Parent::RegistryRetry => {
+                chain_sync
+                    .registry_miss_retry
+                    .insert(parent, tokio::time::Instant::now());
+            }
+            Parent::AwaitingItsParent => {
+                chain_sync
+                    .blocks_awaiting_parent
+                    .insert(parent, block::Hash([0x99; 32]));
+            }
+        }
+
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent)))
+            .await
+            .expect("a parent that can arrive doesn't restart sync");
+
+        assert_eq!(
+            chain_sync.blocks_awaiting_parent.get(&hash),
+            Some(&parent),
+            "{parent_state:?}"
+        );
+        assert!(
+            !chain_sync.registry_miss_retry.contains_key(&hash),
+            "a waiting block doesn't pause new downloads: {parent_state:?}"
+        );
+        assert!(
+            chain_sync.registry_miss_retry_counts.is_empty(),
+            "{parent_state:?}"
+        );
+        peers.expect_no_requests().await;
+    }
+
+    assert!(!TestChainSync::should_restart_sync(
+        &parent_unknown(block::Hash([0xCC; 32]), block::Hash([0xAA; 32])),
+        false
+    ));
+}
+
+/// A block the download task dropped for an unknown parent is downloaded again at once when its
+/// parent can now be built on: committed, or still being written by the state.
+#[tokio::test]
+async fn parent_unknown_downloads_again_once_its_parent_can_be_built_on() {
+    #[derive(Clone, Copy, Debug)]
+    enum Parent {
         Committed,
         BeingWritten,
     }
-    for parent_state in [
-        Parent::RegistryRetry,
-        Parent::Committed,
-        Parent::BeingWritten,
-    ] {
+    for parent_state in [Parent::Committed, Parent::BeingWritten] {
         let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
         let hash = block::Hash([0xCC; 32]);
         let parent = block::Hash([0xAA; 32]);
-        if matches!(parent_state, Parent::RegistryRetry) {
-            chain_sync
-                .registry_miss_retry
-                .insert(parent, tokio::time::Instant::now());
-        }
 
         let (response, _) = tokio::join!(
             chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
             async {
                 match parent_state {
-                    Parent::RegistryRetry => {}
                     Parent::Committed => answer_parent_extendable(&mut state, parent).await,
                     Parent::BeingWritten => {
                         answer_parent_unavailable(
@@ -2502,40 +2544,56 @@ async fn parent_unknown_retries_after_backoff_while_parent_can_arrive() {
             },
         );
 
-        response.expect("a parent that can arrive retries the block");
+        response.expect("a parent that can be built on doesn't restart sync");
         assert!(
-            chain_sync.registry_miss_retry.contains_key(&hash),
+            chain_sync.blocks_awaiting_parent.is_empty(),
             "{parent_state:?}"
         );
-        assert_eq!(
-            chain_sync.registry_miss_retry_counts.get(&hash),
-            Some(&1),
-            "{parent_state:?}"
-        );
-        // The retry waits for the backoff instead of downloading again at once.
-        peers.expect_no_requests().await;
+        let _download = peers
+            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+            .await;
     }
+}
 
-    let (mut chain_sync, _, _, _peers, _state, _) = setup_chain_sync();
-    let hash = block::Hash([0xCC; 32]);
+/// Once a parent verifies, every block waiting on it, directly or through another waiting block,
+/// is downloaded again. Blocks waiting on other parents keep waiting.
+#[tokio::test]
+async fn verified_parent_downloads_its_waiting_blocks_again() {
+    let (mut chain_sync, _, _, mut peers, _state, _) = setup_chain_sync();
     let parent = block::Hash([0xAA; 32]);
+    let child = block::Hash([0xBB; 32]);
+    let grandchild = block::Hash([0xCC; 32]);
+    let other_parent = block::Hash([0xDD; 32]);
+    let unrelated = block::Hash([0xEE; 32]);
+    chain_sync.blocks_awaiting_parent.insert(child, parent);
+    chain_sync.blocks_awaiting_parent.insert(grandchild, child);
     chain_sync
-        .registry_miss_retry
-        .insert(parent, tokio::time::Instant::now());
+        .blocks_awaiting_parent
+        .insert(unrelated, other_parent);
+
     chain_sync
-        .registry_miss_retry_counts
-        .insert(hash, sync::MISSING_BLOCK_REGISTRY_RETRY_LIMIT);
-    assert!(
-        chain_sync
-            .handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent)))
-            .await
-            .is_err(),
-        "an exhausted retry budget restarts sync"
+        .handle_block_response_with_missing_retry(Ok((Height(41), parent)))
+        .await
+        .expect("a verified block doesn't restart sync");
+
+    let mut requested = HashSet::new();
+    for _ in 0..2 {
+        let _download = peers
+            .expect_request_that(|request| match request {
+                zn::Request::BlocksByHash(hashes) if hashes.len() == 1 => {
+                    requested.extend(hashes.iter().copied());
+                    true
+                }
+                _ => false,
+            })
+            .await;
+    }
+    assert_eq!(requested, [child, grandchild].into());
+    assert_eq!(
+        chain_sync.blocks_awaiting_parent,
+        [(unrelated, other_parent)].into()
     );
-    assert!(TestChainSync::should_restart_sync(
-        &parent_unknown(hash, parent),
-        false
-    ));
+    peers.expect_no_requests().await;
 }
 
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {

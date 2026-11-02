@@ -1049,6 +1049,13 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
+    /// Blocks dropped before verification because their parent was not yet usable but could
+    /// still arrive, keyed by block hash with the parent each one waits for.
+    ///
+    /// They are not downloaded again until that parent verifies, so a parent that never arrives
+    /// costs nothing more. They don't pause new downloads. Cleared at the start of each round.
+    blocks_awaiting_parent: HashMap<block::Hash, block::Hash>,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -1205,6 +1212,7 @@ where
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            blocks_awaiting_parent: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1568,6 +1576,7 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        self.blocks_awaiting_parent.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1662,6 +1671,7 @@ where
                 reserve.clear();
                 self.prospective_tips.clear();
                 self.registry_miss_retry.clear();
+                self.blocks_awaiting_parent.clear();
 
                 while let Some(response) = self.downloads.next().await {
                     if let Err(error) = response {
@@ -2657,11 +2667,56 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
-    /// The download task drops a block whose parent is neither in flight nor a block the state can
-    /// build on, before verifying it. The syncer drops it too, unless the parent can now be built
-    /// on, is in flight, or is waiting for a retry: then the block is downloaded again after the registry-miss backoff,
-    /// bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`], with the same pause on new dispatch as
-    /// any registry-miss retry.
+    /// Downloads `hash` again, for a block that was dropped before verification.
+    async fn request_block_again(&mut self, hash: block::Hash) -> Result<(), Report> {
+        match self.downloads.download_and_verify(hash).await {
+            Ok(()) | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                Ok(())
+            }
+            Err(error) => Ok(self.handle_block_response(Err(error))?),
+        }
+    }
+
+    /// Downloads again every block waiting for `parent`, directly or through other waiting
+    /// blocks, now that `parent` has verified. Parents are requested before their children, so
+    /// each child finds its parent in flight.
+    async fn request_blocks_awaiting(&mut self, parent: block::Hash) -> Result<(), Report> {
+        if self.blocks_awaiting_parent.is_empty() {
+            return Ok(());
+        }
+
+        let mut ready = vec![parent];
+        let mut next = 0;
+        while let Some(&waited_on) = ready.get(next) {
+            next += 1;
+            let children: Vec<block::Hash> = self
+                .blocks_awaiting_parent
+                .iter()
+                .filter(|(_, block_parent)| **block_parent == waited_on)
+                .map(|(child, _)| *child)
+                .collect();
+            for child in &children {
+                self.blocks_awaiting_parent.remove(child);
+            }
+            ready.extend(children);
+        }
+
+        for hash in ready.into_iter().skip(1) {
+            debug!(
+                ?hash,
+                ?parent,
+                "block's parent verified, downloading the block again"
+            );
+            self.request_block_again(hash).await?;
+        }
+        Ok(())
+    }
+
+    /// The download task drops a block whose parent is neither admitted in flight nor a block the
+    /// state can build on, before verifying it. The syncer drops it too, unless the parent can still
+    /// arrive. If the parent can now be built on, the block is downloaded again at once. If the
+    /// parent is in flight, waiting for a retry, or itself waiting for its own parent, the block
+    /// waits in [`Self::blocks_awaiting_parent`] and is downloaded again once the parent verifies.
     /// A block whose authorizing data binding is still unconfirmed after the download task waited
     /// for its parent is dropped the same way, without scoring its supplier.
     ///
@@ -2702,6 +2757,8 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+            self.blocks_awaiting_parent.remove(hash);
+            self.request_blocks_awaiting(*hash).await?;
         }
 
         // The download task already waited for the parent and verified the body again.
@@ -2719,8 +2776,10 @@ where
             // The parent may have committed after the verifier's state read. A known parent below
             // the finalized tip can never be built on, so the state is asked whether the parent
             // can be extended, not whether it exists.
-            let parent_can_arrive = self.downloads.contains(&parent)
+            let parent_pending = self.downloads.contains(&parent)
                 || self.registry_miss_retry.contains_key(&parent)
+                || self.blocks_awaiting_parent.contains_key(&parent);
+            let parent_can_arrive = parent_pending
                 // Boxing lets rustc prove this future is `Send` for spawned callers.
                 || futures::FutureExt::boxed(parent_can_be_built_on(self.state.clone(), parent))
                     .await
@@ -2735,32 +2794,20 @@ where
                 return Ok(());
             }
 
-            // The download task dropped this block before verification, but its parent can now be
-            // built on, is in flight, or is waiting for a retry. Download the block again after the
-            // registry-miss backoff, by when its parent can usually be found. Like any
-            // registry-miss retry, this pauses new dispatch and tip refreshes until the retry
-            // is sent. That is intended: it only happens when a parent was briefly away from the
-            // downloader, and the child is the next block sync needs.
+            // The download task dropped this block before verification, but its parent can still
+            // arrive. Download it again only once the parent can be built on, so a parent that
+            // never arrives costs no further downloads.
             if matches!(
                 response,
                 Err(BlockDownloadVerifyError::ParentUnknown { .. })
             ) {
-                let retry_count = self.registry_miss_retry_counts.entry(hash).or_default();
-                if *retry_count < MISSING_BLOCK_REGISTRY_RETRY_LIMIT {
-                    *retry_count += 1;
-                    debug!(
-                        ?hash,
-                        ?parent,
-                        retry_attempt = *retry_count,
-                        "block parent can still arrive, retrying block after backoff"
-                    );
-                    self.registry_miss_retry.insert(
-                        hash,
-                        tokio::time::Instant::now() + REGISTRY_MISS_RETRY_BACKOFF,
-                    );
-                    return Ok(());
+                if parent_pending {
+                    debug!(?hash, ?parent, "block waits for its parent to verify");
+                    self.blocks_awaiting_parent.insert(hash, parent);
+                } else {
+                    self.request_block_again(hash).await?;
                 }
-                self.registry_miss_retry_counts.remove(&hash);
+                return Ok(());
             }
         }
 
@@ -3257,14 +3304,14 @@ where
                 false
             }
             BlockDownloadVerifyError::ParentUnknown { .. } => {
-                // Only reached once the retry budget runs out while the parent could still
-                // arrive: restart to get fresh tips rather than wait on it indefinitely.
-                warn!(
+                // The missing-retry handler drops or holds these blocks, so this is not reached
+                // in normal operation. A block nothing can be built on doesn't need a restart.
+                debug!(
                     error = ?e,
                     %peer,
-                    "block retry budget exhausted while waiting for its parent, restarting sync"
+                    "block parent is unknown, dropping the block and continuing sync"
                 );
-                true
+                false
             }
             BlockDownloadVerifyError::TipChildHeightMismatch { .. } => {
                 // Only reached once the requeue budget is exhausted: the required hash still

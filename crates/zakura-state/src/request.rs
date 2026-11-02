@@ -654,6 +654,22 @@ impl ContextuallyVerifiedBlock {
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
+        Self::with_block_and_shared_spent_utxos(
+            network,
+            semantically_verified,
+            Arc::new(spent_outputs),
+        )
+    }
+
+    /// Like [`Self::with_block_and_spent_utxos`], but retains an already shared spent-output
+    /// map so proposal validation and the solved block can use the same allocation.
+    ///
+    /// The same input requirements and panic conditions apply.
+    pub(crate) fn with_block_and_shared_spent_utxos(
+        network: &Network,
+        semantically_verified: SemanticallyVerifiedBlock,
+        spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
             hash,
@@ -676,7 +692,7 @@ impl ContextuallyVerifiedBlock {
             hash,
             height,
             new_outputs: Arc::new(new_outputs),
-            spent_outputs: Arc::new(spent_outputs),
+            spent_outputs,
             transaction_hashes,
             chain_value_pool_change,
             receipt_order,

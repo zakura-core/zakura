@@ -838,7 +838,8 @@ impl NonFinalizedState {
                 &new_chain.created_utxos,
                 &new_chain.spent_utxos,
                 finalized_state,
-            ),
+            )
+            .map(Arc::new),
         };
         if let (true, Ok(spent_utxos)) = (self.records_proposal_spends, &spent_utxos) {
             self.proposal_spends.remember(&prepared, spent_utxos);
@@ -884,7 +885,7 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        let contextual = ContextuallyVerifiedBlock::with_block_and_shared_spent_utxos(
             &self.network,
             prepared,
             spent_utxos,

@@ -22,7 +22,7 @@ const MAX_ENTRIES: usize = 4;
 struct Entry {
     parent_hash: block::Hash,
     transaction_hashes: Arc<[transaction::Hash]>,
-    spent_utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    spent_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 }
 
 /// Spend check results shared by a non-finalized state and its clones.
@@ -35,16 +35,16 @@ struct Entry {
 pub(crate) struct ProposalSpends(Arc<Mutex<VecDeque<Entry>>>);
 
 impl ProposalSpends {
-    /// Remembers the spent outputs of a proposal that passed the spend check.
+    /// Shares the spent outputs of a proposal that passed the spend check without copying them.
     pub(crate) fn remember(
         &self,
         proposal: &SemanticallyVerifiedBlock,
-        spent_utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        spent_utxos: &Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
     ) {
         let entry = Entry {
             parent_hash: proposal.block.header.previous_block_hash,
             transaction_hashes: proposal.transaction_hashes.clone(),
-            spent_utxos: spent_utxos.clone(),
+            spent_utxos: Arc::clone(spent_utxos),
         };
         let mut entries = self.lock();
         entries.retain(|old| !old.matches(proposal));
@@ -59,7 +59,7 @@ impl ProposalSpends {
     pub(crate) fn take(
         &self,
         block: &SemanticallyVerifiedBlock,
-    ) -> Option<HashMap<transparent::OutPoint, transparent::OrderedUtxo>> {
+    ) -> Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>> {
         let mut entries = self.lock();
         let index = entries.iter().position(|entry| entry.matches(block))?;
         entries.remove(index).map(|entry| entry.spent_utxos)
@@ -251,6 +251,29 @@ mod tests {
     }
 
     #[test]
+    fn eviction_and_cache_drop_preserve_spends_retained_by_validation() {
+        let _init_guard = zakura_test::init();
+        let (_, _, mut child, outpoint, expected) = state_with_spend();
+        let spends = ProposalSpends::default();
+        let recorded = Arc::new(HashMap::from([(outpoint, expected.clone())]));
+        let original = child.clone().prepare();
+        spends.remember(&original, &recorded);
+        assert_eq!(Arc::strong_count(&recorded), 2);
+
+        for _ in 0..MAX_ENTRIES {
+            child = child.make_fake_child();
+            spends.remember(&child.clone().prepare(), &Arc::default());
+        }
+        assert!(
+            spends.take(&original).is_none(),
+            "the oldest result was evicted"
+        );
+        assert_eq!(Arc::strong_count(&recorded), 1);
+        drop(spends);
+        assert_eq!(recorded.as_ref(), &HashMap::from([(outpoint, expected)]));
+    }
+
+    #[test]
     fn transaction_order_and_parent_are_each_part_of_the_cache_key() {
         let _init_guard = zakura_test::init();
         let (parent, mut child, _) = blocks();
@@ -258,7 +281,7 @@ mod tests {
             .transactions
             .push(parent.transactions[0].clone());
         let spends = ProposalSpends::default();
-        spends.remember(&child.clone().prepare(), &HashMap::new());
+        spends.remember(&child.clone().prepare(), &Arc::new(HashMap::new()));
         let mut reordered = child.clone();
         Arc::make_mut(&mut reordered).transactions.swap(0, 1);
         assert!(spends.take(&reordered.prepare()).is_none());
@@ -294,7 +317,14 @@ mod tests {
             .proposal_spends
             .take(&child.clone().prepare())
             .expect("the proposal clone shares its results with the original state");
-        assert_eq!(recorded, HashMap::from([(outpoint, expected)]));
+        assert_eq!(recorded.as_ref(), &HashMap::from([(outpoint, expected)]));
+        assert!(Arc::ptr_eq(
+            &recorded,
+            &proposal_state
+                .best_tip_block()
+                .expect("the proposal committed")
+                .spent_outputs,
+        ));
         state
             .proposal_spends
             .remember(&child.clone().prepare(), &recorded);
@@ -307,6 +337,13 @@ mod tests {
             "the commit used the proposal's result"
         );
         let cached_chain = state.best_chain().expect("the solved block committed");
+        assert!(Arc::ptr_eq(
+            &recorded,
+            &cached_chain
+                .tip_block()
+                .expect("the solved block committed")
+                .spent_outputs,
+        ));
         let uncached_chain = uncached_state
             .best_chain()
             .expect("the uncached block committed");
@@ -347,7 +384,7 @@ mod tests {
             .proposal_spends
             .take(&child.clone().prepare())
             .expect("a repeated proposal must leave the writer's cached result available");
-        assert_eq!(recorded, HashMap::from([(outpoint, expected)]));
+        assert_eq!(recorded.as_ref(), &HashMap::from([(outpoint, expected)]));
         state
             .proposal_spends
             .remember(&child.clone().prepare(), &recorded);
@@ -446,14 +483,15 @@ mod tests {
             Arc::make_mut(&mut proposal).transactions[1] =
                 Arc::new(spend_transaction(version, outpoint));
             let spends = ProposalSpends::default();
-            let recorded = HashMap::from([(outpoint, expected.clone())]);
+            let recorded = Arc::new(HashMap::from([(outpoint, expected.clone())]));
             assert_eq!(
                 check::utxo::transparent_spend(
                     &proposal.clone().prepare(),
                     &chain.created_utxos,
                     &chain.spent_utxos,
                     &finalized,
-                ),
+                )
+                .map(Arc::new),
                 Ok(recorded.clone())
             );
             spends.remember(&proposal.clone().prepare(), &recorded);
@@ -478,7 +516,8 @@ mod tests {
                     &chain.created_utxos,
                     &chain.spent_utxos,
                     &finalized,
-                ),
+                )
+                .map(Arc::new),
                 Ok(recorded.clone())
             );
             assert_eq!(spends.take(&authorized.prepare()), Some(recorded.clone()));

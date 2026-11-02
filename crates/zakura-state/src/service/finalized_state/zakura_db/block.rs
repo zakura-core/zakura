@@ -1236,15 +1236,15 @@ impl ZakuraDb {
     }
 }
 
-/// Read a spent transparent UTXO and its output location before deleting it from the database.
-///
-/// Some UTXOs are created and spent in the same block, so they are in
-/// `tx_hash_indexes` and `new_outputs` rather than the database.
 /// Convert an in-memory length to a memory charge.
 fn byte_count(length: usize) -> u64 {
     u64::try_from(length).unwrap_or(u64::MAX)
 }
 
+/// Read a spent transparent UTXO and its output location before deleting it from the database.
+///
+/// Some UTXOs are created and spent in the same block, so they are in
+/// `tx_hash_indexes` and `new_outputs` rather than the database.
 fn read_spent_utxo(
     db: &ZakuraDb,
     height: Height,

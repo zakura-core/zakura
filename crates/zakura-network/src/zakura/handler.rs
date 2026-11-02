@@ -5453,7 +5453,13 @@ async fn request_stream_worker(
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        output = context.resources.output.admit_result(bound.frames, bound.bytes) => output,
+        output = async {
+            if bound.one_frame {
+                context.resources.output.admit(bound.bytes).await
+            } else {
+                context.resources.output.admit_shared(bound.bytes).await
+            }
+        } => output,
     };
 
     // The raw frame's grant ends with the service's call, which cancelling the
@@ -6126,7 +6132,8 @@ impl LegacyResponseBudget {
 /// The most output one response to a request can need.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ResponseBound {
-    frames: usize,
+    /// Whether the whole response fits one frame, which a stream's floor slot can fund.
+    one_frame: bool,
     /// Wire bytes, including each frame's header.
     bytes: u64,
 }
@@ -6135,7 +6142,7 @@ impl ResponseBound {
     /// The bound of a request whose response has no derivable limit: any number of
     /// frames, up to the compatibility response cap.
     const MAX: Self = Self {
-        frames: usize::MAX,
+        one_frame: false,
         // Widening usize to u64 is lossless on supported targets.
         bytes: LEGACY_RESPONSE_MAX_AGGREGATE_BYTES as u64,
     };
@@ -6170,7 +6177,7 @@ impl LegacyResponseBudget {
         // Widening u32 to usize is lossless on supported targets.
         let frame_payload_bytes = (max_frame_bytes as usize).saturating_sub(FRAME_HEADER_BYTES);
         let one_frame = |payload_bytes: usize| ResponseBound {
-            frames: 1,
+            one_frame: true,
             // Widening usize to u64 is lossless on supported targets.
             bytes: payload_bytes
                 .min(frame_payload_bytes)
@@ -6223,7 +6230,7 @@ impl LegacyResponseBudget {
             .min(most_frames)
             .saturating_add(1);
         ResponseBound {
-            frames,
+            one_frame: false,
             // Widening usize to u64 is lossless on supported targets.
             bytes: payload_bytes.saturating_add(frames.saturating_mul(FRAME_HEADER_BYTES)) as u64,
         }

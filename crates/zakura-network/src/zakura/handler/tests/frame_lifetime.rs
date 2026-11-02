@@ -430,7 +430,7 @@ async fn a_saturated_output_budget_holds_a_request_before_its_service() -> Resul
     let mut requests = LegacyRequests::connect(OUTPUT, Vec::new()).await?;
     let saturating = requests
         .output_gate()
-        .admit_result(2, OUTPUT)
+        .admit_shared(OUTPUT)
         .now_or_never()
         .ok_or("an idle budget funds the charge")?;
     let frame_bytes = 8 + one_block_request().len() as u64;
@@ -475,7 +475,7 @@ async fn a_small_request_runs_beside_a_large_reservation() -> Result<(), BoxErro
 
     let large = requests
         .output_gate()
-        .admit_result(2, OUTPUT - LEFT)
+        .admit_shared(OUTPUT - LEFT)
         .now_or_never()
         .ok_or("an idle budget funds the reservation")?;
     let (beside, _cancel) = requests.start(LEGACY_REQUEST_PING, Vec::new()).await?;
@@ -485,7 +485,7 @@ async fn a_small_request_runs_beside_a_large_reservation() -> Result<(), BoxErro
 
     let rest = requests
         .output_gate()
-        .admit_result(2, LEFT)
+        .admit_shared(LEFT)
         .now_or_never()
         .ok_or("the reservation left this room")?;
     let (on_floor, _cancel) = requests.start(LEGACY_REQUEST_PING, Vec::new()).await?;
@@ -518,7 +518,7 @@ async fn cancelling_a_request_returns_its_reservation() -> Result<(), BoxError> 
 
     let saturating = requests
         .output_gate()
-        .admit_result(2, OUTPUT)
+        .admit_shared(OUTPUT)
         .now_or_never()
         .ok_or("cancellation returned the budget")?;
     let (waiting, cancel_waiting) = requests
@@ -565,25 +565,25 @@ fn each_request_kind_reserves_its_own_bound() {
         assert_eq!(
             legacy(small, Vec::new()),
             ResponseBound {
-                frames: 1,
+                one_frame: true,
                 bytes: 16
             }
         );
     }
     let hashes_bound = legacy(LEGACY_REQUEST_FIND_BLOCKS, Vec::new());
-    assert_eq!(hashes_bound.frames, 1);
+    assert!(hashes_bound.one_frame);
     assert!(hashes_bound.bytes <= 17 + 500 * 32 + 8);
     for one_frame in [
         LEGACY_REQUEST_FIND_HEADERS,
         LEGACY_REQUEST_MEMPOOL_TRANSACTION_IDS,
     ] {
         let bound = legacy(one_frame, Vec::new());
-        assert_eq!(bound.frames, 1);
+        assert!(bound.one_frame);
         assert!(bound.bytes <= u64::from(CAP));
     }
 
     let one_block = legacy(LEGACY_REQUEST_BLOCKS_BY_HASH, hashes(1));
-    assert!(one_block.frames > 1, "a block may need several frames");
+    assert!(!one_block.one_frame, "a block may need several frames");
     assert!(one_block.bytes > MAX_PROTOCOL_MESSAGE_LEN as u64);
     assert!(one_block.bytes < 2 * MAX_PROTOCOL_MESSAGE_LEN as u64);
     let many_blocks = legacy(LEGACY_REQUEST_BLOCKS_BY_HASH, hashes(200));
@@ -645,7 +645,7 @@ fn the_bound_covers_an_encoded_response_under_small_caps() -> Result<(), BoxErro
                 .map(|frame| frame_wire_bytes(frame.payload.len()))
                 .sum();
             assert!(
-                bytes <= bound.bytes && frames.len() <= bound.frames,
+                bytes <= bound.bytes,
                 "{} frames of {bytes} bytes exceed {bound:?}",
                 frames.len(),
             );

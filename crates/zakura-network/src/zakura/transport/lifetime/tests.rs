@@ -177,11 +177,11 @@ fn only_a_one_frame_result_uses_the_floor() {
     let (gate, connection, _node) = gate(10, 200);
     let saturating = gate.try_admit(10).unwrap();
     assert!(
-        gate.admit_result(2, 10).now_or_never().is_none(),
+        gate.admit_shared(10).now_or_never().is_none(),
         "the floor does not fund a multi-frame result"
     );
     let floor = gate
-        .admit_result(1, 10)
+        .admit(10)
         .now_or_never()
         .expect("the floor funds one frame");
     assert_eq!(
@@ -191,7 +191,7 @@ fn only_a_one_frame_result_uses_the_floor() {
     );
     drop((floor, saturating));
     let shared = gate
-        .admit_result(2, 10)
+        .admit_shared(10)
         .now_or_never()
         .expect("released shared bytes fund the result");
     assert_eq!(connection.granted(), 10);
@@ -204,8 +204,8 @@ fn only_a_one_frame_result_uses_the_floor() {
 #[tokio::test]
 async fn shrinking_a_reservation_frees_room_for_a_waiter() {
     let (gate, connection, node) = gate(100, 200);
-    let mut reservation = gate.admit_result(2, 80).await;
-    let mut waiter = Box::pin(gate.admit_result(2, 50));
+    let mut reservation = gate.admit_shared(80).await;
+    let mut waiter = Box::pin(gate.admit_shared(50));
     assert!(futures::poll!(&mut waiter).is_pending());
     assert_eq!(node.granted(), 80);
 
@@ -243,14 +243,14 @@ fn a_queued_large_reservation_delays_only_multi_frame_results() {
     let [running, large, small, medium] = [0, 1, 2, 3].map(streams);
     let _running = running.try_admit(90).unwrap();
 
-    let mut waiting = Box::pin(large.admit_result(2, 50));
+    let mut waiting = Box::pin(large.admit_shared(50));
     assert!((&mut waiting).now_or_never().is_none());
     assert!(
-        medium.admit_result(2, 1).now_or_never().is_none(),
+        medium.admit_shared(1).now_or_never().is_none(),
         "FIFO order holds a multi-frame result behind the head"
     );
     assert!(
-        small.admit_result(1, 1).now_or_never().is_some(),
+        small.admit(1).now_or_never().is_some(),
         "a one-frame result never waits for its stream's fresh floor"
     );
 }

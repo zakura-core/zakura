@@ -355,16 +355,12 @@ impl FrameGate {
         }
     }
 
-    /// Wait to fund a result of at most `frames` frames and `bytes` bytes.
-    /// Cancelling the wait takes nothing.
+    /// Wait to fund a multi-frame result of at most `bytes` bytes from the shared
+    /// budgets. Cancelling the wait takes nothing.
     ///
-    /// A one-frame result may use the floor slot, because the floor funds one frame.
-    /// A larger result waits for the shared budgets, so a saturated node cannot hide
-    /// a whole multi-frame response behind one floor slot.
-    pub(crate) async fn admit_result(&self, frames: usize, bytes: u64) -> FrameGrant {
-        if frames <= 1 {
-            return self.admit(bytes).await;
-        }
+    /// The floor funds one frame, so a saturated node cannot hide a whole multi-frame
+    /// response behind one floor slot. A one-frame result uses [`Self::admit`].
+    pub(crate) async fn admit_shared(&self, bytes: u64) -> FrameGrant {
         let started = Instant::now();
         let charge = FrameCharge::shared(self.shared(bytes).await);
         FrameGrant {

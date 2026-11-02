@@ -260,10 +260,7 @@ impl CandidateDialerState {
             return None;
         }
 
-        for ip in &reserved_ips {
-            let count = self.in_flight_by_ip.entry(*ip).or_default();
-            *count = count.checked_add(1).expect("attempts in flight fit usize");
-        }
+        self.reserve(&reserved_ips);
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
         self.in_flight.insert(
@@ -274,6 +271,16 @@ impl CandidateDialerState {
             },
         );
         Some(DialAttemptKey { node_id, sequence })
+    }
+
+    /// Counts one more in-flight attempt on each of `ips`.
+    fn reserve(&mut self, ips: &[IpAddr]) {
+        for ip in ips {
+            let count = self.in_flight_by_ip.entry(*ip).or_default();
+            *count = count
+                .checked_add(1)
+                .expect("attempts in flight fit usize: each node has at most one");
+        }
     }
 
     /// Settles the attempt `key` with its worker's `result` at `now`.

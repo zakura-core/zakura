@@ -1,24 +1,18 @@
-//! Owner families share one node without one family's saturation stopping another.
+//! Transport owners share one node without one stream's saturation stopping another.
 //!
-//! These tests hold real owners together. The header, discovery, and legacy partitions
-//! keep their private owners, so each of their modules tests them against a saturated
-//! [`NodeResources`].
+//! These tests hold only [`NodeResources`] owners. Other families' owners share no state
+//! with it, so holding them here could not fail. No test holds several families' real
+//! owners together: the integrated saturation witness is an open gap.
 
 use std::{num::NonZeroU64, time::Duration};
 
 use futures::FutureExt;
-use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
-use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 use zakura_rt::time::timeout;
 
 use super::*;
 use crate::{
     config::Config,
-    zakura::{
-        regulation::{test_family, ServeCapacity, ServeLimits, SessionCapacity},
-        transport::{ByteBudget, NodeResources, OwnerCounts, OwnerPhase, TransportLimits},
-        ServicePeerDirection, ServicePeerLimits,
-    },
+    zakura::transport::{NodeResources, OwnerCounts, OwnerPhase, TransportLimits},
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,15 +20,6 @@ const WINDOW: u64 = 64;
 const MAX_CONNECTIONS: usize = 2;
 const MAX_OPEN_STREAMS: u16 = 4;
 const MAX_FRAME_BYTES: u32 = 1024;
-
-const SERVE_LIMITS: ServeLimits = ServeLimits {
-    node_execution: 2,
-    peer_execution: 2,
-    peer_output_responses: 2,
-    node_output_responses: 2,
-    peer_output_bytes: 1 << 10,
-    node_output_bytes: 1 << 10,
-};
 
 fn transport() -> ResourceEnvelope {
     ResourceEnvelope::new(TransportLimits {
@@ -68,16 +53,6 @@ fn bound() -> OwnerBound {
 
 fn retained_bound() -> u128 {
     transport().retained_frame_bytes()
-}
-
-fn block() -> Block {
-    zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .expect("the test vector is a valid block")
-}
-
-fn one_block_pool() -> DecodedBlockPool {
-    DecodedBlockPool::for_block_count(NonZeroU64::MIN)
 }
 
 #[test]
@@ -249,8 +224,8 @@ fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
     drop(handshakes);
 }
 
-/// One family holds all shared transport bytes and its own owner. Every other family
-/// keeps its own capacity, and the sum stays inside the composed bound.
+/// One stream holds all shared transport bytes and its own floors. Every other stream
+/// keeps its floor, and the sum stays inside the composed bound.
 #[tokio::test]
 async fn mixed_family_saturation_leaves_every_other_owner_available() {
     timeout(TEST_TIMEOUT, async {
@@ -260,21 +235,14 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
         let headers = connection.stream();
         let discovery = connection.stream();
 
-        // Blocks saturate the shared budgets and their own floors.
+        // One stream saturates the shared budgets and its own floors.
         let (_raw_hold, _output_hold) = node.hold_node_budgets();
         let _block_raw_floor = blocks.raw.try_admit(WINDOW).expect("the floor is free");
         let _block_output_floor = blocks.output.try_admit(WINDOW).expect("the floor is free");
         assert!(blocks.raw.try_admit(1).is_none());
         assert!(blocks.output.try_admit(1).is_none());
 
-        // The block family's own owners saturate too.
-        let pool = one_block_pool();
-        let retained = pool
-            .try_admit(block(), Admission::WithinLimit)
-            .expect("the pool funds one block");
-        assert!(pool.try_admit(block(), Admission::WithinLimit).is_err());
-
-        // Other families each still make progress on their own capacity.
+        // Other streams each still make progress on their own floors.
         let header_frame = headers.raw.try_admit(WINDOW);
         let discovery_frame = discovery.output.try_admit(WINDOW);
         assert!(header_frame.is_some() && discovery_frame.is_some());
@@ -283,18 +251,6 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
             .admit_compat_response(1)
             .now_or_never()
             .expect("the compatibility partition is separate from raw bytes");
-
-        let backend = ByteBudget::new(1 << 10);
-        let reservation = backend
-            .reserve_owned(1 << 10)
-            .expect("the byte budget is empty");
-        let serve = ServeCapacity::new("mixed", &test_family::GET, SERVE_LIMITS)
-            .expect("the limits are valid");
-        assert_eq!(serve.node_output_held(), 0);
-        let session = SessionCapacity::new("mixed", &ServicePeerLimits::default());
-        let _session_slot = session
-            .reserve(ServicePeerDirection::Outbound)
-            .expect("the session capacity is free");
 
         let usage = node.report_usage(bound());
         assert!(bound().admits(&usage.owners));
@@ -306,50 +262,9 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
         );
 
         drop(compat);
-        drop(reservation);
-        drop(retained);
-        assert_eq!(pool.reserved_bytes(), 0);
     })
     .await
     .expect("the composition never waits on a saturated owner");
-}
-
-/// A saturated decoded pool refuses its own blocks and touches nothing else. Closing it
-/// leaves its holders' charges in place until they drop.
-#[tokio::test]
-async fn backend_contention_stays_inside_the_decoded_pool() {
-    timeout(TEST_TIMEOUT, async {
-        let node = NodeResources::new(transport());
-        let stream = node.connection().stream();
-        let pool = one_block_pool();
-        let held = pool
-            .try_admit(block(), Admission::WithinLimit)
-            .expect("the pool funds one block");
-        let attributed = pool.reserved_bytes();
-        assert!(attributed > 0);
-
-        assert!(pool.try_admit(block(), Admission::WithinLimit).is_err());
-        assert_eq!(
-            pool.reserved_bytes(),
-            attributed,
-            "a refusal charges nothing"
-        );
-        assert_eq!(node.usage().raw_bytes, 0, "the pool charges no frame bytes");
-        let frame = stream.raw.try_admit(WINDOW);
-        assert!(frame.is_some(), "a saturated backend holds no frame");
-
-        pool.close();
-        assert!(pool.try_admit(block(), Admission::WithinLimit).is_err());
-        assert_eq!(
-            pool.reserved_bytes(),
-            attributed,
-            "a holder keeps its charge"
-        );
-        drop(held);
-        assert_eq!(pool.reserved_bytes(), 0);
-    })
-    .await
-    .expect("nothing here waits on the backend");
 }
 
 /// Close and reject frames use the output floor, so a saturated node delays a control

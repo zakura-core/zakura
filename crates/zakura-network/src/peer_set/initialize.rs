@@ -261,8 +261,6 @@ where
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
     // TCP and compatibility ingress reach the backend through clones of this one
     // service, so its load-shedding buffer is their shared admission.
-    metrics::gauge!("zcash.net.tcp.ingress.bound.bytes")
-        .set(config.tcp_ingress_bound_bytes() as f64);
     let inbound_for_zakura_sink = inbound_service.clone();
     let peer_registry = PeerRegistry::default();
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(

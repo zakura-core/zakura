@@ -709,7 +709,7 @@ impl StageDecision {
 ///
 /// Every field is a plain value. See the module doc.
 #[derive(Clone, Debug, Default)]
-pub(super) struct WorkPolicy {
+pub(in crate::zakura::header_sync) struct WorkPolicy {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
     scheduling_revision: u64,
     repair_episodes: HashMap<HeaderSyncWorkOwner, AuxiliaryRequirementEpisode>,
@@ -718,7 +718,9 @@ pub(super) struct WorkPolicy {
 
 impl WorkPolicy {
     /// Changes whenever target ownership or a peer's awaiting/active state changes.
-    pub(super) fn scheduling_revision(&self) -> u64 {
+    /// These changes invalidate cached offers. The reactor separately tracks effective
+    /// virtual claims using negotiated limits.
+    pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
         self.scheduling_revision
     }
 
@@ -726,17 +728,20 @@ impl WorkPolicy {
         self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::zakura::header_sync) fn len(&self) -> usize {
         self.work_by_peer.len()
     }
 
     /// Whether `peer` holds unstarted or active work.
-    pub(super) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
+    pub(in crate::zakura::header_sync) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
         self.work_by_peer.contains_key(peer)
     }
 
     /// Whether any peer's unstarted or active work pursues `target_tip_hash`.
-    pub(super) fn is_target_assigned(&self, target_tip_hash: zakura_chain::block::Hash) -> bool {
+    pub(in crate::zakura::header_sync) fn is_target_assigned(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> bool {
         self.target_owners(target_tip_hash).next().is_some()
     }
 
@@ -761,7 +766,7 @@ impl WorkPolicy {
     }
 
     /// Return every peer's target that still waits for its locator.
-    pub(super) fn awaiting_targets(
+    pub(in crate::zakura::header_sync) fn awaiting_targets(
         &self,
     ) -> impl Iterator<Item = (&ZakuraPeerId, &AdvertisedHeaderTarget)> {
         self.work_by_peer
@@ -903,14 +908,17 @@ impl WorkPolicy {
     }
 
     /// Return the peer's current unstarted target, if any.
-    pub(super) fn awaiting_target(&self, peer: &ZakuraPeerId) -> Option<&AdvertisedHeaderTarget> {
+    pub(in crate::zakura::header_sync) fn awaiting_target(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<&AdvertisedHeaderTarget> {
         match self.work_by_peer.get(peer) {
             Some(PeerWorkState::AwaitingLocator { target, .. }) => Some(target.as_ref()),
             _ => None,
         }
     }
 
-    pub(super) fn awaiting(
+    pub(in crate::zakura::header_sync) fn awaiting(
         &self,
         peer: &ZakuraPeerId,
         session_id: u64,
@@ -968,7 +976,7 @@ impl WorkPolicy {
     }
 
     /// Return the durable evidence episode bound to one active repair request.
-    pub(super) fn repair_episode(
+    pub(in crate::zakura::header_sync) fn repair_episode(
         &self,
         owner: HeaderSyncWorkOwner,
     ) -> Option<AuxiliaryRequirementEpisode> {
@@ -1013,7 +1021,10 @@ impl WorkPolicy {
     }
 
     /// Return the active target carrying one exact durable owner.
-    pub(super) fn active_owner(&self, owner: HeaderSyncWorkOwner) -> Option<&ActiveHeaderRequest> {
+    pub(in crate::zakura::header_sync) fn active_owner(
+        &self,
+        owner: HeaderSyncWorkOwner,
+    ) -> Option<&ActiveHeaderRequest> {
         self.work_by_peer.values().find_map(|work| match work {
             PeerWorkState::Active { request, .. } if request.owner == owner => {
                 Some(request.as_ref())
@@ -1034,7 +1045,10 @@ impl WorkPolicy {
         unstarted
     }
 
-    pub(super) fn active(&self, peer: &ZakuraPeerId) -> Option<&ActiveHeaderRequest> {
+    pub(in crate::zakura::header_sync) fn active(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<&ActiveHeaderRequest> {
         match self.work_by_peer.get(peer) {
             Some(PeerWorkState::Active { request, .. }) => Some(request),
             _ => None,

@@ -6,9 +6,7 @@
 
 use std::sync::Arc;
 
-use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
-};
+use zakura_header_chain::{EngineSnapshot, Frontier, HeaderSyncWorkOwner, SourceId};
 use zakura_rt::{
     collections::HashMap,
     sync::{
@@ -305,39 +303,19 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
 }
 
-impl PeerWorkQueue {
-    /// Changes to target ownership or awaiting/active state invalidate cached offers.
-    /// The reactor separately tracks effective virtual claims using negotiated limits.
-    pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
-        self.policy.scheduling_revision()
-    }
+/// Reads see the value-only policy. Every mutation goes through the queue, which
+/// pairs it with its capacity effect.
+impl std::ops::Deref for PeerWorkQueue {
+    type Target = WorkPolicy;
 
+    fn deref(&self) -> &WorkPolicy {
+        &self.policy
+    }
+}
+
+impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn capacity_releases(&self) -> watch::Receiver<u64> {
         self.budget.0.released.subscribe()
-    }
-
-    pub(in crate::zakura::header_sync) fn len(&self) -> usize {
-        self.policy.len()
-    }
-
-    /// Whether `peer` holds unstarted or active work.
-    pub(in crate::zakura::header_sync) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
-        self.policy.has_work(peer)
-    }
-
-    /// Whether any peer's unstarted or active work pursues `target_tip_hash`.
-    pub(in crate::zakura::header_sync) fn is_target_assigned(
-        &self,
-        target_tip_hash: zakura_chain::block::Hash,
-    ) -> bool {
-        self.policy.is_target_assigned(target_tip_hash)
-    }
-
-    /// Return every peer's target that still waits for its locator.
-    pub(in crate::zakura::header_sync) fn awaiting_targets(
-        &self,
-    ) -> impl Iterator<Item = (&ZakuraPeerId, &AdvertisedHeaderTarget)> {
-        self.policy.awaiting_targets()
     }
 
     /// Retire locator work captured from an obsolete committed snapshot.
@@ -415,25 +393,6 @@ impl PeerWorkQueue {
         self.apply_stage(decision)
     }
 
-    /// Return the peer's current unstarted target, if any.
-    pub(in crate::zakura::header_sync) fn awaiting_target(
-        &self,
-        peer: &ZakuraPeerId,
-    ) -> Option<&AdvertisedHeaderTarget> {
-        self.policy.awaiting_target(peer)
-    }
-
-    pub(in crate::zakura::header_sync) fn awaiting(
-        &self,
-        peer: &ZakuraPeerId,
-        session_id: u64,
-        target_tip_hash: zakura_chain::block::Hash,
-        scope: HeaderWorkAuthority,
-    ) -> Option<&AdvertisedHeaderTarget> {
-        self.policy
-            .awaiting(peer, session_id, target_tip_hash, scope)
-    }
-
     pub(in crate::zakura::header_sync) fn start(&mut self, request: ActiveHeaderRequest) -> bool {
         let reserved = self.request_reservations.contains_key(&request.peer);
         self.policy.start(request, reserved)
@@ -457,14 +416,6 @@ impl PeerWorkQueue {
         }
         self.policy.bind_repair_episode(owner, episode);
         true
-    }
-
-    /// Return the durable evidence episode bound to one active repair request.
-    pub(in crate::zakura::header_sync) fn repair_episode(
-        &self,
-        owner: HeaderSyncWorkOwner,
-    ) -> Option<zakura_header_chain::AuxiliaryRequirementEpisode> {
-        self.policy.repair_episode(owner)
     }
 
     #[cfg(test)]
@@ -493,25 +444,10 @@ impl PeerWorkQueue {
         self.remove(&peer)
     }
 
-    /// Return the active target carrying one exact durable owner.
-    pub(in crate::zakura::header_sync) fn active_owner(
-        &self,
-        owner: HeaderSyncWorkOwner,
-    ) -> Option<&ActiveHeaderRequest> {
-        self.policy.active_owner(owner)
-    }
-
     pub(in crate::zakura::header_sync) fn remove_unstarted(&mut self, peer: &ZakuraPeerId) {
         if self.policy.remove_unstarted(peer) {
             self.release_capacity(peer);
         }
-    }
-
-    pub(in crate::zakura::header_sync) fn active(
-        &self,
-        peer: &ZakuraPeerId,
-    ) -> Option<&ActiveHeaderRequest> {
-        self.policy.active(peer)
     }
 
     /// Mutable access for tests and models that seed a request's fields directly.
@@ -783,6 +719,8 @@ mod model_tests;
 #[cfg(test)]
 mod tests {
     use std::{cmp::Ordering, sync::Arc};
+
+    use zakura_header_chain::HeaderWorkAuthority;
 
     use super::*;
     use crate::zakura::header_sync::{

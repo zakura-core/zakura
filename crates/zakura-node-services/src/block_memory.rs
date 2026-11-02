@@ -5,9 +5,19 @@
 //! and charge. A charge never changes pool, so its last holder settles the pool that
 //! admitted it.
 //!
-//! A pipeline pool also limits the bytes its pipeline still holds. A block leaves
-//! that share when its pipeline work ends, so downstream retention can never
-//! refuse the work that would let downstream stores release their blocks.
+//! # Decoded limits
+//!
+//! Three limits bound decoded blocks in block sync, and each has one enforcer.
+//!
+//! | Limit | Bounds | Enforcer |
+//! | --- | --- | --- |
+//! | Handoff cap, `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` | Decoded bytes in the sequencer input queue and `applying`. | `charge_decoded_handoff`, before admission. Refusal hands over raw bytes. |
+//! | Pipeline bound, `decoded_pipeline_byte_bound` | Decoded bytes the pipeline still holds. | This pool's [`Admission::WithinLimit`]. [`Admission::PipelineExempt`] passes it for the commit window. |
+//! | Count allowance, [`DecodedBlockPool::for_block_count`] and [`DecodedBlockPool::for_pipeline`] | Allocations with any holder, including holders past the pipeline. | This pool, for every admission. |
+//!
+//! A block leaves the pipeline bound when its pipeline work ends, so downstream
+//! retention can never refuse the work that would let downstream stores release
+//! their blocks.
 
 use std::{fmt, io, num::NonZeroU64, ops::Deref, sync::Arc};
 

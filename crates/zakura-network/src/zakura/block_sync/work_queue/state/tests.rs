@@ -1083,8 +1083,8 @@ fn trace_with(
                        step: usize,
                        phase: WorkOwnershipPhase,
                        failure: Option<&(dyn std::any::Any + Send)>| {
-        let failure = failure
-            .map(|payload| WorkOwnershipFailure::from_panic(payload, phase, PROPERTY));
+        let failure =
+            failure.map(|payload| WorkOwnershipFailure::from_panic(payload, phase, PROPERTY));
         steps.push(WorkOwnershipStep {
             step,
             input: input[(step - 1) * 4..(step * 4).min(input.len())].to_vec(),

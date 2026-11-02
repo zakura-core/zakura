@@ -35,7 +35,7 @@ const OWNERSHIP: Machine = Machine {
 const REACTOR: Machine = Machine {
     name: "block/reactor-policy",
     identity: "block-reactor",
-    claim: "After every input, the reactor's pending query, next query ID, retry gate, owed force, closed dispatch, and progress mirrors agree with the independent model, and every accepted or refused query carries the model's exact identity.",
+    claim: "After every input, the reactor's pending query, next query ID, retry gate, owed force, closed dispatch, authority, epochs, and progress mirrors agree with the independent model, and every accepted or refused query carries the model's exact identity.",
     generator: 1,
     budget: 128,
     history: |input| {

@@ -2555,6 +2555,26 @@ async fn parent_unknown_downloads_again_once_its_parent_can_be_built_on() {
     }
 }
 
+/// A held block is not downloaded again when sync rediscovers its hash; it is requested once its
+/// parent verifies.
+#[tokio::test]
+async fn rediscovered_held_block_is_not_downloaded_again() {
+    let (mut chain_sync, _, _, mut peers, _state, _) = setup_chain_sync();
+    let held = block::Hash([0xCC; 32]);
+    chain_sync
+        .blocks_awaiting_parent
+        .insert(held, block::Hash([0xAA; 32]));
+
+    let extra = chain_sync
+        .request_blocks([held].into_iter().collect())
+        .await
+        .expect("requesting a held hash skips it");
+
+    assert!(extra.is_empty());
+    assert!(!chain_sync.downloads.contains(&held));
+    peers.expect_no_requests().await;
+}
+
 /// Once a parent verifies, every block waiting on it, directly or through another waiting block,
 /// is downloaded again. Blocks waiting on other parents keep waiting.
 #[tokio::test]
@@ -4651,73 +4671,154 @@ async fn child_waits_for_its_downloading_parent_to_be_admitted() {
     }
 }
 
-/// A block whose downloading parent fails its own check, or fails to download, is dropped
-/// before the verifier: a requested hash proves nothing about where the block connects.
+/// A block whose downloading parent fails its own check is dropped before the verifier: a
+/// requested hash proves nothing about where the block connects.
 #[tokio::test]
-async fn child_of_a_downloading_parent_that_is_not_admitted_is_dropped() {
+async fn child_of_a_parent_that_fails_its_check_is_dropped() {
     let _init_guard = zakura_test::init();
+    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
+        downloading_parent_setup(false);
 
-    for parent_download_fails in [false, true] {
-        let (block1, block2, mut peer_set, mut verifier, mut downloads) =
-            downloading_parent_setup(false);
+    let parent_download =
+        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
+    parent_download.respond(zn::Response::Blocks(vec![Available((
+        block1.clone(),
+        None,
+    ))]));
 
-        downloads
-            .download_and_verify(block1.hash())
+    let mut dropped = HashSet::new();
+    for _ in 0..2 {
+        match downloads
+            .next()
             .await
-            .expect("queuing a fresh hash succeeds");
-        let parent_download = peer_set
-            .expect_request(zn::Request::BlocksByHash(
-                iter::once(block1.hash()).collect(),
-            ))
-            .await;
-        downloads
-            .download_and_verify(block2.hash())
-            .await
-            .expect("queuing a fresh hash succeeds");
-        peer_set
-            .expect_request(zn::Request::BlocksByHash(
-                iter::once(block2.hash()).collect(),
-            ))
-            .await
-            .respond(zn::Response::Blocks(vec![Available((
-                block2.clone(),
-                None,
-            ))]));
-
-        if parent_download_fails {
-            parent_download.respond(Err(client_dropped_error()));
-        } else {
-            parent_download.respond(zn::Response::Blocks(vec![Available((
-                block1.clone(),
-                None,
-            ))]));
-        }
-
-        let mut child_dropped = false;
-        for _ in 0..2 {
-            match downloads
-                .next()
-                .await
-                .expect("the download task produces a result instead of panicking")
-            {
-                Err(BlockDownloadVerifyError::ParentUnknown { hash, .. })
-                    if hash == block2.hash() =>
-                {
-                    child_dropped = true;
-                }
-                Err(BlockDownloadVerifyError::ParentUnknown { hash, .. })
-                    if hash == block1.hash() && !parent_download_fails => {}
-                Err(BlockDownloadVerifyError::DownloadFailed { hash, .. })
-                    if hash == block1.hash() && parent_download_fails => {}
-                other => panic!("parent download fails: {parent_download_fails}: {other:?}"),
+            .expect("the download task produces a result instead of panicking")
+        {
+            Err(BlockDownloadVerifyError::ParentUnknown { hash, .. }) => {
+                dropped.insert(hash);
             }
+            other => panic!("unexpected result: {other:?}"),
         }
-        assert!(
-            child_dropped,
-            "parent download fails: {parent_download_fails}"
-        );
-        verifier.expect_no_requests().await;
     }
+    assert_eq!(dropped, [block1.hash(), block2.hash()].into());
+    verifier.expect_no_requests().await;
+}
+
+/// A block whose downloading parent fails to download keeps waiting while the parent is
+/// requested again, and both are verified once the retry passes its check. The child is not
+/// dropped and downloaded again.
+#[tokio::test]
+async fn child_keeps_waiting_while_its_parent_download_is_retried() {
+    let _init_guard = zakura_test::init();
+    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
+        downloading_parent_setup(true);
+
+    let parent_download =
+        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
+    parent_download.respond(Err(client_dropped_error()));
+    match downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking")
+    {
+        Err(BlockDownloadVerifyError::DownloadFailed { hash, .. }) if hash == block1.hash() => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+    verifier.expect_no_requests().await;
+
+    downloads
+        .download_and_verify(block1.hash())
+        .await
+        .expect("queuing the retry succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block1.hash()).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            block1.clone(),
+            None,
+        ))]));
+
+    let mut remaining: HashSet<block::Hash> = [block1.hash(), block2.hash()].into();
+    for _ in 0..2 {
+        verifier
+            .expect_request_that(|req| remaining.remove(&req.block().hash()))
+            .await
+            .respond_with(|req| req.block().hash());
+    }
+    for _ in 0..2 {
+        downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking")
+            .expect("both blocks verify");
+    }
+    peer_set.expect_no_requests().await;
+}
+
+/// A block whose downloading parent fails to download and is never requested again waits for
+/// the admission timeout, then the state decides, and here drops it.
+#[tokio::test(start_paused = true)]
+async fn child_of_a_parent_that_is_never_retried_is_dropped_after_the_wait() {
+    let _init_guard = zakura_test::init();
+    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
+        downloading_parent_setup(false);
+
+    let parent_download =
+        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
+    parent_download.respond(Err(client_dropped_error()));
+
+    let mut child_dropped = false;
+    for _ in 0..2 {
+        match downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking")
+        {
+            Err(BlockDownloadVerifyError::DownloadFailed { hash, .. }) if hash == block1.hash() => {
+            }
+            Err(BlockDownloadVerifyError::ParentUnknown { hash, .. }) if hash == block2.hash() => {
+                child_dropped = true;
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+    assert!(child_dropped);
+    verifier.expect_no_requests().await;
+}
+
+/// Requests `parent` and then `child`, serves the child, and returns the parent's pending
+/// download.
+async fn request_parent_then_serve_child(
+    downloads: &mut Downloads<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >,
+    peer_set: &mut MockService<zn::Request, zn::Response, PanicAssertion>,
+    parent: &Arc<Block>,
+    child: &Arc<Block>,
+) -> zakura_test::mock_service::ResponseSender<zn::Request, zn::Response, crate::BoxError> {
+    downloads
+        .download_and_verify(parent.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    let parent_download = peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(parent.hash()).collect(),
+        ))
+        .await;
+    downloads
+        .download_and_verify(child.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(child.hash()).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((child.clone(), None))]));
+    parent_download
 }
 
 /// A block at or below the last checkpoint goes to the checkpoint verifier, which never waits

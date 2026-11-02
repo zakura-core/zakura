@@ -2538,6 +2538,10 @@ where
         // propagating — this prevents dropping unprocessed hashes from the
         // batch, which would create frontier gaps and stalls (#5709).
         for hash in hashes.into_iter() {
+            // A held block is requested again once its parent verifies.
+            if self.blocks_awaiting_parent.contains_key(&hash) {
+                continue;
+            }
             match self.downloads.download_and_verify(hash).await {
                 Ok(()) => {}
                 Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {

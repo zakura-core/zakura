@@ -344,7 +344,8 @@ impl std::fmt::Debug for ParentWait {
 /// How far an in-flight block has got through the parent check before verification.
 ///
 /// A block's children may wait on it as their parent only once it is [`Admission::Admitted`].
-/// If its task ends first, the watch channel closes while still [`Admission::Pending`].
+/// If its download fails, the block stays [`Admission::Pending`] for its retry, which reuses the
+/// same channel. If its task ends any other way first, the channel closes while still pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
     /// The block has not been checked yet.
@@ -458,15 +459,17 @@ where
     /// Current lifecycle phase for each pending legacy block task.
     task_states: Arc<Mutex<HashMap<block::Hash, LegacyTaskState>>>,
 
-    /// Whether each pending task has passed its parent check, so its children can rely on it.
-    admissions: Arc<Mutex<HashMap<block::Hash, watch::Receiver<Admission>>>>,
+    /// Whether each pending block has passed its parent check, so its children can rely on it.
+    ///
+    /// A block whose download failed keeps its entry, so its children keep waiting for the retry.
+    admissions: Arc<Mutex<HashMap<block::Hash, Arc<watch::Sender<Admission>>>>>,
 
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
 }
 
 fn remove_admission(
-    admissions: &Mutex<HashMap<block::Hash, watch::Receiver<Admission>>>,
+    admissions: &Mutex<HashMap<block::Hash, Arc<watch::Sender<Admission>>>>,
     hash: block::Hash,
 ) {
     admissions
@@ -475,8 +478,8 @@ fn remove_admission(
         .remove(&hash);
 }
 
-/// Waits until an in-flight parent is admitted, returning `false` if its task ends first or
-/// [`PARENT_ADMISSION_TIMEOUT`] passes.
+/// Waits until an in-flight parent is admitted, returning `false` if it is dropped first or
+/// [`PARENT_ADMISSION_TIMEOUT`] passes. A failed download that is being retried keeps waiting.
 async fn parent_admitted(mut admission: watch::Receiver<Admission>) -> bool {
     timeout(
         PARENT_ADMISSION_TIMEOUT,
@@ -534,7 +537,11 @@ where
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
-                    remove_admission(this.admissions, hash);
+                    // The syncer requests a block whose download failed again, or restarts the
+                    // round, which clears every entry. Until then its children keep waiting.
+                    if !matches!(e, BlockDownloadVerifyError::DownloadFailed { .. }) {
+                        remove_admission(this.admissions, hash);
+                    }
                     let state = take_task_state(this.task_states, hash);
                     this.trace
                         .block_finish(hash, LegacyBlockOutcome::Error(&e), state);
@@ -735,12 +742,15 @@ where
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
         let task_states = self.task_states.clone();
         let admissions = self.admissions.clone();
-        let (admission_tx, admission_rx) = watch::channel(Admission::Pending);
-        // Registered before the task starts, so a child that downloads first waits for it.
-        self.admissions
+        // Registered before the task starts, so a child that downloads first waits for it. A
+        // retry after a failed download reuses the entry its children are already waiting on.
+        let admission_tx = self
+            .admissions
             .lock()
             .expect("admission lock is only held for synchronous updates")
-            .insert(hash, admission_rx);
+            .entry(hash)
+            .or_insert_with(|| Arc::new(watch::channel(Admission::Pending).0))
+            .clone();
         let trace = self.trace.clone();
 
         let task = tokio::spawn(
@@ -982,13 +992,14 @@ where
                     // it connects. Its admission is published before it reaches the verifier, and
                     // it leaves this map only after its verification returns, by when the state
                     // has added it to a chain. So a connected parent is always admitted here or
-                    // extendable in the state. If its task ends without being admitted, the state
+                    // extendable in the state. If its download fails, this keeps waiting for the
+                    // retry. If it is dropped any other way without being admitted, the state
                     // decides.
                     let parent_admission = admissions
                         .lock()
                         .expect("admission lock is only held for synchronous updates")
                         .get(&parent)
-                        .cloned();
+                        .map(|admission| admission.subscribe());
 
                     let parent_is_extendable = tokio::select! {
                         biased;

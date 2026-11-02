@@ -117,7 +117,9 @@ episodes contribute duration histograms, including episodes entirely between
 scrapes. Gauges expose cumulative saturated time, current and longest episode
 duration, last completed duration, and the matching observation clock. Existing
 downloader activity refreshes open-episode gauges; no new timer task is added.
-The report uses that clock for saturated fraction and events per hour. An episode
+Rates and saturated fractions use the complete collector window, including idle
+time after the last timer refresh. Open durations reflect the most recent
+downloader activity and can lag the scrape by the bounded fallback interval. An episode
 still open at the end has only an elapsed lower bound, not a completed duration.
 Duration histograms distinguish admission saturation from grandfathered capacity
 reductions. Histograms and longest-episode gauges cover the process lifetime;

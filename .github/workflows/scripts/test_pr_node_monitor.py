@@ -137,6 +137,13 @@ sync_missing_parent_charge_duration_seconds{reason="parent_available",quantile="
         self.assertEqual(measured["deferred_retry_attempts"], 7)
         self.assertFalse(measured["open_at_end"])
 
+    def test_pressure_rates_include_idle_time_after_the_last_timer_refresh(self):
+        first, last = self.observation(0), self.observation(3600, saturation=1)
+        last["missing_parent"]["sync"].update(saturation_observed_seconds=10, saturation_total_seconds=1)
+        pressure = monitor.summarize_capacity([first, last], 3600)["sync"]["pressure"]
+        self.assertEqual(pressure["admission_saturation_episodes_per_hour"], 1)
+        self.assertEqual(pressure["saturated_fraction"], 1 / 3600)
+
     def test_open_episode_is_reported_without_claiming_its_completed_duration(self):
         first, last = self.observation(0), self.observation(1, saturation=1, active=15)
         last["missing_parent"]["sync"].update(saturation_active=1, saturation_observed_seconds=1,

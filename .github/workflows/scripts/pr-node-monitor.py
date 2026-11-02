@@ -110,18 +110,19 @@ def tip_window_failures(samples: list[dict], reference_url: str | None) -> list[
     return failures
 
 
-def summarize_pressure(values: list[dict]) -> dict:
+def summarize_pressure(values: list[dict], observed_seconds: float) -> dict:
     """Report transition-timed occupancy and distinguish metadata loss from body deferral.
 
     Open episodes are censored: their elapsed time is a lower bound, not a
     completed duration. Exported timers are refreshed by existing downloader
-    activity; their own observation clock supplies the matching denominator.
+    activity. Rates use the collector window, including idle time after the
+    final transition; an idle downloader need not refresh its timer gauges.
     """
     def delta(field):
         first, last = values[0].get(field), values[-1].get(field)
         return last - first if first is not None and last is not None and last >= first else None
 
-    elapsed = delta("saturation_observed_seconds")
+    elapsed = observed_seconds
     saturated = delta("saturation_total_seconds")
     events = delta("limit_reached_count")
     evictions = {name: delta(field) for name, field in (
@@ -129,7 +130,8 @@ def summarize_pressure(values: list[dict]) -> dict:
         ("capacity_reduction", "capacity_evicted_count"))}
     total_evictions = sum(evictions.values()) if all(v is not None for v in evictions.values()) else None
     return {
-        "timer_observed_seconds": elapsed,
+        "observed_seconds": elapsed,
+        "timer_observed_seconds": delta("saturation_observed_seconds"),
         "saturated_seconds": saturated,
         "saturated_fraction": saturated / elapsed if saturated is not None and elapsed else None,
         "admission_saturation_episodes": events,
@@ -216,7 +218,7 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
             "end_elapsed": observations[-1]["elapsed"],
             "observed_seconds": observations[-1]["elapsed"] - observations[0]["elapsed"],
             "samples": len(observations),
-            "pressure": summarize_pressure(values),
+            "pressure": summarize_pressure(values, observations[-1]["elapsed"] - observations[0]["elapsed"]),
             "capacities": sorted({v["capacity"] for v in values}),
             "allowances": sorted({v["limit"] for v in values if v.get("limit") is not None}),
             "peak": peak,

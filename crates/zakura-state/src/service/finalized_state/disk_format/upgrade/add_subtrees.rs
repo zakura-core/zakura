@@ -34,7 +34,7 @@ pub(super) fn detailed_check(
     }
 
     // This is redundant in some code paths, but not in others. But it's quick anyway.
-    let quick_result = subtree_format_calculation_pre_checks(db)?;
+    let quick_result = subtree_format_calculation_pre_checks(db);
 
     // Check the entire format before returning any errors.
     let sapling_result = check_sapling_subtrees(db, cancel_receiver)?;
@@ -59,34 +59,32 @@ pub(super) fn detailed_check(
 ///
 /// This check runs the first subtree calculation, but it doesn't read the subtree data in the
 /// database. So it can be run before the upgrade is started.
-pub(super) fn subtree_format_calculation_pre_checks(
-    db: &ZakuraDb,
-) -> Result<Result<(), String>, FormatChangeError> {
+pub(super) fn subtree_format_calculation_pre_checks(db: &ZakuraDb) -> Result<(), String> {
     // Pruned databases can intentionally be missing historical raw transaction
     // bytes needed to reconstruct the old blocks used by these vector checks.
     if db.is_pruned() {
-        return Ok(Ok(()));
+        return Ok(());
     }
 
     // Fast-synced databases deliberately have no per-height note-commitment trees
     // or subtrees below the checkpoint handoff height, so these checks don't apply.
     if db.is_vct_synced() {
-        return Ok(Ok(()));
+        return Ok(());
     }
 
     // Check the entire format before returning any errors.
-    let sapling_result = quick_check_sapling_subtrees(db)?;
-    let orchard_result = quick_check_orchard_subtrees(db)?;
+    let sapling_result = quick_check_sapling_subtrees(db);
+    let orchard_result = quick_check_orchard_subtrees(db);
 
     if sapling_result.is_err() || orchard_result.is_err() {
         let err = Err(format!(
             "missing or bad first subtree: sapling: {sapling_result:?}, orchard: {orchard_result:?}"
         ));
         warn!(?err);
-        return Ok(err);
+        return err;
     }
 
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// A quick test vector that allows us to fail an incorrect upgrade within a few seconds.
@@ -133,22 +131,20 @@ fn first_orchard_mainnet_subtree() -> NoteCommitmentSubtree<orchard::tree::Node>
 /// rather than waiting ~20 minutes to see if it failed.
 ///
 /// Returns an error if a note commitment subtree is missing or incorrect.
-fn quick_check_sapling_subtrees(
-    db: &ZakuraDb,
-) -> Result<Result<(), &'static str>, zakura_node_services::block_memory::AdmissionFailure> {
+fn quick_check_sapling_subtrees(db: &ZakuraDb) -> Result<(), &'static str> {
     // We check the first sapling subtree on mainnet, so skip this check if it isn't available.
     if db.network() != Mainnet {
-        return Ok(Ok(()));
+        return Ok(());
     }
 
     let Some(NoteCommitmentSubtreeIndex(tip_subtree_index)) =
         db.sapling_tree_for_tip().subtree_index()
     else {
-        return Ok(Ok(()));
+        return Ok(());
     };
 
     if tip_subtree_index == 0 && !db.sapling_tree_for_tip().is_complete_subtree() {
-        return Ok(Ok(()));
+        return Ok(());
     }
 
     // Find the first complete subtree: previous and current trees, and their end heights.
@@ -166,21 +162,21 @@ fn quick_check_sapling_subtrees(
     let Some((prev_end_height, prev_tree, end_height, tree)) = first_complete_subtree else {
         let result = Err("iterator did not find complete subtree, but the tree has it");
         error!(?result);
-        return Ok(result);
+        return result;
     };
 
     // Creating this test vector involves a cryptographic check, so only do it once.
     let expected_subtree = first_sapling_mainnet_subtree();
 
-    let db_subtree = calculate_sapling_subtree(db, prev_end_height, prev_tree, end_height, tree)?;
+    let db_subtree = calculate_sapling_subtree(db, prev_end_height, prev_tree, end_height, tree);
 
     if db_subtree != expected_subtree {
         let result = Err("first subtree did not match expected test vector");
         error!(?result, ?db_subtree, ?expected_subtree);
-        return Ok(result);
+        return result;
     }
 
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// Quickly check that the first calculated orchard subtree is correct.
@@ -189,22 +185,20 @@ fn quick_check_sapling_subtrees(
 /// rather than waiting ~20 minutes to see if it failed.
 ///
 /// Returns an error if a note commitment subtree is missing or incorrect.
-fn quick_check_orchard_subtrees(
-    db: &ZakuraDb,
-) -> Result<Result<(), &'static str>, zakura_node_services::block_memory::AdmissionFailure> {
+fn quick_check_orchard_subtrees(db: &ZakuraDb) -> Result<(), &'static str> {
     // We check the first orchard subtree on mainnet, so skip this check if it isn't available.
     if db.network() != Mainnet {
-        return Ok(Ok(()));
+        return Ok(());
     }
 
     let Some(NoteCommitmentSubtreeIndex(tip_subtree_index)) =
         db.orchard_tree_for_tip().subtree_index()
     else {
-        return Ok(Ok(()));
+        return Ok(());
     };
 
     if tip_subtree_index == 0 && !db.orchard_tree_for_tip().is_complete_subtree() {
-        return Ok(Ok(()));
+        return Ok(());
     }
 
     // Find the first complete subtree: previous and current trees, and their end heights.
@@ -222,21 +216,21 @@ fn quick_check_orchard_subtrees(
     let Some((prev_end_height, prev_tree, end_height, tree)) = first_complete_subtree else {
         let result = Err("iterator did not find complete subtree, but the tree has it");
         error!(?result);
-        return Ok(result);
+        return result;
     };
 
     // Creating this test vector involves a cryptographic check, so only do it once.
     let expected_subtree = first_orchard_mainnet_subtree();
 
-    let db_subtree = calculate_orchard_subtree(db, prev_end_height, prev_tree, end_height, tree)?;
+    let db_subtree = calculate_orchard_subtree(db, prev_end_height, prev_tree, end_height, tree);
 
     if db_subtree != expected_subtree {
         let result = Err("first subtree did not match expected test vector");
         error!(?result, ?db_subtree, ?expected_subtree);
-        return Ok(result);
+        return result;
     }
 
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// Check that Sapling note commitment subtrees were correctly added.
@@ -514,23 +508,19 @@ fn check_orchard_subtrees(
 /// If a subtree is not completed by a note commitment in the block at `end_height`.
 #[must_use = "subtree should be written to the database after it is calculated"]
 #[instrument(skip(read_db, prev_tree, tree))]
-#[allow(clippy::unwrap_in_result)]
 fn calculate_sapling_subtree(
     read_db: &ZakuraDb,
     prev_end_height: Height,
     prev_tree: Arc<sapling::tree::NoteCommitmentTree>,
     end_height: Height,
     tree: Arc<sapling::tree::NoteCommitmentTree>,
-) -> Result<
-    NoteCommitmentSubtree<sapling_crypto::Node>,
-    zakura_node_services::block_memory::AdmissionFailure,
-> {
+) -> NoteCommitmentSubtree<sapling_crypto::Node> {
     // If a subtree is completed by a note commitment in the block at `end_height`,
     // then that subtree can be completed in two different ways:
     if let Some((index, node)) = tree.completed_subtree_index_and_root() {
         // If the subtree is completed by the last note commitment in that block,
         // we already have that subtree root available in the tree.
-        Ok(NoteCommitmentSubtree::new(index, end_height, node))
+        NoteCommitmentSubtree::new(index, end_height, node)
     } else {
         // If the subtree is completed without using the last note commitment in the block,
         // we need to calculate the subtree root, starting with the tree from the previous block.
@@ -588,10 +578,9 @@ fn calculate_sapling_subtree(
         // TODO: consider just reading the block's transactions from the database file,
         //       because we don't use the block header data at all.
         let block = read_db
-            .block(end_height.into())?
+            .stored_block(end_height.into())
             .expect("height with note commitment tree should have block");
         let sapling_note_commitments = block
-            .view()
             .sapling_note_commitments()
             .take(prev_remaining_notes)
             .cloned()
@@ -627,7 +616,7 @@ fn calculate_sapling_subtree(
             )
         });
 
-        Ok(NoteCommitmentSubtree::new(index, end_height, node))
+        NoteCommitmentSubtree::new(index, end_height, node)
     }
 }
 
@@ -644,23 +633,19 @@ fn calculate_sapling_subtree(
 /// If a subtree is not completed by a note commitment in the block at `end_height`.
 #[must_use = "subtree should be written to the database after it is calculated"]
 #[instrument(skip(read_db, prev_tree, tree))]
-#[allow(clippy::unwrap_in_result)]
 fn calculate_orchard_subtree(
     read_db: &ZakuraDb,
     prev_end_height: Height,
     prev_tree: Arc<orchard::tree::NoteCommitmentTree>,
     end_height: Height,
     tree: Arc<orchard::tree::NoteCommitmentTree>,
-) -> Result<
-    NoteCommitmentSubtree<orchard::tree::Node>,
-    zakura_node_services::block_memory::AdmissionFailure,
-> {
+) -> NoteCommitmentSubtree<orchard::tree::Node> {
     // If a subtree is completed by a note commitment in the block at `end_height`,
     // then that subtree can be completed in two different ways:
     if let Some((index, node)) = tree.completed_subtree_index_and_root() {
         // If the subtree is completed by the last note commitment in that block,
         // we already have that subtree root available in the tree.
-        Ok(NoteCommitmentSubtree::new(index, end_height, node))
+        NoteCommitmentSubtree::new(index, end_height, node)
     } else {
         // If the subtree is completed without using the last note commitment in the block,
         // we need to calculate the subtree root, starting with the tree from the previous block.
@@ -718,10 +703,9 @@ fn calculate_orchard_subtree(
         // TODO: consider just reading the block's transactions from the database file,
         //       because we don't use the block header data at all.
         let block = read_db
-            .block(end_height.into())?
+            .stored_block(end_height.into())
             .expect("height with note commitment tree should have block");
         let orchard_note_commitments = block
-            .view()
             .orchard_note_commitments()
             .take(prev_remaining_notes)
             .cloned()
@@ -757,6 +741,6 @@ fn calculate_orchard_subtree(
             )
         });
 
-        Ok(NoteCommitmentSubtree::new(index, end_height, node))
+        NoteCommitmentSubtree::new(index, end_height, node)
     }
 }

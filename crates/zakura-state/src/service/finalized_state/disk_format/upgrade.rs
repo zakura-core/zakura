@@ -285,14 +285,6 @@ impl CancelReceiver {
 /// An error that prevents the coordinator from updating the database format version.
 #[derive(Debug, Error)]
 pub enum FormatChangeError {
-    /// A standalone disk transaction could not acquire decode admission.
-    #[error("disk transaction admission failed: {0}")]
-    PayloadAdmission(#[from] zakura_node_services::block_memory::PayloadAdmissionFailure),
-
-    /// Disk block decoding or retention exhausted its admission pool.
-    #[error("disk block admission failed: {0}")]
-    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
-
     /// Shutdown cancels the format change.
     #[error("database format change was cancelled")]
     Cancelled,
@@ -310,19 +302,6 @@ pub enum FormatChangeError {
 impl From<CancelFormatChange> for FormatChangeError {
     fn from(_: CancelFormatChange) -> Self {
         Self::Cancelled
-    }
-}
-
-impl FormatChangeError {
-    /// Read pressure prevents observation; it does not establish a format defect.
-    pub(crate) fn is_read_capacity_exhausted(&self) -> bool {
-        matches!(
-            self,
-            Self::BlockAdmission(zakura_node_services::block_memory::AdmissionFailure::Capacity)
-                | Self::PayloadAdmission(
-                    zakura_node_services::block_memory::PayloadAdmissionFailure::Capacity
-                )
-        )
     }
 }
 
@@ -542,20 +521,11 @@ impl DbFormatChange {
                 return Err(FormatChangeError::Cancelled);
             }
 
-            let result = Self::check_new_blocks(&db).run_format_change_or_check(
+            Self::check_new_blocks(&db).run_format_change_or_check(
                 &db,
                 initial_finalized_tip_height,
                 &cancel_receiver,
-            );
-            match result {
-                Err(error) if error.is_read_capacity_exhausted() => {
-                    warn!(
-                        ?error,
-                        "database format check incomplete; retrying at the next interval"
-                    );
-                }
-                result => result?,
-            }
+            )?;
         }
     }
 
@@ -788,9 +758,7 @@ impl DbFormatChange {
 
     /// Run quick checks that the current database format is valid.
     #[allow(clippy::vec_init_then_push)]
-    pub fn format_validity_checks_quick(
-        db: &ZakuraDb,
-    ) -> Result<Result<(), String>, FormatChangeError> {
+    pub fn format_validity_checks_quick(db: &ZakuraDb) -> Result<(), String> {
         let timer = CodeTimer::start();
         let mut results = Vec::new();
 
@@ -800,7 +768,7 @@ impl DbFormatChange {
         // This check can be run before the upgrade, but the upgrade code is finished, so we don't
         // run it early any more. (If future code changes accidentally make it depend on the
         // upgrade, they would accidentally break compatibility with older Zebra cached states.)
-        results.push(add_subtrees::subtree_format_calculation_pre_checks(db)?);
+        results.push(add_subtrees::subtree_format_calculation_pre_checks(db));
 
         results.push(cache_genesis_roots::quick_check(db));
         results.push(fix_tree_key_type::quick_check(db));
@@ -811,10 +779,10 @@ impl DbFormatChange {
         if results.iter().any(Result::is_err) {
             let err = Err(format!("invalid quick check: {results:?}"));
             error!(?err);
-            return Ok(err);
+            return err;
         }
 
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Run detailed checks that the current database format is valid.
@@ -829,7 +797,7 @@ impl DbFormatChange {
         // Check the entire format before returning any errors.
         //
         // Do the quick checks first, so we don't have to do this in every detailed check.
-        results.push(Self::format_validity_checks_quick(db)?);
+        results.push(Self::format_validity_checks_quick(db));
         results.push(prune_trees::detailed_check(db, cancel_receiver)?);
         results.push(add_subtrees::detailed_check(db, cancel_receiver)?);
         results.push(cache_genesis_roots::detailed_check(db, cancel_receiver)?);

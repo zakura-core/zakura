@@ -45,10 +45,6 @@ pub(super) struct FinalFrontiers {
 /// Errors producing [`FinalFrontiers`] from a finalized database.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FinalFrontiersGenerationError {
-    /// Disk block decoding or retention exhausted its admission pool.
-    #[error("disk block admission failed: {0}")]
-    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
-
     /// The database has no finalized tip identity to bind the generated frontier.
     #[error("cannot produce final frontiers at height {height:?}: finalized database is empty")]
     MissingFinalizedTip {
@@ -631,14 +627,14 @@ pub(super) fn produce_settled_final_frontiers(
     let mut last_change = None;
     for raw_height in height.0.saturating_add(1)..=tip.0 {
         let scan_height = block::Height(raw_height);
-        let block = db.block(scan_height.into())?.ok_or(
+        let block = db.stored_block(scan_height.into()).ok_or(
             FinalFrontiersGenerationError::MissingBlockInSproutWindow {
                 missing: scan_height,
                 height,
                 tip,
             },
         )?;
-        if block.view().sprout_note_commitments().next().is_some() {
+        if block.sprout_note_commitments().next().is_some() {
             last_change = Some(scan_height);
         }
     }

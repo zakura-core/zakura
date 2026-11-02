@@ -3746,16 +3746,24 @@ mod tests {
             .expect("zero bytes always fit")
     }
 
+    /// A sink that sends its work to `inbound_tx` under the production budget.
+    fn test_sink(
+        inbound_tx: mpsc::Sender<LegacyInboundWork>,
+        outbound: LegacyGossipOutbound,
+    ) -> LegacyGossipSink {
+        LegacyGossipSink {
+            inbound_tx,
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            outbound,
+            trace: ZakuraTrace::noop(),
+        }
+    }
+
     /// A sink with a chosen inbound budget, whose queue the test drains itself.
     fn budgeted_sink(capacity: u64) -> (LegacyGossipSink, mpsc::Receiver<LegacyInboundWork>) {
         let (inbound_tx, inbound_rx) = mpsc::channel(8);
-        let supervisor = ZakuraSupervisorHandle::new(8);
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(capacity),
-            outbound: outbound_for_supervisor(&supervisor),
-            trace: ZakuraTrace::noop(),
-        };
+        let mut sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
+        sink.inbound_budget = InboundBudget::new(capacity);
         (sink, inbound_rx)
     }
 
@@ -3828,13 +3836,7 @@ mod tests {
                 _charge: InboundBudget::new(1).try_charge(0).expect("zero fits"),
             }))
             .expect("the queue has one slot");
-        let supervisor = ZakuraSupervisorHandle::new(8);
-        let sink = LegacyGossipSink {
-            inbound_tx: full_tx,
-            inbound_budget: InboundBudget::new(1 << 20),
-            outbound: outbound_for_supervisor(&supervisor),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(full_tx, LegacyGossipOutbound::default());
         let refused = sink
             .request(
                 inbound_peer(),
@@ -3899,19 +3901,6 @@ mod tests {
                 if matches!(&headers[..], [HeaderHandle::Shared(header)] if *header == block.header)
         ));
         Ok(())
-    }
-
-    /// A budget clamps an item larger than itself, so the item enters when idle.
-    #[test]
-    fn the_inbound_budget_clamps_one_oversized_item() {
-        let budget = InboundBudget::new(10);
-        let held = budget
-            .try_charge(u64::MAX)
-            .expect("an idle budget admits it");
-        assert_eq!(budget.available(), 0);
-        assert!(budget.try_charge(1).is_none());
-        drop(held);
-        assert_eq!(budget.available(), 10);
     }
 
     /// Saturated inventory fetches never delay the control partition, and a waiter
@@ -5982,12 +5971,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![92; 32]).expect("test peer id is within bounds");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, _peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
@@ -6009,12 +5993,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![93; 32]).expect("test peer id is within bounds");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
@@ -6033,12 +6012,7 @@ mod tests {
     async fn stale_legacy_gossip_teardown_keeps_replacement_session() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![94; 32]).expect("test peer id is within bounds");
         let old_conn_id = 1;
         let new_conn_id = 2;
@@ -6135,12 +6109,7 @@ mod tests {
     async fn repeated_no_frame_gossip_sessions_retire_the_service() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![98; 32]).expect("test peer id is within bounds");
         let conn_id = 7;
 
@@ -6191,12 +6160,7 @@ mod tests {
     #[tokio::test]
     async fn a_received_frame_resets_gossip_churn() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: LegacyGossipOutbound::default(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
         let outbound = sink.outbound.clone();
         let peer_id = ZakuraPeerId::new(vec![99; 32]).expect("test peer id is within bounds");
         let conn_id = 7;
@@ -6237,12 +6201,7 @@ mod tests {
     {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![97; 32]).expect("test peer id is within bounds");
         let conn_id = 5;
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -6292,12 +6251,7 @@ mod tests {
         let (inbound_tx, inbound_rx) = mpsc::channel(1);
         drop(inbound_rx);
         let outbound = LegacyGossipOutbound::default();
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: outbound.clone(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, outbound.clone());
         let peer_id = ZakuraPeerId::new(vec![95; 32]).expect("test peer id is within bounds");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token);
@@ -6402,12 +6356,7 @@ mod tests {
     #[test]
     fn inbound_queue_full_drops_without_rejecting_peer_but_malformed_rejects() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let sink = LegacyGossipSink {
-            inbound_tx,
-            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
-            outbound: LegacyGossipOutbound::default(),
-            trace: ZakuraTrace::noop(),
-        };
+        let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
         let peer_id = ZakuraPeerId::new(vec![4; 32]).expect("test peer id is within bounds");
         let frame = LegacyGossipFrame::AdvertiseBlock(block_hash(6))
             .encode_frame()

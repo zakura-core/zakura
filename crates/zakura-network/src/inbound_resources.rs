@@ -156,4 +156,17 @@ mod tests {
         assert_eq!(budget.used(), 0);
         assert!(budget.try_charge(1).is_some());
     }
+
+    /// A budget clamps an item larger than itself, so the item enters when idle.
+    #[test]
+    fn the_inbound_budget_clamps_one_oversized_item() {
+        let budget = InboundBudget::new(10);
+        let held = budget
+            .try_charge(u64::MAX)
+            .expect("an idle budget admits it");
+        assert_eq!(budget.available(), 0);
+        assert!(budget.try_charge(1).is_none());
+        drop(held);
+        assert_eq!(budget.available(), 10);
+    }
 }

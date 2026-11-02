@@ -605,34 +605,28 @@ fn the_bound_covers_an_encoded_response_under_small_caps() -> Result<(), BoxErro
     for (frame_cap, message_cap) in [(1 << 20, 4 << 20), (1 << 20, 64), (64, 1 << 20), (64, 64)] {
         let mut limits = test_connection_limits();
         limits.max_message_bytes = message_cap;
-        let responses = [
-            Response::Blocks(vec![
-                InventoryResponse::Available((block.clone().into(), None)),
-                InventoryResponse::Missing(block.hash()),
-            ]),
-            Response::Transactions(vec![InventoryResponse::Available((
-                transaction.clone(),
-                None,
-            ))]),
-        ];
-        for (message_type, response) in [
-            LEGACY_REQUEST_BLOCKS_BY_HASH,
-            LEGACY_REQUEST_TRANSACTIONS_BY_ID,
-        ]
-        .into_iter()
-        .zip(responses)
-        {
-            let items = if message_type == LEGACY_REQUEST_BLOCKS_BY_HASH {
-                2
-            } else {
-                1
-            };
-            let mut payload = vec![items];
-            if message_type == LEGACY_REQUEST_BLOCKS_BY_HASH {
-                payload.extend_from_slice(&[7; 64]);
-            } else {
-                InventoryHash::from(transaction.id()).zcash_serialize(&mut payload)?;
-            }
+        let mut transaction_request = vec![1];
+        InventoryHash::from(transaction.id()).zcash_serialize(&mut transaction_request)?;
+        let mut block_request = vec![2];
+        block_request.extend_from_slice(&[7; 64]);
+        for (message_type, payload, response) in [
+            (
+                LEGACY_REQUEST_BLOCKS_BY_HASH,
+                block_request,
+                Response::Blocks(vec![
+                    InventoryResponse::Available((block.clone().into(), None)),
+                    InventoryResponse::Missing(block.hash()),
+                ]),
+            ),
+            (
+                LEGACY_REQUEST_TRANSACTIONS_BY_ID,
+                transaction_request,
+                Response::Transactions(vec![InventoryResponse::Available((
+                    transaction.clone(),
+                    None,
+                ))]),
+            ),
+        ] {
             let frame = Frame {
                 message_type,
                 flags: 0,

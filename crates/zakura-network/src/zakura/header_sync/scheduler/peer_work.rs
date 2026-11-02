@@ -91,20 +91,14 @@ impl HeaderChunkBudget {
         }))
     }
 
-    fn release_reserved(&self, count: usize) {
+    /// Return `count` headers through `released`, and wake waiters when any return.
+    fn release(
+        &self,
+        count: usize,
+        released: impl FnOnce(HeaderChunkUsage, usize) -> HeaderChunkUsage,
+    ) {
         let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
-        *usage = usage.release_reserved(count);
-        self.publish(*usage);
-        if count != 0 {
-            self.0
-                .released
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
-        }
-    }
-
-    fn release_owned(&self, count: usize) {
-        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
-        *usage = usage.release_owned(count);
+        *usage = released(*usage, count);
         self.publish(*usage);
         if count != 0 {
             self.0
@@ -159,7 +153,8 @@ impl Drop for HeaderCountReservationInner {
     fn drop(&mut self) {
         let remaining = self.remaining.swap(0, AtomicOrdering::SeqCst);
         if remaining != 0 {
-            self.budget.release_reserved(remaining);
+            self.budget
+                .release(remaining, HeaderChunkUsage::release_reserved);
         }
     }
 }
@@ -183,7 +178,8 @@ impl Eq for HeaderCapacityLease {}
 
 impl Drop for HeaderCapacityLeaseInner {
     fn drop(&mut self) {
-        self.budget.release_owned(self.count);
+        self.budget
+            .release(self.count, HeaderChunkUsage::release_owned);
     }
 }
 
@@ -250,7 +246,9 @@ impl RetainedHeaders {
             self.call.kind == StorageCallKind::Prepare && apply.kind == StorageCallKind::Apply,
             "retained headers move only from a prepare to its apply"
         );
-        self.end = HeaderWorkEnd::HandedToApply { apply: apply.number };
+        self.end = HeaderWorkEnd::HandedToApply {
+            apply: apply.number,
+        };
         self.record_end();
         self.call = apply;
         self.end = HeaderWorkEnd::Dropped;
@@ -522,18 +520,8 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         count: u32,
     ) -> bool {
-        if self.request_reservations.contains_key(peer) {
-            return false;
-        }
         let count = usize::try_from(count).unwrap_or(usize::MAX);
-        if count > MAX_HEADER_CHUNK_RESERVATION_V1 {
-            return false;
-        }
-        let Some(reservation) = self.budget.reserve(count) else {
-            return false;
-        };
-        self.request_reservations.insert(peer.clone(), reservation);
-        true
+        count <= MAX_HEADER_CHUNK_RESERVATION_V1 && self.reserve(peer, count)
     }
 
     /// Reserve aggregate capacity for one selected auxiliary repair range.
@@ -542,10 +530,14 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         count: u32,
     ) -> bool {
+        self.reserve(peer, usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// Give `peer`, which holds no reservation, one of `count` headers.
+    fn reserve(&mut self, peer: &ZakuraPeerId, count: usize) -> bool {
         if self.request_reservations.contains_key(peer) {
             return false;
         }
-        let count = usize::try_from(count).unwrap_or(usize::MAX);
         let Some(reservation) = self.budget.reserve(count) else {
             return false;
         };

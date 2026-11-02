@@ -45,17 +45,6 @@ impl ExchangeProgress {
     }
 }
 
-/// How a session's initial exchange ended.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum InitialExchange {
-    /// The peer answered every query.
-    Complete,
-    /// The answers did not all arrive within the timeout.
-    TimedOut,
-    /// The stream or session ended first.
-    Ended,
-}
-
 /// Which event ended the initial exchange's wait.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum InitialWait {
@@ -164,13 +153,17 @@ impl PeerStep {
 }
 
 /// The operation the session waits on.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 enum Phase {
+    #[default]
     Start,
     Exchanging,
     WaitingInitial,
-    /// The wait ended with this classification, pending the session check.
-    CheckingInitial(InitialExchange),
+    /// The wait ended, pending the session check. `completed` is false when
+    /// the answers did not all arrive within the timeout.
+    CheckingInitial {
+        completed: bool,
+    },
     CheckingOwners,
     Refreshing,
     AwaitingAnswers,
@@ -180,22 +173,12 @@ enum Phase {
 }
 
 /// One discovery session's exchange progress and completion policy.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct PeerState {
     progress: ExchangeProgress,
-    /// How the initial exchange ended, once known.
-    initial: Option<InitialExchange>,
+    /// Whether the initial exchange's wait timed out on a current session.
+    timed_out: bool,
     phase: Phase,
-}
-
-impl Default for PeerState {
-    fn default() -> Self {
-        Self {
-            progress: ExchangeProgress::default(),
-            initial: None,
-            phase: Phase::Start,
-        }
-    }
 }
 
 impl PeerState {
@@ -245,27 +228,23 @@ impl PeerState {
             }
             (Phase::Exchanging, PeerInput::Exchanged { sent: false })
             | (Phase::WaitingInitial, PeerInput::InitialWaitEnded(InitialWait::Cancelled))
-            | (Phase::CheckingInitial(_), PeerInput::CurrentSession { current: false }) => {
+            | (Phase::CheckingInitial { .. }, PeerInput::CurrentSession { current: false }) => {
                 self.initial_ended()
             }
             (Phase::WaitingInitial, PeerInput::InitialWaitEnded(wait)) => {
-                let initial = if wait == InitialWait::Complete {
-                    InitialExchange::Complete
-                } else {
-                    InitialExchange::TimedOut
+                self.phase = Phase::CheckingInitial {
+                    completed: wait == InitialWait::Complete,
                 };
-                self.phase = Phase::CheckingInitial(initial);
                 PeerStep::then(PeerOutput::CheckCurrentSession)
             }
-            (Phase::CheckingInitial(initial), PeerInput::CurrentSession { current: true }) => {
-                self.initial = Some(initial);
+            (Phase::CheckingInitial { completed }, PeerInput::CurrentSession { current: true }) => {
+                self.timed_out = !completed;
                 self.phase = Phase::CheckingOwners;
                 // The answers can wait behind the peer's serving queue and
                 // this node's verification slots, so a slow exchange is not
                 // the peer's fault. It continues like a completed one, and is
                 // settled when its session ends.
-                let charge =
-                    (initial == InitialExchange::Complete).then_some(SessionCharge::Succeed);
+                let charge = completed.then_some(SessionCharge::Succeed);
                 PeerStep::new(charge, PeerOutput::CheckSoleOwner)
             }
             (
@@ -328,7 +307,6 @@ impl PeerState {
     /// Ends a session whose initial exchange broke. Charging the session
     /// stops endless reopens that break the stream first.
     fn initial_ended(&mut self) -> PeerStep {
-        self.initial = Some(InitialExchange::Ended);
         self.phase = Phase::Ended;
         PeerStep::new(Some(SessionCharge::Fail), PeerOutput::End { close: None })
     }
@@ -340,7 +318,7 @@ impl PeerState {
     /// bound.
     fn release(&mut self) -> PeerStep {
         self.phase = Phase::Ended;
-        let charge = (self.initial == Some(InitialExchange::TimedOut)).then(|| {
+        let charge = self.timed_out.then(|| {
             if self.progress.complete() {
                 SessionCharge::Succeed
             } else {

@@ -131,8 +131,6 @@ impl Drop for ByteRelease<'_> {
 /// A rejected ownership transfer leaves both owners unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ReservationError {
-    #[error("reservation belongs to another budget")]
-    Budget,
     #[error("transfer amount exceeds owned funding")]
     Amount,
 }
@@ -142,8 +140,6 @@ pub(crate) enum ReservationError {
 pub(crate) enum BudgetClosure {
     #[error("queue transition poisoned the accounting lock")]
     QueuePoisoned,
-    #[error("ownership transfer crossed budgets")]
-    WrongBudget,
     #[error("{operation} cannot transfer {amount} bytes from {owned} owned bytes")]
     Arithmetic {
         operation: &'static str,
@@ -167,17 +163,12 @@ impl ByteReservation {
         self.bytes
     }
 
-    pub(crate) fn same_budget(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.budget.inner, &other.budget.inner)
-    }
-
     /// Transfer an admitted charge. Rejection preserves both owners and closes admission.
     pub(crate) fn merge(&mut self, other: &mut Self) -> Result<(), ReservationError> {
-        if !self.same_budget(other) {
-            self.budget.close(BudgetClosure::WrongBudget);
-            other.budget.close(BudgetClosure::WrongBudget);
-            return Err(ReservationError::Budget);
-        }
+        debug_assert!(
+            Arc::ptr_eq(&self.budget.inner, &other.budget.inner),
+            "the owning queue admits all its funding from one budget"
+        );
         let Some(total) = self.bytes.checked_add(other.bytes) else {
             self.budget.close(BudgetClosure::Arithmetic {
                 operation: "merge",
@@ -197,11 +188,10 @@ impl ByteReservation {
         release: &mut ByteRelease<'_>,
         bytes: u64,
     ) -> Result<(), ReservationError> {
-        if !Arc::ptr_eq(&self.budget.inner, &release.budget.inner) {
-            self.budget.close(BudgetClosure::WrongBudget);
-            release.budget.close(BudgetClosure::WrongBudget);
-            return Err(ReservationError::Budget);
-        }
+        debug_assert!(
+            Arc::ptr_eq(&self.budget.inner, &release.budget.inner),
+            "the owning queue starts its release from its own budget"
+        );
         let amounts = self
             .bytes
             .checked_sub(bytes)
@@ -591,26 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_settlement_rejects_wrong_budget_without_transferring() {
-        let budget = ByteBudget::new(1000);
-        let other = ByteBudget::new(1000);
-        let mut funding = budget.reserve_owned(200).unwrap();
-        let mut release = other.deferred_release();
-        assert_eq!(
-            funding.settle_into(&mut release, 200),
-            Err(ReservationError::Budget)
-        );
-        assert!(budget.is_closed());
-        assert!(other.is_closed());
-        assert_eq!(funding.bytes(), 200);
-        drop(release);
-        assert_eq!(other.reserved(), 0);
-        assert_eq!(budget.reserved(), 200);
-        drop(funding);
-        assert_eq!(budget.reserved(), 0);
-    }
-
-    #[test]
     fn deferred_settlement_survives_unwind() {
         let budget = ByteBudget::new(1000);
         let unrelated = budget.reserve_owned(17).unwrap();
@@ -623,26 +593,6 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(budget.reserved(), 17);
         drop(unrelated);
-    }
-
-    #[test]
-    fn rejected_merge_preserves_equal_charges_in_both_budgets() {
-        let first = ByteBudget::new(400);
-        let second = ByteBudget::new(400);
-        let mut destination = first.reserve_owned(200).unwrap();
-        let mut source = second.reserve_owned(200).unwrap();
-        assert_eq!(
-            destination.merge(&mut source),
-            Err(ReservationError::Budget),
-            "equal charges do not authorize cross-budget transfer"
-        );
-        assert_eq!((destination.bytes(), source.bytes()), (200, 200));
-        assert_eq!((first.reserved(), second.reserved()), (200, 200));
-        assert!(first.is_closed() && second.is_closed());
-        drop(source);
-        assert_eq!((first.reserved(), second.reserved()), (200, 0));
-        drop(destination);
-        assert_eq!(first.reserved(), 0);
     }
 
     #[test]

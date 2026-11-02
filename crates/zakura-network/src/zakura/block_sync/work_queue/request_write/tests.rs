@@ -1547,17 +1547,17 @@ fn funding_audit_checks_the_actual_counter_and_allows_held_receipts() {
     );
     assert!(f.budget.is_closed());
     assert_eq!(f.budget.available(), 0);
+    // Settlement only meets funding from its own budget.
+    let foreign = std::mem::replace(&mut f.work.lock().funding, f.budget.empty_reservation());
     drop(claim);
     f.work.reset_above(block::Height(0));
     assert!(
         !f.work.audit_funding(),
         "reset cannot reopen a corrupt generation"
     );
-    assert_eq!(
-        other.reserved(),
-        funded,
-        "rejected settlement keeps its owner charged"
-    );
+    assert_eq!(f.budget.reserved(), 0);
+    drop(foreign);
+    assert_eq!(other.reserved(), 0);
 }
 
 #[test]
@@ -1617,7 +1617,7 @@ fn failed_settlement_retains_pool_without_poisoning_queue() {
 }
 
 #[test]
-fn rejected_publication_releases_wrong_budget_after_unlock() {
+fn rejected_publication_releases_funding_after_unlock() {
     use std::{
         future::Future,
         sync::atomic::{AtomicBool, Ordering},
@@ -1631,29 +1631,23 @@ fn rejected_publication_releases_wrong_budget_after_unlock() {
         }
     }
     let mut f = Fixture::new();
-    let mut request = f.take(1);
-    let other = ByteBudget::new(1_000);
-    let original = std::mem::replace(&mut request.funding, other.reserve_owned(200).unwrap());
+    let request = f.take(1);
     let probe = Arc::new(Probe(f.work.clone(), AtomicBool::new(false)));
     let waker = Waker::from(probe.clone());
     let mut context = Context::from_waker(&waker);
-    let mut released = Box::pin(other.subscribe_capacity().notified());
+    let mut released = Box::pin(f.budget.subscribe_capacity().notified());
     assert!(released.as_mut().poll(&mut context).is_pending());
+    f.cancel.cancel();
     assert!(request
-        .publish(|_| panic!("wrong-budget request published"))
+        .publish(|_| panic!("cancelled request published"))
         .is_none());
-    assert!(f.budget.is_closed());
-    assert!(other.is_closed());
-    assert_eq!(other.reserved(), 0);
+    assert_eq!(f.budget.reserved(), 0);
     assert!(
         probe.1.load(Ordering::SeqCst),
         "rejected funding woke under the queue lock"
     );
-    assert_eq!(f.budget.reserved(), 200);
     assert_eq!(f.work.reserved_bytes(), 0);
     assert_eq!(f.work.pending_len(), 2);
-    drop(original);
-    assert_eq!(f.budget.reserved(), 0);
 }
 
 #[test]

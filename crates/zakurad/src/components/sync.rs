@@ -8,6 +8,7 @@ use std::{
     convert,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -53,7 +54,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-use downloads::{AlwaysHedge, Downloads, NotFoundKind};
+use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentWait};
 use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
@@ -108,6 +109,37 @@ const TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
 
 /// Maximum requeues of one block after a transient verification timeout in a sync round.
 const BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT: usize = 3;
+
+/// Bounds a download task's wait for the parent of a block whose authorizing data binding was
+/// unconfirmed, including state readiness. The state's own limit only covers the request.
+const UNCONFIRMED_BINDING_PARENT_WAIT: Duration = zs::constants::AWAIT_BLOCK_INFO_TIMEOUT;
+
+/// Returns a [`ParentWait`] that asks `state` to wait for a block to commit, bounded by
+/// [`UNCONFIRMED_BINDING_PARENT_WAIT`].
+fn state_parent_wait<ZS>(state: ZS) -> ParentWait
+where
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ZS::Future: Send + 'static,
+{
+    ParentWait(Arc::new(move |parent| {
+        let state = state.clone();
+        // Boxing lets rustc prove this future is `Send` for spawned callers.
+        futures::FutureExt::boxed(async move {
+            matches!(
+                timeout(
+                    UNCONFIRMED_BINDING_PARENT_WAIT,
+                    state.oneshot(zs::Request::AwaitBlockInfo(parent)),
+                )
+                .await,
+                Ok(Ok(zs::Response::BlockInfo(Some(_))))
+            )
+        })
+    }))
+}
 
 /// Minimum UTXO lookup timeouts without a verified block before the syncer restarts.
 const MIN_UTXO_RACE_DROPS_BEFORE_RESTART: usize = 4;
@@ -859,7 +891,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZS::Future: Send,
+    ZS::Future: Send + 'static,
     ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -981,7 +1013,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZS::Future: Send,
+    ZS::Future: Send + 'static,
     ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -1067,10 +1099,13 @@ where
             expose_peer_addresses,
         );
 
+        let parent_wait = state_parent_wait(state.clone());
+
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
             latest_chain_tip.clone(),
+            parent_wait,
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
@@ -2554,6 +2589,8 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
+    /// A block whose authorizing data binding is still unconfirmed after the download task waited
+    /// for its parent is dropped the same way, without scoring its supplier.
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2592,6 +2629,16 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+        }
+
+        // The download task already waited for the parent and verified the body again.
+        if let Some((hash, parent)) = response.as_ref().err().and_then(Self::unconfirmed_binding) {
+            debug!(
+                ?hash,
+                ?parent,
+                "block parent did not commit in time to confirm its binding, dropping block"
+            );
+            return Ok(());
         }
 
         let unavailable_parent = response.as_ref().err().and_then(Self::unavailable_parent);
@@ -2992,6 +3039,22 @@ where
         )
     }
 
+    /// Returns the block and parent hashes of a verification failure whose authorizing data
+    /// binding is still unconfirmed after the download task waited for the parent.
+    fn unconfirmed_binding(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
+        match error {
+            BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block { source },
+                hash,
+                ..
+            } => match **source {
+                VerifyBlockError::AuthDataUnconfirmed { parent, .. } => Some((*hash, parent)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns the block and parent hashes of a UTXO lookup timeout whose parent is not in a
     /// chain that can accept the block.
     fn unavailable_parent(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
@@ -3023,6 +3086,11 @@ where
         let peer = block_error_peer_label(e, expose_peer_addresses);
 
         match e {
+            // The handler drops the block without restarting the round.
+            e if Self::unconfirmed_binding(e).is_some() => {
+                debug!(error = ?e, %peer, "block binding stays unconfirmed, continuing sync");
+                false
+            }
             // The retry handler bounds these races without cancelling the parent's commit.
             e if Self::is_utxo_lookup_timeout(e)
                 || Self::is_post_checkpoint_verify_timeout(e)

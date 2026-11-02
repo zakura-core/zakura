@@ -1581,6 +1581,41 @@ pub(crate) fn validate_and_commit_non_finalized(
     )
 }
 
+/// Returns `error` if it belongs to the block, or the commitment mismatch if the body's
+/// authorizing data doesn't match its header.
+///
+/// Contextual rules can read authorizing data before the commitment check runs, such as v6
+/// anchors, so a consensus failure is only the block's if its header commits to that data (see
+/// `check::auth_data_commitment`, which `commitment` runs). Transaction IDs commit to spent
+/// outpoints and nullifiers (ZIP 244, and the whole v4 encoding), and the Merkle root was checked
+/// before this, so every body for the block repeats a duplicate spend or nullifier: that failure is
+/// the block's whatever the authorizing data says.
+fn attribute_contextual_failure(
+    error: ValidateContextError,
+    commitment: impl FnOnce() -> crate::AuthDataCommitment,
+) -> ValidateContextError {
+    if !matches!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+    ) || matches!(
+        error,
+        ValidateContextError::DuplicateTransparentSpend { .. }
+            | ValidateContextError::DuplicateSproutNullifier { .. }
+            | ValidateContextError::DuplicateSaplingNullifier { .. }
+            | ValidateContextError::DuplicateOrchardNullifier { .. }
+            | ValidateContextError::DuplicateIronwoodNullifier { .. }
+    ) {
+        return error;
+    }
+
+    match commitment() {
+        crate::AuthDataCommitment::Mismatch(mismatch) => {
+            ValidateContextError::InvalidBlockCommitment(mismatch)
+        }
+        crate::AuthDataCommitment::Bound | crate::AuthDataCommitment::Unavailable => error,
+    }
+}
+
 #[tracing::instrument(
     name = "validate_and_commit_non_finalized",
     level = "debug",
@@ -1598,6 +1633,8 @@ fn validate_and_commit_non_finalized_with_metrics(
     contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
     let total_start = Instant::now();
+    let block = prepared.block.clone();
+    let auth_data_root = prepared.auth_data_root;
     let initial_checks_start = Instant::now();
     let initial_checks =
         check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
@@ -1622,6 +1659,17 @@ fn validate_and_commit_non_finalized_with_metrics(
                 contextual_metrics,
             )
         }
+    });
+    let result = result.map_err(|error| {
+        attribute_contextual_failure(error, || {
+            check::auth_data_commitment(
+                &non_finalized_state.network,
+                non_finalized_state,
+                finalized_state,
+                block,
+                auth_data_root,
+            )
+        })
     });
     contextual_metrics.record_duration(
         "state.contextual.total.duration_seconds",

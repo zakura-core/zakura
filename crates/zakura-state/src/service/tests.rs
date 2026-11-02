@@ -3356,6 +3356,348 @@ async fn rejected_checkpoint_body_fails_descendants_with_a_retryable_error() {
     .expect("the honest body for the same height commits");
 }
 
+/// Opens an ephemeral NU5-from-height-1 Regtest state with genesis committed, which accepts
+/// semantically verified blocks from height 1.
+async fn nu5_state_with_genesis() -> (StateService, Network, Arc<Block>) {
+    use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height(0), 0)
+        .await
+        .expect("the ephemeral state opens");
+    let genesis = block::genesis::regtest_genesis_block();
+    timeout(
+        Duration::from_secs(10),
+        (&mut state).oneshot(Request::CommitCheckpointVerifiedBlock(
+            genesis.clone().into(),
+        )),
+    )
+    .await
+    .expect("the genesis commit completes")
+    .expect("genesis commits");
+    (state, network, genesis)
+}
+
+/// Builds a height-1 child of `genesis` with a v5 coinbase followed by `extra`, whose header
+/// commits to its authorizing data.
+fn nu5_child_of_genesis(
+    network: &Network,
+    genesis: &Arc<Block>,
+    extra: Vec<zakura_chain::transaction::Transaction>,
+) -> Arc<Block> {
+    use zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED;
+
+    nu5_child(
+        network,
+        genesis,
+        Height(1),
+        &CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        extra,
+    )
+}
+
+/// Builds a child of `parent` at `height` with a v5 coinbase followed by `extra`, whose header
+/// commits to its authorizing data over the parent's `history_root`.
+fn nu5_child(
+    network: &Network,
+    parent: &Arc<Block>,
+    height: Height,
+    history_root: &block::ChainHistoryMmrRootHash,
+    extra: Vec<zakura_chain::transaction::Transaction>,
+) -> Arc<Block> {
+    use zakura_chain::{
+        block::ChainHistoryBlockTxAuthCommitmentHash,
+        transaction::arbitrary::transaction_to_fake_v5,
+    };
+
+    let mut child = parent.make_fake_child();
+    let block = Arc::make_mut(&mut child);
+    let coinbase = transaction_to_fake_v5(&block.transactions[0], network, height);
+    block.transactions = std::iter::once(coinbase)
+        .chain(extra)
+        .map(Arc::new)
+        .collect();
+    let header = Arc::make_mut(&mut block.header);
+    header.merkle_root = block.transactions.iter().collect();
+    header.time += chrono::Duration::seconds(1);
+    let commitment: [u8; 32] = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        history_root,
+        &child.auth_data_root(),
+    )
+    .into();
+    child.set_block_commitment(commitment)
+}
+
+/// Returns `block` with different coinbase authorizing data under the same header.
+///
+/// A v5 transaction ID does not commit to `scriptSig` (ZIP 244), so the Merkle root and block
+/// hash stay the same while the authorizing data root changes.
+fn with_altered_auth_data(block: &Arc<Block>) -> Arc<Block> {
+    let mut mismatched = block.clone();
+    let coinbase = &mut Arc::make_mut(&mut mismatched).transactions[0];
+    match &mut Arc::make_mut(coinbase).inputs_mut()[0] {
+        transparent::Input::Coinbase { data, .. } => data.push(0x42),
+        input => panic!("the first input is the coinbase input: {input:?}"),
+    }
+    assert_eq!(mismatched.hash(), block.hash());
+    assert_eq!(
+        mismatched.header.merkle_root,
+        mismatched.transactions.iter().collect()
+    );
+    assert_ne!(mismatched.auth_data_root(), block.auth_data_root());
+    mismatched
+}
+
+/// Asks `state` whether `block`'s header commits to its authorizing data.
+async fn check(state: &mut StateService, block: Arc<Block>) -> crate::AuthDataCommitment {
+    let call = state.oneshot(Request::CheckAuthDataCommitment(
+        crate::BlockCommitmentData {
+            block,
+            auth_data_root: None,
+        },
+    ));
+    match timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the check completes")
+        .expect("the check succeeds")
+    {
+        Response::AuthDataCommitment(commitment) => commitment,
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// The authorizing data check finds a parent in the non-finalized state, not just at the
+/// finalized tip, and uses that parent's history tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_data_commitment_check_uses_a_non_finalized_parent() {
+    use crate::AuthDataCommitment;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let parent = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    timeout(
+        Duration::from_secs(10),
+        (&mut state).oneshot(Request::CommitSemanticallyVerifiedBlock(
+            parent.clone().prepare(),
+        )),
+    )
+    .await
+    .expect("the parent commit completes")
+    .expect("the parent commits");
+
+    let history_root = state
+        .read_service
+        .latest_non_finalized_state()
+        .best_chain()
+        .expect("the parent is in the non-finalized state")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the parent's history tree is not empty");
+    let child = nu5_child(&network, &parent, Height(2), &history_root, Vec::new());
+
+    assert_eq!(
+        check(&mut state, child.clone()).await,
+        AuthDataCommitment::Bound
+    );
+    let mismatched = check(&mut state, with_altered_auth_data(&child)).await;
+    assert!(
+        matches!(
+            mismatched,
+            AuthDataCommitment::Mismatch(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ),
+        "{mismatched:?}"
+    );
+}
+
+/// The authorizing data check compares a body with its header's NU5 commitment over the
+/// parent's history tree, and reports when that context is unusable.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_data_commitment_check_uses_the_parent_history_tree() {
+    use crate::AuthDataCommitment;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let matching = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    let mismatched = with_altered_auth_data(&matching);
+    // No state has this parent.
+    let orphan = matching.make_fake_child();
+    // The parent tree is empty, and this height is neither its successor nor the Heartwood
+    // activation that lets an empty tree stand in.
+    let mut skipped = Block::clone(&orphan);
+    Arc::make_mut(&mut skipped.header).previous_block_hash = genesis.hash();
+
+    assert_eq!(check(&mut state, matching).await, AuthDataCommitment::Bound);
+    let mismatched = check(&mut state, mismatched).await;
+    assert!(
+        matches!(
+            mismatched,
+            AuthDataCommitment::Mismatch(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ),
+        "{mismatched:?}"
+    );
+    assert_eq!(
+        check(&mut state, orphan).await,
+        AuthDataCommitment::Unavailable
+    );
+    assert_eq!(
+        check(&mut state, Arc::new(skipped)).await,
+        AuthDataCommitment::Unavailable
+    );
+}
+
+/// Commits `block` as semantically verified and returns its contextual validation error.
+async fn commit_failing_semantic_block(
+    state: &mut StateService,
+    block: Arc<Block>,
+) -> ValidateContextError {
+    let error = timeout(
+        Duration::from_secs(10),
+        state.oneshot(Request::CommitSemanticallyVerifiedBlock(block.prepare())),
+    )
+    .await
+    .expect("the commit completes")
+    .expect_err("the body fails contextual validation");
+    let error = error
+        .downcast_ref::<crate::CommitSemanticallyVerifiedError>()
+        .expect("semantic commits fail with the semantic commit error type");
+    match error.inner() {
+        CommitBlockError::ValidateContextError(error) => (**error).clone(),
+        error => panic!("unexpected commit error: {error:?}"),
+    }
+}
+
+/// A contextual failure in a body whose authorizing data its header does not commit to is
+/// reported as that mismatch, even when the failing rule runs before the commitment check.
+///
+/// From v6, anchors are authorizing data and are checked before `hashBlockCommitments`, so the
+/// earlier rule would otherwise be reported instead of the mismatch. A missing transparent output
+/// takes the same early path here.
+#[tokio::test(flavor = "multi_thread")]
+async fn early_contextual_failures_defer_to_the_auth_data_commitment() {
+    use zakura_chain::transaction::LockTime;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let missing_input = zakura_chain::transaction::Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: zakura_chain::transaction::Hash([9; 32]),
+                index: 0,
+            },
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let matching = nu5_child_of_genesis(&network, &genesis, vec![missing_input]);
+    let mismatched = with_altered_auth_data(&matching);
+
+    let mismatched = commit_failing_semantic_block(&mut state, mismatched).await;
+    assert!(mismatched.is_auth_commitment_mismatch(), "{mismatched:?}");
+
+    // The same header with its committed body fails on its own.
+    let matching = commit_failing_semantic_block(&mut state, matching).await;
+    assert!(
+        matches!(
+            matching,
+            ValidateContextError::MissingTransparentOutput { .. }
+        ),
+        "{matching:?}"
+    );
+}
+
+/// A v6 anchor is authorizing data, and state checks anchors before `hashBlockCommitments`. When
+/// the header does not commit to a body's anchor, its unknown-anchor failure must be reported as
+/// the commitment mismatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn v6_anchor_failures_defer_to_the_auth_data_commitment() {
+    use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
+    use zakura_chain::{
+        amount::Amount,
+        at_least_one, ironwood,
+        orchard::{self, tree},
+        primitives::Halo2Proof,
+        transaction::{LockTime, Transaction},
+    };
+
+    fn anchor(byte: u8) -> tree::Root {
+        let mut bytes = [0; 32];
+        bytes[0] = byte;
+        tree::Root::try_from(bytes).expect("a small anchor is canonical")
+    }
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut TestRunner::default())
+        .expect("the action strategy creates a value")
+        .current();
+    // No tree in this state has this anchor.
+    let ironwood_spend = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood::ShieldedData {
+            flags: orchard::Flags::ENABLE_SPENDS,
+            value_balance: Amount::zero(),
+            shared_anchor: anchor(1),
+            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }),
+    };
+    let matching = nu5_child_of_genesis(&network, &genesis, vec![ironwood_spend]);
+
+    let mut mismatched = matching.clone();
+    let spend = &mut Arc::make_mut(&mut mismatched).transactions[1];
+    let Transaction::V6 {
+        ironwood_shielded_data: Some(shielded_data),
+        ..
+    } = Arc::make_mut(spend)
+    else {
+        unreachable!("the second transaction is the v6 Ironwood spend");
+    };
+    shielded_data.shared_anchor = anchor(2);
+    assert_eq!(mismatched.hash(), matching.hash());
+    assert_eq!(
+        mismatched.header.merkle_root,
+        mismatched.transactions.iter().collect()
+    );
+    assert_ne!(mismatched.auth_data_root(), matching.auth_data_root());
+
+    let mismatched = commit_failing_semantic_block(&mut state, mismatched).await;
+    assert!(mismatched.is_auth_commitment_mismatch(), "{mismatched:?}");
+
+    // The same header with its committed body fails on its own.
+    let matching = commit_failing_semantic_block(&mut state, matching).await;
+    assert!(
+        matches!(matching, ValidateContextError::UnknownIronwoodAnchor { .. }),
+        "{matching:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn precious_block_request_selects_the_preferred_tip_legacy() {
     assert_precious_block_request(false).await;

@@ -824,7 +824,14 @@ impl NonFinalizedState {
         }
 
         let transparent_spend_start = Instant::now();
-        let spent_utxos = match self.proposal_spends.take(&prepared) {
+        // Repeated proposals must leave cached results available to solved-block commits
+        // while they compute and record their own spend check.
+        let cached_spends = if self.records_proposal_spends {
+            None
+        } else {
+            self.proposal_spends.take(&prepared)
+        };
+        let spent_utxos = match cached_spends {
             Some(spent_utxos) => Ok(spent_utxos),
             None => check::utxo::transparent_spend(
                 &prepared,

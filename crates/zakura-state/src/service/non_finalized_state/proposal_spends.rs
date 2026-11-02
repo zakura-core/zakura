@@ -96,7 +96,11 @@ mod tests {
 
     use crate::{
         arbitrary::Prepare,
-        service::{check, finalized_state::FinalizedState, non_finalized_state::NonFinalizedState},
+        service::{
+            check,
+            finalized_state::FinalizedState,
+            non_finalized_state::{ContextualMetrics, NonFinalizedState},
+        },
         tests::FakeChainHelper,
         Config, ValidateContextError,
     };
@@ -308,6 +312,49 @@ mod tests {
             .expect("the uncached block committed");
         assert!(cached_chain.eq_internal_state(uncached_chain));
         assert!(!cached_chain.unspent_utxos().contains_key(&outpoint));
+    }
+
+    #[test]
+    fn a_repeated_proposal_preserves_the_cached_result_when_its_spend_check_fails() {
+        let _init_guard = zakura_test::init();
+        let (finalized, mut state, child, outpoint, expected) = state_with_spend();
+        let mut proposal_state = state.clone();
+        proposal_state.record_proposal_spends();
+        proposal_state
+            .commit_block(child.clone().prepare(), &finalized)
+            .expect("the first proposal is valid and records its spent output");
+
+        // Hide the output only from the repeated proposal's parent snapshot to force
+        // a lookup failure. The writer retains the valid parent and cached result.
+        // This makes cache preservation observable without relying on thread timing.
+        let mut proposal_chain = state
+            .best_chain()
+            .expect("the parent is present")
+            .as_ref()
+            .clone();
+        proposal_chain.created_utxos.remove(&outpoint);
+        let result = proposal_state.validate_and_commit(
+            Arc::new(proposal_chain),
+            child.clone().prepare(),
+            &finalized,
+            ContextualMetrics::Disabled,
+        );
+        assert!(matches!(
+            result,
+            Err(ValidateContextError::MissingTransparentOutput { outpoint: missing, .. }) if missing == outpoint
+        ));
+        let recorded = state
+            .proposal_spends
+            .take(&child.clone().prepare())
+            .expect("a repeated proposal must leave the writer's cached result available");
+        assert_eq!(recorded, HashMap::from([(outpoint, expected)]));
+        state
+            .proposal_spends
+            .remember(&child.clone().prepare(), &recorded);
+        state
+            .commit_block(child.clone().prepare(), &finalized)
+            .expect("the writer can still commit using the cached spend result");
+        assert!(state.proposal_spends.take(&child.prepare()).is_none());
     }
 
     #[test]

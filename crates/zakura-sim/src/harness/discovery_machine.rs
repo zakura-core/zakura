@@ -434,6 +434,7 @@ impl Reached {
                 self.retained_hint |= retained_hint;
                 self.last_step_applied_rule = stale_result || current_result || retained_hint;
             }
+            MachineStep::Fixture(_) => {}
         }
     }
 }
@@ -460,7 +461,7 @@ pub const BOOK_ENTRY: HarnessEntry = HarnessEntry {
     name: Target::Book.name(),
     generator: 2,
     scenario_bytes: 512,
-    pad_scenario: false,
+    machine: true,
     composes: &[],
     planted: false,
     run: |value, input, sink| run(Target::Book, value, input, sink),
@@ -481,7 +482,7 @@ pub const STATE_ENTRY: HarnessEntry = HarnessEntry {
     name: Target::State.name(),
     generator: 2,
     scenario_bytes: 512,
-    pad_scenario: false,
+    machine: true,
     composes: &[],
     planted: false,
     run: |value, input, sink| run(Target::State, value, input, sink),

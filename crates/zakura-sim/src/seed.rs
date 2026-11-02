@@ -536,8 +536,8 @@ fn validate(entry: &HarnessEntry, path: &Path, sidecar: &Sidecar) -> Result<Vec<
 }
 
 /// The digest of the scenario the full fuzz `input` decodes to on `entry`,
-/// using the harness's prefix and padding rule. Checks that the scenario round-trips through the harness's
-/// scenario type.
+/// using the harness's prefix and padding rule. Checks that the scenario
+/// round-trips through the harness's scenario type.
 pub fn decode(entry: &HarnessEntry, input: &[u8]) -> Result<String, SeedError> {
     let drawn = entry.scenario(input);
     let meta = (entry.meta)(&drawn).map_err(|error| SeedError::RoundTrip(error.to_string()))?;

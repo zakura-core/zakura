@@ -130,7 +130,7 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
         if len(window) != len(observations):
             failures.append("Metrics missing inside the observation window.")
         gaps = [b["elapsed"] - a["elapsed"] for a, b in zip(observations, observations[1:])]
-        if any(gap > max(2.5 * interval, 2.5) for gap in gaps):
+        if any(gap > max(1.5 * interval, 1.5) for gap in gaps):
             failures.append("The sampling interval was interrupted.")
         if any(v.get(key) is None for v in values for key in CAPACITY_FIELDS):
             failures.append("Reservation metrics are incomplete.")
@@ -693,9 +693,11 @@ def main(argv=None) -> int:
                 flush=True,
             )
             break
-        if time.monotonic() + args.interval > deadline:
+        now = time.monotonic()
+        next_sample = max(start + len(samples) * args.interval, now)
+        if next_sample > deadline:
             break
-        time.sleep(args.interval)
+        time.sleep(next_sample - now)
 
     startup_height, startup_error = (
         read_startup_height(args.log_file) if args.require_startup_height

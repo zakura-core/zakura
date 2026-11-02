@@ -176,10 +176,11 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
-    /// A downloaded block above the checkpoints names a parent that the state does not know and
-    /// this downloader is not downloading, so verifying it could only wait for a parent that may
-    /// never arrive. This is an unscored drop, not a consensus verdict.
-    #[error("downloaded block's parent is unknown: {height:?} {hash:?} parent {parent:?}")]
+    /// A downloaded block above the checkpoints names a parent that this downloader is not
+    /// downloading and that the state can't build on: unknown, or known but below the finalized
+    /// tip. Verifying it could only wait for a parent that may never arrive. This is an unscored
+    /// drop, not a consensus verdict.
+    #[error("downloaded block's parent can't be built on: {height:?} {hash:?} parent {parent:?}")]
     ParentUnknown {
         height: block::Height,
         hash: block::Hash,
@@ -340,14 +341,15 @@ impl std::fmt::Debug for ParentWait {
     }
 }
 
-/// Whether the state knows a block, committed or already sent to be written. Returns `true`
-/// when the state can't answer, so an unanswered question never drops a block.
+/// Whether a block could be built on this parent now: the parent is the finalized tip or in a
+/// non-finalized chain. Returns `true` when the state can't answer, so an unanswered question
+/// never drops a block.
 #[derive(Clone)]
-pub struct ParentKnown(pub Arc<dyn Fn(block::Hash) -> BoxFuture<'static, bool> + Send + Sync>);
+pub struct ParentExtendable(pub Arc<dyn Fn(block::Hash) -> BoxFuture<'static, bool> + Send + Sync>);
 
-impl std::fmt::Debug for ParentKnown {
+impl std::fmt::Debug for ParentExtendable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ParentKnown")
+        f.write_str("ParentExtendable")
     }
 }
 
@@ -398,8 +400,8 @@ where
     /// unconfirmed.
     parent_wait: ParentWait,
 
-    /// Checks that a downloaded block's parent is known before the block is verified.
-    parent_known: ParentKnown,
+    /// Checks that a downloaded block's parent can be built on before the block is verified.
+    parent_extendable: ParentExtendable,
 
     // Configuration
     //
@@ -532,7 +534,7 @@ where
         verifier: ZV,
         latest_chain_tip: ZSTip,
         parent_wait: ParentWait,
-        parent_known: ParentKnown,
+        parent_extendable: ParentExtendable,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         chain_network: Network,
@@ -547,7 +549,7 @@ where
             verifier,
             latest_chain_tip,
             parent_wait,
-            parent_known,
+            parent_extendable,
             lookahead_limit,
             chain_network,
             max_checkpoint_height,
@@ -676,7 +678,7 @@ where
         let mut verifier = self.verifier.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let parent_wait = self.parent_wait.clone();
-        let parent_known = self.parent_known.clone();
+        let parent_extendable = self.parent_extendable.clone();
 
         let lookahead_limit = self.lookahead_limit;
         let chain_network = self.chain_network.clone();
@@ -912,14 +914,16 @@ where
                 // for a missing parent: up to the UTXO lookup timeout for a block that spends
                 // outputs, or in the state's queue until the finalized tip passes it for a
                 // coinbase-only block. The syncer only downloads chains that start at a block in
-                // its own locator, so an honest block's parent is either known to the state or
-                // still being downloaded here. A block whose parent is neither can only wait for a
-                // parent that may never arrive, so drop it before it takes a verifier slot.
+                // its own locator, so a connected block's parent is either one the state can build
+                // on (the finalized tip or a block in a non-finalized chain) or still being
+                // downloaded here. A block whose parent is neither can only wait for a parent that
+                // may never arrive, so drop it before it takes a verifier slot. A parent that is
+                // merely known, such as a finalized block below the tip, doesn't count.
                 if block_height > max_checkpoint_height {
                     let parent = block.header.previous_block_hash;
                     // A parent normally leaves this map only after its verification returns, by
-                    // when the state already has it, so a connected parent is always in one of
-                    // the two places. It also leaves on a reset, which cancels this task too, or
+                    // when the state has added it to a chain, so a connected parent is always in
+                    // one of the two places. It also leaves on a reset, which cancels this task too, or
                     // when its own download fails, which the syncer handles by retrying it; a
                     // child dropped meanwhile is retried as well.
                     let parent_in_flight = task_states
@@ -927,7 +931,7 @@ where
                         .expect("legacy task state lock is only held for synchronous updates")
                         .contains_key(&parent);
 
-                    let parent_is_known = parent_in_flight || {
+                    let parent_is_extendable = parent_in_flight || {
                         // Prefer the cancel handle if both are ready.
                         tokio::select! {
                             biased;
@@ -935,11 +939,11 @@ where
                                 trace!("task cancelled waiting for the parent check");
                                 return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
                             }
-                            known = (parent_known.0)(parent) => known,
+                            known = (parent_extendable.0)(parent) => known,
                         }
                     };
 
-                    if !parent_is_known {
+                    if !parent_is_extendable {
                         debug!(
                             ?hash,
                             ?parent,

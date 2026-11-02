@@ -54,7 +54,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentKnown, ParentWait};
+use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentExtendable, ParentWait};
 use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
@@ -141,13 +141,22 @@ where
     }))
 }
 
-/// Bounds a download task's question to the state about whether a block's parent is known,
-/// including state readiness. A block whose question times out is verified as before.
-const PARENT_KNOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds a download task's question to the state about whether a block's parent can be built
+/// on, including state readiness. A block whose question times out is verified as before.
+const PARENT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Returns a [`ParentKnown`] that asks `state` whether it knows a block, bounded by
-/// [`PARENT_KNOWN_TIMEOUT`]. A failed or timed-out request counts as known.
-fn state_parent_known<ZS>(state: ZS) -> ParentKnown
+/// Asks `state` whether a block can be built on `parent` now: whether `parent` is the finalized
+/// tip or in a non-finalized chain. A known block below the finalized tip can't be built on.
+fn parent_can_be_extended(parent: block::Hash) -> zs::Request {
+    zs::Request::CheckParentInputs {
+        parent,
+        outpoints: Arc::from([]),
+    }
+}
+
+/// Returns a [`ParentExtendable`] that asks `state` whether a block can be built on a parent,
+/// bounded by [`PARENT_CHECK_TIMEOUT`]. A failed or timed-out request counts as extendable.
+fn state_parent_extendable<ZS>(state: ZS) -> ParentExtendable
 where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
         + Send
@@ -156,17 +165,19 @@ where
         + 'static,
     ZS::Future: Send + 'static,
 {
-    ParentKnown(Arc::new(move |parent| {
+    ParentExtendable(Arc::new(move |parent| {
         let state = state.clone();
         // Boxing lets rustc prove this future is `Send` for spawned callers.
         futures::FutureExt::boxed(async move {
             !matches!(
                 timeout(
-                    PARENT_KNOWN_TIMEOUT,
-                    state.oneshot(zs::Request::KnownBlock(parent)),
+                    PARENT_CHECK_TIMEOUT,
+                    state.oneshot(parent_can_be_extended(parent)),
                 )
                 .await,
-                Ok(Ok(zs::Response::KnownBlock(None)))
+                Ok(Ok(zs::Response::ParentInputs(
+                    zs::ParentInputs::ParentUnavailable
+                )))
             )
         })
     }))
@@ -1131,14 +1142,14 @@ where
         );
 
         let parent_wait = state_parent_wait(state.clone());
-        let parent_known = state_parent_known(state.clone());
+        let parent_extendable = state_parent_extendable(state.clone());
 
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
             latest_chain_tip.clone(),
             parent_wait,
-            parent_known,
+            parent_extendable,
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
@@ -2622,9 +2633,9 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
-    /// The download task drops a block whose parent is neither committed nor in flight before
-    /// verifying it. The syncer drops it too, unless the parent is now committed, in flight or
-    /// waiting for a retry: then the block is downloaded again after the registry-miss backoff,
+    /// The download task drops a block whose parent is neither in flight nor a block the state can
+    /// build on, before verifying it. The syncer drops it too, unless the parent can now be built
+    /// on, is in flight, or is waiting for a retry: then the block is downloaded again after the registry-miss backoff,
     /// bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`], with the same pause on new dispatch as
     /// any registry-miss retry.
     /// A block whose authorizing data binding is still unconfirmed after the download task waited
@@ -2681,17 +2692,19 @@ where
 
         let unavailable_parent = response.as_ref().err().and_then(Self::unavailable_parent);
         if let Some((hash, parent)) = unavailable_parent {
-            // The parent may have committed after the verifier's state read.
+            // The parent may have committed after the verifier's state read. A known parent below
+            // the finalized tip can never be built on, so the state is asked whether the parent
+            // can be extended, not whether it exists.
             let parent_can_arrive = self.downloads.contains(&parent)
                 || self.registry_miss_retry.contains_key(&parent)
-                || matches!(
+                || !matches!(
                     // Boxing lets rustc prove this future is `Send` for spawned callers.
                     futures::FutureExt::boxed(
-                        self.state.clone().oneshot(zs::Request::KnownBlock(parent))
+                        self.state.clone().oneshot(parent_can_be_extended(parent))
                     )
                     .await
                     .map_err(|e| eyre!(e))?,
-                    zs::Response::KnownBlock(Some(_))
+                    zs::Response::ParentInputs(zs::ParentInputs::ParentUnavailable)
                 );
             if !parent_can_arrive {
                 debug!(
@@ -2703,8 +2716,8 @@ where
                 return Ok(());
             }
 
-            // The download task dropped this block before verification, but its parent is now
-            // known, in flight, or waiting for a retry. Download the block again after the
+            // The download task dropped this block before verification, but its parent can now be
+            // built on, is in flight, or is waiting for a retry. Download the block again after the
             // registry-miss backoff, by when its parent can usually be found. Like any
             // registry-miss retry, this pauses new dispatch and tip refreshes until the retry
             // is sent. That is intended: it only happens when a parent was briefly away from the
@@ -3123,7 +3136,7 @@ where
 
     /// Returns the block and parent hashes of a block that could not verify for lack of its
     /// parent: a UTXO lookup timeout whose parent is not in a chain that can accept the block, or
-    /// a block the download task dropped because its parent was unknown.
+    /// a block the download task dropped because no chain could accept it.
     fn unavailable_parent(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
         match error {
             BlockDownloadVerifyError::ParentUnknown { hash, parent, .. } => Some((*hash, *parent)),

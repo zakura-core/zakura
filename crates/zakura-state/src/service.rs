@@ -1187,7 +1187,7 @@ impl StateService {
     /// parents that pass a liveness check but that nothing goes on to drain.
     fn drains_the_non_finalized_queue_now(&self, parent_hash: &block::Hash) -> bool {
         if self.block_write_sender.finalized.is_some() {
-            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
+            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized`
             // does not run for this parent and only the handoff empties the queue. The handoff
             // needs the last hash we sent to be durably written and the configured boundary to
             // be reached. Only an unbounded configuration can hand off based on a child alone.
@@ -1200,7 +1200,7 @@ impl StateService {
                 && self.checkpoint_handoff_is_ready(true);
         }
 
-        // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
+        // The queue is live: `send_ready_non_finalized` walks forward from this parent
         // later in this same call.
         self.can_fork_chain_at(parent_hash)
     }

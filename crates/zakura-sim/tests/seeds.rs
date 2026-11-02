@@ -80,6 +80,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
                 5, 0, 0, 0, 4, 1, 0, 0, 5, 1, 0, 0,
             ],
         }),
+        "header-reactor-policy" => value(zakura_sim::record::machine::MachineScenario {
+            input: include_bytes!("fixtures/header-reactor-policy.bin").to_vec(),
+        }),
+        "header-publisher-policy" => value(zakura_sim::record::machine::MachineScenario {
+            input: include_bytes!("fixtures/header-publisher-policy.bin").to_vec(),
+        }),
         "block-work-funding" => value(zakura_sim::record::machine::MachineScenario {
             input: include_bytes!("fixtures/block-work-funding.bin").to_vec(),
         }),
@@ -87,6 +93,13 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
             input: include_bytes!("fixtures/block-decoded-retention.bin").to_vec(),
         }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
+        "discovery-verification-capacity" => value(discovery::CapacityScenario::default()),
+        "discovery-record-book" => value(zakura_sim::record::machine::MachineScenario {
+            input: include_bytes!("fixtures/discovery-record-book.bin").to_vec(),
+        }),
+        "discovery-session-installation" => value(zakura_sim::record::machine::MachineScenario {
+            input: include_bytes!("fixtures/discovery-session-installation.bin").to_vec(),
+        }),
         "block-sync-handoff" => value(BlockScenario::default()),
         "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),
         "block-sync-paused-handoffs" => value(BlockScenario::paused_handoffs()),

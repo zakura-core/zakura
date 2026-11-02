@@ -118,7 +118,7 @@ async fn minimum_grant_floods_apply_while_output_is_blocked() {
     let started = std::time::Instant::now();
     let ((), allocated) = zakura_test::allocations::measure(|| {
         for grant in &grants[1..] {
-            let applied = lock(&publisher.shared).apply(grant, limits());
+            let applied = lock(&publisher.shared).apply(grant);
             assert_eq!(applied, Ok(Applied::Live));
         }
     });

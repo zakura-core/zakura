@@ -33,7 +33,7 @@ fn an_unanswered_close_drops_the_session_at_the_request_timeout() {
             );
         }
 
-        let session = reactor.peer_state[&peer].session.clone();
+        let session = reactor.sessions[&peer].session.clone();
         reactor.retire_unanswered_closes(Instant::now());
         assert!(!session.cancel_token().is_cancelled());
         reactor.retire_unanswered_closes(Instant::now() + reactor.startup.request_timeout);
@@ -43,7 +43,10 @@ fn an_unanswered_close_drops_the_session_at_the_request_timeout() {
             "only an unanswered Close drops the session"
         );
         assert_eq!(
-            reactor.unproductive_peer_cooldowns.contains_key(&peer),
+            reactor
+                .state
+                .unproductive_peer_cooldowns
+                .contains_key(&peer),
             !answered
         );
     }
@@ -126,7 +129,7 @@ fn an_idle_subscription_closes_when_no_round_can_continue_it() {
         HeaderTargetAdmissionResult::Applied,
     );
     assert!(
-        reactor.peer_state[&peer]
+        reactor.sessions[&peer]
             .session
             .subscriber()
             .resumable()
@@ -134,7 +137,7 @@ fn an_idle_subscription_closes_when_no_round_can_continue_it() {
         "the subscription is kept for the next round"
     );
     assert!(
-        reactor.close_deadlines.is_empty(),
+        reactor.state.close_deadlines.is_empty(),
         "nothing waits on a kept subscription"
     );
 
@@ -143,7 +146,7 @@ fn an_idle_subscription_closes_when_no_round_can_continue_it() {
     reactor.handle_status(peer.clone(), 0, status);
     reactor.schedule_cached_statuses();
     assert_eq!(next_update(&mut outbound).operation, v9::Operation::Close);
-    assert!(reactor.close_deadlines.contains_key(&peer));
+    assert!(reactor.state.close_deadlines.contains_key(&peer));
 }
 
 /// A `Close` that the session's full queue refuses starts no deadline,
@@ -171,10 +174,13 @@ fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
     while send.try_send(filler.clone()).is_ok() {}
 
     reactor.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
-    assert!(reactor.close_deadlines.is_empty(), "nothing was queued");
-    assert!(reactor.pending_closes.contains_key(&peer));
+    assert!(
+        reactor.state.close_deadlines.is_empty(),
+        "nothing was queued"
+    );
+    assert!(reactor.state.pending_closes.contains_key(&peer));
 
-    let (_, retry_at) = reactor.pending_closes[&peer];
+    let (_, retry_at) = reactor.state.pending_closes[&peer];
     assert_eq!(reactor.next_maintenance_deadline(), retry_at);
     reactor.handle_status(peer.clone(), 0, pruned_status(&snapshot, target));
     assert_eq!(
@@ -186,8 +192,8 @@ fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
     while outbound.try_recv().is_ok() {}
     reactor.retry_pending_closes(retry_at);
     assert_eq!(next_update(&mut outbound).operation, v9::Operation::Close);
-    assert!(reactor.close_deadlines.contains_key(&peer));
-    assert!(reactor.pending_closes.is_empty());
+    assert!(reactor.state.close_deadlines.contains_key(&peer));
+    assert!(reactor.state.pending_closes.is_empty());
 }
 
 /// A full lifecycle queue still has room for every admitted session's teardown.
@@ -261,7 +267,7 @@ async fn service_teardown_reclaims_lifecycle_capacity() {
     while let Ok(event) = reactor.lifecycle.try_recv() {
         reactor.handle_lifecycle(event);
     }
-    assert_eq!(reactor.peer_state[&peer()].session.session_id(), 8);
+    assert_eq!(reactor.sessions[&peer()].session.session_id(), 8);
     assert!(!second.2.is_cancelled());
     service.remove_peer(&peer(), 7);
     assert!(!second.2.is_cancelled());
@@ -273,7 +279,7 @@ async fn service_teardown_reclaims_lifecycle_capacity() {
     while let Ok(event) = reactor.lifecycle.try_recv() {
         reactor.handle_lifecycle(event);
     }
-    assert!(!reactor.peer_state.contains_key(&peer()));
+    assert!(!reactor.sessions.contains_key(&peer()));
     // Repeating beyond the entire queue capacity catches leaked reservations.
     for generation in 9..410 {
         let session = add(generation);

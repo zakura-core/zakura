@@ -14,7 +14,7 @@ use zakura_rt::{
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
     events::*,
-    pipe::run_peer,
+    peer::run_peer,
     v9::{
         CommonMessage, Cursor, LeaseOwner, Publisher, RegtestMessage, SubscribeError,
         SubscribeHeaders, Subscriber,

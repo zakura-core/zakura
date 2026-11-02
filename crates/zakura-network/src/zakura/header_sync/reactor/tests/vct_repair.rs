@@ -1,3 +1,4 @@
+use super::super::repair::vct_repair_task;
 use super::*;
 use crate::zakura::testkit::{TraceCapture, TraceValue};
 

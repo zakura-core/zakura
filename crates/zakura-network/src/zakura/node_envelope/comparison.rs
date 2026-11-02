@@ -4,7 +4,7 @@
 //! release build:
 //!
 //! ```text
-//! ZAKURA_COMPARISON_PROBE=1 cargo test --release -p zakura-network --lib \
+//! cargo test --release -p zakura-network --lib \
 //!     node_envelope::comparison -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -50,7 +50,9 @@ use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 use zakura_test::allocations::measure;
 
 use crate::zakura::{
-    transport::{NodeResources, ResourceEnvelope, StreamResources, TransportLimits},
+    transport::{
+        frame_wire_bytes, NodeResources, ResourceEnvelope, StreamResources, TransportLimits,
+    },
     DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_RECEIVE_WINDOW,
 };
 
@@ -60,8 +62,8 @@ const SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
 const FRAMES_PER_PEER: u64 = 256;
 /// Peer counts: below and at the default connection cap.
 const PEERS: [usize; 2] = [16, DEFAULT_ZAKURA_MAX_CONNECTIONS];
-/// Object sizes: a small message and a block chunk.
-const FRAME_BYTES: [u64; 2] = [1 << 10, 1 << 20];
+/// Object sizes: an empty message, a small message and a block chunk.
+const FRAME_BYTES: [u64; 3] = [frame_wire_bytes(0), 1 << 10, 1 << 20];
 /// How long a consumer retains a frame: a local hand-off, then a stalled store.
 const CONSUMER_DELAYS: [Duration; 2] = [Duration::ZERO, Duration::from_millis(5)];
 
@@ -119,17 +121,14 @@ enum Scenario {
     BlockedOutput,
     /// Peers reconnect after every frame, so owners keep entering and leaving.
     ReconnectChurn,
-    /// Peers send frames with empty payloads as fast as the owners admit them.
-    EmptyMessageFlood,
     /// One family holds the node budgets while others move floor frames.
     MixedFamilySaturation,
 }
 
-const SCENARIOS: [Scenario; 5] = [
+const SCENARIOS: [Scenario; 4] = [
     Scenario::Throughput,
     Scenario::BlockedOutput,
     Scenario::ReconnectChurn,
-    Scenario::EmptyMessageFlood,
     Scenario::MixedFamilySaturation,
 ];
 
@@ -219,6 +218,8 @@ async fn drive(
     tally: Arc<Tally>,
 ) {
     let node = NodeResources::new(ResourceEnvelope::new(limits));
+    // These hold their budgets until every task below finishes.
+    let (_blocked, _node_budgets);
     let mut tasks = zakura_rt::task::JoinSet::new();
     match scenario {
         Scenario::Throughput => {
@@ -230,21 +231,19 @@ async fn drive(
         }
         Scenario::BlockedOutput => {
             // These peers fill their connection budgets and hold them to the end.
-            let blocked: Vec<_> = (0..peers / 4)
+            _blocked = (0..peers / 4)
                 .map(|_| {
                     let stream = node.connection().stream();
                     let held = u64::from(limits.receive_window) * 2;
                     let grant = stream.raw.try_admit(held);
                     (stream, grant)
                 })
-                .collect();
+                .collect::<Vec<_>>();
             for _ in peers / 4..peers {
                 let stream = node.connection().stream();
                 let (node, tally) = (node.clone(), tally.clone());
                 tasks.spawn(pipe(node, stream, FRAMES_PER_PEER, bytes, delay, tally));
             }
-            while tasks.join_next().await.is_some() {}
-            drop(blocked);
         }
         Scenario::ReconnectChurn => {
             for _ in 0..peers {
@@ -260,16 +259,8 @@ async fn drive(
                 });
             }
         }
-        Scenario::EmptyMessageFlood => {
-            for _ in 0..peers {
-                let stream = node.connection().stream();
-                let (node, tally) = (node.clone(), tally.clone());
-                let empty = crate::zakura::transport::frame_wire_bytes(0);
-                tasks.spawn(pipe(node, stream, FRAMES_PER_PEER, empty, delay, tally));
-            }
-        }
         Scenario::MixedFamilySaturation => {
-            let holds = node.hold_node_budgets();
+            _node_budgets = node.hold_node_budgets();
             for _ in 0..peers {
                 let stream = node.connection().stream();
                 let (node, tally) = (node.clone(), tally.clone());
@@ -283,8 +274,6 @@ async fn drive(
                     }
                 });
             }
-            while tasks.join_next().await.is_some() {}
-            drop(holds);
         }
     }
     while tasks.join_next().await.is_some() {}
@@ -371,12 +360,9 @@ fn tolerance_problems(composed: &Row, baseline: &Row, bound: u128) -> Vec<String
 
 /// Compare every scenario under the composed and baseline limits.
 #[test]
-#[ignore = "manual real-runtime comparison; requires ZAKURA_COMPARISON_PROBE=1"]
+#[ignore = "manual real-runtime comparison"]
 #[allow(clippy::print_stderr)] // Report each row with --nocapture.
 fn composed_owners_stay_within_their_tolerances() {
-    if std::env::var_os("ZAKURA_COMPARISON_PROBE").is_none() {
-        return;
-    }
     let mut problems = Vec::new();
     for scenario in SCENARIOS {
         for peers in PEERS {
@@ -408,7 +394,7 @@ fn composed_owners_stay_within_their_tolerances() {
 /// The decode count must stay equal to the admitted count while the pipeline limit
 /// doesn't bind, and each retry must wait for a capacity release, not spin.
 #[test]
-#[ignore = "manual real-runtime comparison; requires ZAKURA_COMPARISON_PROBE=1"]
+#[ignore = "manual real-runtime comparison"]
 #[allow(clippy::print_stderr)] // Report each row with --nocapture.
 fn failed_decoded_admission_keeps_decodes_within_tolerance() {
     /// Decodes per admitted block a refusing pool may spend.
@@ -417,9 +403,6 @@ fn failed_decoded_admission_keeps_decodes_within_tolerance() {
     /// The pool holds at most this many blocks' bytes before a consumer releases one.
     const RESIDENT: u64 = 16;
 
-    if std::env::var_os("ZAKURA_COMPARISON_PROBE").is_none() {
-        return;
-    }
     let decode = || -> Block {
         zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()

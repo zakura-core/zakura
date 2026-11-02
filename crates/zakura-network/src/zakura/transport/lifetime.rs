@@ -428,7 +428,7 @@ impl FrameGate {
 }
 
 /// The encoded size of a frame with `payload_len` payload bytes.
-pub(crate) fn frame_wire_bytes(payload_len: usize) -> u64 {
+pub(crate) const fn frame_wire_bytes(payload_len: usize) -> u64 {
     // Widening usize to u64 is lossless on supported targets.
     (payload_len as u64).saturating_add(FRAME_HEADER_BYTES as u64)
 }

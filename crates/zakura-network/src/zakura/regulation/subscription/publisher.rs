@@ -6,7 +6,8 @@
 //! pure owner keeps the ledger in its state and its runtime owner keeps the
 //! slots. [`PublicationReporter`] turns the ledger's returned facts into
 //! metrics, logs, and transition events for the runtime owner.
-//! [`Publications`] joins all three for an owner with no such split.
+//! `Publications` joins all three for tests and the testkit, whose owners have
+//! no such split.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -429,6 +430,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> PublicationLedger<K, C> {
 
     /// The cursor of the last page sent, or the acknowledged cursor if none
     /// is unacknowledged. The next page follows it.
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "zakura-testkit", zakura_sim))]
     pub(crate) fn last_sent(&self, key: &K) -> Option<&C> {
         let published = self.live.get(key)?;
         Some(
@@ -455,21 +457,25 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> PublicationLedger<K, C> {
     }
 
     /// Live and closing subscriptions.
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "zakura-testkit", zakura_sim))]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
         self.live.keys()
     }
 
     /// Sent pages the subscriber has not acknowledged.
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "zakura-testkit", zakura_sim))]
     pub(crate) fn unacknowledged(&self, key: &K) -> Option<usize> {
         self.live.get(key).map(|published| published.sent.len())
     }
 
     /// Tombstones held.
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "zakura-testkit", zakura_sim))]
     pub(crate) fn tombstones(&self) -> usize {
         self.tombstones.len()
     }
 
     /// Opens admitted above `max_live`, within the margin.
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "zakura-testkit", zakura_sim))]
     pub(crate) fn over_limit_count(&self) -> u64 {
         self.over_limit
     }
@@ -603,6 +609,7 @@ impl<K> PublicationReporter<K> {
 /// The subscriptions a peer opened on one session: a [`PublicationLedger`],
 /// the [`PublicationSlots`] it names, and its [`PublicationReporter`], under
 /// one owner.
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
 #[derive(Debug)]
 pub(crate) struct Publications<K, C> {
     ledger: PublicationLedger<K, C>,
@@ -610,6 +617,7 @@ pub(crate) struct Publications<K, C> {
     reporter: PublicationReporter<K>,
 }
 
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
 impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
     /// An empty table for the subscription row `limits`.
     pub(crate) fn new(limits: SubscriptionLimits) -> Self {
@@ -703,45 +711,16 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         self.reporter.ended(key);
         self.slots.terminal(slot)
     }
+}
 
-    /// See [`PublicationLedger::last_sent`].
-    pub(crate) fn last_sent(&self, key: &K) -> Option<&C> {
-        self.ledger.last_sent(key)
-    }
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
+impl<K, C> std::ops::Deref for Publications<K, C> {
+    type Target = PublicationLedger<K, C>;
 
-    /// See [`PublicationLedger::unspent`].
-    pub(crate) fn unspent(&self, key: &K) -> Option<Totals> {
-        self.ledger.unspent(key)
-    }
-
-    /// See [`PublicationLedger::is_closing`].
-    pub(crate) fn is_closing(&self, key: &K) -> bool {
-        self.ledger.is_closing(key)
-    }
-
-    /// See [`PublicationLedger::keys`].
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
-        self.ledger.keys()
-    }
-
-    /// See [`PublicationLedger::unacknowledged`].
-    pub(crate) fn unacknowledged(&self, key: &K) -> Option<usize> {
-        self.ledger.unacknowledged(key)
-    }
-
-    /// See [`PublicationLedger::tombstones`].
-    pub(crate) fn tombstones(&self) -> usize {
-        self.ledger.tombstones()
-    }
-
-    /// See [`PublicationLedger::over_limit_count`].
-    pub(crate) fn over_limit_count(&self) -> u64 {
-        self.ledger.over_limit_count()
-    }
-
-    /// See [`PublicationLedger::credit`].
-    pub(crate) fn credit(&self, key: &K) -> Option<&ResponseCredit> {
-        self.ledger.credit(key)
+    /// The ledger's reads. Its writes stay behind the slots and the reporter, so
+    /// this has no `DerefMut`.
+    fn deref(&self) -> &Self::Target {
+        &self.ledger
     }
 }
 

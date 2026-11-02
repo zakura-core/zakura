@@ -550,8 +550,9 @@ fn resume_task_panic<T>(
 pub use header_sync::{
     trace_header_publisher_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
     HeaderMachinePhase, HeaderPublisherHistory, HeaderPublisherStep,
-    HeaderPublisherSubscriptionView, HeaderPublisherView, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView,
-    HeaderReactorStep, HeaderReactorView,
+    HeaderPublisherSubscriptionView, HeaderPublisherView, HeaderReactorHistory,
+    HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
+    HeaderReactorView,
 };
 #[cfg(test)]
 mod tests {

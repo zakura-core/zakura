@@ -12,7 +12,7 @@
 //! - [`SessionTable`] holds each peer's current session, and its
 //!   [`WriterFence`] closes the connection rather than orphan a started
 //!   exchange.
-//! - [`Subscriptions`] and [`Publications`] hold the two sides of a
+//! - [`Subscriptions`] and [`PublicationLedger`] hold the two sides of a
 //!   subscription: renewable credit, ordered updates, the cursor history,
 //!   and tombstones for crossed updates.
 //! - [`sizing`] derives every capacity default from the throughput target.
@@ -56,11 +56,13 @@ pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};
 pub(crate) mod sizing;
 
 mod subscription;
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
+pub(crate) use subscription::Publications;
 pub(crate) use subscription::{
     within_window, Applied, CreditExceeded, PageStall, PublicationLedger, PublicationOpened,
-    PublicationReporter, PublicationSlots, Publications, ResponseCredit, SharedSubscriptions,
-    SlotId, SlotOffer, SubscribeRefused, SubscriptionEnded, SubscriptionFault, SubscriptionLimits,
-    Subscriptions, TerminalPermit, Totals, Update,
+    PublicationReporter, PublicationSlots, ResponseCredit, SharedSubscriptions, SlotId, SlotOffer,
+    SubscribeRefused, SubscriptionEnded, SubscriptionFault, SubscriptionLimits, Subscriptions,
+    TerminalPermit, Totals, Update,
 };
 
 mod slots;

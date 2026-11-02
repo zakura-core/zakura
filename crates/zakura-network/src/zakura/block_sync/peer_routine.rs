@@ -3011,6 +3011,8 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use zakura_node_services::block_memory::BlockHandle;
+    use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
@@ -5298,7 +5300,7 @@ mod tests {
     async fn hand_off_mainnet_block_1_with_pool(
         applying_decoded_bytes: u64,
         queued_decoded_bytes: u64,
-        pool: zakura_node_services::block_memory::DecodedBlockPool,
+        pool: DecodedBlockPool,
         late: bool,
         close_decoded_pool: bool,
     ) -> Option<(u64, SequencedBody, u64)> {
@@ -5561,10 +5563,7 @@ mod tests {
             assert_eq!(pool.reserved_bytes(), bytes);
             let block = sequenced
                 .body
-                .decoded_block(
-                    &pool,
-                    zakura_node_services::block_memory::Admission::WithinLimit,
-                )
+                .decoded_block(&pool, Admission::WithinLimit)
                 .unwrap();
             assert!(
                 matches!(block, BlockHandle::Owned(_)),
@@ -5724,7 +5723,7 @@ mod tests {
                 &ZakuraBlockSyncConfig::default()
                     .decoded_block_pool(10_000)
                     .unwrap(),
-                zakura_node_services::block_memory::Admission::WithinLimit,
+                Admission::WithinLimit,
             )
             .unwrap();
 
@@ -5768,10 +5767,7 @@ mod tests {
         let BlockSyncAction::SubmitBlock { block, .. } = action else {
             panic!("expected a body submission, got {action:?}");
         };
-        assert!(matches!(
-            block,
-            zakura_node_services::block_memory::BlockHandle::Owned(_)
-        ));
+        assert!(matches!(block, BlockHandle::Owned(_)));
         assert_eq!(block, routine_decode);
         assert!(std::ptr::eq(block.header(), routine_decode.header()));
         for (submitted, received) in block

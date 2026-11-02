@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     future,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use proptest::{prop_assert, prop_assert_eq};
 
@@ -4908,7 +4909,7 @@ struct TestSequencer {
 
 struct TestSubmission {
     intent: SubmitItem,
-    block: zakura_node_services::block_memory::BlockHandle,
+    block: BlockHandle,
 }
 
 impl std::ops::Deref for TestSubmission {
@@ -5735,10 +5736,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
 async fn next_submission(
     actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
     timeout: Duration,
-) -> Option<(
-    BlockApplyToken,
-    zakura_node_services::block_memory::BlockHandle,
-)> {
+) -> Option<(BlockApplyToken, BlockHandle)> {
     time::timeout(timeout, async {
         loop {
             let action = actions_rx
@@ -6448,7 +6446,7 @@ struct DetachedWindow {
         zakura_header_chain::BodyWorkOwner,
         zakura_header_chain::SourceId,
         BlockApplyToken,
-        zakura_node_services::block_memory::BlockHandle,
+        BlockHandle,
     )>,
     task: tokio::task::JoinHandle<()>,
 }

@@ -1,6 +1,7 @@
 //! Fixed test vectors for the ReadStateService.
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::TransactionHandle;
 
 use tower::ServiceExt;
 use zakura_chain::{
@@ -110,9 +111,7 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
             let transaction_cases = vec![(
                 ReadRequest::Transaction(transaction.hash()),
                 Ok(ReadResponse::Transaction(Some(MinedTx {
-                    tx: zakura_node_services::block_memory::TransactionHandle::Shared(
-                        transaction.clone(),
-                    ),
+                    tx: TransactionHandle::Shared(transaction.clone()),
                     height: block.coinbase_height().unwrap(),
                     confirmations: 1 + tip_height.0 - block.coinbase_height().unwrap().0,
                     block_time: block.header.time,

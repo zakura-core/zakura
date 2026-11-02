@@ -116,6 +116,7 @@ use std::{
 };
 #[cfg(not(target_os = "windows"))]
 use std::{net::SocketAddr, path::Path};
+use zakura_node_services::block_memory::BlockHandle;
 
 use eyre::{eyre, WrapErr};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -2921,7 +2922,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zakura_node_services::block_memory::BlockHandle::from(zebra_block),
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3047,7 +3048,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zakura_node_services::block_memory::BlockHandle::from(zebra_block),
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );

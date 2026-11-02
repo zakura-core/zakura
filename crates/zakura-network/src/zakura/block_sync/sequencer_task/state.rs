@@ -10,6 +10,7 @@
 //! it changes current work.
 
 use std::collections::VecDeque;
+use zakura_node_services::block_memory::Admission;
 
 use chrono::{DateTime, Utc};
 
@@ -195,7 +196,7 @@ pub(super) struct SubmissionBody {
     /// The payload that IO materializes.
     pub(super) id: super::super::reorder::BodyId,
     /// The admission class of this height's decode.
-    pub(super) admission: zakura_node_services::block_memory::Admission,
+    pub(super) admission: Admission,
 }
 
 /// The result of rolling back a submission the action channel refused.

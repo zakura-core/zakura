@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use zakura_node_services::block_memory::Admission;
 
 use crate::zakura::block_sync::reorder::RetainedBody;
 
@@ -429,7 +430,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
         .materialize(
             facts.id,
             &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
-            zakura_node_services::block_memory::Admission::WithinLimit,
+            Admission::WithinLimit,
         )
         .unwrap();
     policy

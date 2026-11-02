@@ -16,6 +16,7 @@ use std::{
     ops::{RangeBounds, RangeInclusive},
     sync::Arc,
 };
+use zakura_node_services::block_memory::{BlockHandle, HeaderHandle};
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
@@ -67,10 +68,7 @@ where
 
 /// Returns the tip block of `chain`.
 /// If there is no chain, returns the tip of `db`.
-pub fn tip_block<C>(
-    chain: Option<C>,
-    db: &ZakuraDb,
-) -> Option<zakura_node_services::block_memory::BlockHandle>
+pub fn tip_block<C>(chain: Option<C>, db: &ZakuraDb) -> Option<BlockHandle>
 where
     C: AsRef<Chain>,
 {
@@ -541,7 +539,7 @@ fn collect_chain_headers<C>(
     intersection: Option<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<zakura_node_services::block_memory::HeaderHandle>
+) -> Vec<HeaderHandle>
 where
     C: AsRef<Chain>,
 {
@@ -629,7 +627,7 @@ pub fn find_chain_headers<C>(
     known_blocks: Vec<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<zakura_node_services::block_memory::HeaderHandle>
+) -> Vec<HeaderHandle>
 where
     C: AsRef<Chain>,
 {
@@ -684,7 +682,7 @@ pub fn next_median_time_past(
 fn best_relevant_chain(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-) -> Result<Vec<zakura_node_services::block_memory::BlockHandle>, BoxError> {
+) -> Result<Vec<BlockHandle>, BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
@@ -717,9 +715,7 @@ fn best_relevant_chain(
 /// The `relevant_chain` has blocks in reverse height order.
 ///
 /// See [`next_median_time_past()`] for details.
-pub(crate) fn calculate_median_time_past(
-    relevant_chain: Vec<zakura_node_services::block_memory::BlockHandle>,
-) -> DateTime32 {
+pub(crate) fn calculate_median_time_past(relevant_chain: Vec<BlockHandle>) -> DateTime32 {
     let relevant_data: Vec<DateTime<Utc>> = relevant_chain
         .iter()
         .map(|block| block.header().time)

@@ -13,6 +13,7 @@
 //! making the state service depend on network serving policy.
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::future::BoxFuture;
 use tower::ServiceExt;
@@ -33,7 +34,7 @@ impl BlockRangeSnapshot {
         &self,
         db: &ZakuraDb,
         height: block::Height,
-    ) -> Option<(zakura_node_services::block_memory::BlockHandle, usize)> {
+    ) -> Option<(BlockHandle, usize)> {
         if height > self.tip? {
             return None;
         }

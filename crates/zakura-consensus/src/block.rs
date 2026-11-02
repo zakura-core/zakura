@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::Utc;
 use futures::stream::FuturesUnordered;
@@ -761,7 +762,7 @@ async fn try_prepared_fast_path<S>(
     prepared_candidates: &prepared::PreparedCandidateCache,
     state_service: &mut S,
     network: &Network,
-    block: zakura_node_services::block_memory::BlockHandle,
+    block: BlockHandle,
     hash: block::Hash,
     (height, receipt_order): (block::Height, Option<u64>),
     admission: &zs::BlockAdmission,

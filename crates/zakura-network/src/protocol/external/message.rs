@@ -1,6 +1,7 @@
 //! Definitions of network messages.
 
 use std::{error::Error, fmt};
+use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::{DateTime, Utc};
 
@@ -217,7 +218,7 @@ pub enum Message {
             any(test, feature = "proptest-impl"),
             proptest(strategy = "any::<Arc<Block>>().prop_map(Into::into)")
         )]
-        zakura_node_services::block_memory::BlockHandle,
+        BlockHandle,
     ),
 
     /// A `tx` message.

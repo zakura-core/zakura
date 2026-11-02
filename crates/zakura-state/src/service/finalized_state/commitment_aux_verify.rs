@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::{BlockHandle, HeaderHandle};
 
 use zakura_chain::{
     block::{merkle::AuthDataRoot, Header, Height},
@@ -28,8 +29,8 @@ use crate::{service::check, ValidateContextError};
 /// One block-sized step in supplied commitment-root verification.
 #[derive(Clone, Debug)]
 pub(crate) struct CommitmentRootVerification {
-    pub(crate) block: Option<zakura_node_services::block_memory::BlockHandle>,
-    pub(crate) header: zakura_node_services::block_memory::HeaderHandle,
+    pub(crate) block: Option<BlockHandle>,
+    pub(crate) header: HeaderHandle,
     pub(crate) height: Height,
     pub(crate) roots: Option<(
         sapling::tree::Root,
@@ -44,7 +45,7 @@ impl CommitmentRootVerification {
     /// Verify this block's parent-history commitment, then fold the supplied
     /// per-block roots into the running history tree for the next block.
     pub(crate) fn with_roots(
-        block: zakura_node_services::block_memory::BlockHandle,
+        block: BlockHandle,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
         ironwood_root: ironwood::tree::Root,
@@ -413,7 +414,7 @@ mod tests {
     }
 
     fn verification_item(
-        block: zakura_node_services::block_memory::BlockHandle,
+        block: BlockHandle,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
     ) -> CommitmentRootVerification {
@@ -442,7 +443,7 @@ mod tests {
             None,
             true,
         );
-        let zakura_node_services::block_memory::BlockHandle::Shared(retained) =
+        let BlockHandle::Shared(retained) =
             with_roots.block.as_ref().expect("roots item has a block")
         else {
             panic!("the fixture supplies a shared block")

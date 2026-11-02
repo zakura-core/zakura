@@ -5,6 +5,7 @@
 // TODO: move these tests into tests::vectors and tests::prop modules.
 
 use std::{env, sync::Arc, time::Duration};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 use tokio::{runtime::Runtime, time::timeout};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
@@ -270,7 +271,7 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
 
 fn assert_decoded_payload_retained(
     probe: &zakura_node_services::block_memory::model::Probe,
-    pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    pool: &DecodedBlockPool,
     bytes: u64,
 ) {
     let allocation = probe.read(1, std::slice::from_ref(pool)).unwrap();
@@ -299,7 +300,7 @@ fn assert_decoded_payload_retained(
 
 async fn wait_for_decoded_payload_release(
     probe: &zakura_node_services::block_memory::model::Probe,
-    pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    pool: &DecodedBlockPool,
     limit: Duration,
 ) {
     timeout(limit, async {

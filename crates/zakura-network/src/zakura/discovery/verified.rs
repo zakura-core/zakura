@@ -25,12 +25,6 @@ impl VerifiedRecord {
     }
 }
 
-impl PartialEq<ZakuraNodeRecord> for VerifiedRecord {
-    fn eq(&self, other: &ZakuraNodeRecord) -> bool {
-        self.0 == *other
-    }
-}
-
 impl Deref for VerifiedRecord {
     type Target = ZakuraNodeRecord;
 

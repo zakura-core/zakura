@@ -1878,15 +1878,6 @@ fn successive_responses_cannot_grow_one_peers_live_summaries() {
 }
 
 #[test]
-fn production_books_draw_distinct_disclosure_keys() {
-    let requester = relay(0);
-    let hashes: HashSet<u64> = (0..4)
-        .map(|_| ZakuraDiscoveryBook::default().window_hash(requester, 1))
-        .collect();
-    assert_eq!(hashes.len(), 4, "each book draws a random key");
-}
-
-#[test]
 fn book_trace_reports_exact_install_replacement_and_eviction() {
     let steps = trace_discovery_book_bytes(BOOK_TRACE_WITNESS);
     assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");

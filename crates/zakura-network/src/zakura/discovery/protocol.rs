@@ -1098,6 +1098,8 @@ impl DisclosureKey {
         Self::new(bytes)
     }
 
+    /// Keys a requester's sample window with domain-separated BLAKE2b.
+    /// The explicit key and little-endian epoch make identical inputs replayable.
     fn hash(&self, requester: NodeId, epoch: u64) -> u64 {
         let mut hasher = blake2b_simd::Params::new()
             .hash_length(8)
@@ -2309,7 +2311,7 @@ impl ZakuraDiscoveryBook {
             return Vec::new();
         }
         // The remainder is below `len`, so it fits usize.
-        let offset = (self.disclosure_hash(requester, snapshot.epoch) % len as u64) as usize;
+        let offset = (self.disclosure_key.hash(requester, snapshot.epoch) % len as u64) as usize;
 
         let mut records: Vec<ZakuraNodeRecord> = snapshot
             .node_ids
@@ -2393,18 +2395,6 @@ impl ZakuraDiscoveryBook {
         node_ids.sort_unstable_by_key(node_id_sort_key);
         node_ids.shuffle(rng);
         node_ids
-    }
-
-    /// Returns `requester`'s window hash in `epoch`.
-    #[cfg(test)]
-    pub(super) fn window_hash(&self, requester: NodeId, epoch: u64) -> u64 {
-        self.disclosure_hash(requester, epoch)
-    }
-
-    /// Keys a requester's sample window with domain-separated BLAKE2b.
-    /// The explicit key and little-endian epoch make identical inputs replayable.
-    fn disclosure_hash(&self, requester: NodeId, epoch: u64) -> u64 {
-        self.disclosure_key.hash(requester, epoch)
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
@@ -7370,6 +7360,19 @@ mod tests {
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.added, 1);
         assert_eq!(outcome.rejected, 1);
+    }
+
+    #[test]
+    fn production_books_draw_distinct_disclosure_keys() {
+        let requester = NodeSecretKey::from_bytes(&[40; 32]).public();
+        let hashes: HashSet<u64> = (0..4)
+            .map(|_| {
+                ZakuraDiscoveryBook::default()
+                    .disclosure_key
+                    .hash(requester, 1)
+            })
+            .collect();
+        assert_eq!(hashes.len(), 4, "each book draws a random key");
     }
 
     #[tokio::test]

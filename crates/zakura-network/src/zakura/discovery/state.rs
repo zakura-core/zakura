@@ -11,9 +11,9 @@ use super::protocol::{
     normalize_services, push_unique_service, BookChange, DialCandidateExclusions, DisclosureKey,
     DiscoveryBookError, DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome,
     ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
-    ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate,
-    ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry,
-    ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
+    ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
+    ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
+    ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
@@ -130,15 +130,13 @@ impl ZakuraActiveServiceEntry {
     }
 
     fn from_live_summaries(summaries: Vec<ZakuraCachedLiveServiceSummary>) -> Self {
-        let mut services = Vec::new();
-        for summary in &summaries {
-            push_unique_service(&mut services, summary.service_id.clone());
-        }
-        Self {
+        let mut entry = Self {
             record: None,
-            services,
+            services: Vec::new(),
             live_summaries: summaries,
-        }
+        };
+        entry.refresh_live_derived_services();
+        entry
     }
 
     fn update_record(&mut self, record: VerifiedRecord, services: Vec<ZakuraServiceId>) {
@@ -438,7 +436,7 @@ impl DiscoveryState {
         self.active_services
             .get(node_id)
             .and_then(|active| active.record.as_ref())
-            .filter(|stored| **stored == *record)
+            .filter(|stored| ***stored == *record)
             .cloned()
     }
 
@@ -714,10 +712,12 @@ impl DiscoveryState {
         now: u64,
         rng: &mut R,
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
-        let required_services = bounded_services(required_services, self.config.book_limits);
+        let required_services = required_services
+            .get(..self.config.book_limits.max_services_per_record)
+            .unwrap_or(required_services);
         self.book.dial_candidates(
             limit,
-            &required_services,
+            required_services,
             preferred_services,
             exclusions,
             now,
@@ -874,17 +874,6 @@ fn effective_live_summary_expiry(
     // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
     // peer's intentionally shorter lifetime.
     Some(local_expiry)
-}
-
-fn bounded_services(
-    services: &[ZakuraServiceId],
-    limits: ZakuraDiscoveryBookLimits,
-) -> Vec<ZakuraServiceId> {
-    services
-        .iter()
-        .take(limits.max_services_per_record)
-        .cloned()
-        .collect()
 }
 
 fn push_excluded_node_id(excluded: &mut Vec<[u8; 32]>, node_id: NodeId, max_node_ids: usize) {

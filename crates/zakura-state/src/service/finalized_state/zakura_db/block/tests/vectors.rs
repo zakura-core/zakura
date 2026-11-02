@@ -383,7 +383,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
     };
     assert_eq!(headers.len(), 1);
     assert!(matches!(headers[0], HeaderHandle::Standalone(_)));
-    let pool = read.db.read_headers.clone();
+    let pool = read.db.read_capacity.headers.clone();
     assert_eq!(
         pool.available_slots(),
         usize::from(limit.get()) - 1,

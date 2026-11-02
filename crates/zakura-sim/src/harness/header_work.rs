@@ -25,7 +25,8 @@ pub const PUBLISHER: Machine = Machine {
     identity: "header-publisher",
     claim: "The header publisher's credit, jobs, terminal outcomes, and slots agree with \
             the independent model after every input.",
-    generator: 1,
+    // Version 2 reads a `Finish` with an odd third byte as a storage reply.
+    generator: 2,
     budget: 128,
     history: publisher_history,
     reached: |steps, _| steps.iter().any(publisher_reached),

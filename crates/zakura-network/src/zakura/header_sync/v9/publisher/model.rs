@@ -1277,7 +1277,7 @@ pub struct HeaderPublisherView {
     pub exit: Option<&'static str>,
 }
 
-/// One decoder-v1 publisher operation.
+/// One decoder-v2 publisher operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderPublisherStep {
     /// The operation's number, from one.
@@ -1292,7 +1292,7 @@ pub struct HeaderPublisherStep {
     pub failure: Option<HeaderMachineFailure>,
 }
 
-/// A decoder-v1 publisher history. It stops at the first failure or when the
+/// A decoder-v2 publisher history. It stops at the first failure or when the
 /// publisher stops.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderPublisherHistory {
@@ -1308,7 +1308,7 @@ fn exit_name(exit: Exit) -> &'static str {
     }
 }
 
-/// Capture decoder-v1 operations without changing the decoder or starting a
+/// Capture decoder-v2 operations without changing the decoder or starting a
 /// runtime. Driver panics stop the history and stay distinct from property
 /// failures.
 pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
@@ -1342,6 +1342,9 @@ pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
     HeaderPublisherHistory { steps }
 }
 
+/// Decoder v2, the simulator's generator 2 for this machine. Version 1 read every
+/// `Finish` as an [`Answer`] from its second byte. Version 2 reads a `Finish` with an
+/// odd third byte as a [`Reply`], so bytes saved under version 1 can change meaning.
 fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
     data[..data.len().min(512)].chunks(4).map(|chunk| {
         let a = chunk[0];

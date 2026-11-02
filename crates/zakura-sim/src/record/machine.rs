@@ -228,7 +228,7 @@ pub struct HeaderPublisherView {
     pub exit: Option<String>,
 }
 
-/// One decoder-v1 header publisher operation.
+/// One decoder-v2 header publisher operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderPublisherStep {

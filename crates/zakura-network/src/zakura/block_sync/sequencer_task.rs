@@ -381,8 +381,8 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
 /// work queue, an action sender, and the
-/// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
-/// `Misbehavior` on the same action channel the reactor uses.
+/// committed throughput meter. Emits `SubmitBlock` / `Misbehavior` on the same action
+/// channel the reactor uses. It settles request bytes only through the work queue.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
     retained_body_limit: u64,
@@ -847,7 +847,6 @@ impl SequencerTask {
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
         self.work.reset_above(tip);
-
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
@@ -874,7 +873,6 @@ impl SequencerTask {
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         if advance.changed {
             self.work.advance_floor(frontiers.verified_block_tip);
-
             self.release_contiguous_blocks().await;
         }
     }
@@ -1138,7 +1136,6 @@ impl SequencerTask {
                 let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
                 self.work.reset_above(self.sequencer.floor());
-
                 let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result identifies a bad body from a peer.
                 // Attribute it to the delivering peer.

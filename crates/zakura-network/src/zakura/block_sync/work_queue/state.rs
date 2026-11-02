@@ -5,12 +5,13 @@
 //! clock, lock, atomic, or channel. [`WorkQueue`](super::WorkQueue) calls each
 //! transition under the queue lock and delivers the returned [`WorkWake`] at the
 //! transition's existing linearization point. Request-write registrations, their
-//! write-status fences, and byte-budget guards stay in IO.
+//! write-status fences, and pooled byte funding stay in IO.
 //!
 //! Every height is in exactly one of `{below-floor (gone), pending, in_flight}`.
 //! A charge enters the ledger only at claim publication and leaves it exactly once,
-//! through the `released_bytes` of the transition that ended it. The caller returns
-//! those bytes to the byte budget that funded the request.
+//! through the `released_bytes` of the transition that ended it. IO settles those
+//! bytes from the queue's pooled funding. Ledger arithmetic is checked: a failure keeps
+//! the last valid values and latches a [`LedgerFault`], which closes the budget.
 
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 
@@ -133,8 +134,8 @@ pub(in crate::zakura::block_sync) struct WorkWake {
 #[must_use]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::zakura::block_sync) struct WorkDelta {
-    /// Reservation bytes that left the ledger. The caller returns exactly these
-    /// bytes to the funding byte budget, once.
+    /// Reservation bytes that left the ledger. The queue settles exactly these
+    /// bytes from its pooled funding, once.
     pub(in crate::zakura::block_sync) released_bytes: u64,
     /// Wakeups the change requires.
     pub(in crate::zakura::block_sync) wake: WorkWake,
@@ -483,7 +484,7 @@ impl WorkQueueState {
     ///
     /// Every taken item becomes a provisional, unpublished claim of `attempt`'s
     /// exact owner. A reset followed by a new take cannot be undone by this
-    /// attempt's cleanup. The take charges nothing: the attempt's own budget guard
+    /// attempt's cleanup. The take charges nothing: the attempt's own funding
     /// holds its bytes until publication.
     pub(in crate::zakura::block_sync) fn take_budgeted(
         &mut self,
@@ -561,8 +562,8 @@ impl WorkQueueState {
     /// provisionally move back to `pending`, so a stale claim cannot return a
     /// replacement owner's work. Returns no wake: the returning routine would
     /// otherwise wake itself, and the failure that freed the work already woke
-    /// other routines. Releases no ledger charge: the attempt's own budget guard
-    /// still holds the funded bytes.
+    /// other routines. Releases no ledger charge: the attempt's own funding
+    /// still holds its bytes.
     pub(in crate::zakura::block_sync) fn return_unpublished(
         &mut self,
         items: &[(block::Height, WorkItem)],

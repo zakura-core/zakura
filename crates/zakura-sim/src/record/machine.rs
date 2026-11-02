@@ -44,22 +44,6 @@ pub enum MachineStep {
     HeaderPublisher(HeaderPublisherStep),
 }
 
-impl MachineStep {
-    /// The failure that stopped the run at this operation, if any.
-    pub fn failure(&self) -> Option<MachineFailure> {
-        match self {
-            Self::Work(step) => step.failure.clone(),
-            Self::WorkFunding(step) => step.failure.clone(),
-            Self::DecodedRetention(step) => step.failure.clone(),
-            Self::HeaderReactor(step) => step.failure.clone(),
-            Self::Reactor(step) => step.failure.clone(),
-            Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
-            Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
-            Self::HeaderPublisher(step) => step.failure.clone(),
-        }
-    }
-}
-
 /// Decoder-v1 evidence for the decoded-block runtime owner.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +103,8 @@ impl MachineStep {
             Self::WorkFunding(step) => step.failure.clone(),
             Self::Reactor(step) => step.failure.clone(),
             Self::DecodedRetention(step) => step.failure.clone(),
+            Self::HeaderReactor(step) => step.failure.clone(),
+            Self::HeaderPublisher(step) => step.failure.clone(),
         }
     }
 }
@@ -596,17 +582,6 @@ impl From<zakura_network::zakura::WorkOwnershipFailure> for MachineFailure {
                 WorkOwnershipPhase::Transition => FailurePhase::Transition,
                 WorkOwnershipPhase::Invariant => FailurePhase::Invariant,
             },
-            message: value.message,
-        }
-    }
-}
-
-impl From<DriverFailure> for MachineFailure {
-    /// Discovery drivers stop only on a checked invariant or a driver panic.
-    fn from(value: DriverFailure) -> Self {
-        Self {
-            property_failure: value.property_failure,
-            phase: FailurePhase::Invariant,
             message: value.message,
         }
     }

@@ -293,13 +293,6 @@ mod machine_tests {
         }
     }
 
-    fn fixture(record: &mut StepRecord) -> &mut FixtureStep {
-        match record.machine.as_deref_mut() {
-            Some(MachineStep::Fixture(step)) => step,
-            other => panic!("the record holds fixture evidence, not {other:?}"),
-        }
-    }
-
     #[test]
     fn machine_evidence_round_trips_and_changes_exact_replay() {
         let record = StepRecord {

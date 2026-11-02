@@ -62,7 +62,7 @@ impl Reached {
                 self.retained_hint |= retained_hint;
                 self.last_step_applied_rule = stale_result || current_result || retained_hint;
             }
-            MachineStep::Fixture(_) => {}
+            _ => {}
         }
     }
 }

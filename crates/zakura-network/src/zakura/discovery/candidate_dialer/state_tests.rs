@@ -831,7 +831,6 @@ fn registrations_credit_only_the_attempt_that_authenticated() {
     use DiscoveryDialResult as R;
     use PeerRegistration::{Absent, Ended, Live};
     let dial = DialObservation::DialEnded;
-    #[rustfmt::skip]
     let rows = [
         (dial(Served, Live), true, Some(R::ConnectedElsewhere)),
         (dial(Failed, Live), false, Some(R::ConnectedElsewhere)),

@@ -610,7 +610,7 @@ impl BookDriver {
                 };
                 // Every supplier's record takes the production path: verify, then install.
                 let result = match VerifiedRecord::verify(record, &context) {
-                    Ok(verified) => self.book.import_verified_tracked(
+                    Ok(verified) => self.book.import_verified_record(
                         verified,
                         source,
                         now,
@@ -1332,6 +1332,7 @@ impl StateDriver {
                     verified,
                     &connected,
                     now,
+                    &mut Vec::new(),
                 );
                 self.result = Some(install_fact(&result));
                 if self.model.is_current(peer, conn_id, session_id) {
@@ -1686,7 +1687,7 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
         ServiceAdmissionDecision::Admit
     );
 
-    let late = state.install_session_record(&a, verified_for_a, &connected, now);
+    let late = state.install_session_record(&a, verified_for_a, &connected, now, &mut Vec::new());
     assert!(matches!(late, Err(SessionRecordError::Superseded)));
     assert_eq!(
         late.map_err(|error| error.verdict()),
@@ -1713,7 +1714,7 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
         VerifiedRecord::verify(hello(0), &context(now)).expect("the hello is authentic");
     assert_eq!(
         state
-            .install_session_record(&b, verified_for_b, &connected, now)
+            .install_session_record(&b, verified_for_b, &connected, now, &mut Vec::new())
             .ok(),
         Some(ImportOutcome::Added)
     );
@@ -1753,7 +1754,7 @@ fn signed_record_expiry_does_not_expire_the_live_summary_ttl() {
     );
     let verified = VerifiedRecord::verify(short_lived, &context(now)).expect("authentic");
     state
-        .install_session_record(&a, verified, &connected, now)
+        .install_session_record(&a, verified, &connected, now, &mut Vec::new())
         .expect("the record installs");
     state
         .receive_session_live_summaries(&a, node_id, services(node_id, u64::MAX), &connected, now)
@@ -1823,7 +1824,7 @@ fn connection_churn_cannot_grow_retained_service_hints() {
         let verified =
             VerifiedRecord::verify(record, &context(START)).expect("the fixture is authentic");
         state
-            .install_connected_peer_record(verified, &[peer.public()], START)
+            .install_connected_peer_record(verified, &[peer.public()], START, &mut Vec::new())
             .expect("the record installs");
         assert_eq!(
             state.retained_hints().len(),
@@ -2045,7 +2046,13 @@ fn discovery_state_witness_rejects_unearned_service_hint() {
                 let verified = VerifiedRecord::verify(hello(0), &context(START))
                     .expect("fixture is authentic");
                 state
-                    .install_session_record(&session(0, conn, id), verified, &[], START)
+                    .install_session_record(
+                        &session(0, conn, id),
+                        verified,
+                        &[],
+                        START,
+                        &mut Vec::new(),
+                    )
                     .expect("session is current");
             }
         }

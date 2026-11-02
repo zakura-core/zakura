@@ -1155,7 +1155,8 @@ pub(super) enum EvictionCause {
     BookLimit,
 }
 
-/// Logs each change to the book.
+/// Logs each change to the book. The handle calls this after it releases the
+/// state lock, so the book's transitions stay free of logging.
 fn log_book_changes(changes: &[BookChange]) {
     for change in changes {
         tracing::debug!(?change, "Zakura discovery book changed");
@@ -1622,11 +1623,13 @@ impl ZakuraDiscoveryHandle {
         }
 
         let now = current_unix_secs();
+        let mut changes = Vec::new();
         self.inner
             .lock()
             .await
-            .install_relayed(authentic, source, now, &mut outcome);
+            .install_relayed(authentic, source, now, &mut outcome, &mut changes);
         drop(verification_slot);
+        log_book_changes(&changes);
         Ok(outcome)
     }
 
@@ -1683,7 +1686,14 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let now = current_unix_secs();
-        self.inner.lock().await.import_static_record(record, now)
+        let mut changes = Vec::new();
+        let result = self
+            .inner
+            .lock()
+            .await
+            .import_static_record(record, now, &mut changes);
+        log_book_changes(&changes);
+        result
     }
 
     /// Imports a connected peer's latest self-record and updates active service hints.
@@ -1704,10 +1714,15 @@ impl ZakuraDiscoveryHandle {
             .await?;
         let now = current_unix_secs();
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
-        self.inner
-            .lock()
-            .await
-            .install_connected_peer_record(verified.0, &connected_node_ids, now)
+        let mut changes = Vec::new();
+        let result = self.inner.lock().await.install_connected_peer_record(
+            verified.0,
+            &connected_node_ids,
+            now,
+            &mut changes,
+        );
+        log_book_changes(&changes);
+        result
     }
 
     /// Imports a connected peer's latest self-record, received on `session`, as
@@ -1724,12 +1739,16 @@ impl ZakuraDiscoveryHandle {
             .await?;
         let now = current_unix_secs();
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
-        self.inner.lock().await.install_session_record(
+        let mut changes = Vec::new();
+        let result = self.inner.lock().await.install_session_record(
             session,
             verified.0,
             &connected_node_ids,
             now,
-        )
+            &mut changes,
+        );
+        log_book_changes(&changes);
+        result
     }
 
     /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
@@ -1791,10 +1810,14 @@ impl ZakuraDiscoveryHandle {
         entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
     ) -> ImportBatchOutcome {
         let now = current_unix_secs();
-        self.inner
+        let mut changes = Vec::new();
+        let outcome = self
+            .inner
             .lock()
             .await
-            .import_persisted_entries(entries, now)
+            .import_persisted_entries(entries, now, &mut changes);
+        log_book_changes(&changes);
+        outcome
     }
 
     /// Inserts a trusted static/bootstrap dial candidate.
@@ -2152,29 +2175,15 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, source, false, now, context)
+        self.import_record_inner(record, source, false, now, context, &mut Vec::new())
     }
 
-    /// Imports one peer record whose author checks already passed.
+    /// Imports one peer record whose author checks already passed, and appends
+    /// each resulting change to `changes`, including on failure.
     ///
     /// Expiry, storage limits, address policy, and sequence order still run
     /// here.
     pub(super) fn import_verified_record(
-        &mut self,
-        record: VerifiedRecord,
-        source: Option<NodeId>,
-        now: u64,
-        context: &DiscoveryRecordValidationContext,
-    ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let mut changes = Vec::new();
-        let result = self.import_verified_tracked(record, source, now, context, &mut changes);
-        log_book_changes(&changes);
-        result
-    }
-
-    /// Imports one peer record as [`Self::import_verified_record`] does, and
-    /// appends each resulting change to `changes`, including on failure.
-    pub(super) fn import_verified_tracked(
         &mut self,
         record: VerifiedRecord,
         source: Option<NodeId>,
@@ -2198,7 +2207,19 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, None, true, now, context)
+        self.import_static_record_tracked(record, now, context, &mut Vec::new())
+    }
+
+    /// Imports one signed static/bootstrap record as [`Self::import_static_record`]
+    /// does, and appends each resulting change to `changes`.
+    pub(super) fn import_static_record_tracked(
+        &mut self,
+        record: ZakuraNodeRecord,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
+    ) -> Result<ImportOutcome, DiscoveryBookError> {
+        self.import_record_inner(record, None, true, now, context, changes)
     }
 
     /// Returns a bounded peer sample from the requester's disclosure window.
@@ -2572,10 +2593,22 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> ImportBatchOutcome {
+        self.import_persisted_entries_tracked(entries, now, context, &mut Vec::new())
+    }
+
+    /// Imports entries as [`Self::import_persisted_entries`] does, and appends each
+    /// resulting change to `changes`.
+    pub(super) fn import_persisted_entries_tracked(
+        &mut self,
+        entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
+    ) -> ImportBatchOutcome {
         let mut outcome = ImportBatchOutcome::default();
         for entry in entries {
             outcome.attempted += 1;
-            match self.import_persisted_entry(entry, now, context) {
+            match self.import_persisted_entry(entry, now, context, changes) {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
             }
@@ -2588,6 +2621,7 @@ impl ZakuraDiscoveryBook {
         entry: ZakuraDiscoveryPersistedEntry,
         now: u64,
         context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let metadata = DiscoveryEntryMetadata {
             source: entry.source,
@@ -2599,10 +2633,7 @@ impl ZakuraDiscoveryBook {
             failure_count: entry.failure_count,
         };
         let record = self.verify_foreign(entry.record, context)?;
-        let mut changes = Vec::new();
-        let result = self.install_record(record, metadata, now, context, &mut changes);
-        log_book_changes(&changes);
-        result
+        self.install_record(record, metadata, now, context, changes)
     }
 
     fn import_record_inner(
@@ -2612,13 +2643,11 @@ impl ZakuraDiscoveryBook {
         is_static: bool,
         now: u64,
         context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let record = self.verify_foreign(record, context)?;
         let metadata = import_metadata(&record, source, is_static, now);
-        let mut changes = Vec::new();
-        let result = self.install_record(record, metadata, now, context, &mut changes);
-        log_book_changes(&changes);
-        result
+        self.install_record(record, metadata, now, context, changes)
     }
 
     /// Runs the author checks of a record about another node.

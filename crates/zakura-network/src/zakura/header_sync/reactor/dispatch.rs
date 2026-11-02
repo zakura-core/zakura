@@ -1,6 +1,26 @@
 //! Starting header storage calls and reporting how they end.
 
+use zakura_node_services::header_chain as port;
+
 use super::*;
+
+/// Reports that a storage call's future ended with `$end`.
+///
+/// Outside test and simulator builds the macro expands to nothing.
+#[cfg(any(test, zakura_sim))]
+macro_rules! tap_end {
+    ($context:expr, $end:expr) => {
+        $context.tap.end($end)
+    };
+}
+
+/// Reports that a storage call's future ended with `$end`.
+///
+/// Outside test and simulator builds the macro expands to nothing.
+#[cfg(not(any(test, zakura_sim)))]
+macro_rules! tap_end {
+    ($context:expr, $end:expr) => {};
+}
 
 pub(super) type PendingPortOperation =
     Pin<Box<dyn Future<Output = StorageOutcome> + Send + 'static>>;
@@ -107,6 +127,195 @@ pub(super) fn end_retained(retained: &mut Option<RetainedHeaders>, end: HeaderWo
     }
 }
 
+/// What every direct storage call's future runs with.
+struct CallContext {
+    header_chain: std::sync::Arc<dyn port::Port>,
+    request_timeout: std::time::Duration,
+    #[cfg(any(test, zakura_sim))]
+    tap: observe::PortTap,
+}
+
+/// The work a target preparation or application belongs to.
+struct TargetCall {
+    peer: ZakuraPeerId,
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+}
+
+impl TargetCall {
+    fn prepared(self, result: HeaderTargetPreparationResult) -> StorageCompletion {
+        StorageCompletion::TargetPrepared {
+            peer: self.peer,
+            source: self.source,
+            owner: self.owner,
+            result,
+        }
+    }
+
+    fn admitted(self, result: HeaderTargetAdmissionResult) -> StorageCompletion {
+        StorageCompletion::TargetAdmission {
+            peer: self.peer,
+            source: self.source,
+            owner: self.owner,
+            result,
+        }
+    }
+}
+
+impl CallContext {
+    async fn read_locator(
+        self,
+        peer: ZakuraPeerId,
+        key: LocatorKey,
+        permit: port::LocatorReadPermit,
+    ) -> StorageCompletion {
+        let result = zakura_rt::time::timeout(
+            self.request_timeout,
+            self.header_chain.continuation_locator(permit.clone()),
+        )
+        .await;
+        tap_end!(self, observe::CallEnd::of_timed(&result));
+        let locator = match result {
+            Ok(Ok(locator)) => locator,
+            Ok(Err(error)) => {
+                tracing::debug!(?peer, ?error, "header locator unavailable");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(?peer, "header locator query timed out");
+                None
+            }
+        };
+        drop(permit);
+        StorageCompletion::Locator { key, locator }
+    }
+
+    async fn read_repair_context(
+        self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> StorageCompletion {
+        let result = zakura_rt::time::timeout(
+            self.request_timeout,
+            self.header_chain.vct_repair_context(owner, height),
+        )
+        .await;
+        tap_end!(self, observe::CallEnd::of_timed(&result));
+        let result = match result {
+            Ok(Ok(port::VctRepairContextReply::Resolved(context))) => {
+                VctRepairContextResult::Resolved(context)
+            }
+            Ok(Ok(port::VctRepairContextReply::Stale)) => VctRepairContextResult::Stale,
+            Ok(Err(error)) => {
+                tracing::debug!(?owner, ?error, "VCT repair context unavailable");
+                VctRepairContextResult::Unavailable
+            }
+            Err(_) => {
+                tracing::debug!(?owner, "VCT repair context timed out");
+                VctRepairContextResult::Unavailable
+            }
+        };
+        StorageCompletion::VctRepairContext { owner, result }
+    }
+
+    async fn prepare_target(
+        self,
+        call: TargetCall,
+        purpose: HeaderTargetPurpose,
+        common_ancestor: zakura_header_chain::Frontier,
+        target: zakura_header_chain::Frontier,
+        completion: zakura_header_chain::TargetCompletion,
+        entries: Vec<HeaderEntry>,
+    ) -> StorageCompletion {
+        if matches!(
+            &purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ) && !matches!(
+            (&purpose, completion),
+            (
+                HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                    selected_target: purpose_target,
+                    ..
+                },
+                zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                    selected_target,
+                    ..
+                },
+            ) if *purpose_target == target
+                && selected_target == target
+                && !entries.is_empty()
+                && entries.iter().all(|entry| entry.tree_aux.is_some())
+                && entries.last().is_some_and(|entry| entry.header.hash() == target.hash)
+        ) {
+            let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
+                zakura_header_chain::HeaderChainError::stale_target(
+                    zakura_header_chain::ErrorSubject::Branch(call.owner.header_authority().branch),
+                ),
+            ));
+            tap_end!(self, observe::CallEnd::NotSubmitted);
+            return call.prepared(result);
+        }
+        let entries = match port::TargetEntries::try_from(
+            entries
+                .into_iter()
+                .map(port_header_entry)
+                .collect::<Vec<_>>(),
+        ) {
+            Ok(entries) => entries,
+            Err(error) => {
+                let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
+                    zakura_header_chain::HeaderChainError::malformed_protocol(
+                        zakura_header_chain::ErrorSubject::Request {
+                            source: call.source,
+                            request_id: call.owner.request_id(),
+                        },
+                        zakura_header_chain::RuleId::new("LC-WIRE-08"),
+                        call.source,
+                        Some(Box::new(error)),
+                    ),
+                ));
+                tap_end!(self, observe::CallEnd::NotSubmitted);
+                return call.prepared(result);
+            }
+        };
+        let result = self
+            .header_chain
+            .prepare_header_target(port::PrepareHeaderTarget {
+                source: call.source,
+                owner: call.owner,
+                common_ancestor,
+                target,
+                entries,
+                completion,
+            })
+            .await
+            .map(HeaderTargetPreparationResult::Prepared)
+            .unwrap_or_else(HeaderTargetPreparationResult::Failed);
+        tap_end!(self, observe::CallEnd::Replied);
+        call.prepared(result)
+    }
+
+    async fn apply_target(
+        self,
+        call: TargetCall,
+        target: zakura_node_services::header_chain::PreparedHeaderTarget,
+    ) -> StorageCompletion {
+        let result = self
+            .header_chain
+            .apply_header_target(target)
+            .await
+            .map(|outcome| match outcome {
+                port::ApplyHeaderTargetOutcome::Applied => HeaderTargetAdmissionResult::Applied,
+                port::ApplyHeaderTargetOutcome::ResourceStalled(receipt) => {
+                    HeaderTargetAdmissionResult::ResourceStalled(receipt)
+                }
+            })
+            .unwrap_or_else(HeaderTargetAdmissionResult::Failed);
+        tap_end!(self, observe::CallEnd::Replied);
+        call.admitted(result)
+    }
+}
+
 impl HeaderSyncReactor {
     pub(super) fn dispatch_action(&mut self, action: HeaderPortOperation) -> StorageDispatch {
         self.dispatch_holding(action, None)
@@ -136,8 +345,6 @@ impl HeaderSyncReactor {
         action: HeaderPortOperation,
         mut held: Option<RetainedHeaders>,
     ) -> StorageDispatch {
-        use zakura_node_services::header_chain as port;
-
         let Some(kind) = StorageCallKind::of(&action) else {
             match action {
                 HeaderPortOperation::Misbehavior { peer, reason } => {
@@ -245,8 +452,12 @@ impl HeaderSyncReactor {
         let (tap, dispatched) = self.begin_port_call(&action, call);
         #[cfg(any(test, zakura_sim))]
         let (panic_tap, pending_tap) = (tap.clone(), tap.clone());
-        let header_chain = self.startup.header_chain_port.clone();
-        let request_timeout = self.startup.request_timeout;
+        let context = CallContext {
+            header_chain: self.startup.header_chain_port.clone(),
+            request_timeout: self.startup.request_timeout,
+            #[cfg(any(test, zakura_sim))]
+            tap,
+        };
         let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
             match action {
                 HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. } => {
@@ -257,97 +468,13 @@ impl HeaderSyncReactor {
                     session_id: _,
                     target_tip_hash: _,
                     scope: _,
-                } => Box::pin(async move {
-                    #[cfg(any(test, zakura_sim))]
-                    let end;
-                    let locator = match zakura_rt::time::timeout(
-                        request_timeout,
-                        header_chain.continuation_locator(
-                            locator_permit
-                                .as_ref()
-                                .expect("locator dispatch acquired capacity")
-                                .clone(),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(locator)) => {
-                            #[cfg(any(test, zakura_sim))]
-                            {
-                                end = observe::CallEnd::Replied;
-                            }
-                            locator
-                        }
-                        Ok(Err(error)) => {
-                            #[cfg(any(test, zakura_sim))]
-                            {
-                                end = observe::CallEnd::PortError;
-                            }
-                            tracing::debug!(?peer, ?error, "header locator unavailable");
-                            None
-                        }
-                        Err(_) => {
-                            #[cfg(any(test, zakura_sim))]
-                            {
-                                end = observe::CallEnd::TimedOut;
-                            }
-                            tracing::debug!(?peer, "header locator query timed out");
-                            None
-                        }
-                    };
-                    #[cfg(any(test, zakura_sim))]
-                    tap.end(end);
-                    drop(locator_permit);
-                    StorageCompletion::Locator {
-                        key: locator_key.expect("locator dispatch recorded its read"),
-                        locator,
-                    }
-                }),
+                } => Box::pin(context.read_locator(
+                    peer,
+                    locator_key.expect("locator dispatch recorded its read"),
+                    locator_permit.expect("locator dispatch acquired capacity"),
+                )),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
-                    Box::pin(async move {
-                        #[cfg(any(test, zakura_sim))]
-                        let end;
-                        let result = match zakura_rt::time::timeout(
-                            request_timeout,
-                            header_chain.vct_repair_context(owner, height),
-                        )
-                        .await
-                        {
-                            Ok(Ok(port::VctRepairContextReply::Resolved(context))) => {
-                                #[cfg(any(test, zakura_sim))]
-                                {
-                                    end = observe::CallEnd::Replied;
-                                }
-                                VctRepairContextResult::Resolved(context)
-                            }
-                            Ok(Ok(port::VctRepairContextReply::Stale)) => {
-                                #[cfg(any(test, zakura_sim))]
-                                {
-                                    end = observe::CallEnd::Replied;
-                                }
-                                VctRepairContextResult::Stale
-                            }
-                            Ok(Err(error)) => {
-                                #[cfg(any(test, zakura_sim))]
-                                {
-                                    end = observe::CallEnd::PortError;
-                                }
-                                tracing::debug!(?owner, ?error, "VCT repair context unavailable");
-                                VctRepairContextResult::Unavailable
-                            }
-                            Err(_) => {
-                                #[cfg(any(test, zakura_sim))]
-                                {
-                                    end = observe::CallEnd::TimedOut;
-                                }
-                                tracing::debug!(?owner, "VCT repair context timed out");
-                                VctRepairContextResult::Unavailable
-                            }
-                        };
-                        #[cfg(any(test, zakura_sim))]
-                        tap.end(end);
-                        StorageCompletion::VctRepairContext { owner, result }
-                    })
+                    Box::pin(context.read_repair_context(owner, height))
                 }
                 HeaderPortOperation::PrepareHeaderTarget {
                     purpose,
@@ -358,122 +485,32 @@ impl HeaderSyncReactor {
                     target,
                     completion,
                     entries,
-                } => Box::pin(async move {
-                    if matches!(
-                        &purpose,
-                        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
-                    ) && !matches!(
-                        (&purpose, completion),
-                        (
-                            HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                                selected_target: purpose_target,
-                                ..
-                            },
-                            zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
-                                selected_target,
-                                ..
-                            },
-                        ) if *purpose_target == target
-                            && selected_target == target
-                            && !entries.is_empty()
-                            && entries.iter().all(|entry| entry.tree_aux.is_some())
-                            && entries.last().is_some_and(|entry| entry.header.hash() == target.hash)
-                    ) {
-                        let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
-                            zakura_header_chain::HeaderChainError::stale_target(
-                                zakura_header_chain::ErrorSubject::Branch(
-                                    owner.header_authority().branch,
-                                ),
-                            ),
-                        ));
-                        #[cfg(any(test, zakura_sim))]
-                        tap.end(observe::CallEnd::NotSubmitted);
-                        return StorageCompletion::TargetPrepared {
-                            peer,
-                            source,
-                            owner,
-                            result,
-                        };
-                    }
-                    let entries = match port::TargetEntries::try_from(
-                        entries
-                            .into_iter()
-                            .map(port_header_entry)
-                            .collect::<Vec<_>>(),
-                    ) {
-                        Ok(entries) => entries,
-                        Err(error) => {
-                            let result =
-                                HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
-                                    zakura_header_chain::HeaderChainError::malformed_protocol(
-                                        zakura_header_chain::ErrorSubject::Request {
-                                            source,
-                                            request_id: owner.request_id(),
-                                        },
-                                        zakura_header_chain::RuleId::new("LC-WIRE-08"),
-                                        source,
-                                        Some(Box::new(error)),
-                                    ),
-                                ));
-                            #[cfg(any(test, zakura_sim))]
-                            tap.end(observe::CallEnd::NotSubmitted);
-                            return StorageCompletion::TargetPrepared {
-                                peer,
-                                source,
-                                owner,
-                                result,
-                            };
-                        }
-                    };
-                    let result = header_chain
-                        .prepare_header_target(port::PrepareHeaderTarget {
-                            source,
-                            owner,
-                            common_ancestor,
-                            target,
-                            entries,
-                            completion,
-                        })
-                        .await
-                        .map(HeaderTargetPreparationResult::Prepared)
-                        .unwrap_or_else(HeaderTargetPreparationResult::Failed);
-                    #[cfg(any(test, zakura_sim))]
-                    tap.end(observe::CallEnd::Replied);
-                    StorageCompletion::TargetPrepared {
+                } => Box::pin(context.prepare_target(
+                    TargetCall {
                         peer,
                         source,
                         owner,
-                        result,
-                    }
-                }),
+                    },
+                    purpose,
+                    common_ancestor,
+                    target,
+                    completion,
+                    entries,
+                )),
                 HeaderPortOperation::ApplyHeaderTarget {
                     purpose: _,
                     peer,
                     source,
                     owner,
                     target,
-                } => Box::pin(async move {
-                    let result = header_chain
-                        .apply_header_target(target)
-                        .await
-                        .map(|outcome| match outcome {
-                            port::ApplyHeaderTargetOutcome::Applied => {
-                                HeaderTargetAdmissionResult::Applied
-                            }
-                            port::ApplyHeaderTargetOutcome::ResourceStalled(receipt) => {
-                                HeaderTargetAdmissionResult::ResourceStalled(receipt)
-                            }
-                        })
-                        .unwrap_or_else(HeaderTargetAdmissionResult::Failed);
-                    #[cfg(any(test, zakura_sim))]
-                    tap.end(observe::CallEnd::Replied);
-                    StorageCompletion::TargetAdmission {
+                } => Box::pin(context.apply_target(
+                    TargetCall {
                         peer,
                         source,
                         owner,
-                        result,
-                    }
-                }),
+                    },
+                    target,
+                )),
             };
         #[cfg(any(test, zakura_sim))]
         if let Some(op) = dispatched {

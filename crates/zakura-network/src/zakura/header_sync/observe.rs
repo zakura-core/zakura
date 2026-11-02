@@ -289,6 +289,17 @@ pub enum CallEnd {
     Dropped,
 }
 
+impl CallEnd {
+    /// How a port call under the reactor's request timeout ended.
+    pub(crate) fn of_timed<T, E, Elapsed>(result: &Result<Result<T, E>, Elapsed>) -> Self {
+        match result {
+            Ok(Ok(_)) => Self::Replied,
+            Ok(Err(_)) => Self::PortError,
+            Err(_) => Self::TimedOut,
+        }
+    }
+}
+
 /// Why the reactor refused a storage call.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RefusalCause {

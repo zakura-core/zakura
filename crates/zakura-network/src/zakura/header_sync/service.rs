@@ -447,9 +447,7 @@ impl PeerSession {
             .try_reserve_guarded()
             .map_err(|error| match error {
                 GuardedReserveError::Full => OrderedSendError::Full,
-                GuardedReserveError::Closed | GuardedReserveError::Unsupported => {
-                    OrderedSendError::Closed
-                }
+                GuardedReserveError::Closed => OrderedSendError::Closed,
             })
     }
 }

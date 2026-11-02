@@ -947,7 +947,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
-    ) = setup_with_misbehavior_receiver(false, Mainnet).await;
+    ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 2 is the tip child. Rewriting only its
     // coinbase height leaves the header, and therefore the block hash, untouched.
@@ -1053,14 +1053,13 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
-    ) = setup_with_misbehavior_receiver(false, Network::new_default_testnet()).await;
+    ) = setup_with_misbehavior_receiver(false).await;
 
-    // Testnet preserves historical parent recovery without the Mainnet work floor.
-    // Setup commits its genesis and block 1, so block 3 is one hop from the tip,
-    // and its parent is the tip child.
+    // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
+    // the tip child.
     let parent: Arc<Block> =
-        zakura_test::vectors::BLOCK_TESTNET_2_BYTES.zcash_deserialize_into()?;
-    let child: Arc<Block> = zakura_test::vectors::BLOCK_TESTNET_3_BYTES.zcash_deserialize_into()?;
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
     let child_hash = child.hash();
     let parent_hash = parent.hash();
     let poisoned_parent = poison_coinbase_height(&parent, Height(1));
@@ -1380,7 +1379,7 @@ async fn setup(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         _misbehavior_rx,
-    ) = setup_with_misbehavior_receiver(add_transactions, Mainnet).await;
+    ) = setup_with_misbehavior_receiver(add_transactions).await;
 
     (
         inbound_service,
@@ -1396,12 +1395,11 @@ async fn setup(
     )
 }
 
-/// [`setup`], on the selected network and returning the receiver for peer misbehavior reports.
+/// [`setup`], additionally returning the receiver for peer misbehavior reports.
 ///
 /// Tests that assert on peer scoring need the receiver; everything else uses [`setup`].
 async fn setup_with_misbehavior_receiver(
     add_transactions: bool,
-    network: Network,
 ) -> (
     Buffer<
         zakura_network::Request,
@@ -1426,11 +1424,12 @@ async fn setup_with_misbehavior_receiver(
 ) {
     let _init_guard = zakura_test::init();
 
+    let network = Mainnet;
     let consensus_config = ConsensusConfig::default();
     let state_config = StateConfig::ephemeral();
     let address_book = AddressBook::new(
         SocketAddr::from_str("0.0.0.0:0").unwrap(),
-        &network,
+        &Mainnet,
         DEFAULT_MAX_CONNS_PER_IP,
         Span::none(),
     );
@@ -1468,18 +1467,9 @@ async fn setup_with_misbehavior_receiver(
     // Push the genesis block to the state.
     // This must be done before creating the mempool to avoid `chain_tip_change`
     // returning "reset" which would clear the mempool.
-    let (genesis_bytes, block_one_bytes) = if matches!(network, Mainnet) {
-        (
-            &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES,
-            &zakura_test::vectors::BLOCK_MAINNET_1_BYTES,
-        )
-    } else {
-        (
-            &zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES,
-            &zakura_test::vectors::BLOCK_TESTNET_1_BYTES,
-        )
-    };
-    let genesis_block: Arc<Block> = genesis_bytes.zcash_deserialize_into().unwrap();
+    let genesis_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
     state_service
         .ready()
         .await
@@ -1509,7 +1499,9 @@ async fn setup_with_misbehavior_receiver(
     // Also push block 1.
     // Block one is a network upgrade and the mempool will be cleared at it,
     // let all our tests start after this event.
-    let block_one: Arc<Block> = block_one_bytes.zcash_deserialize_into().unwrap();
+    let block_one: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
     state_service
         .clone()
         .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(

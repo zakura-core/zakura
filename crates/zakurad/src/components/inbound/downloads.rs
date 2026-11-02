@@ -31,7 +31,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::{has_sufficient_work, target_meets_work_floor},
+    download_work::has_sufficient_work,
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -1104,11 +1104,7 @@ where
             // The parent is checked after the height policies, so only blocks this node would
             // verify can start a recovery, and before the source lock, so a recovery is not
             // delayed by earlier blocks from the same source.
-            // Historical bootstrap can admit easy blocks for verification, but
-            // their unverified heights must not authorize parent downloads.
-            if kind == DownloadKind::Advertised
-                && target_meets_work_floor(&chain_network, block.header.difficulty_threshold)
-            {
+            if kind == DownloadKind::Advertised {
                 let parent = block.header.previous_block_hash;
                 let one_hop_from_tip = tip_height
                     .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
@@ -1900,55 +1896,6 @@ mod tests {
             assert_eq!(addr, Some(advertiser_addr));
             assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
         }
-    }
-
-    /// Historical admission must not authorize a missing-parent download.
-    #[tokio::test]
-    async fn mainnet_work_floor_preserves_historical_gossip_without_parent_recovery() {
-        let historical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into()
-            .expect("test vector deserializes");
-        let historical_hash = historical.hash();
-        assert!(!target_meets_work_floor(
-            &Network::Mainnet,
-            historical.header.difficulty_threshold,
-        ));
-        let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
-        let (_tip_sender, latest_chain_tip) = chain_tip_at(block::Height(0), hash(0xAA));
-        let mut downloads = downloads_returning(historical, advertiser_addr, latest_chain_tip);
-        downloads.spawner.state = BoxCloneService::new(service_fn(|request| async move {
-            match request {
-                zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                request => panic!("historical gossip must not query its parent: {request:?}"),
-            }
-        }));
-        downloads.spawner.verifier = BoxCloneService::new(service_fn(
-            move |request: zakura_consensus::Request| async move {
-                assert_eq!(request.block().hash(), historical_hash);
-                Ok(historical_hash)
-            },
-        ));
-
-        assert_eq!(
-            downloads.download_and_verify(
-                historical_hash,
-                Some(zn::PeerSource::LegacySocket(advertiser_addr)),
-            ),
-            DownloadAction::AddedToQueue,
-        );
-        let result = tokio::time::timeout(Duration::from_secs(5), downloads.next())
-            .await
-            .expect("historical gossip reaches verification without parent recovery")
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, historical_hash);
-        assert!(downloads
-            .spawner
-            .admission
-            .lock()
-            .unwrap()
-            .parent_recoveries
-            .is_empty());
     }
 
     /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays

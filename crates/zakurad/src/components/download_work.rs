@@ -36,21 +36,10 @@ pub(super) fn has_sufficient_work(
     committed_tip_height: Option<Height>,
     target: CompactDifficulty,
 ) -> bool {
-    if height <= MAINNET_WORK_FLOOR_HEIGHT
-        && committed_tip_height.is_none_or(|tip| tip < MAINNET_WORK_FLOOR_HEIGHT)
+    if !matches!(network, Network::Mainnet)
+        || (height <= MAINNET_WORK_FLOOR_HEIGHT
+            && committed_tip_height.is_none_or(|tip| tip < MAINNET_WORK_FLOOR_HEIGHT))
     {
-        return true;
-    }
-
-    target_meets_work_floor(network, target)
-}
-
-/// Whether the claimed target can authorize Mainnet missing-parent recovery.
-///
-/// Recovery has no historical exemption: an unverified height must never
-/// authorize an extra download. Other networks retain their existing rules.
-pub(super) fn target_meets_work_floor(network: &Network, target: CompactDifficulty) -> bool {
-    if !matches!(network, Network::Mainnet) {
         return true;
     }
 
@@ -98,7 +87,6 @@ mod tests {
                 easiest_target,
             ));
         }
-        assert!(!target_meets_work_floor(&Network::Mainnet, easiest_target));
     }
 
     #[test]
@@ -129,7 +117,6 @@ mod tests {
                 Some(height),
                 easiest_target
             ));
-            assert!(target_meets_work_floor(&network, easiest_target));
         }
     }
 

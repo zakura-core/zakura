@@ -112,6 +112,8 @@ impl MachineStep {
     /// The failure that stopped the run at this operation, if any.
     pub fn failure(&self) -> Option<MachineFailure> {
         match self {
+            Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
+            Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
             Self::Fixture(step) => step.failure.clone(),
             Self::Work(step) => step.failure.clone(),
             Self::WorkFunding(step) => step.failure.clone(),
@@ -141,6 +143,18 @@ pub struct MachineFailure {
     pub phase: FailurePhase,
     /// Panic payload without the panic hook's source location.
     pub message: String,
+}
+
+impl From<DriverFailure> for MachineFailure {
+    /// Discovery's drivers catch an operation and its model comparison together,
+    /// so each failure reports one phase.
+    fn from(failure: DriverFailure) -> Self {
+        Self {
+            property_failure: failure.property_failure,
+            phase: FailurePhase::Invariant,
+            message: failure.message,
+        }
+    }
 }
 
 /// One operation of a fixture machine.

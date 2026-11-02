@@ -3625,15 +3625,13 @@ mod tests {
             .expect("the frame answers a query")
     }
 
-    /// Past the initial timeout, a delivered answer that waits for verification
-    /// holds the discovery-only close. Its settlement releases the close.
-    #[tokio::test(start_paused = true)]
-    async fn timed_out_close_waits_for_a_delivered_answer() -> Result<(), crate::BoxError> {
-        let (handle, peer_id, _) = handle_with_session(60, 2).await?;
-        let (send, _peer_recv) = framed_channel(16);
-        let (io, _states) = test_peer_io(handle, peer_id, send);
+    /// Runs a session past the initial timeout. `hold` keeps the discovery-only
+    /// close waiting until it settles, and its settlement releases the close.
+    async fn assert_close_held_until_settled<H>(
+        io: PeerIO,
+        hold: H,
+    ) -> Result<(), crate::BoxError> {
         let connection = io.connection_cancel.clone();
-        let answer = claimed_peers_answer(&io.queries).await;
         let started = tokio::time::Instant::now();
         let session = tokio::spawn(io.run());
 
@@ -3643,13 +3641,13 @@ mod tests {
         .await;
         assert!(
             !connection.is_cancelled(),
-            "the timeout does not revoke the delivered answer"
+            "the timeout does not revoke what the session holds"
         );
 
-        drop(answer);
+        drop(hold);
         tokio::time::timeout(Duration::from_millis(100), connection.cancelled())
             .await
-            .expect("the settled answer lets the connection close");
+            .expect("settlement lets the connection close");
         assert!(
             started.elapsed()
                 < DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE
@@ -3658,49 +3656,10 @@ mod tests {
         Ok(())
     }
 
-    /// Past the initial timeout, a `Hello` in verification holds the
-    /// discovery-only close. Its settlement releases the close.
-    #[tokio::test(start_paused = true)]
-    async fn timed_out_close_waits_for_a_hello_in_verification() -> Result<(), crate::BoxError> {
-        let (handle, peer_id, _) = handle_with_session(72, 2).await?;
-        let (send, _peer_recv) = framed_channel(16);
-        let (io, _states) = test_peer_io(handle, peer_id, send);
+    /// Runs a session whose `_hold` never settles. It cannot hold the connection
+    /// open past the answer deadline.
+    async fn assert_close_deadline<H>(io: PeerIO, _hold: H) -> Result<(), crate::BoxError> {
         let connection = io.connection_cancel.clone();
-        let hello = io.queries.verifying_hello();
-        let started = tokio::time::Instant::now();
-        let session = tokio::spawn(io.run());
-
-        tokio::time::sleep(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
-        )
-        .await;
-        assert!(
-            !connection.is_cancelled(),
-            "the timeout does not drop the Hello in verification"
-        );
-
-        drop(hello);
-        tokio::time::timeout(Duration::from_millis(100), connection.cancelled())
-            .await
-            .expect("the settled Hello lets the connection close");
-        assert!(
-            started.elapsed()
-                < DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE
-        );
-        session.await?;
-        Ok(())
-    }
-
-    /// A `Hello` stuck behind verification cannot hold the connection open past
-    /// the answer deadline.
-    #[tokio::test(start_paused = true)]
-    async fn timed_out_close_waits_at_most_the_deadline_for_a_hello() -> Result<(), crate::BoxError>
-    {
-        let (handle, peer_id, _) = handle_with_session(74, 2).await?;
-        let (send, _peer_recv) = framed_channel(16);
-        let (io, _states) = test_peer_io(handle, peer_id, send);
-        let connection = io.connection_cancel.clone();
-        let _hello = io.queries.verifying_hello();
         let session = tokio::spawn(io.run());
 
         tokio::time::timeout(
@@ -3713,6 +3672,37 @@ mod tests {
         .expect("the deadline closes the connection");
         session.await?;
         Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_close_waits_for_a_delivered_answer_or_a_hello() -> Result<(), crate::BoxError>
+    {
+        let (handle, peer_id, _) = handle_with_session(60, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let answer = claimed_peers_answer(&io.queries).await;
+        assert_close_held_until_settled(io, answer).await?;
+
+        let (handle, peer_id, _) = handle_with_session(72, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let hello = io.queries.verifying_hello();
+        assert_close_held_until_settled(io, hello).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_close_waits_at_most_the_deadline() -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(62, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let answer = claimed_peers_answer(&io.queries).await;
+        assert_close_deadline(io, answer).await?;
+
+        let (handle, peer_id, _) = handle_with_session(74, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let hello = io.queries.verifying_hello();
+        assert_close_deadline(io, hello).await
     }
 
     /// The reader holds the settled wait from a `Hello`'s decode until its
@@ -3760,30 +3750,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), reader)
             .await??
             .expect("an authentic Hello rejects nothing");
-        Ok(())
-    }
-
-    /// An answer stuck behind verification cannot hold the connection open past
-    /// the answer deadline.
-    #[tokio::test(start_paused = true)]
-    async fn timed_out_close_waits_at_most_the_deadline_for_a_delivered_answer(
-    ) -> Result<(), crate::BoxError> {
-        let (handle, peer_id, _) = handle_with_session(62, 2).await?;
-        let (send, _peer_recv) = framed_channel(16);
-        let (io, _states) = test_peer_io(handle, peer_id, send);
-        let connection = io.connection_cancel.clone();
-        let _answer = claimed_peers_answer(&io.queries).await;
-        let session = tokio::spawn(io.run());
-
-        tokio::time::timeout(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
-                + DISCOVERY_ANSWER_WRITE_DEADLINE
-                + Duration::from_secs(1),
-            connection.cancelled(),
-        )
-        .await
-        .expect("the deadline closes the connection");
-        session.await?;
         Ok(())
     }
 

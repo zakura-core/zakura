@@ -8,12 +8,12 @@ use zakura_rt::collections::{HashMap, HashSet};
 
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
-    normalize_services, push_unique_service, DialCandidateExclusions, DisclosureKey,
+    normalize_services, push_unique_service, BookChange, DialCandidateExclusions, DisclosureKey,
     DiscoveryBookError, DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome,
     ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
-    ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate,
-    ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry,
-    ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
+    ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
+    ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
+    ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
@@ -77,7 +77,9 @@ impl SessionRecordError {
 ///
 /// The discovery handle holds it under one mutex and does the IO: clocks,
 /// randomness, signing, record verification, and watch publication. These
-/// transitions take the current time and any random source as arguments.
+/// transitions take the current time and any random source as arguments. Each
+/// import appends its book changes to a caller's list, and the handle logs them
+/// after it releases the mutex.
 ///
 /// Every time argument is Unix seconds. Signed record expiry and the local
 /// deadlines (the live-summary TTL and the dial backoffs) share that clock,
@@ -128,15 +130,13 @@ impl ZakuraActiveServiceEntry {
     }
 
     fn from_live_summaries(summaries: Vec<ZakuraCachedLiveServiceSummary>) -> Self {
-        let mut services = Vec::new();
-        for summary in &summaries {
-            push_unique_service(&mut services, summary.service_id.clone());
-        }
-        Self {
+        let mut entry = Self {
             record: None,
-            services,
+            services: Vec::new(),
             live_summaries: summaries,
-        }
+        };
+        entry.refresh_live_derived_services();
+        entry
     }
 
     fn update_record(&mut self, record: VerifiedRecord, services: Vec<ZakuraServiceId>) {
@@ -436,7 +436,7 @@ impl DiscoveryState {
         self.active_services
             .get(node_id)
             .and_then(|active| active.record.as_ref())
-            .filter(|stored| **stored == *record)
+            .filter(|stored| ***stored == *record)
             .cloned()
     }
 
@@ -451,6 +451,7 @@ impl DiscoveryState {
         source: Option<NodeId>,
         now: u64,
         outcome: &mut ImportBatchOutcome,
+        changes: &mut Vec<BookChange>,
     ) {
         let max_records = self.config.book_limits.max_imported_records_per_response;
         let context = self.validation_context(now);
@@ -462,7 +463,7 @@ impl DiscoveryState {
             outcome.attempted += 1;
             match self
                 .book
-                .import_verified_record(record, source, now, &context)
+                .import_verified_record(record, source, now, &context, changes)
             {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
@@ -481,11 +482,12 @@ impl DiscoveryState {
         record: VerifiedRecord,
         connected: &[NodeId],
         now: u64,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, SessionRecordError> {
         if !self.is_current_session(session) {
             return Err(SessionRecordError::Superseded);
         }
-        Ok(self.install_connected_peer_record(record, connected, now)?)
+        Ok(self.install_connected_peer_record(record, connected, now, changes)?)
     }
 
     /// Installs a connected peer's own record and updates its service hints.
@@ -501,6 +503,7 @@ impl DiscoveryState {
         record: VerifiedRecord,
         connected: &[NodeId],
         now: u64,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         self.sync_active_services(connected, now);
         let max_services = self.config.book_limits.max_services_per_record;
@@ -515,9 +518,13 @@ impl DiscoveryState {
         let peer_node_id = record.body.node_id;
         let services = normalize_services(record.body.services.clone());
         let context = self.validation_context(now);
-        let import_result =
-            self.book
-                .import_verified_record(record.clone(), Some(peer_node_id), now, &context);
+        let import_result = self.book.import_verified_record(
+            record.clone(),
+            Some(peer_node_id),
+            now,
+            &context,
+            changes,
+        );
         if import_result.is_ok()
             || matches!(import_result, Err(ref error) if is_direct_address_import_error(error))
         {
@@ -638,9 +645,11 @@ impl DiscoveryState {
         &mut self,
         record: ZakuraNodeRecord,
         now: u64,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let context = self.validation_context(now);
-        self.book.import_static_record(record, now, &context)
+        self.book
+            .import_static_record_tracked(record, now, &context, changes)
     }
 
     /// Re-validates and imports entries loaded from persistent storage.
@@ -648,9 +657,11 @@ impl DiscoveryState {
         &mut self,
         entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
         now: u64,
+        changes: &mut Vec<BookChange>,
     ) -> ImportBatchOutcome {
         let context = self.validation_context(now);
-        self.book.import_persisted_entries(entries, now, &context)
+        self.book
+            .import_persisted_entries_tracked(entries, now, &context, changes)
     }
 
     /// Returns a bounded peer sample for `requester`, at most the configured
@@ -701,10 +712,12 @@ impl DiscoveryState {
         now: u64,
         rng: &mut R,
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
-        let required_services = bounded_services(required_services, self.config.book_limits);
+        let required_services = required_services
+            .get(..self.config.book_limits.max_services_per_record)
+            .unwrap_or(required_services);
         self.book.dial_candidates(
             limit,
-            &required_services,
+            required_services,
             preferred_services,
             exclusions,
             now,
@@ -861,17 +874,6 @@ fn effective_live_summary_expiry(
     // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
     // peer's intentionally shorter lifetime.
     Some(local_expiry)
-}
-
-fn bounded_services(
-    services: &[ZakuraServiceId],
-    limits: ZakuraDiscoveryBookLimits,
-) -> Vec<ZakuraServiceId> {
-    services
-        .iter()
-        .take(limits.max_services_per_record)
-        .cloned()
-        .collect()
 }
 
 fn push_excluded_node_id(excluded: &mut Vec<[u8; 32]>, node_id: NodeId, max_node_ids: usize) {

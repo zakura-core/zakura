@@ -12,11 +12,13 @@
 //! to its deadline, for this session's unwritten answers and for the peer's
 //! delivered answers and `Hello`, which can be waiting for a verification slot.
 
-mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
+mod model;
+mod state;
+#[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use tests::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
+pub use model::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 
 use std::{sync::Arc, time::Duration};
 
@@ -87,6 +89,9 @@ impl SharedPeerState {
     /// Resolves once the peer answered every part of the exchange.
     async fn wait_complete(&self) {
         loop {
+            // Enabled before the check, so a record that lands between the check
+            // and the await still wakes it. `notify_waiters` stores no permit for
+            // a future created after it.
             let progressed = self.0.progressed.notified();
             zakura_rt::pin!(progressed);
             progressed.as_mut().enable();

@@ -261,7 +261,8 @@ impl CandidateDialerState {
         }
 
         for ip in &reserved_ips {
-            *self.in_flight_by_ip.entry(*ip).or_default() += 1;
+            let count = self.in_flight_by_ip.entry(*ip).or_default();
+            *count = count.checked_add(1).expect("attempts in flight fit usize");
         }
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -300,10 +301,13 @@ impl CandidateDialerState {
             self.paused_until = Some(now + ZAKURA_DISCOVERY_DIAL_INTERVAL);
         }
         for ip in &attempt.reserved_ips {
-            let Some(count) = self.in_flight_by_ip.get_mut(ip) else {
-                continue;
-            };
-            *count = count.saturating_sub(1);
+            let count = self
+                .in_flight_by_ip
+                .get_mut(ip)
+                .expect("an in-flight attempt keeps a count on each IP it reserved");
+            *count = count
+                .checked_sub(1)
+                .expect("a kept count includes this attempt");
             if *count == 0 {
                 self.in_flight_by_ip.remove(ip);
             }

@@ -13,7 +13,6 @@ cargo-fuzz = true
 [package.metadata.zakura-machine.targets]
 service_session = { decoder = 1, properties = ["session/offer-assembly", "session/one-active-generation", "session/legal-reopen"] }
 cadence = { decoder = 1, properties = ["cadence/hold", "cadence/settlement"] }
-block_work_ownership = { decoder = 1, properties = ["block/work-ownership"] }
 block_peer_registry = { decoder = 1, properties = ["block/peer-registry"] }
 block_retry_authority = { decoder = 1, properties = ["block/retry-authority"] }
 block_query = { decoder = 1, properties = ["block/query-dispatch", "block/query-completion"] }
@@ -23,8 +22,6 @@ block_request_lifecycle = { decoder = 1, properties = ["block/request-lifecycle"
 block_sequencer_order = { decoder = 1, properties = ["block/contiguous-submission"] }
 block_sequencer_reset = { decoder = 1, properties = ["block/retired-apply-isolation"] }
 block_sequencer_evidence = { decoder = 1, properties = ["block/required-evidence"] }
-discovery_book = { decoder = 1, properties = ["discovery/record-book"] }
-discovery_state = { decoder = 1, properties = ["discovery/session-installation"] }
 discovery_session = { decoder = 1, properties = ["discovery/session-policy"] }
 discovery_redial = { decoder = 1, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership"] }
@@ -37,22 +34,8 @@ zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuz
 [workspace]
 
 [[bin]]
-name = "discovery_book"
-path = "fuzz_targets/discovery_book.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "block_peer_registry"
 path = "fuzz_targets/block_peer_registry.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "discovery_state"
-path = "fuzz_targets/discovery_state.rs"
 test = false
 doc = false
 bench = false

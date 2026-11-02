@@ -4,7 +4,7 @@
              worker.task.abort();
          }
          while let Some((attempt, outcome)) = self.workers.next().await {
--            trace_dial_phase(&self.trace, attempt, outcome.worker.phase());
+-            trace_dial_phase(&self.trace, attempt, outcome.phase);
 -            state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now());
 +            let _ = (attempt, outcome, &state);
          }

@@ -82,8 +82,11 @@ action channel, reply routes, and shutdown have witnesses in `zakura-network`.
 `discovery_record_book` and `discovery_session_installation` use the shared trace
 and replay pipeline without starting QUIC. Each consumes at most 512 causal
 bytes under its own decoder-v2 identity. They compare the real owner with its
-independent model after each completed operation. They do not establish
-asynchronous races or teardown. `discovery_verification_capacity` runs the real
+independent model after each completed operation. The tests
+`book_trace_reports_exact_install_replacement_and_eviction` and
+`session_trace_separates_stale_results_and_retained_hints` show that each witness
+input reaches its rules, and that an empty input reaches none. They do not
+establish asynchronous races or teardown. `discovery_verification_capacity` runs the real
 handle under the scheduler and checks that unsettled verification results stay
 within the slots while a slow holder keeps the state lock. Run long campaigns
 manually or nightly; these targets add no blocking PR fuzz campaign.

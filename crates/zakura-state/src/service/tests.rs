@@ -4189,6 +4189,67 @@ async fn precious_block_request_fails_fast_during_checkpoint_sync() {
 /// passing through the orphan queue, and its outputs stay visible to UTXO lookups.
 #[tokio::test(flavor = "multi_thread")]
 async fn block_with_a_ready_parent_skips_the_orphan_queue() {
+    use std::sync::Mutex;
+
+    use metrics::{
+        Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+
+    #[derive(Default)]
+    struct QueueSizes {
+        values: Mutex<Vec<f64>>,
+    }
+
+    impl GaugeFn for QueueSizes {
+        fn increment(&self, _value: f64) {
+            panic!("the orphan queue reports its absolute size");
+        }
+
+        fn decrement(&self, _value: f64) {
+            panic!("the orphan queue reports its absolute size");
+        }
+
+        fn set(&self, value: f64) {
+            self.values.lock().unwrap().push(value);
+        }
+    }
+
+    #[derive(Default)]
+    struct QueueRecorder {
+        sizes: Arc<QueueSizes>,
+    }
+
+    impl Recorder for QueueRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            if key.name() == "state.memory.queued.block.count" {
+                Gauge::from_arc(self.sizes.clone())
+            } else {
+                Gauge::noop()
+            }
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
     let _init_guard = zakura_test::init();
     let (mut state, _, _, _) =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
@@ -4216,7 +4277,7 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    let prepared = block.prepare();
+    let prepared = block.clone().prepare();
     let (hash, outpoint) = (
         prepared.hash,
         *prepared
@@ -4226,7 +4287,20 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
             .expect("the block creates outputs"),
     );
 
-    let _response = state.queue_and_commit_to_non_finalized_state(prepared, None);
+    let recorder = QueueRecorder::default();
+    let _response = metrics::with_local_recorder(&recorder, || {
+        state.queue_and_commit_to_non_finalized_state(prepared, None)
+    });
+    assert!(
+        recorder
+            .sizes
+            .values
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|size| *size == 0.0),
+        "a ready block must never temporarily enter the orphan queue"
+    );
 
     match writer
         .try_recv()
@@ -4251,4 +4325,21 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
             .is_some(),
         "the block's outputs are available while it is being written"
     );
+
+    let mut orphan = (*block).clone();
+    Arc::make_mut(&mut orphan.header).previous_block_hash = block::Hash([9; 32]);
+    let orphan = Arc::new(orphan).prepare();
+    let orphan_hash = orphan.hash;
+    let _orphan_response = metrics::with_local_recorder(&recorder, || {
+        state.queue_and_commit_to_non_finalized_state(orphan, None)
+    });
+    assert!(
+        recorder.sizes.values.lock().unwrap().contains(&1.0),
+        "the recorder must observe a block waiting for an unknown parent"
+    );
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .get_mut(&orphan_hash)
+        .is_some());
+    assert!(writer.try_recv().is_err());
 }

@@ -303,11 +303,7 @@ impl ServiceSessionState {
 
     /// Whether this endpoint proactively opens the service's session.
     pub(in crate::zakura::handler) fn opens_locally(&self) -> bool {
-        opens_ordered_stream_locally(
-            self.policy,
-            self.roles.is_initiator,
-            self.roles.i_open_collision_winner,
-        )
+        opens_ordered_stream_locally(self.policy, self.roles)
     }
 
     fn has_active_session(&self) -> bool {
@@ -330,7 +326,7 @@ impl ServiceSessionState {
 
     /// Adopt a locally opened generation. The caller drops any reopen wait.
     pub(in crate::zakura::handler) fn opened(&mut self, session_id: u64) {
-        self.cancel_wait();
+        self.clear_wait();
         self.local_session_id = Some(session_id);
     }
 
@@ -352,11 +348,6 @@ impl ServiceSessionState {
         } else {
             RemoteCompletion::CheckDemand
         }
-    }
-
-    /// Adopt the recorded inbound generation. The caller drops any reopen wait.
-    pub(in crate::zakura::handler) fn remote_adopted(&mut self) {
-        self.cancel_wait();
     }
 
     /// Park the inbound generation `session_id` because its service has no
@@ -384,13 +375,8 @@ impl ServiceSessionState {
         let current = self.remove_active_session(exit.opened_locally, exit.session_id);
         let reopen_after = if current
             && !self.has_active_session()
-            && should_reopen_ordered_session(
-                exit,
-                self.policy,
-                self.roles.is_initiator,
-                self.roles.i_open_collision_winner,
-                connection_cancelled,
-            ) {
+            && should_reopen_ordered_session(exit, self.policy, self.roles, connection_cancelled)
+        {
             self.schedule_transport_backoff()
         } else {
             None
@@ -454,17 +440,14 @@ impl ServiceSessionState {
         Some(delay)
     }
 
-    /// The service's reopen wait fired. The caller removes it.
-    pub(in crate::zakura::handler) fn wait_finished(&mut self) {
-        self.cancel_wait();
-    }
-
     /// Whether the caller holds a reopen wait for this service.
     fn is_waiting(&self) -> bool {
         matches!(self.reopen_state, SessionReopenState::Waiting(_))
     }
 
-    fn cancel_wait(&mut self) {
+    /// The service's reopen wait ended: it fired, or a new generation replaced
+    /// it. The caller removes the wait.
+    pub(in crate::zakura::handler) fn clear_wait(&mut self) {
         if self.is_waiting() {
             self.reopen_state = SessionReopenState::Idle;
         }
@@ -491,12 +474,11 @@ pub(in crate::zakura::handler) fn may_open_ordered_stream(
 /// an offer during upgrade.
 pub(in crate::zakura::handler) fn opens_ordered_stream_locally(
     policy: SessionPolicy,
-    is_initiator: bool,
-    i_open_collision_winner: bool,
+    roles: ConnectionRoles,
 ) -> bool {
     match policy.opening {
-        SessionOpening::InitiatorOnly => is_initiator,
-        SessionOpening::EitherSide => i_open_collision_winner,
+        SessionOpening::InitiatorOnly => roles.is_initiator,
+        SessionOpening::EitherSide => roles.i_open_collision_winner,
     }
 }
 
@@ -506,13 +488,12 @@ pub(in crate::zakura::handler) fn opens_ordered_stream_locally(
 pub(in crate::zakura::handler) fn should_reopen_ordered_session(
     exited: SessionExit,
     policy: SessionPolicy,
-    is_initiator: bool,
-    i_open_collision_winner: bool,
+    roles: ConnectionRoles,
     connection_cancelled: bool,
 ) -> bool {
     exited.stream.mode == StreamMode::Persistent
         && policy.reopen
-        && opens_ordered_stream_locally(policy, is_initiator, i_open_collision_winner)
+        && opens_ordered_stream_locally(policy, roles)
         && !connection_cancelled
 }
 

@@ -611,7 +611,7 @@ impl SessionHarness {
             );
         }
         if collision || open_now {
-            self.session.remote_adopted();
+            self.session.clear_wait();
             self.wait.apply(DemandChange::Cancel);
             self.model.clear_wait();
         } else {
@@ -643,7 +643,7 @@ impl SessionHarness {
         if self.wait.0.take().is_none() {
             return;
         }
-        self.session.wait_finished();
+        self.session.clear_wait();
         self.model.clear_wait();
         let may_reopen =
             self.model.opens_locally && self.model.local.is_none() && self.model.remote.is_none();

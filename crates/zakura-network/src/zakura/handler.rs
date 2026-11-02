@@ -2115,7 +2115,7 @@ impl ServiceSessionIO {
     /// the service may reopen.
     fn on_wait_fired(&mut self, kind: u16, connection_cancelled: bool) -> Option<Stream> {
         let session = self.sessions.get_mut(&kind)?;
-        session.wait_finished();
+        session.clear_wait();
         let reopen = session
             .may_reopen(connection_cancelled)
             .then(|| session.stream());
@@ -2154,7 +2154,7 @@ impl ServiceSessionIO {
             }
             return false;
         }
-        self.session(kind).remote_adopted();
+        self.session(kind).clear_wait();
         self.cancel(kind);
         self.trace(
             kind,
@@ -2191,20 +2191,12 @@ impl ServiceSessionIO {
         Some(delay)
     }
 
-    /// Replace any wait of `kind` with `demand`'s own wait.
+    /// Replace any wait of `kind` with `demand`'s own wait, if it has one.
     fn start_demand(&mut self, kind: u16, demand: SessionDemand) {
-        let wait: BoxRunFuture<'static, ()> = match demand {
-            SessionDemand::OpenNow => Box::pin(future::ready(())),
-            SessionDemand::RetryAt(at) => Box::pin(async move {
-                zakura_rt::time::sleep_until(at).await;
-            }),
-            SessionDemand::WaitForChange(changed) => changed,
-            SessionDemand::Retire => {
-                unreachable!("the session state cancels a retired service's wait")
-            }
-        };
         self.cancel(kind);
-        self.waits.insert(kind, futures::stream::once(wait));
+        if let Some(wait) = session_demand_wait(demand) {
+            self.waits.insert(kind, futures::stream::once(wait));
+        }
     }
 
     /// Wait `delay` before `kind` may reopen.
@@ -2231,6 +2223,19 @@ impl ServiceSessionIO {
             removed.is_some(),
             "yielded ordered session wait remains keyed until it is handled"
         );
+    }
+}
+
+/// The future that ends when `demand` next asks to check its service, or `None`
+/// if it never does.
+fn session_demand_wait(demand: SessionDemand) -> Option<BoxRunFuture<'static, ()>> {
+    match demand {
+        SessionDemand::OpenNow => Some(Box::pin(future::ready(()))),
+        SessionDemand::RetryAt(at) => Some(Box::pin(async move {
+            zakura_rt::time::sleep_until(at).await;
+        })),
+        SessionDemand::WaitForChange(changed) => Some(changed),
+        SessionDemand::Retire => None,
     }
 }
 

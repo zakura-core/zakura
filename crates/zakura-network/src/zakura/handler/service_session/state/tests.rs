@@ -12,9 +12,7 @@ use super::{
 };
 use crate::zakura::{
     handler::{CloseCause, ServiceSessionIO, ZakuraConnTrace},
-    ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
-    ZAKURA_STREAM_HEADER_SYNC,
+    ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
 
 const REOPEN: SessionPolicy = SessionPolicy {
@@ -56,151 +54,81 @@ fn retry_later() -> SessionDemand {
 
 // Opening and reopen rules.
 
-/// Reopen a header-sync stream after the responder parks it on a healthy connection.
-/// The transport opening roles determine the reopen policy.
+/// The transport opening roles select the one endpoint that opens and reopens
+/// a service, whichever generation just exited. Both endpoints still accept an
+/// either-side offer, for interoperability with peers that open one themselves.
 #[test]
 fn ordered_session_reopen_follows_transport_opening_policy() {
-    let initiator_opened = Stream {
-        kind: ZAKURA_STREAM_HEADER_SYNC,
-        version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        frame_cap: 1,
-        capability: ZAKURA_CAP_HEADER_SYNC,
-        ..Stream::PERSISTENT
-    };
-    let exit = SessionExit {
-        stream: initiator_opened,
-        session_id: 1,
-        opened_locally: true,
-    };
-    let initiator_policy = SessionPolicy {
-        opening: SessionOpening::InitiatorOnly,
-        reopen: true,
-    };
-    assert!(should_reopen_ordered_session(
-        exit,
-        initiator_policy,
-        true,
-        false,
-        false
-    ));
-    assert!(!should_reopen_ordered_session(
-        exit,
-        initiator_policy,
-        false,
-        true,
-        false
-    ));
-    assert!(!should_reopen_ordered_session(
-        exit,
-        initiator_policy,
-        true,
-        false,
-        true
-    ));
-    assert!(!should_reopen_ordered_session(
-        exit,
-        SessionPolicy::default(),
-        true,
-        false,
-        false,
-    ));
-
-    // The authorized side replaces an accepted stream too; replacement does
-    // not depend on which physical generation just exited.
-    assert!(should_reopen_ordered_session(
-        SessionExit {
-            opened_locally: false,
-            ..exit
-        },
-        initiator_policy,
-        true,
-        false,
-        false,
-    ));
-
-    let either_peer = SessionExit {
-        stream: Stream {
-            kind: ZAKURA_STREAM_BLOCK_SYNC,
-            ..initiator_opened
-        },
-        ..exit
-    };
-    let either_policy = SessionPolicy {
+    const fn roles(is_initiator: bool, i_open_collision_winner: bool) -> ConnectionRoles {
+        ConnectionRoles {
+            is_initiator,
+            i_open_collision_winner,
+        }
+    }
+    const EITHER: SessionPolicy = SessionPolicy {
         opening: SessionOpening::EitherSide,
         reopen: true,
     };
-    assert!(should_reopen_ordered_session(
-        either_peer,
-        either_policy,
-        true,
-        true,
-        false
-    ));
-    assert!(!should_reopen_ordered_session(
-        either_peer,
-        either_policy,
-        false,
-        false,
-        false
-    ));
-    assert!(opens_ordered_stream_locally(either_policy, false, true));
-    assert!(!opens_ordered_stream_locally(either_policy, true, false));
-
+    let stream = test_ordered_stream();
+    let local = SessionExit {
+        stream,
+        session_id: 1,
+        opened_locally: true,
+    };
+    let remote = SessionExit {
+        opened_locally: false,
+        ..local
+    };
     let request_response = SessionExit {
         stream: Stream {
             kind: 102,
             mode: StreamMode::RequestResponse,
-            ..initiator_opened
+            ..stream
         },
-        ..exit
-    };
-    assert!(!should_reopen_ordered_session(
-        request_response,
-        either_policy,
-        true,
-        true,
-        false,
-    ));
-}
-
-#[test]
-fn either_side_session_has_one_proactive_opener_across_connection_roles() {
-    let policy = SessionPolicy {
-        opening: SessionOpening::EitherSide,
-        reopen: true,
-    };
-    let exit = SessionExit {
-        stream: Stream {
-            kind: ZAKURA_STREAM_BLOCK_SYNC,
-            version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-            frame_cap: 1,
-            capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-            ..Stream::PERSISTENT
-        },
-        session_id: 1,
-        opened_locally: false,
+        ..local
     };
 
-    for winner_is_initiator in [false, true] {
-        let opens = [
-            opens_ordered_stream_locally(policy, winner_is_initiator, true),
-            opens_ordered_stream_locally(policy, !winner_is_initiator, false),
-        ];
-        assert_eq!(opens, [true, false]);
-        assert_eq!(opens.into_iter().filter(|opens| *opens).count(), 1);
-
-        let reopens = [
-            should_reopen_ordered_session(exit, policy, winner_is_initiator, true, false),
-            should_reopen_ordered_session(exit, policy, !winner_is_initiator, false, false),
-        ];
-        assert_eq!(reopens, [true, false]);
-        assert_eq!(reopens.into_iter().filter(|reopens| *reopens).count(), 1);
+    // Exit, policy, roles, connection cancelled, and whether the service reopens.
+    for (exit, policy, roles, cancelled, reopens) in [
+        (local, REOPEN, roles(true, false), false, true),
+        (remote, REOPEN, roles(true, false), false, true),
+        (local, REOPEN, roles(false, true), false, false),
+        (local, REOPEN, roles(true, false), true, false),
+        (
+            local,
+            SessionPolicy::default(),
+            roles(true, false),
+            false,
+            false,
+        ),
+        (local, EITHER, roles(true, true), false, true),
+        (local, EITHER, roles(false, false), false, false),
+        (remote, EITHER, roles(false, true), false, true),
+        (remote, EITHER, roles(true, false), false, false),
+        (remote, EITHER, roles(true, true), false, true),
+        (remote, EITHER, roles(false, false), false, false),
+        (request_response, EITHER, roles(true, true), false, false),
+    ] {
+        assert_eq!(
+            should_reopen_ordered_session(exit, policy, roles, cancelled),
+            reopens,
+            "{exit:?} {policy:?} {roles:?} cancelled={cancelled}"
+        );
     }
 
-    // Both endpoints continue accepting an offer for interoperability with
-    // peers that still proactively open either-side streams themselves.
-    assert!(may_open_ordered_stream(policy, true));
-    assert!(may_open_ordered_stream(policy, false));
+    // The collision winner alone opens an either-side service, whoever dialed.
+    for winner_is_initiator in [false, true] {
+        assert!(opens_ordered_stream_locally(
+            EITHER,
+            roles(winner_is_initiator, true)
+        ));
+        assert!(!opens_ordered_stream_locally(
+            EITHER,
+            roles(!winner_is_initiator, false)
+        ));
+    }
+    assert!(may_open_ordered_stream(EITHER, true));
+    assert!(may_open_ordered_stream(EITHER, false));
 }
 
 #[test]
@@ -271,9 +199,9 @@ fn an_old_generation_exit_leaves_the_replacement_active() {
         Some(DemandChange::Start)
     );
     assert!(!session.has_active_session(), "parking frees the service");
-    session.wait_finished();
+    session.clear_wait();
     assert_eq!(session.remote_completed(2), RemoteCompletion::CheckDemand);
-    session.remote_adopted();
+    session.clear_wait();
 
     let old = SessionExit {
         stream,
@@ -306,7 +234,7 @@ fn a_lost_collision_keeps_the_adopted_generation_after_the_local_exit() {
         session.remote_completed(2),
         RemoteCompletion::AdoptCollision
     );
-    session.remote_adopted();
+    session.clear_wait();
 
     let local = SessionExit {
         stream,

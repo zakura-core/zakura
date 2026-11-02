@@ -826,86 +826,34 @@ fn candidate_witness_rejects_lost_backoff() {
 /// the attempt.
 #[test]
 fn registrations_credit_only_the_attempt_that_authenticated() {
-    use DiscoveryDialResult as Result;
+    use DialFinish::{AlpnMismatch, Failed, LocalLimit, Served};
+    use DialObservation::{RegistrationEnded as RegEnded, RegistrationHealthy, WatchClosed};
+    use DiscoveryDialResult as R;
     use PeerRegistration::{Absent, Ended, Live};
     let dial = DialObservation::DialEnded;
-    for (observation, authenticated, expected) in [
-        (
-            dial(DialFinish::Served, Live),
-            true,
-            Some(Result::ConnectedElsewhere),
-        ),
-        (
-            dial(DialFinish::Failed, Live),
-            false,
-            Some(Result::ConnectedElsewhere),
-        ),
-        (
-            dial(DialFinish::LocalLimit, Live),
-            false,
-            Some(Result::ConnectedElsewhere),
-        ),
-        (
-            dial(DialFinish::Served, Ended),
-            true,
-            Some(Result::ShortLivedRegistered),
-        ),
-        (
-            dial(DialFinish::Failed, Ended),
-            true,
-            Some(Result::ShortLivedRegistered),
-        ),
-        (dial(DialFinish::Failed, Ended), false, Some(Result::Failed)),
-        (
-            dial(DialFinish::LocalLimit, Ended),
-            false,
-            Some(Result::LocalResourceLimit),
-        ),
-        (
-            dial(DialFinish::AlpnMismatch, Ended),
-            false,
-            Some(Result::AlpnMismatch),
-        ),
-        (
-            dial(DialFinish::Served, Absent),
-            true,
-            Some(Result::ShortLivedRegistered),
-        ),
-        (
-            dial(DialFinish::Served, Absent),
-            false,
-            Some(Result::Failed),
-        ),
-        (dial(DialFinish::Failed, Absent), true, Some(Result::Failed)),
-        (
-            dial(DialFinish::LocalLimit, Absent),
-            true,
-            Some(Result::LocalResourceLimit),
-        ),
-        (
-            dial(DialFinish::AlpnMismatch, Absent),
-            false,
-            Some(Result::AlpnMismatch),
-        ),
-        (
-            DialObservation::RegistrationHealthy,
-            true,
-            Some(Result::Registered),
-        ),
-        (
-            DialObservation::RegistrationHealthy,
-            false,
-            Some(Result::ConnectedElsewhere),
-        ),
-        (
-            DialObservation::RegistrationEnded,
-            true,
-            Some(Result::ShortLivedRegistered),
-        ),
-        (DialObservation::RegistrationEnded, false, None),
-        (DialObservation::WatchClosed, true, Some(Result::Failed)),
-        (DialObservation::WatchClosed, false, Some(Result::Failed)),
-    ] {
+    #[rustfmt::skip]
+    let rows = [
+        (dial(Served, Live), true, Some(R::ConnectedElsewhere)),
+        (dial(Failed, Live), false, Some(R::ConnectedElsewhere)),
+        (dial(LocalLimit, Live), false, Some(R::ConnectedElsewhere)),
+        (dial(Served, Ended), true, Some(R::ShortLivedRegistered)),
+        (dial(Failed, Ended), true, Some(R::ShortLivedRegistered)),
+        (dial(Failed, Ended), false, Some(R::Failed)),
+        (dial(LocalLimit, Ended), false, Some(R::LocalResourceLimit)),
+        (dial(AlpnMismatch, Ended), false, Some(R::AlpnMismatch)),
+        (dial(Served, Absent), true, Some(R::ShortLivedRegistered)),
+        (dial(Served, Absent), false, Some(R::Failed)),
+        (dial(Failed, Absent), true, Some(R::Failed)),
+        (dial(LocalLimit, Absent), true, Some(R::LocalResourceLimit)),
+        (dial(AlpnMismatch, Absent), false, Some(R::AlpnMismatch)),
+        (RegistrationHealthy, true, Some(R::Registered)),
+        (RegistrationHealthy, false, Some(R::ConnectedElsewhere)),
+        (RegEnded, true, Some(R::ShortLivedRegistered)),
+        (RegEnded, false, None),
+        (WatchClosed, true, Some(R::Failed)),
+        (WatchClosed, false, Some(R::Failed)),
+    ];
+    for (observation, authenticated, expected) in rows {
         assert_eq!(
             classify_dial(observation, authenticated),
             expected,

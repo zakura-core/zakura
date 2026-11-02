@@ -3824,7 +3824,8 @@ mod tests {
                 _charge: InboundBudget::new(1).try_charge(0).expect("zero fits"),
             }))
             .expect("the queue has one slot");
-        let sink = test_sink(full_tx, LegacyGossipOutbound::default());
+        let mut sink = test_sink(full_tx, LegacyGossipOutbound::default());
+        sink.inbound_budget = InboundBudget::new(1 << 20);
         let refused = sink
             .request(
                 inbound_peer(),

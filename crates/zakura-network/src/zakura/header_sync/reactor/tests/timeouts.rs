@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use zakura_header_chain::SourceId;
 use zakura_node_services::header_chain as port;
 
+use super::super::dispatch::StorageDispatch;
 use super::super::repair::vct_send_retry_attribution;
 use super::*;
 use crate::zakura::{

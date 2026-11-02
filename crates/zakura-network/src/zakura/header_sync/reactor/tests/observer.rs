@@ -13,6 +13,7 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::Semaphore as TokioSemaphore;
 use zakura_node_services::header_chain as port;
 
+use super::super::dispatch::StorageDispatch;
 use super::*;
 use crate::zakura::{
     testkit::{TraceCapture, TraceReader},

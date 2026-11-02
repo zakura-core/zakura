@@ -51,10 +51,14 @@ use crate::zakura::{
 };
 use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
-/// The most response frame bytes one compatibility exchange may retain.
+/// The most response frame bytes one compatibility exchange may retain, on either
+/// side.
 ///
-/// The responder caps a response at the same value, so an honest peer never
-/// exceeds it.
+/// A request can name up to `MAX_TX_INV_IN_SENT_MESSAGE` hashes. Without this cap,
+/// `encode_response` would retain a whole multi-frame response before its first write,
+/// and a hostile responder could fill a requester with tens of GiB of accepted frames
+/// before any decode. The local service emits far less, because `zakurad` caps
+/// `getdata` at about 1 MiB, so an honest peer never exceeds it.
 pub(crate) const COMPAT_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
 
 /// The most bytes one compatibility exchange may charge: its frames, plus the

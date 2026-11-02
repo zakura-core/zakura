@@ -62,7 +62,7 @@ use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
     CompatResponseGrant, ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources,
     OrderedStreamFailure, OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout,
-    StreamResources, TransportLimits,
+    StreamResources, TransportLimits, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -236,20 +236,6 @@ const LEGACY_INVENTORY_HASH_BYTES: usize = 36;
 /// A witnessed transaction's inventory entry: a type code and two 32-byte hashes.
 const LEGACY_WTX_INVENTORY_BYTES: usize = 68;
 const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
-/// Maximum cumulative response payload bytes the requester will retain in the
-/// accepted-frame `Vec` before `decode_response` consumes it.
-///
-/// `LegacyResponseBudget::from_request` otherwise derives the per-response byte
-/// budget for Blocks/Transactions as `item_count * max_message_bytes`, so a
-/// request naming the protocol-max inventory count (`MAX_TX_INV_IN_SENT_MESSAGE`)
-/// would let a hostile responder fill ~`25_000 * MAX_PROTOCOL_MESSAGE_LEN` (tens
-/// of GiB) of validated frames before any decode begins. The inbound responder
-/// already caps a single response's cumulative payload at the same value
-/// (`legacy_gossip::LEGACY_RESPONSE_MAX_AGGREGATE_BYTES`), so an honest peer
-/// never sends more than this; clamping the requester budget to the same
-/// operational aggregate is the symmetric requester-side mirror.
-const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
-    super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -6117,7 +6103,7 @@ impl LegacyResponseBudget {
         // accepted-frame `Vec` before `decode_response` runs. The inbound
         // responder already bounds a single response to the same aggregate, so
         // this only rejects responses an honest peer would never send.
-        let max_bytes = max_bytes.min(LEGACY_RESPONSE_MAX_AGGREGATE_BYTES);
+        let max_bytes = max_bytes.min(COMPAT_RESPONSE_MAX_AGGREGATE_BYTES);
 
         Ok(Self {
             kind,
@@ -6144,7 +6130,7 @@ impl ResponseBound {
     const MAX: Self = Self {
         one_frame: false,
         // Widening usize to u64 is lossless on supported targets.
-        bytes: LEGACY_RESPONSE_MAX_AGGREGATE_BYTES as u64,
+        bytes: COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
     };
 }
 
@@ -6221,8 +6207,8 @@ impl LegacyResponseBudget {
             .saturating_mul(item_payload_bytes)
             .saturating_add(LEGACY_RESPONSE_REQUEST_ID_BYTES)
             .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
-            .min(LEGACY_RESPONSE_MAX_AGGREGATE_BYTES);
-        let most_frames = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES
+            .min(COMPAT_RESPONSE_MAX_AGGREGATE_BYTES);
+        let most_frames = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES
             / LEGACY_RESPONSE_CHUNK_HEADER_BYTES.saturating_add(1);
         let frames = self
             .max_items
@@ -11931,7 +11917,7 @@ mod tests {
     // a hostile responder a ~50 GiB retained-frame budget before any decode.
     //
     // The inbound responder already caps a single response's cumulative payload
-    // at `LEGACY_RESPONSE_MAX_AGGREGATE_BYTES` (8 * MAX_PROTOCOL_MESSAGE_LEN), so
+    // at `COMPAT_RESPONSE_MAX_AGGREGATE_BYTES` (8 * MAX_PROTOCOL_MESSAGE_LEN), so
     // an honest peer never sends more than that. The requester must clamp its
     // retained-frame budget to the same operational aggregate. This test asserts
     // the budget is bounded regardless of requested item count; it FAILS before
@@ -11957,10 +11943,10 @@ mod tests {
             LegacyResponseBudget::from_request(blocks.message_type, &blocks.payload, limits)
                 .expect("budget derives from a max-inventory blocks request");
         assert!(
-            blocks_budget.max_bytes <= LEGACY_RESPONSE_MAX_AGGREGATE_BYTES,
+            blocks_budget.max_bytes <= COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
             "BlocksByHash retained-frame budget {} must be clamped to the aggregate cap {}",
             blocks_budget.max_bytes,
-            LEGACY_RESPONSE_MAX_AGGREGATE_BYTES,
+            COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
         );
 
         // The transaction-fetch path scales identically and must be clamped too.
@@ -11970,10 +11956,10 @@ mod tests {
         let txs_budget = LegacyResponseBudget::from_request(txs.message_type, &txs.payload, limits)
             .expect("budget derives from a max-inventory transactions request");
         assert!(
-            txs_budget.max_bytes <= LEGACY_RESPONSE_MAX_AGGREGATE_BYTES,
+            txs_budget.max_bytes <= COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
             "TransactionsById retained-frame budget {} must be clamped to the aggregate cap {}",
             txs_budget.max_bytes,
-            LEGACY_RESPONSE_MAX_AGGREGATE_BYTES,
+            COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
         );
 
         // The clamp must only remove the unbounded tail: a modest request still
@@ -11991,7 +11977,7 @@ mod tests {
             small_budget.max_bytes,
         );
         assert!(
-            small_budget.max_bytes <= LEGACY_RESPONSE_MAX_AGGREGATE_BYTES,
+            small_budget.max_bytes <= COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
             "even a single-item budget stays within the aggregate cap",
         );
     }

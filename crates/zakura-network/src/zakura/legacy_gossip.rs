@@ -44,6 +44,7 @@ use crate::{
 };
 
 use super::trace::BlockBodySource;
+use super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
     RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
@@ -171,19 +172,6 @@ const LEGACY_REQUEST_STREAM_RATE_DIVISOR: u32 = 2;
 /// fetch on the legacy peer set forever, starving the Zakura path.
 const DUAL_STACK_LEGACY_INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
-/// Maximum cumulative response payload bytes the inbound responder will buffer
-/// for a single legacy request before aborting.
-///
-/// A peer can name up to `MAX_TX_INV_IN_SENT_MESSAGE` block/transaction hashes
-/// on one request; without an aggregate cap `encode_response` would serialize
-/// and retain the entire multi-frame `Vec<Frame>` (worst case
-/// `MAX_TX_INV_IN_SENT_MESSAGE * MAX_PROTOCOL_MESSAGE_LEN`, tens of GiB) before
-/// the first byte is written. The outbound reader already enforces a symmetric
-/// per-response cap (`LegacyResponseBudget`); this is the responder-side mirror.
-/// Sized well above any single response the local service emits (zakurad caps
-/// `getdata` at ~1 MiB) yet far below memory-risk thresholds.
-const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
-    super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
@@ -1078,7 +1066,7 @@ impl ResponseEncodeBudget {
     /// budget.
     fn account(&mut self, payload_len: usize) -> Result<(), LegacyGossipError> {
         self.bytes = self.bytes.saturating_add(payload_len);
-        if self.bytes > LEGACY_RESPONSE_MAX_AGGREGATE_BYTES {
+        if self.bytes > COMPAT_RESPONSE_MAX_AGGREGATE_BYTES {
             return Err(LegacyGossipError::ResponseAggregateBudget(self.bytes));
         }
         Ok(())
@@ -7143,7 +7131,7 @@ mod tests {
 
         // Enough available blocks to overflow the cumulative byte budget must be
         // rejected, not fully materialized as a `Vec<Frame>`.
-        let block_copies = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let block_copies = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
         let many_blocks = Response::Blocks(
             (0..block_copies)
                 .map(|_| InventoryResponse::Available((block.clone().into(), None)))
@@ -7159,7 +7147,7 @@ mod tests {
 
         // The same cumulative budget guards the transaction responder path,
         // which shares `push_chunked_response`.
-        let tx_copies = 2 * LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let tx_copies = 2 * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
         let many_transactions = Response::Transactions(
             (0..tx_copies)
                 .flat_map(|_| {

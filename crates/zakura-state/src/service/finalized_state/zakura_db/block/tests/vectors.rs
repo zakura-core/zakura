@@ -205,7 +205,21 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let (state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    let (mut state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    // A second block lets replay hold one block's transaction while it reads the next.
+    let block_1: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        deadline,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     let budget = with_budget(&mut read, 1);
     let hash = genesis.transactions[0].hash();
     let ReadResponse::Transaction(Some(result)) = timeout(
@@ -271,8 +285,8 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
         replay_with_subtrees, DerivedFrontiers, HistoricalTreeDerivationError,
     };
     let replay = || {
-        replay_with_subtrees(&read.db, Height(0), 0, DerivedFrontiers::empty(), |_, _| {
-            panic!("genesis has no shielded commitments")
+        replay_with_subtrees(&read.db, Height(1), 0, DerivedFrontiers::empty(), |_, _| {
+            panic!("the first blocks have no shielded commitments")
         })
     };
     assert!(matches!(

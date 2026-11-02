@@ -15,4 +15,5 @@ Invoke each test with `cargo +1.97.0 test --locked -p zakura-state --lib <test>`
 The service test uses real RocksDB data and returns a stored genesis block after
 capacity becomes available. Its blocked job runs on Tokio's real blocking pool.
 These tests do not provide deterministic replay or a bound on retained results,
-waiting requests, direct synchronous database users, or writer work.
+direct synchronous database users, or writer work. Waiting requests hold no
+lock or byte charge, so the pools do not cap them.

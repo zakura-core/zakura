@@ -1122,6 +1122,7 @@ impl WorkPolicy {
     /// A `bounded_prefix` round narrows an ordinary owner to its staged tip,
     /// since state admits only that prefix. Return `None` unless `peer`'s work
     /// is receiving and holds staged headers.
+    #[allow(clippy::unwrap_in_result)] // Its expects are local work invariants, not peer input.
     pub(super) fn begin_prepare(
         &mut self,
         peer: &ZakuraPeerId,

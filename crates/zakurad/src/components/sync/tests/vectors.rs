@@ -2859,7 +2859,7 @@ async fn short_verify_timeout_starts_after_final_checkpoint() -> Result<(), crat
                 .expect("the child is queued")
                 .expect_err("the short timeout must fire");
             assert!(
-                TestChainSync::is_post_checkpoint_verify_timeout(&error),
+                error.is_post_checkpoint_verify_timeout(),
                 "the downloader must preserve Tokio's Elapsed type"
             );
             drop(commit);
@@ -4981,6 +4981,86 @@ async fn child_keeps_waiting_while_its_parent_download_is_retried() {
     assert_eq!(
         asked_parents(&asked),
         vec![block1.header.previous_block_hash]
+    );
+}
+
+/// A parent whose verification ends without a verdict (here a missing-input timeout) stays
+/// pending while the syncer requests it again. A child downloaded before the retry waits for the
+/// retry to pass its check, instead of asking the state about a parent it may still be holding.
+#[tokio::test]
+async fn child_waits_while_its_parent_verification_is_retried() {
+    let _init_guard = zakura_test::init();
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(true, Height(0));
+    let serve = |block: &Arc<Block>| zn::Response::Blocks(vec![Available((block.clone(), None))]);
+
+    downloads
+        .download_and_verify(block1.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block1.hash()).collect(),
+        ))
+        .await
+        .respond(serve(&block1));
+    verifier
+        .expect_request_that(|req| req.block().hash() == block1.hash())
+        .await
+        .respond(Err(crate::BoxError::from(RouterError::Block {
+            source: Box::new(VerifyBlockError::Transaction(
+                TransactionError::TransparentInputNotFound,
+            )),
+        })));
+    let error = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking")
+        .expect_err("the parent's verification ends without a verdict");
+    assert!(error.is_retried_verification(), "{error:?}");
+
+    // The child arrives before the parent is requested again, and waits for it.
+    downloads
+        .download_and_verify(block2.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block2.hash()).collect(),
+        ))
+        .await
+        .respond(serve(&block2));
+    verifier.expect_no_requests().await;
+
+    downloads
+        .download_and_verify(block1.hash())
+        .await
+        .expect("queuing the retry succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block1.hash()).collect(),
+        ))
+        .await
+        .respond(serve(&block1));
+
+    let mut remaining: HashSet<block::Hash> = [block1.hash(), block2.hash()].into();
+    for _ in 0..2 {
+        verifier
+            .expect_request_that(|req| remaining.remove(&req.block().hash()))
+            .await
+            .respond_with(|req| req.block().hash());
+    }
+    for _ in 0..2 {
+        downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking")
+            .expect("both blocks verify");
+    }
+    assert_eq!(
+        asked_parents(&asked),
+        vec![block1.header.previous_block_hash; 2],
+        "only the parent's own checks ask the state"
     );
 }
 

@@ -29,6 +29,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     parameters::Network,
 };
+use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -281,6 +282,44 @@ pub(super) enum NotFoundKind {
 }
 
 impl BlockDownloadVerifyError {
+    /// Whether verification ended without a verdict, so the syncer requests the block again
+    /// (within its retry budget) instead of treating it as rejected.
+    pub(super) fn is_retried_verification(&self) -> bool {
+        self.is_utxo_lookup_timeout()
+            || self.is_post_checkpoint_verify_timeout()
+            || self.is_pending_commit()
+    }
+
+    /// Identifies the state service's `AwaitUtxo` timeout.
+    pub(super) fn is_utxo_lookup_timeout(&self) -> bool {
+        matches!(
+            self,
+            BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block { source },
+                ..
+            } if matches!(
+                **source,
+                VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+                    | VerifyBlockError::ParentUnavailable { .. }
+            )
+        )
+    }
+
+    /// Identifies the short Tokio timeout; the eight-minute Tower timeout has a different type.
+    pub(super) fn is_post_checkpoint_verify_timeout(&self) -> bool {
+        matches!(
+            self,
+            BlockDownloadVerifyError::ValidationRequestError { error, .. }
+                if error.is::<tokio::time::error::Elapsed>()
+        )
+    }
+
+    /// Identifies a duplicate whose original commit has no known outcome yet.
+    fn is_pending_commit(&self) -> bool {
+        matches!(self, BlockDownloadVerifyError::Invalid { error, .. }
+            if matches!(error.duplicate_location(), Some(zs::KnownBlock::Queue | zs::KnownBlock::WriteChannel)))
+    }
+
     /// Returns the connected legacy peer that supplied the invalid block, if known.
     pub(super) fn advertiser_addr(&self) -> Option<PeerSocketAddr> {
         match self {
@@ -500,11 +539,17 @@ where
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
-                    // A failed download is neither verified nor rejected: the syncer requests it
-                    // again or restarts the round, so its children keep waiting until then. A
-                    // retry only starts after this result is polled, so this never finishes a
-                    // newer task for the same hash.
-                    if !matches!(e, BlockDownloadVerifyError::DownloadFailed { .. }) {
+                    // A failed download, or a verification that ended without a verdict, is
+                    // neither verified nor rejected: the syncer requests the block again or
+                    // restarts the round, so its children keep waiting until then. A retried
+                    // block must pass its parent check again before its children may rely on it.
+                    // A retry only starts after this result is polled, so this never changes a
+                    // newer task's entry.
+                    if matches!(e, BlockDownloadVerifyError::DownloadFailed { .. })
+                        || e.is_retried_verification()
+                    {
+                        this.parent_gate.unpass(hash);
+                    } else {
                         this.parent_gate.finish(hash);
                     }
                     let state = take_task_state(this.task_states, hash);

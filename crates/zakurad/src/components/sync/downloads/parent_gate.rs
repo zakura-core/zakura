@@ -20,13 +20,18 @@ use crate::components::sync::{
 
 /// Bounds a download task's wait for a parent that is still pending.
 ///
-/// The parent's own task already bounds the wait, so this is only a safety net. Its download
-/// times out after [`BLOCK_DOWNLOAD_TIMEOUT`]. A block missing from every peer is retried for up
-/// to [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`] × [`REGISTRY_MISS_RETRY_BACKOFF`] (120 s). Any other
-/// failure, or an exhausted retry budget, restarts the round, which cancels the waiting children.
-/// The first block after the last checkpoint waits for the final checkpoint range to be written,
-/// which takes up to [`FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT`] (120 s). This cap is above both, so
-/// an honest child is never dropped while its parent is still legitimately on its way.
+/// This is a safety net: the parent's own retry budgets end every wait, by delivering the parent
+/// or by restarting the round, which cancels the waiting children. It is set above the two waits
+/// an honest parent commonly needs: a block missing from every peer, retried for up to
+/// [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`] × [`REGISTRY_MISS_RETRY_BACKOFF`] (120 s) plus one
+/// [`BLOCK_DOWNLOAD_TIMEOUT`], and the final checkpoint range's write, which takes up to
+/// [`FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT`] (120 s).
+///
+/// A parent that compounds several budgets (transient failures, "not found" answers and registry
+/// misses, each download taking up to its timeout) can take longer. Then its children are dropped,
+/// and so are their descendants in flight, and a later tip refresh or round finds them again.
+/// Covering that worst case would let a peer that advertises an unavailable parent hold
+/// lookahead slots for several minutes per child.
 pub(in crate::components::sync) const PARENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(150);
 
 const _: () = {
@@ -95,6 +100,12 @@ impl ParentGate {
     /// Records that pending block `hash` passed its parent check.
     pub(super) fn pass(&self, hash: block::Hash) {
         self.update(|sets| sets.pending.contains(&hash) && sets.passed.insert(hash));
+    }
+
+    /// Records that `hash` will be requested again without a verdict: it stays pending, but must
+    /// pass its parent check again before its children may go to the verifier.
+    pub(super) fn unpass(&self, hash: block::Hash) {
+        self.update(|sets| sets.passed.remove(&hash));
     }
 
     /// Records that `hash` verified or was rejected, so it no longer counts as a parent.
@@ -323,6 +334,26 @@ mod tests {
             asked(&questions).is_empty(),
             "the state is never asked about a pending parent"
         );
+    }
+
+    /// A retried parent stays pending but no longer counts as passed, so a new child waits for
+    /// it to pass again.
+    #[tokio::test]
+    async fn unpassed_parent_keeps_its_children_waiting() {
+        let gate = Arc::new(ParentGate::default());
+        let (state, questions) = recording_state(false);
+        gate.request(hash(1));
+        gate.pass(hash(1));
+        gate.unpass(hash(1));
+        assert!(gate.is_pending(&hash(1)) && !gate.is_passed(&hash(1)));
+
+        let child = spawn_child(&gate, hash(1), &state);
+        settle().await;
+        assert!(!child.is_finished(), "the child waits for the retry");
+
+        gate.pass(hash(1));
+        assert!(child.await.expect("child task doesn't panic"));
+        assert!(asked(&questions).is_empty());
     }
 
     #[test]

@@ -2743,18 +2743,18 @@ where
             }
         }
 
-        if let Some(error) = response.as_ref().err().filter(|error| {
-            Self::is_utxo_lookup_timeout(error)
-                || Self::is_post_checkpoint_verify_timeout(error)
-                || Self::is_pending_commit(error)
-        }) {
+        if let Some(error) = response
+            .as_ref()
+            .err()
+            .filter(|error| error.is_retried_verification())
+        {
             let hash = match error {
                 BlockDownloadVerifyError::Invalid { hash, .. }
                 | BlockDownloadVerifyError::ValidationRequestError { hash, .. } => *hash,
                 _ => unreachable!("verification timeouts carry a block hash"),
             };
 
-            if Self::is_utxo_lookup_timeout(error) {
+            if error.is_utxo_lookup_timeout() {
                 self.utxo_race_drops = self.utxo_race_drops.saturating_add(1);
                 if self.utxo_race_drops
                     >= self
@@ -3095,27 +3095,6 @@ where
             || error.is_auth_commitment_mismatch()
     }
 
-    /// Identifies a duplicate whose original commit has no known outcome yet.
-    fn is_pending_commit(error: &BlockDownloadVerifyError) -> bool {
-        matches!(error, BlockDownloadVerifyError::Invalid { error, .. }
-            if matches!(error.duplicate_location(), Some(zs::KnownBlock::Queue | zs::KnownBlock::WriteChannel)))
-    }
-
-    /// Identifies the state service's `AwaitUtxo` timeout.
-    fn is_utxo_lookup_timeout(error: &BlockDownloadVerifyError) -> bool {
-        matches!(
-            error,
-            BlockDownloadVerifyError::Invalid {
-                error: RouterError::Block { source },
-                ..
-            } if matches!(
-                **source,
-                VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
-                    | VerifyBlockError::ParentUnavailable { .. }
-            )
-        )
-    }
-
     /// Returns the block and parent hashes of a verification failure whose authorizing data
     /// binding is still unconfirmed after the download task waited for the parent.
     fn unconfirmed_binding(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
@@ -3148,15 +3127,6 @@ where
         }
     }
 
-    /// Identifies the short Tokio timeout; the eight-minute Tower timeout has a different type.
-    fn is_post_checkpoint_verify_timeout(error: &BlockDownloadVerifyError) -> bool {
-        matches!(
-            error,
-            BlockDownloadVerifyError::ValidationRequestError { error, .. }
-                if error.is::<tokio::time::error::Elapsed>()
-        )
-    }
-
     /// Return if the sync should be restarted based on the given error
     /// from the block downloader and verifier stream.
     fn should_restart_sync(e: &BlockDownloadVerifyError, expose_peer_addresses: bool) -> bool {
@@ -3169,10 +3139,7 @@ where
                 false
             }
             // The retry handler bounds these races without cancelling the parent's commit.
-            e if Self::is_utxo_lookup_timeout(e)
-                || Self::is_post_checkpoint_verify_timeout(e)
-                || Self::is_pending_commit(e) =>
-            {
+            e if e.is_retried_verification() => {
                 debug!(error = ?e, %peer, "block verification remains incomplete, continuing sync");
                 false
             }

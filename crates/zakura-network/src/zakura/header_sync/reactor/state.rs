@@ -13,9 +13,9 @@ use zakura_rt::{collections::HashMap, time::Instant};
 pub(super) use super::StorageCall;
 pub use super::StorageCallKind;
 use super::{
-    source_id_from_peer, AdvertisedHeaderTarget, AuxSchema, CompletedHeaderTargets,
-    HeaderPortOperation, HeaderRequestTerminal, HeaderTargetPhase, HeaderTargetPurpose,
-    PeerWorkPriority, RepairRequirement, RepairRequirementSlot, Status, ZakuraPeerId,
+    source_id_from_peer, v9, AdvertisedHeaderTarget, AuxSchema, CompletedHeaderTargets,
+    HeaderPortOperation, HeaderRequestTerminal, HeaderTargetPhase, HeaderTargetPurpose, PageLimits,
+    PeerWorkPriority, RepairRequirement, RepairRequirementSlot, Status, ZakuraPeerId, MAX_HS_RANGE,
     VCT_REPAIR_RETRY_INTERVAL,
 };
 
@@ -1147,7 +1147,7 @@ pub(super) const VCT_REPAIR_STALL_REPORT_AFTER: std::time::Duration =
 ///
 /// The reactor reports the tally when no supplier qualifies. Without it the trace records only
 /// that the repair made no progress, not which requirement excluded the network.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct VctSupplierRejections {
     /// Peers that had advertised a status.
     pub(super) considered: u64,
@@ -1169,6 +1169,155 @@ pub(super) struct VctSupplierRejections {
     pub(super) excluded_input: u64,
     /// Eligible peers whose request could not enter the ordered send queue.
     pub(super) send_failed: u64,
+}
+
+/// The facts about one admitted peer that decide whether it can supply a repair.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RepairSupplierFacts<'a> {
+    pub(super) peer: &'a ZakuraPeerId,
+    /// The peer's last status.
+    pub(super) status: &'a Status,
+    /// Whether the peer holds started header work.
+    pub(super) serving: bool,
+    /// Whether the peer's session holds a live subscription.
+    pub(super) subscription_live: bool,
+}
+
+/// The local limits on one repair supplier pass.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RepairSupplierLimits {
+    /// One header's wire size on this network.
+    pub(super) header_bytes: usize,
+    /// The serving limits this node advertises.
+    pub(super) page_limits: PageLimits,
+    /// The aggregate header capacity this repair can reserve now.
+    pub(super) local_capacity: u32,
+}
+
+/// One peer that can supply a repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RepairCandidate {
+    pub(super) peer: ZakuraPeerId,
+    pub(super) source: zakura_header_chain::SourceId,
+    pub(super) status: Status,
+    /// The headers to request from this peer.
+    pub(super) request_count: u32,
+}
+
+/// The outcome of one repair supplier pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct RepairCandidates {
+    /// Peers that can supply the repair, in supplier order.
+    pub(super) candidates: Vec<RepairCandidate>,
+    /// Why every other peer cannot.
+    pub(super) rejections: VctSupplierRejections,
+    /// Peers whose live subscription must end before a repair can open its own.
+    pub(super) closing: Vec<ZakuraPeerId>,
+}
+
+/// Choose the suppliers for `task`'s repair of `context`, in the order `suppliers` names.
+///
+/// A peer can serve the exact repair target from its retained header graph or
+/// from its finalized state, and those two bands are exhaustive below its selected
+/// tip. So this checks only reachable height, response capacity, and schema
+/// support. The supplier proves branch membership by returning the exact target
+/// hash after the exact predecessor hash, and admission rejects anything else.
+pub(super) fn repair_candidates<'a>(
+    task: &RepairRequirement,
+    context: &zakura_header_chain::VctRepairContext,
+    limits: RepairSupplierLimits,
+    suppliers: impl IntoIterator<Item = RepairSupplierFacts<'a>>,
+) -> RepairCandidates {
+    let desired_count = u32::try_from(context.selected_header_count())
+        .expect("a VCT repair range fits the transition header limit");
+    let mut pass = RepairCandidates::default();
+    let rejections = &mut pass.rejections;
+    for supplier in suppliers {
+        let status = supplier.status;
+        rejections.considered += 1;
+        if status.selected_tip_height < context.target.height {
+            rejections.below_target_height += 1;
+            continue;
+        }
+        let reachable_count = status
+            .selected_tip_height
+            .0
+            .checked_sub(context.target.height.0)
+            .and_then(|distance| distance.checked_add(1))
+            .unwrap_or(0);
+        let message_capacity = v9::page_capacity(
+            limits.header_bytes,
+            AuxSchema::V1,
+            usize::try_from(status.max_message_bytes.min(limits.page_limits.max_bytes))
+                .unwrap_or(usize::MAX),
+        );
+        let peer_supported_count = desired_count
+            .min(reachable_count)
+            .min(status.max_headers_per_response)
+            .min(limits.page_limits.max_headers)
+            .min(message_capacity)
+            .min(MAX_HS_RANGE);
+        if peer_supported_count == 0 {
+            rejections.insufficient_capacity += 1;
+            continue;
+        }
+        let supported_count = if limits.local_capacity == 0 {
+            peer_supported_count
+        } else {
+            peer_supported_count.min(limits.local_capacity)
+        };
+        // An ambiguous boundary repair cannot shorten, so its supplier must serve both headers.
+        // Missing local capacity only delays the full request.
+        let unshortenable = context
+            .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
+            .is_none();
+        if unshortenable && peer_supported_count < desired_count {
+            rejections.insufficient_capacity += 1;
+            continue;
+        }
+        if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
+            rejections.unsupported_schema += 1;
+            continue;
+        }
+        if supplier.serving {
+            rejections.already_serving += 1;
+            continue;
+        }
+        if supplier.subscription_live {
+            // A repair opens its own subscription after this one ends.
+            pass.closing.push(supplier.peer.clone());
+            rejections.already_serving += 1;
+            continue;
+        }
+        let source = source_id_from_peer(supplier.peer);
+        if context.retains_source(source) {
+            rejections.retained_source += 1;
+            continue;
+        }
+        if task.excluded_input_sources.contains(&source) {
+            rejections.excluded_input += 1;
+            continue;
+        }
+        if task.tried_sources.contains(&source) {
+            rejections.already_tried += 1;
+            continue;
+        }
+        if task.supplier_is_waiting_for_status(source) {
+            rejections.supplier_status_wait += 1;
+            continue;
+        }
+        pass.candidates.push(RepairCandidate {
+            peer: supplier.peer.clone(),
+            source,
+            status: status.clone(),
+            request_count: if unshortenable {
+                desired_count
+            } else {
+                supported_count
+            },
+        });
+    }
+    pass
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

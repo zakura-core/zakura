@@ -42,7 +42,7 @@ fn status(tip: u8) -> Status {
         max_headers_per_response: 16,
         max_subscriptions: 1,
         max_message_bytes: 1_000_000,
-        tree_aux_schema_mask: 0,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
     }
 }
 
@@ -179,6 +179,117 @@ fn repair(generation: u8, height: u8) -> RepairRequirement {
 
 fn predecessor() -> zakura_header_chain::Frontier {
     zakura_header_chain::Frontier::new(block::Height(0), hash(0xC1, 0))
+}
+
+/// The local limits of every repair supplier pass in these tests.
+fn supplier_limits() -> RepairSupplierLimits {
+    RepairSupplierLimits {
+        header_bytes: COMMON_HEADER_BYTES,
+        page_limits: PageLimits {
+            max_headers: 16,
+            max_bytes: 1_000_000,
+            aux_schema_mask: AuxSchema::V1.mask_bit(),
+        },
+        local_capacity: 1,
+    }
+}
+
+/// `task`, resolved to a one-header context, and ready for supplier assignment.
+fn ready_repair(
+    mut task: RepairRequirement,
+) -> (RepairRequirement, zakura_header_chain::VctRepairContext) {
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
+        zakura_header_chain::Frontier::new(task.height, hash(0xC2, 0)),
+        zakura_header_chain::HeaderLocator::for_continuation(predecessor()),
+        None,
+    );
+    let now = Instant::now();
+    task.mark_context_requested(now, now)
+        .expect("a new repair needs context");
+    task.resolve(context.clone())
+        .expect("the context names the repair's height");
+    (task, context)
+}
+
+/// What the model knows about one repair supplier.
+#[derive(Clone, Debug)]
+struct ModelSupplier {
+    peer: usize,
+    status: Status,
+    serving: bool,
+    live: bool,
+    tried: bool,
+    excluded: bool,
+    waiting: bool,
+}
+
+/// The documented supplier rules for a one-header repair at `target`, in order:
+/// the candidates, the peers to close, and the rejection tally.
+fn model_supplier_pass(
+    target: block::Height,
+    suppliers: &[ModelSupplier],
+) -> (Vec<usize>, Vec<usize>, VctSupplierRejections) {
+    let mut tally = VctSupplierRejections::default();
+    let (mut candidates, mut closing) = (Vec::new(), Vec::new());
+    for supplier in suppliers {
+        tally.considered += 1;
+        let status = &supplier.status;
+        let fits_one_header = status.max_headers_per_response != 0
+            && v9::page_capacity(
+                COMMON_HEADER_BYTES,
+                AuxSchema::V1,
+                1_000_000.min(status.max_message_bytes as usize),
+            ) != 0;
+        if status.selected_tip_height < target {
+            tally.below_target_height += 1;
+        } else if !fits_one_header {
+            tally.insufficient_capacity += 1;
+        } else if status.tree_aux_schema_mask & 1 == 0 {
+            tally.unsupported_schema += 1;
+        } else if supplier.serving {
+            tally.already_serving += 1;
+        } else if supplier.live {
+            tally.already_serving += 1;
+            closing.push(supplier.peer);
+        } else if supplier.excluded {
+            tally.excluded_input += 1;
+        } else if supplier.tried {
+            tally.already_tried += 1;
+        } else if supplier.waiting {
+            tally.supplier_status_wait += 1;
+        } else {
+            candidates.push(supplier.peer);
+        }
+    }
+    (candidates, closing, tally)
+}
+
+/// The peer indexes of `pass`, to compare with [`model_supplier_pass`].
+fn pass_indexes(pass: RepairCandidates) -> (Vec<usize>, Vec<usize>, VctSupplierRejections) {
+    let index = |peer: &ZakuraPeerId| {
+        (0..u8::MAX as usize)
+            .find(|index| peer_id(*index) == *peer)
+            .expect("the pass only names test peers")
+    };
+    (
+        pass.candidates
+            .iter()
+            .map(|candidate| {
+                assert_eq!(
+                    candidate.request_count, 1,
+                    "{PROPERTY}: a one-header repair"
+                );
+                index(&candidate.peer)
+            })
+            .collect(),
+        pass.closing.iter().map(index).collect(),
+        pass.rejections,
+    )
+}
+
+/// A copy of `task` that has not started asking for its context.
+fn task_with_new_state(task: RepairRequirement) -> RepairRequirement {
+    RepairRequirement::new(task.owner, task.height, task.repair_generation)
 }
 
 /// The model's view of one admitted session.
@@ -732,8 +843,56 @@ impl Harness {
         Some(self.started[read % self.started.len()].clone())
     }
 
+    /// Compare the suppliers that the current repair would choose with the
+    /// model's choice. A pending read stands for started work, and a `Close`
+    /// waiting for its outcome stands for a live subscription.
+    fn check_repair_suppliers(&self) {
+        let Some(task) = self.state.vct_repair.current().cloned() else {
+            return;
+        };
+        let (task, context) = ready_repair(task_with_new_state(task));
+        let suppliers: Vec<_> = self
+            .state
+            .vct_supplier_order
+            .iter()
+            .filter_map(|peer| {
+                let status = self.state.peers.get(peer)?.last_status.as_ref()?;
+                Some(RepairSupplierFacts {
+                    peer,
+                    status,
+                    serving: self.state.locators.contains(peer),
+                    subscription_live: self.state.close_deadlines.contains_key(peer),
+                })
+            })
+            .collect();
+        let actual = repair_candidates(&task, &context, supplier_limits(), suppliers);
+        let expected: Vec<_> = self
+            .model
+            .suppliers
+            .iter()
+            .filter_map(|peer| {
+                let tip = self.model.sessions.get(peer)?.status?;
+                Some(ModelSupplier {
+                    peer: *peer,
+                    status: status(tip),
+                    serving: self.model.pending.contains_key(peer),
+                    live: self.model.close_outcomes.contains_key(peer),
+                    tried: false,
+                    excluded: false,
+                    waiting: false,
+                })
+            })
+            .collect();
+        assert_eq!(
+            pass_indexes(actual),
+            model_supplier_pass(task.height, &expected),
+            "{PROPERTY}: repair suppliers"
+        );
+    }
+
     /// Compare every observable fact of the machine with the model.
     fn check(&self) {
+        self.check_repair_suppliers();
         assert_eq!(
             self.state.scheduling_revision, self.model.revision,
             "{PROPERTY}"
@@ -1183,6 +1342,62 @@ proptest! {
     #[test]
     fn reactor_state_matches_the_model(ops in prop::collection::vec(op(), 1..64)) {
         run(ops);
+    }
+
+    /// Every rejection rule, in the order the supplier pass applies them.
+    #[test]
+    fn repair_suppliers_match_the_model(
+        suppliers in prop::collection::vec(any::<(u8, u8)>(), 0..PEERS)
+    ) {
+        let (mut task, context) = ready_repair(repair(0, 1));
+        let suppliers: Vec<_> = suppliers
+            .into_iter()
+            .enumerate()
+            .map(|(peer, (tip, flags))| {
+                let mut status = status(tip % 4);
+                status.max_headers_per_response = u32::from(flags & 1) * 16;
+                status.tree_aux_schema_mask = u32::from(flags >> 1 & 1);
+                ModelSupplier {
+                    peer,
+                    status,
+                    serving: flags & 4 != 0,
+                    live: flags & 8 != 0,
+                    tried: flags & 16 != 0,
+                    excluded: flags & 32 != 0,
+                    waiting: flags & 64 != 0,
+                }
+            })
+            .collect();
+        for supplier in &suppliers {
+            let source = source_id_from_peer(&peer_id(supplier.peer));
+            if supplier.excluded {
+                task.excluded_input_sources.insert(source);
+            }
+            if supplier.tried {
+                task.tried_sources.insert(source);
+            }
+            if supplier.waiting {
+                let owner = task.owner;
+                task.assign(owner, context.clone()).expect("the repair is ready");
+                task.wait_for_supplier_status(source).expect("the repair is assigned");
+            }
+        }
+        let ids: Vec<_> = suppliers.iter().map(|supplier| peer_id(supplier.peer)).collect();
+        let actual = repair_candidates(
+            &task,
+            &context,
+            supplier_limits(),
+            suppliers.iter().zip(&ids).map(|(supplier, peer)| RepairSupplierFacts {
+                peer,
+                status: &supplier.status,
+                serving: supplier.serving,
+                subscription_live: supplier.live,
+            }),
+        );
+        prop_assert_eq!(
+            pass_indexes(actual),
+            model_supplier_pass(task.height, &suppliers)
+        );
     }
 }
 

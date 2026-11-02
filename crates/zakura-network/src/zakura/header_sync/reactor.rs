@@ -45,8 +45,9 @@ pub use super::scheduler::peer_work::StorageCallKind;
 #[cfg(any(test, zakura_sim))]
 use super::observe::{self, ReactorEvent};
 use state::{
-    vct_error_retry, CloseAttempt, LocalOperationExpiry, LocatorDisposition, LocatorKey,
-    LocatorProposal, ReactorState, RepairStallDue, SchedulingOpportunity, VctLocalOperation,
+    repair_candidates, vct_error_retry, CloseAttempt, LocalOperationExpiry, LocatorDisposition,
+    LocatorKey, LocatorProposal, ReactorState, RepairCandidate, RepairStallDue,
+    RepairSupplierFacts, RepairSupplierLimits, SchedulingOpportunity, VctLocalOperation,
     VctRepairRetry, VctRepairRetryAttribution, VctRepairStall, VctRepairStallOutcome,
     VctSupplierRejections,
 };
@@ -502,6 +503,17 @@ fn vct_repair_predecessor(task: &RepairRequirement) -> Option<zakura_header_chai
         | RepairPolicyState::Completed => return None,
     };
     context.locator.entries().first().copied()
+}
+
+/// How one repair candidate's request ended.
+enum RepairAttempt {
+    /// The pass is over: the request started, or the repair retried.
+    Finished,
+    /// The aggregate header budget had no room for the request.
+    NoLocalCapacity,
+    /// The request could not enter the peer's send queue. The failure is
+    /// local when it describes no fault of the supplier.
+    SendFailed { local: bool },
 }
 
 #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
@@ -2883,122 +2895,31 @@ impl HeaderSyncReactor {
         };
         let desired_count = u32::try_from(context.selected_header_count())
             .expect("a VCT repair range fits the transition header limit");
-        let local_capacity = self
-            .peer_work_queue
-            .reservable_repair_header_count(desired_count);
-        // A peer can serve the exact repair target from its retained header graph or from its
-        // finalized state, and those two bands are exhaustive below its selected tip. The filter
-        // therefore checks only reachable height, response capacity, and schema support. The
-        // supplier proves branch membership by returning the exact target hash after the exact
-        // predecessor hash; the admission path rejects anything else.
-        let mut rejections = VctSupplierRejections::default();
-        let mut candidates = Vec::new();
-        let mut closing = Vec::new();
-        for peer in &self.state.vct_supplier_order {
-            let Some(handles) = self.sessions.get(peer) else {
-                continue;
-            };
-            let Some(status) = self
-                .state
-                .peers
-                .get(peer)
-                .and_then(|schedule| schedule.last_status.as_ref())
-            else {
-                continue;
-            };
-            rejections.considered += 1;
-            if status.selected_tip_height < context.target.height {
-                rejections.below_target_height += 1;
-                continue;
-            }
-            let reachable_count = status
-                .selected_tip_height
-                .0
-                .checked_sub(context.target.height.0)
-                .and_then(|distance| distance.checked_add(1))
-                .unwrap_or(0);
-            let message_capacity = v9::page_capacity(
-                self.header_bytes,
-                AuxSchema::V1,
-                usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
-                    .unwrap_or(usize::MAX),
-            );
-            let peer_supported_count = desired_count
-                .min(reachable_count)
-                .min(status.max_headers_per_response)
-                .min(self.page_limits.max_headers)
-                .min(message_capacity)
-                .min(MAX_HS_RANGE);
-            if peer_supported_count == 0 {
-                rejections.insufficient_capacity += 1;
-                continue;
-            }
-            let supported_count = if local_capacity == 0 {
-                peer_supported_count
-            } else {
-                peer_supported_count.min(local_capacity)
-            };
-            // An ambiguous boundary repair cannot shorten, so its supplier must serve both headers.
-            // Missing local capacity only delays the full request.
-            let unshortenable = context
-                .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
-                .is_none();
-            if unshortenable && peer_supported_count < desired_count {
-                rejections.insufficient_capacity += 1;
-                continue;
-            }
-            let supported_count = if unshortenable {
-                desired_count
-            } else {
-                supported_count
-            };
-            if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
-                rejections.unsupported_schema += 1;
-                continue;
-            }
-            if self.peer_work_queue.active(peer).is_some() {
-                rejections.already_serving += 1;
-                continue;
-            }
-            if handles.session.subscriber().live().is_some() {
-                // A repair opens its own subscription after this one ends.
-                closing.push(peer.clone());
-                rejections.already_serving += 1;
-                continue;
-            }
-            let source = source_id_from_peer(peer);
-            if context.retains_source(source) {
-                rejections.retained_source += 1;
-                continue;
-            }
-            if task.excluded_input_sources.contains(&source) {
-                rejections.excluded_input += 1;
-                continue;
-            }
-            if task.tried_sources.contains(&source) {
-                rejections.already_tried += 1;
-                continue;
-            }
-            if task.supplier_is_waiting_for_status(source) {
-                rejections.supplier_status_wait += 1;
-                continue;
-            }
-            candidates.push((
-                peer.clone(),
-                source,
-                handles.session.clone(),
-                status.clone(),
-                supported_count,
-            ));
+        let limits = RepairSupplierLimits {
+            header_bytes: self.header_bytes,
+            page_limits: self.page_limits,
+            local_capacity: self
+                .peer_work_queue
+                .reservable_repair_header_count(desired_count),
+        };
+        let suppliers = self.state.vct_supplier_order.iter().filter_map(|peer| {
+            let handles = self.sessions.get(peer)?;
+            Some(RepairSupplierFacts {
+                peer,
+                status: self.state.peers.get(peer)?.last_status.as_ref()?,
+                serving: self.peer_work_queue.active(peer).is_some(),
+                subscription_live: handles.session.subscriber().live().is_some(),
+            })
+        });
+        let mut pass = repair_candidates(&task, context, limits, suppliers);
+        for peer in &pass.closing {
+            self.close_subscription(peer);
         }
-        for peer in closing {
-            self.close_subscription(&peer);
-        }
-        if candidates.is_empty() {
+        if pass.candidates.is_empty() {
             self.note_vct_repair_stall(
                 &task,
                 predecessor,
-                rejections,
+                pass.rejections,
                 VctRepairStallOutcome::NoEligibleSupplier,
                 now,
             );
@@ -3007,157 +2928,17 @@ impl HeaderSyncReactor {
         // Keep the rotating order even when a later supplier offers a larger batch.
         let mut local_capacity_unavailable = false;
         let mut local_send_failure = false;
-        for (peer, source, session, mut status, request_count) in candidates {
-            if self.peer_work_queue.awaiting_target(&peer).is_some() {
-                // Preemption returns the ordinary offer even if reserving or sending repair fails.
-                self.defer_ordinary_target(&peer);
-            }
-            if self
-                .peer_work_queue
-                .reservable_repair_header_count(request_count)
-                != request_count
-                || !self
-                    .peer_work_queue
-                    .reserve_repair_request(&peer, request_count)
-            {
-                local_capacity_unavailable = true;
-                continue;
-            }
-            let selected_context = context
-                .bounded_prefix(
-                    usize::try_from(request_count).expect("the negotiated repair count fits usize"),
-                )
-                .expect("a positive repair prefix exists");
-            let request_target = selected_context.request_target();
-            status.selected_tip_height = request_target.height;
-            status.selected_tip_hash = request_target.hash;
-            status.max_headers_per_response = request_count;
-            let request_id = match session.try_open(
-                &status,
-                selected_context.locator.entries(),
-                AuxSchema::V1,
-                request_count,
-            ) {
-                Ok(request_id) => request_id,
-                Err(error) => {
-                    self.peer_work_queue.cancel_request_reservation(&peer);
-                    self.emit_queue_send_failed(&peer, &session, "SubscribeHeaders", &error, None);
-                    rejections.send_failed += 1;
-                    match vct_send_retry_attribution(&error) {
-                        VctRepairRetryAttribution::Supplier
-                        | VctRepairRetryAttribution::ExcludedInput => {
-                            if let Some(current) = self.state.vct_repair.get_mut(task.owner) {
-                                let _ = current.record_failed_source(source);
-                            }
-                            self.state.rotate_supplier(source);
-                        }
-                        // A full or closed outbound stream describes this one peer. Backing the
-                        // whole round off here would let a peer that stops reading its stream keep
-                        // its place at the front of every candidate list and fail the same send
-                        // forever, so the remaining candidates still get their turn.
-                        VctRepairRetryAttribution::Local => {
-                            local_send_failure = true;
-                        }
-                        VctRepairRetryAttribution::Stale => unreachable!(
-                            "ordered-send failures cannot report a stale state episode"
-                        ),
-                    }
-                    continue;
+        for candidate in pass.candidates {
+            match self.try_repair_candidate(&task, context, candidate) {
+                RepairAttempt::Finished => return,
+                RepairAttempt::NoLocalCapacity => local_capacity_unavailable = true,
+                RepairAttempt::SendFailed { local } => {
+                    pass.rejections.send_failed += 1;
+                    local_send_failure |= local;
                 }
-            };
-            self.emit_header_request(
-                &peer,
-                session.session_id(),
-                task.owner.header,
-                request_id,
-                request_target.hash,
-                &selected_context.locator,
-                request_count,
-                AuxSchema::V1,
-            );
-            let wire_owner = task.owner.authority.bind(
-                session.session_id(),
-                NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
-            );
-            if self
-                .state
-                .vct_repair
-                .assign(task.owner, wire_owner, selected_context.clone())
-                .is_err()
-            {
-                self.close_subscription(&peer);
-                self.peer_work_queue.cancel_request_reservation(&peer);
-                return;
             }
-            if let Some(task) = self.state.vct_repair.get(wire_owner) {
-                self.emit_vct_repair_state(task, "assignment", Some("assigned"));
-            }
-            let target = AdvertisedHeaderTarget {
-                scope: wire_owner.header,
-                session_id: session.session_id(),
-                status,
-            };
-            if self
-                .peer_work_queue
-                .stage(peer.clone(), target.clone(), PeerWorkPriority::Normal)
-                != QueueWorkResult::NeedsLocator
-                || !self.peer_work_queue.start_repair(
-                    ActiveHeaderRequest {
-                        purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                            selected_target: request_target,
-                            repair_generation: task.repair_generation,
-                        },
-                        peer: peer.clone(),
-                        source,
-                        target,
-                        sent_locator: selected_context.locator.clone(),
-                        request_id,
-                        owner: wire_owner.into(),
-                        common_ancestor: None,
-                        entries: Vec::new(),
-                        phase: HeaderTargetPhase::Receiving,
-                        incarnation: WorkIncarnation::UNSTARTED,
-                        cursor: None,
-                        max_header_count: request_count,
-                        tree_aux_schema: AuxSchema::V1,
-                    },
-                    selected_context.episode,
-                )
-            {
-                self.close_subscription(&peer);
-                self.peer_work_queue.cancel_request_reservation(&peer);
-                self.retry_vct_repair(
-                    wire_owner,
-                    VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
-                );
-                return;
-            }
-            observe!(
-                self,
-                ReactorEvent::started(
-                    self.peer_work_queue
-                        .active(&peer)
-                        .expect("the repair request was just started")
-                )
-            );
-            self.state.arm_request_deadline(
-                peer.clone(),
-                Instant::now(),
-                self.startup.request_timeout,
-            );
-            metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
-            metrics::counter!("sync.header.vct.repair.requested.headers")
-                .increment(u64::from(request_count));
-            debug!(
-                ?peer,
-                start_height = context.target.height.0,
-                end_height = request_target.height.0,
-                header_count = request_count,
-                hash = ?request_target.hash,
-                "requested selected VCT metadata repair"
-            );
-            return;
         }
+        let rejections = pass.rejections;
         if local_send_failure {
             let deferred = self
                 .state
@@ -3198,6 +2979,169 @@ impl HeaderSyncReactor {
                     .ok()
             });
         }
+    }
+
+    /// Reserve for, send, and start `task`'s repair request to `candidate`.
+    fn try_repair_candidate(
+        &mut self,
+        task: &RepairRequirement,
+        context: &zakura_header_chain::VctRepairContext,
+        candidate: RepairCandidate,
+    ) -> RepairAttempt {
+        let RepairCandidate {
+            peer,
+            source,
+            mut status,
+            request_count,
+        } = candidate;
+        if self.peer_work_queue.awaiting_target(&peer).is_some() {
+            // Preemption returns the ordinary offer even if reserving or sending repair fails.
+            self.defer_ordinary_target(&peer);
+        }
+        if self
+            .peer_work_queue
+            .reservable_repair_header_count(request_count)
+            != request_count
+            || !self
+                .peer_work_queue
+                .reserve_repair_request(&peer, request_count)
+        {
+            return RepairAttempt::NoLocalCapacity;
+        }
+        let session = self
+            .sessions
+            .get(&peer)
+            .expect("a pass's candidates keep their sessions while it runs")
+            .session
+            .clone();
+        let selected_context = context
+            .bounded_prefix(
+                usize::try_from(request_count).expect("the negotiated repair count fits usize"),
+            )
+            .expect("a positive repair prefix exists");
+        let request_target = selected_context.request_target();
+        status.selected_tip_height = request_target.height;
+        status.selected_tip_hash = request_target.hash;
+        status.max_headers_per_response = request_count;
+        let request_id = match session.try_open(
+            &status,
+            selected_context.locator.entries(),
+            AuxSchema::V1,
+            request_count,
+        ) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                self.peer_work_queue.cancel_request_reservation(&peer);
+                self.emit_queue_send_failed(&peer, &session, "SubscribeHeaders", &error, None);
+                return match vct_send_retry_attribution(&error) {
+                    VctRepairRetryAttribution::Supplier
+                    | VctRepairRetryAttribution::ExcludedInput => {
+                        if let Some(current) = self.state.vct_repair.get_mut(task.owner) {
+                            let _ = current.record_failed_source(source);
+                        }
+                        self.state.rotate_supplier(source);
+                        RepairAttempt::SendFailed { local: false }
+                    }
+                    // A full or closed outbound stream describes this one peer. Backing the
+                    // whole round off here would let a peer that stops reading its stream keep
+                    // its place at the front of every candidate list and fail the same send
+                    // forever, so the remaining candidates still get their turn.
+                    VctRepairRetryAttribution::Local => RepairAttempt::SendFailed { local: true },
+                    VctRepairRetryAttribution::Stale => {
+                        unreachable!("ordered-send failures cannot report a stale state episode")
+                    }
+                };
+            }
+        };
+        self.emit_header_request(
+            &peer,
+            session.session_id(),
+            task.owner.header,
+            request_id,
+            request_target.hash,
+            &selected_context.locator,
+            request_count,
+            AuxSchema::V1,
+        );
+        let wire_owner = task.owner.authority.bind(
+            session.session_id(),
+            NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
+        );
+        if self
+            .state
+            .vct_repair
+            .assign(task.owner, wire_owner, selected_context.clone())
+            .is_err()
+        {
+            self.close_subscription(&peer);
+            self.peer_work_queue.cancel_request_reservation(&peer);
+            return RepairAttempt::Finished;
+        }
+        if let Some(task) = self.state.vct_repair.get(wire_owner) {
+            self.emit_vct_repair_state(task, "assignment", Some("assigned"));
+        }
+        let target = AdvertisedHeaderTarget {
+            scope: wire_owner.header,
+            session_id: session.session_id(),
+            status,
+        };
+        if self
+            .peer_work_queue
+            .stage(peer.clone(), target.clone(), PeerWorkPriority::Normal)
+            != QueueWorkResult::NeedsLocator
+            || !self.peer_work_queue.start_repair(
+                ActiveHeaderRequest {
+                    purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                        selected_target: request_target,
+                        repair_generation: task.repair_generation,
+                    },
+                    peer: peer.clone(),
+                    source,
+                    target,
+                    sent_locator: selected_context.locator.clone(),
+                    request_id,
+                    owner: wire_owner.into(),
+                    common_ancestor: None,
+                    entries: Vec::new(),
+                    phase: HeaderTargetPhase::Receiving,
+                    incarnation: WorkIncarnation::UNSTARTED,
+                    cursor: None,
+                    max_header_count: request_count,
+                    tree_aux_schema: AuxSchema::V1,
+                },
+                selected_context.episode,
+            )
+        {
+            self.close_subscription(&peer);
+            self.peer_work_queue.cancel_request_reservation(&peer);
+            self.retry_vct_repair(
+                wire_owner,
+                VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+            );
+            return RepairAttempt::Finished;
+        }
+        observe!(
+            self,
+            ReactorEvent::started(
+                self.peer_work_queue
+                    .active(&peer)
+                    .expect("the repair request was just started")
+            )
+        );
+        self.state
+            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
+        metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
+        metrics::counter!("sync.header.vct.repair.requested.headers")
+            .increment(u64::from(request_count));
+        debug!(
+            ?peer,
+            start_height = context.target.height.0,
+            end_height = request_target.height.0,
+            header_count = request_count,
+            hash = ?request_target.hash,
+            "requested selected VCT metadata repair"
+        );
+        RepairAttempt::Finished
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {

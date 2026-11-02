@@ -3071,11 +3071,11 @@ mod zakura_header_sync_driver_tests {
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
 
         assert_eq!(
-            block_apply_class((&block1).into(), block::Height(1)),
+            block_apply_class(&block1, block::Height(1)),
             BlockApplyClass::Checkpoint
         );
         assert_eq!(
-            block_apply_class((&block2).into(), block::Height(1)),
+            block_apply_class(&block2, block::Height(1)),
             BlockApplyClass::Full
         );
     }
@@ -4854,7 +4854,7 @@ mod zakura_header_sync_driver_tests {
         let source = test_block_source();
 
         let Some((height, hash, result, event)) =
-            abandoned_block_apply_finished_event(owner, source, 99, block.as_ref().into())
+            abandoned_block_apply_finished_event(owner, source, 99, &block)
         else {
             panic!("test block has a coinbase height");
         };

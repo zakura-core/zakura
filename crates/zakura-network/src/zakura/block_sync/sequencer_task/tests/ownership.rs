@@ -725,7 +725,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
     else {
         panic!("the commit-window body must submit");
     };
-    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    let decoded_bytes = submitted.attributed_memory_size_bytes();
     assert_eq!(
         task.state
             .sequencer()
@@ -781,7 +781,7 @@ async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submiss
     else {
         panic!("the body must submit");
     };
-    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    let decoded_bytes = submitted.attributed_memory_size_bytes();
     assert_eq!(
         view.borrow().applying_decoded_attributed_memory_bytes,
         decoded_bytes

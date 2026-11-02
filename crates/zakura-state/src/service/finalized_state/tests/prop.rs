@@ -81,18 +81,16 @@ fn next_vct_block(block: impl Into<BlockHandle>) -> Option<VctSuccessorWitness> 
     Some(vct_successor_witness(block))
 }
 
-fn exact_vct_auxiliary_window<'a>(
-    block: impl Into<zakura_chain::block::BlockView<'a>>,
+fn exact_vct_auxiliary_window(
+    block: &zakura_chain::block::BlockRef,
     height: Height,
     roots: (
         zakura_chain::sapling::tree::Root,
         zakura_chain::orchard::tree::Root,
         zakura_chain::ironwood::tree::Root,
     ),
-    successor: impl Into<zakura_chain::block::BlockView<'a>>,
+    successor: &zakura_chain::block::BlockRef,
 ) -> VctAuxiliaryWindow {
-    let block = block.into();
-    let successor = successor.into();
     use std::num::NonZeroU64;
     use zakura_header_chain::{
         AlarmSet, AuxDelivery, BodySizeHint, ChainScore, EngineMode, EngineSnapshot, EvidenceId,

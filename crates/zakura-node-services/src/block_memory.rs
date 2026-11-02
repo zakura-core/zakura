@@ -22,7 +22,7 @@
 use std::{fmt, io, num::NonZeroU64, ops::Deref, sync::Arc};
 
 use zakura_chain::{
-    block::{self, Block, BlockView, Header},
+    block::{Block, BlockRef, Header},
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
@@ -438,18 +438,20 @@ struct RetainedBlock {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use zakura_chain::{block::BlockView, transaction::Transaction};
+/// use zakura_chain::transaction::Transaction;
 /// use zakura_node_services::block_memory::OwnedBlock;
 /// fn escape(owner: &OwnedBlock) -> Arc<Transaction> {
-///     BlockView::from(owner).transactions().next().unwrap().clone()
+///     owner.transactions().next().unwrap().clone()
 /// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct OwnedBlock(Arc<RetainedBlock>);
 
-impl<'a> From<&'a OwnedBlock> for BlockView<'a> {
-    fn from(block: &'a OwnedBlock) -> Self {
-        (&block.0.block).into()
+impl Deref for OwnedBlock {
+    type Target = BlockRef;
+
+    fn deref(&self) -> &BlockRef {
+        &self.0.block
     }
 }
 
@@ -508,13 +510,10 @@ impl BlockHandle {
     }
 
     /// Borrow payloads without exposing raw shared handles.
-    pub fn view(&self) -> BlockView<'_> {
-        self.block().into()
-    }
-
-    /// Borrow the block header.
-    pub fn header(&self) -> &Header {
-        self.view().header()
+    /// Callers use it to reach `BlockRef::transactions`, which [`Self::transactions`]
+    /// shadows, and `BlockRef::header` where an extension trait's `header` shadows it.
+    pub fn view(&self) -> &BlockRef {
+        self.block()
     }
 
     /// Retain the header with its existing ownership.
@@ -542,26 +541,13 @@ impl BlockHandle {
                 .expect("the index comes from this immutable block")
         })
     }
-
-    /// Return the height reported by the coinbase transaction.
-    pub fn coinbase_height(&self) -> Option<block::Height> {
-        self.block().coinbase_height()
-    }
-
-    /// Compute the block hash.
-    pub fn hash(&self) -> block::Hash {
-        self.block().hash()
-    }
-
-    /// Compute the authorizing-data commitment root.
-    pub fn auth_data_root(&self) -> block::merkle::AuthDataRoot {
-        self.block().auth_data_root()
-    }
 }
 
-impl<'a> From<&'a BlockHandle> for BlockView<'a> {
-    fn from(block: &'a BlockHandle) -> Self {
-        block.view()
+impl Deref for BlockHandle {
+    type Target = BlockRef;
+
+    fn deref(&self) -> &BlockRef {
+        self.block()
     }
 }
 

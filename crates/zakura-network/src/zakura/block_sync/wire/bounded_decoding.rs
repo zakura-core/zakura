@@ -61,11 +61,11 @@ fn buffered_replay_keeps_the_same_transaction_allocation_bound() {
         )
         .unwrap();
     assert_eq!(
-        replayed.view().zcash_serialize_to_vec().unwrap(),
+        replayed.zcash_serialize_to_vec().unwrap(),
         expected.zcash_serialize_to_vec().unwrap()
     );
     assert_eq!(
-        replayed.view().transaction_capacity(),
+        replayed.transaction_capacity(),
         replayed.view().transactions().len()
     );
 }

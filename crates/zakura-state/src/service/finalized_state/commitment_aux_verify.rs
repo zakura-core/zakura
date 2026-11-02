@@ -144,12 +144,12 @@ impl CommitmentRootVerificationError {
 /// - Sapling..Heartwood: the header's `FinalSaplingRoot` commits the Sapling root
 ///   directly, so the supplied root must equal it.
 /// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the empty-tree root.
-pub(crate) fn verify_supplied_sapling_root_below_heartwood<'a>(
+pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     network: &Network,
-    block: impl Into<zakura_chain::block::BlockView<'a>>,
+    block: &zakura_chain::block::BlockRef,
     sapling_root: &sapling::tree::Root,
 ) -> Result<(), ValidateContextError> {
-    let expected = match block.into().commitment(network)? {
+    let expected = match block.commitment(network)? {
         Commitment::FinalSaplingRoot(header_root) => header_root,
         Commitment::PreSaplingReserved(_) => sapling::tree::NoteCommitmentTree::default().root(),
         // Heartwood activation and later are authenticated by the MMR path.

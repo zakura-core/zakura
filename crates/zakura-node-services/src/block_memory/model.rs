@@ -251,7 +251,8 @@ struct Driver {
 }
 
 fn block() -> Block {
-    Arc::try_unwrap(block::genesis::regtest_genesis_block()).expect("fresh genesis has one owner")
+    Arc::try_unwrap(zakura_chain::block::genesis::regtest_genesis_block())
+        .expect("fresh genesis has one owner")
 }
 
 impl Driver {

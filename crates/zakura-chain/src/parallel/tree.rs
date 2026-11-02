@@ -63,11 +63,10 @@ impl NoteCommitmentTrees {
     /// If any of the tree updates cause an error,
     /// it will be returned at the end of the parallel batches.
     #[allow(clippy::unwrap_in_result)]
-    pub fn update_trees_parallel<'a>(
+    pub fn update_trees_parallel(
         &mut self,
-        block: impl Into<crate::block::BlockView<'a>>,
+        block: &crate::block::BlockRef,
     ) -> Result<(), NoteCommitmentTreeError> {
-        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("height was already validated");
@@ -148,11 +147,10 @@ impl NoteCommitmentTrees {
     ///
     /// Returns immediately without cloning or recalculating the root when the block has
     /// no Sprout note commitments.
-    pub fn update_sprout_tree<'a>(
+    pub fn update_sprout_tree(
         &mut self,
-        block: impl Into<crate::block::BlockView<'a>>,
+        block: &crate::block::BlockRef,
     ) -> Result<(), NoteCommitmentTreeError> {
-        let block = block.into();
         let sprout_note_commitments: Vec<_> = block.sprout_note_commitments().cloned().collect();
         if sprout_note_commitments.is_empty() {
             return Ok(());

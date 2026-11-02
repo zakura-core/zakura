@@ -8,7 +8,7 @@ use zakura_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
     },
-    block::{BlockView, Hash, Header, Height},
+    block::{BlockRef, Hash, Header, Height},
     parameters::{
         subsidy::{
             founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
@@ -65,10 +65,7 @@ impl UnmatchedCoinbaseOutputs {
 /// > transaction as the first transaction in the block.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-pub fn coinbase_is_first<'a>(
-    block: impl Into<BlockView<'a>>,
-) -> Result<&'a transaction::Transaction, BlockError> {
-    let block = block.into();
+pub fn coinbase_is_first(block: &BlockRef) -> Result<&transaction::Transaction, BlockError> {
     // # Consensus
     //
     // > A block MUST have at least one transaction
@@ -199,12 +196,11 @@ pub fn proof_of_work_is_valid(
 /// subsidy in `block` is valid for `network`
 ///
 /// [3.9]: https://zips.z.cash/protocol/protocol.pdf#subsidyconcepts
-pub fn subsidy_is_valid<'a>(
-    block: impl Into<BlockView<'a>>,
+pub fn subsidy_is_valid(
+    block: &BlockRef,
     net: &Network,
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<DeferredPoolBalanceChange, BlockError> {
-    let block = block.into();
     if expected_block_subsidy.is_zero() {
         return Ok(DeferredPoolBalanceChange::zero());
     }
@@ -545,12 +541,11 @@ pub fn shielded_action_limits_are_valid<T: AsRef<Transaction>>(
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 /// [7.1]: https://zips.z.cash/protocol/nu5.pdf#txnencodingandconsensus
 /// [7.6]: https://zips.z.cash/protocol/nu5.pdf#blockheader
-pub fn merkle_root_validity<'a>(
+pub fn merkle_root_validity(
     network: &Network,
-    block: impl Into<BlockView<'a>>,
+    block: &BlockRef,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
-    let block = block.into();
     // Check the header commitments first. The network upgrade check trusts the coinbase height,
     // which a peer can rewrite without changing a V5 block's hash.
     let merkle_root = transaction_hashes.iter().cloned().collect();

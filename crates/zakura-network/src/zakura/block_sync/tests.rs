@@ -5645,7 +5645,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         .iter()
         .chain(initial_submissions.iter().map(|(_, block)| block))
         .chain(std::iter::once(&block_402))
-        .map(|block| block.view().attributed_memory_size_bytes())
+        .map(|block| block.attributed_memory_size_bytes())
         .sum();
     assert_eq!(pool.reserved_bytes(), held_bytes);
     drop(initial_submissions);

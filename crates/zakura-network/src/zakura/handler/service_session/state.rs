@@ -100,19 +100,9 @@ impl PendingState {
         self.sessions.values().map(|session| session.deadline).min()
     }
 
-    /// The kind and wire ID of every offer that [`Self::expire`] would drop at
-    /// `now`.
-    pub(in crate::zakura::handler) fn expiring(&self, now: Instant) -> Vec<(u16, u64)> {
-        self.sessions
-            .iter()
-            .filter(|(_, session)| session.deadline <= now)
-            .map(|(kind, session)| (*kind, session.id))
-            .collect()
-    }
-
     /// Drop every offer whose deadline has passed and defer another offer of
-    /// its service. Returns the kinds of the dropped offers.
-    pub(in crate::zakura::handler) fn expire(&mut self, now: Instant) -> Vec<u16> {
+    /// its service. Returns the kind and wire ID of each dropped offer.
+    pub(in crate::zakura::handler) fn expire(&mut self, now: Instant) -> Vec<(u16, u64)> {
         self.retry_after.retain(|_, retry| *retry > now);
         let mut expired = Vec::new();
         for (kind, session) in self
@@ -120,7 +110,7 @@ impl PendingState {
             .extract_if(|_, session| session.deadline <= now)
         {
             self.retry_after.insert(kind, now + session.retry_delay);
-            expired.push(kind);
+            expired.push((kind, session.id));
         }
         expired
     }

@@ -337,12 +337,17 @@ impl Model {
         Some(MemberArrival::Waiting)
     }
 
-    fn expire(&mut self, now: Instant) -> bool {
+    /// The wire ID of the offer that expires at `now`, if any.
+    fn expire(&mut self, now: Instant) -> Option<u64> {
         if self.deferred_until.is_some_and(|until| until <= now) {
             self.deferred_until = None;
         }
-        let expired = self.offer.as_ref().is_some_and(|offer| offer.2 <= now);
-        if expired {
+        let expired = self
+            .offer
+            .as_ref()
+            .filter(|offer| offer.2 <= now)
+            .map(|offer| offer.0);
+        if expired.is_some() {
             self.offer = None;
             self.deferred_until = Some(now + SETUP_TIMEOUT);
         }
@@ -503,14 +508,11 @@ impl SessionHarness {
                 let expired = self.pending.expire(self.now);
                 let expected = self.model.expire(self.now);
                 self.summary.expired_offers += expired.len();
+                let kind = self.stream.kind;
                 check(
                     OFFER_ASSEMBLY,
                     expired,
-                    if expected {
-                        vec![self.stream.kind]
-                    } else {
-                        Vec::new()
-                    },
+                    expected.map(|id| (kind, id)).into_iter().collect(),
                 );
             }
             Op::Demand(demand) => {

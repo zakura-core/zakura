@@ -167,9 +167,9 @@ impl PendingSessions {
 
     /// Expiry releases every arrived member and briefly defers another offer.
     pub(super) fn expire(&mut self, now: Instant) {
-        for (kind, wire_id) in self.state.expiring(now) {
-            let arrived = self.streams.get(&kind).and_then(|arrived| arrived.first());
-            if let Some(member) = arrived {
+        for (kind, wire_id) in self.state.expire(now) {
+            let arrived = self.streams.remove(&kind);
+            if let Some(member) = arrived.as_ref().and_then(|arrived| arrived.first()) {
                 trace_session_step(
                     &member.context.conn,
                     &member.context.close_cause,
@@ -177,9 +177,6 @@ impl PendingSessions {
                     SessionStep::OfferExpired { wire_id },
                 );
             }
-        }
-        for kind in self.state.expire(now) {
-            self.streams.remove(&kind);
         }
     }
 

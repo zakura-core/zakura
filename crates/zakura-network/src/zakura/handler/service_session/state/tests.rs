@@ -340,8 +340,8 @@ fn a_late_member_keeps_the_first_arrivals_deadline() {
         Some(MemberArrival::Waiting)
     );
     assert_eq!(pending.deadline(), Some(deadline));
-    assert_eq!(pending.expire(late), Vec::<u16>::new());
-    assert_eq!(pending.expire(deadline), vec![MEMBER_A.kind]);
+    assert_eq!(pending.expire(late), Vec::new());
+    assert_eq!(pending.expire(deadline), vec![(MEMBER_A.kind, 7)]);
     assert_eq!(pending.deadline(), None);
     assert_eq!(
         pending.reservation(MEMBER_A.kind, deadline),
@@ -723,20 +723,4 @@ fn attempts_name_local_generations_and_stale_exits_keep_them() {
     assert!(session.exited(exit(40, true), false).is_some());
     assert_eq!(session.local_attempt(), None);
     assert_eq!(session.begin_attempt(), 3, "reopens keep counting");
-}
-
-/// `expiring` names exactly the offers `expire` drops, by wire ID.
-#[test]
-fn expiring_offers_keep_their_wire_ids() {
-    let layout = layout();
-    let start = Instant::now();
-    let mut pending = PendingState::default();
-    pending
-        .arrive(&layout, 9, MEMBER_A, SETUP_TIMEOUT, start)
-        .unwrap();
-    assert_eq!(pending.expiring(start), Vec::new());
-    let deadline = start + SETUP_TIMEOUT;
-    assert_eq!(pending.expiring(deadline), vec![(MEMBER_A.kind, 9)]);
-    assert_eq!(pending.expire(deadline), vec![MEMBER_A.kind]);
-    assert_eq!(pending.expiring(deadline), Vec::new());
 }

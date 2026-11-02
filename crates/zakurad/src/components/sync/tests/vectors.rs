@@ -4433,13 +4433,13 @@ fn scaled_lookahead_stays_below_the_drop_height() {
 
 #[test]
 fn backend_verification_total_sums_effective_limits_and_rejects_excess() {
+    use crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY;
     use crate::components::sync::{
         lookahead_limit_multiplier, BackendExecutionError, Config,
         DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT, MAX_BACKEND_BLOCK_VERIFICATIONS,
         MIN_CHECKPOINT_CONCURRENCY_LIMIT, MIN_CONCURRENCY_LIMIT,
         VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
     };
-    use crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY;
 
     // Limits below their minimums count at the minimum the syncer raises them to.
     let low = Config {

@@ -892,11 +892,11 @@ fn finalized_output(
             hash: outpoint.hash,
         },
     )?;
-    let transaction =
-        db.stored_transaction(outpoint.hash)
-            .ok_or(RollbackFinalizedStateError::MissingTransaction {
-                hash: outpoint.hash,
-            })?;
+    let transaction = db.stored_transaction(outpoint.hash).ok_or(
+        RollbackFinalizedStateError::MissingTransaction {
+            hash: outpoint.hash,
+        },
+    )?;
     let output = transaction
         .0
         .outputs()

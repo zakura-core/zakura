@@ -233,9 +233,7 @@ impl ZakuraDb {
         &self,
         hash_or_height: HashOrHeight,
     ) -> Result<Option<BlockHandle>, AdmissionFailure> {
-        Ok(self
-            .block_and_size(hash_or_height)?
-            .map(|(block, _)| block))
+        Ok(self.block_and_size(hash_or_height)?.map(|(block, _)| block))
     }
 
     /// Read a full block and its serialized size like [`Self::block`].

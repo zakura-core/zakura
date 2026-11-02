@@ -105,7 +105,11 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     };
     let probe = Probe::new(owner);
     let bytes = owner.decoded_bytes();
-    assert_eq!(budget.retained_bytes(), bytes, "settled to the measured block");
+    assert_eq!(
+        budget.retained_bytes(),
+        bytes,
+        "settled to the measured block"
+    );
     let pool = read.db.read_capacity.blocks.clone();
     let header = block.retained_header();
     let transaction = block.transaction(0).unwrap();
@@ -173,7 +177,11 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     drop(state);
     drop(read);
     assert_eq!(block.hash(), genesis.hash());
-    assert_eq!(budget.retained_bytes(), bytes, "database teardown keeps the charge");
+    assert_eq!(
+        budget.retained_bytes(),
+        bytes,
+        "database teardown keeps the charge"
+    );
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -345,7 +353,9 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
     use std::time::Duration;
     use tokio::time::timeout;
     use tower::ServiceExt;
-    use zakura_node_services::block_memory::{model::PayloadProbe, HeaderHandle, ReadMemoryExhausted};
+    use zakura_node_services::block_memory::{
+        model::PayloadProbe, HeaderHandle, ReadMemoryExhausted,
+    };
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
@@ -379,7 +389,11 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         probe.serialized_bytes(),
         Some(genesis.header.zcash_serialized_size())
     );
-    assert_eq!(budget.retained_bytes(), header_bytes, "live clones retain the charge");
+    assert_eq!(
+        budget.retained_bytes(),
+        header_bytes,
+        "live clones retain the charge"
+    );
     let error = timeout(deadline, read.clone().oneshot(header_read))
         .await
         .unwrap()
@@ -755,8 +769,7 @@ async fn disk_reads_reserve_their_recorded_bound_before_decoding() {
     let (_state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
     let serialized = u64::try_from(genesis.zcash_serialized_size()).unwrap();
     let block_bound = serialized * MAX_DECODED_BYTES_PER_WIRE_BYTE;
-    let transaction_bound = u64::try_from(genesis.transactions[0].zcash_serialized_size())
-        .unwrap()
+    let transaction_bound = u64::try_from(genesis.transactions[0].zcash_serialized_size()).unwrap()
         * MAX_DECODED_BYTES_PER_WIRE_BYTE;
     let limit = 16 * block_bound;
     let budget = with_budget(&mut read, limit);
@@ -791,7 +804,10 @@ async fn disk_reads_reserve_their_recorded_bound_before_decoding() {
     assert!(db.raw_block_result(height).unwrap().is_some());
     drop(other);
     let other = leave(serialized - 1);
-    assert_eq!(db.raw_block_result(height).unwrap_err(), ReadMemoryExhausted);
+    assert_eq!(
+        db.raw_block_result(height).unwrap_err(),
+        ReadMemoryExhausted
+    );
     drop(other);
     assert_eq!(budget.retained_bytes(), 0);
 }
@@ -821,7 +837,10 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
         db.block_and_size(height).unwrap_err(),
         AdmissionFailure::Capacity
     );
-    assert_eq!(db.raw_block_result(height).unwrap_err(), ReadMemoryExhausted);
+    assert_eq!(
+        db.raw_block_result(height).unwrap_err(),
+        ReadMemoryExhausted
+    );
     let hash = genesis.transactions[0].hash();
     assert_eq!(db.transaction(hash).unwrap_err(), ReadMemoryExhausted);
     assert_eq!(budget.retained_bytes(), decoded, "refusals leave no charge");

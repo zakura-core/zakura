@@ -1333,7 +1333,7 @@ async fn caches_getaddr_response() {
 }
 
 /// The state's read result limit serves the default inbound peers, each holding one
-/// legacy `getdata` block request.
+/// legacy `getdata` block request, clamped to the peer memory budget.
 #[test]
 fn read_result_limit_derives_from_getdata_and_inbound_limits() {
     assert_eq!(
@@ -1345,19 +1345,48 @@ fn read_result_limit_derives_from_getdata_and_inbound_limits() {
         zakura_state::DEFAULT_READ_RESULT_PEERS,
         network.peerset_inbound_connection_limit()
     );
+    assert_eq!(
+        zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES,
+        network.zakura.peer_memory_budget_bytes
+    );
 
+    // The default peer budget clamps the 115.2 GB derivation to 8 GiB.
+    let default = crate::config::ZakuradConfig::default();
+    assert_eq!(
+        default
+            .mirrored_state_config()
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get),
+        Some(network.zakura.peer_memory_budget_bytes)
+    );
+
+    // A small peer set keeps its derived limit below the budget.
     let config = crate::config::ZakuradConfig {
         network: zakura_network::Config {
-            peerset_initial_target_size: 7,
-            ..network
+            peerset_initial_target_size: 5,
+            ..network.clone()
         },
         ..Default::default()
     };
+    let derived = StateConfig::read_result_byte_limit_for_peers(
+        config.network.peerset_inbound_connection_limit(),
+        u64::MAX,
+    );
+    assert!(derived.get() < network.zakura.peer_memory_budget_bytes);
     assert_eq!(
         config.mirrored_state_config().read_result_byte_limit,
-        Some(StateConfig::read_result_byte_limit_for_peers(
-            config.network.peerset_inbound_connection_limit()
-        ))
+        Some(derived)
+    );
+
+    // A lower peer budget lowers the clamp.
+    let mut tight = crate::config::ZakuradConfig::default();
+    tight.network.zakura.peer_memory_budget_bytes = derived.get() / 2;
+    assert_eq!(
+        tight
+            .mirrored_state_config()
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get),
+        Some(derived.get() / 2)
     );
 }
 
@@ -1434,7 +1463,9 @@ async fn refused_block_reads_send_notfound() {
 
     let response = inbound
         .clone()
-        .oneshot(Request::BlocksByHash([refused, unknown].into_iter().collect()))
+        .oneshot(Request::BlocksByHash(
+            [refused, unknown].into_iter().collect(),
+        ))
         .await
         .expect("a refused read still answers the request");
     assert_eq!(

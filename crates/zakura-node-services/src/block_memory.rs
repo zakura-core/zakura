@@ -1004,12 +1004,20 @@ mod tests {
         let observed = budget.clone();
         let owner = read_pool()
             .try_decode_reserved(budget.try_reserve(3 * bytes).unwrap(), || {
-                assert_eq!(observed.retained_bytes(), 3 * bytes, "reserved before decode");
+                assert_eq!(
+                    observed.retained_bytes(),
+                    3 * bytes,
+                    "reserved before decode"
+                );
                 Some(block())
             })
             .unwrap()
             .unwrap();
-        assert_eq!(budget.retained_bytes(), bytes, "settled to the measured block");
+        assert_eq!(
+            budget.retained_bytes(),
+            bytes,
+            "settled to the measured block"
+        );
 
         let transaction = owner.transaction(0).unwrap();
         drop(owner);
@@ -1031,7 +1039,9 @@ mod tests {
 
         // A reservation below the measured size refuses its growth while another holder exists.
         let small = budget.try_reserve(0).unwrap();
-        let error = pool.try_decode_reserved(small, || Some(block())).unwrap_err();
+        let error = pool
+            .try_decode_reserved(small, || Some(block()))
+            .unwrap_err();
         assert_eq!(error, AdmissionFailure::Capacity);
         assert_eq!(budget.retained_bytes(), bytes);
         assert_eq!(pool.reserved_blocks(), 1);
@@ -1082,7 +1092,8 @@ mod tests {
 
     #[test]
     fn only_capacity_refusals_are_read_capacity_refusals() {
-        let refusal = |error: Box<dyn std::error::Error + Send + Sync>| is_read_capacity_refusal(&*error);
+        let refusal =
+            |error: Box<dyn std::error::Error + Send + Sync>| is_read_capacity_refusal(&*error);
         assert!(refusal(ReadMemoryExhausted.into()));
         assert!(refusal(AdmissionFailure::Capacity.into()));
         assert!(!refusal(AdmissionFailure::Closed.into()));
@@ -1105,7 +1116,11 @@ mod tests {
 
         let refused = budget.try_reserve(0).unwrap().retain(vec![0u8; 64]);
         assert_eq!(refused.unwrap_err(), ReadMemoryExhausted);
-        assert_eq!(budget.retained_bytes(), measured, "the refused read left no charge");
+        assert_eq!(
+            budget.retained_bytes(),
+            measured,
+            "the refused read left no charge"
+        );
         drop(clone);
         assert_eq!(budget.retained_bytes(), 0);
     }
@@ -1201,7 +1216,11 @@ mod tests {
         let first = memory(u64::MAX);
         let second = memory(u64::MAX);
         let a = first.try_reserve(0).unwrap().retain(transaction()).unwrap();
-        let b = second.try_reserve(0).unwrap().retain(transaction()).unwrap();
+        let b = second
+            .try_reserve(0)
+            .unwrap()
+            .retain(transaction())
+            .unwrap();
         assert_eq!(a.hash(), b.hash());
         let probe = model::PayloadProbe::new(&b);
         drop(a);

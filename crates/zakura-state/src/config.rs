@@ -42,9 +42,10 @@ pub struct Config {
     /// transient parser memory that [`Self::read_concurrency_limit`] bounds, and all
     /// disk usage.
     ///
-    /// When unset, `zakurad` derives the limit from its inbound peer limit with
-    /// [`Self::read_result_byte_limit_for_peers`], and other database users assume
-    /// [`DEFAULT_READ_RESULT_PEERS`] peers.
+    /// When unset, `zakurad` derives the limit from its inbound peer limit and its peer
+    /// memory budget with [`Self::read_result_byte_limit_for_peers`]. Other database
+    /// users assume [`DEFAULT_READ_RESULT_PEERS`] peers and
+    /// [`DEFAULT_READ_RESULT_CEILING_BYTES`].
     pub read_result_byte_limit: Option<NonZeroU64>,
 
     /// Maximum blocking data-read jobs admitted by one database instance.
@@ -512,6 +513,10 @@ const MAX_BLOCKING_READ_WORKERS: u64 = 512;
 /// `zakura-network`'s default inbound limit, 100 initial target peers × 3.
 pub const DEFAULT_READ_RESULT_PEERS: usize = 300;
 
+/// The ceiling on the derived retained read limit when no peer memory budget is known:
+/// `zakura-network`'s default `peer_memory_budget_bytes`, 8 GiB.
+pub const DEFAULT_READ_RESULT_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Blocks one peer request can hold as read results: `zakurad`'s legacy
 /// `GETDATA_MAX_BLOCK_COUNT`, the largest per-peer block request the state serves.
 pub const READ_RESULT_BLOCKS_PER_PEER: u64 = 16;
@@ -539,26 +544,39 @@ pub enum ReadCapacityError {
 }
 
 impl Config {
-    /// The retained read limit that serves `inbound_peers` peers, each holding its
-    /// largest block request: [`READ_RESULT_BLOCKS_PER_PEER`] decoded maximum-size blocks.
+    /// The retained read limit for `inbound_peers` peers, clamped to `ceiling_bytes`.
     ///
-    /// With 300 peers this is 300 × 16 × 24 MB = 115.2 GB. The decoded bound is 12 times
-    /// the 2 MB serialized size, so typical blocks retain far less. A per-peer memory
-    /// budget will replace this derivation.
-    pub fn read_result_byte_limit_for_peers(inbound_peers: usize) -> NonZeroU64 {
+    /// The derivation serves each peer's largest block request:
+    /// [`READ_RESULT_BLOCKS_PER_PEER`] decoded maximum-size blocks. With 300 peers this
+    /// is 300 × 16 × 24 MB = 115.2 GB. The decoded bound is 12 times the 2 MB serialized
+    /// size, so typical blocks retain far less.
+    ///
+    /// The derived bound exceeds the memory a node can spend on peers, so the limit is
+    /// clamped to the peer memory budget, 8 GiB by default. A refusal under the clamp is
+    /// a retryable capacity error: legacy `getdata` answers it with `notfound`, and no
+    /// path treats it as an invalid block or transaction. The clamp never goes below one
+    /// decoded maximum-size block, so one legal block always remains readable. A per-peer
+    /// memory budget will replace this derivation.
+    pub fn read_result_byte_limit_for_peers(
+        inbound_peers: usize,
+        ceiling_bytes: u64,
+    ) -> NonZeroU64 {
         let peers = u64::try_from(inbound_peers).unwrap_or(u64::MAX).max(1);
-        NonZeroU64::new(
-            peers
-                .saturating_mul(READ_RESULT_BLOCKS_PER_PEER)
-                .saturating_mul(MAX_DECODED_BLOCK_BYTES),
-        )
-        .expect("each factor is at least one")
+        let derived = peers
+            .saturating_mul(READ_RESULT_BLOCKS_PER_PEER)
+            .saturating_mul(MAX_DECODED_BLOCK_BYTES);
+        NonZeroU64::new(derived.min(ceiling_bytes.max(MAX_DECODED_BLOCK_BYTES)))
+            .expect("a decoded maximum-size block has a nonzero size")
     }
 
-    /// The configured retained read limit, or the limit for [`DEFAULT_READ_RESULT_PEERS`].
+    /// The configured retained read limit, or the limit for [`DEFAULT_READ_RESULT_PEERS`]
+    /// clamped to [`DEFAULT_READ_RESULT_CEILING_BYTES`].
     pub fn read_result_byte_limit(&self) -> NonZeroU64 {
         self.read_result_byte_limit.unwrap_or_else(|| {
-            Self::read_result_byte_limit_for_peers(DEFAULT_READ_RESULT_PEERS)
+            Self::read_result_byte_limit_for_peers(
+                DEFAULT_READ_RESULT_PEERS,
+                DEFAULT_READ_RESULT_CEILING_BYTES,
+            )
         })
     }
 
@@ -635,7 +653,7 @@ mod tests {
         let decoded_block = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
         assert_eq!(
             Config::default().read_memory_bound(),
-            Ok(300 * 16 * decoded_block
+            Ok(DEFAULT_READ_RESULT_CEILING_BYTES
                 + 68 * (MAX_BLOCK_PARSER_BYTES + decoded_block)
                 + crate::constants::CHAIN_TIP_BLOCK_RETENTION
                     * (decoded_block + MAX_BLOCK_PARSER_BYTES))
@@ -646,13 +664,32 @@ mod tests {
     fn read_result_limit_serves_every_peer_request() {
         let decoded_block = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
         assert_eq!(
-            Config::read_result_byte_limit_for_peers(1000).get(),
+            Config::read_result_byte_limit_for_peers(1000, u64::MAX).get(),
             1000 * READ_RESULT_BLOCKS_PER_PEER * decoded_block
         );
         assert_eq!(
-            Config::read_result_byte_limit_for_peers(0).get(),
+            Config::read_result_byte_limit_for_peers(0, u64::MAX).get(),
             READ_RESULT_BLOCKS_PER_PEER * decoded_block,
             "a node without inbound peers can still serve one request"
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(
+                DEFAULT_READ_RESULT_PEERS,
+                DEFAULT_READ_RESULT_CEILING_BYTES
+            )
+            .get(),
+            DEFAULT_READ_RESULT_CEILING_BYTES,
+            "the peer memory budget clamps the 115.2 GB derivation"
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(1, DEFAULT_READ_RESULT_CEILING_BYTES).get(),
+            READ_RESULT_BLOCKS_PER_PEER * decoded_block,
+            "a derivation below the ceiling is kept"
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(300, 0).get(),
+            decoded_block,
+            "the clamp keeps one maximum-size block readable"
         );
         let configured = Config {
             read_result_byte_limit: NonZeroU64::new(decoded_block),
@@ -696,7 +733,14 @@ mod tests {
         assert_eq!(config.read_result_byte_limit, None);
         assert_eq!(
             config.read_result_byte_limit(),
-            Config::read_result_byte_limit_for_peers(DEFAULT_READ_RESULT_PEERS)
+            Config::read_result_byte_limit_for_peers(
+                DEFAULT_READ_RESULT_PEERS,
+                DEFAULT_READ_RESULT_CEILING_BYTES
+            )
+        );
+        assert_eq!(
+            config.read_result_byte_limit().get(),
+            DEFAULT_READ_RESULT_CEILING_BYTES
         );
     }
 

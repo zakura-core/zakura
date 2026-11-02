@@ -1015,6 +1015,15 @@ where
         Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        if joinsplit_data.is_none() && sapling_bundle.is_none() {
+            // Only shielded data signs the transaction-wide sighash, so a transparent-only
+            // transaction never needs it; its inputs compute their own sighashes.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1129,6 +1138,15 @@ where
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1210,6 +1228,15 @@ where
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
         let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() && ironwood_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()

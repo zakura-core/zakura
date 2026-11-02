@@ -888,8 +888,7 @@ mod tests {
     ) -> (FramedSend, FramedWorkerRecv, OutputByteBudget) {
         let (sender, receiver) = worker_framed_channel(depth);
         let budget = OutputByteBudget::new(capacity).unwrap();
-        let wide = OutputByteBudget::new(1 << 30).unwrap();
-        let sender = sender.with_output_gate(FrameGate::new(budget.clone(), wide));
+        let sender = sender.with_output_gate(FrameGate::over(budget.clone()));
         (sender, receiver, budget)
     }
 
@@ -1121,8 +1120,7 @@ mod tests {
     }
 
     fn admitted(budget: &OutputByteBudget) -> AdmittedFrame {
-        let wide = OutputByteBudget::new(1 << 30).unwrap();
-        let grant = FrameGate::new(budget.clone(), wide)
+        let grant = FrameGate::over(budget.clone())
             .try_admit(frame_bytes())
             .unwrap();
         AdmittedFrame {

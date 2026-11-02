@@ -232,6 +232,15 @@ impl ConnectionResources {
 }
 
 #[cfg(test)]
+impl FrameGate {
+    /// A gate over `connection`, under a node budget that never binds.
+    pub(crate) fn over(connection: OutputByteBudget) -> Self {
+        let node = OutputByteBudget::new(1 << 30).expect("the test budget has a valid size");
+        Self::new(connection, node)
+    }
+}
+
+#[cfg(test)]
 impl StreamResources {
     /// Owners that never bind, for tests of other behavior.
     pub(crate) fn unconstrained() -> Self {

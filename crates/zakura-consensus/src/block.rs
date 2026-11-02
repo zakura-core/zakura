@@ -33,8 +33,8 @@ use zakura_state as zs;
 
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
-pub mod check;
 mod body_digest;
+pub mod check;
 mod prepared;
 mod receipt;
 pub mod request;

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio::sync::Notify;
 
+use super::super::dispatch::StorageDispatch;
 use super::*;
 use crate::zakura::testkit::{TraceCapture, TraceValue};
 use crate::zakura::CloseCause;

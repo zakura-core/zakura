@@ -91,7 +91,7 @@ fn record_writes_a_complete_trace() {
         assert_eq!(read.meta.sim, entry.name);
         // Fixed-prefix harnesses read missing scenario bytes as 0.
         let mut prefix = BYTES[..entry.scenario_bytes.min(BYTES.len())].to_vec();
-        if entry.pad_scenario {
+        if !entry.machine {
             prefix.resize(entry.scenario_bytes, 0);
         }
         assert_eq!(read.meta.scenario, (entry.draw)(&prefix));

@@ -38,11 +38,13 @@ use crate::{
 /// block-sync body. Version 18 added the decoded size of the block a
 /// submission carries. Version 19 added the runtime object a task's point
 /// touches. Version 20 adds causal inputs and independent state views for
-/// machine steps, tagged by kind. Version 21 adds the reactor's refused and
-/// joined storage calls. Version 22 adds the reactor's `dropped` call ends, the
-/// `call` that submitted a header `submitted` fact, and the `callers_alive` of a
-/// header `shut-down` fact. Version 23 adds the header publisher's machine step.
-pub const FORMAT_VERSION: u32 = 23;
+/// machine steps, tagged by kind. Other pure-reactor lanes hold versions 21 and
+/// 22. Version 23 is the header-owner lane's: the reactor's refused and joined
+/// storage calls and `dropped` call ends, the `call` that submitted a header
+/// `submitted` fact, the `callers_alive` of a header `shut-down` fact, and the
+/// repair stall and unproductive requests of a header reactor machine step.
+/// Version 24 adds the header publisher's machine step.
+pub const FORMAT_VERSION: u32 = 24;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.

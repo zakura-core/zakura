@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A machine harness's scenario.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineScenario {
+    /// Complete causal machine input, independent of scheduling choices.
+    pub input: Vec<u8>,
+}
+
 /// Typed semantic evidence from one transport-free machine operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -11,6 +19,10 @@ use serde::{Deserialize, Serialize};
     deny_unknown_fields
 )]
 pub enum MachineStep {
+    /// A fixture machine's operation. It tests machine-trace support itself, as
+    /// [`crate::harness::fixtures`] tests the simulator. No production machine
+    /// records it.
+    Fixture(FixtureStep),
     /// Header reactor scheduling and locator policy, with its independent model.
     HeaderReactor(HeaderReactorStep),
     /// Header publisher credit and terminal policy, with its independent model.
@@ -19,10 +31,11 @@ pub enum MachineStep {
 
 impl MachineStep {
     /// The failure that stopped the run at this operation, if any.
-    pub fn failure(&self) -> Option<&MachineFailure> {
+    pub fn failure(&self) -> Option<MachineFailure> {
         match self {
-            Self::HeaderReactor(step) => step.failure.as_ref(),
-            Self::HeaderPublisher(step) => step.failure.as_ref(),
+            Self::Fixture(step) => step.failure.clone(),
+            Self::HeaderReactor(step) => step.failure.clone(),
+            Self::HeaderPublisher(step) => step.failure.clone(),
         }
     }
 }
@@ -47,6 +60,16 @@ pub struct MachineFailure {
     pub phase: FailurePhase,
     /// Panic payload without the panic hook's source location.
     pub message: String,
+}
+
+/// One operation of a fixture machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureStep {
+    /// Original causal bytes.
+    pub input: Vec<u8>,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
 }
 
 /// One storage call's exact identity.
@@ -95,6 +118,22 @@ pub struct ReactorSessionView {
     pub status: Option<String>,
     /// Whether the status is spent.
     pub spent: bool,
+    /// The session's unproductive requests.
+    pub unproductive_requests: u32,
+}
+
+/// A repair stall in a reactor state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorStallView {
+    /// The stalled repair's generation.
+    pub generation: u64,
+    /// Milliseconds from the run's clock origin to the first failed attempt.
+    pub since_millis: u64,
+    /// Milliseconds from the run's clock origin to the last trace row.
+    pub last_trace_millis: Option<u64>,
+    /// Whether the reactor reported this generation at error level.
+    pub reported: bool,
 }
 
 /// One pending locator read in a reactor state view.
@@ -125,6 +164,8 @@ pub struct HeaderReactorView {
     pub paused: bool,
     /// The current repair: its generation and height.
     pub repair: Option<(u64, u32)>,
+    /// The current repair's stall.
+    pub stall: Option<ReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
     /// Milliseconds from the run's clock origin to the next deadline. A deferred
@@ -225,6 +266,7 @@ impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
                     peer: session.peer,
                     status: session.status.map(|hash| hash.to_string()),
                     spent: session.spent,
+                    unproductive_requests: session.unproductive_requests,
                 })
                 .collect(),
             reads: value
@@ -250,6 +292,12 @@ impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
             suppliers: value.suppliers,
             paused: value.paused,
             repair: value.repair,
+            stall: value.stall.map(|stall| ReactorStallView {
+                generation: stall.generation,
+                since_millis: stall.since_millis,
+                last_trace_millis: stall.last_trace_millis,
+                reported: stall.reported,
+            }),
             cached_deferred: value.cached_deferred,
             next_deadline_millis: value.next_deadline_millis,
         }

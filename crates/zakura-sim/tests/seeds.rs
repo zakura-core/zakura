@@ -64,10 +64,10 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(plan.scenario());
     }
     match stem {
-        "header-reactor-policy" => value(zakura_sim::harness::header_work::Scenario {
+        "header-reactor-policy" => value(zakura_sim::record::machine::MachineScenario {
             input: include_bytes!("fixtures/header-reactor-policy.bin").to_vec(),
         }),
-        "header-publisher-policy" => value(zakura_sim::harness::header_work::Scenario {
+        "header-publisher-policy" => value(zakura_sim::record::machine::MachineScenario {
             input: include_bytes!("fixtures/header-publisher-policy.bin").to_vec(),
         }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),

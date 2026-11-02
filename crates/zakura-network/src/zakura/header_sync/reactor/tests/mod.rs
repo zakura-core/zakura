@@ -265,25 +265,26 @@ fn seed_applying_request(
         QueueWorkResult::NeedsLocator
     );
     assert!(reactor.peer_work_queue.reserve_request(&peer, 1));
-    assert!(reactor.peer_work_queue.start(ActiveHeaderRequest {
-        purpose: HeaderTargetPurpose::Normal,
-        peer: peer.clone(),
-        source,
-        target: advertised,
-        sent_locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-        request_id,
-        owner,
-        common_ancestor: Some(anchor),
-        entries: vec![HeaderEntry {
+    assert!(reactor.peer_work_queue.start({
+        let mut request = ActiveHeaderRequest::new(
+            HeaderTargetPurpose::Normal,
+            peer.clone(),
+            source,
+            zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            owner,
+            advertised,
+            request_id,
+            1,
+            AuxSchema::None,
+        );
+        request.common_ancestor = Some(anchor);
+        request.entries = vec![HeaderEntry {
             header,
             body_size: 0,
             tree_aux: None,
-        }],
-        phase: HeaderTargetPhase::Applying,
-        incarnation: WorkIncarnation::UNSTARTED,
-        cursor: None,
-        max_header_count: 1,
-        tree_aux_schema: AuxSchema::None,
+        }];
+        request.phase = HeaderTargetPhase::Applying;
+        request
     }));
     reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
     (source, owner, owner.header_authority().branch)

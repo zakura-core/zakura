@@ -115,7 +115,6 @@ impl EvictionFixture {
             tree_aux_schema: AuxSchema::None,
             entries: vec![entry],
         };
-        let _ = active;
         self.reactor
             .peer_work_queue
             .set_capacity_for_test(&self.peer, 0, 1);

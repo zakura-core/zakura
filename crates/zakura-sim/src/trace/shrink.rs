@@ -1,7 +1,7 @@
 //! The shrinker: reduce a failing trace to fewer non-default picks on the
 //! build that recorded it (traces.md, Trace shrinking).
 //!
-//! Machine histories delete aligned decoder-v1 operations and preserve the exact
+//! Machine histories delete aligned four-byte operations and preserve the exact
 //! failure phase and payload. Scheduler histories use five passes:
 //!
 //! 1. **Confirm.** Replay the trace Exact. A trace that doesn't replay, such
@@ -65,7 +65,10 @@ pub use crate::plan::Candidate;
 use crate::{
     harness::{self, HarnessEntry, RecordInput},
     plan::{By, SkipScript},
-    record::{DrawRecord, EndRecord, Record, StepRecord},
+    record::{
+        machine::{MachineFailure, MachineScenario, MachineStep},
+        DrawRecord, EndRecord, Record, StepRecord,
+    },
     witness::{Expect, WitnessError},
     Category, MemorySink, Plan, PlanChoice, PlanInput,
 };
@@ -84,6 +87,9 @@ pub const BEST_PLAN_FILE: &str = "best-plan.json";
 
 /// The best scenario and plan, replaced together after an accepted candidate.
 pub const BEST_CANDIDATE_FILE: &str = "best-candidate.json";
+
+/// The bytes of one machine operation, the unit machine shrinking deletes.
+const MACHINE_OPERATION_BYTES: usize = 4;
 
 /// One [`Reduction`] per line.
 pub const REDUCTIONS_FILE: &str = "reductions.jsonl";
@@ -131,7 +137,12 @@ impl Counts {
         let init = trace.init.as_ref().map_or(&[][..], |init| &init.draws);
         Counts {
             non_default: non_default(init, &trace.steps),
-            input_bytes: machine_input(&trace.meta.sim, &trace.meta.scenario)
+            input_bytes: trace
+                .steps
+                .iter()
+                .any(|step| step.machine.is_some())
+                .then(|| machine_input(&trace.meta.scenario))
+                .flatten()
                 .map(|input| input.len()),
             // A usize always fits in a u64 on supported targets.
             events: trace
@@ -313,7 +324,7 @@ pub fn shrink_with(
     let mut shrinker = Shrinker {
         harness,
         scenario: trace.meta.scenario.clone(),
-        machine_failure: machine_failure(&trace.steps, trace.end.as_ref()),
+        machine_failure: machine_failure(&trace.steps),
         property: property.clone(),
         budget,
         started,
@@ -348,10 +359,7 @@ pub fn shrink_with(
         &property,
         &out.join(REDUCED_DIR),
     ) {
-        Ok(reduced)
-            if machine_failure(&reduced.steps, reduced.end.as_ref())
-                == shrinker.machine_failure =>
-        {
+        Ok(reduced) if machine_failure(&reduced.steps) == shrinker.machine_failure => {
             (Some(reduced.id.clone()), Some(Counts::of(&reduced)), None)
         }
         Ok(_) => (
@@ -382,43 +390,19 @@ pub fn shrink_with(
     }
 }
 
-/// The direct machine decoder owns these bytes; scheduler inputs stay separate.
-fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
-    if !crate::harness::header_work::is_machine(name) {
-        return None;
-    }
-    serde_json::from_value::<crate::harness::header_work::Scenario>(scenario.clone())
+/// A machine scenario's causal bytes. Scheduler inputs stay separate.
+fn machine_input(scenario: &Value) -> Option<Vec<u8>> {
+    serde_json::from_value::<MachineScenario>(scenario.clone())
         .ok()
         .map(|scenario| scenario.input)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MachineFailureKey {
-    Driver(crate::record::machine::MachineFailure),
-    State { expected: String, actual: String },
-}
-
-fn machine_failure<'a>(
-    steps: impl IntoIterator<Item = &'a StepRecord>,
-    end: Option<&EndRecord>,
-) -> Option<MachineFailureKey> {
-    let mut machine = false;
-    for step in steps.into_iter().filter_map(|step| step.machine.as_deref()) {
-        let failure = step.failure();
-        machine = true;
-        if let Some(failure) = failure {
-            return Some(MachineFailureKey::Driver(failure.clone()));
-        }
-    }
-    // The adapter can detect a state mismatch even when the driver did not panic.
-    if !machine {
-        return None;
-    }
-    end.and_then(|end| end.violation.as_ref())
-        .map(|violation| MachineFailureKey::State {
-            expected: violation.expected.clone(),
-            actual: violation.actual.clone(),
-        })
+/// The first failure in `steps`' machine evidence.
+fn machine_failure<'a>(steps: impl IntoIterator<Item = &'a StepRecord>) -> Option<MachineFailure> {
+    steps
+        .into_iter()
+        .filter_map(|step| step.machine.as_deref())
+        .find_map(MachineStep::failure)
 }
 
 /// The property the shrink keeps violated: the one that ended the run, or
@@ -635,7 +619,7 @@ enum Choice {
 struct Shrinker<'a> {
     harness: &'static HarnessEntry,
     scenario: Value,
-    machine_failure: Option<MachineFailureKey>,
+    machine_failure: Option<MachineFailure>,
     property: String,
     budget: ShrinkBudget,
     started: Instant,
@@ -671,7 +655,7 @@ impl Shrinker<'_> {
     /// even when a limit stops them. `Ok` means pass 4 reached a fixed
     /// point.
     fn reduce(&mut self, base: &mut Run, violation_step: Option<u64>) -> Result<(), Stop> {
-        if machine_input(self.harness.name, &self.scenario).is_some() {
+        if self.harness.machine {
             return self.reduce_machine(base);
         }
         if let Some(step) = violation_step {
@@ -681,18 +665,18 @@ impl Shrinker<'_> {
         self.default_scheduling(base)
     }
 
-    /// Delete decoder-v1 operations, preserving alignment and the exact failure.
+    /// Deletes machine operations, preserving alignment and the exact failure.
     fn reduce_machine(&mut self, base: &mut Run) -> Result<(), Stop> {
-        let Some(mut input) = machine_input(self.harness.name, &self.scenario) else {
+        let Some(mut input) = machine_input(&self.scenario) else {
             return Ok(());
         };
-        let mut size = input.len().div_ceil(4);
+        let mut size = input.len().div_ceil(MACHINE_OPERATION_BYTES);
         while size > 0 {
             let accepted_before = self.accepted;
             let mut start = 0;
             while start < input.len() {
                 self.check_budget()?;
-                let end = (start + size * 4).min(input.len());
+                let end = (start + size * MACHINE_OPERATION_BYTES).min(input.len());
                 let mut candidate = input.clone();
                 candidate.drain(start..end);
                 let previous = self.scenario.clone();
@@ -880,12 +864,7 @@ impl Shrinker<'_> {
                     Record::Step(step) => Some(step),
                     _ => None,
                 });
-                let end = sink.records.iter().find_map(|record| match record {
-                    Record::End(end) => Some(end),
-                    _ => None,
-                });
-                let failure = machine_failure(steps, end);
-                if failure != expected_failure {
+                if machine_failure(steps) != expected_failure {
                     return Err(WitnessError::ChangedFailure);
                 }
                 Ok(Run::from_records(sink))

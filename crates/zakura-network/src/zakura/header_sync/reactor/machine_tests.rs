@@ -1,8 +1,10 @@
 //! Machine tests for [`ReactorState`].
 //!
-//! Each step drives `ReactorState` the way the reactor does, applies the same
-//! step to an independent model, and compares the two. The model never calls
-//! `ReactorState`. A virtual clock supplies every `now`.
+//! Each step drives `ReactorState` and the real [`repair_candidates`] choice,
+//! applies the same step to an independent model, and compares the two. The model
+//! never calls `ReactorState`. A virtual clock supplies every `now`. The saved
+//! `header/reactor-policy` input pins this decoder, so offer and page decisions
+//! run in the `peer_work` model instead.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -42,7 +44,7 @@ fn status(tip: u8) -> Status {
         max_headers_per_response: 16,
         max_subscriptions: 1,
         max_message_bytes: 1_000_000,
-        tree_aux_schema_mask: 0,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
     }
 }
 
@@ -179,6 +181,117 @@ fn repair(generation: u8, height: u8) -> RepairRequirement {
 
 fn predecessor() -> zakura_header_chain::Frontier {
     zakura_header_chain::Frontier::new(block::Height(0), hash(0xC1, 0))
+}
+
+/// The local limits of every repair supplier pass in these tests.
+fn supplier_limits() -> RepairSupplierLimits {
+    RepairSupplierLimits {
+        header_bytes: COMMON_HEADER_BYTES,
+        page_limits: PageLimits {
+            max_headers: 16,
+            max_bytes: 1_000_000,
+            aux_schema_mask: AuxSchema::V1.mask_bit(),
+        },
+        local_capacity: 1,
+    }
+}
+
+/// `task`, resolved to a one-header context, and ready for supplier assignment.
+fn ready_repair(
+    mut task: RepairRequirement,
+) -> (RepairRequirement, zakura_header_chain::VctRepairContext) {
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
+        zakura_header_chain::Frontier::new(task.height, hash(0xC2, 0)),
+        zakura_header_chain::HeaderLocator::for_continuation(predecessor()),
+        None,
+    );
+    let now = Instant::now();
+    task.mark_context_requested(now, now)
+        .expect("a new repair needs context");
+    task.resolve(context.clone())
+        .expect("the context names the repair's height");
+    (task, context)
+}
+
+/// What the model knows about one repair supplier.
+#[derive(Clone, Debug)]
+struct ModelSupplier {
+    peer: usize,
+    status: Status,
+    serving: bool,
+    live: bool,
+    tried: bool,
+    excluded: bool,
+    waiting: bool,
+}
+
+/// The documented supplier rules for a one-header repair at `target`, in order:
+/// the candidates, the peers to close, and the rejection tally.
+fn model_supplier_pass(
+    target: block::Height,
+    suppliers: &[ModelSupplier],
+) -> (Vec<usize>, Vec<usize>, VctSupplierRejections) {
+    let mut tally = VctSupplierRejections::default();
+    let (mut candidates, mut closing) = (Vec::new(), Vec::new());
+    for supplier in suppliers {
+        tally.considered += 1;
+        let status = &supplier.status;
+        let fits_one_header = status.max_headers_per_response != 0
+            && v9::page_capacity(
+                COMMON_HEADER_BYTES,
+                AuxSchema::V1,
+                1_000_000.min(status.max_message_bytes as usize),
+            ) != 0;
+        if status.selected_tip_height < target {
+            tally.below_target_height += 1;
+        } else if !fits_one_header {
+            tally.insufficient_capacity += 1;
+        } else if status.tree_aux_schema_mask & 1 == 0 {
+            tally.unsupported_schema += 1;
+        } else if supplier.serving {
+            tally.already_serving += 1;
+        } else if supplier.live {
+            tally.already_serving += 1;
+            closing.push(supplier.peer);
+        } else if supplier.excluded {
+            tally.excluded_input += 1;
+        } else if supplier.tried {
+            tally.already_tried += 1;
+        } else if supplier.waiting {
+            tally.supplier_status_wait += 1;
+        } else {
+            candidates.push(supplier.peer);
+        }
+    }
+    (candidates, closing, tally)
+}
+
+/// The peer indexes of `pass`, to compare with [`model_supplier_pass`].
+fn pass_indexes(pass: RepairCandidates) -> (Vec<usize>, Vec<usize>, VctSupplierRejections) {
+    let index = |peer: &ZakuraPeerId| {
+        (0..u8::MAX as usize)
+            .find(|index| peer_id(*index) == *peer)
+            .expect("the pass only names test peers")
+    };
+    (
+        pass.candidates
+            .iter()
+            .map(|candidate| {
+                assert_eq!(
+                    candidate.request_count, 1,
+                    "{PROPERTY}: a one-header repair"
+                );
+                index(&candidate.peer)
+            })
+            .collect(),
+        pass.closing.iter().map(index).collect(),
+        pass.rejections,
+    )
+}
+
+/// A copy of `task` that has not started asking for its context.
+fn task_with_new_state(task: RepairRequirement) -> RepairRequirement {
+    RepairRequirement::new(task.owner, task.height, task.repair_generation)
 }
 
 /// The model's view of one admitted session.
@@ -451,7 +564,7 @@ impl Harness {
                     .get(&peer)
                     .is_some_and(|pending| pending.read == read % self.started.len());
                 assert_eq!(
-                    self.state.calls.settle(key.call).is_ok(),
+                    self.state.calls.settle(key.call),
                     was_pending,
                     "{PROPERTY}: only the pending call settles"
                 );
@@ -484,7 +597,7 @@ impl Harness {
                     .get(&peer)
                     .is_some_and(|pending| pending.read == read % self.started.len());
                 assert_eq!(
-                    self.state.calls.settle(key.call).is_ok(),
+                    self.state.calls.settle(key.call),
                     matches,
                     "{PROPERTY}: only the pending call settles"
                 );
@@ -732,133 +845,88 @@ impl Harness {
         Some(self.started[read % self.started.len()].clone())
     }
 
-    /// Compare every observable fact of the machine with the model.
-    fn check(&self) {
-        assert_eq!(
-            self.state.scheduling_revision, self.model.revision,
-            "{PROPERTY}"
-        );
-        assert_eq!(
-            self.state.peers.len(),
-            self.model.sessions.len(),
-            "{PROPERTY}"
-        );
-        for peer in 0..PEERS {
-            let id = peer_id(peer);
-            let schedule = self.state.peers.get(&id).map(|schedule| {
-                (
-                    schedule
-                        .last_status
-                        .as_ref()
-                        .map(|status| status.selected_tip_hash),
-                    schedule.status_spent,
-                    schedule.unproductive_requests,
-                )
-            });
-            let expected = self.model.sessions.get(&peer).map(|session| {
-                (
-                    session.status.map(|tip| status(tip).selected_tip_hash),
-                    session.spent,
-                    0,
-                )
-            });
-            assert_eq!(schedule, expected, "{PROPERTY}: peer {} schedule", peer);
-            assert_eq!(
-                self.state.locators.contains(&id),
-                self.model.pending.contains_key(&peer),
-                "{PROPERTY}: peer {} pending read",
-                peer
-            );
-        }
-        let mut expected_calls: Vec<_> = self
-            .model
-            .pending
-            .values()
-            .map(|pending| self.started[pending.read].1.call)
-            .collect();
-        expected_calls.sort_unstable_by_key(|call| call.number);
-        assert_eq!(
-            self.state.calls.pending(),
-            expected_calls,
-            "{PROPERTY}: accepted locator calls"
-        );
+    /// Compare the suppliers that the current repair would choose with the
+    /// model's choice. A pending read stands for started work, and a `Close`
+    /// waiting for its outcome stands for a live subscription.
+    fn check_repair_suppliers(&self) {
+        let Some(task) = self.state.vct_repair.current().cloned() else {
+            return;
+        };
+        let (task, context) = ready_repair(task_with_new_state(task));
         let suppliers: Vec<_> = self
             .state
             .vct_supplier_order
             .iter()
-            .map(|peer| self.peer_index(peer))
+            .filter_map(|peer| {
+                let status = self.state.peers.get(peer)?.last_status.as_ref()?;
+                Some(RepairSupplierFacts {
+                    peer,
+                    status,
+                    serving: self.state.locators.contains(peer),
+                    subscription_live: self.state.close_deadlines.contains_key(peer),
+                })
+            })
+            .collect();
+        let actual = repair_candidates(&task, &context, supplier_limits(), suppliers);
+        let expected: Vec<_> = self
+            .model
+            .suppliers
+            .iter()
+            .filter_map(|peer| {
+                let tip = self.model.sessions.get(peer)?.status?;
+                Some(ModelSupplier {
+                    peer: *peer,
+                    status: status(tip),
+                    serving: self.model.pending.contains_key(peer),
+                    live: self.model.close_outcomes.contains_key(peer),
+                    tried: false,
+                    excluded: false,
+                    waiting: false,
+                })
+            })
             .collect();
         assert_eq!(
-            &suppliers,
-            &Vec::from(self.model.suppliers.clone()),
-            "{PROPERTY}"
+            pass_indexes(actual),
+            model_supplier_pass(task.height, &expected),
+            "{PROPERTY}: repair suppliers"
         );
-        let committed = self
-            .model
-            .committed
-            .map(|version| zakura_header_chain::StateVersion::new(u64::from(version)));
-        let paused = self.model.stalled_at.is_some_and(|stalled| {
-            self.model
-                .committed
-                .is_none_or(|version| version <= stalled)
-        });
-        assert_eq!(
-            self.state.ordinary_discovery_paused(committed),
-            paused,
-            "{PROPERTY}"
-        );
-        assert_eq!(
-            self.state
-                .vct_repair
-                .current()
-                .map(|task| (task.repair_generation, task.height)),
-            self.model.repair.map(|(generation, height)| (
-                u64::from(generation),
-                block::Height(u32::from(height) + 1)
-            )),
-            "{PROPERTY}"
-        );
-        assert_eq!(
-            self.state.vct_repair_stall.map(|stall| (
-                stall.generation,
-                stall.since,
-                stall.last_trace,
-                stall.reported
-            )),
-            self.model.stall.map(|stall| (
-                u64::from(stall.generation),
-                stall.since,
-                stall.last_trace,
-                stall.reported
-            )),
-            "{PROPERTY}"
-        );
-        // Every deadline the model knows, except the cached-pass refill.
-        let deadline = self
-            .model
+    }
+
+    /// Compare every observable fact of the machine with the model.
+    fn check(&self) {
+        assert_eq!(self.actual_view(), self.expected_view(), "{PROPERTY}");
+        if self.model.cached_deferred {
+            // The views hide this deadline: the model bounds a deferred pass's
+            // refill rather than predicting it.
+            let next = self.state.next_deadline();
+            assert!(
+                next.is_some_and(|next| next <= self.now + CACHED_PASS_REFILL),
+                "{PROPERTY}"
+            );
+            assert_eq!(
+                next,
+                self.model_deadline()
+                    .map_or(next, |deadline| next.min(Some(deadline))),
+                "{PROPERTY}"
+            );
+        }
+        self.check_repair_suppliers();
+    }
+
+    /// Every deadline the model knows, except the cached-pass refill.
+    fn model_deadline(&self) -> Option<Instant> {
+        self.model
             .close_retries
             .values()
             .chain(self.model.close_outcomes.values())
             .map(|(_, at)| *at)
             .chain(self.model.stall.map(ModelStall::next_deadline))
-            .min();
-        if self.model.cached_deferred {
-            // A deferred pass wakes the reactor within one refill.
-            let refill = self.now + CACHED_PASS_REFILL;
-            let next = self.state.next_deadline();
-            assert!(next.is_some_and(|next| next <= refill), "{PROPERTY}");
-            assert_eq!(
-                next,
-                deadline.map_or(next, |deadline| next.min(Some(deadline))),
-                "{PROPERTY}"
-            );
-        } else {
-            assert_eq!(self.state.next_deadline(), deadline, "{PROPERTY}");
-        }
+            .min()
     }
 }
 
 /// Run `ops` from an empty state, checking the machine after every step.
+#[cfg(test)]
 fn run_with(
     ops: impl IntoIterator<Item = Op>,
     mut after_step: impl FnMut(&mut Harness),
@@ -1184,6 +1252,62 @@ proptest! {
     fn reactor_state_matches_the_model(ops in prop::collection::vec(op(), 1..64)) {
         run(ops);
     }
+
+    /// Every rejection rule, in the order the supplier pass applies them.
+    #[test]
+    fn repair_suppliers_match_the_model(
+        suppliers in prop::collection::vec(any::<(u8, u8)>(), 0..PEERS)
+    ) {
+        let (mut task, context) = ready_repair(repair(0, 1));
+        let suppliers: Vec<_> = suppliers
+            .into_iter()
+            .enumerate()
+            .map(|(peer, (tip, flags))| {
+                let mut status = status(tip % 4);
+                status.max_headers_per_response = u32::from(flags & 1) * 16;
+                status.tree_aux_schema_mask = u32::from(flags >> 1 & 1);
+                ModelSupplier {
+                    peer,
+                    status,
+                    serving: flags & 4 != 0,
+                    live: flags & 8 != 0,
+                    tried: flags & 16 != 0,
+                    excluded: flags & 32 != 0,
+                    waiting: flags & 64 != 0,
+                }
+            })
+            .collect();
+        for supplier in &suppliers {
+            let source = source_id_from_peer(&peer_id(supplier.peer));
+            if supplier.excluded {
+                task.excluded_input_sources.insert(source);
+            }
+            if supplier.tried {
+                task.tried_sources.insert(source);
+            }
+            if supplier.waiting {
+                let owner = task.owner;
+                task.assign(owner, context.clone()).expect("the repair is ready");
+                task.wait_for_supplier_status(source).expect("the repair is assigned");
+            }
+        }
+        let ids: Vec<_> = suppliers.iter().map(|supplier| peer_id(supplier.peer)).collect();
+        let actual = repair_candidates(
+            &task,
+            &context,
+            supplier_limits(),
+            suppliers.iter().zip(&ids).map(|(supplier, peer)| RepairSupplierFacts {
+                peer,
+                status: &supplier.status,
+                serving: supplier.serving,
+                subscription_live: supplier.live,
+            }),
+        );
+        prop_assert_eq!(
+            pass_indexes(actual),
+            model_supplier_pass(task.height, &suppliers)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1217,7 +1341,7 @@ const PROPERTY: &str = "header/reactor-policy";
 
 /// Applicable transitions in a decoder-v1 header reactor history.
 #[derive(Debug, Default, Eq, PartialEq)]
-pub struct HeaderReactorReplaySummary {
+struct HeaderReactorReplaySummary {
     /// Operations decoded.
     pub transitions: usize,
     /// Session admissions checked.
@@ -1244,7 +1368,8 @@ pub struct HeaderReactorReplaySummary {
 
 /// Replay decoder-v1 quadruples against the existing header reactor model.
 /// Read at most 512 bytes and keep every deadline relative to one clock origin.
-pub fn replay_header_reactor_bytes(data: &[u8]) -> HeaderReactorReplaySummary {
+#[cfg(test)]
+fn replay_header_reactor_bytes(data: &[u8]) -> HeaderReactorReplaySummary {
     run_with(decode(data), |_| {}).summary
 }
 
@@ -1304,6 +1429,21 @@ pub struct HeaderReactorSessionView {
     pub status: Option<block::Hash>,
     /// Whether the status is spent.
     pub spent: bool,
+    /// The session's unproductive requests.
+    pub unproductive_requests: u32,
+}
+
+/// A repair stall in a [`HeaderReactorView`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReactorStallView {
+    /// The stalled repair's generation.
+    pub generation: u64,
+    /// Milliseconds from the clock origin to the first failed attempt.
+    pub since_millis: u64,
+    /// Milliseconds from the clock origin to the last trace row.
+    pub last_trace_millis: Option<u64>,
+    /// Whether the reactor reported this generation at error level.
+    pub reported: bool,
 }
 
 /// One pending locator read in a [`HeaderReactorView`].
@@ -1332,6 +1472,8 @@ pub struct HeaderReactorView {
     pub paused: bool,
     /// The current repair: its generation and height.
     pub repair: Option<(u64, u32)>,
+    /// The current repair's stall.
+    pub stall: Option<HeaderReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
     /// Milliseconds from the clock origin to the next deadline. A deferred
@@ -1381,6 +1523,7 @@ impl Harness {
                         .as_ref()
                         .map(|status| status.selected_tip_hash),
                     spent: schedule.status_spent,
+                    unproductive_requests: schedule.unproductive_requests,
                 })
             })
             .collect();
@@ -1420,6 +1563,15 @@ impl Harness {
                 .vct_repair
                 .current()
                 .map(|task| (task.repair_generation, task.height.0)),
+            stall: self
+                .state
+                .vct_repair_stall
+                .map(|stall| HeaderReactorStallView {
+                    generation: stall.generation,
+                    since_millis: self.millis(stall.since),
+                    last_trace_millis: stall.last_trace.map(|at| self.millis(at)),
+                    reported: stall.reported,
+                }),
             cached_deferred: self.state.cached_pass_deferred,
             next_deadline_millis: (!self.state.cached_pass_deferred)
                 .then(|| self.state.next_deadline())
@@ -1454,6 +1606,7 @@ impl Harness {
                     peer: *peer,
                     status: session.status.map(|tip| status(tip).selected_tip_hash),
                     spent: session.spent,
+                    unproductive_requests: 0,
                 })
                 .collect(),
             reads,
@@ -1469,17 +1622,15 @@ impl Harness {
                 .model
                 .repair
                 .map(|(generation, height)| (u64::from(generation), u32::from(height) + 1)),
+            stall: self.model.stall.map(|stall| HeaderReactorStallView {
+                generation: u64::from(stall.generation),
+                since_millis: self.millis(stall.since),
+                last_trace_millis: stall.last_trace.map(|at| self.millis(at)),
+                reported: stall.reported,
+            }),
             cached_deferred: self.model.cached_deferred,
             next_deadline_millis: (!self.model.cached_deferred)
-                .then(|| {
-                    self.model
-                        .close_retries
-                        .values()
-                        .chain(self.model.close_outcomes.values())
-                        .map(|(_, at)| *at)
-                        .chain(self.model.stall.map(ModelStall::next_deadline))
-                        .min()
-                })
+                .then(|| self.model_deadline())
                 .flatten()
                 .map(|at| self.millis(at)),
         }
@@ -1626,6 +1777,19 @@ fn header_reactor_witness_rejects_lost_locator() {
             harness.state.locators.remove_exact(key);
         }
     });
+}
+
+/// The shared adapter judges only a step's failure, so a view mismatch must
+/// become a property failure.
+#[test]
+fn a_view_mismatch_is_a_property_failure() {
+    let mut harness = run(decode(WITNESS));
+    harness.state.scheduling_revision += 1;
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.check()))
+        .expect_err("the views disagree");
+    let failure =
+        HeaderMachineFailure::of_panic(PROPERTY, HeaderMachinePhase::Invariant, payload.as_ref());
+    assert!(failure.property_failure, "{}", failure.message);
 }
 
 #[test]

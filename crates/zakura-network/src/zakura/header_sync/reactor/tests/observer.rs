@@ -13,6 +13,7 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::Semaphore as TokioSemaphore;
 use zakura_node_services::header_chain as port;
 
+use super::super::dispatch::StorageDispatch;
 use super::*;
 use crate::zakura::{
     testkit::{TraceCapture, TraceReader},
@@ -364,7 +365,7 @@ fn request_ref(active: &ActiveHeaderRequest) -> RequestRef {
         peer: active.peer.clone(),
         session_id: active.owner.session_id(),
         request_id: active.request_id.get(),
-        incarnation: active.incarnation.get(),
+        incarnation: active.incarnation().get(),
         owner: active.owner,
         target_tip_hash: active.target.status.selected_tip_hash,
     }
@@ -536,7 +537,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
                     peer: peer.clone(),
                     session_id: 7,
                     request_id: 9,
-                    incarnation: seeded.incarnation.get(),
+                    incarnation: seeded.incarnation().get(),
                     owner: seeded.owner,
                     target_tip_hash: seeded.target.status.selected_tip_hash,
                 },

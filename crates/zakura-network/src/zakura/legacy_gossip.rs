@@ -4124,9 +4124,10 @@ mod tests {
                     sleep(delay).await;
                     let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)
                         .expect("the protocol message limit fits in u32");
-                    LegacyResponseCodec::encode_response(request_id, answer, cap, cap)
-                        .map(ResponseFrames::from)
-                        .map_err(BoxError::from)
+                    match LegacyResponseCodec::encode_response(request_id, answer, cap, cap) {
+                        Ok(frames) => Ok(ResponseFrames::with_zero_grant_for_tests(frames).await),
+                        Err(error) => Err(BoxError::from(error)),
+                    }
                 };
                 let frames = tokio::select! {
                     biased;

@@ -1376,22 +1376,22 @@ impl ZakuraPeerHandle {
 #[derive(Debug)]
 pub struct ResponseFrames {
     frames: Vec<Frame>,
-    grant: Option<CompatResponseGrant>,
+    grant: CompatResponseGrant,
 }
 
 impl ResponseFrames {
     /// Split the frames from the grant that funds them.
-    pub(crate) fn into_parts(self) -> (Vec<Frame>, Option<CompatResponseGrant>) {
+    pub(crate) fn into_parts(self) -> (Vec<Frame>, CompatResponseGrant) {
         (self.frames, self.grant)
     }
-}
 
-impl From<Vec<Frame>> for ResponseFrames {
-    /// Frames that another owner funds, such as a scripted peer's fixed answer.
-    fn from(frames: Vec<Frame>) -> Self {
+    /// A scripted peer's frames under a real zero-byte grant.
+    #[cfg(test)]
+    pub(crate) async fn with_zero_grant_for_tests(frames: Vec<Frame>) -> Self {
+        let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(1, 1)));
         Self {
             frames,
-            grant: None,
+            grant: node.connection().admit_compat_response(0).await,
         }
     }
 }
@@ -5980,10 +5980,7 @@ async fn write_outbound_request_frame_inner(
             }
             Err(ZakuraHandlerError::Closed) => {
                 legacy_state.finish()?;
-                return Ok(ResponseFrames {
-                    frames,
-                    grant: Some(grant),
-                });
+                return Ok(ResponseFrames { frames, grant });
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
                 return Err(OutboundRequestError::Local(Box::new(

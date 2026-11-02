@@ -175,8 +175,9 @@ pub enum ParentInputs {
     /// Every input is unspent at the parent, with the output each one spends.
     ///
     /// The block verifier hands these outputs to its transaction checks, so they are read once
-    /// per block. The map holds each output once while the block verifies. The transaction checks
-    /// already copy every output they spend, so peak memory stays about the same.
+    /// per block. The map holds each output once while the block verifies, in addition to the
+    /// copies the transaction checks make of the outputs they spend. Its locking scripts are
+    /// capped per check, see `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
     Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),

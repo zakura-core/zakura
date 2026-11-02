@@ -212,7 +212,8 @@ impl PreparedCandidateResolver {
 
 impl PreparedCandidateResolver {
     /// Retains a validated candidate that has no work ID, so a full submission of it can reuse
-    /// its parsed transactions. It is evicted like any other candidate of its source.
+    /// its parsed transactions. It can evict only candidates without live work IDs; if those cannot
+    /// make enough room, the new candidate is not retained.
     pub(crate) fn retain(&self, block: Arc<Block>, source: PreparedCandidateSource) {
         let transaction_bytes = serialized_transactions(&block);
         let size = candidate_size(&block);
@@ -345,7 +346,18 @@ impl Partition {
         while self.entries.len() >= self.limits.max_entries
             || self.bytes.saturating_add(required) > self.limits.max_bytes
         {
-            let entry_id = self.entries.front()?.id;
+            // Without an alias reservation, caching is optional and must preserve active work.
+            let entry_id = self
+                .entries
+                .iter()
+                .find(|entry| {
+                    alias_size != 0
+                        || !self
+                            .work_ids
+                            .values()
+                            .any(|alias| alias.entry_id == entry.id)
+                })?
+                .id;
             self.remove_entry(entry_id);
         }
         let id = self.next_entry_id;
@@ -597,6 +609,88 @@ mod tests {
             &decoded.transactions[0],
             &proposal.transactions[0]
         ));
+    }
+
+    #[test]
+    fn proposals_without_work_ids_preserve_active_work_under_cache_pressure() {
+        let first = distinct_block(1);
+        let second = distinct_block(2);
+        for limits in [
+            PartitionLimits {
+                max_entries: 2,
+                max_work_ids: 4,
+                max_bytes: usize::MAX,
+            },
+            PartitionLimits {
+                max_entries: 4,
+                max_work_ids: 4,
+                max_bytes: 2 * (candidate_size(&first) + work_id_alias_size("a")),
+            },
+        ] {
+            let cache = with_limits(limits);
+            insert(&cache, &first, "a", ClientProposal);
+            insert(&cache, &second, "b", ClientProposal);
+            for index in 3..12 {
+                let proposal = distinct_block(index);
+                cache.retain(proposal.clone(), ClientProposal);
+                assert!(cache
+                    .decode_submitted(&submitted_bytes(&proposal))
+                    .is_none());
+                assert!(cache.resolve("a", *first.header).is_ok());
+                assert!(cache.resolve("b", *second.header).is_ok());
+                assert_accounting(&cache.lock().proposals);
+            }
+        }
+    }
+
+    #[test]
+    fn proposals_without_work_ids_evict_only_unreferenced_candidates() {
+        let active = distinct_block(1);
+        let old = distinct_block(2);
+        let replacement = distinct_block(3);
+        for limits in [
+            PartitionLimits {
+                max_entries: 2,
+                max_work_ids: 4,
+                max_bytes: usize::MAX,
+            },
+            PartitionLimits {
+                max_entries: 4,
+                max_work_ids: 4,
+                max_bytes: 2 * (candidate_size(&active) + work_id_alias_size("a")),
+            },
+        ] {
+            let cache = with_limits(limits);
+            insert(&cache, &active, "a", ClientProposal);
+            cache.retain(old.clone(), ClientProposal);
+            cache.retain(replacement.clone(), ClientProposal);
+            assert!(cache.resolve("a", *active.header).is_ok());
+            assert!(cache.decode_submitted(&submitted_bytes(&old)).is_none());
+            assert!(cache
+                .decode_submitted(&submitted_bytes(&replacement))
+                .is_some());
+
+            // Giving a retained proposal a work ID protects it from later alias-free proposals.
+            insert(&cache, &replacement, "b", ClientProposal);
+            cache.retain(distinct_block(4), ClientProposal);
+            assert!(cache.resolve("a", *active.header).is_ok());
+            assert!(cache.resolve("b", *replacement.header).is_ok());
+
+            // An expired alias no longer protects its candidate from eviction.
+            cache
+                .lock()
+                .proposals
+                .work_ids
+                .get_mut("a")
+                .unwrap()
+                .expires_at = Instant::now();
+            let next = distinct_block(5);
+            cache.retain(next.clone(), ClientProposal);
+            assert!(cache.decode_submitted(&submitted_bytes(&active)).is_none());
+            assert!(cache.decode_submitted(&submitted_bytes(&next)).is_some());
+            assert!(cache.resolve("b", *replacement.header).is_ok());
+            assert_accounting(&cache.lock().proposals);
+        }
     }
 
     #[test]

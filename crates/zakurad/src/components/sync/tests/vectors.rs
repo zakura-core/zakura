@@ -3879,6 +3879,7 @@ fn setup_downloads_with_parent_wait(
         chain_tip,
         parent_wait,
         every_parent_known(),
+        Height(0),
     )
 }
 
@@ -3890,6 +3891,7 @@ fn setup_downloads_with_parent_checks(
     chain_tip: MockChainTip,
     parent_wait: ParentWait,
     parent_known: ParentKnown,
+    max_checkpoint_height: Height,
 ) -> Downloads<
     MockService<zn::Request, zn::Response, PanicAssertion>,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
@@ -3907,7 +3909,7 @@ fn setup_downloads_with_parent_checks(
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
-        Height(0),
+        max_checkpoint_height,
         LegacySyncTrace::new(None, false),
     )
 }
@@ -4343,6 +4345,7 @@ async fn serve_non_tip_child(
     verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     parent_known: ParentKnown,
     parent_in_flight: bool,
+    max_checkpoint_height: Height,
 ) -> Result<(Height, block::Hash), BlockDownloadVerifyError> {
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
         .zcash_deserialize_into()
@@ -4363,6 +4366,7 @@ async fn serve_non_tip_child(
             panic!("unexpected parent wait for {parent:?}")
         })),
         parent_known,
+        max_checkpoint_height,
     );
 
     let _parent_download = if parent_in_flight {
@@ -4415,9 +4419,14 @@ async fn unknown_parent_is_dropped_before_the_verifier() {
     let mut verifier =
         MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
 
-    let error = serve_non_tip_child(verifier.clone(), parent_known_answer(parent, false), false)
-        .await
-        .expect_err("a block with an unknown parent is dropped");
+    let error = serve_non_tip_child(
+        verifier.clone(),
+        parent_known_answer(parent, false),
+        false,
+        Height(0),
+    )
+    .await
+    .expect_err("a block with an unknown parent is dropped");
 
     assert!(
         matches!(
@@ -4447,6 +4456,7 @@ async fn known_parent_reaches_the_verifier() {
             verifier.clone(),
             parent_known_answer(block.header.previous_block_hash, true),
             false,
+            Height(0),
         ),
         async {
             verifier
@@ -4478,7 +4488,7 @@ async fn in_flight_parent_reaches_the_verifier() {
     }));
 
     let (result, _) = tokio::join!(
-        serve_non_tip_child(verifier.clone(), parent_known, true),
+        serve_non_tip_child(verifier.clone(), parent_known, true, Height(0)),
         async {
             verifier
                 .expect_request_that(|req| matches!(req, zakura_consensus::Request::Commit(_)))
@@ -4491,6 +4501,84 @@ async fn in_flight_parent_reaches_the_verifier() {
         result.expect("a block with an in-flight parent verifies"),
         (Height(1_687_107), block.hash())
     );
+}
+
+/// A block at or below the last checkpoint goes to the checkpoint verifier, which never waits
+/// for a missing parent, so the parent check is skipped.
+#[tokio::test]
+async fn checkpoint_block_skips_the_parent_check() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let parent_known = ParentKnown(Arc::new(|parent| {
+        panic!("a checkpoint block needs no parent check, asked about {parent:?}")
+    }));
+
+    let (result, _) = tokio::join!(
+        serve_non_tip_child(verifier.clone(), parent_known, false, Height(1_687_107)),
+        async {
+            verifier
+                .expect_request_that(|req| matches!(req, zakura_consensus::Request::Commit(_)))
+                .await
+                .respond(block.hash());
+        },
+    );
+
+    assert_eq!(
+        result.expect("a checkpoint block verifies"),
+        (Height(1_687_107), block.hash())
+    );
+}
+
+/// The state adapter reports a parent as unknown only when the state says it doesn't have it.
+/// Any location, a failed request, or no answer within the timeout lets the block be verified.
+#[tokio::test(start_paused = true)]
+async fn state_parent_known_drops_only_on_a_definite_no() {
+    let parent = block::Hash([0xAA; 32]);
+
+    // `None` never answers.
+    async fn ask(parent: block::Hash, answer: Option<Result<zs::Response, &'static str>>) -> bool {
+        let state = tower::service_fn(move |request: zs::Request| {
+            assert_eq!(request, zs::Request::KnownBlock(parent));
+            let answer = answer.clone();
+            async move {
+                match answer {
+                    Some(Ok(response)) => Ok(response),
+                    Some(Err(error)) => Err(crate::BoxError::from(error)),
+                    None => std::future::pending().await,
+                }
+            }
+            .boxed()
+        });
+        (sync::state_parent_known(state).0)(parent).await
+    }
+
+    assert!(!ask(parent, Some(Ok(zs::Response::KnownBlock(None)))).await);
+    for location in [
+        zs::KnownBlock::Finalized,
+        zs::KnownBlock::BestChain,
+        zs::KnownBlock::SideChain,
+        zs::KnownBlock::WriteChannel,
+        zs::KnownBlock::Queue,
+    ] {
+        assert!(
+            ask(
+                parent,
+                Some(Ok(zs::Response::KnownBlock(Some(location.clone()))))
+            )
+            .await,
+            "{location:?}"
+        );
+    }
+    assert!(
+        ask(parent, Some(Err("state failed"))).await,
+        "a failed request"
+    );
+    assert!(ask(parent, None).await, "no answer within the timeout");
 }
 
 /// A body whose parent is not our tip keeps the existing behind-tip policy: the tip check can't

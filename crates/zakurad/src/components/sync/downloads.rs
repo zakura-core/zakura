@@ -925,7 +925,19 @@ where
                         .expect("legacy task state lock is only held for synchronous updates")
                         .contains_key(&parent);
 
-                    if !parent_in_flight && !(parent_known.0)(parent).await {
+                    let parent_is_known = parent_in_flight || {
+                        // Prefer the cancel handle if both are ready.
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                trace!("task cancelled waiting for the parent check");
+                                return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
+                            }
+                            known = (parent_known.0)(parent) => known,
+                        }
+                    };
+
+                    if !parent_is_known {
                         debug!(
                             ?hash,
                             ?parent,

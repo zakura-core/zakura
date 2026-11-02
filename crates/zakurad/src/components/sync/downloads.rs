@@ -885,7 +885,9 @@ where
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
                 }
 
-                if !has_sufficient_work(&chain_network, block_height, block.header.difficulty_threshold) {
+                // Admission must precede shared flow-control changes: a rejected
+                // body must not pause or resume downloads using its claimed height.
+                if !has_sufficient_work(&chain_network, tip_height, block_height, block.header.difficulty_threshold) {
                     metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }
@@ -964,8 +966,6 @@ where
                     parent_gate.pass(hash);
                 }
 
-                // Only a block that passed every check above moves the pause flag, so a rejected
-                // block can't leave it stuck.
                 if block_height > lookahead_pause_height {
                     // This log can be very verbose, usually hundreds of blocks are dropped.
                     // So we only log at info level for the first above-height block.

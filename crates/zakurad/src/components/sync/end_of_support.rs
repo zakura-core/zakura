@@ -42,18 +42,17 @@ pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
 /// The last Mainnet height supported by this release.
 ///
-/// The next block projects to December 3, 2026 at 20:43:17 UTC using Mainnet
-/// height 3,490,665 at its block timestamp, September 21, 2026 at 02:29:57
+/// The next block projects to December 5, 2026 at 00:00:20 UTC using Mainnet
+/// height 3,539,449 at its block timestamp, November 2, 2026 at 15:49:05
 /// UTC, 75-second blocks through height 3,543,404, and 25-second blocks from
 /// the ZIP 259 NU7 activation at height 3,543,405. This fixes EOS at
-/// approximately December 4, before the December 5 deadline, even if release
-/// preparation advances [`ESTIMATED_RELEASE_HEIGHT`]. Enforcement follows
-/// height, not time.
+/// approximately December 5, even if release preparation advances
+/// [`ESTIMATED_RELEASE_HEIGHT`]. Enforcement follows height, not time.
 ///
 /// Earlier releases deliberately halted before the expected NU7 activation.
 /// This release follows the activation, so its support window extends about
 /// four weeks past it.
-const MAINNET_EOS_HEIGHT: Height = Height(3_640_098);
+const MAINNET_EOS_HEIGHT: Height = Height(3_643_309);
 
 /// A string which is part of the panic that will be displayed if Zebra halts.
 pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";

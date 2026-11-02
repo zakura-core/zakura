@@ -35,10 +35,38 @@ use crate::{
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock,
 };
 
+/// Start a Mainnet state service on `config` with genesis committed to disk.
+async fn genesis_read_state(
+    config: Config,
+) -> (
+    crate::service::StateService,
+    crate::service::ReadStateService,
+    Arc<Block>,
+) {
+    let (mut state, read, _, _) =
+        crate::service::StateService::new(config, &Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    (state, read, genesis)
+}
+
 /// A real disk result keeps admission after its worker and database handles end.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_block_results_keep_shared_admission_through_final_payload_holders() {
-    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use crate::{ReadRequest, ReadResponse};
     use std::{num::NonZeroU16, time::Duration};
     use tokio::time::timeout;
     use tower::ServiceExt;
@@ -50,22 +78,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         read_block_limit: NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (state, read, genesis) = genesis_read_state(config).await;
 
     let ReadResponse::Block(Some(block)) = timeout(
         deadline,
@@ -172,7 +185,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
 /// Direct reads, services, and iterators share final-holder transaction admission.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_transactions_keep_shared_admission_through_clones_and_database_drop() {
-    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use crate::{ReadRequest, ReadResponse};
     use std::{num::NonZeroU16, time::Duration};
     use tokio::time::timeout;
     use tower::ServiceExt;
@@ -186,22 +199,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
         read_transaction_limit: NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (state, read, genesis) = genesis_read_state(config).await;
     let hash = genesis.transactions[0].hash();
     let ReadResponse::Transaction(Some(result)) = timeout(
         deadline,
@@ -336,7 +334,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
 /// Header and serialized block results retain shared admission through final holders.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_header_and_raw_block_results_keep_shared_admission() {
-    use crate::{service::StateService, ReadRequest, ReadResponse};
+    use crate::{ReadRequest, ReadResponse};
     use std::{num::NonZeroU16, time::Duration};
     use tokio::time::timeout;
     use tower::ServiceExt;
@@ -351,22 +349,7 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         read_raw_block_limit: NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (state, read, genesis) = genesis_read_state(config).await;
     let height_zero = crate::HashOrHeight::Height(Height(0));
     let header_read = ReadRequest::BlockHeader(height_zero);
     let ReadResponse::BlockHeader { header, .. } =
@@ -823,30 +806,13 @@ fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
 /// from parser memory, and a refusal is not reported as missing data.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
-    use crate::service::StateService;
-    use std::{num::NonZeroU64, time::Duration};
-    use tokio::time::timeout;
+    use std::num::NonZeroU64;
     use zakura_node_services::block_memory::{
         AdmissionFailure, PayloadAdmissionFailure, ReadMemoryBudget,
     };
 
     let _guard = zakura_test::init();
-    let (mut state, read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (_state, read, genesis) = genesis_read_state(Config::ephemeral()).await;
 
     let mut db = read.db.clone();
     let budget = ReadMemoryBudget::new(NonZeroU64::MAX, NonZeroU64::MIN);
@@ -918,30 +884,13 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
 /// The parser limit refuses rows before a read copies the rest of a block.
 #[tokio::test(flavor = "multi_thread")]
 async fn parser_limit_refuses_reads_while_another_parser_holds_it() {
-    use crate::service::StateService;
-    use std::{num::NonZeroU64, time::Duration};
-    use tokio::time::timeout;
+    use std::num::NonZeroU64;
     use zakura_node_services::block_memory::{
         AdmissionFailure, DecodedBlockPool, ReadMemoryBudget,
     };
 
     let _guard = zakura_test::init();
-    let (mut state, read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
-    let genesis: Arc<Block> = Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap(),
-    );
-    timeout(
-        Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis)),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
+    let (_state, read, _) = genesis_read_state(Config::ephemeral()).await;
 
     let mut db = read.db.clone();
     let budget = ReadMemoryBudget::new(NonZeroU64::new(8).unwrap(), NonZeroU64::MAX);

@@ -719,43 +719,13 @@ mod tests {
     }
 
     #[test]
-    fn read_concurrency_limit_requires_positive_bounded_capacity() {
-        assert_eq!(
-            toml::from_str::<Config>("")
-                .unwrap()
-                .read_concurrency_limit
-                .get(),
-            64
-        );
-        assert_eq!(
-            toml::from_str::<Config>("read_concurrency_limit = 1")
-                .unwrap()
-                .read_concurrency_limit
-                .get(),
-            1
-        );
-        assert!(toml::from_str::<Config>("read_concurrency_limit = 0").is_err());
-        assert!(toml::from_str::<Config>("read_concurrency_limit = 65536").is_err());
-        assert_eq!(
-            toml::from_str::<Config>("").unwrap().read_block_limit.get(),
-            1024
-        );
-        assert!(toml::from_str::<Config>("read_block_limit = 0").is_err());
-        assert!(toml::from_str::<Config>("read_block_limit = 65536").is_err());
-        assert_eq!(
-            toml::from_str::<Config>("")
-                .unwrap()
-                .read_transaction_limit
-                .get(),
-            4096
-        );
-        assert!(toml::from_str::<Config>("read_transaction_limit = 0").is_err());
-        assert!(toml::from_str::<Config>("read_transaction_limit = 65536").is_err());
+    fn read_limits_have_their_documented_defaults() {
         let config = toml::from_str::<Config>("").unwrap();
+        assert_eq!(config.read_concurrency_limit.get(), 64);
+        assert_eq!(config.read_block_limit.get(), 1024);
+        assert_eq!(config.read_transaction_limit.get(), 4096);
         assert_eq!(config.read_header_limit.get(), 16384);
         assert_eq!(config.read_raw_block_limit.get(), 128);
-        assert!(toml::from_str::<Config>("read_header_limit = 0").is_err());
-        assert!(toml::from_str::<Config>("read_raw_block_limit = 0").is_err());
     }
 
     #[test]

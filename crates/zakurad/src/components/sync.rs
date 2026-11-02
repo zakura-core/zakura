@@ -54,7 +54,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentWait};
+use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentKnown, ParentWait};
 use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
@@ -136,6 +136,37 @@ where
                 )
                 .await,
                 Ok(Ok(zs::Response::BlockInfo(Some(_))))
+            )
+        })
+    }))
+}
+
+/// Bounds a download task's question to the state about whether a block's parent is known,
+/// including state readiness. A block whose question times out is verified as before.
+const PARENT_KNOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns a [`ParentKnown`] that asks `state` whether it knows a block, bounded by
+/// [`PARENT_KNOWN_TIMEOUT`]. A failed or timed-out request counts as known.
+fn state_parent_known<ZS>(state: ZS) -> ParentKnown
+where
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ZS::Future: Send + 'static,
+{
+    ParentKnown(Arc::new(move |parent| {
+        let state = state.clone();
+        // Boxing lets rustc prove this future is `Send` for spawned callers.
+        futures::FutureExt::boxed(async move {
+            !matches!(
+                timeout(
+                    PARENT_KNOWN_TIMEOUT,
+                    state.oneshot(zs::Request::KnownBlock(parent)),
+                )
+                .await,
+                Ok(Ok(zs::Response::KnownBlock(None)))
             )
         })
     }))
@@ -1100,12 +1131,14 @@ where
         );
 
         let parent_wait = state_parent_wait(state.clone());
+        let parent_known = state_parent_known(state.clone());
 
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
             latest_chain_tip.clone(),
             parent_wait,
+            parent_known,
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
@@ -2589,6 +2622,10 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
+    /// The download task drops a block whose parent is neither committed nor in flight before
+    /// verifying it. The syncer drops it too, unless the parent is now committed, in flight or
+    /// waiting for a retry: then the block is downloaded again after the registry-miss backoff,
+    /// bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`].
     /// A block whose authorizing data binding is still unconfirmed after the download task waited
     /// for its parent is dropped the same way, without scoring its supplier.
     ///
@@ -2663,6 +2700,31 @@ where
                 );
                 self.verify_timeout_retry_counts.remove(&hash);
                 return Ok(());
+            }
+
+            // The download task dropped this block before verification, but its parent is now
+            // known, in flight, or waiting for a retry. Download the block again after the
+            // registry-miss backoff, by when its parent can usually be found.
+            if matches!(
+                response,
+                Err(BlockDownloadVerifyError::ParentUnknown { .. })
+            ) {
+                let retry_count = self.registry_miss_retry_counts.entry(hash).or_default();
+                if *retry_count < MISSING_BLOCK_REGISTRY_RETRY_LIMIT {
+                    *retry_count += 1;
+                    debug!(
+                        ?hash,
+                        ?parent,
+                        retry_attempt = *retry_count,
+                        "block parent can still arrive, retrying block after backoff"
+                    );
+                    self.registry_miss_retry.insert(
+                        hash,
+                        tokio::time::Instant::now() + REGISTRY_MISS_RETRY_BACKOFF,
+                    );
+                    return Ok(());
+                }
+                self.registry_miss_retry_counts.remove(&hash);
             }
         }
 
@@ -3055,10 +3117,12 @@ where
         }
     }
 
-    /// Returns the block and parent hashes of a UTXO lookup timeout whose parent is not in a
-    /// chain that can accept the block.
+    /// Returns the block and parent hashes of a block that could not verify for lack of its
+    /// parent: a UTXO lookup timeout whose parent is not in a chain that can accept the block, or
+    /// a block the download task dropped because its parent was unknown.
     fn unavailable_parent(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
         match error {
+            BlockDownloadVerifyError::ParentUnknown { hash, parent, .. } => Some((*hash, *parent)),
             BlockDownloadVerifyError::Invalid {
                 error: RouterError::Block { source },
                 hash,
@@ -3155,6 +3219,16 @@ where
                      dropping the block and continuing sync"
                 );
                 false
+            }
+            BlockDownloadVerifyError::ParentUnknown { .. } => {
+                // Only reached once the retry budget runs out while the parent could still
+                // arrive: restart to get fresh tips rather than wait on it indefinitely.
+                warn!(
+                    error = ?e,
+                    %peer,
+                    "block retry budget exhausted while waiting for its parent, restarting sync"
+                );
+                true
             }
             BlockDownloadVerifyError::TipChildHeightMismatch { .. } => {
                 // Only reached once the requeue budget is exhausted: the required hash still

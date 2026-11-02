@@ -41,7 +41,7 @@ use crate::{
         sync::{
             self,
             downloads::{
-                lookahead_heights, BlockDownloadVerifyError, Downloads, ParentWait,
+                lookahead_heights, BlockDownloadVerifyError, Downloads, ParentKnown, ParentWait,
                 VERIFICATION_PIPELINE_DROP_LIMIT,
             },
             legacy_trace::LegacySyncTrace,
@@ -266,6 +266,9 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             None,
         ))]));
 
+    // Block 1's parent is already committed; block 2's is still downloading.
+    answer_parent_known(&mut state_service, block0_hash).await;
+
     // We can't guarantee the verification request order
     let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
         [(block1_hash, block1), (block2_hash, block2)]
@@ -342,6 +345,9 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             block4.clone(),
             None,
         ))]));
+
+    // Block 3's parent is already committed; block 4's is still downloading.
+    answer_parent_known(&mut state_service, block2_hash).await;
 
     // We can't guarantee the verification request order
     let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
@@ -470,6 +476,8 @@ async fn sync_singleton_obtain_tips_ok() -> Result<(), crate::BoxError> {
             block1.clone(),
             None,
         ))]));
+
+    answer_parent_known(&mut state_service, block0_hash).await;
 
     block_verifier_router
         .expect_request(zakura_consensus::Request::Commit(block1))
@@ -608,6 +616,9 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
             None,
         ))]));
 
+    // Block 1's parent is already committed; block 2's is still downloading.
+    answer_parent_known(&mut state_service, block0_hash).await;
+
     let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
         [(block1_hash, block1), (block2_hash, block2)]
             .iter()
@@ -670,6 +681,8 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
             block3.clone(),
             None,
         ))]));
+
+    answer_parent_known(&mut state_service, block2_hash).await;
 
     block_verifier_router
         .expect_request(zakura_consensus::Request::Commit(block3))
@@ -1324,6 +1337,9 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             None,
         ))]));
 
+    // Block 1's parent is already committed; block 2's is still downloading.
+    answer_parent_known(&mut state_service, block0_hash).await;
+
     // We can't guarantee the verification request order
     let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
         [(block1_hash, block1), (block2_hash, block2)]
@@ -1923,7 +1939,7 @@ async fn transient_download_failure_requeues_and_clears_on_success() -> Result<(
         _sync_status,
         mut block_verifier_router,
         mut peer_set,
-        _state_service,
+        mut state_service,
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
@@ -1948,6 +1964,8 @@ async fn transient_download_failure_requeues_and_clears_on_success() -> Result<(
         .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+
+    answer_parent_known(&mut state_service, block.header.previous_block_hash).await;
 
     block_verifier_router
         .expect_request(zakura_consensus::Request::Commit(block))
@@ -2041,6 +2059,7 @@ async fn transient_download_failure_has_eight_peer_request_ceiling() -> Result<(
                 prime_block.clone(),
                 None,
             ))]));
+        answer_parent_known(&mut state_service, prime_block.header.previous_block_hash).await;
         block_verifier_router
             .expect_request_that(|request| request.block().hash() == prime_hash)
             .await
@@ -2110,8 +2129,10 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
     let retried_block: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
     let retried_hash = retried_block.hash();
+    // Not the retried block's child, so its parent is never downloading and the download task
+    // always asks the state about it.
     let unrelated_block: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
     let unrelated_hash = unrelated_block.hash();
     let reserve = [retried_hash, unrelated_hash].into_iter().collect();
 
@@ -2162,6 +2183,11 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
 
         // Commit the unrelated block before answering the queue-level retry. This proves that the
         // transient error did not cancel other work in the round.
+        answer_parent_known(
+            &mut state_service,
+            unrelated_block.header.previous_block_hash,
+        )
+        .await;
         block_verifier_router
             .expect_request_that(|request| request.block().hash() == unrelated_hash)
             .await
@@ -2176,6 +2202,7 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
                 retried_block.clone(),
                 None,
             ))]));
+        answer_parent_known(&mut state_service, retried_block.header.previous_block_hash).await;
         block_verifier_router
             .expect_request_that(|request| request.block().hash() == retried_hash)
             .await
@@ -2206,6 +2233,7 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
     let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
     let parent_hash = parent.hash();
     let child_hash = child.hash();
+    let grandparent_hash = parent.header.previous_block_hash;
     let sync_round = chain_sync.sync_round([parent_hash, child_hash].into_iter().collect(), None);
     let drive_services = async {
         for block in [parent, child.clone()] {
@@ -2216,6 +2244,9 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
                 .await
                 .respond(zn::Response::Blocks(vec![Available((block, None))]));
         }
+        // The parent's own parent is committed, so its download task asks the state about it.
+        // The child's parent is still downloading, so the child's task asks nothing.
+        answer_parent_known(&mut state, grandparent_hash).await;
         // The two verifier calls can arrive in either order.
         let first = verifier.expect_request_that(|_| true).await;
         let second = verifier.expect_request_that(|_| true).await;
@@ -2236,15 +2267,17 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
         );
 
         // A retry proves the syncer handled the child's error while the parent stayed pending.
+        // The retried child reaches the verifier before the parent commits, so its parent is
+        // still downloading when its task checks.
         let retry = peers
             .expect_request(zn::Request::BlocksByHash(iter::once(child_hash).collect()))
             .await;
-        parent_commit.respond(parent_hash);
         retry.respond(zn::Response::Blocks(vec![Available((child.clone(), None))]));
-        verifier
+        let child_retry_commit = verifier
             .expect_request(zakura_consensus::Request::Commit(child))
-            .await
-            .respond(child_hash);
+            .await;
+        parent_commit.respond(parent_hash);
+        child_retry_commit.respond(child_hash);
     };
     let (result, ()) = tokio::join!(sync_round, drive_services);
     result.expect("the parent and child must finish in the original sync round");
@@ -2392,6 +2425,109 @@ async fn unavailable_parent_retries_while_parent_can_arrive() -> Result<(), crat
     Ok(())
 }
 
+fn parent_unknown(hash: block::Hash, parent: block::Hash) -> BlockDownloadVerifyError {
+    BlockDownloadVerifyError::ParentUnknown {
+        height: Height(42),
+        hash,
+        parent,
+    }
+}
+
+/// A block the download task dropped for an unknown parent stays dropped, without a restart, a
+/// retry or a score, when its parent still cannot arrive.
+#[tokio::test]
+async fn parent_unknown_drops_block_when_parent_cannot_arrive() {
+    let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+
+    let (response, _) = tokio::join!(
+        chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
+        async {
+            state
+                .expect_request(zs::Request::KnownBlock(parent))
+                .await
+                .respond(zs::Response::KnownBlock(None));
+        },
+    );
+
+    response.expect("an unknown parent does not restart sync");
+    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    assert!(!chain_sync.registry_miss_retry.contains_key(&hash));
+    assert!(chain_sync.registry_miss_retry_counts.is_empty());
+    peers.expect_no_requests().await;
+}
+
+/// A block the download task dropped for an unknown parent is downloaded again after the
+/// registry-miss backoff when its parent can now arrive, and restarts sync once that retry budget
+/// runs out.
+#[tokio::test]
+async fn parent_unknown_retries_after_backoff_while_parent_can_arrive() {
+    #[derive(Clone, Copy, Debug)]
+    enum Parent {
+        RegistryRetry,
+        Committed,
+    }
+    for parent_state in [Parent::RegistryRetry, Parent::Committed] {
+        let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
+        let hash = block::Hash([0xCC; 32]);
+        let parent = block::Hash([0xAA; 32]);
+        if matches!(parent_state, Parent::RegistryRetry) {
+            chain_sync
+                .registry_miss_retry
+                .insert(parent, tokio::time::Instant::now());
+        }
+
+        let (response, _) = tokio::join!(
+            chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
+            async {
+                if matches!(parent_state, Parent::Committed) {
+                    state
+                        .expect_request(zs::Request::KnownBlock(parent))
+                        .await
+                        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+                }
+            },
+        );
+
+        response.expect("a parent that can arrive retries the block");
+        assert!(
+            chain_sync.registry_miss_retry.contains_key(&hash),
+            "{parent_state:?}"
+        );
+        assert_eq!(
+            chain_sync.registry_miss_retry_counts.get(&hash),
+            Some(&1),
+            "{parent_state:?}"
+        );
+        // The retry waits for the backoff instead of downloading again at once.
+        peers.expect_no_requests().await;
+    }
+
+    let (mut chain_sync, _, _, _peers, _state, _) = setup_chain_sync();
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+    chain_sync
+        .registry_miss_retry
+        .insert(parent, tokio::time::Instant::now());
+    chain_sync
+        .registry_miss_retry_counts
+        .insert(hash, sync::MISSING_BLOCK_REGISTRY_RETRY_LIMIT);
+    assert!(
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent)))
+            .await
+            .is_err(),
+        "an exhausted retry budget restarts sync"
+    );
+    assert!(TestChainSync::should_restart_sync(
+        &parent_unknown(hash, parent),
+        false
+    ));
+}
+
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
     BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {
@@ -2454,7 +2590,7 @@ async fn verification_timeout_restart_classification() {
 #[tokio::test]
 async fn verification_timeout_requeues_and_recovers() -> Result<(), crate::BoxError> {
     for utxo_timeout in [true, false] {
-        let (mut chain_sync, _, mut verifier, mut peers, _state, _tip) = setup_chain_sync();
+        let (mut chain_sync, _, mut verifier, mut peers, mut state, _tip) = setup_chain_sync();
         let block: Arc<Block> =
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
@@ -2472,6 +2608,7 @@ async fn verification_timeout_requeues_and_recovers() -> Result<(), crate::BoxEr
             .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
             .await
             .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+        answer_parent_known(&mut state, block.header.previous_block_hash).await;
         verifier
             .expect_request(zakura_consensus::Request::Commit(block))
             .await
@@ -2496,7 +2633,7 @@ async fn verification_timeout_requeues_and_recovers() -> Result<(), crate::BoxEr
 #[tokio::test]
 async fn verification_timeout_restarts_after_retry_limit() -> Result<(), crate::BoxError> {
     for utxo_timeout in [true, false] {
-        let (mut chain_sync, _, mut verifier, mut peers, _state, _tip) = setup_chain_sync();
+        let (mut chain_sync, _, mut verifier, mut peers, mut state, _tip) = setup_chain_sync();
         // Keep the wave limit above the per-hash limit so this test isolates retry exhaustion.
         chain_sync.full_verify_concurrency_limit = sync::BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT + 2;
         let block: Arc<Block> =
@@ -2527,6 +2664,7 @@ async fn verification_timeout_restarts_after_retry_limit() -> Result<(), crate::
                 .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
                 .await
                 .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+            answer_parent_known(&mut state, block.header.previous_block_hash).await;
             verifier
                 .expect_request(zakura_consensus::Request::Commit(block.clone()))
                 .await
@@ -3437,6 +3575,20 @@ async fn registry_miss_retry_accumulates_budget_for_the_same_block() {
     peer_set.expect_no_requests().await;
 }
 
+/// Answers a download task's question about whether `parent` is known: it is.
+///
+/// The test syncers verify everything above genesis in full, so each block whose parent is not
+/// itself still downloading asks the state about its parent before it reaches the verifier.
+async fn answer_parent_known(
+    state: &mut MockService<zs::Request, zs::Response, PanicAssertion>,
+    parent: block::Hash,
+) {
+    state
+        .expect_request(zs::Request::KnownBlock(parent))
+        .await
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+}
+
 fn setup() -> (
     // ChainSync
     impl Future<Output = Result<(), Report>> + Send,
@@ -3614,6 +3766,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         ParentWait(Arc::new(|parent| {
             panic!("unexpected parent wait for {parent:?}")
         })),
+        every_parent_known(),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3665,6 +3818,7 @@ async fn block_download_network_readiness_times_out() {
         ParentWait(Arc::new(|parent| {
             panic!("unexpected parent wait for {parent:?}")
         })),
+        every_parent_known(),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3680,6 +3834,11 @@ async fn block_download_network_readiness_times_out() {
         "network readiness should time out, got {result:?}"
     );
     assert_eq!(downloads.in_flight(), 0);
+}
+
+/// A [`ParentKnown`] for downloader tests that are not about the parent check.
+fn every_parent_known() -> ParentKnown {
+    ParentKnown(Arc::new(|_| async { true }.boxed()))
 }
 
 /// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`, whose parent waits
@@ -3714,6 +3873,28 @@ fn setup_downloads_with_parent_wait(
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     MockChainTip,
 > {
+    setup_downloads_with_parent_checks(
+        peer_set,
+        verifier,
+        chain_tip,
+        parent_wait,
+        every_parent_known(),
+    )
+}
+
+/// Builds a [`Downloads`] like [`setup_downloads`], with `parent_wait` for unconfirmed bindings
+/// and `parent_known` for the parent check before verification.
+fn setup_downloads_with_parent_checks(
+    peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
+    verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    chain_tip: MockChainTip,
+    parent_wait: ParentWait,
+    parent_known: ParentKnown,
+) -> Downloads<
+    MockService<zn::Request, zn::Response, PanicAssertion>,
+    MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    MockChainTip,
+> {
     let (past_lookahead_limit_sender, _past_lookahead_limit_receiver) =
         tokio::sync::watch::channel(false);
 
@@ -3722,6 +3903,7 @@ fn setup_downloads_with_parent_wait(
         verifier,
         chain_tip,
         parent_wait,
+        parent_known,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -4151,6 +4333,163 @@ async fn canonical_tip_child_reaches_the_verifier() {
         result.expect("a canonical tip child verifies"),
         (Height(1_687_107), canonical_hash),
         "the canonical tip child must be unaffected by the height check"
+    );
+}
+
+/// Serves block 1,687,107 to a downloader whose best tip is just below it but on another chain,
+/// so the block is not a tip child and only the parent check decides whether it is verified. If
+/// `parent_in_flight`, the block's parent is queued first and its download never answers.
+async fn serve_non_tip_child(
+    verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    parent_known: ParentKnown,
+    parent_in_flight: bool,
+) -> Result<(Height, block::Hash), BlockDownloadVerifyError> {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let hash = block.hash();
+    let parent = block.header.previous_block_hash;
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+
+    let mut downloads = setup_downloads_with_parent_checks(
+        peer_set.clone(),
+        verifier,
+        chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
+        parent_known,
+    );
+
+    let _parent_download = if parent_in_flight {
+        downloads
+            .download_and_verify(parent)
+            .await
+            .expect("queuing a fresh hash succeeds");
+        Some(
+            peer_set
+                .expect_request(zn::Request::BlocksByHash(iter::once(parent).collect()))
+                .await,
+        )
+    } else {
+        None
+    };
+
+    downloads
+        .download_and_verify(hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block, None))]));
+
+    downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking")
+}
+
+/// A [`ParentKnown`] that expects to be asked about `expected` only, and answers `known`.
+fn parent_known_answer(expected: block::Hash, known: bool) -> ParentKnown {
+    ParentKnown(Arc::new(move |parent| {
+        assert_eq!(parent, expected, "the check asks about the block's parent");
+        async move { known }.boxed()
+    }))
+}
+
+/// A block above the checkpoints whose parent is neither known to the state nor being downloaded
+/// is dropped before the verifier, unscored, instead of waiting for a parent that may never come.
+#[tokio::test]
+async fn unknown_parent_is_dropped_before_the_verifier() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let parent = block.header.previous_block_hash;
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+
+    let error = serve_non_tip_child(verifier.clone(), parent_known_answer(parent, false), false)
+        .await
+        .expect_err("a block with an unknown parent is dropped");
+
+    assert!(
+        matches!(
+            error,
+            BlockDownloadVerifyError::ParentUnknown { height, hash, parent: unknown }
+                if height == Height(1_687_107) && hash == block.hash() && unknown == parent
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.advertiser_addr(), None, "the supplier is not scored");
+    verifier.expect_no_requests().await;
+}
+
+/// A block whose parent the state knows, in any chain, still reaches the verifier.
+#[tokio::test]
+async fn known_parent_reaches_the_verifier() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+
+    let (result, _) = tokio::join!(
+        serve_non_tip_child(
+            verifier.clone(),
+            parent_known_answer(block.header.previous_block_hash, true),
+            false,
+        ),
+        async {
+            verifier
+                .expect_request_that(|req| matches!(req, zakura_consensus::Request::Commit(_)))
+                .await
+                .respond(block.hash());
+        },
+    );
+
+    assert_eq!(
+        result.expect("a block with a known parent verifies"),
+        (Height(1_687_107), block.hash())
+    );
+}
+
+/// A block whose parent this downloader is still downloading reaches the verifier, which waits
+/// for the parent as before, without asking the state.
+#[tokio::test]
+async fn in_flight_parent_reaches_the_verifier() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let parent_known = ParentKnown(Arc::new(|parent| {
+        panic!("an in-flight parent needs no state question, asked about {parent:?}")
+    }));
+
+    let (result, _) = tokio::join!(
+        serve_non_tip_child(verifier.clone(), parent_known, true),
+        async {
+            verifier
+                .expect_request_that(|req| matches!(req, zakura_consensus::Request::Commit(_)))
+                .await
+                .respond(block.hash());
+        },
+    );
+
+    assert_eq!(
+        result.expect("a block with an in-flight parent verifies"),
+        (Height(1_687_107), block.hash())
     );
 }
 

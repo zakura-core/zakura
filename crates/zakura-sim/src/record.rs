@@ -38,7 +38,7 @@ use crate::{
 /// block-sync body. Version 18 added the decoded size of the block a
 /// submission carries. Version 19 added the runtime object a task's point
 /// touches. Version 20 adds causal inputs and independent state views for
-/// machine steps.
+/// machine steps, tagged by kind.
 pub const FORMAT_VERSION: u32 = 20;
 
 /// What records mean: the identity grammar, the default-pick and default-draw

@@ -14,20 +14,6 @@ zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuz
 [workspace]
 
 [[bin]]
-name = "discovery_book"
-path = "fuzz_targets/discovery_book.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "discovery_state"
-path = "fuzz_targets/discovery_state.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "discovery_redial"
 path = "fuzz_targets/discovery_redial.rs"
 test = false

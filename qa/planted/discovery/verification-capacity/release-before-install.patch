@@ -6,9 +6,9 @@ index f80874e5f..ab427eed5 100644
                  outcome.rejected += unverified_len;
                  return Ok(outcome);
              };
--            verification_slot = Some(slot);
+-            verification_slot = slot;
 +            drop(slot);
 +            verification_slot = None::<SlotPermit>;
-             let (fresh, dropped) = verified?;
+             let (fresh, dropped) = result?;
              outcome.rejected += dropped;
              authentic.extend(fresh);

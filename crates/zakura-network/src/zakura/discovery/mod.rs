@@ -13,16 +13,15 @@ mod runtime;
 mod service;
 #[cfg(zakura_sim)]
 pub(crate) use service::discovery_streams;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod fuzz;
 mod serving;
 mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-mod state_tests;
-#[cfg(any(test, feature = "p2p-fuzz"))]
-pub use state_tests::{
-    replay_discovery_book_bytes, replay_discovery_state_bytes, trace_discovery_book_bytes,
-    trace_discovery_state_bytes, AdmittedFact, BookEntryFact, BookFact, BookStep, BookView,
-    DiscoveryBookReplaySummary, DiscoveryStateReplaySummary, DriverFailure, HintFact, SessionStep,
-    SessionView,
+pub use fuzz::{
+    trace_discovery_book_bytes, trace_discovery_state_bytes, AdmittedFact, BookEntryFact, BookFact,
+    BookStep, BookView, DriverFailure, EvictionFact, HintFact, ImportFact, InstallFact,
+    SessionStep, SessionView,
 };
 mod trace;
 mod verified;

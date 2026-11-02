@@ -47,8 +47,9 @@ howudoin = []
 sync-metrics = []
 
 # Testing features that activate extra dependencies
-p2p-fuzz = []
 header-fuzz = []
+# Exposes the P2P machine drivers to `qa/fuzz/p2p` and `zakura-sim`.
+p2p-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 

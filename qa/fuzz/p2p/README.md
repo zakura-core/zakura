@@ -1,44 +1,48 @@
-# P2P machine fuzz targets
+# P2P machine fuzzing
 
-Run these targets locally or in the nightly/manual campaign.
+This isolated `cargo-fuzz` package is intentionally not a workspace member. Each
+target drives one pure P2P machine from fuzz bytes and checks it against an
+independent model after every input. A target panics with the property ID that
+the machine broke. The targets do not start QUIC or the simulator step loop.
 
-## Discovery state targets
+Each owning PR adds its targets as `[[bin]]` entries, with a row in the table
+below. Decoders read at most 512 bytes. Empty inputs report zero applicability.
 
-| Target | Local property ID | Applicability witness |
-| --- | --- | --- |
-| `discovery_book` | `discovery/record-book` | `discovery_book_witness_exercises_provenance_quota_and_expiry` |
-| `discovery_state` | `discovery/session-installation` | `discovery_state_witness_exercises_stale_verification_and_expiry` |
+| Target | Property | Decoder | Applicability witness |
+| --- | --- | --- | --- |
+| `discovery_session` | `discovery/session-policy` | 1 | `discovery_session_witness_reaches_close_after_recheck` |
+| `discovery_redial` | `discovery/redial-policy` | 1 | `redial_witness_exercises_limits_resets_and_lagging_registration` |
+| `discovery_query` | `discovery/query-ownership` | 1 | `query_witness_exercises_ownership_and_caps` |
+| `discovery_query` | `discovery/answer-settlement` | 2 | `settlement_witness_exercises_holds_and_retirement` |
+| `discovery_candidate` | `discovery/dial-attempts` | 1 | `candidate_witness_exercises_identity_backoff_and_local_limits` |
 
-Both targets reuse the existing independent models. Decoder version 1 reads at
-most 512 bytes in four-byte operations. Empty inputs report zero applicability.
+The input decoding, the model and the checks live in `zakura-network` behind the
+`p2p-fuzz` feature, so the machine types stay private to the crate.
 
-The book witness imports relayed records, rejects a relay-quota overflow, updates
-dial metadata, changes provenance, advances time and rejects an expired record.
-Two planted failures add unearned confirmation or an extra dial failure.
-The session witness replaces a session before verification completes, rejects
-the stale result, installs the current result and expires a live service summary.
-Two planted failures remove the current admission or install an unearned hint.
-Each planted failure must report the intended property ID.
+Run a target from this directory with a pinned nightly toolchain. Pass
+`--fuzz-dir .`, because `cargo-fuzz` otherwise looks for `fuzz/` under the
+workspace root:
 
-Decoder version 1 excludes peer sampling, and its corpus keeps that meaning.
-The existing proptest checks sampling eligibility and disclosure limits. The
-`zakura-sim` target `discovery/record-book` uses decoder version 2 to replay
-signed samples under a fixed disclosure key, a seeded shuffle and a fixture clock.
-Record metadata and session checks compare normalized state and do not depend on
-hash iteration order. These targets check synchronous installation rules;
-`discovery/verification-capacity` checks the real handle's task cancellation and
-verification waits.
+```console
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target>
+```
 
-## Discovery session and redial targets
+`cargo-fuzz` creates and updates each target's local `corpus/` and `artifacts/`
+directories. Git ignores both. Run targets locally or in the nightly or manual
+campaign; no fuzz campaign blocks PR CI.
 
-| Target | Local property ID | Applicability witness |
-| --- | --- | --- |
-| `discovery_session` | `discovery/session-policy` | `discovery_session_witness_reaches_close_after_recheck` |
-| `discovery_redial` | `discovery/redial-policy` | `redial_witness_exercises_limits_resets_and_lagging_registration` |
+When libFuzzer reports a failure, reproduce and minimize the artifact:
 
-Both decoder-v1 targets read at most 512 bytes and reuse their existing
-independent models for proptest and cargo-fuzz. Empty inputs report zero
-applicability.
+```console
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> path/to/crash-artifact
+cargo +nightly-2026-07-15 fuzz tmin --fuzz-dir . <target> path/to/crash-artifact
+```
+
+Turn every confirmed bug into a normal deterministic test in the owning crate.
+Do not commit raw or minimized corpus files. Machine bytes are compatible with
+their target and decoder version. They are not portable simulator traces.
+
+## Discovery targets
 
 `discovery_session` decodes hello, admitted answers and operation outcomes.
 It checks exchange completion, single settlement, and ownership checks before
@@ -49,20 +53,6 @@ Two planted failures skip the recheck or discard the success charge.
 Each remaining triple selects an attempt and registration lifetime. Its witness
 checks local limits, backoff growth, registration upgrades, resets and stopping.
 Two planted failures reset a failed attempt or charge a local limit.
-
-These targets check pure policies. They do not check worker cancellation or
-connection ownership across scheduled IO.
-
-## Discovery query and candidate targets
-
-| Target | Local property ID | Applicability witness |
-| --- | --- | --- |
-| `discovery_query` (decoder 1) | `discovery/query-ownership` | `query_witness_exercises_ownership_and_caps` |
-| `discovery_query` (decoder 2) | `discovery/answer-settlement` | `settlement_witness_exercises_holds_and_retirement` |
-| `discovery_candidate` | `discovery/dial-attempts` | `candidate_witness_exercises_identity_backoff_and_local_limits` |
-
-These decoders share their existing proptest models with cargo-fuzz. They read
-at most 512 bytes and report zero applicability for empty histories.
 
 `discovery_query` decodes reservation, queue, release and claim operations.
 Its model calculates wire caps independently and checks that an answer claims

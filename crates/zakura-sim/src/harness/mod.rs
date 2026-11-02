@@ -19,6 +19,7 @@ pub mod discovery_machine;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod machine;
 pub mod policy;
 mod record;
 pub mod scenario;
@@ -353,8 +354,9 @@ pub struct HarnessEntry {
     pub generator: u32,
     /// [`Subsystem::SCENARIO_BYTES`].
     pub scenario_bytes: usize,
-    /// Whether short scenario prefixes receive zero padding before decoding.
-    pub pad_scenario: bool,
+    /// Whether the harness drives a pure machine. A machine reads a short input
+    /// as it is; every other harness reads missing scenario bytes as 0.
+    pub machine: bool,
     /// [`Subsystem::COMPOSES`].
     pub composes: &'static [&'static str],
     /// [`Subsystem::PLANTED`].
@@ -365,8 +367,8 @@ pub struct HarnessEntry {
     pub meta: fn(&Value) -> Result<MetaRecord, HarnessError>,
     /// [`run_config`] for a serialized scenario.
     pub config: fn(&Value) -> Result<RunConfig, HarnessError>,
-    /// [`Subsystem::draw`], serialized. The prefix must be exactly
-    /// `scenario_bytes` long when `pad_scenario` is true.
+    /// [`Subsystem::draw`], serialized. Outside a machine, the prefix must be
+    /// exactly `scenario_bytes` long.
     pub draw: fn(&[u8]) -> Value,
     /// Every property the harness checks in any scenario, with its status.
     pub properties: fn() -> Vec<PropertyRef>,
@@ -383,15 +385,15 @@ pub type WitnessFn =
     fn(&Value, PlanInput, &str, Expect, &mut dyn RecordSink) -> Result<(), WitnessError>;
 
 impl HarnessEntry {
-    /// Decode the causal prefix, preserving short machine histories.
+    /// The scenario that the full fuzz `input`'s prefix decodes to.
     pub fn scenario(&self, input: &[u8]) -> Value {
         let prefix = &input[..input.len().min(self.scenario_bytes)];
-        if self.pad_scenario && prefix.len() < self.scenario_bytes {
+        if self.machine || prefix.len() == self.scenario_bytes {
+            (self.draw)(prefix)
+        } else {
             let mut padded = prefix.to_vec();
             padded.resize(self.scenario_bytes, 0);
             (self.draw)(&padded)
-        } else {
-            (self.draw)(prefix)
         }
     }
 
@@ -422,7 +424,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         name: S::NAME,
         generator: S::GENERATOR,
         scenario_bytes: S::SCENARIO_BYTES,
-        pad_scenario: true,
+        machine: false,
         composes: S::COMPOSES,
         planted: S::PLANTED,
         run: run_value::<S>,

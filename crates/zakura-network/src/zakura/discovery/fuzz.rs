@@ -1,8 +1,9 @@
-//! Machine tests for discovery's shared state: the record book and
+//! Machine models and drivers for discovery's shared state: the record book and
 //! [`DiscoveryState`], each checked against an independent model.
 //!
 //! The models restate the documented rules. They never call the code they
-//! check.
+//! check. `zakura-sim` replays these drivers through [`trace_discovery_book_bytes`]
+//! and [`trace_discovery_state_bytes`].
 
 use std::{
     any::Any,
@@ -12,15 +13,11 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use proptest::prelude::*;
 use rand_10::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::collections::{HashMap, HashSet};
-
-#[cfg(test)]
-use super::protocol::RecordVerdict;
 
 use super::protocol::{
     BookChange, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
@@ -36,6 +33,9 @@ use crate::zakura::{
     ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, ZAKURA_PROTOCOL_VERSION_CURRENT,
 };
 
+#[cfg(test)]
+mod state_tests;
+
 const START: u64 = 1_700_000_000;
 const CHAIN_ID: [u8; 32] = [7; 32];
 const SKEW: u64 = 300;
@@ -46,79 +46,6 @@ const BOOK_MAX_RECORDS: usize = 4;
 const BOOK_MAX_PER_RELAY: usize = 2;
 const SAMPLE_WINDOW: usize = 3;
 const HIGH_FAILURES: u32 = 3;
-
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "fresh-process checks compare the signed sample history"
-)]
-fn controlled_disclosure_replays_signed_samples_across_insertion_orders() {
-    fn history(reverse: bool) -> Vec<Vec<Vec<u8>>> {
-        let mut book = ZakuraDiscoveryBook::with_disclosure_key(
-            ZakuraDiscoveryBookLimits {
-                max_records: 16,
-                max_imported_records_per_response: SAMPLE_WINDOW,
-                ..ZakuraDiscoveryBookLimits::default()
-            },
-            None,
-            DisclosureKey::new([7; 32]),
-        );
-        let mut records: Vec<_> = (0..12)
-            .map(|index| {
-                record(
-                    &secret(80 + index),
-                    10 + index,
-                    1,
-                    START + 4 * DISCLOSURE_EPOCH,
-                )
-            })
-            .collect();
-        if reverse {
-            records.reverse();
-        }
-        for record in records {
-            let source = record.body.node_id;
-            book.import_record(record, Some(source), START, &context(START))
-                .unwrap();
-        }
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut history = Vec::new();
-        for epoch in 0..3 {
-            for requester in 0..RELAYS {
-                let records = book.sample_peers_with_rng(
-                    SAMPLE_WINDOW,
-                    &[],
-                    &[],
-                    START + epoch * DISCLOSURE_EPOCH,
-                    relay(requester),
-                    &mut rng,
-                );
-                assert_eq!(records.len(), SAMPLE_WINDOW);
-                history.push(
-                    records
-                        .into_iter()
-                        .map(|record| {
-                            let mut bytes = record.body.encode_for_signature().unwrap();
-                            bytes.extend_from_slice(&record.signature.to_bytes());
-                            bytes
-                        })
-                        .collect(),
-                );
-            }
-        }
-        history
-    }
-    let expected = history(false);
-    assert_eq!(
-        expected,
-        history(true),
-        "hash-table order must not change disclosure replay"
-    );
-    println!(
-        "signed_disclosure_history={}",
-        serde_json::to_string(&expected).unwrap()
-    );
-}
 
 const AUTHORS: usize = 6;
 const RELAYS: usize = 3;
@@ -228,33 +155,6 @@ enum BookOp {
     Advance(u64),
 }
 
-#[cfg(test)]
-fn supplier() -> impl Strategy<Value = Supplier> {
-    prop_oneof![
-        2 => Just(Supplier::Author),
-        3 => (0..RELAYS).prop_map(Supplier::Relay),
-        1 => Just(Supplier::Nobody),
-    ]
-}
-
-#[cfg(test)]
-fn book_op() -> impl Strategy<Value = BookOp> {
-    prop_oneof![
-        6 => (0..AUTHORS, 0u64..4, -400i64..120, supplier()).prop_map(
-            |(author, sequence, expires_in, supplier)| BookOp::Import {
-                author,
-                sequence,
-                expires_in,
-                supplier,
-            }
-        ),
-        1 => (0..AUTHORS).prop_map(BookOp::DialSuccess),
-        1 => (0..AUTHORS).prop_map(BookOp::DialFailure),
-        2 => (0..RELAYS, 0usize..5).prop_map(|(requester, limit)| BookOp::Sample { requester, limit }),
-        2 => prop_oneof![0u64..60, 500u64..700].prop_map(BookOp::Advance),
-    ]
-}
-
 /// The model's view of one stored entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelEntry {
@@ -267,13 +167,35 @@ struct ModelEntry {
     last_success: Option<u64>,
 }
 
-/// What the model expects one import to return.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Expected {
-    Outcome(ImportOutcome),
+/// One import's result in a machine step.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportFact {
+    /// A new entry stored the record.
+    Added,
+    /// The record replaced an entry's older record.
+    Updated,
+    /// An equal sequence refreshed the entry's metadata.
+    MetadataUpdated,
+    /// The stored record's sequence is later.
+    IgnoredOlder,
+    /// The record expired before it arrived.
     Expired,
+    /// The supplier's relay quota refused the record.
     RelayFull,
+    /// The book evicted the new record at its record limit.
     BookFull,
+}
+
+impl From<ImportOutcome> for ImportFact {
+    fn from(outcome: ImportOutcome) -> Self {
+        match outcome {
+            ImportOutcome::Added => Self::Added,
+            ImportOutcome::Updated => Self::Updated,
+            ImportOutcome::MetadataUpdated => Self::MetadataUpdated,
+            ImportOutcome::IgnoredOlder => Self::IgnoredOlder,
+        }
+    }
 }
 
 /// An independent restatement of the book's documented rules.
@@ -282,8 +204,6 @@ struct BookModel {
     entries: HashMap<NodeId, ModelEntry>,
     /// The record changes the current operation made.
     changes: Vec<BookChange>,
-    /// What the current operation's import should return.
-    last_result: Option<Expected>,
 }
 
 impl BookModel {
@@ -321,22 +241,9 @@ impl BookModel {
         expires: u64,
         source: Option<NodeId>,
         now: u64,
-    ) -> Expected {
-        let expected = self.predict_import(node_id, sequence, expires, source, now);
-        self.last_result = Some(expected);
-        expected
-    }
-
-    fn predict_import(
-        &mut self,
-        node_id: NodeId,
-        sequence: u64,
-        expires: u64,
-        source: Option<NodeId>,
-        now: u64,
-    ) -> Expected {
+    ) -> ImportFact {
         if expires.saturating_add(SKEW) < now {
-            return Expected::Expired;
+            return ImportFact::Expired;
         }
         let first_party = source == Some(node_id);
         let relay = Self::relay_of(source, node_id);
@@ -346,7 +253,7 @@ impl BookModel {
             // An expired record no longer orders its node's records.
             let stored_orders = entry.expires >= now;
             if stored_orders && sequence < entry.sequence {
-                return Expected::Outcome(ImportOutcome::IgnoredOlder);
+                return ImportFact::IgnoredOlder;
             }
             let same_sequence = stored_orders && sequence == entry.sequence;
             // A full relay cannot take over an entry.
@@ -360,7 +267,7 @@ impl BookModel {
             entry.last_seen = now;
             entry.confirmed |= first_party;
             if same_sequence {
-                return Expected::Outcome(ImportOutcome::MetadataUpdated);
+                return ImportFact::MetadataUpdated;
             }
             self.changes.push(BookChange::Replaced {
                 node_id,
@@ -370,7 +277,7 @@ impl BookModel {
             });
             entry.sequence = sequence;
             entry.expires = expires;
-            return Expected::Outcome(ImportOutcome::Updated);
+            return ImportFact::Updated;
         }
 
         if let Some(relay) = relay.filter(|_| relay_full) {
@@ -383,7 +290,7 @@ impl BookModel {
                 .map(|(id, _)| *id)
                 .collect();
             if expired.is_empty() {
-                return Expected::RelayFull;
+                return ImportFact::RelayFull;
             }
             expired.sort_unstable_by_key(|id| *id.as_bytes());
             for id in expired {
@@ -421,10 +328,10 @@ impl BookModel {
                 cause: EvictionCause::BookLimit,
             });
             if victim == node_id {
-                return Expected::BookFull;
+                return ImportFact::BookFull;
             }
         }
-        Expected::Outcome(ImportOutcome::Added)
+        ImportFact::Added
     }
 
     /// The documented eviction order: the earliest-expiring expired entry,
@@ -483,17 +390,17 @@ impl BookModel {
     }
 }
 
-fn import_result(result: Result<ImportOutcome, DiscoveryBookError>) -> Expected {
+fn import_result(result: Result<ImportOutcome, DiscoveryBookError>) -> ImportFact {
     match result {
-        Ok(outcome) => Expected::Outcome(outcome),
-        Err(DiscoveryBookError::Record(DiscoveryRecordError::Expired)) => Expected::Expired,
+        Ok(outcome) => outcome.into(),
+        Err(DiscoveryBookError::Record(DiscoveryRecordError::Expired)) => ImportFact::Expired,
         Err(DiscoveryBookError::Limit {
             field: "records per relay",
             ..
-        }) => Expected::RelayFull,
+        }) => ImportFact::RelayFull,
         Err(DiscoveryBookError::Limit {
             field: "records", ..
-        }) => Expected::BookFull,
+        }) => ImportFact::BookFull,
         Err(error) => panic!("the generated records only fail on expiry or limits: {error}"),
     }
 }
@@ -511,38 +418,9 @@ fn observed_entry(book: &ZakuraDiscoveryBook, node_id: NodeId) -> Option<ModelEn
 }
 
 const BOOK_PROPERTY: &str = "discovery/record-book";
-/// Applicability counters for a decoder-v1 discovery history.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct DiscoveryBookReplaySummary {
-    /// Operations compared with the model.
-    pub transitions: usize,
-    /// Signed record import results checked.
-    pub imports: usize,
-    /// Imports rejected by the relay quota.
-    pub relay_rejections: usize,
-    /// Imports rejected as expired.
-    pub expired_imports: usize,
-    /// Dial metadata updates checked.
-    pub dial_updates: usize,
-    /// Nonzero clock advances checked.
-    pub time_advances: usize,
-}
-fn run_book(
-    ops: impl IntoIterator<Item = BookOp>,
-    seed: u64,
-    mut after_step: impl FnMut(&mut ZakuraDiscoveryBook, u64),
-) -> DiscoveryBookReplaySummary {
-    let mut driver = BookDriver::new(seed);
-    for op in ops {
-        driver.apply(op);
-        driver.check(&mut after_step);
-    }
-    driver.summary
-}
 
 /// The real book and its model at one point in a history.
 struct BookDriver {
-    summary: DiscoveryBookReplaySummary,
     book: ZakuraDiscoveryBook,
     model: BookModel,
     rng: StdRng,
@@ -552,7 +430,9 @@ struct BookDriver {
     /// The record changes the book reported for the current operation.
     changes: Vec<BookChange>,
     /// The current import's result, if the operation imported a record.
-    result: Option<Expected>,
+    result: Option<ImportFact>,
+    /// What the model predicts for the current import.
+    expected_result: Option<ImportFact>,
     /// The current sample's signed records, as they would go on the wire.
     sample: Vec<Vec<u8>>,
 }
@@ -572,7 +452,6 @@ impl BookDriver {
             *part = seed.to_le_bytes();
         }
         Self {
-            summary: DiscoveryBookReplaySummary::default(),
             book: ZakuraDiscoveryBook::with_disclosure_key(
                 limits,
                 Some(local),
@@ -585,15 +464,16 @@ impl BookDriver {
             now: START,
             changes: Vec::new(),
             result: None,
+            expected_result: None,
             sample: Vec::new(),
         }
     }
 
     fn apply(&mut self, op: BookOp) {
-        self.summary.transitions += 1;
         self.changes.clear();
         self.model.changes.clear();
         self.result = None;
+        self.expected_result = None;
         self.sample.clear();
         let now = self.now;
         match op {
@@ -616,7 +496,7 @@ impl BookDriver {
                 };
                 // Every supplier's record takes the production path: verify, then install.
                 let result = match VerifiedRecord::verify(record, &context) {
-                    Ok(verified) => self.book.import_verified_tracked(
+                    Ok(verified) => self.book.import_verified_record(
                         verified,
                         source,
                         now,
@@ -625,22 +505,16 @@ impl BookDriver {
                     ),
                     Err(error) => Err(error.into()),
                 };
-                self.summary.imports += 1;
-                let expected = self.model.import(node_id, sequence, expires, source, now);
-                self.summary.relay_rejections += usize::from(expected == Expected::RelayFull);
-                self.summary.expired_imports += usize::from(expected == Expected::Expired);
-                let actual = import_result(result);
-                self.result = Some(actual);
-                assert_eq!(actual, expected, "{BOOK_PROPERTY}");
+                self.expected_result =
+                    Some(self.model.import(node_id, sequence, expires, source, now));
+                self.result = Some(import_result(result));
             }
             BookOp::DialSuccess(author) => {
-                self.summary.dial_updates += 1;
                 let node_id = self.authors[author].public();
                 self.book.mark_dial_success(&node_id, now);
                 self.model.dial_success(node_id, now);
             }
             BookOp::DialFailure(author) => {
-                self.summary.dial_updates += 1;
                 let node_id = self.authors[author].public();
                 self.book.mark_dial_failure(&node_id, now);
                 self.model.dial_failure(node_id);
@@ -688,7 +562,6 @@ impl BookDriver {
                 );
             }
             BookOp::Advance(secs) => {
-                self.summary.time_advances += usize::from(secs > 0);
                 self.now += secs;
             }
         }
@@ -696,43 +569,21 @@ impl BookDriver {
 
     fn check(&mut self, after_step: &mut impl FnMut(&mut ZakuraDiscoveryBook, u64)) {
         after_step(&mut self.book, self.now);
-        assert_eq!(
-            self.book.discovered_len(),
-            self.model.entries.len(),
-            "{BOOK_PROPERTY}"
-        );
+        assert_view_matches(BOOK_PROPERTY, &self.actual_view(), &self.expected_view());
         assert!(
             self.model.entries.len() <= BOOK_MAX_RECORDS,
             "{BOOK_PROPERTY}"
         );
-        assert_eq!(self.changes, self.model.changes, "{BOOK_PROPERTY}");
         assert!(
             self.book.sample_snapshot_len() <= BOOK_MAX_RECORDS.max(SAMPLE_WINDOW),
             "{BOOK_PROPERTY}: the sample snapshot exceeds the book"
         );
-        for signer in &self.authors {
-            let node_id = signer.public();
-            assert_eq!(
-                observed_entry(&self.book, node_id),
-                self.model.entries.get(&node_id).cloned(),
-                "{BOOK_PROPERTY}"
-            );
-        }
         for index in 0..RELAYS {
             assert!(
                 self.model.relayed_by(relay(index)) <= BOOK_MAX_PER_RELAY,
                 "{BOOK_PROPERTY}"
             );
         }
-        assert_eq!(
-            self.book
-                .relayed_counts()
-                .into_iter()
-                .map(|(relay, count)| (hex::encode(relay.as_bytes()), count))
-                .collect::<Vec<_>>(),
-            self.model.relayed_counts(),
-            "{BOOK_PROPERTY}"
-        );
     }
 
     fn actual_view(&self) -> BookView {
@@ -747,6 +598,7 @@ impl BookDriver {
         entries.sort_unstable_by(|left, right| left.node.cmp(&right.node));
         BookView {
             now: self.now,
+            discovered: self.book.discovered_len(),
             entries,
             relayed: self
                 .book
@@ -755,7 +607,7 @@ impl BookDriver {
                 .map(|(relay, count)| (hex::encode(relay.as_bytes()), count))
                 .collect(),
             changes: self.changes.iter().map(BookFact::from).collect(),
-            result: self.result.map(|result| format!("{result:?}")),
+            result: self.result,
         }
     }
 
@@ -769,15 +621,11 @@ impl BookDriver {
         entries.sort_unstable_by(|left, right| left.node.cmp(&right.node));
         BookView {
             now: self.now,
+            discovered: self.model.entries.len(),
             entries,
             relayed: self.model.relayed_counts(),
             changes: self.model.changes.iter().map(BookFact::from).collect(),
-            result: self.result.map(|_| {
-                format!(
-                    "{:?}",
-                    self.model.last_result.expect("each import sets its result")
-                )
-            }),
+            result: self.expected_result,
         }
     }
 }
@@ -857,9 +705,19 @@ pub enum BookFact {
         node: String,
         /// The removed record's sequence.
         sequence: u64,
-        /// `relay-quota` or `book-limit`.
-        cause: String,
+        /// Why the entry left.
+        cause: EvictionFact,
     },
+}
+
+/// Why an entry left the book in a machine step.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvictionFact {
+    /// An expired entry gave way to its relay's next record.
+    RelayQuota,
+    /// The book exceeded its record limit.
+    BookLimit,
 }
 
 impl From<&BookChange> for BookFact {
@@ -894,10 +752,9 @@ impl From<&BookChange> for BookFact {
                 node: hex::encode(node_id.as_bytes()),
                 sequence: *sequence,
                 cause: match cause {
-                    EvictionCause::RelayQuota => "relay-quota",
-                    EvictionCause::BookLimit => "book-limit",
-                }
-                .to_owned(),
+                    EvictionCause::RelayQuota => EvictionFact::RelayQuota,
+                    EvictionCause::BookLimit => EvictionFact::BookLimit,
+                },
             },
         }
     }
@@ -909,6 +766,8 @@ impl From<&BookChange> for BookFact {
 pub struct BookView {
     /// The explicit fixture time, in Unix seconds.
     pub now: u64,
+    /// Discovered records in the book.
+    pub discovered: usize,
     /// Stored entries in node id order.
     pub entries: Vec<BookEntryFact>,
     /// Each relay's attributed entries, in node id order.
@@ -916,7 +775,7 @@ pub struct BookView {
     /// The record changes this operation made, in order.
     pub changes: Vec<BookFact>,
     /// The import's result, for an import operation.
-    pub result: Option<String>,
+    pub result: Option<ImportFact>,
 }
 
 /// One decoder-v2 record-book operation.
@@ -947,6 +806,28 @@ pub struct DriverFailure {
     pub property_failure: bool,
     /// The panic payload, without the panic hook's source location.
     pub message: String,
+}
+
+/// Fails `property` unless the owner's view matches the model's.
+///
+/// The panic names only the first differing field. The step record keeps both
+/// views, so a shrink can delete an unrelated operation and keep the same failure.
+fn assert_view_matches<V: Eq + Serialize>(property: &str, actual: &V, expected: &V) {
+    if actual == expected {
+        return;
+    }
+    let values = (serde_json::to_value(actual), serde_json::to_value(expected));
+    let field = match &values {
+        (Ok(Value::Object(actual)), Ok(expected)) => actual
+            .iter()
+            .find(|(name, value)| expected.get(name.as_str()) != Some(*value))
+            .map(|(name, _)| name.as_str()),
+        _ => None,
+    };
+    panic!(
+        "{property}: {} differs from the model",
+        field.unwrap_or("the view")
+    );
 }
 
 fn driver_failure(payload: &(dyn Any + Send), property: &str) -> DriverFailure {
@@ -999,15 +880,6 @@ pub fn trace_discovery_book_bytes(data: &[u8]) -> Vec<BookStep> {
         }
     }
     steps
-}
-
-#[cfg(test)]
-proptest! {
- #![proptest_config(ProptestConfig::with_cases(48))]
- #[test]
- fn book_matches_independent_model(seed in any::<u64>(), ops in prop::collection::vec(book_op(), 1..64)) { run_book(ops, seed, |_, _| {}); }
- #[test]
- fn book_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { replay_discovery_book_bytes(&bytes); }
 }
 
 // DiscoveryState model.
@@ -1113,39 +985,6 @@ enum StateOp {
     ReadHints,
 }
 
-#[cfg(test)]
-fn state_op() -> impl Strategy<Value = StateOp> {
-    let key = || (0..PEERS, 0u64..3, 0u64..3);
-    prop_oneof![
-        3 => (key(), any::<bool>()).prop_map(|((peer, conn_id, session_id), outbound)| StateOp::Admit {
-            peer,
-            conn_id,
-            session_id,
-            outbound,
-        }),
-        1 => key().prop_map(|(peer, conn_id, session_id)| StateOp::RemoveSession {
-            peer,
-            conn_id,
-            session_id,
-        }),
-        1 => (0..PEERS, 0u64..3).prop_map(|(peer, conn_id)| StateOp::RemoveConnection { peer, conn_id }),
-        2 => (0..PEERS, any::<bool>()).prop_map(|(peer, connected)| StateOp::SetConnected { peer, connected }),
-        2 => key().prop_map(|(peer, conn_id, session_id)| StateOp::StartHello {
-            peer,
-            conn_id,
-            session_id,
-        }),
-        2 => (0usize..8).prop_map(StateOp::FinishHello),
-        3 => (key(), 1u64..60).prop_map(|((peer, conn_id, session_id), ttl)| StateOp::ReceiveServices {
-            peer,
-            conn_id,
-            session_id,
-            ttl,
-        }),
-        2 => (0u64..40).prop_map(StateOp::Advance),
-    ]
-}
-
 /// The model's view of one peer.
 #[derive(Clone, Debug, Default)]
 struct PeerModel {
@@ -1226,54 +1065,23 @@ impl StateModel {
 }
 
 const STATE_PROPERTY: &str = "discovery/session-installation";
-/// Applicability counters for a decoder-v1 discovery history.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct DiscoveryStateReplaySummary {
-    /// Operations decoded.
-    pub transitions: usize,
-    /// Session admission decisions checked.
-    pub admissions: usize,
-    /// Current-session verification results installed.
-    pub installed_hellos: usize,
-    /// Superseded verification results rejected.
-    pub stale_hellos: usize,
-    /// Current connected-session summaries accepted.
-    pub live_summaries: usize,
-    /// Nonzero clock advances checked.
-    pub time_advances: usize,
-}
-fn run_state(
-    ops: impl IntoIterator<Item = StateOp>,
-    mut after_step: impl FnMut(&mut DiscoveryState, &StateModel),
-) -> DiscoveryStateReplaySummary {
-    let mut driver = StateDriver::new();
-    for op in ops {
-        driver.apply(op);
-        after_step(&mut driver.state, &driver.model);
-        driver.check_reads();
-        driver.check_sessions();
-    }
-    driver.summary
-}
 
 /// The real state and its model at one point in a history.
 struct StateDriver {
-    summary: DiscoveryStateReplaySummary,
     state: DiscoveryState,
     model: StateModel,
     pending: Vec<(usize, ZakuraConnId, u64, VerifiedRecord)>,
     hellos: Vec<VerifiedRecord>,
     now: u64,
     /// The current operation's installation result.
-    result: Option<String>,
+    result: Option<InstallFact>,
     /// What the model predicts for the current operation's installation.
-    expected_result: Option<String>,
+    expected_result: Option<InstallFact>,
 }
 
 impl StateDriver {
     fn new() -> Self {
         Self {
-            summary: DiscoveryStateReplaySummary::default(),
             state: discovery_state(),
             model: StateModel::new(),
             pending: Vec::new(),
@@ -1291,7 +1099,6 @@ impl StateDriver {
     }
 
     fn apply(&mut self, op: StateOp) {
-        self.summary.transitions += 1;
         self.result = None;
         self.expected_result = None;
         let now = self.now;
@@ -1302,7 +1109,6 @@ impl StateDriver {
                 session_id,
                 outbound,
             } => {
-                self.summary.admissions += 1;
                 let decision = self
                     .state
                     .admit_session(session(peer, conn_id, session_id), direction(outbound));
@@ -1356,28 +1162,22 @@ impl StateDriver {
                     verified,
                     &connected,
                     now,
+                    &mut Vec::new(),
                 );
-                self.result = Some(install_label(&result));
+                self.result = Some(install_fact(&result));
                 if self.model.is_current(peer, conn_id, session_id) {
-                    self.summary.installed_hellos += 1;
                     let expected = if self.model.peers[peer].in_book {
-                        ImportOutcome::MetadataUpdated
+                        ImportFact::MetadataUpdated
                     } else {
-                        ImportOutcome::Added
+                        ImportFact::Added
                     };
-                    self.expected_result = Some(format!("installed:{expected:?}"));
-                    assert_eq!(result.ok(), Some(expected), "{STATE_PROPERTY}");
+                    self.expected_result = Some(InstallFact::Installed(expected));
                     // An install first drops what disconnected peers no longer back.
                     self.model.sync(now);
                     self.model.peers[peer].in_book = true;
                     self.model.peers[peer].hinted = true;
                 } else {
-                    self.summary.stale_hellos += 1;
-                    self.expected_result = Some("superseded".to_owned());
-                    assert!(
-                        matches!(result, Err(SessionRecordError::Superseded)),
-                        "{STATE_PROPERTY}"
-                    );
+                    self.expected_result = Some(InstallFact::Superseded);
                 }
             }
             StateOp::ReceiveServices {
@@ -1400,14 +1200,12 @@ impl StateDriver {
                 if self.model.is_current(peer, conn_id, session_id) {
                     self.model.sync(now);
                     if self.model.peers[peer].connected {
-                        self.summary.live_summaries += 1;
                         self.model.peers[peer].live_until =
                             Some((now + ttl).min(now + LIVE_SUMMARY_TTL));
                     }
                 }
             }
             StateOp::Advance(secs) => {
-                self.summary.time_advances += usize::from(secs > 0);
                 self.now += secs;
             }
             StateOp::ReadHints => self.check_reads(),
@@ -1460,6 +1258,7 @@ impl StateDriver {
             ),
             "{STATE_PROPERTY}"
         );
+        assert_view_matches(STATE_PROPERTY, &self.actual_view(), &self.expected_view());
     }
 
     fn actual_view(&self) -> SessionView {
@@ -1531,11 +1330,23 @@ impl StateDriver {
     }
 }
 
-fn install_label(result: &Result<ImportOutcome, SessionRecordError>) -> String {
+/// One verification result's installation in a machine step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallFact {
+    /// The session was current, and the book took the record.
+    Installed(ImportFact),
+    /// A later session replaced the session that delivered the record.
+    Superseded,
+    /// The book refused the record, with this error.
+    Failed(String),
+}
+
+fn install_fact(result: &Result<ImportOutcome, SessionRecordError>) -> InstallFact {
     match result {
-        Ok(outcome) => format!("installed:{outcome:?}"),
-        Err(SessionRecordError::Superseded) => "superseded".to_owned(),
-        Err(SessionRecordError::Import(error)) => format!("failed:{error}"),
+        Ok(outcome) => InstallFact::Installed((*outcome).into()),
+        Err(SessionRecordError::Superseded) => InstallFact::Superseded,
+        Err(SessionRecordError::Import(error)) => InstallFact::Failed(error.to_string()),
     }
 }
 
@@ -1578,7 +1389,7 @@ pub struct SessionView {
     /// Discovered records in the book.
     pub discovered: usize,
     /// The installation's result, for an operation that finished a verification.
-    pub installation: Option<String>,
+    pub installation: Option<InstallFact>,
 }
 
 /// One decoder-v2 session-installation operation.
@@ -1627,340 +1438,53 @@ pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<SessionStep> {
     steps
 }
 
-/// Decoder-v2 adds explicit hint reads to decoder-v1's operations.
+/// Decodes four bytes into each session-installation operation. Generator 2 names
+/// this decoder in saved scenarios.
 fn decode_state_v2(data: &[u8]) -> impl Iterator<Item = StateOp> + '_ {
-    data.chunks(4).map(|chunk| match chunk[0] % 9 {
-        8 => StateOp::ReadHints,
-        op => decode_state_op(op, chunk),
-    })
-}
-
-#[cfg(test)]
-proptest! {
- #![proptest_config(ProptestConfig::with_cases(256))]
- #[test]
- fn discovery_state_matches_independent_model(ops in prop::collection::vec(state_op(), 1..64)) { run_state(ops, |_, _| {}); }
- #[test]
- fn state_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { replay_discovery_state_bytes(&bytes); }
-}
-
-// Worked scenarios.
-
-/// Session A's `Hello` verifies, B replaces A, and then A's verification
-/// completes. A installs no record, no service hint, and no live summary, and
-/// B stays admitted and serves normally.
-#[test]
-fn late_verification_for_a_replaced_session_changes_nothing() {
-    let mut state = discovery_state();
-    let node_id = peer_secret(0).public();
-    let connected = [node_id];
-    let a = session(0, 1, 1);
-    let b = session(0, 1, 2);
-    let now = START;
-
-    assert_eq!(
-        state.admit_session(a.clone(), ServicePeerDirection::Inbound),
-        ServiceAdmissionDecision::Admit
-    );
-    let verified_for_a =
-        VerifiedRecord::verify(hello(0), &context(now)).expect("the hello is authentic");
-    assert_eq!(
-        state.admit_session(b.clone(), ServicePeerDirection::Inbound),
-        ServiceAdmissionDecision::Admit
-    );
-
-    let late = state.install_session_record(&a, verified_for_a, &connected, now);
-    assert!(matches!(late, Err(SessionRecordError::Superseded)));
-    assert_eq!(
-        late.map_err(|error| error.verdict()),
-        Err(RecordVerdict::Drop),
-        "A's late result does not penalize the peer"
-    );
-    state
-        .receive_session_live_summaries(&a, node_id, services(node_id, now + 10), &connected, now)
-        .expect("the summaries decode");
-    assert_eq!(state.book().get(&node_id), None);
-    assert_eq!(state.active_services(node_id, &connected, now), None);
-    assert_eq!(state.live_service_summaries(node_id, &connected, now), None);
-    assert!(
-        state.is_current_session(&b),
-        "A's late result keeps B admitted"
-    );
-    assert_eq!(state.peer_snapshot().inbound_peers, 1);
-
-    // A's late disconnect does not remove B either.
-    state.remove_session(&a);
-    assert!(state.is_current_session(&b));
-
-    let verified_for_b =
-        VerifiedRecord::verify(hello(0), &context(now)).expect("the hello is authentic");
-    assert_eq!(
-        state
-            .install_session_record(&b, verified_for_b, &connected, now)
-            .ok(),
-        Some(ImportOutcome::Added)
-    );
-    state
-        .receive_session_live_summaries(&b, node_id, services(node_id, now + 10), &connected, now)
-        .expect("the summaries decode");
-    assert_eq!(
-        state
-            .live_service_summaries(node_id, &connected, now)
-            .map(|summaries| summaries.len()),
-        Some(1)
-    );
-}
-
-/// A peer's record hint ends at its signed expiry, and its live summaries end
-/// at their local TTL. Moving the time past the signed expiry while the local
-/// TTL has not passed drops the record hint and keeps the live summaries.
-///
-/// Both deadlines are Unix seconds today; the test pins that they are two
-/// separate deadlines.
-#[test]
-fn signed_record_expiry_does_not_expire_the_live_summary_ttl() {
-    let mut state = discovery_state();
-    let node_id = peer_secret(0).public();
-    let connected = [node_id];
-    let a = session(0, 1, 1);
-    let now = START;
-    let signed_expiry = now + 5;
-
-    state.admit_session(a.clone(), ServicePeerDirection::Inbound);
-    let short_lived = record_with_services(
-        &peer_secret(0),
-        100,
-        1,
-        signed_expiry,
-        vec![ZakuraServiceId::discovery(), ZakuraServiceId::block_sync()],
-    );
-    let verified = VerifiedRecord::verify(short_lived, &context(now)).expect("authentic");
-    state
-        .install_session_record(&a, verified, &connected, now)
-        .expect("the record installs");
-    state
-        .receive_session_live_summaries(&a, node_id, services(node_id, u64::MAX), &connected, now)
-        .expect("the summaries decode");
-    assert_eq!(
-        state.active_services(node_id, &connected, now),
-        Some(vec![
-            ZakuraServiceId::block_sync(),
-            ZakuraServiceId::discovery()
-        ]),
-        "the record hint lists its signed services"
-    );
-
-    let after_signed_expiry = signed_expiry + 1;
-    assert_eq!(
-        state.active_services(node_id, &connected, after_signed_expiry),
-        Some(vec![ZakuraServiceId::discovery()]),
-        "only the live summaries back the hint after the signed expiry"
-    );
-    let live = state
-        .live_service_summaries(node_id, &connected, after_signed_expiry)
-        .expect("the peer keeps an entry");
-    assert_eq!(live.len(), 1, "the local TTL has not passed");
-    assert_eq!(live[0].expires_at_unix_secs, now + LIVE_SUMMARY_TTL);
-
-    assert_eq!(
-        state.live_service_summaries(node_id, &connected, now + LIVE_SUMMARY_TTL),
-        None,
-        "the local TTL has passed"
-    );
-}
-
-/// The self-record sequence starts after the persisted sequence or at the
-/// wall-clock seed, whichever is later, and strictly increases.
-#[test]
-fn self_record_sequence_resumes_after_the_persisted_sequence() {
-    let restarted = ZakuraDiscoveryLocalConfig {
-        last_authored_sequence: Some(100),
-        ..local_config()
-    };
-    let mut local = LocalRecordState::new(&restarted, 5).expect("valid config");
-    let ttl = Duration::from_secs(60);
-    assert_eq!(local.next_body(START, 5, ttl).sequence, 101);
-    assert_eq!(local.next_body(START, 5, ttl).sequence, 102);
-    assert_eq!(local.next_body(START, 1_000, ttl).sequence, 1_000);
-    assert_eq!(
-        local.next_body(START, 1_000, ttl).expires_at_unix_secs,
-        START + 60
-    );
-
-    let mut state = discovery_state();
-    let body = state.next_self_record_body(START, 7);
-    let current = ZakuraNodeRecord::sign(body, &secret(1)).expect("the local key signs");
-    let refresh = ZakuraDiscoveryConfig::default().refresh_interval.as_secs();
-    let expires = current.body.expires_at_unix_secs;
-    assert!(state.self_record_is_fresh(&current, expires - refresh - 1));
-    assert!(!state.self_record_is_fresh(&current, expires - refresh));
-}
-
-#[test]
-fn connection_churn_cannot_grow_retained_service_hints() {
-    let mut state = discovery_state();
-    let peers: Vec<_> = (0..16u8).map(|peer| secret(200 + peer)).collect();
-    for (index, peer) in peers.iter().enumerate() {
-        let address = 20 + u8::try_from(index).expect("test indexes are small");
-        let record = record(peer, address, 1, START + 50_000);
-        let verified =
-            VerifiedRecord::verify(record, &context(START)).expect("the fixture is authentic");
-        state
-            .install_connected_peer_record(verified, &[peer.public()], START)
-            .expect("the record installs");
-        assert_eq!(
-            state.retained_hints().len(),
-            1,
-            "a disconnected peer's hint leaves at the next install"
-        );
-    }
-}
-
-#[test]
-fn successive_responses_cannot_grow_one_peers_live_summaries() {
-    let mut state = discovery_state();
-    let node_id = peer_secret(0).public();
-    let summary = DiscoveryServiceSummary {
-        peer_exchange_slots_free: 1,
-        max_records_per_response: 32,
-        expected_disconnect_after_exchange: true,
-    };
-    let response = |index: usize| {
-        let mut envelope =
-            ServiceSummaryEnvelope::discovery(&summary).expect("the summary encodes");
-        envelope.service_id =
-            ZakuraServiceId::new(format!("x{index}")).expect("a short service id is valid");
-        Services {
-            node_id,
-            expires_at_unix_secs: START + 20,
-            summaries: vec![envelope],
-        }
-    };
-    let responses = 2 * super::protocol::MAX_SERVICE_SUMMARIES_PER_RESPONSE;
-    for index in 0..responses {
-        state
-            .receive_live_summaries(node_id, response(index), &[node_id], START)
-            .expect("the summary decodes");
-    }
-    let cached = state
-        .live_service_summaries(node_id, &[node_id], START)
-        .expect("the connected peer has a hint");
-    assert_eq!(
-        cached.len(),
-        super::protocol::MAX_SERVICE_SUMMARIES_PER_RESPONSE
-    );
-    assert_eq!(
-        cached.last().map(|summary| summary.service_id.clone()),
-        response(responses - 1)
-            .summaries
-            .first()
-            .map(|envelope| envelope.service_id.clone()),
-        "the newest summary stays"
-    );
-}
-
-#[test]
-fn production_books_draw_distinct_disclosure_keys() {
-    let requester = relay(0);
-    let hashes: HashSet<u64> = (0..4)
-        .map(|_| ZakuraDiscoveryBook::default().window_hash(requester, 1))
-        .collect();
-    assert_eq!(hashes.len(), 4, "each book draws a random key");
-}
-
-#[test]
-fn book_trace_reports_exact_install_replacement_and_eviction() {
-    let steps = trace_discovery_book_bytes(BOOK_TRACE_WITNESS);
-    assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
-    for step in &steps {
-        assert_eq!(step.actual, step.expected);
-    }
-    let changes = || steps.iter().flat_map(|step| &step.actual.changes);
-    assert!(changes().any(|change| matches!(change, BookFact::Installed { .. })));
-    assert!(changes().any(|change| matches!(change, BookFact::Replaced { .. })));
-    assert!(changes()
-        .any(|change| matches!(change, BookFact::Evicted { cause, .. } if cause == "book-limit")));
-    assert!(changes()
-        .any(|change| matches!(change, BookFact::Evicted { cause, .. } if cause == "relay-quota")));
-    assert!(steps.iter().any(|step| !step.sample.is_empty()));
-    assert_eq!(steps, trace_discovery_book_bytes(BOOK_TRACE_WITNESS));
-}
-
-#[test]
-fn session_trace_separates_stale_results_and_retained_hints() {
-    let steps = trace_discovery_state_bytes(STATE_TRACE_WITNESS);
-    assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
-    for step in &steps {
-        assert_eq!(step.actual, step.expected);
-    }
-    let installations = || {
-        steps
-            .iter()
-            .filter_map(|step| step.actual.installation.as_deref())
-    };
-    assert!(installations().any(|result| result == "superseded"));
-    assert!(installations().any(|result| result.starts_with("installed:")));
-    assert!(steps.iter().any(|step| !step.actual.hints.is_empty()));
-}
-
-/// Fills the book, replaces a record, evicts on quota and on the record limit, samples,
-/// and moves a record to another relay.
-#[cfg(test)]
-const BOOK_TRACE_WITNESS: &[u8] = &[
-    // Authors 0..=3 import their own records, valid for 110 seconds.
-    0, 0, 1, 255, 0, 1, 1, 255, 0, 2, 1, 255, 0, 3, 1, 255, // A dial confirms author 0.
-    3, 0, 0, 0, // Author 4 evicts one of the unconfirmed records.
-    0, 4, 1, 255, // Sample four, under a window of three.
-    6, 0, 4, 0, // Author 0 replaces its record with a later sequence.
-    0, 0, 3, 255, // Advance 765 seconds, so every record expires.
-    5, 0, 0, 255, // Relay 0 takes authors 0 and 1.
-    1, 0, 2, 255, 1, 1, 2, 255, // Advance again, so its entries expire.
-    5, 0, 0, 255, // Relay 0's next new record, from author 5, removes them.
-    1, 5, 2, 255, // Relay 1 supplies author 5's later sequence, so the attribution moves.
-    1, 11, 3, 255,
-];
-
-/// Installs a current result, rejects a stale result, retains a hint, and reads it.
-#[cfg(test)]
-const STATE_TRACE_WITNESS: &[u8] = &[
-    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
-    7, 0, 0, 40, 8, 0, 0, 0, // Peer 0 disconnects while peer 1's `Hello` installs.
-    3, 0, 1, 0, 0, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0,
-];
-
-/// Replay decoder-v1 quadruples against the record-book model.
-/// Read at most 512 bytes. Sampling needs a controlled disclosure key and is excluded.
-pub fn replay_discovery_book_bytes(data: &[u8]) -> DiscoveryBookReplaySummary {
-    run_book(decode_book(data), 0, |_, _| {})
-}
-
-fn decode_book(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
-    data[..data.len().min(512)].chunks(4).map(|chunk| {
-        let a = chunk[0];
+    data.chunks(4).map(|chunk| {
         let b = chunk.get(1).copied().unwrap_or(0);
         let c = chunk.get(2).copied().unwrap_or(0);
         let d = chunk.get(3).copied().unwrap_or(0);
-        let author = usize::from(b) % AUTHORS;
-        match a % 6 {
-            0..=2 => BookOp::Import {
-                author,
-                sequence: u64::from(c % 4),
-                expires_in: i64::from(d) * 2 - 400,
-                supplier: match a % 3 {
-                    0 => Supplier::Author,
-                    1 => Supplier::Relay(usize::from(b) / AUTHORS % RELAYS),
-                    _ => Supplier::Nobody,
-                },
+        let peer = usize::from(b) % PEERS;
+        let conn_id = u64::from(c % 3);
+        let session_id = u64::from(d % 3);
+        match chunk[0] % 9 {
+            0 => StateOp::Admit {
+                peer,
+                conn_id,
+                session_id,
+                outbound: b & 128 != 0,
             },
-            3 => BookOp::DialSuccess(author),
-            4 => BookOp::DialFailure(author),
-            _ => BookOp::Advance(u64::from(d) * 3),
+            1 => StateOp::RemoveSession {
+                peer,
+                conn_id,
+                session_id,
+            },
+            2 => StateOp::RemoveConnection { peer, conn_id },
+            3 => StateOp::SetConnected {
+                peer,
+                connected: c & 1 == 0,
+            },
+            4 => StateOp::StartHello {
+                peer,
+                conn_id,
+                session_id,
+            },
+            5 => StateOp::FinishHello(usize::from(b)),
+            6 => StateOp::ReceiveServices {
+                peer,
+                conn_id,
+                session_id,
+                ttl: u64::from(d) + 1,
+            },
+            7 => StateOp::Advance(u64::from(d)),
+            _ => StateOp::ReadHints,
         }
     })
 }
 
-/// Decoder-v2 quadruples add peer samples to decoder-v1's operations. The two
-/// decoders read the same bytes differently, so each keeps its own corpus.
+/// Decodes four bytes into each record-book operation. Generator 2 names this
+/// decoder in saved scenarios.
 fn decode_book_v2(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
     data.chunks(4).map(|chunk| {
         let a = chunk[0];
@@ -1988,159 +1512,4 @@ fn decode_book_v2(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
             },
         }
     })
-}
-
-/// Replay decoder-v1 quadruples against the session-installation model.
-/// Read at most 512 bytes. All verification completions retain their session key.
-pub fn replay_discovery_state_bytes(data: &[u8]) -> DiscoveryStateReplaySummary {
-    run_state(decode_state(data), |_, _| {})
-}
-
-fn decode_state(data: &[u8]) -> impl Iterator<Item = StateOp> + '_ {
-    data[..data.len().min(512)]
-        .chunks(4)
-        .map(|chunk| decode_state_op(chunk[0] % 8, chunk))
-}
-
-fn decode_state_op(op: u8, chunk: &[u8]) -> StateOp {
-    let b = chunk.get(1).copied().unwrap_or(0);
-    let c = chunk.get(2).copied().unwrap_or(0);
-    let d = chunk.get(3).copied().unwrap_or(0);
-    let peer = usize::from(b) % PEERS;
-    let conn_id = u64::from(c % 3);
-    let session_id = u64::from(d % 3);
-    match op {
-        0 => StateOp::Admit {
-            peer,
-            conn_id,
-            session_id,
-            outbound: b & 128 != 0,
-        },
-        1 => StateOp::RemoveSession {
-            peer,
-            conn_id,
-            session_id,
-        },
-        2 => StateOp::RemoveConnection { peer, conn_id },
-        3 => StateOp::SetConnected {
-            peer,
-            connected: c & 1 == 0,
-        },
-        4 => StateOp::StartHello {
-            peer,
-            conn_id,
-            session_id,
-        },
-        5 => StateOp::FinishHello(usize::from(b)),
-        6 => StateOp::ReceiveServices {
-            peer,
-            conn_id,
-            session_id,
-            ttl: u64::from(d) + 1,
-        },
-        _ => StateOp::Advance(u64::from(d)),
-    }
-}
-
-#[cfg(test)]
-const BOOK_WITNESS: &[u8] = &[
-    1, 0, 0, 255, 1, 1, 0, 255, 1, 2, 0, 255, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 255, 5, 0, 0, 255,
-    0, 0, 2, 0,
-];
-#[cfg(test)]
-const STATE_WITNESS: &[u8] = &[
-    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
-    7, 0, 0, 40, 1, 0, 0, 0,
-];
-
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn discovery_book_witness_exercises_provenance_quota_and_expiry() {
-    let summary = replay_discovery_book_bytes(BOOK_WITNESS);
-    assert_eq!(
-        summary,
-        DiscoveryBookReplaySummary {
-            transitions: 8,
-            imports: 5,
-            relay_rejections: 1,
-            expired_imports: 1,
-            dial_updates: 2,
-            time_advances: 1
-        }
-    );
-    assert_eq!(
-        replay_discovery_book_bytes(&[]),
-        DiscoveryBookReplaySummary::default()
-    );
-    println!("tier=Machine target=discovery_book decoder=1 {summary:?}");
-}
-
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn discovery_state_witness_exercises_stale_verification_and_expiry() {
-    let summary = replay_discovery_state_bytes(STATE_WITNESS);
-    assert_eq!(
-        summary,
-        DiscoveryStateReplaySummary {
-            transitions: 10,
-            admissions: 2,
-            installed_hellos: 1,
-            stale_hellos: 1,
-            live_summaries: 1,
-            time_advances: 1
-        }
-    );
-    assert_eq!(
-        replay_discovery_state_bytes(&[]),
-        DiscoveryStateReplaySummary::default()
-    );
-    println!("tier=Machine target=discovery_state decoder=1 {summary:?}");
-}
-
-#[test]
-#[should_panic(expected = "discovery/record-book")]
-fn discovery_book_witness_rejects_unearned_confirmation() {
-    run_book(decode_book(BOOK_WITNESS), 0, |book, now| {
-        book.mark_dial_success(&author(0).public(), now);
-    });
-}
-
-#[test]
-#[should_panic(expected = "discovery/record-book")]
-fn discovery_book_witness_rejects_extra_dial_failure() {
-    run_book(decode_book(BOOK_WITNESS), 0, |book, now| {
-        book.mark_dial_failure(&author(0).public(), now);
-    });
-}
-
-#[test]
-#[should_panic(expected = "discovery/session-installation")]
-fn discovery_state_witness_rejects_lost_admission() {
-    run_state(decode_state(STATE_WITNESS), |state, model| {
-        if let Some((conn, id, _)) = model.peers[0].admitted {
-            state.remove_session(&session(0, conn, id));
-        }
-    });
-}
-
-#[test]
-#[should_panic(expected = "discovery/session-installation")]
-fn discovery_state_witness_rejects_unearned_service_hint() {
-    run_state(decode_state(STATE_WITNESS), |state, model| {
-        if model.peers[0].connected {
-            if let Some((conn, id, _)) = model.peers[0].admitted {
-                let verified = VerifiedRecord::verify(hello(0), &context(START))
-                    .expect("fixture is authentic");
-                state
-                    .install_session_record(&session(0, conn, id), verified, &[], START)
-                    .expect("session is current");
-            }
-        }
-    });
 }

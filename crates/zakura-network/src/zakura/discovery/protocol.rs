@@ -1098,6 +1098,8 @@ impl DisclosureKey {
         Self::new(bytes)
     }
 
+    /// Keys a requester's sample window with domain-separated BLAKE2b.
+    /// The explicit key and little-endian epoch make identical inputs replayable.
     fn hash(&self, requester: NodeId, epoch: u64) -> u64 {
         let mut hasher = blake2b_simd::Params::new()
             .hash_length(8)
@@ -1155,7 +1157,18 @@ pub(super) enum EvictionCause {
     BookLimit,
 }
 
-/// Logs each change to the book.
+/// A verification result and the slot that funds it until installation.
+///
+/// Fields drop in declaration order, so the result ends before its capacity
+/// returns. A record with stored evidence needs no verification and holds no slot.
+#[derive(Debug)]
+struct VerifiedHold<T> {
+    result: T,
+    slot: Option<SlotPermit>,
+}
+
+/// Logs each change to the book. The handle calls this after it releases the
+/// state lock, so the book's transitions stay free of logging.
 fn log_book_changes(changes: &[BookChange]) {
     for change in changes {
         tracing::debug!(?change, "Zakura discovery book changed");
@@ -1614,7 +1627,7 @@ impl ZakuraDiscoveryHandle {
             return Ok(outcome);
         }
 
-        let verification_slot;
+        let mut verification_slot = None;
         let mut authentic = Vec::with_capacity(batch.len());
         let mut unverified = Vec::new();
         {
@@ -1628,7 +1641,7 @@ impl ZakuraDiscoveryHandle {
         }
         if !unverified.is_empty() {
             let unverified_len = unverified.len();
-            let Some((verified, slot)) = self
+            let Some(VerifiedHold { result, slot }) = self
                 .verify_off_lock(move |context| verify_relayed(unverified, context))
                 .await
             else {
@@ -1636,24 +1649,24 @@ impl ZakuraDiscoveryHandle {
                 outcome.rejected += unverified_len;
                 return Ok(outcome);
             };
-            verification_slot = Some(slot);
-            let (fresh, dropped) = verified?;
+            verification_slot = slot;
+            let (fresh, dropped) = result?;
             outcome.rejected += dropped;
             authentic.extend(fresh);
-        } else {
-            verification_slot = None;
         }
 
         let now = current_unix_secs();
+        let mut changes = Vec::new();
         {
             let mut state = self.inner.lock().await;
             if session.is_none_or(|session| state.is_current_session(session)) {
-                state.install_relayed(authentic, source, now, &mut outcome);
+                state.install_relayed(authentic, source, now, &mut outcome, &mut changes);
             } else {
                 outcome.rejected += authentic.len();
             }
         }
         drop(verification_slot);
+        log_book_changes(&changes);
         Ok(outcome)
     }
 
@@ -1710,7 +1723,14 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let now = current_unix_secs();
-        self.inner.lock().await.import_static_record(record, now)
+        let mut changes = Vec::new();
+        let result = self
+            .inner
+            .lock()
+            .await
+            .import_static_record(record, now, &mut changes);
+        log_book_changes(&changes);
+        result
     }
 
     /// Imports a connected peer's latest self-record and updates active service hints.
@@ -1731,10 +1751,15 @@ impl ZakuraDiscoveryHandle {
             .await?;
         let now = current_unix_secs();
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
-        self.inner
-            .lock()
-            .await
-            .install_connected_peer_record(verified.0, &connected_node_ids, now)
+        let mut changes = Vec::new();
+        let result = self.inner.lock().await.install_connected_peer_record(
+            verified.result,
+            &connected_node_ids,
+            now,
+            &mut changes,
+        );
+        log_book_changes(&changes);
+        result
     }
 
     /// Imports a connected peer's latest self-record, received on `session`, as
@@ -1751,12 +1776,16 @@ impl ZakuraDiscoveryHandle {
             .await?;
         let now = current_unix_secs();
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
-        self.inner.lock().await.install_session_record(
+        let mut changes = Vec::new();
+        let result = self.inner.lock().await.install_session_record(
             session,
-            verified.0,
+            verified.result,
             &connected_node_ids,
             now,
-        )
+            &mut changes,
+        );
+        log_book_changes(&changes);
+        result
     }
 
     /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
@@ -1764,7 +1793,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
-    ) -> Result<(VerifiedRecord, Option<SlotPermit>), DiscoveryBookError> {
+    ) -> Result<VerifiedHold<VerifiedRecord>, DiscoveryBookError> {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
@@ -1779,15 +1808,21 @@ impl ZakuraDiscoveryHandle {
     async fn verify_unless_stored(
         &self,
         record: ZakuraNodeRecord,
-    ) -> Result<(VerifiedRecord, Option<SlotPermit>), DiscoveryBookError> {
+    ) -> Result<VerifiedHold<VerifiedRecord>, DiscoveryBookError> {
         if let Some(stored) = self.inner.lock().await.stored_evidence(&record) {
-            return Ok((stored, None));
+            return Ok(VerifiedHold {
+                result: stored,
+                slot: None,
+            });
         }
-        let (verified, slot) = self
+        let VerifiedHold { result, slot } = self
             .verify_off_lock(move |context| VerifiedRecord::verify(record, context))
             .await
             .ok_or(DiscoveryBookError::VerificationCancelled)?;
-        Ok((verified.map_err(DiscoveryBookError::Record)?, Some(slot)))
+        Ok(VerifiedHold {
+            result: result.map_err(DiscoveryBookError::Record)?,
+            slot,
+        })
     }
 
     /// Runs `verify` in a blocking task under a node-wide verification slot,
@@ -1796,16 +1831,16 @@ impl ZakuraDiscoveryHandle {
     async fn verify_off_lock<T: Send + 'static>(
         &self,
         verify: impl FnOnce(&DiscoveryRecordValidationContext) -> T + Send + 'static,
-    ) -> Option<(T, SlotPermit)> {
+    ) -> Option<VerifiedHold<T>> {
         let slot = self.verify_slots.reserve().await;
         let context = DiscoveryRecordValidationContext {
             current_unix_secs: current_unix_secs(),
             ..self.verification_context.clone()
         };
         crate::zakura::resume_task_panic(
-            zakura_rt::task::spawn_blocking_named("discovery_verify", move || {
-                // Tuple fields drop in order: destroy the result before releasing capacity.
-                (verify(&context), slot)
+            zakura_rt::task::spawn_blocking_named("discovery_verify", move || VerifiedHold {
+                result: verify(&context),
+                slot: Some(slot),
             })
             .await,
         )
@@ -1818,10 +1853,14 @@ impl ZakuraDiscoveryHandle {
         entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
     ) -> ImportBatchOutcome {
         let now = current_unix_secs();
-        self.inner
+        let mut changes = Vec::new();
+        let outcome = self
+            .inner
             .lock()
             .await
-            .import_persisted_entries(entries, now)
+            .import_persisted_entries(entries, now, &mut changes);
+        log_book_changes(&changes);
+        outcome
     }
 
     /// Inserts a trusted static/bootstrap dial candidate.
@@ -2179,29 +2218,15 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, source, false, now, context)
+        self.import_record_inner(record, source, false, now, context, &mut Vec::new())
     }
 
-    /// Imports one peer record whose author checks already passed.
+    /// Imports one peer record whose author checks already passed, and appends
+    /// each resulting change to `changes`, including on failure.
     ///
     /// Expiry, storage limits, address policy, and sequence order still run
     /// here.
     pub(super) fn import_verified_record(
-        &mut self,
-        record: VerifiedRecord,
-        source: Option<NodeId>,
-        now: u64,
-        context: &DiscoveryRecordValidationContext,
-    ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let mut changes = Vec::new();
-        let result = self.import_verified_tracked(record, source, now, context, &mut changes);
-        log_book_changes(&changes);
-        result
-    }
-
-    /// Imports one peer record as [`Self::import_verified_record`] does, and
-    /// appends each resulting change to `changes`, including on failure.
-    pub(super) fn import_verified_tracked(
         &mut self,
         record: VerifiedRecord,
         source: Option<NodeId>,
@@ -2225,7 +2250,19 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, None, true, now, context)
+        self.import_static_record_tracked(record, now, context, &mut Vec::new())
+    }
+
+    /// Imports one signed static/bootstrap record as [`Self::import_static_record`]
+    /// does, and appends each resulting change to `changes`.
+    pub(super) fn import_static_record_tracked(
+        &mut self,
+        record: ZakuraNodeRecord,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
+    ) -> Result<ImportOutcome, DiscoveryBookError> {
+        self.import_record_inner(record, None, true, now, context, changes)
     }
 
     /// Returns a bounded peer sample from the requester's disclosure window.
@@ -2301,7 +2338,7 @@ impl ZakuraDiscoveryBook {
             return Vec::new();
         }
         // The remainder is below `len`, so it fits usize.
-        let offset = (self.disclosure_hash(requester, snapshot.epoch) % len as u64) as usize;
+        let offset = (self.disclosure_key.hash(requester, snapshot.epoch) % len as u64) as usize;
 
         let mut records: Vec<ZakuraNodeRecord> = snapshot
             .node_ids
@@ -2385,18 +2422,6 @@ impl ZakuraDiscoveryBook {
         node_ids.sort_unstable_by_key(node_id_sort_key);
         node_ids.shuffle(rng);
         node_ids
-    }
-
-    /// Returns `requester`'s window hash in `epoch`.
-    #[cfg(test)]
-    pub(super) fn window_hash(&self, requester: NodeId, epoch: u64) -> u64 {
-        self.disclosure_hash(requester, epoch)
-    }
-
-    /// Keys a requester's sample window with domain-separated BLAKE2b.
-    /// The explicit key and little-endian epoch make identical inputs replayable.
-    fn disclosure_hash(&self, requester: NodeId, epoch: u64) -> u64 {
-        self.disclosure_key.hash(requester, epoch)
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
@@ -2599,10 +2624,22 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> ImportBatchOutcome {
+        self.import_persisted_entries_tracked(entries, now, context, &mut Vec::new())
+    }
+
+    /// Imports entries as [`Self::import_persisted_entries`] does, and appends each
+    /// resulting change to `changes`.
+    pub(super) fn import_persisted_entries_tracked(
+        &mut self,
+        entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
+    ) -> ImportBatchOutcome {
         let mut outcome = ImportBatchOutcome::default();
         for entry in entries {
             outcome.attempted += 1;
-            match self.import_persisted_entry(entry, now, context) {
+            match self.import_persisted_entry(entry, now, context, changes) {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
             }
@@ -2615,6 +2652,7 @@ impl ZakuraDiscoveryBook {
         entry: ZakuraDiscoveryPersistedEntry,
         now: u64,
         context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let metadata = DiscoveryEntryMetadata {
             source: entry.source,
@@ -2626,10 +2664,7 @@ impl ZakuraDiscoveryBook {
             failure_count: entry.failure_count,
         };
         let record = self.verify_foreign(entry.record, context)?;
-        let mut changes = Vec::new();
-        let result = self.install_record(record, metadata, now, context, &mut changes);
-        log_book_changes(&changes);
-        result
+        self.install_record(record, metadata, now, context, changes)
     }
 
     fn import_record_inner(
@@ -2639,13 +2674,11 @@ impl ZakuraDiscoveryBook {
         is_static: bool,
         now: u64,
         context: &DiscoveryRecordValidationContext,
+        changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let record = self.verify_foreign(record, context)?;
         let metadata = import_metadata(&record, source, is_static, now);
-        let mut changes = Vec::new();
-        let result = self.install_record(record, metadata, now, context, &mut changes);
-        log_book_changes(&changes);
-        result
+        self.install_record(record, metadata, now, context, changes)
     }
 
     /// Runs the author checks of a record about another node.
@@ -7356,6 +7389,19 @@ mod tests {
         assert_eq!(outcome.rejected, 1);
     }
 
+    #[test]
+    fn production_books_draw_distinct_disclosure_keys() {
+        let requester = NodeSecretKey::from_bytes(&[40; 32]).public();
+        let hashes: HashSet<u64> = (0..4)
+            .map(|_| {
+                ZakuraDiscoveryBook::default()
+                    .disclosure_key
+                    .hash(requester, 1)
+            })
+            .collect();
+        assert_eq!(hashes.len(), 4, "each book draws a random key");
+    }
+
     #[tokio::test]
     async fn verification_result_retains_capacity_until_its_payload_drops() {
         let (_connected, connected_rx) = watch::channel(Vec::new());
@@ -7365,7 +7411,7 @@ mod tests {
             .verify_off_lock(|_| Arc::new(vec![0u8; 1024]))
             .await
             .unwrap();
-        let payload = Arc::downgrade(&result.0);
+        let payload = Arc::downgrade(&result.result);
         assert_eq!(
             handle.verify_slots.available(),
             0,
@@ -7381,7 +7427,7 @@ mod tests {
             .verify_connected_peer_record(record.clone(), record.body.node_id)
             .await
             .unwrap();
-        assert!(verified.1.is_some());
+        assert!(verified.slot.is_some());
         assert_eq!(
             handle.verify_slots.available(),
             0,

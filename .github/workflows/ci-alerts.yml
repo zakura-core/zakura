@@ -17,6 +17,7 @@ on:
       - Coverage
       - Cross-platform build
       - Docs Check
+      - Fuzz campaign check
       - Header-chain fuzzing
       - Legacy Pages redirect
       - Lint

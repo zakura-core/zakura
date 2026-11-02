@@ -176,6 +176,17 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
+    /// A downloaded block above the checkpoints names a parent that this downloader is not
+    /// downloading and that the state can't build on: unknown, or known but below the finalized
+    /// tip. Verifying it could only wait for a parent that may never arrive. This is an unscored
+    /// drop, not a consensus verdict.
+    #[error("downloaded block's parent can't be built on: {height:?} {hash:?} parent {parent:?}")]
+    ParentUnknown {
+        height: block::Height,
+        hash: block::Hash,
+        parent: block::Hash,
+    },
+
     /// A downloaded block claims our best tip as its parent, but its coinbase height is not
     /// one above the tip height.
     ///
@@ -330,6 +341,18 @@ impl std::fmt::Debug for ParentWait {
     }
 }
 
+/// Whether a block could be built on this parent: the parent is the finalized tip, in a
+/// non-finalized chain, or being written by the state. Returns `true` when the state can't
+/// answer, so an unanswered question never drops a block.
+#[derive(Clone)]
+pub struct ParentExtendable(pub Arc<dyn Fn(block::Hash) -> BoxFuture<'static, bool> + Send + Sync>);
+
+impl std::fmt::Debug for ParentExtendable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParentExtendable")
+    }
+}
+
 /// Returns the parent that a failed verification needs before its authorizing data binding can
 /// be confirmed.
 fn unconfirmed_parent(verification: &Result<block::Hash, BoxError>) -> Option<block::Hash> {
@@ -376,6 +399,9 @@ where
     /// Waits for a parent before verifying again a block whose authorizing data binding was
     /// unconfirmed.
     parent_wait: ParentWait,
+
+    /// Checks that a downloaded block's parent can be built on before the block is verified.
+    parent_extendable: ParentExtendable,
 
     // Configuration
     //
@@ -508,6 +534,7 @@ where
         verifier: ZV,
         latest_chain_tip: ZSTip,
         parent_wait: ParentWait,
+        parent_extendable: ParentExtendable,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         chain_network: Network,
@@ -522,6 +549,7 @@ where
             verifier,
             latest_chain_tip,
             parent_wait,
+            parent_extendable,
             lookahead_limit,
             chain_network,
             max_checkpoint_height,
@@ -650,6 +678,7 @@ where
         let mut verifier = self.verifier.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let parent_wait = self.parent_wait.clone();
+        let parent_extendable = self.parent_extendable.clone();
 
         let lookahead_limit = self.lookahead_limit;
         let chain_network = self.chain_network.clone();
@@ -879,6 +908,57 @@ where
                 if !has_sufficient_work(&chain_network, block_height, block.header.difficulty_threshold) {
                     metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
+                }
+
+                // Security: a block above the checkpoints goes to the full verifier, which waits
+                // for a missing parent: up to the UTXO lookup timeout for a block that spends
+                // outputs, or in the state's queue until the finalized tip passes it for a
+                // coinbase-only block. The syncer only downloads chains that start at a block in
+                // its own locator, so a connected block's parent is either one the state can build
+                // on (the finalized tip or a block in a non-finalized chain) or still being
+                // downloaded here. A parent the state is still writing counts too, because sync
+                // skips such a block as already known. A block whose parent is none of these can
+                // only wait for a parent that may never arrive, so drop it before it takes a
+                // verifier slot. A parent that is merely known, such as a finalized block below
+                // the tip, doesn't count.
+                if block_height > max_checkpoint_height {
+                    let parent = block.header.previous_block_hash;
+                    // A parent normally leaves this map only after its verification returns, by
+                    // when the state has added it to a chain, so a connected parent is always in
+                    // one of the two places. It also leaves on a reset, which cancels this task too, or
+                    // when its own download fails, which the syncer handles by retrying it; a
+                    // child dropped meanwhile is retried as well.
+                    let parent_in_flight = task_states
+                        .lock()
+                        .expect("legacy task state lock is only held for synchronous updates")
+                        .contains_key(&parent);
+
+                    let parent_is_extendable = parent_in_flight || {
+                        // Prefer the cancel handle if both are ready.
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                trace!("task cancelled waiting for the parent check");
+                                return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
+                            }
+                            known = (parent_extendable.0)(parent) => known,
+                        }
+                    };
+
+                    if !parent_is_extendable {
+                        debug!(
+                            ?hash,
+                            ?parent,
+                            ?block_height,
+                            "synced block's parent is neither known nor in flight: dropped downloaded block"
+                        );
+                        metrics::counter!("sync.unknown.parent.dropped.block.count").increment(1);
+                        return Err(BlockDownloadVerifyError::ParentUnknown {
+                            height: block_height,
+                            hash,
+                            parent,
+                        });
+                    }
                 }
 
                 // A body that fails before its parent commits can't be attributed yet, so wait for

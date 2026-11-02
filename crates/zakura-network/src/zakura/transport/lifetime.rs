@@ -26,8 +26,9 @@
 //! never charge the same bytes, and [`ResourceEnvelope`] adds the two.
 //!
 //! Request-stream executions need no budget here. Each runs on a stream that
-//! holds one of its connection's `max_open_streams` permits, and a connection
-//! keeps its slot until its stream workers settle.
+//! holds one of its connection's `max_open_streams` permits. A connection keeps
+//! its slot until its stream workers settle or teardown's bounded drain ends. A
+//! worker that outlasts the drain stays in the [`OwnerLedger`] until its task ends.
 
 use std::sync::Arc;
 use std::time::Duration;

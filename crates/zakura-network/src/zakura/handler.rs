@@ -3407,7 +3407,9 @@ impl ZakuraProtocolHandler {
         workers.abort_all();
         // An aborted worker keeps its owners until its task actually ends.
         // Settle them before this connection returns its admission slot, so a
-        // replacement cannot run beside the old generation's stream owners.
+        // replacement does not run beside the old generation's stream owners.
+        // The wait is bounded: a task that yields to no abort within the timeout
+        // cannot hold the slot, and the owner ledger keeps counting its owners.
         while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
             .await
             .ok()

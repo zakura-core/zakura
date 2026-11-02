@@ -155,11 +155,12 @@ where
         },
         Property {
             id: PropertyId::new(REACTOR_QUERY_LIFECYCLE),
-            claim: "each needed-block query the reactor offers takes the next ID under the \
-                    current authority, past an open retry gate and with any owed force; \
-                    storage takes only accepted queries under their exact identities; a \
-                    refusal keeps the pending query and next ID, and owes a retry unless the \
-                    channel closed, which ends dispatch and owes nothing",
+            claim: "storage takes only accepted needed-block queries, once, under their \
+                    exact identities; an accepted query becomes the reported pending query and \
+                    advances the next ID; a refusal keeps both, and arms a retry unless the \
+                    channel closed, which ends dispatch and arms nothing; a stale reply or \
+                    failure keeps the pending query; a reset, authority change, or tip reset \
+                    retires it",
             kind: Kind::Safety,
             assumes: &[],
             needs: REACTOR_NEEDS,

@@ -1476,7 +1476,7 @@ pub enum BlockSyncFact {
     /// The reactor completed a view, reset, or query transition.
     Reactor {
         /// The transition.
-        transition: BlockSyncReactorTransition,
+        transition: crate::record::machine::ReactorAction,
         /// The reactor's logical state after it.
         state: BlockSyncReactorState,
     },
@@ -1484,85 +1484,12 @@ pub enum BlockSyncFact {
     SequencerClosed,
 }
 
-/// A needed-block query's exact identity and bounds in a reactor transition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct BlockSyncQuery {
-    /// The query's exact ID.
-    pub query_id: u64,
-    /// The body-work authority that dispatched it.
-    pub scope: crate::record::machine::BodyAuthority,
-    /// First requested height.
-    pub from: u32,
-    /// Requested height count.
-    pub limit: u32,
-    /// Header tip the query asked about.
-    pub header_tip: u32,
-    /// Whether the query bypassed the low-water gate.
-    pub forced: bool,
-}
-
-/// One completed reactor transition, named by its exact identities.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case", rename_all_fields = "snake_case")]
-pub enum BlockSyncReactorTransition {
-    /// The action channel accepted a query.
-    QueryAccepted(BlockSyncQuery),
-    /// The action channel refused a query.
-    QueryRefused {
-        /// The refused proposal.
-        query: BlockSyncQuery,
-        /// `control-reserve`, `full`, or `closed`.
-        refusal: String,
-    },
-    /// A needed-block reply reached the reactor state.
-    QueryReply {
-        /// The reply's query ID.
-        query_id: u64,
-        /// The reply's authority.
-        scope: crate::record::machine::BodyAuthority,
-        /// The classification.
-        outcome: crate::record::machine::ReactorReply,
-    },
-    /// A query failure reached the reactor state.
-    QueryFailed {
-        /// The failure's query ID.
-        query_id: u64,
-        /// The failure's authority.
-        scope: crate::record::machine::BodyAuthority,
-        /// Whether it retired the pending query.
-        matched: bool,
-    },
-    /// A forced opening lifted the retry gate, or a covered range or a
-    /// body-size hint change retired the query state.
-    QueryGateChanged,
-    /// The retry gate's deadline passed.
-    RetryElapsed,
-    /// A Sequencer view asked for a reaction.
-    View {
-        /// The reaction is a destructive reset.
-        reset: bool,
-        /// The view advanced the verified tip.
-        tip_advanced: bool,
-    },
-    /// A committed view changed body-work authority.
-    AuthorityChanged {
-        /// The new authority.
-        authority: crate::record::machine::BodyAuthority,
-        /// Whether the change started a new body-work epoch.
-        epoch_changed: bool,
-    },
-    /// The reactor asked the Sequencer to reset to a verified tip.
-    TipReset {
-        /// The reset target.
-        tip: u32,
-    },
-}
-
 /// The reactor's logical state after a transition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockSyncReactorState {
     /// The accepted query awaiting a reply.
-    pub pending: Option<u64>,
+    pub pending: Option<crate::record::machine::ReactorQuery>,
     /// The next accepted query's ID.
     pub next_query_id: Option<u64>,
     /// Whether a retry deadline is armed.
@@ -1571,6 +1498,8 @@ pub struct BlockSyncReactorState {
     pub retry_forced: bool,
     /// Whether the action channel reported closed.
     pub dispatch_closed: bool,
+    /// The committed body-work authority, if the reactor has one.
+    pub scope: Option<crate::record::machine::BodyAuthority>,
     /// Verified-tip mirror.
     pub verified_tip: u32,
     /// Query and scheduling floor.

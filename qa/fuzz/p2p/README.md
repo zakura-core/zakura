@@ -92,7 +92,7 @@ below.
 | `block_peer_registry` | `block/peer-registry` | 1 |
 | `block_retry_authority` | `block/retry-authority` | 1 |
 | `block_query` | `block/query-dispatch`, `block/query-completion` | 1 |
-| `block_reactor` | `block/reactor-policy` | 2 |
+| `block_reactor` | `block/reactor-policy` | 3 |
 | `block_fill` | `block/fill-retry-run`, `block/fill-retained-funding`, `block/fill-commit-window` | 1 |
 | `block_request_lifecycle` | `block/request-lifecycle` | 1 |
 
@@ -135,9 +135,11 @@ proposals, exact and stale replies, resets, authority changes, and retry expiry.
 Its identity ledger calls no production policy helper. `block_reactor` shares the
 reactor policy model with proptest and covers view mirrors, reaction epochs, reset
 refills, query refusal, retry expiry, and authority changes. Decoder 2 of
-`block_reactor` adds a closed-channel refusal to bit 16 of the refill byte. No
-committed corpus uses decoder 1. Both decide pure
-transitions. Runtime witnesses cover the action channel and storage waits.
+`block_reactor` added a closed-channel refusal to bit 16 of the refill byte. Decoder
+3 delivers an authority byte as a committed view, which retires the pending query,
+and reads bit 4 of a refill's byte as the first view's arrival. No committed corpus
+uses an older decoder. Both targets decide pure transitions. Runtime witnesses cover
+the action channel and storage waits.
 
 `block_fill` comes from PR #1677, head
 `7aef27b246dcf8f0d3625d598553d2a827411ea0`. Decoder 1 keeps that byte layout, and

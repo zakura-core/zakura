@@ -1279,10 +1279,10 @@ mod tests {
     fn block_sync_observation_encoding_is_pinned() {
         use crate::observe::{
             BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncRange,
-            BlockSyncReactorState, BlockSyncReactorTransition, BlockSyncRequest,
-            BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission, BlockSyncWorkItem,
-            StorageBranch, WorkOwner, WorkScope,
+            BlockSyncReactorState, BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained,
+            BlockSyncSubmission, BlockSyncWorkItem, StorageBranch, WorkOwner, WorkScope,
         };
+        use crate::record::machine::ReactorAction;
 
         let owner = || WorkOwner {
             kind: "body".into(),
@@ -1457,13 +1457,14 @@ mod tests {
                 }],
             },
             BlockSyncFact::Reactor {
-                transition: BlockSyncReactorTransition::RetryElapsed,
+                transition: ReactorAction::RetryElapsed,
                 state: BlockSyncReactorState {
                     pending: None,
                     next_query_id: Some(2),
                     retry_armed: false,
                     retry_forced: false,
                     dispatch_closed: false,
+                    scope: None,
                     verified_tip: 1,
                     request_floor: 1,
                     header_tip: 4,

@@ -1513,14 +1513,6 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
 const REACTOR_INPUT: &[u8] = include_bytes!("fixtures/header-reactor-policy.bin");
 
 #[test]
-fn reactor_machine_replay_child() {
-    if let Some(dir) = std::env::var_os("ZAKURA_REACTOR_MACHINE_CHILD") {
-        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
-        assert!(report.verified(), "{report:?}");
-    }
-}
-
-#[test]
 fn reactor_machine_records_and_replays_without_transport() {
     let dir = record_named("header/reactor-policy", REACTOR_INPUT);
     let trace = open(dir.path());
@@ -1630,7 +1622,7 @@ fn block_reactor_machine_replay_child() {
 
 #[test]
 fn reactor_machine_records_and_replays_query_identities() {
-    use zakura_sim::record::machine::{MachineStep, ReactorAction};
+    use zakura_sim::record::machine::{MachineStep, ReactorAction, ReactorRefusal};
     let entry = harness::find("block/reactor-policy").unwrap();
     let dir = record(entry, BLOCK_REACTOR_INPUT);
     let trace = open(dir.path());
@@ -1656,11 +1648,13 @@ fn reactor_machine_records_and_replays_query_identities() {
     };
     assert!(matches!(
         actions(0).as_slice(),
-        [ReactorAction::QueryAccepted { query }] if query.query_id == 1
+        [ReactorAction::AuthorityChanged { .. }, ReactorAction::QueryAccepted { query }]
+            if query.query_id == 1
     ));
     assert!(matches!(
         actions(1).as_slice(),
-        [ReactorAction::QueryRefused { query, closed: false }] if query.query_id == 2
+        [ReactorAction::QueryRefused { query, refusal: ReactorRefusal::Full }]
+            if query.query_id == 2
     ));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
@@ -1676,7 +1670,7 @@ fn reactor_machine_records_and_replays_query_identities() {
     );
 
     edit(dir.path(), |lines| {
-        step(lines, 2)["machine"]["step"]["actual"]["next_query_id"] = json!(99);
+        step(lines, 2)["machine"]["step"]["actual"]["state"]["next_query_id"] = json!(99);
     });
     assert!(matches!(
         replayed(dir.path(), ReplayOptions::default()),

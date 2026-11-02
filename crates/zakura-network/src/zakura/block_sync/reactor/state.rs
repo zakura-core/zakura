@@ -23,6 +23,7 @@
 
 use std::{collections::BTreeSet, num::NonZeroU64};
 
+use serde::Serialize;
 use zakura_chain::block;
 use zakura_header_chain::{
     BodyCompletionDecision, BodySupplierDiscovered, BodyUnavailableSummary, BodyWorkAuthority,
@@ -43,6 +44,7 @@ use super::{
 use crate::zakura::block_sync::state::next_height;
 use crate::zakura::block_sync::status::StatusDelivery;
 
+mod evidence;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -52,9 +54,10 @@ pub use fuzz::{replay_block_query_bytes, BlockQueryReplaySummary};
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use tests::{
     replay_block_reactor_bytes, trace_block_reactor_bytes, BlockReactorHistory,
-    BlockReactorReplaySummary, BlockReactorStep, ReactorMachineAction, ReactorMachineQuery,
-    ReactorMachineView,
+    BlockReactorReplaySummary, BlockReactorStep, ReactorMachineView,
 };
+
+pub use evidence::{QueryReplyOutcome, ReactorSnapshot, ReactorTransition};
 
 /// The block-sync reactor's logical state.
 #[derive(Debug)]
@@ -104,18 +107,28 @@ impl ReactorState {
             .map(BodyWorkAuthority::for_view)
     }
 
-    /// Apply the query gates that need no shared-state reads.
-    pub(super) fn open_query(&mut self, force: bool) -> QueryOpening {
+    /// Apply the query gates that need no shared-state reads. The transition
+    /// reports a gate's change to the query state.
+    #[must_use = "a gate change must reach the trace and the observer"]
+    pub(super) fn open_query(&mut self, force: bool) -> (QueryOpening, Option<ReactorTransition>) {
         if !self.state_queries_enabled {
-            return QueryOpening::Closed;
+            return (QueryOpening::Closed, None);
         }
-        self.queries.open(QueryGate {
+        let before = self.queries.gate();
+        let opening = self.queries.open(QueryGate {
             force,
             header_quiet: self.bootstrap.is_header_quiet(),
             diverged: self.verified_tip_diverged(),
             request_floor: self.progress.request_floor,
             best_header_tip: self.progress.best_header_tip,
-        })
+        });
+        (opening, self.queries.gate_change(before))
+    }
+
+    /// Retire the query state for a reset to the verified `tip`.
+    pub(super) fn reset_queries(&mut self, tip: block::Height) -> ReactorTransition {
+        self.queries.clear();
+        ReactorTransition::TipReset { tip }
     }
 
     /// Plan the query that `opening` allows.
@@ -152,8 +165,24 @@ impl ReactorState {
     ///
     /// An unrelated reply leaves the pending query in place. A matching reply
     /// always retires the pending query, even when its authority or anchor is
-    /// stale.
+    /// stale. The transition reports the classification.
+    #[must_use = "a query reply must reach the trace and the observer"]
     pub(super) fn complete_needed_query(
+        &mut self,
+        query_id: NonZeroU64,
+        scope: BodyWorkAuthority,
+        body_anchor: Frontier,
+    ) -> (NeededReply, ReactorTransition) {
+        let reply = self.classify_needed_reply(query_id, scope, body_anchor);
+        let transition = ReactorTransition::QueryReply {
+            query_id,
+            scope,
+            outcome: reply.outcome(),
+        };
+        (reply, transition)
+    }
+
+    fn classify_needed_reply(
         &mut self,
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
@@ -230,172 +259,37 @@ impl ReactorState {
     }
 }
 
-// ---- transition evidence ----
-
-/// A query's exact identity, authority, and bounds, for traces and observers.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct QueryIdentity {
-    /// The query's exact ID.
-    pub query_id: NonZeroU64,
-    /// The body-work authority that dispatched it.
-    pub scope: BodyWorkAuthority,
-    /// First requested height.
-    pub from: block::Height,
-    /// Requested height count.
-    pub limit: u32,
-    /// Header tip the query asked about.
-    pub best_header_tip: block::Height,
-    /// Whether the query bypassed the low-water gate.
-    pub forced: bool,
-}
-
-impl From<PendingNeededQuery> for QueryIdentity {
-    fn from(query: PendingNeededQuery) -> Self {
-        Self {
-            query_id: query.query_id,
-            scope: query.scope,
-            from: query.from,
-            limit: query.limit,
-            best_header_tip: query.best_header_tip,
-            forced: query.forced,
-        }
-    }
-}
-
-/// How [`ReactorState::complete_needed_query`] classified a reply.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum QueryReplyOutcome {
-    /// The reply matched no pending query.
-    Stale,
-    /// The reply matched under a retired authority.
-    StaleAuthority,
-    /// State's anchor moved ahead of the verified mirror.
-    AnchorAdvanced,
-    /// State's anchor sits behind or beside the verified mirror.
-    AnchorReset,
-    /// The reply's blocks became current work.
-    Accepted,
-}
-
-/// One completed view, reset, or query transition of the reactor's state.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ReactorTransition {
-    /// The action channel accepted a query, which became the pending query.
-    QueryAccepted(QueryIdentity),
-    /// The action channel refused a query. The pending query and next ID stayed.
-    QueryRefused {
-        /// The refused proposal.
-        query: QueryIdentity,
-        /// Why the channel refused it.
-        refusal: ActionRefusal,
-    },
-    /// A needed-block reply reached the state.
-    QueryReply {
-        /// The reply's query ID.
-        query_id: NonZeroU64,
-        /// The reply's authority.
-        scope: BodyWorkAuthority,
-        /// The classification.
-        outcome: QueryReplyOutcome,
-    },
-    /// A query failure reached the state.
-    QueryFailed {
-        /// The failure's query ID.
-        query_id: NonZeroU64,
-        /// The failure's authority.
-        scope: BodyWorkAuthority,
-        /// Whether it retired the pending query.
-        matched: bool,
-    },
-    /// A forced opening lifted the retry gate, or a covered range or a
-    /// body-size hint change retired the query state.
-    QueryGateChanged,
-    /// The retry gate's deadline passed.
-    RetryElapsed,
-    /// A Sequencer view asked for a reaction.
-    View {
-        /// The reaction is a destructive reset.
-        reset: bool,
-        /// The view advanced the verified tip.
-        tip_advanced: bool,
-    },
-    /// A committed view changed body-work authority.
-    AuthorityChanged {
-        /// The new authority.
-        authority: BodyWorkAuthority,
-        /// Whether the change started a new body-work epoch.
-        epoch_changed: bool,
-    },
-    /// The reactor asked the Sequencer to reset to a verified tip.
-    TipReset {
-        /// The reset target.
-        tip: block::Height,
-    },
-}
-
-/// The reactor's logical state at a completed transition.
-///
-/// It holds no deadline, because an instant does not replay across processes.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct ReactorSnapshot {
-    /// The accepted query awaiting a reply.
-    pub pending: Option<QueryIdentity>,
-    /// The next accepted query's ID. `None` means the IDs ran out.
-    pub next_query_id: Option<NonZeroU64>,
-    /// Whether a retry deadline is armed.
-    pub retry_armed: bool,
-    /// Whether the next proposal owes a refused or failed query's force.
-    pub retry_forced: bool,
-    /// Whether the action channel reported closed.
-    pub dispatch_closed: bool,
-    /// The committed body-work authority, if the reactor has one.
-    pub scope: Option<BodyWorkAuthority>,
-    /// Verified-tip mirror.
-    pub verified_block_tip: block::Height,
-    /// Query and scheduling floor.
-    pub request_floor: block::Height,
-    /// Header-tip mirror.
-    pub best_header_tip: block::Height,
-    /// Last `reset_epoch` the reactor reacted to.
-    pub last_reset_epoch: u64,
-    /// Last `reaction_epoch` the reactor reacted to.
-    pub last_reaction_epoch: u64,
-}
-
-impl ReactorState {
-    /// Read the logical state. The caller reports it at a completed transition.
-    pub(super) fn snapshot(&self) -> ReactorSnapshot {
-        ReactorSnapshot {
-            pending: self.queries.pending.map(Into::into),
-            next_query_id: self.queries.next_id,
-            retry_armed: self.queries.retry_at.is_some(),
-            retry_forced: self.queries.retry_forced,
-            dispatch_closed: self.queries.dispatch_closed,
-            scope: self.body_work_scope(),
-            verified_block_tip: self.progress.verified_block_tip,
-            request_floor: self.progress.request_floor,
-            best_header_tip: self.progress.best_header_tip,
-            last_reset_epoch: self.progress.last_reset_epoch,
-            last_reaction_epoch: self.progress.last_reaction_epoch,
-        }
-    }
-}
-
 // ---- queries ----
 
 /// Identity, authority, and bounds of one body-missing metadata query.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct PendingNeededQuery {
-    pub(super) query_id: NonZeroU64,
-    pub(super) scope: BodyWorkAuthority,
-    pub(super) from: block::Height,
-    pub(super) limit: u32,
-    pub(super) best_header_tip: block::Height,
-    pub(super) best_header_hash: block::Hash,
-    pub(super) hint_revision: Option<u64>,
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PendingNeededQuery {
+    /// The query's exact ID.
+    pub query_id: NonZeroU64,
+    /// The body-work authority that dispatched it.
+    #[serde(
+        rename = "header_generation",
+        serialize_with = "evidence::header_generation"
+    )]
+    pub scope: BodyWorkAuthority,
+    /// First requested height.
+    #[serde(rename = "range_start")]
+    pub from: block::Height,
+    /// Requested height count.
+    #[serde(rename = "range_count")]
+    pub limit: u32,
+    /// Header tip the query asked about.
+    #[serde(skip)]
+    pub best_header_tip: block::Height,
+    /// Header hash at that tip.
+    #[serde(skip)]
+    pub best_header_hash: block::Hash,
+    /// The hint revision this query refreshes, if any.
+    #[serde(skip)]
+    pub hint_revision: Option<u64>,
     /// The query bypassed the low-water gate. Its refusal or failure carries
     /// that bypass into the retry.
-    pub(super) forced: bool,
+    pub forced: bool,
 }
 
 impl PendingNeededQuery {
@@ -486,10 +380,6 @@ pub(super) struct QueryProposal {
 }
 
 impl QueryProposal {
-    pub(super) fn query(&self) -> PendingNeededQuery {
-        self.query
-    }
-
     /// The action that asks state for this query's metadata.
     pub(super) fn action(&self) -> BlockSyncAction {
         BlockSyncAction::QueryNeededBlocks {
@@ -514,15 +404,6 @@ pub(super) enum QueryPlan {
     /// The reactor exhausted the query identifier space.
     IdsExhausted,
     Dispatch(QueryProposal),
-}
-
-/// The query state a [`ReactorTransition`] reports, for detecting a change
-/// that no input-specific transition names.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct QueryLifecycle {
-    pending: Option<PendingNeededQuery>,
-    retry_at: Option<Instant>,
-    retry_forced: bool,
 }
 
 /// The pending needed-block query, its retry gate, and the hint refresh.
@@ -560,17 +441,17 @@ impl QueryState {
     }
 
     /// The pending query, the retry gate, and the owed force.
-    pub(super) fn lifecycle(&self) -> QueryLifecycle {
-        QueryLifecycle {
-            pending: self.pending,
-            retry_at: self.retry_at,
-            retry_forced: self.retry_forced,
-        }
+    fn gate(&self) -> (Option<PendingNeededQuery>, Option<Instant>, bool) {
+        (self.pending, self.retry_at, self.retry_forced)
     }
 
-    #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn next_id(&self) -> Option<NonZeroU64> {
-        self.next_id
+    /// The transition that reports a change from `before`, which no
+    /// input-specific transition names.
+    fn gate_change(
+        &self,
+        before: (Option<PendingNeededQuery>, Option<Instant>, bool),
+    ) -> Option<ReactorTransition> {
+        (self.gate() != before).then_some(ReactorTransition::QueryGateChanged)
     }
 
     pub(super) fn retry_at(&self) -> Option<Instant> {
@@ -579,18 +460,6 @@ impl QueryState {
 
     pub(super) fn hint_refresh(&self) -> Option<HintRefresh> {
         self.hint_refresh
-    }
-
-    /// Whether a refused or failed forced query still owes a forced retry.
-    #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn retry_forced(&self) -> bool {
-        self.retry_forced
-    }
-
-    /// Whether the action channel reported closed.
-    #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn dispatch_closed(&self) -> bool {
-        self.dispatch_closed
     }
 
     /// Apply the closed-channel, retry, quiet-period, and floor gates.
@@ -683,12 +552,13 @@ impl QueryState {
 
     /// The action channel accepted `proposal`: it becomes the pending query and
     /// consumes its query ID.
-    pub(super) fn accepted(&mut self, proposal: QueryProposal) {
+    pub(super) fn accepted(&mut self, proposal: QueryProposal) -> ReactorTransition {
         let query_id = proposal.query.query_id;
         self.pending = Some(proposal.query);
         self.retry_at = None;
         self.retry_forced = false;
         self.next_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
+        ReactorTransition::QueryAccepted(proposal.query)
     }
 
     /// The action channel refused `proposal`. The pending query and the next
@@ -702,7 +572,7 @@ impl QueryState {
         proposal: QueryProposal,
         refusal: ActionRefusal,
         now: Instant,
-    ) {
+    ) -> ReactorTransition {
         match refusal {
             ActionRefusal::Closed => {
                 self.dispatch_closed = true;
@@ -713,6 +583,10 @@ impl QueryState {
                 self.retry_forced |= proposal.query.forced;
                 self.schedule_retry(now);
             }
+        }
+        ReactorTransition::QueryRefused {
+            query: proposal.query,
+            refusal,
         }
     }
 
@@ -732,29 +606,32 @@ impl QueryState {
     }
 
     /// Retire the pending query when `(query_id, scope)` identifies it, and
-    /// schedule a retry. Returns whether the failure matched.
-    #[must_use = "an unmatched failure is a stale completion"]
+    /// schedule a retry. An unmatched failure is a stale completion.
     pub(super) fn fail(
         &mut self,
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
         now: Instant,
-    ) -> bool {
-        let Some(query) = self
+    ) -> ReactorTransition {
+        let pending = self
             .pending
-            .filter(|pending| pending.query_id == query_id && pending.scope == scope)
-        else {
-            return false;
-        };
-        self.pending = None;
-        self.retry_forced |= query.forced;
-        self.schedule_retry(now);
-        true
+            .filter(|pending| pending.query_id == query_id && pending.scope == scope);
+        if let Some(query) = pending {
+            self.pending = None;
+            self.retry_forced |= query.forced;
+            self.schedule_retry(now);
+        }
+        ReactorTransition::QueryFailed {
+            query_id,
+            scope,
+            matched: pending.is_some(),
+        }
     }
 
     /// Lift the retry gate when its deadline passes.
-    pub(super) fn retry_elapsed(&mut self) {
+    pub(super) fn retry_elapsed(&mut self) -> ReactorTransition {
         self.retry_at = None;
+        ReactorTransition::RetryElapsed
     }
 
     /// Retire the pending query and lift the retry gate and any owed forced retry.
@@ -946,6 +823,7 @@ impl ReactorProgress {
 
 /// The reaction a Sequencer view asks for.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[must_use = "a reaction must reach the trace and the observer"]
 pub(super) enum ViewReaction {
     /// Only the mirrors changed.
     ObserveOnly,
@@ -1045,6 +923,20 @@ pub(super) enum AuthorityUpdate {
     Refreshed(BodyWorkAuthority),
 }
 
+impl AuthorityUpdate {
+    /// The transition that reports this change.
+    pub(super) fn transition(self) -> ReactorTransition {
+        let (authority, epoch_changed) = match self {
+            Self::EpochChanged { authority, .. } => (authority, true),
+            Self::Refreshed(authority) => (authority, false),
+        };
+        ReactorTransition::AuthorityChanged {
+            authority,
+            epoch_changed,
+        }
+    }
+}
+
 /// How a committed view moves the verified frontiers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum FrontierUpdate {
@@ -1081,6 +973,8 @@ pub(super) struct CommittedViewUpdate {
     pub(super) authority: Option<AuthorityUpdate>,
     pub(super) frontiers: FrontierUpdate,
     pub(super) hints: HintUpdate,
+    /// Reports the view's retirement of the query state, if any.
+    pub(super) gate_change: Option<ReactorTransition>,
     header_changed: bool,
     /// The hint change retired a pending query whose sizes it corrects.
     refreshed_pending_query: bool,
@@ -1108,6 +1002,7 @@ impl ReactorState {
         view: CommittedHeaderChainView,
         now: time::Instant,
     ) -> CommittedViewUpdate {
+        let before = self.queries.gate();
         let previous = self.committed_view.take();
         let previous_scope = previous.as_ref().map(BodyWorkAuthority::for_view);
         let body_work_epoch_changed = previous
@@ -1211,6 +1106,7 @@ impl ReactorState {
             authority,
             frontiers: frontier_update,
             hints,
+            gate_change: self.queries.gate_change(before),
             header_changed,
             refreshed_pending_query,
         }
@@ -1515,7 +1411,8 @@ impl ActionClass {
 }
 
 /// Why the action channel refused an action.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActionRefusal {
     /// An optional action found only the control reserve free.
     ControlReserve,

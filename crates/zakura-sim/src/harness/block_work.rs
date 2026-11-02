@@ -1,7 +1,10 @@
 //! Transport-free execution of block policy and runtime funding models.
 
 use super::{machine::Machine, HarnessEntry};
-use crate::{record::machine::MachineStep, witness::Expect};
+use crate::{
+    record::machine::{MachineStep, ReactorAction},
+    witness::Expect,
+};
 
 const OWNERSHIP: Machine = Machine {
     name: "block/work-ownership",
@@ -25,6 +28,34 @@ const OWNERSHIP: Machine = Machine {
                 .items
                 .iter()
                 .any(|item| item.in_flight && item.owner.is_some() && item.charge > 0))
+        })
+    },
+};
+
+const REACTOR: Machine = Machine {
+    name: "block/reactor-policy",
+    identity: "block-reactor",
+    claim: "After every input, the reactor's pending query, next query ID, retry gate, owed force, closed dispatch, authority, epochs, and progress mirrors agree with the independent model, and every accepted or refused query carries the model's exact identity.",
+    // Version 3 delivers an authority byte as a committed view, which retires the
+    // pending query, and reads bit 4 of a refill's byte as the first view's arrival.
+    generator: 3,
+    budget: 128,
+    history: |input| {
+        zakura_network::zakura::trace_block_reactor_bytes(input)
+            .steps
+            .into_iter()
+            .map(|step| (step.step, MachineStep::Reactor(step.into())))
+            .collect()
+    },
+    // The reactor's trigger is an offered query, not a byte charge.
+    reached: |steps, _| {
+        steps.iter().any(|step| {
+            matches!(step, MachineStep::Reactor(reactor) if reactor.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ReactorAction::QueryAccepted { .. } | ReactorAction::QueryRefused { .. }
+                )
+            }))
         })
     },
 };
@@ -59,6 +90,11 @@ const FUNDING: Machine = Machine {
 
 /// Pure policy uses the shared registry, recorder, replay verifier and explorer.
 pub const ENTRY: HarnessEntry = crate::machine_entry!(OWNERSHIP);
+
+/// Reactor query and view policy uses reactor decoder-v3 and the same evidence
+/// loop. It decides pure transitions: the real reactor's action channel, reply
+/// routes, and shutdown have their witnesses in zakura-network.
+pub const REACTOR_ENTRY: HarnessEntry = crate::machine_entry!(REACTOR);
 
 /// Real queue owners use funding decoder-v1 and the same execution/evidence loop.
 /// This target establishes completed-operation retention, not asynchronous races

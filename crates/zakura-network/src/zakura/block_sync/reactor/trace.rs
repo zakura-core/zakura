@@ -9,148 +9,9 @@ use super::*;
 struct BlockReactorTransitionEvent {
     event: &'static str,
     #[serde(flatten)]
-    transition: TransitionDetail,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pending_query_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_query_id: Option<u64>,
-    retry_armed: bool,
-    retry_forced: bool,
-    dispatch_closed: bool,
-    verified_tip: u32,
-    request_floor: u32,
-    best_header_tip: u32,
-    reset_epoch: u64,
-    reaction_epoch: u64,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "transition", rename_all = "snake_case")]
-enum TransitionDetail {
-    QueryAccepted {
-        query_id: u64,
-        range_start: u32,
-        range_count: u32,
-        forced: bool,
-        header_generation: u64,
-    },
-    QueryRefused {
-        query_id: u64,
-        range_start: u32,
-        range_count: u32,
-        forced: bool,
-        header_generation: u64,
-        refusal: &'static str,
-    },
-    QueryReply {
-        query_id: u64,
-        header_generation: u64,
-        outcome: &'static str,
-    },
-    QueryFailed {
-        query_id: u64,
-        header_generation: u64,
-        matched: bool,
-    },
-    QueryGateChanged,
-    RetryElapsed,
-    View {
-        reset: bool,
-        tip_advanced: bool,
-    },
-    AuthorityChanged {
-        header_generation: u64,
-        epoch_changed: bool,
-    },
-    TipReset {
-        tip: u32,
-    },
-}
-
-impl From<ReactorTransition> for TransitionDetail {
-    fn from(transition: ReactorTransition) -> Self {
-        match transition {
-            ReactorTransition::QueryAccepted(query) => Self::QueryAccepted {
-                query_id: query.query_id.get(),
-                range_start: query.from.0,
-                range_count: query.limit,
-                forced: query.forced,
-                header_generation: query.scope.header.header_generation.get(),
-            },
-            ReactorTransition::QueryRefused { query, refusal } => Self::QueryRefused {
-                query_id: query.query_id.get(),
-                range_start: query.from.0,
-                range_count: query.limit,
-                forced: query.forced,
-                header_generation: query.scope.header.header_generation.get(),
-                refusal: match refusal {
-                    ActionRefusal::ControlReserve => "control_reserve",
-                    ActionRefusal::Full => "full",
-                    ActionRefusal::Closed => "closed",
-                },
-            },
-            ReactorTransition::QueryReply {
-                query_id,
-                scope,
-                outcome,
-            } => Self::QueryReply {
-                query_id: query_id.get(),
-                header_generation: scope.header.header_generation.get(),
-                outcome: match outcome {
-                    QueryReplyOutcome::Stale => "stale",
-                    QueryReplyOutcome::StaleAuthority => "stale_authority",
-                    QueryReplyOutcome::AnchorAdvanced => "anchor_advanced",
-                    QueryReplyOutcome::AnchorReset => "anchor_reset",
-                    QueryReplyOutcome::Accepted => "accepted",
-                },
-            },
-            ReactorTransition::QueryFailed {
-                query_id,
-                scope,
-                matched,
-            } => Self::QueryFailed {
-                query_id: query_id.get(),
-                header_generation: scope.header.header_generation.get(),
-                matched,
-            },
-            ReactorTransition::QueryGateChanged => Self::QueryGateChanged,
-            ReactorTransition::RetryElapsed => Self::RetryElapsed,
-            ReactorTransition::View {
-                reset,
-                tip_advanced,
-            } => Self::View {
-                reset,
-                tip_advanced,
-            },
-            ReactorTransition::AuthorityChanged {
-                authority,
-                epoch_changed,
-            } => Self::AuthorityChanged {
-                header_generation: authority.header.header_generation.get(),
-                epoch_changed,
-            },
-            ReactorTransition::TipReset { tip } => Self::TipReset { tip: tip.0 },
-        }
-    }
-}
-
-impl BlockReactorTransitionEvent {
-    fn new(transition: ReactorTransition, state: ReactorSnapshot) -> Self {
-        Self {
-            event: "reactor_transition",
-            transition: transition.into(),
-            pending_query_id: state.pending.map(|query| query.query_id.get()),
-            next_query_id: state.next_query_id.map(NonZeroU64::get),
-            retry_armed: state.retry_armed,
-            retry_forced: state.retry_forced,
-            dispatch_closed: state.dispatch_closed,
-            verified_tip: state.verified_block_tip.0,
-            request_floor: state.request_floor.0,
-            best_header_tip: state.best_header_tip.0,
-            reset_epoch: state.last_reset_epoch,
-            reaction_epoch: state.last_reaction_epoch,
-        }
-    }
+    transition: ReactorTransition,
+    #[serde(flatten)]
+    state: ReactorSnapshot,
 }
 
 impl JsonlTraceEvent for BlockReactorTransitionEvent {
@@ -163,21 +24,17 @@ impl ReactorIO {
     pub(super) fn report_transition(&self, transition: ReactorTransition) {
         self.startup
             .trace
-            .emit_event(|| BlockReactorTransitionEvent::new(transition, self.state.snapshot()));
+            .emit_event(|| BlockReactorTransitionEvent {
+                event: "reactor_transition",
+                transition,
+                state: self.state.snapshot(),
+            });
         #[cfg(any(test, zakura_sim))]
         if let Some(observer) = &self.startup.observer.0 {
             observer.observe(super::block_sync_observe::BlockEvent::Reactor {
                 transition,
                 state: Box::new(self.state.snapshot()),
             });
-        }
-    }
-
-    /// Report a change from `before` in the query state, when the caller's
-    /// input has no transition of its own that names the change.
-    pub(super) fn report_query_gate_change(&self, before: state::QueryLifecycle) {
-        if self.state.queries.lifecycle() != before {
-            self.report_transition(ReactorTransition::QueryGateChanged);
         }
     }
 
@@ -510,5 +367,145 @@ impl ReactorIO {
         self.emit_block(bs_trace::BLOCK_CHAIN_TIP_RESET, |row| {
             row.verified_block_tip = Some(height(verified_block_tip));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use zakura_header_chain::{
+        BodyWorkAuthority, BodyWorkEpoch, BranchId, HeaderGeneration, HeaderWorkAuthority,
+        VerifiedGeneration,
+    };
+
+    use super::*;
+
+    /// Pins the trace fields that `zakura-bench-digest.py` and readers of a
+    /// `reactor_transition` line depend on.
+    #[test]
+    fn reactor_transition_event_keeps_its_trace_fields() {
+        let scope = BodyWorkAuthority {
+            header: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(7),
+                branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+            },
+            verified_generation: VerifiedGeneration::new(1),
+            body_work_epoch: BodyWorkEpoch::default(),
+        };
+        let query = PendingNeededQuery {
+            query_id: NonZeroU64::new(3).expect("3 is nonzero"),
+            scope,
+            from: block::Height(10),
+            limit: 8,
+            best_header_tip: block::Height(100),
+            best_header_hash: block::Hash([2; 32]),
+            hint_revision: None,
+            forced: true,
+        };
+        let state = ReactorSnapshot {
+            pending: Some(query),
+            next_query_id: NonZeroU64::new(4),
+            retry_armed: true,
+            retry_forced: false,
+            dispatch_closed: false,
+            scope: Some(scope),
+            verified_block_tip: block::Height(9),
+            request_floor: block::Height(9),
+            best_header_tip: block::Height(100),
+            last_reset_epoch: 1,
+            last_reaction_epoch: 2,
+        };
+        let event = |transition| {
+            serde_json::to_value(BlockReactorTransitionEvent {
+                event: "reactor_transition",
+                transition,
+                state,
+            })
+            .expect("the event serializes")
+        };
+        let state_fields = json!({
+            "event": "reactor_transition",
+            "pending_query_id": 3,
+            "next_query_id": 4,
+            "retry_armed": true,
+            "retry_forced": false,
+            "dispatch_closed": false,
+            "verified_tip": 9,
+            "request_floor": 9,
+            "best_header_tip": 100,
+            "reset_epoch": 1,
+            "reaction_epoch": 2,
+        });
+        let cases = [
+            (
+                ReactorTransition::QueryRefused {
+                    query,
+                    refusal: ActionRefusal::ControlReserve,
+                },
+                json!({
+                    "transition": "query_refused",
+                    "query_id": 3,
+                    "range_start": 10,
+                    "range_count": 8,
+                    "forced": true,
+                    "header_generation": 7,
+                    "refusal": "control_reserve",
+                }),
+            ),
+            (
+                ReactorTransition::QueryAccepted(query),
+                json!({
+                    "transition": "query_accepted",
+                    "query_id": 3,
+                    "range_start": 10,
+                    "range_count": 8,
+                    "forced": true,
+                    "header_generation": 7,
+                }),
+            ),
+            (
+                ReactorTransition::QueryReply {
+                    query_id: query.query_id,
+                    scope,
+                    outcome: QueryReplyOutcome::StaleAuthority,
+                },
+                json!({
+                    "transition": "query_reply",
+                    "query_id": 3,
+                    "header_generation": 7,
+                    "outcome": "stale_authority",
+                }),
+            ),
+            (
+                ReactorTransition::AuthorityChanged {
+                    authority: scope,
+                    epoch_changed: true,
+                },
+                json!({
+                    "transition": "authority_changed",
+                    "header_generation": 7,
+                    "epoch_changed": true,
+                }),
+            ),
+            (
+                ReactorTransition::TipReset {
+                    tip: block::Height(5),
+                },
+                json!({ "transition": "tip_reset", "tip": 5 }),
+            ),
+        ];
+        for (transition, fields) in cases {
+            let mut expected = state_fields.clone();
+            expected
+                .as_object_mut()
+                .expect("the state fields are an object")
+                .extend(
+                    fields
+                        .as_object()
+                        .expect("the fields are an object")
+                        .clone(),
+                );
+            assert_eq!(event(transition), expected);
+        }
     }
 }

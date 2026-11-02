@@ -144,8 +144,7 @@ fn observe(state: &mut ReactorState, spec: &Spec, now: time::Instant) -> Committ
 
 /// Open a forced refill against the state's own authority.
 fn committed_refill(state: &mut ReactorState, accept: bool, now: Instant) -> Refill {
-    let scope = state.body_work_scope();
-    refill(state, true, work(Some(1), 0, 1), scope, accept, now)
+    refill(state, true, work(Some(1), 0, 1), accept, now)
 }
 
 #[test]
@@ -267,7 +266,7 @@ fn only_misbehavior_reports_are_optional_actions() {
         ..base_spec()
     };
     let _ = observe(&mut state, &alarmed, time::Instant::now());
-    let start = match state.open_query(true) {
+    let start = match state.open_query(true).0 {
         QueryOpening::NeedsWork => QueryStart::Work(work(Some(1), 0, 1)),
         other => panic!("a forced refill opens, got {other:?}"),
     };
@@ -293,7 +292,7 @@ fn only_misbehavior_reports_are_optional_actions() {
         reason: crate::zakura::block_sync::BlockSyncMisbehavior::InvalidBlock,
     };
     assert_eq!(ActionClass::of(&misbehavior), ActionClass::Optional);
-    state.queries.refused(query, ActionRefusal::Full, now);
+    let _ = state.queries.refused(query, ActionRefusal::Full, now);
 }
 
 // ---- model ----

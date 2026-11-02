@@ -23,6 +23,7 @@
 
 use std::{collections::BTreeSet, num::NonZeroU64};
 
+use serde::Serialize;
 use zakura_chain::block;
 use zakura_header_chain::{
     BodyCompletionDecision, BodySupplierDiscovered, BodyUnavailableSummary, BodyWorkAuthority,
@@ -261,21 +262,30 @@ impl ReactorState {
 // ---- queries ----
 
 /// Identity, authority, and bounds of one body-missing metadata query.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PendingNeededQuery {
     /// The query's exact ID.
     pub query_id: NonZeroU64,
     /// The body-work authority that dispatched it.
+    #[serde(
+        rename = "header_generation",
+        serialize_with = "evidence::header_generation"
+    )]
     pub scope: BodyWorkAuthority,
     /// First requested height.
+    #[serde(rename = "range_start")]
     pub from: block::Height,
     /// Requested height count.
+    #[serde(rename = "range_count")]
     pub limit: u32,
     /// Header tip the query asked about.
+    #[serde(skip)]
     pub best_header_tip: block::Height,
     /// Header hash at that tip.
+    #[serde(skip)]
     pub best_header_hash: block::Hash,
     /// The hint revision this query refreshes, if any.
+    #[serde(skip)]
     pub hint_revision: Option<u64>,
     /// The query bypassed the low-water gate. Its refusal or failure carries
     /// that bypass into the retry.
@@ -1401,7 +1411,8 @@ impl ActionClass {
 }
 
 /// Why the action channel refused an action.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActionRefusal {
     /// An optional action found only the control reserve free.
     ControlReserve,

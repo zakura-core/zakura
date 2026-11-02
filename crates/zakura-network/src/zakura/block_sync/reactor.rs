@@ -26,9 +26,9 @@ pub use state::{
     BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
     ReactorMachineView,
 };
+pub use state::{ActionRefusal, ReactorSnapshot, ReactorTransition};
 #[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
-pub use state::PendingNeededQuery;
-pub use state::{ActionRefusal, QueryReplyOutcome, ReactorSnapshot, ReactorTransition};
+pub use state::{PendingNeededQuery, QueryReplyOutcome};
 #[cfg(test)]
 mod tests;
 mod trace;

@@ -251,6 +251,17 @@ pub(in crate::zakura::handler) enum RemoteCompletion {
     CheckDemand,
 }
 
+/// How a service's demand decides a complete inbound session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::handler) enum RemoteDemand {
+    /// Adopt the peer's session. The caller drops any reopen wait.
+    Adopt,
+    /// Park the peer's session, with this endpoint's wait change if it may
+    /// reopen the service. Otherwise the entitled remote opener observes the
+    /// parked stream and retries.
+    Park(Option<DemandChange>),
+}
+
 /// Connection-owned lifecycle for one negotiated ordered service.
 ///
 /// The service has at most one active generation in each opening direction.
@@ -350,19 +361,31 @@ impl ServiceSessionState {
         }
     }
 
-    /// Park the inbound generation `session_id` because its service has no
-    /// demand. Frees the service for a later offer.
-    ///
-    /// Returns the demand's wait change if this endpoint may reopen the
-    /// service. Otherwise the entitled remote opener observes the parked
-    /// stream and retries.
-    pub(in crate::zakura::handler) fn remote_parked(
+    /// Decide the inbound generation `session_id` that [`Self::remote_completed`]
+    /// recorded. Only immediate demand adopts it. Parking frees the service for
+    /// a later offer.
+    pub(in crate::zakura::handler) fn remote_demand(
         &mut self,
         session_id: u64,
         demand: DemandWait,
-    ) -> Option<DemandChange> {
+    ) -> RemoteDemand {
+        if demand == DemandWait::OpenNow {
+            self.clear_wait();
+            return RemoteDemand::Adopt;
+        }
         self.remove_active_session(false, session_id);
-        (self.policy.reopen && self.opens_locally()).then(|| self.schedule_demand(demand))
+        RemoteDemand::Park(
+            (self.policy.reopen && self.opens_locally()).then(|| self.schedule_demand(demand)),
+        )
+    }
+
+    /// Apply a service's demand after its reopen wait fired. Returns `None` if
+    /// the service opens now, or the wait change otherwise.
+    pub(in crate::zakura::handler) fn reopen_demand(
+        &mut self,
+        demand: DemandWait,
+    ) -> Option<DemandChange> {
+        (demand != DemandWait::OpenNow).then(|| self.schedule_demand(demand))
     }
 
     /// Record that `exit`'s generation ended. A stale generation changes

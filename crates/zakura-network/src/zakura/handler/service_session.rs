@@ -12,7 +12,7 @@ use zakura_rt::sync::Barrier;
 mod state;
 pub(super) use state::{
     may_open_ordered_stream, ConnectionRoles, DemandChange, DemandWait, RemoteCompletion,
-    ServiceSessionState, SessionExit,
+    RemoteDemand, ServiceSessionState, SessionExit,
 };
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state::{replay_service_session_bytes, ServiceSessionReplaySummary};

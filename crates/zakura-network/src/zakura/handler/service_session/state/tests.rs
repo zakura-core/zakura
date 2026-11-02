@@ -195,13 +195,16 @@ fn an_old_generation_exit_leaves_the_replacement_active() {
     let mut session = state(stream);
     assert_eq!(session.remote_completed(1), RemoteCompletion::CheckDemand);
     assert_eq!(
-        session.remote_parked(1, DemandWait::Later),
-        Some(DemandChange::Start)
+        session.remote_demand(1, DemandWait::Later),
+        RemoteDemand::Park(Some(DemandChange::Start))
     );
     assert!(!session.has_active_session(), "parking frees the service");
     session.clear_wait();
     assert_eq!(session.remote_completed(2), RemoteCompletion::CheckDemand);
-    session.clear_wait();
+    assert_eq!(
+        session.remote_demand(2, DemandWait::OpenNow),
+        RemoteDemand::Adopt
+    );
 
     let old = SessionExit {
         stream,
@@ -234,7 +237,10 @@ fn a_lost_collision_keeps_the_adopted_generation_after_the_local_exit() {
         session.remote_completed(2),
         RemoteCompletion::AdoptCollision
     );
-    session.clear_wait();
+    assert_eq!(
+        session.remote_demand(2, DemandWait::OpenNow),
+        RemoteDemand::Adopt
+    );
 
     let local = SessionExit {
         stream,

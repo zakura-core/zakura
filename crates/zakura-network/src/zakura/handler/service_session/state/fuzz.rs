@@ -23,7 +23,8 @@ use zakura_rt::time::Instant;
 
 use super::{
     ConnectionRoles, DemandChange, DemandWait, MemberArrival, MemberReservation, PendingState,
-    RemoteCompletion, ServiceSessionState, SessionExit, SessionReopenState, SessionWaitReason,
+    RemoteCompletion, RemoteDemand, ServiceSessionState, SessionExit, SessionReopenState,
+    SessionWaitReason,
 };
 use crate::zakura::{transport::SessionLayout, SessionOpening, SessionPolicy, Stream};
 
@@ -610,17 +611,23 @@ impl SessionHarness {
                 RemoteCompletion::CheckDemand,
             );
         }
+        // As the connection loop does: a lost collision implies demand.
+        let demand = if completion == RemoteCompletion::AdoptCollision || open_now {
+            DemandWait::OpenNow
+        } else {
+            DemandWait::Later
+        };
+        let decision = self.session.remote_demand(generation, demand);
         if collision || open_now {
-            self.session.clear_wait();
+            check(LEGAL_REOPEN, decision, RemoteDemand::Adopt);
             self.wait.apply(DemandChange::Cancel);
             self.model.clear_wait();
         } else {
-            let change = self.session.remote_parked(generation, DemandWait::Later);
             self.model.remote = None;
             let expected = (self.model.reopens && self.model.opens_locally)
                 .then(|| self.model.demand(DemandWait::Later));
-            check(LEGAL_REOPEN, change, expected);
-            if let Some(change) = change {
+            check(LEGAL_REOPEN, decision, RemoteDemand::Park(expected));
+            if let Some(change) = expected {
                 self.wait.apply(change);
             }
         }
@@ -652,10 +659,18 @@ impl SessionHarness {
             return;
         }
         if !open_now {
-            let change = self.session.schedule_demand(DemandWait::Later);
-            check(LEGAL_REOPEN, change, self.model.demand(DemandWait::Later));
+            let change = self.model.demand(DemandWait::Later);
+            let machine = self.session.reopen_demand(DemandWait::Later);
+            check(LEGAL_REOPEN, machine, Some(change));
             self.wait.apply(change);
-        } else if opens {
+            return;
+        }
+        check(
+            LEGAL_REOPEN,
+            self.session.reopen_demand(DemandWait::OpenNow),
+            None,
+        );
+        if opens {
             let generation = self.admit(true);
             self.session.opened(generation);
             self.wait.apply(DemandChange::Cancel);

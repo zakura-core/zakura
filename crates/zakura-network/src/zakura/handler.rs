@@ -4,7 +4,7 @@ mod service_session;
 mod trace;
 use service_session::{
     may_open_ordered_stream, spawn_service_session, trace_session_step, ConnectionRoles,
-    DemandChange, DemandWait, PendingSessions, PreparedStream, RemoteCompletion,
+    DemandChange, DemandWait, PendingSessions, PreparedStream, RemoteCompletion, RemoteDemand,
     ServiceSessionState, SessionExit, SetupIo,
 };
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -2138,32 +2138,48 @@ impl ServiceSessionIO {
         Some(completion)
     }
 
-    /// Adopt a completed peer's session if `demand` opens it now, or park it.
-    /// Returns whether the service adopted it.
+    /// Apply `demand` to a completed peer's session. Returns whether the service
+    /// adopted it rather than parking it.
     fn on_remote_demand(&mut self, kind: u16, session_id: u64, demand: SessionDemand) -> bool {
-        if !matches!(demand, SessionDemand::OpenNow) {
-            self.trace(
-                kind,
-                SessionStep::GenerationParked {
-                    generation: session_id,
-                },
-            );
-            let wait = DemandWait::from(&demand);
-            if let Some(change) = self.session(kind).remote_parked(session_id, wait) {
-                self.apply_demand(kind, change, demand);
+        let wait = DemandWait::from(&demand);
+        match self.session(kind).remote_demand(session_id, wait) {
+            RemoteDemand::Adopt => {
+                self.cancel(kind);
+                self.trace(
+                    kind,
+                    SessionStep::GenerationInstalled {
+                        generation: session_id,
+                        attempt: None,
+                    },
+                );
+                true
             }
-            return false;
+            RemoteDemand::Park(change) => {
+                self.trace(
+                    kind,
+                    SessionStep::GenerationParked {
+                        generation: session_id,
+                    },
+                );
+                if let Some(change) = change {
+                    self.apply_demand(kind, change, demand);
+                }
+                false
+            }
         }
-        self.session(kind).clear_wait();
-        self.cancel(kind);
-        self.trace(
-            kind,
-            SessionStep::GenerationInstalled {
-                generation: session_id,
-                attempt: None,
-            },
-        );
-        true
+    }
+
+    /// Apply `demand` after `kind`'s reopen wait fired. Returns whether the
+    /// service opens now.
+    fn on_reopen_demand(&mut self, kind: u16, demand: SessionDemand) -> bool {
+        let wait = DemandWait::from(&demand);
+        match self.session(kind).reopen_demand(wait) {
+            None => true,
+            Some(change) => {
+                self.apply_demand(kind, change, demand);
+                false
+            }
+        }
     }
 
     /// Apply `demand` to `kind`'s state and keep the demand's wait if the state
@@ -3127,12 +3143,8 @@ impl ZakuraProtocolHandler {
                         &peer_id,
                         context.direction,
                     );
-                    match demand {
-                        SessionDemand::OpenNow => {}
-                        demand => {
-                            session_io.schedule_demand(stream.kind, demand);
-                            continue;
-                        }
+                    if !session_io.on_reopen_demand(stream.kind, demand) {
+                        continue;
                     }
 
                     match self

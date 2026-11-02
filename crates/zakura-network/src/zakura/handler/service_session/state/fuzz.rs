@@ -23,7 +23,8 @@ use zakura_rt::time::Instant;
 
 use super::{
     ConnectionRoles, DemandChange, DemandWait, MemberArrival, MemberReservation, PendingState,
-    RemoteCompletion, ServiceSessionState, SessionExit, SessionReopenState, SessionWaitReason,
+    RemoteCompletion, RemoteDemand, ServiceSessionState, SessionExit, SessionReopenState,
+    SessionWaitReason,
 };
 use crate::zakura::{transport::SessionLayout, SessionOpening, SessionPolicy, Stream};
 
@@ -337,12 +338,17 @@ impl Model {
         Some(MemberArrival::Waiting)
     }
 
-    fn expire(&mut self, now: Instant) -> bool {
+    /// The wire ID of the offer that expires at `now`, if any.
+    fn expire(&mut self, now: Instant) -> Option<u64> {
         if self.deferred_until.is_some_and(|until| until <= now) {
             self.deferred_until = None;
         }
-        let expired = self.offer.as_ref().is_some_and(|offer| offer.2 <= now);
-        if expired {
+        let expired = self
+            .offer
+            .as_ref()
+            .filter(|offer| offer.2 <= now)
+            .map(|offer| offer.0);
+        if expired.is_some() {
             self.offer = None;
             self.deferred_until = Some(now + SETUP_TIMEOUT);
         }
@@ -408,29 +414,24 @@ impl Model {
     }
 }
 
-/// The connection loop's one wait per service, as `ServiceSessionIO` keeps it.
+/// Whether the connection loop holds its one wait for the service, as
+/// `ServiceSessionIO` keeps it.
 #[derive(Debug, Default)]
-struct WaitSlot(Option<DemandOrBackoff>);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DemandOrBackoff {
-    Demand,
-    Backoff,
-}
+struct WaitSlot(bool);
 
 impl WaitSlot {
     fn apply(&mut self, change: DemandChange) {
         match change {
             DemandChange::Keep => {}
-            DemandChange::Cancel => self.0 = None,
-            DemandChange::Start => self.0 = Some(DemandOrBackoff::Demand),
+            DemandChange::Cancel => self.0 = false,
+            DemandChange::Start => self.0 = true,
         }
     }
 
     fn backoff(&mut self, delay: Option<Duration>) {
         if delay.is_some() {
-            check(LEGAL_REOPEN, self.0, None);
-            self.0 = Some(DemandOrBackoff::Backoff);
+            check(LEGAL_REOPEN, self.0, false);
+            self.0 = true;
         }
     }
 }
@@ -503,14 +504,11 @@ impl SessionHarness {
                 let expired = self.pending.expire(self.now);
                 let expected = self.model.expire(self.now);
                 self.summary.expired_offers += expired.len();
+                let kind = self.stream.kind;
                 check(
                     OFFER_ASSEMBLY,
                     expired,
-                    if expected {
-                        vec![self.stream.kind]
-                    } else {
-                        Vec::new()
-                    },
+                    expected.map(|id| (kind, id)).into_iter().collect(),
                 );
             }
             Op::Demand(demand) => {
@@ -608,17 +606,23 @@ impl SessionHarness {
                 RemoteCompletion::CheckDemand,
             );
         }
+        // As the connection loop does: a lost collision implies demand.
+        let demand = if completion == RemoteCompletion::AdoptCollision || open_now {
+            DemandWait::OpenNow
+        } else {
+            DemandWait::Later
+        };
+        let decision = self.session.remote_demand(generation, demand);
         if collision || open_now {
-            self.session.remote_adopted();
+            check(LEGAL_REOPEN, decision, RemoteDemand::Adopt);
             self.wait.apply(DemandChange::Cancel);
             self.model.clear_wait();
         } else {
-            let change = self.session.remote_parked(generation, DemandWait::Later);
             self.model.remote = None;
             let expected = (self.model.reopens && self.model.opens_locally)
                 .then(|| self.model.demand(DemandWait::Later));
-            check(LEGAL_REOPEN, change, expected);
-            if let Some(change) = change {
+            check(LEGAL_REOPEN, decision, RemoteDemand::Park(expected));
+            if let Some(change) = expected {
                 self.wait.apply(change);
             }
         }
@@ -638,10 +642,10 @@ impl SessionHarness {
     }
 
     fn wait_fires(&mut self, open_now: bool, opens: bool) {
-        if self.wait.0.take().is_none() {
+        if !std::mem::take(&mut self.wait.0) {
             return;
         }
-        self.session.wait_finished();
+        self.session.clear_wait();
         self.model.clear_wait();
         let may_reopen =
             self.model.opens_locally && self.model.local.is_none() && self.model.remote.is_none();
@@ -650,10 +654,18 @@ impl SessionHarness {
             return;
         }
         if !open_now {
-            let change = self.session.schedule_demand(DemandWait::Later);
-            check(LEGAL_REOPEN, change, self.model.demand(DemandWait::Later));
+            let change = self.model.demand(DemandWait::Later);
+            let machine = self.session.reopen_demand(DemandWait::Later);
+            check(LEGAL_REOPEN, machine, Some(change));
             self.wait.apply(change);
-        } else if opens {
+            return;
+        }
+        check(
+            LEGAL_REOPEN,
+            self.session.reopen_demand(DemandWait::OpenNow),
+            None,
+        );
+        if opens {
             let generation = self.admit(true);
             self.session.opened(generation);
             self.wait.apply(DemandChange::Cancel);
@@ -691,7 +703,9 @@ impl SessionHarness {
             session_id: id,
             opened_locally,
         };
-        let delay = self.session.exited(exit, false);
+        let outcome = self.session.exited(exit, false);
+        check(ONE_ACTIVE_GENERATION, outcome.current, !stale);
+        let delay = outcome.reopen_after;
         check(LEGAL_REOPEN, delay, self.model.exit(opened_locally, id));
         if stale {
             self.summary.stale_exits += 1;
@@ -730,11 +744,7 @@ impl SessionHarness {
             self.session.reopen_attempts,
             self.model.attempts,
         );
-        check(
-            LEGAL_REOPEN,
-            self.session.is_waiting(),
-            self.wait.0.is_some(),
-        );
+        check(LEGAL_REOPEN, self.session.is_waiting(), self.wait.0);
         check(
             LEGAL_REOPEN,
             self.session.reopen_state,

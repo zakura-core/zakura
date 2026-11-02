@@ -65,22 +65,11 @@ pub struct FramedRecv {
 
 #[derive(Debug)]
 enum FramedReceiver {
-    Plain(mpsc::Receiver<Frame>),
     Queued(mpsc::UnboundedReceiver<QueuedFrame>),
     Admitted(mpsc::Receiver<AdmittedFrame>),
 }
 
 impl FramedRecv {
-    /// Wrap a bounded frame receiver.
-    pub fn new(receiver: mpsc::Receiver<Frame>) -> Self {
-        Self {
-            receiver: FramedReceiver::Plain(receiver),
-            failure_cause: None,
-            precheck: None,
-            returned: None,
-        }
-    }
-
     /// Wrap the queue from a stream's transport reader.
     pub(crate) fn admitted(receiver: mpsc::Receiver<AdmittedFrame>) -> Self {
         Self {
@@ -147,7 +136,6 @@ impl FramedRecv {
     /// Stop new ingress while preserving frames already in the bounded queue.
     pub(crate) fn close(&mut self) {
         match &mut self.receiver {
-            FramedReceiver::Plain(receiver) => receiver.close(),
             FramedReceiver::Queued(receiver) => receiver.close(),
             FramedReceiver::Admitted(receiver) => receiver.close(),
         }
@@ -160,17 +148,6 @@ impl FramedRecv {
         }
         self.returned = None;
         match &mut self.receiver {
-            // The release arm stays a bare expression, so its build is unchanged.
-            #[cfg(not(any(test, zakura_sim)))]
-            FramedReceiver::Plain(receiver) => receiver.try_recv(),
-            #[cfg(any(test, zakura_sim))]
-            FramedReceiver::Plain(receiver) => {
-                let frame = receiver.try_recv();
-                if frame.is_ok() {
-                    self.take_tag();
-                }
-                frame
-            }
             FramedReceiver::Queued(receiver) => loop {
                 if let Some(frame) = receiver.try_recv()?.receive() {
                     #[cfg(any(test, zakura_sim))]
@@ -195,17 +172,6 @@ impl FramedRecv {
         }
         self.returned = None;
         match &mut self.receiver {
-            // As in `try_recv`, the release arm is unchanged.
-            #[cfg(not(any(test, zakura_sim)))]
-            FramedReceiver::Plain(receiver) => receiver.recv().await,
-            #[cfg(any(test, zakura_sim))]
-            FramedReceiver::Plain(receiver) => {
-                let frame = receiver.recv().await;
-                if frame.is_some() {
-                    self.take_tag();
-                }
-                frame
-            }
             FramedReceiver::Queued(receiver) => {
                 while let Some(queued) = receiver.recv().await {
                     if let Some(frame) = queued.receive() {
@@ -230,17 +196,11 @@ impl FramedRecv {
 /// Send half for bounded Zakura frames.
 #[derive(Clone, Debug)]
 pub struct FramedSend {
-    sender: FramedSender,
-    response_slots: Option<SlotBudget>,
+    queue: FrameQueue,
+    response_slots: SlotBudget,
     session_resources: Option<Arc<dyn super::service::SessionResources>>,
     /// Funds frames that arrive without a guard from another owner.
     output: Option<FrameGate>,
-}
-
-#[derive(Clone, Debug)]
-enum FramedSender {
-    Plain(mpsc::Sender<Frame>),
-    Queued(FrameQueue),
 }
 
 /// The send half of a stream's ordered frame queue.
@@ -292,22 +252,12 @@ impl FrameQueue {
 }
 
 impl FramedSend {
-    /// Wrap a bounded frame sender.
-    pub fn new(sender: mpsc::Sender<Frame>) -> Self {
-        Self {
-            sender: FramedSender::Plain(sender),
-            response_slots: None,
-            session_resources: None,
-            output: None,
-        }
-    }
-
     fn queued(queue: FrameQueue) -> Self {
         let response_slots = SlotBudget::new(queue.depth.saturating_sub(1).max(1))
             .expect("a transport queue has a positive semaphore-bounded capacity");
         Self {
-            response_slots: Some(response_slots),
-            sender: FramedSender::Queued(queue),
+            response_slots,
+            queue,
             session_resources: None,
             output: None,
         }
@@ -341,10 +291,7 @@ impl FramedSend {
         let bytes = frame_wire_bytes(frame.payload.len());
         let admitted = self.output.as_ref().and_then(|gate| gate.try_admit(bytes));
         async move {
-            let queue = match &self.sender {
-                FramedSender::Plain(sender) => return sender.send(frame).await,
-                FramedSender::Queued(queue) => queue,
-            };
+            let queue = &self.queue;
             let output = match (admitted, &self.output) {
                 (Some(grant), _) => Some(grant),
                 (None, None) => None,
@@ -368,10 +315,7 @@ impl FramedSend {
 
     /// Try to queue a frame without waiting for capacity.
     pub fn try_send(&self, frame: Frame) -> Result<(), mpsc::error::TrySendError<Frame>> {
-        let queue = match &self.sender {
-            FramedSender::Plain(sender) => return sender.try_send(frame),
-            FramedSender::Queued(queue) => queue,
-        };
+        let queue = &self.queue;
         let slot = match queue.try_slot() {
             Ok(slot) => slot,
             Err(mpsc::error::TrySendError::Full(())) => {
@@ -396,9 +340,7 @@ impl FramedSend {
 
     /// Reserve queue space before encoding a response or sharing its ownership.
     pub(crate) fn try_reserve_guarded(&self) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
-        let FramedSender::Queued(queue) = &self.sender else {
-            return Err(GuardedReserveError::Unsupported);
-        };
+        let queue = &self.queue;
         queue
             .try_slot()
             .map(|slot| GuardedFrameSlot {
@@ -415,9 +357,7 @@ impl FramedSend {
     pub(crate) async fn reserve_guarded(
         &self,
     ) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
-        let FramedSender::Queued(queue) = &self.sender else {
-            return Err(GuardedReserveError::Unsupported);
-        };
+        let queue = &self.queue;
         queue
             .slot()
             .await
@@ -439,10 +379,7 @@ impl FramedSend {
         frame: Frame,
         guard: FrameGuard,
     ) -> Result<(), GuardedReserveError> {
-        let FramedSender::Queued(queue) = &self.sender else {
-            return Err(GuardedReserveError::Unsupported);
-        };
-        queue
+        self.queue
             .frames
             .send(QueuedFrame::guarded(frame, guard, None))
             .map_err(|_| GuardedReserveError::Closed)
@@ -455,29 +392,19 @@ impl FramedSend {
     pub(crate) async fn reserve_response_guarded(
         &self,
     ) -> Result<ResponseFrameSlot<'_>, GuardedReserveError> {
-        let budget = self
-            .response_slots
-            .as_ref()
-            .ok_or(GuardedReserveError::Unsupported)?;
-        let response = budget.reserve().await;
+        let response = self.response_slots.reserve().await;
         let slot = self.reserve_guarded().await?;
         Ok(ResponseFrameSlot { slot, response })
     }
 
     /// Current free slots in the bounded transport queue.
     pub fn capacity(&self) -> usize {
-        match &self.sender {
-            FramedSender::Plain(sender) => sender.capacity(),
-            FramedSender::Queued(queue) => queue.slots.available(),
-        }
+        self.queue.slots.available()
     }
 
     /// Total slots in the bounded transport queue.
     pub fn max_capacity(&self) -> usize {
-        match &self.sender {
-            FramedSender::Plain(sender) => sender.max_capacity(),
-            FramedSender::Queued(queue) => queue.depth,
-        }
+        self.queue.depth
     }
 }
 
@@ -507,9 +434,7 @@ impl GuardedFrameSlot<'_> {
         }
         let sent = self.sender.send(QueuedFrame {
             frame,
-            guard: None,
-            claim: Some(claim),
-            output: None,
+            owner: FrameOwner::Claim(claim),
             queue_slot: Some(self.slot),
         });
         sent.is_ok() && !self.sender.is_closed()
@@ -546,8 +471,6 @@ pub(crate) enum GuardedReserveError {
     Full,
     /// The transport worker has closed its receive half.
     Closed,
-    /// This handle wraps a compatibility channel without guard support.
-    Unsupported,
 }
 
 /// Shared service ownership held until a frame finishes its application write.
@@ -566,14 +489,23 @@ impl FrameGuard {
     }
 }
 
-/// Frame plus optional response ownership retained through its transport write.
+/// What keeps a queued frame's resources owned through its transport write.
+#[derive(Debug)]
+enum FrameOwner {
+    /// No other owner funds this frame. The grant is absent on a queue without
+    /// an output gate.
+    Output { _grant: Option<FrameGrant> },
+    /// Another owner's capacity funds this frame until its write ends.
+    Guard(FrameGuard),
+    /// This request's owner claims it before its first byte.
+    Claim(Arc<dyn FrameWriteClaim>),
+}
+
+/// Frame plus the ownership retained through its transport write.
 #[derive(Debug)]
 pub(crate) struct QueuedFrame {
     frame: Frame,
-    guard: Option<FrameGuard>,
-    claim: Option<Arc<dyn FrameWriteClaim>>,
-    /// Funds a frame that has no guard from another owner.
-    output: Option<FrameGrant>,
+    owner: FrameOwner,
     /// This frame's place in the queue, which ends when the receiver dequeues
     /// it. A terminal frame's exchange slot funds its place instead.
     queue_slot: Option<SlotPermit>,
@@ -582,7 +514,7 @@ pub(crate) struct QueuedFrame {
 impl QueuedFrame {
     /// Complete an in-process channel delivery if its claim can still start.
     fn receive(self) -> Option<Frame> {
-        if let Some(claim) = &self.claim {
+        if let FrameOwner::Claim(claim) = &self.owner {
             if !claim.try_start() {
                 return None;
             }
@@ -594,9 +526,7 @@ impl QueuedFrame {
     fn plain(frame: Frame, output: Option<FrameGrant>, queue_slot: SlotPermit) -> Self {
         Self {
             frame,
-            guard: None,
-            claim: None,
-            output,
+            owner: FrameOwner::Output { _grant: output },
             queue_slot: Some(queue_slot),
         }
     }
@@ -604,16 +534,18 @@ impl QueuedFrame {
     fn guarded(frame: Frame, guard: FrameGuard, queue_slot: Option<SlotPermit>) -> Self {
         Self {
             frame,
-            guard: Some(guard),
-            claim: None,
-            output: None,
+            owner: FrameOwner::Guard(guard),
             queue_slot,
         }
     }
 
     /// Split the frame from its guard while retaining both in the caller.
     pub(crate) fn into_parts(self) -> (Frame, Option<FrameGuard>) {
-        (self.frame, self.guard)
+        let guard = match self.owner {
+            FrameOwner::Guard(guard) => Some(guard),
+            FrameOwner::Output { .. } | FrameOwner::Claim(_) => None,
+        };
+        (self.frame, guard)
     }
 
     /// Run the transport write while retaining this frame's guard.
@@ -644,17 +576,19 @@ impl QueuedFrame {
     {
         let Self {
             frame,
-            guard: _guard,
-            claim,
-            output: _output,
+            owner,
             queue_slot: _,
         } = self;
         let encoded = encode(frame)?;
-        if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
+        let claim = match &owner {
+            FrameOwner::Claim(claim) => Some(claim),
+            FrameOwner::Output { .. } | FrameOwner::Guard(_) => None,
+        };
+        if claim.is_some_and(|claim| !claim.try_start()) {
             return Ok(());
         }
         write(encoded).await?;
-        if let Some(claim) = &claim {
+        if let Some(claim) = claim {
             claim.written();
         }
         Ok(())
@@ -742,22 +676,6 @@ mod tests {
                 ..
             }))
         ));
-    }
-
-    #[tokio::test]
-    async fn public_constructors_keep_plain_channel_compatibility() {
-        let (raw_sender, mut raw_receiver) = mpsc::channel(1);
-        let sender = FramedSend::new(raw_sender);
-        sender.send(frame(7)).await.expect("plain channel is open");
-        assert_eq!(raw_receiver.recv().await, Some(frame(7)));
-
-        let (raw_sender, raw_receiver) = mpsc::channel(1);
-        let mut receiver = FramedRecv::new(raw_receiver);
-        raw_sender
-            .send(frame(8))
-            .await
-            .expect("plain channel is open");
-        assert_eq!(receiver.recv().await, Some(frame(8)));
     }
 
     #[tokio::test]
@@ -896,15 +814,15 @@ mod tests {
 
         drop(write);
         let slot = pending.await.unwrap();
-        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 1);
+        assert_eq!(sender.response_slots.reserved(), 1);
         drop(slot);
-        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+        assert_eq!(sender.response_slots.reserved(), 0);
         drop(receiver);
         assert!(matches!(
             sender.reserve_response_guarded().await,
             Err(GuardedReserveError::Closed)
         ));
-        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+        assert_eq!(sender.response_slots.reserved(), 0);
     }
 
     #[tokio::test]
@@ -931,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_reservation_reports_full_closed_and_unsupported_queues() {
+    fn guarded_reservation_reports_full_and_closed_queues() {
         let (sender, receiver) = worker_framed_channel(1);
         sender.try_send(frame(1)).unwrap();
         assert!(matches!(
@@ -942,13 +860,6 @@ mod tests {
         assert!(matches!(
             sender.try_reserve_guarded(),
             Err(GuardedReserveError::Closed)
-        ));
-
-        let (raw_sender, _raw_receiver) = mpsc::channel(1);
-        let sender = FramedSend::new(raw_sender);
-        assert!(matches!(
-            sender.try_reserve_guarded(),
-            Err(GuardedReserveError::Unsupported)
         ));
     }
 
@@ -977,8 +888,7 @@ mod tests {
     ) -> (FramedSend, FramedWorkerRecv, OutputByteBudget) {
         let (sender, receiver) = worker_framed_channel(depth);
         let budget = OutputByteBudget::new(capacity).unwrap();
-        let wide = OutputByteBudget::new(1 << 30).unwrap();
-        let sender = sender.with_output_gate(FrameGate::new(budget.clone(), wide));
+        let sender = sender.with_output_gate(FrameGate::over(budget.clone()));
         (sender, receiver, budget)
     }
 
@@ -1210,8 +1120,7 @@ mod tests {
     }
 
     fn admitted(budget: &OutputByteBudget) -> AdmittedFrame {
-        let wide = OutputByteBudget::new(1 << 30).unwrap();
-        let grant = FrameGate::new(budget.clone(), wide)
+        let grant = FrameGate::over(budget.clone())
             .try_admit(frame_bytes())
             .unwrap();
         AdmittedFrame {

@@ -11,9 +11,8 @@ use super::{
     *,
 };
 use crate::zakura::{
-    handler::ServiceSessionIO, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-    ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+    handler::{CloseCause, ServiceSessionIO, ZakuraConnTrace},
+    ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
 
 const REOPEN: SessionPolicy = SessionPolicy {
@@ -40,157 +39,96 @@ fn state(stream: Stream) -> ServiceSessionState {
     ServiceSessionState::new(stream, REOPEN, INITIATOR)
 }
 
+/// The connection's session IO for that one service.
+fn session_io(stream: Stream) -> ServiceSessionIO {
+    ServiceSessionIO::new(
+        [(stream.kind, state(stream))].into_iter().collect(),
+        ZakuraConnTrace::without_peer(1),
+        CloseCause::new(),
+    )
+}
+
 fn retry_later() -> SessionDemand {
     SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60))
 }
 
 // Opening and reopen rules.
 
-/// Reopen a header-sync stream after the responder parks it on a healthy connection.
-/// The transport opening roles determine the reopen policy.
+/// The transport opening roles select the one endpoint that opens and reopens
+/// a service, whichever generation just exited. Both endpoints still accept an
+/// either-side offer, for interoperability with peers that open one themselves.
 #[test]
 fn ordered_session_reopen_follows_transport_opening_policy() {
-    let initiator_opened = Stream {
-        kind: ZAKURA_STREAM_HEADER_SYNC,
-        version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        frame_cap: 1,
-        capability: ZAKURA_CAP_HEADER_SYNC,
-        ..Stream::PERSISTENT
-    };
-    let exit = SessionExit {
-        stream: initiator_opened,
-        session_id: 1,
-        opened_locally: true,
-    };
-    let initiator_policy = SessionPolicy {
-        opening: SessionOpening::InitiatorOnly,
-        reopen: true,
-    };
-    assert!(should_reopen_ordered_session(
-        exit,
-        initiator_policy,
-        true,
-        false,
-        false
-    ));
-    assert!(!should_reopen_ordered_session(
-        exit,
-        initiator_policy,
-        false,
-        true,
-        false
-    ));
-    assert!(!should_reopen_ordered_session(
-        exit,
-        initiator_policy,
-        true,
-        false,
-        true
-    ));
-    assert!(!should_reopen_ordered_session(
-        exit,
-        SessionPolicy::default(),
-        true,
-        false,
-        false,
-    ));
-
-    // The authorized side replaces an accepted stream too; replacement does
-    // not depend on which physical generation just exited.
-    assert!(should_reopen_ordered_session(
-        SessionExit {
-            opened_locally: false,
-            ..exit
-        },
-        initiator_policy,
-        true,
-        false,
-        false,
-    ));
-
-    let either_peer = SessionExit {
-        stream: Stream {
-            kind: ZAKURA_STREAM_BLOCK_SYNC,
-            ..initiator_opened
-        },
-        ..exit
-    };
-    let either_policy = SessionPolicy {
+    const fn roles(is_initiator: bool, i_open_collision_winner: bool) -> ConnectionRoles {
+        ConnectionRoles {
+            is_initiator,
+            i_open_collision_winner,
+        }
+    }
+    const EITHER: SessionPolicy = SessionPolicy {
         opening: SessionOpening::EitherSide,
         reopen: true,
     };
-    assert!(should_reopen_ordered_session(
-        either_peer,
-        either_policy,
-        true,
-        true,
-        false
-    ));
-    assert!(!should_reopen_ordered_session(
-        either_peer,
-        either_policy,
-        false,
-        false,
-        false
-    ));
-    assert!(opens_ordered_stream_locally(either_policy, false, true));
-    assert!(!opens_ordered_stream_locally(either_policy, true, false));
-
+    let stream = test_ordered_stream();
+    let local = SessionExit {
+        stream,
+        session_id: 1,
+        opened_locally: true,
+    };
+    let remote = SessionExit {
+        opened_locally: false,
+        ..local
+    };
     let request_response = SessionExit {
         stream: Stream {
             kind: 102,
             mode: StreamMode::RequestResponse,
-            ..initiator_opened
+            ..stream
         },
-        ..exit
-    };
-    assert!(!should_reopen_ordered_session(
-        request_response,
-        either_policy,
-        true,
-        true,
-        false,
-    ));
-}
-
-#[test]
-fn either_side_session_has_one_proactive_opener_across_connection_roles() {
-    let policy = SessionPolicy {
-        opening: SessionOpening::EitherSide,
-        reopen: true,
-    };
-    let exit = SessionExit {
-        stream: Stream {
-            kind: ZAKURA_STREAM_BLOCK_SYNC,
-            version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-            frame_cap: 1,
-            capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-            ..Stream::PERSISTENT
-        },
-        session_id: 1,
-        opened_locally: false,
+        ..local
     };
 
-    for winner_is_initiator in [false, true] {
-        let opens = [
-            opens_ordered_stream_locally(policy, winner_is_initiator, true),
-            opens_ordered_stream_locally(policy, !winner_is_initiator, false),
-        ];
-        assert_eq!(opens, [true, false]);
-        assert_eq!(opens.into_iter().filter(|opens| *opens).count(), 1);
-
-        let reopens = [
-            should_reopen_ordered_session(exit, policy, winner_is_initiator, true, false),
-            should_reopen_ordered_session(exit, policy, !winner_is_initiator, false, false),
-        ];
-        assert_eq!(reopens, [true, false]);
-        assert_eq!(reopens.into_iter().filter(|reopens| *reopens).count(), 1);
+    // Exit, policy, roles, connection cancelled, and whether the service reopens.
+    for (exit, policy, roles, cancelled, reopens) in [
+        (local, REOPEN, roles(true, false), false, true),
+        (remote, REOPEN, roles(true, false), false, true),
+        (local, REOPEN, roles(false, true), false, false),
+        (local, REOPEN, roles(true, false), true, false),
+        (
+            local,
+            SessionPolicy::default(),
+            roles(true, false),
+            false,
+            false,
+        ),
+        (local, EITHER, roles(true, true), false, true),
+        (local, EITHER, roles(false, false), false, false),
+        (remote, EITHER, roles(false, true), false, true),
+        (remote, EITHER, roles(true, false), false, false),
+        (remote, EITHER, roles(true, true), false, true),
+        (remote, EITHER, roles(false, false), false, false),
+        (request_response, EITHER, roles(true, true), false, false),
+    ] {
+        assert_eq!(
+            should_reopen_ordered_session(exit, policy, roles, cancelled),
+            reopens,
+            "{exit:?} {policy:?} {roles:?} cancelled={cancelled}"
+        );
     }
 
-    // Both endpoints continue accepting an offer for interoperability with
-    // peers that still proactively open either-side streams themselves.
-    assert!(may_open_ordered_stream(policy, true));
-    assert!(may_open_ordered_stream(policy, false));
+    // The collision winner alone opens an either-side service, whoever dialed.
+    for winner_is_initiator in [false, true] {
+        assert!(opens_ordered_stream_locally(
+            EITHER,
+            roles(winner_is_initiator, true)
+        ));
+        assert!(!opens_ordered_stream_locally(
+            EITHER,
+            roles(!winner_is_initiator, false)
+        ));
+    }
+    assert!(may_open_ordered_stream(EITHER, true));
+    assert!(may_open_ordered_stream(EITHER, false));
 }
 
 #[test]
@@ -257,20 +195,23 @@ fn an_old_generation_exit_leaves_the_replacement_active() {
     let mut session = state(stream);
     assert_eq!(session.remote_completed(1), RemoteCompletion::CheckDemand);
     assert_eq!(
-        session.remote_parked(1, DemandWait::Later),
-        Some(DemandChange::Start)
+        session.remote_demand(1, DemandWait::Later),
+        RemoteDemand::Park(Some(DemandChange::Start))
     );
     assert!(!session.has_active_session(), "parking frees the service");
-    session.wait_finished();
+    session.clear_wait();
     assert_eq!(session.remote_completed(2), RemoteCompletion::CheckDemand);
-    session.remote_adopted();
+    assert_eq!(
+        session.remote_demand(2, DemandWait::OpenNow),
+        RemoteDemand::Adopt
+    );
 
     let old = SessionExit {
         stream,
         session_id: 1,
         opened_locally: false,
     };
-    assert_eq!(session.exited(old, false), None);
+    assert_eq!(session.exited(old, false).reopen_after, None);
     assert_eq!(session.remote_session_id, Some(2));
     assert!(!session.is_waiting(), "a stale exit schedules no reopen");
 
@@ -279,7 +220,7 @@ fn an_old_generation_exit_leaves_the_replacement_active() {
         ..old
     };
     assert_eq!(
-        session.exited(current, false),
+        session.exited(current, false).reopen_after,
         Some(ORDERED_STREAM_REOPEN_BACKOFF)
     );
     assert!(!session.has_active_session());
@@ -296,14 +237,17 @@ fn a_lost_collision_keeps_the_adopted_generation_after_the_local_exit() {
         session.remote_completed(2),
         RemoteCompletion::AdoptCollision
     );
-    session.remote_adopted();
+    assert_eq!(
+        session.remote_demand(2, DemandWait::OpenNow),
+        RemoteDemand::Adopt
+    );
 
     let local = SessionExit {
         stream,
         session_id: 1,
         opened_locally: true,
     };
-    assert_eq!(session.exited(local, false), None);
+    assert_eq!(session.exited(local, false).reopen_after, None);
     assert_eq!(session.local_session_id, None);
     assert_eq!(session.remote_session_id, Some(2));
 }
@@ -340,8 +284,8 @@ fn a_late_member_keeps_the_first_arrivals_deadline() {
         Some(MemberArrival::Waiting)
     );
     assert_eq!(pending.deadline(), Some(deadline));
-    assert_eq!(pending.expire(late), Vec::<u16>::new());
-    assert_eq!(pending.expire(deadline), vec![MEMBER_A.kind]);
+    assert_eq!(pending.expire(late), Vec::new());
+    assert_eq!(pending.expire(deadline), vec![(MEMBER_A.kind, 7)]);
     assert_eq!(pending.deadline(), None);
     assert_eq!(
         pending.reservation(MEMBER_A.kind, deadline),
@@ -452,24 +396,25 @@ fn every_member_completes_the_offer_in_any_order() {
 
 // The reopen-wait contract between the state and `ServiceSessionIO`.
 
+const KIND: u16 = ZAKURA_STREAM_HEADER_SYNC;
+
 #[tokio::test(start_paused = true)]
 async fn session_waits_deduplicate_demand() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
     let (change_tx, change_rx) = watch::channel(());
 
     io.schedule_demand(
-        &mut session,
+        KIND,
         SessionDemand::WaitForChange(Box::pin(async move {
             let mut change_rx = change_rx;
             let _ = change_rx.changed().await;
         })),
     );
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
 
     assert_eq!(io.waits.len(), 1);
     assert_eq!(
-        session.reopen_state,
+        io.session(KIND).reopen_state,
         SessionReopenState::Waiting(SessionWaitReason::Demand)
     );
     assert_eq!(
@@ -481,76 +426,69 @@ async fn session_waits_deduplicate_demand() {
 
 #[tokio::test(start_paused = true)]
 async fn session_demand_replaces_transport_backoff() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
     assert_eq!(
-        io.schedule_transport_backoff(&mut session),
+        io.schedule_transport_backoff(KIND),
         Some(ORDERED_STREAM_REOPEN_BACKOFF)
     );
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
 
-    assert_eq!(session.reopen_attempts, 1);
+    assert_eq!(io.session(KIND).reopen_attempts, 1);
     assert_eq!(io.waits.len(), 1);
     assert_eq!(
-        session.reopen_state,
+        io.session(KIND).reopen_state,
         SessionReopenState::Waiting(SessionWaitReason::Demand)
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn ordered_session_exit_keeps_existing_demand_wait() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
 
-    assert_eq!(io.schedule_transport_backoff(&mut session), None);
-    assert_eq!(session.reopen_attempts, 0);
+    assert_eq!(io.schedule_transport_backoff(KIND), None);
+    assert_eq!(io.session(KIND).reopen_attempts, 0);
     assert_eq!(io.waits.len(), 1);
     assert_eq!(
-        session.reopen_state,
+        io.session(KIND).reopen_state,
         SessionReopenState::Waiting(SessionWaitReason::Demand)
     );
 }
 
 #[tokio::test]
 async fn ordered_session_retirement_cancels_and_blocks_transport_waits() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, retry_later());
-    io.schedule_demand(&mut session, SessionDemand::Retire);
+    io.schedule_demand(KIND, retry_later());
+    io.schedule_demand(KIND, SessionDemand::Retire);
 
     assert!(io.waits.is_empty());
-    assert_eq!(session.reopen_state, SessionReopenState::Retired);
-    assert_eq!(io.schedule_transport_backoff(&mut session), None);
-    assert_eq!(session.reopen_attempts, 0);
+    assert_eq!(io.session(KIND).reopen_state, SessionReopenState::Retired);
+    assert_eq!(io.schedule_transport_backoff(KIND), None);
+    assert_eq!(io.session(KIND).reopen_attempts, 0);
 }
 
 #[tokio::test]
 async fn ordered_session_adoption_drops_pending_wait() {
-    let stream = test_ordered_stream();
-    let mut session = state(stream);
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, SessionDemand::OpenNow);
-    session.opened(1);
-    io.cancel(stream.kind);
+    io.schedule_demand(KIND, SessionDemand::OpenNow);
+    let attempt = io.begin_attempt(KIND);
+    io.on_opened(KIND, 1, attempt);
 
     assert!(io.waits.is_empty());
-    assert_eq!(session.reopen_state, SessionReopenState::Idle);
+    assert_eq!(io.session(KIND).reopen_state, SessionReopenState::Idle);
 }
 
 #[tokio::test]
 async fn session_demand_change_yields_exactly_one_reopen() {
-    let stream = test_ordered_stream();
-    let mut session = state(stream);
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
     let (change_tx, mut change_rx) = watch::channel(());
 
     io.schedule_demand(
-        &mut session,
+        KIND,
         SessionDemand::WaitForChange(Box::pin(async move {
             let _ = change_rx.changed().await;
         })),
@@ -561,23 +499,19 @@ async fn session_demand_change_yields_exactly_one_reopen() {
         .expect("reactor change is observed before timeout")
         .expect("connection still owns a pending session wait");
 
-    assert_eq!(kind, stream.kind);
-    io.finish(kind);
-    session.wait_finished();
+    assert_eq!(kind, KIND);
+    assert_eq!(io.on_wait_fired(kind, false), Some(test_ordered_stream()));
     assert!(
         io.waits.is_empty(),
         "one state change yields one reopen attempt"
     );
-    assert!(session.may_reopen(false));
 }
 
 #[tokio::test(start_paused = true)]
 async fn session_demand_deadline_yields_exactly_one_reopen() {
-    let stream = test_ordered_stream();
-    let mut session = state(stream);
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
     tokio::time::advance(Duration::from_secs(60)).await;
     let (kind, ()) = io
         .waits
@@ -585,9 +519,8 @@ async fn session_demand_deadline_yields_exactly_one_reopen() {
         .await
         .expect("reactor deadline keeps a pending session wait");
 
-    assert_eq!(kind, stream.kind);
-    io.finish(kind);
-    session.wait_finished();
+    assert_eq!(kind, KIND);
+    assert!(io.on_wait_fired(kind, false).is_some());
     assert!(
         io.waits.is_empty(),
         "one deadline yields one reopen attempt"
@@ -596,12 +529,11 @@ async fn session_demand_deadline_yields_exactly_one_reopen() {
 
 #[test]
 fn ordered_session_connection_teardown_drops_pending_waits() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
     let (change_tx, mut change_rx) = watch::channel(());
 
     io.schedule_demand(
-        &mut session,
+        KIND,
         SessionDemand::WaitForChange(Box::pin(async move {
             let _ = change_rx.changed().await;
         })),
@@ -637,7 +569,7 @@ proptest! {
     reason = "witnesses print applicability counters"
 )]
 fn fixed_seeds_exercise_every_session_rule() {
-    let mut total = ServiceSessionReplaySummary::default();
+    let mut total = std::collections::BTreeMap::new();
     for seed in 1..=32u64 {
         // A xorshift stream: reproducible bytes without a fuzzing engine.
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -649,20 +581,19 @@ fn fixed_seeds_exercise_every_session_rule() {
                 state.to_le_bytes()[0]
             })
             .collect();
-        let summary = replay_service_session_bytes(&bytes);
-        total.completed_offers += summary.completed_offers;
-        total.invalid_members += summary.invalid_members;
-        total.conflicting_members += summary.conflicting_members;
-        total.expired_offers += summary.expired_offers;
-        total.deferred_members += summary.deferred_members;
-        total.parked_collisions += summary.parked_collisions;
-        total.adopted_collisions += summary.adopted_collisions;
-        total.local_opens += summary.local_opens;
-        total.stale_exits += summary.stale_exits;
-        total.reopen_backoffs += summary.reopen_backoffs;
-        total.retirements += summary.retirements;
+        for (rule, count) in replay_rules(&replay_service_session_bytes(&bytes)) {
+            *total.entry(rule).or_insert(0) += count;
+        }
     }
     println!("tier=Machine target=service_session decoder=1 {total:?}");
+    for (rule, count) in &total {
+        assert!(*count > 0, "no fixed seed exercised {rule}: {total:?}");
+    }
+}
+
+/// Every rule a replay counts, by name. The destructure makes a new counter a
+/// compile error here.
+fn replay_rules(summary: &ServiceSessionReplaySummary) -> [(&'static str, usize); 11] {
     let ServiceSessionReplaySummary {
         completed_offers,
         invalid_members,
@@ -675,8 +606,8 @@ fn fixed_seeds_exercise_every_session_rule() {
         stale_exits,
         reopen_backoffs,
         retirements,
-    } = total.clone();
-    for (rule, count) in [
+    } = *summary;
+    [
         ("completed offers", completed_offers),
         ("invalid members", invalid_members),
         ("conflicting members", conflicting_members),
@@ -688,13 +619,11 @@ fn fixed_seeds_exercise_every_session_rule() {
         ("stale exits", stale_exits),
         ("reopen backoffs", reopen_backoffs),
         ("retirements", retirements),
-    ] {
-        assert!(count > 0, "no fixed seed exercised {rule}: {total:?}");
-    }
+    ]
 }
 
-/// A trace names the attempt that opened a generation, and only the exit of
-/// that exact generation clears it.
+/// Attempts count every local open, and only the exit of the exact generation
+/// is current.
 #[test]
 fn attempts_name_local_generations_and_stale_exits_keep_them() {
     let roles = ConnectionRoles {
@@ -711,32 +640,16 @@ fn attempts_name_local_generations_and_stale_exits_keep_them() {
     assert_eq!(session.begin_attempt(), 1);
     assert_eq!(session.begin_attempt(), 2, "a failed open keeps its number");
     session.opened(40);
-    assert_eq!(session.local_attempt(), Some(2));
 
     for stale in [exit(39, true), exit(40, false)] {
-        assert!(!session.records(stale));
-        assert_eq!(session.exited(stale, false), None);
-        assert_eq!(session.local_attempt(), Some(2));
+        let outcome = session.exited(stale, false);
+        assert!(!outcome.current);
+        assert_eq!(outcome.reopen_after, None);
+        assert_eq!(session.local_session_id, Some(40));
     }
 
-    assert!(session.records(exit(40, true)));
-    assert!(session.exited(exit(40, true), false).is_some());
-    assert_eq!(session.local_attempt(), None);
+    let outcome = session.exited(exit(40, true), false);
+    assert!(outcome.current);
+    assert!(outcome.reopen_after.is_some());
     assert_eq!(session.begin_attempt(), 3, "reopens keep counting");
-}
-
-/// `expiring` names exactly the offers `expire` drops, by wire ID.
-#[test]
-fn expiring_offers_keep_their_wire_ids() {
-    let layout = layout();
-    let start = Instant::now();
-    let mut pending = PendingState::default();
-    pending
-        .arrive(&layout, 9, MEMBER_A, SETUP_TIMEOUT, start)
-        .unwrap();
-    assert_eq!(pending.expiring(start), Vec::new());
-    let deadline = start + SETUP_TIMEOUT;
-    assert_eq!(pending.expiring(deadline), vec![(MEMBER_A.kind, 9)]);
-    assert_eq!(pending.expire(deadline), vec![MEMBER_A.kind]);
-    assert_eq!(pending.expiring(deadline), Vec::new());
 }

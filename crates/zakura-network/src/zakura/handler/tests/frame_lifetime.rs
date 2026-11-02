@@ -40,8 +40,35 @@ fn prelude(request_id: Option<u64>) -> StreamPrelude {
 /// A raw gate of `capacity` bytes, with the budget that observes it.
 fn raw_gate(capacity: u64) -> (FrameGate, OutputByteBudget) {
     let budget = OutputByteBudget::new(capacity).unwrap();
-    let wide = OutputByteBudget::new(1 << 30).unwrap();
-    (FrameGate::new(budget.clone(), wide), budget)
+    (FrameGate::over(budget.clone()), budget)
+}
+
+/// A persistent stream worker on `send` and `recv`, its inbound frames, its
+/// sender, and its cancellation.
+fn spawn_stream_worker(
+    send: SendStream,
+    recv: RecvStream,
+    context: StreamWorkerContext,
+) -> (
+    AbortOnDropHandle<()>,
+    mpsc::Receiver<AdmittedFrame>,
+    FramedSend,
+    CancellationToken,
+) {
+    let (inbound_tx, inbound_rx) = mpsc::channel(4);
+    let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+    let cancel = context.connection_token.clone();
+    context.precheck.start();
+    let worker = AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker(
+        send,
+        recv,
+        prelude(None),
+        context,
+        inbound_tx,
+        outbound_rx,
+        4,
+    )));
+    (worker, inbound_rx, outbound_tx, cancel)
 }
 
 /// The reader stops after a checked header until capacity returns. A worker's
@@ -57,19 +84,7 @@ async fn a_saturated_gate_holds_the_payload_until_capacity_returns() -> Result<(
 
     let bytes = frame_bytes(1, 16);
     let (_peer_send, _peer_recv, send, recv) = link.open(&bytes).await?;
-    let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-    let (_outbound_tx, outbound_rx) = worker_framed_channel(1);
-    let cancel = context.connection_token.clone();
-    context.precheck.start();
-    let worker = AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker(
-        send,
-        recv,
-        prelude(None),
-        context,
-        inbound_tx,
-        outbound_rx,
-        4,
-    )));
+    let (worker, mut inbound_rx, _outbound_tx, cancel) = spawn_stream_worker(send, recv, context);
     assert!(
         timeout(HELD, inbound_rx.recv()).await.is_err(),
         "no frame passes the saturated gate"
@@ -110,19 +125,7 @@ async fn cancelling_a_partial_frame_returns_its_admission() -> Result<(), BoxErr
     let mut bytes = frame_bytes(1, 512);
     bytes.truncate(100);
     let (_peer_send, _peer_recv, send, recv) = link.open(&bytes).await?;
-    let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-    let (_outbound_tx, outbound_rx) = worker_framed_channel(1);
-    let cancel = context.connection_token.clone();
-    context.precheck.start();
-    let worker = AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker(
-        send,
-        recv,
-        prelude(None),
-        context,
-        inbound_tx,
-        outbound_rx,
-        4,
-    )));
+    let (worker, _inbound_rx, _outbound_tx, cancel) = spawn_stream_worker(send, recv, context);
     timeout(TEST_TIMEOUT, async {
         while budget.granted() != 520 {
             tokio::time::sleep(Duration::from_millis(5)).await;

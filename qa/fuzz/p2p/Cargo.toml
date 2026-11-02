@@ -7,6 +7,11 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# What each target checks and which decoder reads its bytes.
+[package.metadata.zakura-machine.targets]
+service_session = { decoder = 1, properties = ["session/offer-assembly", "session/one-active-generation", "session/legal-reopen"] }
+cadence = { decoder = 1, properties = ["cadence/hold", "cadence/settlement"] }
+
 [dependencies]
 libfuzzer-sys = "0.4"
 zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuzz"] }

@@ -158,6 +158,7 @@ fn the_envelope_derives_each_bound_from_windows_connections_and_streams() {
     assert_eq!(envelope.connection_output_bytes, 32 << 20);
     assert_eq!(envelope.node_raw_bytes, 256 * (64 << 20));
     assert_eq!(envelope.node_output_bytes, 256 * (32 << 20));
+    assert_eq!(envelope.request_executions, 256 * 1024);
     assert_eq!(envelope.floor_frame_bytes, 2 * 256 * 1024 * (1 << 20));
     assert_eq!(envelope.transport_credit_bytes, 288 * (48 << 20));
     assert_eq!(

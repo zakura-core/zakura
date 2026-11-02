@@ -22,9 +22,7 @@
 //! matched-body path, and unmatched-body paths run in the same task.
 
 use std::collections::BTreeMap;
-use zakura_node_services::block_memory::{
-    Admission, AdmissionFailure, DecodedBlockPool, OwnedBlock,
-};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 use zakura_rt::{
     collections::HashSet,

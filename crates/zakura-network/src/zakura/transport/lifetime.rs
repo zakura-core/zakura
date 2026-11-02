@@ -105,6 +105,8 @@ pub(crate) struct ResourceEnvelope {
     pub(crate) node_output_bytes: u64,
     /// Outbound compatibility exchange bytes that the node may retain.
     pub(crate) compat_response_bytes: u64,
+    /// Request-stream executions that open streams allow at once across the node.
+    pub(crate) request_executions: usize,
     /// The frames each stream's raw and output floor slots may retain, in bytes.
     pub(crate) floor_frame_bytes: u128,
     /// Unspent transport credit the peer memory budget funds, in bytes.
@@ -134,6 +136,7 @@ impl ResourceEnvelope {
             connection_output_bytes,
             node_output_bytes: node_bytes(connection_output_bytes),
             compat_response_bytes: COMPAT_RESPONSE_EXCHANGES * COMPAT_EXCHANGE_MAX_BYTES,
+            request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
             floor_frame_bytes: 2 * streams * u128::from(limits.max_frame_bytes),
             transport_credit_bytes: live_connections
                 * u128::from(zakura_quic::connection_memory_bytes(

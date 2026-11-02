@@ -175,6 +175,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
         mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
         state: Buffer::new(BoxService::new(state), 1),
         latest_chain_tip,
+        max_checkpoint_height: network.checkpoint_list().max_height(),
         network,
         misbehavior_sender,
     };

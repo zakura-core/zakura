@@ -22,16 +22,18 @@ const MAINNET_TARGET_MULTIPLIER: u32 = 10;
 ///
 /// This does not verify the header hash or Equihash solution, or replace the
 /// parent-dependent difficulty check. All Mainnet downloads remain exempt while
-/// the committed tip is below the network's last checkpoint or absent. Only our
-/// own chain progress determines this exemption, never a peer's claimed height.
+/// the committed tip is absent or below `max_checkpoint_height`, the boundary
+/// returned by verifier initialization. Only our own chain progress determines
+/// this exemption, never a peer's claimed height.
 /// Other networks retain their existing validation rules.
 pub(super) fn has_sufficient_work(
     network: &Network,
     committed_tip_height: Option<Height>,
+    max_checkpoint_height: Height,
     target: CompactDifficulty,
 ) -> bool {
     if !matches!(network, Network::Mainnet)
-        || committed_tip_height.is_none_or(|tip| tip < network.checkpoint_list().max_height())
+        || committed_tip_height.is_none_or(|tip| tip < max_checkpoint_height)
     {
         return true;
     }
@@ -54,20 +56,40 @@ mod tests {
     use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
     #[test]
-    fn mainnet_work_floor_activates_at_the_last_checkpoint() {
+    fn mainnet_work_floor_activates_at_the_configured_checkpoint() {
         let network = Network::Mainnet;
-        let checkpoint = network.checkpoint_list().max_height();
         let easiest_target = network.target_difficulty_limit().to_compact();
-        for tip in [None, Some(checkpoint.previous().unwrap())] {
-            assert!(has_sufficient_work(&network, tip, easiest_target));
-        }
-        for tip in [checkpoint, checkpoint.next().unwrap()] {
-            assert!(!has_sufficient_work(&network, Some(tip), easiest_target));
-            assert!(has_sufficient_work(
-                &network,
-                Some(tip),
-                MAINNET_REFERENCE_TARGET,
-            ));
+        for checkpoint_sync in [true, false] {
+            let config = zakura_consensus::Config {
+                checkpoint_sync,
+                ..Default::default()
+            };
+            let (_, checkpoint) = zakura_consensus::router::init_checkpoint_list(config, &network);
+            if !checkpoint_sync {
+                assert!(checkpoint < network.checkpoint_list().max_height());
+            }
+            for tip in [None, Some(checkpoint.previous().unwrap())] {
+                assert!(has_sufficient_work(
+                    &network,
+                    tip,
+                    checkpoint,
+                    easiest_target
+                ));
+            }
+            for tip in [checkpoint, checkpoint.next().unwrap()] {
+                assert!(!has_sufficient_work(
+                    &network,
+                    Some(tip),
+                    checkpoint,
+                    easiest_target
+                ));
+                assert!(has_sufficient_work(
+                    &network,
+                    Some(tip),
+                    checkpoint,
+                    MAINNET_REFERENCE_TARGET,
+                ));
+            }
         }
     }
 
@@ -80,7 +102,12 @@ mod tests {
             let checkpoint = network.checkpoint_list().max_height();
             let easiest_target = network.target_difficulty_limit().to_compact();
             for tip in [None, Some(checkpoint), Some(checkpoint.next().unwrap())] {
-                assert!(has_sufficient_work(&network, tip, easiest_target));
+                assert!(has_sufficient_work(
+                    &network,
+                    tip,
+                    checkpoint,
+                    easiest_target
+                ));
             }
         }
     }
@@ -98,21 +125,25 @@ mod tests {
         assert!(has_sufficient_work(
             &Network::Mainnet,
             tip,
+            Network::Mainnet.checkpoint_list().max_height(),
             MAINNET_REFERENCE_TARGET
         ));
         assert!(has_sufficient_work(
             &Network::Mainnet,
             tip,
+            Network::Mainnet.checkpoint_list().max_height(),
             easiest_allowed_encoding
         ));
         assert!(!has_sufficient_work(
             &Network::Mainnet,
             tip,
+            Network::Mainnet.checkpoint_list().max_height(),
             easier_encoding
         ));
         assert!(!has_sufficient_work(
             &Network::Mainnet,
             tip,
+            Network::Mainnet.checkpoint_list().max_height(),
             CompactDifficulty::from_le_bytes([0; 4]),
         ));
     }

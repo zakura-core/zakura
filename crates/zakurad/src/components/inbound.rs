@@ -278,6 +278,9 @@ pub struct InboundSetupData {
     /// The network whose target spacing scales the gossip lookahead window.
     pub network: Network,
 
+    /// The last height handled by the configured checkpoint verifier.
+    pub max_checkpoint_height: block::Height,
+
     /// A channel to send misbehavior reports to the [`AddressBook`].
     pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
 }
@@ -473,6 +476,7 @@ impl Service<zn::Request> for Inbound {
                         latest_chain_tip,
                         network,
                         misbehavior_sender,
+                        max_checkpoint_height,
                     } = setup_data;
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
@@ -485,6 +489,7 @@ impl Service<zn::Request> for Inbound {
                         state.clone(),
                         latest_chain_tip,
                         network,
+                        max_checkpoint_height,
                     ));
 
                     result = Ok(());

@@ -241,7 +241,8 @@ impl Harness {
             verifier,
             state,
             latest_chain_tip,
-            chain_network,
+            chain_network.clone(),
+            chain_network.checkpoint_list().max_height(),
         );
 
         Self {

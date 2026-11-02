@@ -360,7 +360,9 @@ pub(in crate::zakura::header_sync) enum OfferedPeerWork {
     Other,
 }
 
-/// The facts that decide one peer's offer of a target at one instant.
+/// The facts that decide one peer's offer of a target at one instant, before
+/// its admission. [`decide_offer`] reads the admission facts only when these
+/// leave the offer open.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) struct OfferFacts {
     /// A `HistoryPruned` pause holds for this peer at the selected header tip.
@@ -371,11 +373,6 @@ pub(in crate::zakura::header_sync) struct OfferFacts {
     pub(in crate::zakura::header_sync) eligible: bool,
     /// The peer's started work.
     pub(in crate::zakura::header_sync) work: OfferedPeerWork,
-    /// A resource stall or missing headroom holds ordinary work back.
-    pub(in crate::zakura::header_sync) held_back: bool,
-    /// The session holds no subscription, or one that a `Grant` can continue
-    /// toward the target.
-    pub(in crate::zakura::header_sync) subscription_ready: bool,
 }
 
 /// Why an offer that cannot yield work is spent.
@@ -419,7 +416,17 @@ pub(in crate::zakura::header_sync) enum OfferDecision {
 }
 
 /// Decide one peer's offer. The checks run in priority order.
-pub(in crate::zakura::header_sync) fn decide_offer(facts: OfferFacts) -> OfferDecision {
+///
+/// `held_back` says whether a resource stall or missing headroom holds
+/// ordinary work back. `subscription_ready` says whether the session holds no
+/// subscription, or one that a `Grant` can continue toward the target. Each
+/// is read only when every earlier check passes, since reading them takes
+/// locks and a pass over peers, and most status offers end before them.
+pub(in crate::zakura::header_sync) fn decide_offer(
+    facts: OfferFacts,
+    held_back: impl FnOnce() -> bool,
+    subscription_ready: impl FnOnce() -> bool,
+) -> OfferDecision {
     let spent = if facts.pruned_pause {
         Some(SpentOffer::PrunedPause)
     } else if facts.covered {
@@ -440,10 +447,10 @@ pub(in crate::zakura::header_sync) fn decide_offer(facts: OfferFacts) -> OfferDe
             spend: facts.work == OfferedPeerWork::SameOrdinaryTarget,
         };
     }
-    if facts.held_back {
+    if held_back() {
         return OfferDecision::HeldBack;
     }
-    if !facts.subscription_ready {
+    if !subscription_ready() {
         return OfferDecision::AwaitSubscription;
     }
     OfferDecision::Stage

@@ -96,6 +96,7 @@ serde = { workspace = true, features = ["serde_derive", "rc"] }
 futures = { workspace = true }
 itertools = { workspace = true }
 rayon = { workspace = true }
+ref-cast = { workspace = true }
 
 # ZF deps
 ed25519-zebra = { workspace = true }

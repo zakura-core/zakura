@@ -452,6 +452,11 @@ pub struct ContextuallyVerifiedBlock {
     /// The block to commit to the state.
     pub(crate) block: BlockHandle,
 
+    /// One copy of the block's header, made when the block enters the
+    /// non-finalized state. Header-chain records share it, so they neither
+    /// pin the block's body nor copy the header on every commit.
+    pub(crate) header: Arc<block::Header>,
+
     /// The hash of the block.
     pub(crate) hash: block::Hash,
 
@@ -670,13 +675,14 @@ impl ContextuallyVerifiedBlock {
             receipt_order,
         } = semantically_verified;
 
-        let chain_value_pool_change = block.view().chain_value_pool_change_from_ordered_utxos(
+        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
             network,
             &spent_outputs,
             deferred_pool_balance_change,
         )?;
 
         Ok(Self {
+            header: Arc::new(*block.header()),
             block,
             hash,
             height,
@@ -826,13 +832,12 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
 }
 
 /// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
-fn transaction_hashes_and_auth_data_root<'a>(
-    block: impl Into<block::BlockView<'a>>,
+fn transaction_hashes_and_auth_data_root(
+    block: &block::BlockRef,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
     use rayon::prelude::*;
 
     let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
-        .into()
         .parallel_transactions()
         .map(|transaction| transaction.txid_and_auth_digest())
         .unzip();

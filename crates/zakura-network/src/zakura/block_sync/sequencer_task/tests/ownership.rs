@@ -398,6 +398,49 @@ fn runtime_payload(
     (policy, payloads, weak)
 }
 
+/// A raw body the pool refuses for capacity is decoded again only after the
+/// capacity version or its admission changes.
+#[test]
+fn capacity_refused_payload_waits_for_a_capacity_change() {
+    let decode = |bytes: &[u8]| -> block::Block { bytes.zcash_deserialize_into().unwrap() };
+    let (_policy, mut payloads, _) = runtime_payload(
+        block::Height(2),
+        Arc::new(decode(BLOCK_MAINNET_2_BYTES.as_slice())),
+    );
+    let id = payloads.retained_ids().next().unwrap();
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(4).unwrap(), 1);
+    let holder = pool
+        .try_admit(
+            decode(BLOCK_MAINNET_3_BYTES.as_slice()),
+            Admission::PipelineExempt,
+        )
+        .unwrap();
+    let full = pool.capacity_version();
+
+    let refused = payloads.materialize(id, &pool, Admission::WithinLimit, full);
+    assert!(matches!(refused, Err(AdmissionFailure::Capacity)));
+    assert_eq!(
+        payloads.capacity_refused,
+        Some((id, Admission::WithinLimit, full))
+    );
+    let skipped = payloads.materialize(id, &pool, Admission::WithinLimit, full);
+    assert!(matches!(skipped, Err(AdmissionFailure::Capacity)));
+
+    holder.leave_pipeline();
+    let released = pool.capacity_version();
+    assert_ne!(released, full, "a release changes capacity");
+    let retried = payloads.materialize(id, &pool, Admission::WithinLimit, released);
+    assert!(matches!(retried, Err(AdmissionFailure::Capacity)));
+    assert_eq!(
+        payloads.capacity_refused,
+        Some((id, Admission::WithinLimit, released)),
+        "the retry decoded and recorded its own refusal"
+    );
+
+    let exempt = payloads.materialize(id, &pool, Admission::PipelineExempt, released);
+    assert!(exempt.is_ok(), "another admission is a new attempt");
+}
+
 #[test]
 fn runtime_payload_demotion_drops_the_decoded_copy() {
     let block = Arc::new(
@@ -427,6 +470,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
             facts.id,
             &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
             Admission::WithinLimit,
+            0,
         )
         .unwrap();
     policy
@@ -681,7 +725,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
     else {
         panic!("the commit-window body must submit");
     };
-    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    let decoded_bytes = submitted.attributed_memory_size_bytes();
     assert_eq!(
         task.state
             .sequencer()
@@ -737,7 +781,7 @@ async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submiss
     else {
         panic!("the body must submit");
     };
-    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    let decoded_bytes = submitted.attributed_memory_size_bytes();
     assert_eq!(
         view.borrow().applying_decoded_attributed_memory_bytes,
         decoded_bytes

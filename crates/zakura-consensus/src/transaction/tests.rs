@@ -108,7 +108,7 @@ async fn cancelled_owned_transaction_verification_keeps_queued_script_charge() {
     );
     let mut future = verifier.call(Request::Block {
         transaction_hash: transaction.hash(),
-        transaction: transaction.into(),
+        transaction,
         known_utxos: Arc::new(known_utxos),
         known_outpoint_hashes: Arc::new(known_outpoint_hashes),
         height,

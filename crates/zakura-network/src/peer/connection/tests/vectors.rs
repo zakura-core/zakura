@@ -1328,6 +1328,7 @@ async fn block_gossip_slot_tracks_connection_write() {
     connection.block_advert_rx = block_advert_rx;
     let gossip = BlockGossipPeer {
         sender: block_advert_tx,
+        address: None,
         uploads: connection.block_uploads.clone(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
@@ -1385,6 +1386,7 @@ async fn truncated_block_request_releases_gossip_slot() {
     connection.block_advert_rx = block_advert_rx;
     let gossip = BlockGossipPeer {
         sender: block_advert_tx,
+        address: None,
         uploads: connection.block_uploads.clone(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,

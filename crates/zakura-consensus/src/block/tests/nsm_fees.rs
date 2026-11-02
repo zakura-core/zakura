@@ -105,6 +105,9 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
                     zs::Request::CommitSemanticallyVerifiedBlock(block) => {
                         zs::Response::Committed(block.hash)
                     }
+                    zs::Request::CheckAuthDataCommitment(_) => {
+                        zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
+                    }
                     _ => panic!("unexpected state request: {request:?}"),
                 })
             });
@@ -199,6 +202,7 @@ proptest::proptest! {
                             assert!(excess <= 0, "overflowing fees must not reach state commit");
                             zs::Response::Committed(block.hash)
                         },
+                        zs::Request::CheckAuthDataCommitment(_) => zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound),
                         _ => panic!("unexpected state request: {request:?}"),
                     })
                 });

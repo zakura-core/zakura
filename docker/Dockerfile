@@ -125,7 +125,8 @@ CMD [ "cargo", "test" ]
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
 # Release archives and both runtime image variants inherit these binaries.
-# RUSTFLAGS sets no CPU target features, so they run on any x86-64 CPU.
+# Default Cargo features enable BMI2/ADX Pasta assembly on x86-64.
+# Use FEATURES="default-release-binaries,portable" for older x86-64 CPUs.
 FROM deps AS release
 
 ARG SHORT_SHA

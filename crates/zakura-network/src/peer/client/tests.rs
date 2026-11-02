@@ -120,6 +120,14 @@ impl ClientTestHarness {
             .expect("request receiver endpoint has already been dropped");
     }
 
+    /// Waits for the next queued block advert.
+    pub(crate) async fn receive_block_advert(&mut self) -> BlockAdvert {
+        self.block_advert_receiver
+            .recv()
+            .await
+            .expect("the connection remains open")
+    }
+
     /// Returns the next block advert the [`Client`] queued, if any.
     pub(crate) fn try_to_receive_block_advert(&mut self) -> Option<BlockAdvert> {
         self.block_advert_receiver.try_recv().ok()

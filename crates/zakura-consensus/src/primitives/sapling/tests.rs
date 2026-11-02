@@ -222,6 +222,29 @@ async fn sapling_fallback_preparation_waits_for_the_rayon_worker() {
         .expect_err("the malformed proof is rejected on the CPU worker");
 }
 
+/// A panic in a fallback CPU job must become an error and leave the pool usable.
+#[tokio::test]
+async fn sapling_fallback_contains_worker_panics() {
+    let _guard = zakura_test::init();
+    let result = tokio::time::timeout(
+        VERIFICATION_TIMEOUT,
+        super::spawn_fallback(|| panic!("deliberate fallback verification panic")),
+    )
+    .await
+    .expect("the panic is reported without waiting for a channel timeout");
+    assert!(
+        result.is_err(),
+        "a panicking verifier never returns success"
+    );
+
+    let (nu, tx) = mined_v4_sapling_transaction_with_spends();
+    let valid = item(&tx, nu).expect("the fixture has a Sapling bundle");
+    tokio::time::timeout(VERIFICATION_TIMEOUT, super::verify_single(valid))
+        .await
+        .expect("the pool remains usable after catching a verification panic")
+        .expect("a valid bundle still verifies after the panicking job");
+}
+
 /// A manual, uncached service benchmark without exposing a benchmark-only API.
 ///
 /// Run this test alone with `--ignored --exact --nocapture`, and set

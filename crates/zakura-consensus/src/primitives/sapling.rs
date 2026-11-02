@@ -248,7 +248,7 @@ pub fn verify_single(
     item: Item,
 ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>> {
     async move {
-        let is_valid = super::spawn_fifo(move || {
+        let is_valid = spawn_fallback(move || {
             let mut batch = BatchValidator::default();
             if !batch.check_bundle(item.bundle, item.sighash.into()) {
                 return false;
@@ -265,6 +265,19 @@ pub fn verify_single(
         }
     }
     .boxed()
+}
+
+/// Runs fallback verification on Rayon, returning an error if it panics.
+///
+/// An uncaught panic in a detached Rayon task aborts the process. Keep the
+/// panic-to-error boundary previously provided by Tokio's blocking task.
+async fn spawn_fallback<F>(verify: F) -> Result<bool, BoxError>
+where
+    F: FnOnce() -> bool + Send + std::panic::UnwindSafe + 'static,
+{
+    super::spawn_fifo(move || std::panic::catch_unwind(verify))
+        .await?
+        .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))
 }
 
 /// The batching-and-fallback stack for Sapling bundle verification, before caching.

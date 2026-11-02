@@ -697,6 +697,7 @@ async fn mainnet_active_work_floor_allows_parent_recovery() {
         assert!(has_sufficient_work(
             &Network::Mainnet,
             Some(tip_height),
+            child_height,
             child.header.difficulty_threshold,
         ));
         assert!(zakura_consensus::proof_of_work_is_valid(

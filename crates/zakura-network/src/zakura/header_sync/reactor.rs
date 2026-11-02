@@ -633,7 +633,7 @@ impl HeaderSyncReactor {
             StorageOutcome::Completed { call, .. } => *call,
             StorageOutcome::Panicked(context) => context.call,
         };
-        if self.state.calls.settle(call).is_err() {
+        if !self.state.calls.settle(call) {
             tracing::error!(
                 ?call,
                 "a header storage call settled twice or never started"
@@ -2958,9 +2958,9 @@ fn source_id_from_peer(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
 mod machine_tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use machine_tests::{
-    replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
-    HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
-    HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep, HeaderReactorView,
+    trace_header_reactor_bytes, HeaderMachineFailure, HeaderMachinePhase, HeaderReactorHistory,
+    HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
+    HeaderReactorView,
 };
 
 #[cfg(test)]

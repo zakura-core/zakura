@@ -562,7 +562,7 @@ impl Harness {
                     .get(&peer)
                     .is_some_and(|pending| pending.read == read % self.started.len());
                 assert_eq!(
-                    self.state.calls.settle(key.call).is_ok(),
+                    self.state.calls.settle(key.call),
                     was_pending,
                     "{PROPERTY}: only the pending call settles"
                 );
@@ -595,7 +595,7 @@ impl Harness {
                     .get(&peer)
                     .is_some_and(|pending| pending.read == read % self.started.len());
                 assert_eq!(
-                    self.state.calls.settle(key.call).is_ok(),
+                    self.state.calls.settle(key.call),
                     matches,
                     "{PROPERTY}: only the pending call settles"
                 );
@@ -1338,7 +1338,7 @@ const PROPERTY: &str = "header/reactor-policy";
 
 /// Applicable transitions in a decoder-v1 header reactor history.
 #[derive(Debug, Default, Eq, PartialEq)]
-pub struct HeaderReactorReplaySummary {
+struct HeaderReactorReplaySummary {
     /// Operations decoded.
     pub transitions: usize,
     /// Session admissions checked.
@@ -1365,7 +1365,8 @@ pub struct HeaderReactorReplaySummary {
 
 /// Replay decoder-v1 quadruples against the existing header reactor model.
 /// Read at most 512 bytes and keep every deadline relative to one clock origin.
-pub fn replay_header_reactor_bytes(data: &[u8]) -> HeaderReactorReplaySummary {
+#[cfg(test)]
+fn replay_header_reactor_bytes(data: &[u8]) -> HeaderReactorReplaySummary {
     run_with(decode(data), |_| {}).summary
 }
 

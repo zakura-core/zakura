@@ -803,10 +803,6 @@ impl StorageCallKind {
     }
 }
 
-/// Why a settlement names no accepted call.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct UnknownStorageCall;
-
 /// Accepted direct storage calls that have not settled.
 ///
 /// Each call settles once, and only its exact number and kind settle it. The
@@ -833,14 +829,14 @@ impl StorageCalls {
         self.pending.insert(call.number, call.kind);
     }
 
-    /// Settle exactly `call`.
-    pub(super) fn settle(&mut self, call: StorageCall) -> Result<(), UnknownStorageCall> {
+    /// Settle exactly `call`, and return whether it was pending.
+    pub(super) fn settle(&mut self, call: StorageCall) -> bool {
         match self.pending.get(&call.number) {
             Some(kind) if *kind == call.kind => {
                 self.pending.remove(&call.number);
-                Ok(())
+                true
             }
-            _ => Err(UnknownStorageCall),
+            _ => false,
         }
     }
 

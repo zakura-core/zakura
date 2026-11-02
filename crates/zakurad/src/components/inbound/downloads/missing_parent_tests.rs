@@ -640,8 +640,10 @@ async fn invalid_proof_of_work_child_does_not_start_a_recovery() {
     let parent = block_1();
     let child = block_2();
     let invalid = with_parent(&child, unavailable(0x42));
+    // Testnet enforces the same header proof of work without the Mainnet
+    // admission floor, which deliberately excludes these historical targets.
     let mut harness = Harness::on_network(
-        Network::Mainnet,
+        Network::new_default_testnet(),
         [parent.clone(), child.clone(), invalid.clone()],
     );
 

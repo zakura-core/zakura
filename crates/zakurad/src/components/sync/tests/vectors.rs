@@ -1596,8 +1596,13 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
     let state_requests = Arc::new(AtomicUsize::new(0));
     let state_requests_in_service = Arc::clone(&state_requests);
     let state_service = tower::service_fn(move |request| {
-        state_requests_in_service.fetch_add(1, Ordering::SeqCst);
+        if matches!(request, zs::Request::KnownBlock(_)) {
+            state_requests_in_service.fetch_add(1, Ordering::SeqCst);
+        }
         async move {
+            if matches!(request, zs::Request::CheckHeaderAdmission(_)) {
+                return Ok(zs::Response::HeaderAdmission(None));
+            }
             assert_eq!(request, zs::Request::KnownBlock(block0_hash));
             Ok::<_, crate::BoxError>(zs::Response::KnownBlock(None))
         }

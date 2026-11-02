@@ -11,9 +11,10 @@ use super::{
     *,
 };
 use crate::zakura::{
-    handler::ServiceSessionIO, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-    ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+    handler::{CloseCause, ServiceSessionIO, ZakuraConnTrace},
+    ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+    ZAKURA_STREAM_HEADER_SYNC,
 };
 
 const REOPEN: SessionPolicy = SessionPolicy {
@@ -38,6 +39,15 @@ fn test_ordered_stream() -> Stream {
 /// State for a reopening service that this endpoint opens.
 fn state(stream: Stream) -> ServiceSessionState {
     ServiceSessionState::new(stream, REOPEN, INITIATOR)
+}
+
+/// The connection's session IO for that one service.
+fn session_io(stream: Stream) -> ServiceSessionIO {
+    ServiceSessionIO::new(
+        [(stream.kind, state(stream))].into_iter().collect(),
+        ZakuraConnTrace::without_peer(1),
+        CloseCause::new(),
+    )
 }
 
 fn retry_later() -> SessionDemand {
@@ -452,24 +462,25 @@ fn every_member_completes_the_offer_in_any_order() {
 
 // The reopen-wait contract between the state and `ServiceSessionIO`.
 
+const KIND: u16 = ZAKURA_STREAM_HEADER_SYNC;
+
 #[tokio::test(start_paused = true)]
 async fn session_waits_deduplicate_demand() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
     let (change_tx, change_rx) = watch::channel(());
 
     io.schedule_demand(
-        &mut session,
+        KIND,
         SessionDemand::WaitForChange(Box::pin(async move {
             let mut change_rx = change_rx;
             let _ = change_rx.changed().await;
         })),
     );
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
 
     assert_eq!(io.waits.len(), 1);
     assert_eq!(
-        session.reopen_state,
+        io.session(KIND).reopen_state,
         SessionReopenState::Waiting(SessionWaitReason::Demand)
     );
     assert_eq!(
@@ -481,76 +492,69 @@ async fn session_waits_deduplicate_demand() {
 
 #[tokio::test(start_paused = true)]
 async fn session_demand_replaces_transport_backoff() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
     assert_eq!(
-        io.schedule_transport_backoff(&mut session),
+        io.schedule_transport_backoff(KIND),
         Some(ORDERED_STREAM_REOPEN_BACKOFF)
     );
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
 
-    assert_eq!(session.reopen_attempts, 1);
+    assert_eq!(io.session(KIND).reopen_attempts, 1);
     assert_eq!(io.waits.len(), 1);
     assert_eq!(
-        session.reopen_state,
+        io.session(KIND).reopen_state,
         SessionReopenState::Waiting(SessionWaitReason::Demand)
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn ordered_session_exit_keeps_existing_demand_wait() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
 
-    assert_eq!(io.schedule_transport_backoff(&mut session), None);
-    assert_eq!(session.reopen_attempts, 0);
+    assert_eq!(io.schedule_transport_backoff(KIND), None);
+    assert_eq!(io.session(KIND).reopen_attempts, 0);
     assert_eq!(io.waits.len(), 1);
     assert_eq!(
-        session.reopen_state,
+        io.session(KIND).reopen_state,
         SessionReopenState::Waiting(SessionWaitReason::Demand)
     );
 }
 
 #[tokio::test]
 async fn ordered_session_retirement_cancels_and_blocks_transport_waits() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, retry_later());
-    io.schedule_demand(&mut session, SessionDemand::Retire);
+    io.schedule_demand(KIND, retry_later());
+    io.schedule_demand(KIND, SessionDemand::Retire);
 
     assert!(io.waits.is_empty());
-    assert_eq!(session.reopen_state, SessionReopenState::Retired);
-    assert_eq!(io.schedule_transport_backoff(&mut session), None);
-    assert_eq!(session.reopen_attempts, 0);
+    assert_eq!(io.session(KIND).reopen_state, SessionReopenState::Retired);
+    assert_eq!(io.schedule_transport_backoff(KIND), None);
+    assert_eq!(io.session(KIND).reopen_attempts, 0);
 }
 
 #[tokio::test]
 async fn ordered_session_adoption_drops_pending_wait() {
-    let stream = test_ordered_stream();
-    let mut session = state(stream);
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, SessionDemand::OpenNow);
-    session.opened(1);
-    io.cancel(stream.kind);
+    io.schedule_demand(KIND, SessionDemand::OpenNow);
+    let attempt = io.begin_attempt(KIND);
+    io.on_opened(KIND, 1, attempt);
 
     assert!(io.waits.is_empty());
-    assert_eq!(session.reopen_state, SessionReopenState::Idle);
+    assert_eq!(io.session(KIND).reopen_state, SessionReopenState::Idle);
 }
 
 #[tokio::test]
 async fn session_demand_change_yields_exactly_one_reopen() {
-    let stream = test_ordered_stream();
-    let mut session = state(stream);
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
     let (change_tx, mut change_rx) = watch::channel(());
 
     io.schedule_demand(
-        &mut session,
+        KIND,
         SessionDemand::WaitForChange(Box::pin(async move {
             let _ = change_rx.changed().await;
         })),
@@ -561,23 +565,19 @@ async fn session_demand_change_yields_exactly_one_reopen() {
         .expect("reactor change is observed before timeout")
         .expect("connection still owns a pending session wait");
 
-    assert_eq!(kind, stream.kind);
-    io.finish(kind);
-    session.wait_finished();
+    assert_eq!(kind, KIND);
+    assert_eq!(io.on_wait_fired(kind, false), Some(test_ordered_stream()));
     assert!(
         io.waits.is_empty(),
         "one state change yields one reopen attempt"
     );
-    assert!(session.may_reopen(false));
 }
 
 #[tokio::test(start_paused = true)]
 async fn session_demand_deadline_yields_exactly_one_reopen() {
-    let stream = test_ordered_stream();
-    let mut session = state(stream);
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
 
-    io.schedule_demand(&mut session, retry_later());
+    io.schedule_demand(KIND, retry_later());
     tokio::time::advance(Duration::from_secs(60)).await;
     let (kind, ()) = io
         .waits
@@ -585,9 +585,8 @@ async fn session_demand_deadline_yields_exactly_one_reopen() {
         .await
         .expect("reactor deadline keeps a pending session wait");
 
-    assert_eq!(kind, stream.kind);
-    io.finish(kind);
-    session.wait_finished();
+    assert_eq!(kind, KIND);
+    assert!(io.on_wait_fired(kind, false).is_some());
     assert!(
         io.waits.is_empty(),
         "one deadline yields one reopen attempt"
@@ -596,12 +595,11 @@ async fn session_demand_deadline_yields_exactly_one_reopen() {
 
 #[test]
 fn ordered_session_connection_teardown_drops_pending_waits() {
-    let mut session = state(test_ordered_stream());
-    let mut io = ServiceSessionIO::default();
+    let mut io = session_io(test_ordered_stream());
     let (change_tx, mut change_rx) = watch::channel(());
 
     io.schedule_demand(
-        &mut session,
+        KIND,
         SessionDemand::WaitForChange(Box::pin(async move {
             let _ = change_rx.changed().await;
         })),

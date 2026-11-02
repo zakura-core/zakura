@@ -16,7 +16,7 @@ cadence = { decoder = 1, properties = ["cadence/hold", "cadence/settlement"] }
 block_peer_registry = { decoder = 1, properties = ["block/peer-registry"] }
 block_retry_authority = { decoder = 1, properties = ["block/retry-authority"] }
 block_query = { decoder = 1, properties = ["block/query-dispatch", "block/query-completion"] }
-block_reactor = { decoder = 2, properties = ["block/reactor-policy"] }
+block_reactor = { decoder = 3, properties = ["block/reactor-policy"] }
 block_fill = { decoder = 1, properties = ["block/fill-retry-run", "block/fill-retained-funding", "block/fill-commit-window"] }
 block_request_lifecycle = { decoder = 1, properties = ["block/request-lifecycle"] }
 block_sequencer_order = { decoder = 1, properties = ["block/contiguous-submission"] }

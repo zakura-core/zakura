@@ -442,7 +442,8 @@ fn session_trace_separates_stale_results_and_retained_hints() {
     assert!(installations().any(|result| matches!(result, InstallFact::Installed(_))));
     assert!(steps.iter().any(|step| !step.actual.hints.is_empty()));
     assert!(steps.iter().any(|step| !step.actual.admitted.is_empty()));
-    let live = |step: &SessionStep| step.actual.hints.iter().any(|hint| hint.live_summaries > 0);
+    let live =
+        |step: &DiscoverySessionStep| step.actual.hints.iter().any(|hint| hint.live_summaries > 0);
     assert!(
         steps
             .windows(2)

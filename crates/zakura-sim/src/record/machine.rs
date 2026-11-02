@@ -1,7 +1,7 @@
 //! Semantic evidence from transport-free machine drivers.
 
 use serde::{Deserialize, Serialize};
-use zakura_network::zakura::{BookStep, DriverFailure, SessionStep};
+use zakura_network::zakura::{BookStep, DiscoverySessionStep, DriverFailure};
 
 /// A machine harness's scenario.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,7 +23,7 @@ pub enum MachineStep {
     /// The real discovery book, its independent model, and its signed samples.
     DiscoveryBook(BookStep),
     /// Discovery's real session and hint owner and its independent model.
-    DiscoveryState(SessionStep),
+    DiscoveryState(DiscoverySessionStep),
     /// A fixture machine's operation. It tests machine-trace support itself, as
     /// [`crate::harness::fixtures`] tests the simulator. No production machine
     /// records it.

@@ -1395,7 +1395,7 @@ pub struct SessionView {
 /// One decoder-v2 session-installation operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionStep {
+pub struct DiscoverySessionStep {
     /// The operation's number, from 1.
     pub step: usize,
     /// The original causal bytes.
@@ -1411,7 +1411,7 @@ pub struct SessionStep {
 /// Runs session-installation decoder-v2 operations under a fixture clock, and captures
 /// each operation. Reads happen only at explicit read operations, so each view
 /// shows what the owner retains between them.
-pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<SessionStep> {
+pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<DiscoverySessionStep> {
     let input = &data[..data.len().min(512)];
     let mut driver = StateDriver::new();
     let mut steps = Vec::new();
@@ -1424,7 +1424,7 @@ pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<SessionStep> {
             .err()
             .map(|payload| driver_failure(payload.as_ref(), STATE_PROPERTY));
         let stop = failure.is_some();
-        steps.push(SessionStep {
+        steps.push(DiscoverySessionStep {
             step: index + 1,
             input: step_input(input, index + 1),
             actual: driver.actual_view(),

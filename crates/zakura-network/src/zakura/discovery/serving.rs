@@ -151,6 +151,11 @@ impl AnswersWritten {
             row.wait().await;
         }
     }
+
+    /// Whether both rows have written every admitted answer.
+    pub(super) fn is_written(&self) -> bool {
+        self.0.iter().all(ResponsesWritten::is_written)
+    }
 }
 
 /// Answers one session's `GetPeers` with a sample from the book.

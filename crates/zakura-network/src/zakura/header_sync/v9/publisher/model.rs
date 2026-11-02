@@ -21,9 +21,9 @@
 //! - the owner holds exactly one slot per live subscription and unwritten
 //!   terminal outcome, and one capacity signal per distinct stalled wait.
 //!
-//! [`replay_header_publisher_bytes`] drives the same model from fuzz bytes, and
-//! [`trace_header_publisher_bytes`] records each operation's state read from
-//! the owner beside the state the model derived.
+//! [`trace_header_publisher_bytes`] drives the model from fuzz bytes and records
+//! each operation's state read from the owner beside the state the model
+//! derived.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -381,15 +381,6 @@ impl Machine {
 
     fn selected(&self) -> Option<EngineSnapshot> {
         self.model.selected.map(Tip::snapshot)
-    }
-
-    fn run(&mut self, step: &Step) {
-        // The task returns once the publisher stops, so no step follows.
-        if self.model.exit.is_some() {
-            return;
-        }
-        self.step(step);
-        self.check_owner();
     }
 
     /// The owner's credit totals match the model's until the publisher stops.
@@ -1163,25 +1154,6 @@ impl Machine {
 
 const PROPERTY: &str = "header/publisher-policy";
 
-/// Applicable operations in a decoder-v1 publisher history.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct HeaderPublisherReplaySummary {
-    /// Operations executed before publisher shutdown.
-    pub transitions: usize,
-    /// New jobs issued.
-    pub jobs: usize,
-    /// Pages that consumed credit.
-    pub pages: usize,
-    /// Header credit consumed by those pages.
-    pub headers: u64,
-    /// Byte credit consumed by those pages.
-    pub bytes: u64,
-    /// Results delivered for an abandoned or settled job.
-    pub stale_results: usize,
-    /// Successful writes of a pending terminal outcome.
-    pub terminals: usize,
-}
-
 /// One subscription in a [`HeaderPublisherView`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderPublisherSubscriptionView {
@@ -1288,12 +1260,6 @@ pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
     HeaderPublisherHistory { steps }
 }
 
-/// Replay decoder-v1 quadruples against the existing publisher model.
-/// Read at most 512 bytes. The model derives page sizes from the wire layout.
-pub fn replay_header_publisher_bytes(data: &[u8]) -> HeaderPublisherReplaySummary {
-    run(decode(data), |_, _| {})
-}
-
 fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
     data[..data.len().min(512)].chunks(4).map(|chunk| {
         let a = chunk[0];
@@ -1360,58 +1326,4 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
             _ => Step::Closed,
         }
     })
-}
-
-fn run(
-    steps: impl IntoIterator<Item = Step>,
-    mut after_step: impl FnMut(&mut Machine, &Step),
-) -> HeaderPublisherReplaySummary {
-    let mut machine = Machine::new();
-    let mut summary = HeaderPublisherReplaySummary::default();
-    for step in steps {
-        if machine.model.exit.is_some() {
-            break;
-        }
-        summary.transitions += 1;
-        let was_idle = machine.model.in_progress.is_none();
-        let consumed = || {
-            machine
-                .model
-                .subs
-                .values()
-                .fold((0u64, 0u64), |(objects, bytes), sub| {
-                    (objects + sub.consumed.objects, bytes + sub.consumed.bytes)
-                })
-        };
-        let before = consumed();
-        match &step {
-            Step::Page { stale, .. } | Step::Finish { stale, .. } => {
-                summary.stale_results +=
-                    usize::from(machine.answering(*stale).is_some_and(|(_, stale)| stale));
-            }
-            Step::TerminalWritten(true) => {
-                summary.terminals += usize::from(machine.writing.is_some())
-            }
-            _ => {}
-        }
-        machine.run(&step);
-        if matches!(step, Step::NextJob) && was_idle && machine.model.in_progress.is_some() {
-            summary.jobs += 1;
-        }
-        if matches!(step, Step::Page { .. }) {
-            let after = machine
-                .model
-                .subs
-                .values()
-                .fold((0u64, 0u64), |(objects, bytes), sub| {
-                    (objects + sub.consumed.objects, bytes + sub.consumed.bytes)
-                });
-            summary.pages += usize::from(after.0 > before.0);
-            summary.headers += after.0.saturating_sub(before.0);
-            summary.bytes += after.1.saturating_sub(before.1);
-        }
-        after_step(&mut machine, &step);
-        machine.check_ledger();
-    }
-    summary
 }

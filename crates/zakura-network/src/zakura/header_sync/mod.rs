@@ -60,7 +60,6 @@ pub use wire::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use v9::{
-    replay_header_publisher_bytes, trace_header_publisher_bytes, HeaderPublisherHistory,
-    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
-    HeaderPublisherView,
+    trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView,
 };

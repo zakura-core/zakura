@@ -93,9 +93,8 @@ mod state;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use model::{
-    replay_header_publisher_bytes, trace_header_publisher_bytes, HeaderPublisherHistory,
-    HeaderPublisherReplaySummary, HeaderPublisherStep, HeaderPublisherSubscriptionView,
-    HeaderPublisherView,
+    trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView,
 };
 pub(crate) use state::is_legal;
 use state::{

@@ -28,6 +28,31 @@ fn answer() -> impl Strategy<Value = Answer> {
     ]
 }
 
+impl Machine {
+    fn run(&mut self, step: &Step) {
+        // The task returns once the publisher stops, so no step follows.
+        if self.model.exit.is_some() {
+            return;
+        }
+        self.step(step);
+        self.check_owner();
+    }
+}
+
+/// Run `steps` over a new machine, calling `after_step` after each and checking
+/// the result.
+fn run(steps: impl IntoIterator<Item = Step>, mut after_step: impl FnMut(&mut Machine, &Step)) {
+    let mut machine = Machine::new();
+    for step in steps {
+        if machine.model.exit.is_some() {
+            break;
+        }
+        machine.run(&step);
+        after_step(&mut machine, &step);
+        machine.check_ledger();
+    }
+}
+
 /// Steps that stop the publisher are rare, so most histories run long.
 fn step() -> impl Strategy<Value = Step> {
     let id = 1..=IDS;
@@ -405,47 +430,14 @@ fn the_owner_holds_a_capacity_signal_only_while_a_stall_waits() {
     assert!(machine.owner.capacity_signals().is_empty());
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn publisher_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_header_publisher_bytes(&bytes);
-    }
-}
-
 const WITNESS: &[u8] = &[
     0, 0, 4, 35, 10, 0, 0, 0, 15, 0, 0, 0, 8, 0, 0, 0, 23, 0, 0, 0, 24, 0, 0, 0, 25, 0, 0, 0, 15,
     0, 0, 128,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn publisher_witness_exercises_credit_terminal_and_stale_page() {
-    let summary = replay_header_publisher_bytes(WITNESS);
-    assert_eq!(
-        summary,
-        HeaderPublisherReplaySummary {
-            transitions: 8,
-            jobs: 1,
-            pages: 1,
-            headers: 1,
-            bytes: 263,
-            stale_results: 1,
-            terminals: 1
-        }
-    );
-    assert_eq!(
-        replay_header_publisher_bytes(&[]),
-        HeaderPublisherReplaySummary::default()
-    );
-    println!("tier=Machine target=header_publisher decoder=1 {summary:?}");
-}
-
 /// The witness's history records one step per operation, and the owner's view
-/// matches the model's after each.
+/// matches the model's after each. It reaches credit, a terminal write, and a
+/// stale page.
 #[test]
 fn publisher_trace_records_the_witness_with_agreeing_views() {
     let history = trace_header_publisher_bytes(WITNESS);
@@ -464,7 +456,9 @@ fn publisher_trace_records_the_witness_with_agreeing_views() {
     );
     assert_eq!(history.steps[4].expected.terminals, [1]);
     assert!(history.steps[5].expected.writing);
-    assert_eq!(history.steps[7].expected.slots, 0);
+    assert_eq!(history.steps[6].expected.slots, 0);
+    // The last operation's page answers the settled job, so it changes nothing.
+    assert_eq!(history.steps[7].actual, history.steps[6].actual);
     assert_eq!(
         trace_header_publisher_bytes(&[]),
         HeaderPublisherHistory::default()

@@ -1088,6 +1088,26 @@ mod tests {
             .expect("settlement frees the kind");
     }
 
+    /// Spawns `answers_settled` and checks that something holds it.
+    #[cfg(test)]
+    async fn held_settled_wait(queries: &Queries) -> zakura_rt::task::JoinHandle<()> {
+        let waiting = queries.clone();
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
+        assert!(!settled.is_finished(), "the hold keeps the wait open");
+        settled
+    }
+
+    /// Drops the last `hold` on `settled` and checks that settlement wakes it.
+    #[cfg(test)]
+    async fn assert_settles<H>(settled: zakura_rt::task::JoinHandle<()>, hold: H) {
+        drop(hold);
+        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
+            .await
+            .expect("settlement wakes the wait")
+            .unwrap();
+    }
+
     /// A `Hello` in verification holds the settled wait, and it takes no pool
     /// entry and blocks no query.
     #[cfg(test)]
@@ -1106,15 +1126,8 @@ mod tests {
             .send_get_peers(get_peers(1))
             .await
             .expect("a Hello in verification blocks no query");
-        let waiting = queries.clone();
-        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
-        zakura_rt::task::yield_now().await;
-        assert!(!settled.is_finished(), "the Hello holds the wait");
-        drop(hello);
-        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
-            .await
-            .expect("settlement wakes the wait")
-            .unwrap();
+        let settled = held_settled_wait(&queries).await;
+        assert_settles(settled, hello).await;
     }
 
     /// `answers_settled` waits for a claimed answer and ignores a query the
@@ -1137,15 +1150,8 @@ mod tests {
             .expect("an unanswered query holds nothing");
 
         let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
-        let waiting = queries.clone();
-        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
-        zakura_rt::task::yield_now().await;
-        assert!(!settled.is_finished(), "the claimed answer holds the wait");
-        drop(answer);
-        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
-            .await
-            .expect("settlement wakes the wait")
-            .unwrap();
+        let settled = held_settled_wait(&queries).await;
+        assert_settles(settled, answer).await;
     }
 
     /// A queued answer holds the wait until its claim and settlement, on the
@@ -1167,18 +1173,11 @@ mod tests {
             .check(PEERS, peers_len(1))
             .expect("the transport admits the owed answer");
 
-        let waiting = queries.clone();
-        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
-        zakura_rt::task::yield_now().await;
-        assert!(!settled.is_finished(), "the queued answer holds the wait");
+        let settled = held_settled_wait(&queries).await;
         let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
         zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the claimed answer holds the wait");
-        drop(answer);
-        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
-            .await
-            .expect("settlement wakes the wait")
-            .unwrap();
+        assert_settles(settled, answer).await;
     }
 
     #[cfg(test)]

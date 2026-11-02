@@ -20,35 +20,29 @@ const WINDOW: u64 = 64;
 const MAX_CONNECTIONS: usize = 2;
 const MAX_OPEN_STREAMS: u16 = 4;
 const MAX_FRAME_BYTES: u32 = 1024;
+const TCP_INGRESS_BYTES: u64 = 3 << 20;
 
-fn transport() -> ResourceEnvelope {
-    ResourceEnvelope::new(TransportLimits {
+fn limits() -> TransportLimits {
+    TransportLimits {
         receive_window: WINDOW as u32,
         send_window: WINDOW,
         max_connections: MAX_CONNECTIONS,
         max_pending_handshakes: 1,
         max_open_streams: MAX_OPEN_STREAMS,
         max_frame_bytes: MAX_FRAME_BYTES,
-    })
-}
-
-fn inputs() -> NodeEnvelopeInputs {
-    NodeEnvelopeInputs {
-        transport: transport(),
-        receive_window_bytes: WINDOW,
-        send_window_bytes: WINDOW,
-        max_connections: MAX_CONNECTIONS,
-        max_pending_handshakes: 1,
-        max_open_streams: MAX_OPEN_STREAMS,
-        max_frame_bytes: MAX_FRAME_BYTES,
-        peer_memory_budget_bytes: 1 << 20,
-        tcp_connections: 3,
-        decoded_pipeline_bytes: 1 << 30,
     }
 }
 
+fn transport() -> ResourceEnvelope {
+    ResourceEnvelope::new(limits())
+}
+
+fn envelope(limits: TransportLimits) -> Result<NodeEnvelope, NodeEnvelopeError> {
+    NodeEnvelope::new(limits, 1 << 20, TCP_INGRESS_BYTES, NonZeroU64::MIN, 1 << 30)
+}
+
 fn bound() -> OwnerBound {
-    OwnerBound::new(1, MAX_CONNECTIONS, MAX_OPEN_STREAMS)
+    OwnerBound::new(1, MAX_CONNECTIONS, MAX_OPEN_STREAMS).expect("the test bound fits")
 }
 
 fn retained_bound() -> u128 {
@@ -81,86 +75,21 @@ fn the_default_node_config_composes() {
 }
 
 #[test]
-fn the_constructor_refuses_a_limit_that_funds_nothing() {
-    let refused = [
-        ("max_connections", {
-            let mut inputs = inputs();
-            inputs.max_connections = 0;
-            inputs
-        }),
-        ("max_pending_handshakes", {
-            let mut inputs = inputs();
-            inputs.max_pending_handshakes = 0;
-            inputs
-        }),
-        ("max_open_streams", {
-            let mut inputs = inputs();
-            inputs.max_open_streams = 0;
-            inputs
-        }),
-        ("max_frame_bytes", {
-            let mut inputs = inputs();
-            inputs.max_frame_bytes = 0;
-            inputs
-        }),
-        ("receive_window_bytes", {
-            let mut inputs = inputs();
-            inputs.receive_window_bytes = 0;
-            inputs
-        }),
-        ("send_window_bytes", {
-            let mut inputs = inputs();
-            inputs.send_window_bytes = 0;
-            inputs
-        }),
-        ("peer_memory_budget_bytes", {
-            let mut inputs = inputs();
-            inputs.peer_memory_budget_bytes = 0;
-            inputs
-        }),
-    ];
-    for (limit, inputs) in refused {
-        assert_eq!(
-            NodeEnvelope::new(inputs, NonZeroU64::MIN),
-            Err(NodeEnvelopeError::ZeroLimit { limit })
-        );
-    }
-}
-
-#[test]
-fn the_constructor_refuses_an_overflowing_bound() {
-    let mut owners = inputs();
-    owners.max_connections = usize::MAX;
-    assert_eq!(
-        NodeEnvelope::new(owners, NonZeroU64::MIN),
-        Err(NodeEnvelopeError::Overflow {
-            bound: "stream owners"
-        })
-    );
-
-    let mut tcp = inputs();
-    tcp.tcp_connections = usize::MAX;
-    assert_eq!(
-        NodeEnvelope::new(tcp, NonZeroU64::MIN),
-        Err(NodeEnvelopeError::Overflow {
-            bound: "tcp ingress bytes"
-        })
-    );
+fn the_constructor_refuses_an_overflowing_owner_bound() {
+    let mut overflowing = limits();
+    overflowing.max_connections = usize::MAX;
+    assert_eq!(envelope(overflowing), Err(NodeEnvelopeError::OwnerOverflow));
 }
 
 #[test]
 fn the_byte_bound_adds_each_owner_once() {
-    let envelope = NodeEnvelope::new(inputs(), NonZeroU64::MIN).expect("the inputs fit");
+    let envelope = envelope(limits()).expect("the limits fit");
 
     assert_eq!(envelope.transport_bytes, retained_bound());
-    assert_eq!(
-        envelope.request_executions,
-        MAX_CONNECTIONS * usize::from(MAX_OPEN_STREAMS)
-    );
     assert_eq!(envelope.decoded_pipeline_bytes, 1 << 30);
     assert_eq!(
         envelope.retained_bytes_bound(),
-        retained_bound() + (1 << 20) + 3 * MAX_INCOMPLETE_MESSAGE_BYTES as u128
+        retained_bound() + (1 << 20) + u128::from(TCP_INGRESS_BYTES)
     );
 }
 

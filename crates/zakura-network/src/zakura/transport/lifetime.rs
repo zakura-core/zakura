@@ -546,16 +546,16 @@ pub(crate) struct OwnerBound {
 }
 
 impl OwnerBound {
-    /// The bound for these admission limits.
+    /// The bound for these admission limits, or `None` if it does not fit.
     pub(crate) fn new(
         max_pending_handshakes: usize,
         max_connections: usize,
         max_open_streams: u16,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        Some(Self {
             handshakes: max_pending_handshakes,
-            streams: max_connections.saturating_mul(usize::from(max_open_streams) + 1),
-        }
+            streams: max_connections.checked_mul(usize::from(max_open_streams) + 1)?,
+        })
     }
 
     /// Whether `counts` fit this bound.

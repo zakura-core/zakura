@@ -600,14 +600,19 @@ impl ZakuraLocalLimits {
 
     /// Returns the transport's byte and worker bounds under these limits.
     pub(crate) fn resource_envelope(&self) -> ResourceEnvelope {
-        ResourceEnvelope::new(TransportLimits {
+        ResourceEnvelope::new(self.transport_limits())
+    }
+
+    /// The limits that the transport's bounds derive from.
+    pub(crate) fn transport_limits(&self) -> TransportLimits {
+        TransportLimits {
             receive_window: self.quic.receive_window_bytes,
             send_window: self.quic.send_window_bytes,
             max_connections: self.max_connections,
             max_pending_handshakes: self.max_pending_handshakes,
             max_open_streams: self.max_open_streams,
             max_frame_bytes: self.max_frame_bytes,
-        })
+        }
     }
 
     /// The most owners that these limits allow at once.
@@ -617,6 +622,7 @@ impl ZakuraLocalLimits {
             self.max_connections,
             self.max_open_streams,
         )
+        .expect("the node envelope refused these limits at startup if they overflow")
     }
 
     /// Returns the QUIC bind settings for `addrs` under these limits.
@@ -4398,7 +4404,7 @@ async fn spawn_zakura_endpoint_inner(
     debug!(
         owners = ?node_envelope.owners,
         retained_bytes_bound = %node_envelope.retained_bytes_bound(),
-        request_executions = node_envelope.request_executions,
+        request_executions = limits.resource_envelope().request_executions,
         decoded_blocks = node_envelope.decoded_blocks,
         decoded_pipeline_bytes = node_envelope.decoded_pipeline_bytes,
         "Zakura node resource envelope"

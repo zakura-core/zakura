@@ -2687,7 +2687,7 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
             Some(admission.clone()),
             0,
         ));
-        state.send_ready_non_finalized_queued(parent);
+        state.send_ready_non_finalized(parent, None);
         (admission, rx)
     };
 
@@ -4183,4 +4183,163 @@ async fn precious_block_request_fails_fast_during_checkpoint_sync() {
         error,
         crate::PreciousError::ProcessingCheckpointedBlocks
     ));
+}
+
+/// A block whose parent the write task can build on goes straight to the write task, without
+/// passing through the orphan queue, and its outputs stay visible to UTXO lookups.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_with_a_ready_parent_skips_the_orphan_queue() {
+    use std::sync::Mutex;
+
+    use metrics::{
+        Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+
+    #[derive(Default)]
+    struct QueueSizes {
+        values: Mutex<Vec<f64>>,
+    }
+
+    impl GaugeFn for QueueSizes {
+        fn increment(&self, _value: f64) {
+            panic!("the orphan queue reports its absolute size");
+        }
+
+        fn decrement(&self, _value: f64) {
+            panic!("the orphan queue reports its absolute size");
+        }
+
+        fn set(&self, value: f64) {
+            self.values.lock().unwrap().push(value);
+        }
+    }
+
+    #[derive(Default)]
+    struct QueueRecorder {
+        sizes: Arc<QueueSizes>,
+    }
+
+    impl Recorder for QueueRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            if key.name() == "state.memory.queued.block.count" {
+                Gauge::from_arc(self.sizes.clone())
+            } else {
+                Gauge::noop()
+            }
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state opens");
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Finish the checkpoint handoff the way `try_handoff_to_non_finalized_write` does.
+    drop(state.block_write_sender.finalized.take());
+    state.non_finalized_block_write_sent_hashes =
+        crate::service::queued_blocks::SentHashes::default();
+    state
+        .non_finalized_block_write_sent_hashes
+        .can_fork_chain_at_hashes = true;
+    let (sender, mut writer) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(sender);
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let prepared = block.clone().prepare();
+    let (hash, outpoint) = (
+        prepared.hash,
+        *prepared
+            .new_outputs
+            .keys()
+            .next()
+            .expect("the block creates outputs"),
+    );
+
+    let recorder = QueueRecorder::default();
+    let _response = metrics::with_local_recorder(&recorder, || {
+        state.queue_and_commit_to_non_finalized_state(prepared, None)
+    });
+    assert!(
+        recorder
+            .sizes
+            .values
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|size| *size == 0.0),
+        "a ready block must never temporarily enter the orphan queue"
+    );
+
+    match writer
+        .try_recv()
+        .expect("the block is sent to the write task")
+    {
+        crate::service::write::NonFinalizedWriteMessage::Commit { queued, .. } => {
+            assert_eq!(queued.0.hash, hash)
+        }
+        _ => panic!("expected a commit message"),
+    }
+    assert!(
+        state
+            .non_finalized_state_queued_blocks
+            .get_mut(&hash)
+            .is_none(),
+        "the block was never left in the orphan queue"
+    );
+    assert!(
+        state
+            .non_finalized_block_write_sent_hashes
+            .utxo(&outpoint)
+            .is_some(),
+        "the block's outputs are available while it is being written"
+    );
+
+    let mut orphan = (*block).clone();
+    Arc::make_mut(&mut orphan.header).previous_block_hash = block::Hash([9; 32]);
+    let orphan = Arc::new(orphan).prepare();
+    let orphan_hash = orphan.hash;
+    let _orphan_response = metrics::with_local_recorder(&recorder, || {
+        state.queue_and_commit_to_non_finalized_state(orphan, None)
+    });
+    assert!(
+        recorder.sizes.values.lock().unwrap().contains(&1.0),
+        "the recorder must observe a block waiting for an unknown parent"
+    );
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .get_mut(&orphan_hash)
+        .is_some());
+    assert!(writer.try_recv().is_err());
 }

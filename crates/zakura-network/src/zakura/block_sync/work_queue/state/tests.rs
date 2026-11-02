@@ -1130,6 +1130,7 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
     })
 }
 
+#[cfg(test)]
 fn run(
     ops: impl IntoIterator<Item = Op>,
     after_step: impl FnMut(&mut WorkQueueState, &Model),

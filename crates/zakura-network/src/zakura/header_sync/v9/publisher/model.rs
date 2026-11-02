@@ -42,7 +42,6 @@ use crate::zakura::{
         reactor::{HeaderMachineFailure, HeaderMachinePhase},
         v9::{Cursor, Operation, RegtestMessage, MAX_HS_SUBSCRIPTIONS},
     },
-    regulation::Totals,
     wire_codec::decode_frame,
     Credit,
 };
@@ -278,21 +277,6 @@ fn model_adjust(outcome: HeadersOutcomeCode, pages: bool, reached: bool) -> Head
     }
 }
 
-/// The publisher's facts the model compares across a stale result.
-fn observe(state: &PublisherState) -> Vec<(u64, Totals, Totals, Option<usize>)> {
-    (1..=IDS)
-        .filter_map(|id| {
-            let credit = state.publications.credit(&id)?;
-            Some((
-                id,
-                credit.granted(),
-                credit.consumed(),
-                state.publications.unacknowledged(&id),
-            ))
-        })
-        .collect()
-}
-
 /// Which update sequence a step sends.
 #[derive(Copy, Clone, Debug)]
 enum Sequence {
@@ -383,37 +367,6 @@ impl Machine {
         self.model.selected.map(Tip::snapshot)
     }
 
-    /// The owner's credit totals match the model's until the publisher stops.
-    fn check_ledger(&self) {
-        if self.model.exit.is_some() {
-            return;
-        }
-        let expected: Vec<_> = self
-            .model
-            .subs
-            .iter()
-            .map(|(id, sub)| {
-                (
-                    *id,
-                    Totals {
-                        objects: sub.granted.objects,
-                        bytes: sub.granted.bytes,
-                    },
-                    Totals {
-                        objects: sub.consumed.objects,
-                        bytes: sub.consumed.bytes,
-                    },
-                    Some(sub.sent.len()),
-                )
-            })
-            .collect();
-        assert_eq!(
-            observe(&self.owner.state),
-            expected,
-            "{PROPERTY}: credit ledger"
-        );
-    }
-
     /// The state read from the production owner.
     fn actual_view(&self) -> HeaderPublisherView {
         let state = &self.owner.state;
@@ -472,18 +425,21 @@ impl Machine {
         }
     }
 
-    /// The owner holds a resource only for what the model says is live.
-    fn check_owner(&mut self) {
+    /// The owner matches the model after every operation, in every field of the
+    /// view: credit, cursors, tombstones, the job, terminal outcomes, slots, and
+    /// the exit. A trace's failure reports any difference, so the simulator's
+    /// machine adapter sees it.
+    fn check(&mut self) {
+        assert_eq!(
+            self.actual_view(),
+            self.expected_view(),
+            "{PROPERTY}: the owner's view"
+        );
         if self.model.exit.is_some() {
             return;
         }
-        let model = &self.model;
-        assert_eq!(
-            self.owner.slots.held(),
-            model.subs.len() + model.held_terminals(),
-            "{PROPERTY}: one slot per live subscription and unwritten outcome"
-        );
-        let mut stalled: Vec<usize> = model
+        let mut stalled: Vec<usize> = self
+            .model
             .subs
             .values()
             .filter_map(|sub| match sub.stall {
@@ -877,12 +833,12 @@ impl Machine {
             reaches_target: !job.following && last == record.target,
             payload_len: usize::try_from(bytes).expect("small page"),
         };
-        let before = observe(&self.owner.state);
+        let before = self.actual_view();
         let committed = self.owner.state.commit(job.key, &page);
         if is_stale {
             assert!(!committed, "{PROPERTY}: a stale page is never sent");
             assert_eq!(
-                observe(&self.owner.state),
+                self.actual_view(),
                 before,
                 "{PROPERTY}: a stale page spends nothing"
             );
@@ -922,18 +878,6 @@ impl Machine {
         sub.last = Some(last);
         sub.following |= page.reaches_target;
         sub.checked_tip = None;
-        assert_eq!(
-            self.owner
-                .state
-                .publications
-                .credit(&job.id)
-                .map(|credit| credit.consumed()),
-            Some(Totals {
-                objects: sub.consumed.objects,
-                bytes: sub.consumed.bytes,
-            }),
-            "{PROPERTY}: state's consumed credit matches the model's"
-        );
     }
 
     fn finish(&mut self, answer: Answer, stale: Option<usize>) {
@@ -966,11 +910,11 @@ impl Machine {
             Answer::ReachedAtOpen => Output::ReachedAtOpen(record.target),
         };
         let latest = self.selected();
-        let before = observe(&self.owner.state);
+        let before = self.actual_view();
         self.owner.state.finish(job.key, output, latest.as_ref());
         if is_stale {
             assert_eq!(
-                observe(&self.owner.state),
+                self.actual_view(),
                 before,
                 "{PROPERTY}: a stale result changes nothing"
             );
@@ -1236,11 +1180,8 @@ pub fn trace_header_publisher_bytes(data: &[u8]) -> HeaderPublisherHistory {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.step(&step)))
                 .map_err(|payload| (HeaderMachinePhase::Transition, payload))
                 .and_then(|()| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        machine.check_owner();
-                        machine.check_ledger();
-                    }))
-                    .map_err(|payload| (HeaderMachinePhase::Invariant, payload))
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.check()))
+                        .map_err(|payload| (HeaderMachinePhase::Invariant, payload))
                 });
         let failure = applied.err().map(|(phase, payload)| {
             HeaderMachineFailure::of_panic(PROPERTY, phase, payload.as_ref())

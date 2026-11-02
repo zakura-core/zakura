@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::header_sync::v9::test_support::OUTCOME_CODES;
+use crate::zakura::{header_sync::v9::test_support::OUTCOME_CODES, regulation::Totals};
 
 fn sequence() -> impl Strategy<Value = Sequence> {
     prop_oneof![4 => Just(Sequence::Next), 1 => Just(Sequence::Repeat)]
@@ -35,7 +35,7 @@ impl Machine {
             return;
         }
         self.step(step);
-        self.check_owner();
+        self.check();
     }
 }
 
@@ -49,7 +49,7 @@ fn run(steps: impl IntoIterator<Item = Step>, mut after_step: impl FnMut(&mut Ma
         }
         machine.run(&step);
         after_step(&mut machine, &step);
-        machine.check_ledger();
+        machine.check();
     }
 }
 

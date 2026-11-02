@@ -1155,6 +1155,16 @@ pub(super) enum EvictionCause {
     BookLimit,
 }
 
+/// A verification result and the slot that funds it until installation.
+///
+/// Fields drop in declaration order, so the result ends before its capacity
+/// returns. A record with stored evidence needs no verification and holds no slot.
+#[derive(Debug)]
+struct VerifiedHold<T> {
+    result: T,
+    slot: Option<SlotPermit>,
+}
+
 /// Logs each change to the book. The handle calls this after it releases the
 /// state lock, so the book's transitions stay free of logging.
 fn log_book_changes(changes: &[BookChange]) {
@@ -1592,7 +1602,7 @@ impl ZakuraDiscoveryHandle {
             return Ok(outcome);
         }
 
-        let verification_slot;
+        let mut verification_slot = None;
         let mut authentic = Vec::with_capacity(batch.len());
         let mut unverified = Vec::new();
         {
@@ -1606,7 +1616,7 @@ impl ZakuraDiscoveryHandle {
         }
         if !unverified.is_empty() {
             let unverified_len = unverified.len();
-            let Some((verified, slot)) = self
+            let Some(VerifiedHold { result, slot }) = self
                 .verify_off_lock(move |context| verify_relayed(unverified, context))
                 .await
             else {
@@ -1614,12 +1624,10 @@ impl ZakuraDiscoveryHandle {
                 outcome.rejected += unverified_len;
                 return Ok(outcome);
             };
-            verification_slot = Some(slot);
-            let (fresh, dropped) = verified?;
+            verification_slot = slot;
+            let (fresh, dropped) = result?;
             outcome.rejected += dropped;
             authentic.extend(fresh);
-        } else {
-            verification_slot = None;
         }
 
         let now = current_unix_secs();
@@ -1716,7 +1724,7 @@ impl ZakuraDiscoveryHandle {
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
         let mut changes = Vec::new();
         let result = self.inner.lock().await.install_connected_peer_record(
-            verified.0,
+            verified.result,
             &connected_node_ids,
             now,
             &mut changes,
@@ -1742,7 +1750,7 @@ impl ZakuraDiscoveryHandle {
         let mut changes = Vec::new();
         let result = self.inner.lock().await.install_session_record(
             session,
-            verified.0,
+            verified.result,
             &connected_node_ids,
             now,
             &mut changes,
@@ -1756,7 +1764,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
-    ) -> Result<(VerifiedRecord, Option<SlotPermit>), DiscoveryBookError> {
+    ) -> Result<VerifiedHold<VerifiedRecord>, DiscoveryBookError> {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
@@ -1771,15 +1779,21 @@ impl ZakuraDiscoveryHandle {
     async fn verify_unless_stored(
         &self,
         record: ZakuraNodeRecord,
-    ) -> Result<(VerifiedRecord, Option<SlotPermit>), DiscoveryBookError> {
+    ) -> Result<VerifiedHold<VerifiedRecord>, DiscoveryBookError> {
         if let Some(stored) = self.inner.lock().await.stored_evidence(&record) {
-            return Ok((stored, None));
+            return Ok(VerifiedHold {
+                result: stored,
+                slot: None,
+            });
         }
-        let (verified, slot) = self
+        let VerifiedHold { result, slot } = self
             .verify_off_lock(move |context| VerifiedRecord::verify(record, context))
             .await
             .ok_or(DiscoveryBookError::VerificationCancelled)?;
-        Ok((verified.map_err(DiscoveryBookError::Record)?, Some(slot)))
+        Ok(VerifiedHold {
+            result: result.map_err(DiscoveryBookError::Record)?,
+            slot,
+        })
     }
 
     /// Runs `verify` in a blocking task under a node-wide verification slot,
@@ -1788,16 +1802,16 @@ impl ZakuraDiscoveryHandle {
     async fn verify_off_lock<T: Send + 'static>(
         &self,
         verify: impl FnOnce(&DiscoveryRecordValidationContext) -> T + Send + 'static,
-    ) -> Option<(T, SlotPermit)> {
+    ) -> Option<VerifiedHold<T>> {
         let slot = self.verify_slots.reserve().await;
         let context = DiscoveryRecordValidationContext {
             current_unix_secs: current_unix_secs(),
             ..self.verification_context.clone()
         };
         crate::zakura::resume_task_panic(
-            zakura_rt::task::spawn_blocking_named("discovery_verify", move || {
-                // Tuple fields drop in order: destroy the result before releasing capacity.
-                (verify(&context), slot)
+            zakura_rt::task::spawn_blocking_named("discovery_verify", move || VerifiedHold {
+                result: verify(&context),
+                slot: Some(slot),
             })
             .await,
         )
@@ -7367,7 +7381,7 @@ mod tests {
             .verify_off_lock(|_| Arc::new(vec![0u8; 1024]))
             .await
             .unwrap();
-        let payload = Arc::downgrade(&result.0);
+        let payload = Arc::downgrade(&result.result);
         assert_eq!(
             handle.verify_slots.available(),
             0,
@@ -7383,7 +7397,7 @@ mod tests {
             .verify_connected_peer_record(record.clone(), record.body.node_id)
             .await
             .unwrap();
-        assert!(verified.1.is_some());
+        assert!(verified.slot.is_some());
         assert_eq!(
             handle.verify_slots.available(),
             0,

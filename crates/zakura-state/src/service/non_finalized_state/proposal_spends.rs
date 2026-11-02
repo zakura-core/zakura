@@ -12,7 +12,7 @@ use std::{
 
 use zakura_chain::{block, transaction, transparent};
 
-use crate::SemanticallyVerifiedBlock;
+use crate::{ContextuallyVerifiedBlock, SemanticallyVerifiedBlock};
 
 /// How many proposal results to keep. Templates are refreshed one at a time, so only the
 /// latest few can still be solved.
@@ -35,19 +35,17 @@ struct Entry {
 pub(crate) struct ProposalSpends(Arc<Mutex<VecDeque<Entry>>>);
 
 impl ProposalSpends {
-    /// Shares the spent outputs of a proposal that passed the spend check without copying them.
-    pub(crate) fn remember(
-        &self,
-        proposal: &SemanticallyVerifiedBlock,
-        spent_utxos: &Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
-    ) {
+    /// Shares a proposal's spent outputs without copying them.
+    ///
+    /// Call only after all contextual checks and the proposal's chain update succeed.
+    pub(crate) fn remember(&self, proposal: &ContextuallyVerifiedBlock) {
         let entry = Entry {
             parent_hash: proposal.block.header.previous_block_hash,
             transaction_hashes: proposal.transaction_hashes.clone(),
-            spent_utxos: Arc::clone(spent_utxos),
+            spent_utxos: Arc::clone(&proposal.spent_outputs),
         };
         let mut entries = self.lock();
-        entries.retain(|old| !old.matches(proposal));
+        entries.retain(|old| !old.matches(entry.parent_hash, &entry.transaction_hashes));
         if entries.len() == MAX_ENTRIES {
             entries.pop_front();
         }
@@ -61,7 +59,12 @@ impl ProposalSpends {
         block: &SemanticallyVerifiedBlock,
     ) -> Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>> {
         let mut entries = self.lock();
-        let index = entries.iter().position(|entry| entry.matches(block))?;
+        let index = entries.iter().position(|entry| {
+            entry.matches(
+                block.block.header.previous_block_hash,
+                &block.transaction_hashes,
+            )
+        })?;
         entries.remove(index).map(|entry| entry.spent_utxos)
     }
 
@@ -74,9 +77,8 @@ impl ProposalSpends {
 }
 
 impl Entry {
-    fn matches(&self, block: &SemanticallyVerifiedBlock) -> bool {
-        self.parent_hash == block.block.header.previous_block_hash
-            && self.transaction_hashes == block.transaction_hashes
+    fn matches(&self, parent_hash: block::Hash, transaction_hashes: &[transaction::Hash]) -> bool {
+        self.parent_hash == parent_hash && self.transaction_hashes.as_ref() == transaction_hashes
     }
 }
 
@@ -102,10 +104,22 @@ mod tests {
             non_finalized_state::{ContextualMetrics, NonFinalizedState},
         },
         tests::FakeChainHelper,
-        Config, ValidateContextError,
+        Config, ContextuallyVerifiedBlock, SemanticallyVerifiedBlock, ValidateContextError,
     };
 
     use super::{ProposalSpends, MAX_ENTRIES};
+
+    fn contextual(
+        proposal: SemanticallyVerifiedBlock,
+        spent_outputs: &Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    ) -> ContextuallyVerifiedBlock {
+        ContextuallyVerifiedBlock::with_block_and_shared_spent_utxos(
+            &Network::Mainnet,
+            proposal,
+            Arc::clone(spent_outputs),
+        )
+        .expect("the cache fixture has consistent spent outputs and value balances")
+    }
 
     fn blocks() -> (Arc<Block>, Arc<Block>, Arc<Block>) {
         // Pre-Heartwood blocks, so an empty finalized state needs no history tree.
@@ -203,7 +217,7 @@ mod tests {
         let spends = ProposalSpends::default();
         let empty = Default::default();
 
-        spends.remember(&child.clone().prepare(), &empty);
+        spends.remember(&contextual(child.clone().prepare(), &empty));
 
         assert!(spends.take(&other_child.prepare()).is_none());
         let mut more_transactions = Block::clone(&child);
@@ -237,7 +251,7 @@ mod tests {
         let mut proposals = Vec::new();
         for _ in 0..=MAX_ENTRIES {
             block = block.make_fake_child();
-            spends.remember(&block.clone().prepare(), &empty);
+            spends.remember(&contextual(block.clone().prepare(), &empty));
             proposals.push(block.clone().prepare());
         }
 
@@ -257,12 +271,12 @@ mod tests {
         let spends = ProposalSpends::default();
         let recorded = Arc::new(HashMap::from([(outpoint, expected.clone())]));
         let original = child.clone().prepare();
-        spends.remember(&original, &recorded);
+        spends.remember(&contextual(original.clone(), &recorded));
         assert_eq!(Arc::strong_count(&recorded), 2);
 
         for _ in 0..MAX_ENTRIES {
             child = child.make_fake_child();
-            spends.remember(&child.clone().prepare(), &Arc::default());
+            spends.remember(&contextual(child.clone().prepare(), &Arc::default()));
         }
         assert!(
             spends.take(&original).is_none(),
@@ -281,7 +295,10 @@ mod tests {
             .transactions
             .push(parent.transactions[0].clone());
         let spends = ProposalSpends::default();
-        spends.remember(&child.clone().prepare(), &Arc::new(HashMap::new()));
+        spends.remember(&contextual(
+            child.clone().prepare(),
+            &Arc::new(HashMap::new()),
+        ));
         let mut reordered = child.clone();
         Arc::make_mut(&mut reordered).transactions.swap(0, 1);
         assert!(spends.take(&reordered.prepare()).is_none());
@@ -325,9 +342,11 @@ mod tests {
                 .expect("the proposal committed")
                 .spent_outputs,
         ));
-        state
-            .proposal_spends
-            .remember(&child.clone().prepare(), &recorded);
+        state.proposal_spends.remember(
+            proposal_state
+                .best_tip_block()
+                .expect("the valid proposal committed"),
+        );
 
         state
             .commit_block(child.clone().prepare(), &finalized_state)
@@ -385,9 +404,11 @@ mod tests {
             .take(&child.clone().prepare())
             .expect("a repeated proposal must leave the writer's cached result available");
         assert_eq!(recorded.as_ref(), &HashMap::from([(outpoint, expected)]));
-        state
-            .proposal_spends
-            .remember(&child.clone().prepare(), &recorded);
+        state.proposal_spends.remember(
+            proposal_state
+                .best_tip_block()
+                .expect("the first valid proposal committed"),
+        );
         state
             .commit_block(child.clone().prepare(), &finalized)
             .expect("the writer can still commit using the cached spend result");
@@ -423,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_proposal_does_not_bypass_later_checks_on_a_cache_hit() {
+    fn failed_proposals_leave_the_cache_empty_or_preserve_a_matching_valid_result() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
         let height = NetworkUpgrade::Heartwood
@@ -449,13 +470,47 @@ mod tests {
                 CommitmentError::InvalidChainHistoryActivationReserved { .. }
             ))
         ));
+        assert!(
+            state
+                .proposal_spends
+                .take(&invalid.clone().prepare())
+                .is_none(),
+            "a rejected proposal must not populate the cache"
+        );
+
+        let valid = parent.make_fake_child().set_block_commitment([0; 32]);
+        proposal_state
+            .commit_block(valid.clone().prepare(), &finalized)
+            .expect("the corrected proposal passes every contextual check");
         let recorded = state
             .proposal_spends
-            .take(&invalid.clone().prepare())
-            .expect("the spend check succeeded before the proposal's commitment failed");
-        state
+            .take(&valid.clone().prepare())
+            .expect("a fully validated proposal records its spent outputs");
+        state.proposal_spends.remember(
+            proposal_state
+                .best_tip_block()
+                .expect("the valid proposal committed"),
+        );
+
+        // Only the header commitment differs, so the invalid proposal has the same
+        // spend-cache key. Its later failure must not replace the successful result.
+        assert_eq!(
+            proposal_state.commit_block(invalid.clone().prepare(), &finalized),
+            proposal_error
+        );
+        let retained = state
             .proposal_spends
-            .remember(&invalid.clone().prepare(), &recorded);
+            .take(&invalid.clone().prepare())
+            .expect("the rejected proposal leaves the earlier successful result available");
+        assert!(Arc::ptr_eq(&recorded, &retained));
+        state.proposal_spends.remember(
+            proposal_state
+                .best_tip_block()
+                .expect("the failed proposal leaves the valid tip intact"),
+        );
+
+        // A solved block still runs the later check even when it consumes a valid
+        // proposal's cached spend result.
         assert_eq!(
             state.commit_block(invalid.clone().prepare(), &finalized),
             proposal_error
@@ -463,13 +518,7 @@ mod tests {
         assert!(state.proposal_spends.take(&invalid.prepare()).is_none());
         assert!(state.eq_internal_state(&before));
         state
-            .commit_block(
-                parent
-                    .make_fake_child()
-                    .set_block_commitment([0; 32])
-                    .prepare(),
-                &finalized,
-            )
+            .commit_block(valid.prepare(), &finalized)
             .expect("the corrected commitment is accepted");
     }
 
@@ -494,7 +543,7 @@ mod tests {
                 .map(Arc::new),
                 Ok(recorded.clone())
             );
-            spends.remember(&proposal.clone().prepare(), &recorded);
+            spends.remember(&contextual(proposal.clone().prepare(), &recorded));
 
             let mut authorized = proposal.clone();
             let tx = Arc::make_mut(&mut Arc::make_mut(&mut authorized).transactions[1]);
@@ -523,7 +572,7 @@ mod tests {
             assert_eq!(spends.take(&authorized.prepare()), Some(recorded.clone()));
 
             for change_input in [true, false] {
-                spends.remember(&proposal.clone().prepare(), &recorded);
+                spends.remember(&contextual(proposal.clone().prepare(), &recorded));
                 let mut changed = proposal.clone();
                 let tx = Arc::make_mut(&mut Arc::make_mut(&mut changed).transactions[1]);
                 if change_input {

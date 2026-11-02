@@ -841,9 +841,6 @@ impl NonFinalizedState {
             )
             .map(Arc::new),
         };
-        if let (true, Ok(spent_utxos)) = (self.records_proposal_spends, &spent_utxos) {
-            self.proposal_spends.remember(&prepared, spent_utxos);
-        }
         contextual_metrics.record_duration(
             "state.contextual.transparent_spend.duration_seconds",
             "state.contextual.mined.transparent_spend.duration_seconds",
@@ -918,7 +915,14 @@ impl NonFinalizedState {
             "state.contextual.mined.parallel_update.duration_seconds",
             parallel_update_start.elapsed(),
         );
-        result
+        let chain = result?;
+        if self.records_proposal_spends {
+            let proposal = chain
+                .tip_block()
+                .expect("successful validation added the proposal as the chain tip");
+            self.proposal_spends.remember(proposal);
+        }
+        Ok(chain)
     }
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.

@@ -2351,7 +2351,7 @@ async fn unavailable_parent_drops_block_without_restart() {
             chain_sync
                 .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent))),
             async {
-                answer_parent_check(&mut state, parent, zs::ParentInputs::ParentUnavailable).await;
+                answer_parent_unavailable(&mut state, parent, None).await;
             },
         );
         response.expect("an unavailable parent does not restart sync");
@@ -2432,25 +2432,31 @@ fn parent_unknown(hash: block::Hash, parent: block::Hash) -> BlockDownloadVerify
 /// retry or a score, when its parent still cannot arrive.
 #[tokio::test]
 async fn parent_unknown_drops_block_when_parent_cannot_arrive() {
-    let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = sender;
-    let hash = block::Hash([0xCC; 32]);
-    let parent = block::Hash([0xAA; 32]);
+    // Unknown, or known but below the finalized tip: either way no chain can accept the block.
+    for location in [None, Some(zs::KnownBlock::Finalized)] {
+        let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        chain_sync.misbehavior_sender = sender;
+        let hash = block::Hash([0xCC; 32]);
+        let parent = block::Hash([0xAA; 32]);
 
-    let (response, _) = tokio::join!(
-        chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
-        async {
-            // Unknown, or known but below the finalized tip: either way no chain can accept it.
-            answer_parent_check(&mut state, parent, zs::ParentInputs::ParentUnavailable).await;
-        },
-    );
+        let (response, _) = tokio::join!(
+            chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
+            answer_parent_unavailable(&mut state, parent, location.clone()),
+        );
 
-    response.expect("an unknown parent does not restart sync");
-    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
-    assert!(!chain_sync.registry_miss_retry.contains_key(&hash));
-    assert!(chain_sync.registry_miss_retry_counts.is_empty());
-    peers.expect_no_requests().await;
+        response.expect("an unknown parent does not restart sync");
+        assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+        assert!(
+            !chain_sync.registry_miss_retry.contains_key(&hash),
+            "{location:?}"
+        );
+        assert!(
+            chain_sync.registry_miss_retry_counts.is_empty(),
+            "{location:?}"
+        );
+        peers.expect_no_requests().await;
+    }
 }
 
 /// A block the download task dropped for an unknown parent is downloaded again after the
@@ -2462,8 +2468,13 @@ async fn parent_unknown_retries_after_backoff_while_parent_can_arrive() {
     enum Parent {
         RegistryRetry,
         Committed,
+        BeingWritten,
     }
-    for parent_state in [Parent::RegistryRetry, Parent::Committed] {
+    for parent_state in [
+        Parent::RegistryRetry,
+        Parent::Committed,
+        Parent::BeingWritten,
+    ] {
         let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
         let hash = block::Hash([0xCC; 32]);
         let parent = block::Hash([0xAA; 32]);
@@ -2476,8 +2487,17 @@ async fn parent_unknown_retries_after_backoff_while_parent_can_arrive() {
         let (response, _) = tokio::join!(
             chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
             async {
-                if matches!(parent_state, Parent::Committed) {
-                    answer_parent_extendable(&mut state, parent).await;
+                match parent_state {
+                    Parent::RegistryRetry => {}
+                    Parent::Committed => answer_parent_extendable(&mut state, parent).await,
+                    Parent::BeingWritten => {
+                        answer_parent_unavailable(
+                            &mut state,
+                            parent,
+                            Some(zs::KnownBlock::WriteChannel),
+                        )
+                        .await
+                    }
                 }
             },
         );
@@ -3585,6 +3605,20 @@ async fn answer_parent_check(
         .respond(zs::Response::ParentInputs(answer));
 }
 
+/// Answers that no chain can take a child of `parent` now, and that the state knows `parent` at
+/// `location`.
+async fn answer_parent_unavailable(
+    state: &mut MockService<zs::Request, zs::Response, PanicAssertion>,
+    parent: block::Hash,
+    location: Option<zs::KnownBlock>,
+) {
+    answer_parent_check(state, parent, zs::ParentInputs::ParentUnavailable).await;
+    state
+        .expect_request(zs::Request::KnownBlock(parent))
+        .await
+        .respond(zs::Response::KnownBlock(location));
+}
+
 /// Answers a download task's question about whether a block can be built on `parent`: it can.
 ///
 /// The test syncers verify everything above genesis in full, so each block whose parent is not
@@ -4551,12 +4585,22 @@ async fn checkpoint_block_skips_the_parent_check() {
 #[tokio::test(start_paused = true)]
 async fn state_parent_extendable_drops_only_on_a_definite_no() {
     let parent = block::Hash([0xAA; 32]);
+    let unavailable = zs::Response::ParentInputs(zs::ParentInputs::ParentUnavailable);
 
-    // `None` never answers.
-    async fn ask(parent: block::Hash, answer: Option<Result<zs::Response, &'static str>>) -> bool {
+    // Answers the chain check with `check` and the location lookup with `location`. `None` never
+    // answers the chain check.
+    async fn ask(
+        parent: block::Hash,
+        check: Option<Result<zs::Response, &'static str>>,
+        location: Option<zs::KnownBlock>,
+    ) -> bool {
         let state = tower::service_fn(move |request: zs::Request| {
-            assert_eq!(request, parent_check(parent));
-            let answer = answer.clone();
+            let answer = if request == parent_check(parent) {
+                check.clone()
+            } else {
+                assert_eq!(request, zs::Request::KnownBlock(parent));
+                Some(Ok(zs::Response::KnownBlock(location.clone())))
+            };
             async move {
                 match answer {
                     Some(Ok(response)) => Ok(response),
@@ -4569,14 +4613,21 @@ async fn state_parent_extendable_drops_only_on_a_definite_no() {
         (sync::state_parent_extendable(state).0)(parent).await
     }
 
+    // No chain can take a child of an unknown block, or of a known block below the finalized tip.
+    for location in [None, Some(zs::KnownBlock::Finalized)] {
+        assert!(
+            !ask(parent, Some(Ok(unavailable.clone())), location.clone()).await,
+            "{location:?}"
+        );
+    }
     assert!(
-        !ask(
+        ask(
             parent,
-            Some(Ok(zs::Response::ParentInputs(
-                zs::ParentInputs::ParentUnavailable
-            )))
+            Some(Ok(unavailable.clone())),
+            Some(zs::KnownBlock::WriteChannel)
         )
-        .await
+        .await,
+        "a parent the state is still writing"
     );
     for answer in [
         zs::ParentInputs::Inconclusive,
@@ -4586,15 +4637,18 @@ async fn state_parent_extendable_drops_only_on_a_definite_no() {
         }),
     ] {
         assert!(
-            ask(parent, Some(Ok(zs::Response::ParentInputs(answer)))).await,
+            ask(parent, Some(Ok(zs::Response::ParentInputs(answer))), None).await,
             "{answer:?}"
         );
     }
     assert!(
-        ask(parent, Some(Err("state failed"))).await,
+        ask(parent, Some(Err("state failed")), None).await,
         "a failed request"
     );
-    assert!(ask(parent, None).await, "no answer within the timeout");
+    assert!(
+        ask(parent, None, None).await,
+        "no answer within the timeout"
+    );
 }
 
 /// Against a real state, a block can be built on the finalized tip, but not on a known block

@@ -341,9 +341,9 @@ impl std::fmt::Debug for ParentWait {
     }
 }
 
-/// Whether a block could be built on this parent now: the parent is the finalized tip or in a
-/// non-finalized chain. Returns `true` when the state can't answer, so an unanswered question
-/// never drops a block.
+/// Whether a block could be built on this parent: the parent is the finalized tip, in a
+/// non-finalized chain, or being written by the state. Returns `true` when the state can't
+/// answer, so an unanswered question never drops a block.
 #[derive(Clone)]
 pub struct ParentExtendable(pub Arc<dyn Fn(block::Hash) -> BoxFuture<'static, bool> + Send + Sync>);
 
@@ -916,9 +916,11 @@ where
                 // coinbase-only block. The syncer only downloads chains that start at a block in
                 // its own locator, so a connected block's parent is either one the state can build
                 // on (the finalized tip or a block in a non-finalized chain) or still being
-                // downloaded here. A block whose parent is neither can only wait for a parent that
-                // may never arrive, so drop it before it takes a verifier slot. A parent that is
-                // merely known, such as a finalized block below the tip, doesn't count.
+                // downloaded here. A parent the state is still writing counts too, because sync
+                // skips such a block as already known. A block whose parent is none of these can
+                // only wait for a parent that may never arrive, so drop it before it takes a
+                // verifier slot. A parent that is merely known, such as a finalized block below
+                // the tip, doesn't count.
                 if block_height > max_checkpoint_height {
                     let parent = block.header.previous_block_hash;
                     // A parent normally leaves this map only after its verification returns, by

@@ -145,13 +145,39 @@ where
 /// on, including state readiness. A block whose question times out is verified as before.
 const PARENT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Asks `state` whether a block can be built on `parent` now: whether `parent` is the finalized
-/// tip or in a non-finalized chain. A known block below the finalized tip can't be built on.
-fn parent_can_be_extended(parent: block::Hash) -> zs::Request {
-    zs::Request::CheckParentInputs {
-        parent,
-        outpoints: Arc::from([]),
+/// Whether a block can be built on `parent`, now or once a pending write finishes.
+///
+/// That holds when `parent` is the finalized tip or in a non-finalized chain, or when the state
+/// has sent `parent` to be written. The state only sends a block to be written once a block can
+/// be built on its own parent, and it rejects the queued descendants of a write that fails. A
+/// known block below the finalized tip can't be built on.
+///
+/// Sync skips a block the state is still writing, because the state reports it as known, so its
+/// child must not be dropped for that parent.
+async fn parent_can_be_built_on<ZS>(state: ZS, parent: block::Hash) -> Result<bool, BoxError>
+where
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone,
+{
+    // With no inputs to check, this only locates the parent.
+    let in_a_chain = state
+        .clone()
+        .oneshot(zs::Request::CheckParentInputs {
+            parent,
+            outpoints: Arc::from([]),
+        })
+        .await?;
+    if !matches!(
+        in_a_chain,
+        zs::Response::ParentInputs(zs::ParentInputs::ParentUnavailable)
+    ) {
+        return Ok(true);
     }
+
+    let location = state.oneshot(zs::Request::KnownBlock(parent)).await?;
+    Ok(matches!(
+        location,
+        zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel))
+    ))
 }
 
 /// Returns a [`ParentExtendable`] that asks `state` whether a block can be built on a parent,
@@ -170,14 +196,8 @@ where
         // Boxing lets rustc prove this future is `Send` for spawned callers.
         futures::FutureExt::boxed(async move {
             !matches!(
-                timeout(
-                    PARENT_CHECK_TIMEOUT,
-                    state.oneshot(parent_can_be_extended(parent)),
-                )
-                .await,
-                Ok(Ok(zs::Response::ParentInputs(
-                    zs::ParentInputs::ParentUnavailable
-                )))
+                timeout(PARENT_CHECK_TIMEOUT, parent_can_be_built_on(state, parent)).await,
+                Ok(Ok(false))
             )
         })
     }))
@@ -2697,15 +2717,10 @@ where
             // can be extended, not whether it exists.
             let parent_can_arrive = self.downloads.contains(&parent)
                 || self.registry_miss_retry.contains_key(&parent)
-                || !matches!(
-                    // Boxing lets rustc prove this future is `Send` for spawned callers.
-                    futures::FutureExt::boxed(
-                        self.state.clone().oneshot(parent_can_be_extended(parent))
-                    )
+                // Boxing lets rustc prove this future is `Send` for spawned callers.
+                || futures::FutureExt::boxed(parent_can_be_built_on(self.state.clone(), parent))
                     .await
-                    .map_err(|e| eyre!(e))?,
-                    zs::Response::ParentInputs(zs::ParentInputs::ParentUnavailable)
-                );
+                    .map_err(|e| eyre!(e))?;
             if !parent_can_arrive {
                 debug!(
                     ?hash,

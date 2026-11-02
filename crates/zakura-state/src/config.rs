@@ -568,37 +568,12 @@ pub enum ReadCapacityError {
     Overflow,
 }
 
-/// Memory partitions behind one database's read services. Each partition has its own
-/// owner, so their sum bounds read memory. Durable disk limits are not part of this plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadCapacityPlan {
-    /// Retained blocks, transactions, and serialized blocks, under a shared gauge.
-    pub result_bytes: u64,
-    /// Active parsers for those results, under a shared gauge.
-    pub parser_bytes: u64,
-    /// Fixed-size headers: their count limit multiplied by their size.
-    pub header_result_bytes: u64,
-    /// Chain-tip blocks in their fixed count partition, including their parsers.
-    pub chain_tip_bytes: u64,
-    /// Block-range parsers, which each worker bounds to one block at a time.
-    pub block_range_parser_bytes: u64,
-}
-
-impl ReadCapacityPlan {
-    /// Sum every partition. The constructor proved that this cannot overflow.
-    pub fn total_bytes(&self) -> u64 {
-        self.result_bytes
-            + self.parser_bytes
-            + self.header_result_bytes
-            + self.chain_tip_bytes
-            + self.block_range_parser_bytes
-    }
-}
-
 impl Config {
     /// Check that the read limits fund their workers and one legal result, then
-    /// return the partitions. Opening a database requires this check to pass.
-    pub fn read_capacity_plan(&self) -> Result<ReadCapacityPlan, ReadCapacityError> {
+    /// return the bytes that bound read memory. Opening a database requires this check.
+    ///
+    /// Each partition in the sum has its own owner. Durable disk limits are not part of it.
+    pub fn read_memory_bound(&self) -> Result<u64, ReadCapacityError> {
         let workers = u64::from(self.read_concurrency_limit.get())
             + u64::try_from(crate::constants::CONTROL_READ_CONCURRENCY)
                 .map_err(|_| ReadCapacityError::Overflow)?;
@@ -638,23 +613,20 @@ impl Config {
             .ok_or(ReadCapacityError::Overflow)?;
 
         [
+            // Retained blocks, transactions, and serialized blocks, under a shared gauge.
             result_bytes,
+            // Active parsers for those results, under a shared gauge.
             parser_bytes,
+            // Fixed-size headers: their count limit multiplied by their size.
             header_result_bytes,
+            // Chain-tip blocks in their fixed count partition, including their parsers.
             chain_tip_bytes,
+            // Block-range parsers, which each worker bounds to one block at a time.
             block_range_parser_bytes,
         ]
         .into_iter()
         .try_fold(0u64, u64::checked_add)
-        .ok_or(ReadCapacityError::Overflow)?;
-
-        Ok(ReadCapacityPlan {
-            result_bytes,
-            parser_bytes,
-            header_result_bytes,
-            chain_tip_bytes,
-            block_range_parser_bytes,
-        })
+        .ok_or(ReadCapacityError::Overflow)
     }
 }
 
@@ -693,22 +665,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_read_capacity_plan_funds_its_workers_and_one_legal_result() {
-        let plan = Config::default().read_capacity_plan().unwrap();
-        assert_eq!(plan.result_bytes, 4 * 1024 * 1024 * 1024);
-        assert_eq!(plan.parser_bytes, 1024 * 1024 * 1024);
-        assert_eq!(plan.block_range_parser_bytes, 68 * 4_000_000);
-        assert!(plan.total_bytes() > plan.result_bytes + plan.parser_bytes);
+    fn default_read_memory_bound_sums_every_partition() {
+        let header_size =
+            u64::try_from(std::mem::size_of::<zakura_chain::block::Header>()).unwrap();
+        assert_eq!(
+            Config::default().read_memory_bound(),
+            Ok(4 * 1024 * 1024 * 1024
+                + 1024 * 1024 * 1024
+                + 16384 * header_size
+                + crate::constants::CHAIN_TIP_BLOCK_RETENTION
+                    * (MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE + MAX_BLOCK_PARSER_BYTES)
+                + 68 * 4_000_000)
+        );
     }
 
     #[test]
-    fn read_capacity_plan_rejects_limits_that_cannot_fund_progress() {
+    fn read_memory_bound_rejects_limits_that_cannot_fund_progress() {
         let workers = Config {
             read_concurrency_limit: NonZeroU16::new(509).unwrap(),
             ..Config::default()
         };
         assert_eq!(
-            workers.read_capacity_plan(),
+            workers.read_memory_bound(),
             Err(ReadCapacityError::TooManyWorkers { workers: 513 })
         );
         let parser = Config {
@@ -716,7 +694,7 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            parser.read_capacity_plan(),
+            parser.read_memory_bound(),
             Err(ReadCapacityError::ParserLimitTooSmall {
                 limit: 68 * 4_000_000 - 1,
                 required: 68 * 4_000_000,
@@ -727,7 +705,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            result.read_capacity_plan(),
+            result.read_memory_bound(),
             Err(ReadCapacityError::ResultLimitTooSmall { limit: 1, .. })
         ));
         let overflow = Config {
@@ -735,7 +713,7 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            overflow.read_capacity_plan(),
+            overflow.read_memory_bound(),
             Err(ReadCapacityError::Overflow)
         );
     }

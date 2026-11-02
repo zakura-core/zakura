@@ -211,7 +211,8 @@ impl ZakuraDb {
         }
 
         // Reject read limits that cannot fund their workers before touching the disk.
-        config.read_capacity_plan()?;
+        let read_memory_bound = config.read_memory_bound()?;
+        tracing::info!(read_memory_bound, "checked the read memory bound");
 
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.

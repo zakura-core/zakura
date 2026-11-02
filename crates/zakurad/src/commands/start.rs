@@ -369,10 +369,14 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
-        config
+        let backend_verifications = config
             .sync
-            .backend_execution_partition()
+            .backend_verification_total()
             .map_err(|error| eyre!(error))?;
+        info!(
+            backend_verifications,
+            "checked the backend verification bound"
+        );
 
         if config.zcashd_compat.enabled {
             zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;

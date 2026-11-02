@@ -95,6 +95,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         offset,
         draws,
         obs,
+        machine,
     } = recorded;
     [
         ("step", *step == produced.step),
@@ -105,6 +106,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         ("offset", *offset == produced.offset),
         ("draws", *draws == produced.draws),
         ("obs", *obs == produced.obs),
+        ("machine", *machine == produced.machine),
     ]
     .into_iter()
     .find_map(|(field, same)| (!same).then_some(field))
@@ -166,5 +168,58 @@ pub(crate) fn trace_difference(trace: &Trace, other: &Trace) -> Option<(u64, &'s
         (Some(end), Some(other)) => end_difference(end, other).map(|field| (last, field)),
         (None, None) => None,
         _ => Some((last, "end")),
+    }
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+    use crate::{
+        plan::By,
+        record::machine::{FailurePhase, FixtureStep, MachineFailure, MachineStep},
+    };
+
+    fn fixture(record: &mut StepRecord) -> &mut FixtureStep {
+        match record.machine.as_deref_mut() {
+            Some(MachineStep::Fixture(step)) => step,
+            other => panic!("the record holds fixture evidence, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_evidence_round_trips_and_changes_exact_replay() {
+        let record = StepRecord {
+            step: 1,
+            pick: "machine:fixture:1".into(),
+            key: None,
+            options: 1,
+            by: By::Forced,
+            offset: None,
+            draws: Vec::new(),
+            obs: None,
+            machine: Some(Box::new(MachineStep::Fixture(FixtureStep {
+                input: vec![0, 0, 0, 0],
+                failure: None,
+            }))),
+        };
+        let json = Record::Step(record.clone()).to_line();
+        let mut encoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(encoded["machine"]["kind"], "fixture");
+        assert!(encoded["machine"]["step"]["input"].is_array());
+        encoded["machine"]["kind"] = serde_json::json!("unsupported-machine");
+        assert!(serde_json::from_value::<Record>(encoded).is_err());
+        let decoded: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, Record::Step(record.clone()));
+        assert_eq!(step_difference(&record, &record), None);
+        let mut changed = record.clone();
+        fixture(&mut changed).input[0] ^= 1;
+        assert_eq!(step_difference(&record, &changed), Some("machine"));
+        let mut changed = record.clone();
+        fixture(&mut changed).failure = Some(MachineFailure {
+            property_failure: true,
+            phase: FailurePhase::Invariant,
+            message: "changed owner".into(),
+        });
+        assert_eq!(step_difference(&record, &changed), Some("machine"));
     }
 }

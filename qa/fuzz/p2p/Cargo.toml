@@ -16,6 +16,8 @@ cadence = { decoder = 1, properties = ["cadence/hold", "cadence/settlement"] }
 libfuzzer-sys = "0.4"
 zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuzz"] }
 
+[workspace]
+
 [[bin]]
 name = "service_session"
 path = "fuzz_targets/service_session.rs"
@@ -29,5 +31,3 @@ path = "fuzz_targets/cadence.rs"
 test = false
 doc = false
 bench = false
-
-[workspace]

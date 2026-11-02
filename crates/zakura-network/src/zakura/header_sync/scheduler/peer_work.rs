@@ -589,7 +589,7 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         call: StorageCall,
     ) -> Option<RetainedHeaders> {
-        let incarnation = self.policy.active(peer)?.incarnation;
+        let incarnation = self.policy.active(peer)?.incarnation();
         Some(RetainedHeaders {
             #[cfg(any(test, zakura_sim))]
             peer: peer.clone(),
@@ -782,27 +782,30 @@ mod tests {
     ) -> ActiveHeaderRequest {
         let request_id =
             HeaderSyncRequestId::new(u64::from(marker)).expect("the marker is nonzero");
-        ActiveHeaderRequest {
-            purpose: HeaderTargetPurpose::Normal,
-            peer: peer(marker),
-            source: SourceId::from_digest([marker; 32]),
-            sent_locator: HeaderLocator::for_continuation(local.frontiers.finalized),
-            owner: zakura_header_chain::HeaderWorkOwner {
-                authority: HeaderWorkAuthority::for_target(local, target.status.selected_tip_hash),
-                session_id: target.session_id,
-                request_id: std::num::NonZeroU64::new(request_id.get())
-                    .expect("header-sync request IDs are nonzero"),
-            }
-            .into(),
-            target,
-            request_id,
-            common_ancestor: Some(local.frontiers.finalized),
-            entries,
-            phase: HeaderTargetPhase::Receiving,
-            incarnation: WorkIncarnation::UNSTARTED,
-            cursor: None,
-            max_header_count: 1_000,
-            tree_aux_schema: AuxSchema::None,
+        {
+            let mut request = ActiveHeaderRequest::new(
+                HeaderTargetPurpose::Normal,
+                peer(marker),
+                SourceId::from_digest([marker; 32]),
+                HeaderLocator::for_continuation(local.frontiers.finalized),
+                zakura_header_chain::HeaderWorkOwner {
+                    authority: HeaderWorkAuthority::for_target(
+                        local,
+                        target.status.selected_tip_hash,
+                    ),
+                    session_id: target.session_id,
+                    request_id: std::num::NonZeroU64::new(request_id.get())
+                        .expect("header-sync request IDs are nonzero"),
+                }
+                .into(),
+                target,
+                request_id,
+                1_000,
+                AuxSchema::None,
+            );
+            request.common_ancestor = Some(local.frontiers.finalized);
+            request.entries = entries;
+            request
         }
     }
 
@@ -913,14 +916,12 @@ mod tests {
             Ok(Some(hash(marker)))
         })
         .expect("the test projection contains every requested frontier");
-        let request = ActiveHeaderRequest {
-            purpose: HeaderTargetPurpose::Normal,
-            peer: peer(1),
-            source: SourceId::from_digest([1; 32]),
-            target: replacement.clone(),
-            sent_locator: locator.clone(),
-            request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
-            owner: zakura_header_chain::HeaderWorkOwner {
+        let request = ActiveHeaderRequest::new(
+            HeaderTargetPurpose::Normal,
+            peer(1),
+            SourceId::from_digest([1; 32]),
+            locator.clone(),
+            zakura_header_chain::HeaderWorkOwner {
                 authority: HeaderWorkAuthority::for_target(
                     &local,
                     replacement.status.selected_tip_hash,
@@ -929,18 +930,15 @@ mod tests {
                 request_id: std::num::NonZeroU64::new(1).expect("one is nonzero"),
             }
             .into(),
-            common_ancestor: None,
-            entries: Vec::new(),
-            phase: HeaderTargetPhase::Receiving,
-            incarnation: WorkIncarnation::UNSTARTED,
-            cursor: None,
-            max_header_count: 1_000,
-            tree_aux_schema: AuxSchema::None,
-        };
+            replacement.clone(),
+            HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
+            1_000,
+            AuxSchema::None,
+        );
         assert!(queue.reserve_request(&peer(1), 1));
         assert!(queue.start(request.clone()));
         let request = queue.active(&peer(1)).expect("the request started").clone();
-        assert_ne!(request.incarnation, WorkIncarnation::UNSTARTED);
+        assert_ne!(request.incarnation(), WorkIncarnation::UNSTARTED);
         assert_eq!(
             queue.stage(
                 peer(1),

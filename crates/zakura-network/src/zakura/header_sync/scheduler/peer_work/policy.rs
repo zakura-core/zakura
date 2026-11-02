@@ -40,7 +40,7 @@ pub struct WorkIncarnation(u64);
 
 impl WorkIncarnation {
     /// The value of a request that no queue has started.
-    pub const UNSTARTED: Self = Self(0);
+    pub(super) const UNSTARTED: Self = Self(0);
 
     /// The incarnation's number.
     pub fn get(self) -> u64 {
@@ -174,7 +174,7 @@ pub struct ActiveHeaderRequest {
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
     /// The round the queue assigned at start, or [`WorkIncarnation::UNSTARTED`] before it.
-    pub incarnation: WorkIncarnation,
+    incarnation: WorkIncarnation,
     /// The subscription cursor of the last staged page.
     pub cursor: Option<Cursor>,
     /// Negotiated page bound before temporary credit limits.
@@ -211,6 +211,43 @@ pub enum HeaderTargetPhase {
 }
 
 impl ActiveHeaderRequest {
+    /// A request for `target` that has received nothing. Only the queue that
+    /// starts it assigns its incarnation.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::zakura::header_sync) fn new(
+        purpose: HeaderTargetPurpose,
+        peer: ZakuraPeerId,
+        source: SourceId,
+        sent_locator: HeaderLocator,
+        owner: HeaderSyncWorkOwner,
+        target: AdvertisedHeaderTarget,
+        request_id: HeaderSyncRequestId,
+        max_header_count: u32,
+        tree_aux_schema: AuxSchema,
+    ) -> Self {
+        Self {
+            purpose,
+            peer,
+            source,
+            target,
+            sent_locator,
+            request_id,
+            owner,
+            common_ancestor: None,
+            entries: Vec::new(),
+            phase: HeaderTargetPhase::Receiving,
+            incarnation: WorkIncarnation::UNSTARTED,
+            cursor: None,
+            max_header_count,
+            tree_aux_schema,
+        }
+    }
+
+    /// The round the queue assigned at start.
+    pub fn incarnation(&self) -> WorkIncarnation {
+        self.incarnation
+    }
+
     /// Whether one page preserves the active phase, target, and exact ancestry.
     pub fn matches_response_page(
         &self,

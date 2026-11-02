@@ -536,25 +536,20 @@ impl HeaderSyncReactor {
             .stage(peer.clone(), target.clone(), PeerWorkPriority::Normal)
             != QueueWorkResult::NeedsLocator
             || !self.peer_work_queue.start_repair(
-                ActiveHeaderRequest {
-                    purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                ActiveHeaderRequest::new(
+                    HeaderTargetPurpose::SelectedAuxiliaryRepair {
                         selected_target: request_target,
                         repair_generation: task.repair_generation,
                     },
-                    peer: peer.clone(),
+                    peer.clone(),
                     source,
+                    selected_context.locator.clone(),
+                    wire_owner.into(),
                     target,
-                    sent_locator: selected_context.locator.clone(),
                     request_id,
-                    owner: wire_owner.into(),
-                    common_ancestor: None,
-                    entries: Vec::new(),
-                    phase: HeaderTargetPhase::Receiving,
-                    incarnation: WorkIncarnation::UNSTARTED,
-                    cursor: None,
-                    max_header_count: request_count,
-                    tree_aux_schema: AuxSchema::V1,
-                },
+                    request_count,
+                    AuxSchema::V1,
+                ),
                 selected_context.episode,
             )
         {

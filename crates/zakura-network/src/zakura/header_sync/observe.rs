@@ -344,7 +344,7 @@ impl RequestRef {
             peer: active.peer.clone(),
             session_id: active.owner.session_id(),
             request_id: active.request_id.get(),
-            incarnation: active.incarnation.get(),
+            incarnation: active.incarnation().get(),
             owner: active.owner,
             target_tip_hash: active.target.status.selected_tip_hash,
         }

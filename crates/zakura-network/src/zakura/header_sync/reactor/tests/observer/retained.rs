@@ -157,7 +157,7 @@ async fn a_prepare_hands_its_headers_to_its_apply_without_a_release() {
         call: 2,
         kind: StorageCallKind::Apply,
         peer: peer.clone(),
-        incarnation: round.incarnation.get(),
+        incarnation: round.incarnation().get(),
         headers: 1,
     }));
 
@@ -195,7 +195,7 @@ async fn an_earlier_rounds_prepare_cannot_settle_a_later_round_with_the_same_own
 
     let new = seed_preparing(&mut reactor, &snapshot, &recorder, &peer, 7);
     assert_eq!(new.owner, old.owner, "a resumed round reuses its owner");
-    assert_ne!(new.incarnation, old.incarnation);
+    assert_ne!(new.incarnation(), old.incarnation());
     assert!(matches!(
         reactor.dispatch_action(prepare(&reactor, &new)),
         StorageDispatch::Started(_)

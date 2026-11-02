@@ -19,7 +19,7 @@ use super::{
         peer_work::{
             decide_offer, page_next, repair_page, HeaderTargetPhase, HeaderWorkEnd, OfferDecision,
             OfferFacts, OfferedPeerWork, PageFacts, PageNext, PeerWorkPriority, PeerWorkQueue,
-            QueueWorkResult, RepairPage, RetainedHeaders, SpentOffer, StorageCall, WorkIncarnation,
+            QueueWorkResult, RepairPage, RetainedHeaders, SpentOffer, StorageCall,
             MAX_HEADER_CHUNK_RESERVATION_V1,
         },
         repair::{RepairPolicyState, RepairRequirement, RepairRequirementSlot},
@@ -2102,22 +2102,17 @@ impl HeaderSyncReactor {
                     session_id,
                     NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
                 );
-                let started = self.peer_work_queue.start(ActiveHeaderRequest {
-                    purpose: HeaderTargetPurpose::Normal,
-                    peer: peer.clone(),
+                let started = self.peer_work_queue.start(ActiveHeaderRequest::new(
+                    HeaderTargetPurpose::Normal,
+                    peer.clone(),
                     source,
+                    locator,
+                    owner.into(),
                     target,
-                    sent_locator: locator,
                     request_id,
-                    owner: owner.into(),
-                    common_ancestor: None,
-                    entries: Vec::new(),
-                    phase: HeaderTargetPhase::Receiving,
-                    incarnation: WorkIncarnation::UNSTARTED,
-                    cursor: None,
-                    max_header_count: negotiated_header_count,
+                    negotiated_header_count,
                     tree_aux_schema,
-                });
+                ));
                 debug_assert!(
                     started,
                     "the matching locator was checked before publication"

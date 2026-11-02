@@ -21,7 +21,7 @@ use super::{
     decide_offer, page_next, ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase,
     HeaderTargetPurpose, OfferDecision, OfferFacts, OfferedPeerWork, PageFacts, PageNext,
     PeerWorkPriority, PeerWorkQueue, QueueWorkResult, RetainedHeaders, SpentOffer, StorageCall,
-    StorageCallKind, WorkIncarnation, MAX_HEADER_CHUNK_RESERVATION_V1,
+    StorageCallKind, MAX_HEADER_CHUNK_RESERVATION_V1,
 };
 use crate::zakura::{
     header_sync::{
@@ -304,12 +304,12 @@ fn target(tip: u8, generation: u8) -> AdvertisedHeaderTarget {
 fn request(peer: usize, tip: u8, generation: u8) -> ActiveHeaderRequest {
     let target = target(tip, generation);
     let request_id = HeaderSyncRequestId::new(1).expect("one is nonzero");
-    ActiveHeaderRequest {
-        purpose: HeaderTargetPurpose::Normal,
-        peer: peer_id(peer),
-        source: zakura_header_chain::SourceId::from_digest([1; 32]),
-        sent_locator: HeaderLocator::for_continuation(ancestor()),
-        owner: HeaderWorkOwner {
+    ActiveHeaderRequest::new(
+        HeaderTargetPurpose::Normal,
+        peer_id(peer),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        HeaderLocator::for_continuation(ancestor()),
+        HeaderWorkOwner {
             authority: target.scope,
             session_id: target.session_id,
             // Every round reuses one request ID, as a resumed subscription does.
@@ -318,14 +318,9 @@ fn request(peer: usize, tip: u8, generation: u8) -> ActiveHeaderRequest {
         .into(),
         target,
         request_id,
-        common_ancestor: None,
-        entries: Vec::new(),
-        phase: HeaderTargetPhase::Receiving,
-        incarnation: WorkIncarnation::UNSTARTED,
-        cursor: None,
-        max_header_count: 1_000,
-        tree_aux_schema: AuxSchema::None,
-    }
+        1_000,
+        AuxSchema::None,
+    )
 }
 
 impl Harness {
@@ -928,7 +923,7 @@ impl Harness {
             );
             let actual = self.queue.active(&id).map(|request| {
                 (
-                    request.incarnation.get(),
+                    request.incarnation().get(),
                     request.phase,
                     request.target.status.selected_tip_hash,
                 )

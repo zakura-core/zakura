@@ -1183,6 +1183,135 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
     assert_eq!(take_commit(&prepared_commit), take_commit(&full_commit));
 }
 
+/// Outputs read at the parent go to the transaction checks but never join the block's own
+/// outputs. A spend of a later output in the same block therefore still reaches state's
+/// in-block ordering check, which rejects it as an early spend.
+#[tokio::test]
+async fn parent_outputs_stay_out_of_the_in_block_ordering_check() {
+    use std::sync::Mutex;
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, None);
+    let height = Height(1);
+
+    let external = |byte| transparent::OutPoint {
+        hash: zakura_chain::transaction::Hash([byte; 32]),
+        index: 0,
+    };
+    let spend = |outpoint| transparent::Input::PrevOut {
+        outpoint,
+        unlock_script: transparent::Script::new(&[]),
+        sequence: 0,
+    };
+    let output = transparent::Output {
+        value: Amount::try_from(1).expect("one zatoshi is a valid amount"),
+        lock_script: transparent::Script::new(&[]),
+    };
+    let v5 = |inputs, outputs| Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs,
+        outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let later = v5(vec![spend(external(2))], vec![output.clone()]);
+    let later_output = transparent::OutPoint {
+        hash: later.hash(),
+        index: 0,
+    };
+    // Index 1 spends the output created at index 2.
+    let early = v5(vec![spend(later_output), spend(external(1))], Vec::new());
+    block.transactions.push(Arc::new(early));
+    block.transactions.push(Arc::new(later));
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+    let block = Arc::new(block);
+
+    let parent_utxos: Arc<HashMap<_, _>> = Arc::new(
+        [external(1), external(2)]
+            .into_iter()
+            .map(|outpoint| {
+                (
+                    outpoint,
+                    transparent::Utxo::new(output.clone(), height, false),
+                )
+            })
+            .collect(),
+    );
+    let committed = Arc::new(Mutex::new(None));
+    let state = service_fn({
+        let parent_utxos = parent_utxos.clone();
+        let committed = committed.clone();
+        move |request: zs::Request| {
+            let parent_utxos = parent_utxos.clone();
+            let committed = committed.clone();
+            async move {
+                Ok::<_, BoxError>(match request {
+                    zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                        (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                    ),
+                    zs::Request::CheckParentInputs { outpoints, .. } => {
+                        assert_eq!(*outpoints, [external(1), external(2)]);
+                        zs::Response::ParentInputs(zs::ParentInputs::Unspent(parent_utxos))
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block)
+                    | zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
+                        let hash = block.hash;
+                        *committed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+                        zs::Response::Committed(hash)
+                    }
+                    _ => panic!("unexpected state request: {request:?}"),
+                })
+            }
+        }
+    });
+    let transaction = service_fn({
+        let parent_utxos = parent_utxos.clone();
+        move |request: tx::Request| {
+            let tx::Request::Block {
+                known_utxos,
+                parent_utxos: request_parent_utxos,
+                ..
+            } = &request
+            else {
+                panic!("block verification sent a mempool transaction request");
+            };
+            assert_eq!(*request_parent_utxos, parent_utxos);
+            assert_eq!(known_utxos[&later_output].tx_index_in_block, 2);
+            async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+        }
+    });
+
+    SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    )
+    .oneshot(Request::Commit(block.clone()))
+    .await
+    .expect("the block reaches state");
+
+    let committed = committed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the verifier committed the block");
+    // State checks spends against these outputs. The later output keeps its index, so the spend
+    // at index 1 fails there, and no parent output can stand in for it.
+    let transaction_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+    assert_eq!(
+        committed.new_outputs,
+        transparent::new_ordered_outputs(&block, &transaction_hashes)
+    );
+    assert_eq!(committed.new_outputs[&later_output].tx_index_in_block, 2);
+    assert!(!committed.new_outputs.contains_key(&external(1)));
+    assert!(!committed.new_outputs.contains_key(&external(2)));
+}
+
 #[test]
 fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zakura_test::init();

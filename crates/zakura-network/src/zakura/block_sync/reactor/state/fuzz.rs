@@ -106,14 +106,14 @@ fn replay(data: &[u8], mut after_step: impl FnMut(&mut QueryState, u8)) -> Block
                     assert_eq!(proposal.query.from, block::Height(1), "{DISPATCH}: start");
                     assert_eq!(proposal.query.limit, 10, "{DISPATCH}: take");
                     if op == 0 {
-                        state.accepted(proposal);
+                        let _ = state.accepted(proposal);
                         pending = Some((next_id, epoch, choice));
                         history.push((next_id, epoch));
                         next_id += 1;
                         retry_at = None;
                         summary.accepted += 1;
                     } else {
-                        state.refused(
+                        let _ = state.refused(
                             proposal,
                             ActionRefusal::Full,
                             origin + Duration::from_millis(now),
@@ -138,11 +138,13 @@ fn replay(data: &[u8], mut after_step: impl FnMut(&mut QueryState, u8)) -> Block
                 let actual = if op == 2 {
                     state.complete(id, authority(generation)).is_some()
                 } else {
-                    state.fail(
-                        id,
-                        authority(generation),
-                        origin + Duration::from_millis(now),
-                    )
+                    state
+                        .fail(
+                            id,
+                            authority(generation),
+                            origin + Duration::from_millis(now),
+                        )
+                        .retired_failed_query()
                 };
                 assert_eq!(actual, matches, "{COMPLETION}: exact identity");
                 if matches {
@@ -160,7 +162,7 @@ fn replay(data: &[u8], mut after_step: impl FnMut(&mut QueryState, u8)) -> Block
                 summary.resets += 1;
             }
             5 => {
-                state.retry_elapsed();
+                let _ = state.retry_elapsed();
                 retry_at = None;
             }
             6 => epoch += 1,

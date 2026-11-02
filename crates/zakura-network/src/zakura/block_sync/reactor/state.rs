@@ -107,18 +107,28 @@ impl ReactorState {
             .map(BodyWorkAuthority::for_view)
     }
 
-    /// Apply the query gates that need no shared-state reads.
-    pub(super) fn open_query(&mut self, force: bool) -> QueryOpening {
+    /// Apply the query gates that need no shared-state reads. The transition
+    /// reports a gate's change to the query state.
+    #[must_use = "a gate change must reach the trace and the observer"]
+    pub(super) fn open_query(&mut self, force: bool) -> (QueryOpening, Option<ReactorTransition>) {
         if !self.state_queries_enabled {
-            return QueryOpening::Closed;
+            return (QueryOpening::Closed, None);
         }
-        self.queries.open(QueryGate {
+        let before = self.queries.gate();
+        let opening = self.queries.open(QueryGate {
             force,
             header_quiet: self.bootstrap.is_header_quiet(),
             diverged: self.verified_tip_diverged(),
             request_floor: self.progress.request_floor,
             best_header_tip: self.progress.best_header_tip,
-        })
+        });
+        (opening, self.queries.gate_change(before))
+    }
+
+    /// Retire the query state for a reset to the verified `tip`.
+    pub(super) fn reset_queries(&mut self, tip: block::Height) -> ReactorTransition {
+        self.queries.clear();
+        ReactorTransition::TipReset { tip }
     }
 
     /// Plan the query that `opening` allows.
@@ -155,8 +165,24 @@ impl ReactorState {
     ///
     /// An unrelated reply leaves the pending query in place. A matching reply
     /// always retires the pending query, even when its authority or anchor is
-    /// stale.
+    /// stale. The transition reports the classification.
+    #[must_use = "a query reply must reach the trace and the observer"]
     pub(super) fn complete_needed_query(
+        &mut self,
+        query_id: NonZeroU64,
+        scope: BodyWorkAuthority,
+        body_anchor: Frontier,
+    ) -> (NeededReply, ReactorTransition) {
+        let reply = self.classify_needed_reply(query_id, scope, body_anchor);
+        let transition = ReactorTransition::QueryReply {
+            query_id,
+            scope,
+            outcome: reply.outcome(),
+        };
+        (reply, transition)
+    }
+
+    fn classify_needed_reply(
         &mut self,
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
@@ -338,10 +364,6 @@ pub(super) struct QueryProposal {
 }
 
 impl QueryProposal {
-    pub(super) fn query(&self) -> PendingNeededQuery {
-        self.query
-    }
-
     /// The action that asks state for this query's metadata.
     pub(super) fn action(&self) -> BlockSyncAction {
         BlockSyncAction::QueryNeededBlocks {
@@ -366,15 +388,6 @@ pub(super) enum QueryPlan {
     /// The reactor exhausted the query identifier space.
     IdsExhausted,
     Dispatch(QueryProposal),
-}
-
-/// The query state a [`ReactorTransition`] reports, for detecting a change
-/// that no input-specific transition names.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct QueryLifecycle {
-    pending: Option<PendingNeededQuery>,
-    retry_at: Option<Instant>,
-    retry_forced: bool,
 }
 
 /// The pending needed-block query, its retry gate, and the hint refresh.
@@ -412,12 +425,17 @@ impl QueryState {
     }
 
     /// The pending query, the retry gate, and the owed force.
-    pub(super) fn lifecycle(&self) -> QueryLifecycle {
-        QueryLifecycle {
-            pending: self.pending,
-            retry_at: self.retry_at,
-            retry_forced: self.retry_forced,
-        }
+    fn gate(&self) -> (Option<PendingNeededQuery>, Option<Instant>, bool) {
+        (self.pending, self.retry_at, self.retry_forced)
+    }
+
+    /// The transition that reports a change from `before`, which no
+    /// input-specific transition names.
+    fn gate_change(
+        &self,
+        before: (Option<PendingNeededQuery>, Option<Instant>, bool),
+    ) -> Option<ReactorTransition> {
+        (self.gate() != before).then_some(ReactorTransition::QueryGateChanged)
     }
 
     #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -535,12 +553,13 @@ impl QueryState {
 
     /// The action channel accepted `proposal`: it becomes the pending query and
     /// consumes its query ID.
-    pub(super) fn accepted(&mut self, proposal: QueryProposal) {
+    pub(super) fn accepted(&mut self, proposal: QueryProposal) -> ReactorTransition {
         let query_id = proposal.query.query_id;
         self.pending = Some(proposal.query);
         self.retry_at = None;
         self.retry_forced = false;
         self.next_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
+        ReactorTransition::QueryAccepted(proposal.query.into())
     }
 
     /// The action channel refused `proposal`. The pending query and the next
@@ -554,7 +573,7 @@ impl QueryState {
         proposal: QueryProposal,
         refusal: ActionRefusal,
         now: Instant,
-    ) {
+    ) -> ReactorTransition {
         match refusal {
             ActionRefusal::Closed => {
                 self.dispatch_closed = true;
@@ -565,6 +584,10 @@ impl QueryState {
                 self.retry_forced |= proposal.query.forced;
                 self.schedule_retry(now);
             }
+        }
+        ReactorTransition::QueryRefused {
+            query: proposal.query.into(),
+            refusal,
         }
     }
 
@@ -584,29 +607,32 @@ impl QueryState {
     }
 
     /// Retire the pending query when `(query_id, scope)` identifies it, and
-    /// schedule a retry. Returns whether the failure matched.
-    #[must_use = "an unmatched failure is a stale completion"]
+    /// schedule a retry. An unmatched failure is a stale completion.
     pub(super) fn fail(
         &mut self,
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
         now: Instant,
-    ) -> bool {
-        let Some(query) = self
+    ) -> ReactorTransition {
+        let pending = self
             .pending
-            .filter(|pending| pending.query_id == query_id && pending.scope == scope)
-        else {
-            return false;
-        };
-        self.pending = None;
-        self.retry_forced |= query.forced;
-        self.schedule_retry(now);
-        true
+            .filter(|pending| pending.query_id == query_id && pending.scope == scope);
+        if let Some(query) = pending {
+            self.pending = None;
+            self.retry_forced |= query.forced;
+            self.schedule_retry(now);
+        }
+        ReactorTransition::QueryFailed {
+            query_id,
+            scope,
+            matched: pending.is_some(),
+        }
     }
 
     /// Lift the retry gate when its deadline passes.
-    pub(super) fn retry_elapsed(&mut self) {
+    pub(super) fn retry_elapsed(&mut self) -> ReactorTransition {
         self.retry_at = None;
+        ReactorTransition::RetryElapsed
     }
 
     /// Retire the pending query and lift the retry gate and any owed forced retry.
@@ -798,6 +824,7 @@ impl ReactorProgress {
 
 /// The reaction a Sequencer view asks for.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[must_use = "a reaction must reach the trace and the observer"]
 pub(super) enum ViewReaction {
     /// Only the mirrors changed.
     ObserveOnly,
@@ -897,6 +924,20 @@ pub(super) enum AuthorityUpdate {
     Refreshed(BodyWorkAuthority),
 }
 
+impl AuthorityUpdate {
+    /// The transition that reports this change.
+    pub(super) fn transition(self) -> ReactorTransition {
+        let (authority, epoch_changed) = match self {
+            Self::EpochChanged { authority, .. } => (authority, true),
+            Self::Refreshed(authority) => (authority, false),
+        };
+        ReactorTransition::AuthorityChanged {
+            authority,
+            epoch_changed,
+        }
+    }
+}
+
 /// How a committed view moves the verified frontiers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum FrontierUpdate {
@@ -933,6 +974,8 @@ pub(super) struct CommittedViewUpdate {
     pub(super) authority: Option<AuthorityUpdate>,
     pub(super) frontiers: FrontierUpdate,
     pub(super) hints: HintUpdate,
+    /// Reports the view's retirement of the query state, if any.
+    pub(super) gate_change: Option<ReactorTransition>,
     header_changed: bool,
     /// The hint change retired a pending query whose sizes it corrects.
     refreshed_pending_query: bool,
@@ -960,6 +1003,7 @@ impl ReactorState {
         view: CommittedHeaderChainView,
         now: time::Instant,
     ) -> CommittedViewUpdate {
+        let before = self.queries.gate();
         let previous = self.committed_view.take();
         let previous_scope = previous.as_ref().map(BodyWorkAuthority::for_view);
         let body_work_epoch_changed = previous
@@ -1063,6 +1107,7 @@ impl ReactorState {
             authority,
             frontiers: frontier_update,
             hints,
+            gate_change: self.queries.gate_change(before),
             header_changed,
             refreshed_pending_query,
         }

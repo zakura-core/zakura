@@ -54,6 +54,7 @@ pub enum QueryReplyOutcome {
 
 /// One completed view, reset, or query transition of the reactor's state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[must_use = "a completed transition must reach the trace and the observer"]
 pub enum ReactorTransition {
     /// The action channel accepted a query, which became the pending query.
     QueryAccepted(QueryIdentity),
@@ -135,6 +136,13 @@ pub struct ReactorSnapshot {
     pub last_reset_epoch: u64,
     /// Last `reaction_epoch` the reactor reacted to.
     pub last_reaction_epoch: u64,
+}
+
+impl ReactorTransition {
+    /// Whether this is a failure that retired the pending query.
+    pub(in super::super) fn retired_failed_query(self) -> bool {
+        matches!(self, Self::QueryFailed { matched: true, .. })
+    }
 }
 
 impl ReactorState {

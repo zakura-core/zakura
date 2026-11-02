@@ -151,7 +151,7 @@ fn refill_answered(
     answer: Result<(), ActionRefusal>,
     now: Instant,
 ) -> Refill {
-    let start = match state.open_query(force) {
+    let start = match state.open_query(force).0 {
         QueryOpening::Closed => return Refill::Held,
         QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
         QueryOpening::NeedsWork => QueryStart::Work(facts),
@@ -159,14 +159,14 @@ fn refill_answered(
     let QueryPlan::Dispatch(proposal) = state.propose_query(force, start) else {
         return Refill::Held;
     };
-    let query = proposal.query();
+    let query = proposal.query;
     match answer {
         Ok(()) => {
-            state.queries.accepted(proposal);
+            let _ = state.queries.accepted(proposal);
             Refill::Accepted(query)
         }
         Err(refusal) => {
-            state.queries.refused(proposal, refusal, now);
+            let _ = state.queries.refused(proposal, refusal, now);
             Refill::Refused(query)
         }
     }
@@ -233,7 +233,9 @@ fn rejected_replacement_then_old_reply_completes_old_query() {
         .observe_header_tip(block::Height(120), header_hash(120));
     let _ = refill(&mut state, false, work(Some(1), 0, 10), false, now);
 
-    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0));
+    let reply = state
+        .complete_needed_query(a.query_id, a.scope, anchor(0))
+        .0;
 
     assert_eq!(reply, NeededReply::Accept(a));
     assert_eq!(state.queries.pending(), None);
@@ -251,9 +253,14 @@ fn unrelated_stale_reply_keeps_replacement_query() {
     let b = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     assert_ne!(a.query_id, b.query_id);
 
-    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0));
+    let reply = state
+        .complete_needed_query(a.query_id, a.scope, anchor(0))
+        .0;
     assert_eq!(reply, NeededReply::Stale);
-    assert!(!state.queries.fail(a.query_id, a.scope, now));
+    assert!(!state
+        .queries
+        .fail(a.query_id, a.scope, now)
+        .retired_failed_query());
     assert_eq!(state.queries.pending(), Some(b));
     assert_eq!(state.queries.retry_at(), None);
 }
@@ -267,7 +274,9 @@ fn matching_reply_under_stale_authority_retires_query() {
     // A production authority change also retires the pending query, so only a
     // direct write reaches this defensive arm.
     state.committed_view = Some(authority_view(1));
-    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0));
+    let reply = state
+        .complete_needed_query(a.query_id, a.scope, anchor(0))
+        .0;
 
     assert_eq!(reply, NeededReply::StaleAuthority);
     assert_eq!(state.queries.pending(), None);
@@ -309,7 +318,9 @@ fn anchor_change_during_query_takes_frontier_path() {
         let mut state = authorized_state(5, 100);
         let a = expect_accepted(refill(&mut state, false, work(Some(6), 0, 10), true, now));
 
-        let reply = state.complete_needed_query(a.query_id, a.scope, body_anchor);
+        let reply = state
+            .complete_needed_query(a.query_id, a.scope, body_anchor)
+            .0;
 
         assert_eq!(reply, expected);
         assert_eq!(state.queries.pending(), None);
@@ -354,7 +365,7 @@ fn refused_forced_refill_retries_past_low_water() {
     assert!(matches!(refused, Refill::Refused(query) if query.forced));
     assert!(state.queries.retry_forced());
 
-    state.queries.retry_elapsed();
+    let _ = state.queries.retry_elapsed();
     let retried = expect_accepted(refill(&mut state, false, work(Some(1), 50, 10), true, now));
     assert!(retried.forced);
     assert!(!state.queries.retry_forced());
@@ -377,8 +388,11 @@ fn failed_forced_query_retries_past_low_water() {
     let mut state = authorized_state(0, 100);
     let query = expect_accepted(refill(&mut state, true, work(Some(1), 50, 10), true, now));
 
-    assert!(state.queries.fail(query.query_id, query.scope, now));
-    state.queries.retry_elapsed();
+    assert!(state
+        .queries
+        .fail(query.query_id, query.scope, now)
+        .retired_failed_query());
+    let _ = state.queries.retry_elapsed();
 
     assert!(expect_accepted(refill(&mut state, false, work(Some(1), 50, 10), true, now,)).forced);
 }
@@ -446,13 +460,13 @@ fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
     assert_eq!(state.queries.next_id(), next_id);
     assert_eq!(state.queries.retry_at(), None);
     assert!(state.queries.dispatch_closed());
-    assert_eq!(state.open_query(true), QueryOpening::Closed);
+    assert_eq!(state.open_query(true).0, QueryOpening::Closed);
 
     assert_eq!(
         state.queries.complete(accepted.query_id, accepted.scope),
         Some(accepted)
     );
-    assert_eq!(state.open_query(true), QueryOpening::Closed);
+    assert_eq!(state.open_query(true).0, QueryOpening::Closed);
 }
 
 #[test]
@@ -506,10 +520,10 @@ fn header_quiet_holds_queries_until_body_sync_starts() {
     state
         .bootstrap
         .hold_for_headers(zakura_rt::time::Instant::now() + Duration::from_secs(30));
-    assert_eq!(state.open_query(true), QueryOpening::Closed);
+    assert_eq!(state.open_query(true).0, QueryOpening::Closed);
 
     state.bootstrap.start_body_sync();
-    assert_eq!(state.open_query(false), QueryOpening::NeedsWork);
+    assert_eq!(state.open_query(false).0, QueryOpening::NeedsWork);
     // Body sync never holds for headers again.
     state
         .bootstrap
@@ -531,8 +545,9 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
         (first.from, first.limit, first.hint_revision),
         (block::Height(1), NEEDED_BLOCK_REFILL_LIMIT, Some(7))
     );
-    let NeededReply::Accept(first) =
-        state.complete_needed_query(first.query_id, first.scope, anchor(0))
+    let NeededReply::Accept(first) = state
+        .complete_needed_query(first.query_id, first.scope, anchor(0))
+        .0
     else {
         panic!("the reply matches the pending query and its anchor");
     };
@@ -540,7 +555,9 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
 
     let second = expect_accepted(refill(&mut state, false, work(None, 0, 0), true, now));
     assert_eq!((second.from, second.limit), (block::Height(4_001), 1_000));
-    let _ = state.complete_needed_query(second.query_id, second.scope, anchor(0));
+    let _ = state
+        .complete_needed_query(second.query_id, second.scope, anchor(0))
+        .0;
     assert!(!state.queries.advance_hint_refresh(&second));
     assert_eq!(state.queries.hint_refresh(), None);
 }
@@ -1071,14 +1088,17 @@ impl Driver {
                     AnchorKind::OtherHash => (tip, hash(0xCC, tip)),
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = self.state.complete_needed_query(
-                    query_id,
-                    authority(scope),
-                    Frontier {
-                        height: block::Height(body_anchor.0),
-                        hash: body_anchor.1,
-                    },
-                );
+                let actual = self
+                    .state
+                    .complete_needed_query(
+                        query_id,
+                        authority(scope),
+                        Frontier {
+                            height: block::Height(body_anchor.0),
+                            hash: body_anchor.1,
+                        },
+                    )
+                    .0;
                 let expected = self.model.reply(id, scope, body_anchor);
                 self.summary.replies += 1;
                 self.summary.stale_replies += usize::from(matches!(
@@ -1097,7 +1117,11 @@ impl Driver {
                     return false;
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = self.state.queries.fail(query_id, authority(scope), now);
+                let actual = self
+                    .state
+                    .queries
+                    .fail(query_id, authority(scope), now)
+                    .retired_failed_query();
                 self.actions.push(ReactorMachineAction::Failed {
                     query_id: id,
                     scope: authority(scope),
@@ -1113,7 +1137,7 @@ impl Driver {
                 {
                     self.summary.retry_expiries += 1;
                     self.actions.push(ReactorMachineAction::RetryElapsed);
-                    self.state.queries.retry_elapsed();
+                    let _ = self.state.queries.retry_elapsed();
                     self.model.retry_until_ms = None;
                 }
             }

@@ -173,14 +173,6 @@ impl ReactorIO {
         }
     }
 
-    /// Report a change from `before` in the query state, when the caller's
-    /// input has no transition of its own that names the change.
-    pub(super) fn report_query_gate_change(&self, before: state::QueryLifecycle) {
-        if self.state.queries.lifecycle() != before {
-            self.report_transition(ReactorTransition::QueryGateChanged);
-        }
-    }
-
     pub(super) fn emit_block(
         &self,
         event: &'static str,

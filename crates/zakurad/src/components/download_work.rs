@@ -68,7 +68,6 @@ pub(super) fn target_meets_work_floor(network: &Network, target: CompactDifficul
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::*;
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},

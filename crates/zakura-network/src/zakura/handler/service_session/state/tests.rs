@@ -569,7 +569,7 @@ proptest! {
     reason = "witnesses print applicability counters"
 )]
 fn fixed_seeds_exercise_every_session_rule() {
-    let mut total = ServiceSessionReplaySummary::default();
+    let mut total = std::collections::BTreeMap::new();
     for seed in 1..=32u64 {
         // A xorshift stream: reproducible bytes without a fuzzing engine.
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -581,20 +581,19 @@ fn fixed_seeds_exercise_every_session_rule() {
                 state.to_le_bytes()[0]
             })
             .collect();
-        let summary = replay_service_session_bytes(&bytes);
-        total.completed_offers += summary.completed_offers;
-        total.invalid_members += summary.invalid_members;
-        total.conflicting_members += summary.conflicting_members;
-        total.expired_offers += summary.expired_offers;
-        total.deferred_members += summary.deferred_members;
-        total.parked_collisions += summary.parked_collisions;
-        total.adopted_collisions += summary.adopted_collisions;
-        total.local_opens += summary.local_opens;
-        total.stale_exits += summary.stale_exits;
-        total.reopen_backoffs += summary.reopen_backoffs;
-        total.retirements += summary.retirements;
+        for (rule, count) in replay_rules(&replay_service_session_bytes(&bytes)) {
+            *total.entry(rule).or_insert(0) += count;
+        }
     }
     println!("tier=Machine target=service_session decoder=1 {total:?}");
+    for (rule, count) in &total {
+        assert!(*count > 0, "no fixed seed exercised {rule}: {total:?}");
+    }
+}
+
+/// Every rule a replay counts, by name. The destructure makes a new counter a
+/// compile error here.
+fn replay_rules(summary: &ServiceSessionReplaySummary) -> [(&'static str, usize); 11] {
     let ServiceSessionReplaySummary {
         completed_offers,
         invalid_members,
@@ -607,8 +606,8 @@ fn fixed_seeds_exercise_every_session_rule() {
         stale_exits,
         reopen_backoffs,
         retirements,
-    } = total.clone();
-    for (rule, count) in [
+    } = *summary;
+    [
         ("completed offers", completed_offers),
         ("invalid members", invalid_members),
         ("conflicting members", conflicting_members),
@@ -620,9 +619,7 @@ fn fixed_seeds_exercise_every_session_rule() {
         ("stale exits", stale_exits),
         ("reopen backoffs", reopen_backoffs),
         ("retirements", retirements),
-    ] {
-        assert!(count > 0, "no fixed seed exercised {rule}: {total:?}");
-    }
+    ]
 }
 
 /// Attempts count every local open, and only the exit of the exact generation

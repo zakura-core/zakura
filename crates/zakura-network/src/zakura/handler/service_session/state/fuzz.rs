@@ -414,29 +414,24 @@ impl Model {
     }
 }
 
-/// The connection loop's one wait per service, as `ServiceSessionIO` keeps it.
+/// Whether the connection loop holds its one wait for the service, as
+/// `ServiceSessionIO` keeps it.
 #[derive(Debug, Default)]
-struct WaitSlot(Option<DemandOrBackoff>);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DemandOrBackoff {
-    Demand,
-    Backoff,
-}
+struct WaitSlot(bool);
 
 impl WaitSlot {
     fn apply(&mut self, change: DemandChange) {
         match change {
             DemandChange::Keep => {}
-            DemandChange::Cancel => self.0 = None,
-            DemandChange::Start => self.0 = Some(DemandOrBackoff::Demand),
+            DemandChange::Cancel => self.0 = false,
+            DemandChange::Start => self.0 = true,
         }
     }
 
     fn backoff(&mut self, delay: Option<Duration>) {
         if delay.is_some() {
-            check(LEGAL_REOPEN, self.0, None);
-            self.0 = Some(DemandOrBackoff::Backoff);
+            check(LEGAL_REOPEN, self.0, false);
+            self.0 = true;
         }
     }
 }
@@ -647,7 +642,7 @@ impl SessionHarness {
     }
 
     fn wait_fires(&mut self, open_now: bool, opens: bool) {
-        if self.wait.0.take().is_none() {
+        if !std::mem::take(&mut self.wait.0) {
             return;
         }
         self.session.clear_wait();
@@ -749,11 +744,7 @@ impl SessionHarness {
             self.session.reopen_attempts,
             self.model.attempts,
         );
-        check(
-            LEGAL_REOPEN,
-            self.session.is_waiting(),
-            self.wait.0.is_some(),
-        );
+        check(LEGAL_REOPEN, self.session.is_waiting(), self.wait.0);
         check(
             LEGAL_REOPEN,
             self.session.reopen_state,

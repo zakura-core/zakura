@@ -1006,6 +1006,65 @@ fn cache_reuse_requires_every_intermediate_major_upgrade() {
     assert!(current_path.exists());
 }
 
+/// Read-only tools open a reusable previous-major cache in place, before a primary upgrades it.
+#[test]
+fn read_only_open_reads_previous_major_cache_without_moving_it() {
+    let _init_guard = zakura_test::init();
+    let chain = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path(), NodeConfig::PrunedCheckpoint);
+    let current = state_database_format_version_in_code();
+    let previous = semver::Version::new(current.major - 1, 1, 0);
+    let current_path = config.db_path(STATE_DATABASE_KIND, current.major, &chain.network);
+    let previous_path = config.db_path(STATE_DATABASE_KIND, previous.major, &chain.network);
+    {
+        let mut state = open(&config, &chain.network);
+        commit_checkpoint(&mut state, &chain.blocks[..3]);
+        crate::write_database_format_version_to_disk(
+            &config,
+            STATE_DATABASE_KIND,
+            current.major,
+            &previous,
+            &chain.network,
+        )
+        .expect("fixture version is written");
+    }
+    std::fs::create_dir_all(
+        previous_path
+            .parent()
+            .expect("version directory has a parent"),
+    )
+    .expect("previous version parent exists");
+    std::fs::rename(&current_path, &previous_path)
+        .expect("fixture moves to the previous version directory");
+
+    {
+        let (_read_state, db, _non_finalized_sender) =
+            init_read_only(config.clone(), &chain.network).expect("read-only state opens");
+        assert_eq!(db.path(), previous_path);
+        assert_eq!(db.major_version(), previous.major);
+        assert_eq!(
+            db.format_version_on_disk().expect("version is readable"),
+            Some(previous.clone())
+        );
+        assert_eq!(db.finalized_tip_height(), Some(Height(2)));
+    }
+    assert!(
+        previous_path.exists(),
+        "a read-only open never moves the database"
+    );
+    assert!(
+        !current_path.exists(),
+        "a read-only open never creates the current path"
+    );
+
+    // A later primary still reuses and upgrades the same database.
+    let state = open(&config, &chain.network);
+    assert_eq!(state.db.path(), current_path);
+    assert!(!previous_path.exists());
+    assert_eq!(state.db.finalized_tip_height(), Some(Height(2)));
+}
+
 /// Offline rollback reverses the canonical UTXO set of a database without transparent indexes,
 /// keeps its marker, and decides that from durable state rather than the checkpoint setting.
 #[test]

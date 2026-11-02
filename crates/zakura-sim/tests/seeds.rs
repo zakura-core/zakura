@@ -64,13 +64,13 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(plan.scenario());
     }
     match stem {
-        "block-work-ownership" => value(zakura_sim::harness::block_work::Scenario {
+        "block-work-ownership" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![
                 0, 0, 0, 9, 1, 0, 0, 1, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 9, 1, 0, 0, 1, 2, 1, 0, 0,
                 5, 0, 0, 0, 4, 1, 0, 0, 5, 1, 0, 0,
             ],
         }),
-        "block-work-funding" => value(zakura_sim::harness::block_work::Scenario {
+        "block-work-funding" => value(zakura_sim::record::machine::MachineScenario {
             input: include_bytes!("fixtures/block-work-funding.bin").to_vec(),
         }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),

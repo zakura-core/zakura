@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::observe::{WorkOwner, WorkScope};
+use crate::observe::{BlockSyncReactorState, WorkOwner, WorkScope};
 
 /// A machine harness's scenario.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -375,7 +375,19 @@ pub enum ReactorReply {
     Accepted,
 }
 
-/// One transition a reactor input caused.
+/// Why the action channel refused a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReactorRefusal {
+    /// An optional action found only the control reserve free.
+    ControlReserve,
+    /// The channel is full.
+    Full,
+    /// The action driver closed the channel.
+    Closed,
+}
+
+/// One completed reactor transition, named by its exact identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "action",
@@ -393,11 +405,11 @@ pub enum ReactorAction {
     QueryRefused {
         /// The refused proposal.
         query: ReactorQuery,
-        /// Whether the channel closed, rather than filled.
-        closed: bool,
+        /// Why the channel refused it.
+        refusal: ReactorRefusal,
     },
     /// A needed-block reply reached the state.
-    Reply {
+    QueryReply {
         /// The reply's query ID.
         query_id: u64,
         /// The reply's authority.
@@ -406,7 +418,7 @@ pub enum ReactorAction {
         outcome: ReactorReply,
     },
     /// A query failure reached the state.
-    Failed {
+    QueryFailed {
         /// The failure's query ID.
         query_id: u64,
         /// The failure's authority.
@@ -414,41 +426,40 @@ pub enum ReactorAction {
         /// Whether it retired the pending query.
         matched: bool,
     },
+    /// A forced opening lifted the retry gate, or a covered range or a
+    /// body-size hint change retired the query state.
+    QueryGateChanged,
     /// The retry gate's deadline passed.
     RetryElapsed,
-    /// A Sequencer view reached the state.
+    /// A Sequencer view asked for a reaction.
     View {
-        /// The view's verified tip.
-        tip: u32,
-        /// The view's download floor.
-        floor: u32,
-        /// Whether the view's reaction epoch advanced.
-        reacted: bool,
-        /// Whether the reaction was a destructive reset.
+        /// The reaction is a destructive reset.
         reset: bool,
+        /// The view advanced the verified tip.
+        tip_advanced: bool,
+    },
+    /// A committed view changed body-work authority.
+    AuthorityChanged {
+        /// The new authority.
+        authority: BodyAuthority,
+        /// Whether the change started a new body-work epoch.
+        epoch_changed: bool,
+    },
+    /// The reactor asked the Sequencer to reset to a verified tip.
+    TipReset {
+        /// The reset target.
+        tip: u32,
     },
 }
 
-/// Reactor query and progress state, read from production or derived by the model.
+/// Reactor state, read from production or derived by the model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReactorView {
-    /// The accepted query awaiting a reply.
-    pub pending: Option<ReactorQuery>,
-    /// The next accepted query's ID.
-    pub next_query_id: Option<u64>,
+    /// The logical state production reports.
+    pub state: BlockSyncReactorState,
     /// The retry deadline as an offset from the history's clock origin.
     pub retry_after_ms: Option<u64>,
-    /// Whether the next proposal owes a refused or failed query's force.
-    pub retry_forced: bool,
-    /// Whether the action channel reported closed.
-    pub dispatch_closed: bool,
-    /// Verified-tip mirror.
-    pub verified_tip: u32,
-    /// Query and scheduling floor.
-    pub request_floor: u32,
-    /// Header-tip mirror.
-    pub header_tip: u32,
 }
 
 /// One block-reactor decoder operation.
@@ -467,14 +478,14 @@ pub struct ReactorStep {
     pub failure: Option<MachineFailure>,
 }
 
-impl From<zakura_network::zakura::ReactorMachineQuery> for ReactorQuery {
-    fn from(value: zakura_network::zakura::ReactorMachineQuery) -> Self {
+impl From<zakura_network::zakura::PendingNeededQuery> for ReactorQuery {
+    fn from(value: zakura_network::zakura::PendingNeededQuery) -> Self {
         Self {
-            query_id: value.query_id,
+            query_id: value.query_id.get(),
             scope: value.scope.into(),
-            from: value.from,
+            from: value.from.0,
             limit: value.limit,
-            header_tip: value.header_tip,
+            header_tip: value.best_header_tip.0,
             forced: value.forced,
         }
     }
@@ -493,47 +504,81 @@ impl From<zakura_network::zakura::QueryReplyOutcome> for ReactorReply {
     }
 }
 
-impl From<zakura_network::zakura::ReactorMachineAction> for ReactorAction {
-    fn from(value: zakura_network::zakura::ReactorMachineAction) -> Self {
-        use zakura_network::zakura::ReactorMachineAction as Action;
+impl From<zakura_network::zakura::ActionRefusal> for ReactorRefusal {
+    fn from(value: zakura_network::zakura::ActionRefusal) -> Self {
+        use zakura_network::zakura::ActionRefusal as Refusal;
         match value {
-            Action::QueryAccepted(query) => Self::QueryAccepted {
+            Refusal::ControlReserve => Self::ControlReserve,
+            Refusal::Full => Self::Full,
+            Refusal::Closed => Self::Closed,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::ReactorTransition> for ReactorAction {
+    fn from(value: zakura_network::zakura::ReactorTransition) -> Self {
+        use zakura_network::zakura::ReactorTransition as Transition;
+        match value {
+            Transition::QueryAccepted(query) => Self::QueryAccepted {
                 query: query.into(),
             },
-            Action::QueryRefused { query, closed } => Self::QueryRefused {
+            Transition::QueryRefused { query, refusal } => Self::QueryRefused {
                 query: query.into(),
-                closed,
+                refusal: refusal.into(),
             },
-            Action::Reply {
+            Transition::QueryReply {
                 query_id,
                 scope,
                 outcome,
-            } => Self::Reply {
-                query_id,
+            } => Self::QueryReply {
+                query_id: query_id.get(),
                 scope: scope.into(),
                 outcome: outcome.into(),
             },
-            Action::Failed {
+            Transition::QueryFailed {
                 query_id,
                 scope,
                 matched,
-            } => Self::Failed {
-                query_id,
+            } => Self::QueryFailed {
+                query_id: query_id.get(),
                 scope: scope.into(),
                 matched,
             },
-            Action::RetryElapsed => Self::RetryElapsed,
-            Action::View {
-                tip,
-                floor,
-                reacted,
+            Transition::QueryGateChanged => Self::QueryGateChanged,
+            Transition::RetryElapsed => Self::RetryElapsed,
+            Transition::View {
                 reset,
+                tip_advanced,
             } => Self::View {
-                tip,
-                floor,
-                reacted,
                 reset,
+                tip_advanced,
             },
+            Transition::AuthorityChanged {
+                authority,
+                epoch_changed,
+            } => Self::AuthorityChanged {
+                authority: authority.into(),
+                epoch_changed,
+            },
+            Transition::TipReset { tip } => Self::TipReset { tip: tip.0 },
+        }
+    }
+}
+
+impl From<zakura_network::zakura::ReactorSnapshot> for BlockSyncReactorState {
+    fn from(value: zakura_network::zakura::ReactorSnapshot) -> Self {
+        Self {
+            pending: value.pending.map(Into::into),
+            next_query_id: value.next_query_id.map(std::num::NonZeroU64::get),
+            retry_armed: value.retry_armed,
+            retry_forced: value.retry_forced,
+            dispatch_closed: value.dispatch_closed,
+            scope: value.scope.map(Into::into),
+            verified_tip: value.verified_block_tip.0,
+            request_floor: value.request_floor.0,
+            header_tip: value.best_header_tip.0,
+            reset_epoch: value.last_reset_epoch,
+            reaction_epoch: value.last_reaction_epoch,
         }
     }
 }
@@ -541,14 +586,8 @@ impl From<zakura_network::zakura::ReactorMachineAction> for ReactorAction {
 impl From<zakura_network::zakura::ReactorMachineView> for ReactorView {
     fn from(value: zakura_network::zakura::ReactorMachineView) -> Self {
         Self {
-            pending: value.pending.map(Into::into),
-            next_query_id: value.next_query_id,
+            state: value.state.into(),
             retry_after_ms: value.retry_after_ms,
-            retry_forced: value.retry_forced,
-            dispatch_closed: value.dispatch_closed,
-            verified_tip: value.verified_tip,
-            request_floor: value.request_floor,
-            header_tip: value.header_tip,
         }
     }
 }

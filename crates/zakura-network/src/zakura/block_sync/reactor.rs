@@ -24,10 +24,10 @@ mod state;
 pub use state::{
     replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
     BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
-    ReactorMachineAction, ReactorMachineQuery, ReactorMachineView,
+    ReactorMachineView,
 };
-#[cfg(any(test, zakura_sim))]
-pub use state::QueryIdentity;
+#[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
+pub use state::PendingNeededQuery;
 pub use state::{ActionRefusal, QueryReplyOutcome, ReactorSnapshot, ReactorTransition};
 #[cfg(test)]
 mod tests;

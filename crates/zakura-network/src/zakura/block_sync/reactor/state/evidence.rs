@@ -7,36 +7,6 @@ use zakura_header_chain::BodyWorkAuthority;
 
 use super::{ActionRefusal, PendingNeededQuery, ReactorState};
 
-/// A query's exact identity, authority, and bounds, for traces and observers.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct QueryIdentity {
-    /// The query's exact ID.
-    pub query_id: NonZeroU64,
-    /// The body-work authority that dispatched it.
-    pub scope: BodyWorkAuthority,
-    /// First requested height.
-    pub from: block::Height,
-    /// Requested height count.
-    pub limit: u32,
-    /// Header tip the query asked about.
-    pub best_header_tip: block::Height,
-    /// Whether the query bypassed the low-water gate.
-    pub forced: bool,
-}
-
-impl From<PendingNeededQuery> for QueryIdentity {
-    fn from(query: PendingNeededQuery) -> Self {
-        Self {
-            query_id: query.query_id,
-            scope: query.scope,
-            from: query.from,
-            limit: query.limit,
-            best_header_tip: query.best_header_tip,
-            forced: query.forced,
-        }
-    }
-}
-
 /// How [`ReactorState::complete_needed_query`] classified a reply.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum QueryReplyOutcome {
@@ -57,11 +27,11 @@ pub enum QueryReplyOutcome {
 #[must_use = "a completed transition must reach the trace and the observer"]
 pub enum ReactorTransition {
     /// The action channel accepted a query, which became the pending query.
-    QueryAccepted(QueryIdentity),
+    QueryAccepted(PendingNeededQuery),
     /// The action channel refused a query. The pending query and next ID stayed.
     QueryRefused {
         /// The refused proposal.
-        query: QueryIdentity,
+        query: PendingNeededQuery,
         /// Why the channel refused it.
         refusal: ActionRefusal,
     },
@@ -115,7 +85,7 @@ pub enum ReactorTransition {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ReactorSnapshot {
     /// The accepted query awaiting a reply.
-    pub pending: Option<QueryIdentity>,
+    pub pending: Option<PendingNeededQuery>,
     /// The next accepted query's ID. `None` means the IDs ran out.
     pub next_query_id: Option<NonZeroU64>,
     /// Whether a retry deadline is armed.
@@ -149,7 +119,7 @@ impl ReactorState {
     /// Read the logical state. The caller reports it at a completed transition.
     pub(in super::super) fn snapshot(&self) -> ReactorSnapshot {
         ReactorSnapshot {
-            pending: self.queries.pending.map(Into::into),
+            pending: self.queries.pending,
             next_query_id: self.queries.next_id,
             retry_armed: self.queries.retry_at.is_some(),
             retry_forced: self.queries.retry_forced,

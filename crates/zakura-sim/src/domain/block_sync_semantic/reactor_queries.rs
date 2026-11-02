@@ -34,14 +34,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::Finding;
 use crate::{
-    observe::{
-        BlockSyncQuery, BlockSyncReactorState, BlockSyncReactorTransition, BodyScope,
-        StorageRequest,
-    },
-    record::machine::{BodyAuthority, ReactorReply},
+    observe::{BlockSyncReactorState, BodyScope, StorageRequest},
+    record::machine::{BodyAuthority, ReactorAction, ReactorQuery, ReactorRefusal, ReactorReply},
 };
 
-/// A query as block storage took it, in the same terms as a [`BlockSyncQuery`].
+/// A query as block storage took it, in the same terms as a [`ReactorQuery`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StorageQuery {
     scope: BodyAuthority,
@@ -52,7 +49,7 @@ struct StorageQuery {
 
 impl StorageQuery {
     /// Whether `query` names exactly this query.
-    fn matches(&self, query: &BlockSyncQuery) -> bool {
+    fn matches(&self, query: &ReactorQuery) -> bool {
         self.scope == query.scope
             && self.from == query.from
             && self.limit == query.limit
@@ -69,7 +66,7 @@ pub struct ReactorQueries {
     /// The next query's ID in the last reported state.
     reported_next: Option<u64>,
     /// Each accepted query, by ID.
-    accepted: BTreeMap<u64, BlockSyncQuery>,
+    accepted: BTreeMap<u64, ReactorQuery>,
     /// Queries storage took and the channel hasn't accepted, by ID.
     unaccepted: BTreeMap<u64, StorageQuery>,
     /// Every query ID storage took.
@@ -104,19 +101,19 @@ impl ReactorQueries {
     pub(super) fn transition(
         &mut self,
         step: u64,
-        transition: &BlockSyncReactorTransition,
+        transition: &ReactorAction,
         state: &BlockSyncReactorState,
     ) {
-        use BlockSyncReactorTransition as Fact;
+        use ReactorAction as Fact;
         match transition {
-            Fact::QueryAccepted(query) => {
+            Fact::QueryAccepted { query } => {
                 self.saw_proposal = true;
                 self.accepted.insert(query.query_id, query.clone());
                 if let Some(taken) = self.unaccepted.remove(&query.query_id) {
                     self.judge_storage_identity(step, query, &taken);
                 }
                 let required = (Some(query.query_id), query.query_id.checked_add(1));
-                if (state.pending, state.next_query_id) != required {
+                if (pending_id(state), state.next_query_id) != required {
                     self.finding(
                         step,
                         format!(
@@ -130,7 +127,7 @@ impl ReactorQueries {
             Fact::QueryRefused { query, refusal } => {
                 self.saw_proposal = true;
                 self.judge_query_state_kept(step, transition, state);
-                let closed = refusal == "closed";
+                let closed = *refusal == ReactorRefusal::Closed;
                 let holds = if closed {
                     state.dispatch_closed && !state.retry_armed
                 } else {
@@ -140,7 +137,7 @@ impl ReactorQueries {
                     self.finding(
                         step,
                         format!(
-                            "a {refusal} refusal of query {} {}",
+                            "a {refusal:?} refusal of query {} {}",
                             query.query_id,
                             if closed {
                                 "closes dispatch and arms no retry"
@@ -176,7 +173,7 @@ impl ReactorQueries {
             | Fact::RetryElapsed
             | Fact::View { .. } => {}
         }
-        self.reported_pending = state.pending;
+        self.reported_pending = pending_id(state);
         self.reported_next = state.next_query_id;
     }
 
@@ -184,11 +181,11 @@ impl ReactorQueries {
     fn judge_query_state_kept(
         &mut self,
         step: u64,
-        transition: &BlockSyncReactorTransition,
+        transition: &ReactorAction,
         state: &BlockSyncReactorState,
     ) {
         let required = (self.reported_pending, self.reported_next);
-        if (state.pending, state.next_query_id) != required {
+        if (pending_id(state), state.next_query_id) != required {
             self.finding(
                 step,
                 format!("{transition:?} keeps (pending, next ID) at {required:?}"),
@@ -258,7 +255,7 @@ impl ReactorQueries {
     }
 
     /// Judges that storage took `query` under its exact identity.
-    fn judge_storage_identity(&mut self, step: u64, query: &BlockSyncQuery, taken: &StorageQuery) {
+    fn judge_storage_identity(&mut self, step: u64, query: &ReactorQuery, taken: &StorageQuery) {
         if taken.matches(query) {
             self.saw_query_at_storage = true;
         } else {
@@ -282,6 +279,11 @@ impl ReactorQueries {
     }
 }
 
+/// The pending query's ID in `state`.
+fn pending_id(state: &BlockSyncReactorState) -> Option<u64> {
+    state.pending.as_ref().map(|query| query.query_id)
+}
+
 /// Checker tests: each crafts `BlockSyncFact::Reactor` and storage facts and
 /// folds them through [`SemanticModel`](super::SemanticModel). They show what
 /// the checker judges. They don't show that a simulated run produces these
@@ -296,7 +298,7 @@ mod checker_tests {
         Observation, ObservationLog,
     };
 
-    use BlockSyncReactorTransition as Fact;
+    use ReactorAction as Fact;
 
     /// A log built one observation per step.
     #[derive(Default)]
@@ -326,7 +328,7 @@ mod checker_tests {
         }
 
         /// Block storage takes a query with `query`'s identity.
-        fn storage(&mut self, query: &BlockSyncQuery) -> &mut Self {
+        fn storage(&mut self, query: &ReactorQuery) -> &mut Self {
             self.seq += 1;
             self.push(Observation::Storage {
                 service: BLOCK_SERVICE.to_owned(),
@@ -375,8 +377,8 @@ mod checker_tests {
         }
     }
 
-    fn query(query_id: u64) -> BlockSyncQuery {
-        BlockSyncQuery {
+    fn query(query_id: u64) -> ReactorQuery {
+        ReactorQuery {
             query_id,
             scope: authority(1),
             from: 1,
@@ -389,11 +391,12 @@ mod checker_tests {
     /// The state with `pending` and `next`, nothing armed, owed, or closed.
     fn state(pending: Option<u64>, next: u64) -> BlockSyncReactorState {
         BlockSyncReactorState {
-            pending,
+            pending: pending.map(query),
             next_query_id: Some(next),
             retry_armed: false,
             retry_forced: false,
             dispatch_closed: false,
+            scope: None,
             verified_tip: 0,
             request_floor: 0,
             header_tip: 100,
@@ -416,17 +419,14 @@ mod checker_tests {
         }
     }
 
-    fn refused(query: BlockSyncQuery, refusal: &str) -> Fact {
-        Fact::QueryRefused {
-            query,
-            refusal: refusal.to_owned(),
-        }
+    fn refused(query: ReactorQuery, refusal: ReactorRefusal) -> Fact {
+        Fact::QueryRefused { query, refusal }
     }
 
     /// Query 1 is accepted and pending.
     fn accepted_first() -> History {
         let mut history = History::default();
-        history.reactor(Fact::QueryAccepted(query(1)), state(Some(1), 2));
+        history.reactor(Fact::QueryAccepted { query: query(1) }, state(Some(1), 2));
         history
     }
 
@@ -442,7 +442,7 @@ mod checker_tests {
     #[test]
     fn checker_finds_a_storage_query_with_another_identity() {
         let mut history = accepted_first();
-        history.storage(&BlockSyncQuery {
+        history.storage(&ReactorQuery {
             limit: 9,
             ..query(1)
         });
@@ -464,7 +464,7 @@ mod checker_tests {
         let mut history = History::default();
         history
             .storage(&query(1))
-            .reactor(Fact::QueryAccepted(query(1)), state(Some(1), 2));
+            .reactor(Fact::QueryAccepted { query: query(1) }, state(Some(1), 2));
         let mut model = history.model();
         assert_eq!(model.reactor_queries.findings, []);
         assert_eq!(model.reactor_queries.take_unaccepted(9), []);
@@ -478,7 +478,7 @@ mod checker_tests {
         bypass.storage(&query(1));
         let mut refusal = accepted_first();
         refusal
-            .reactor(refused(query(2), "full"), armed(Some(1), 2))
+            .reactor(refused(query(2), ReactorRefusal::Full), armed(Some(1), 2))
             .storage(&query(2));
         for history in [bypass, refusal] {
             let mut model = history.model();
@@ -493,7 +493,7 @@ mod checker_tests {
     fn checker_finds_an_accepted_query_whose_pending_state_disagrees() {
         for reported in [state(None, 2), state(Some(1), 1), state(Some(7), 2)] {
             let mut history = History::default();
-            history.reactor(Fact::QueryAccepted(query(1)), reported.clone());
+            history.reactor(Fact::QueryAccepted { query: query(1) }, reported.clone());
             let findings = history.findings();
             assert_eq!(findings.len(), 1, "{reported:?}: {findings:?}");
         }
@@ -503,9 +503,9 @@ mod checker_tests {
     fn checker_holds_a_refusal_that_keeps_pending_and_next_id() {
         let mut history = accepted_first();
         history
-            .reactor(refused(query(2), "full"), armed(Some(1), 2))
+            .reactor(refused(query(2), ReactorRefusal::Full), armed(Some(1), 2))
             .reactor(Fact::RetryElapsed, state(Some(1), 2))
-            .reactor(Fact::QueryAccepted(query(2)), state(Some(2), 3));
+            .reactor(Fact::QueryAccepted { query: query(2) }, state(Some(2), 3));
         assert_eq!(history.findings(), []);
     }
 
@@ -514,7 +514,7 @@ mod checker_tests {
     fn checker_finds_a_refusal_that_changes_pending_or_next_id() {
         for reported in [armed(Some(1), 3), armed(None, 2)] {
             let mut history = accepted_first();
-            history.reactor(refused(query(2), "full"), reported.clone());
+            history.reactor(refused(query(2), ReactorRefusal::Full), reported.clone());
             let findings = history.findings();
             assert_eq!(findings.len(), 1, "{reported:?}: {findings:?}");
         }
@@ -523,14 +523,17 @@ mod checker_tests {
     #[test]
     fn checker_finds_a_full_refusal_that_arms_no_retry() {
         let mut history = accepted_first();
-        history.reactor(refused(query(2), "full"), state(Some(1), 2));
+        history.reactor(refused(query(2), ReactorRefusal::Full), state(Some(1), 2));
         assert_eq!(history.findings().len(), 1);
     }
 
     #[test]
     fn checker_judges_a_closed_refusal() {
         let mut history = accepted_first();
-        history.reactor(refused(query(2), "closed"), closed(Some(1), 2));
+        history.reactor(
+            refused(query(2), ReactorRefusal::Closed),
+            closed(Some(1), 2),
+        );
         assert_eq!(history.findings(), []);
 
         for reported in [
@@ -541,7 +544,7 @@ mod checker_tests {
             },
         ] {
             let mut history = accepted_first();
-            history.reactor(refused(query(2), "closed"), reported.clone());
+            history.reactor(refused(query(2), ReactorRefusal::Closed), reported.clone());
             assert_eq!(history.findings().len(), 1, "{reported:?}");
         }
     }

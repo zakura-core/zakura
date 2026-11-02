@@ -127,6 +127,7 @@ enum Refill {
 
 /// Run one refill the way the reactor does. `accept` selects between an accepted
 /// dispatch and a full action channel.
+#[cfg(test)]
 fn refill(
     state: &mut ReactorState,
     force: bool,
@@ -142,8 +143,8 @@ fn refill(
     refill_answered(state, force, facts, answer, now)
 }
 
-/// Run one refill with the action channel's exact `answer`, which reaches the
-/// state before anything else happens.
+/// Run one refill with the action channel's exact `answer`.
+#[cfg(test)]
 fn refill_answered(
     state: &mut ReactorState,
     force: bool,
@@ -151,7 +152,22 @@ fn refill_answered(
     answer: Result<(), ActionRefusal>,
     now: Instant,
 ) -> Refill {
-    let start = match state.open_query(force).0 {
+    refill_recorded(state, force, facts, answer, now, &mut Vec::new())
+}
+
+/// Run one refill and add its transitions to `actions`, as the reactor reports
+/// them. The channel's `answer` reaches the state before anything else happens.
+fn refill_recorded(
+    state: &mut ReactorState,
+    force: bool,
+    facts: WorkFacts,
+    answer: Result<(), ActionRefusal>,
+    now: Instant,
+    actions: &mut Vec<ReactorTransition>,
+) -> Refill {
+    let (opening, gate_change) = state.open_query(force);
+    actions.extend(gate_change);
+    let start = match opening {
         QueryOpening::Closed => return Refill::Held,
         QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
         QueryOpening::NeedsWork => QueryStart::Work(facts),
@@ -162,11 +178,11 @@ fn refill_answered(
     let query = proposal.query;
     match answer {
         Ok(()) => {
-            let _ = state.queries.accepted(proposal);
+            actions.push(state.queries.accepted(proposal));
             Refill::Accepted(query)
         }
         Err(refusal) => {
-            let _ = state.queries.refused(proposal, refusal, now);
+            actions.push(state.queries.refused(proposal, refusal, now));
             Refill::Refused(query)
         }
     }
@@ -204,7 +220,7 @@ fn refused_replacement_keeps_accepted_query() {
     let now = Instant::now();
     let mut state = authorized_state(0, 100);
     let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
-    let next_id = state.queries.next_id();
+    let next_id = state.queries.next_id;
 
     // A changed header tip makes the next proposal differ from `a`.
     state
@@ -216,7 +232,7 @@ fn refused_replacement_keeps_accepted_query() {
         matches!(b, Refill::Refused(b) if Some(b.query_id) == next_id && b.query_id != a.query_id)
     );
     assert_eq!(state.queries.pending(), Some(a));
-    assert_eq!(state.queries.next_id(), next_id);
+    assert_eq!(state.queries.next_id, next_id);
     assert_eq!(
         state.queries.retry_at(),
         Some(now + NEEDED_BLOCK_QUERY_RETRY_DELAY)
@@ -363,12 +379,12 @@ fn refused_forced_refill_retries_past_low_water() {
     let mut state = authorized_state(0, 100);
     let refused = refill(&mut state, true, work(Some(1), 50, 10), false, now);
     assert!(matches!(refused, Refill::Refused(query) if query.forced));
-    assert!(state.queries.retry_forced());
+    assert!(state.queries.retry_forced);
 
     let _ = state.queries.retry_elapsed();
     let retried = expect_accepted(refill(&mut state, false, work(Some(1), 50, 10), true, now));
     assert!(retried.forced);
-    assert!(!state.queries.retry_forced());
+    assert!(!state.queries.retry_forced);
 
     // The accepted retry settled the debt, so the low-water gate applies again.
     state
@@ -414,7 +430,7 @@ fn old_reply_keeps_the_force_a_refused_replacement_owes() {
 
     assert_eq!(state.queries.complete(old.query_id, old.scope), Some(old));
     assert_eq!(state.queries.retry_at(), None);
-    assert!(state.queries.retry_forced());
+    assert!(state.queries.retry_forced);
 }
 
 /// A reset supersedes the refused query and the force it owed.
@@ -432,7 +448,7 @@ fn reset_clears_the_owed_force() {
         ViewReaction::React { reset: true, .. }
     ));
     assert_eq!(state.queries.retry_at(), None);
-    assert!(!state.queries.retry_forced());
+    assert!(!state.queries.retry_forced);
 }
 
 /// A closed action channel cannot accept a retry, so no timer spins during
@@ -442,7 +458,7 @@ fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
     let now = Instant::now();
     let mut state = authorized_state(0, 100);
     let accepted = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
-    let next_id = state.queries.next_id();
+    let next_id = state.queries.next_id;
     state
         .progress
         .observe_header_tip(block::Height(120), header_hash(120));
@@ -457,9 +473,9 @@ fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
 
     assert!(matches!(refused, Refill::Refused(_)));
     assert_eq!(state.queries.pending(), Some(accepted));
-    assert_eq!(state.queries.next_id(), next_id);
+    assert_eq!(state.queries.next_id, next_id);
     assert_eq!(state.queries.retry_at(), None);
-    assert!(state.queries.dispatch_closed());
+    assert!(state.queries.dispatch_closed);
     assert_eq!(state.open_query(true).0, QueryOpening::Closed);
 
     assert_eq!(
@@ -987,7 +1003,7 @@ struct Driver {
     model: Model,
     summary: BlockReactorReplaySummary,
     /// Accepted, refused, and other transitions of the input being applied.
-    actions: Vec<ReactorMachineAction>,
+    actions: Vec<ReactorTransition>,
 }
 
 impl Driver {
@@ -1006,9 +1022,12 @@ impl Driver {
     /// transition, and apply the same rule to the model.
     fn observe_authority(&mut self, generation: u8) {
         let now = self.base + Duration::from_millis(self.model.now_ms);
-        let _ = self
+        let update = self
             .state
             .observe_committed_view(authority_view(generation), now);
+        self.actions.extend(update.gate_change);
+        self.actions
+            .extend(update.authority.map(AuthorityUpdate::transition));
         self.model.observe_authority(generation);
     }
 
@@ -1025,16 +1044,10 @@ impl Driver {
             Refill::Held => None,
             Refill::Accepted(query) => {
                 self.summary.accepted += 1;
-                self.actions
-                    .push(ReactorMachineAction::QueryAccepted(machine_query(query)));
                 Some((model_query(query), true))
             }
             Refill::Refused(query) => {
                 self.summary.refused += 1;
-                self.actions.push(ReactorMachineAction::QueryRefused {
-                    query: machine_query(query),
-                    closed: self.state.queries.dispatch_closed(),
-                });
                 Some((model_query(query), false))
             }
         };
@@ -1057,12 +1070,13 @@ impl Driver {
                 if has_authority {
                     self.observe_first_authority();
                 }
-                let actual = refill_answered(
+                let actual = refill_recorded(
                     &mut self.state,
                     force,
                     work(first_unclaimed, backlog, low_water),
                     answer,
                     now,
+                    &mut self.actions,
                 );
                 let expected =
                     self.model
@@ -1088,28 +1102,21 @@ impl Driver {
                     AnchorKind::OtherHash => (tip, hash(0xCC, tip)),
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = self
-                    .state
-                    .complete_needed_query(
-                        query_id,
-                        authority(scope),
-                        Frontier {
-                            height: block::Height(body_anchor.0),
-                            hash: body_anchor.1,
-                        },
-                    )
-                    .0;
+                let (actual, transition) = self.state.complete_needed_query(
+                    query_id,
+                    authority(scope),
+                    Frontier {
+                        height: block::Height(body_anchor.0),
+                        hash: body_anchor.1,
+                    },
+                );
+                self.actions.push(transition);
                 let expected = self.model.reply(id, scope, body_anchor);
                 self.summary.replies += 1;
                 self.summary.stale_replies += usize::from(matches!(
                     expected,
                     ModelReply::Stale | ModelReply::StaleAuthority
                 ));
-                self.actions.push(ReactorMachineAction::Reply {
-                    query_id: id,
-                    scope: authority(scope),
-                    outcome: actual.outcome(),
-                });
                 assert_eq!(model_reply(actual), expected, "{PROPERTY}");
             }
             Input::Fail { target, scope } => {
@@ -1117,17 +1124,13 @@ impl Driver {
                     return false;
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = self
-                    .state
-                    .queries
-                    .fail(query_id, authority(scope), now)
-                    .retired_failed_query();
-                self.actions.push(ReactorMachineAction::Failed {
-                    query_id: id,
-                    scope: authority(scope),
-                    matched: actual,
-                });
-                assert_eq!(actual, self.model.fail(id, scope), "{PROPERTY}");
+                let actual = self.state.queries.fail(query_id, authority(scope), now);
+                self.actions.push(actual);
+                assert_eq!(
+                    actual.retired_failed_query(),
+                    self.model.fail(id, scope),
+                    "{PROPERTY}"
+                );
             }
             Input::RetryElapsed => {
                 if self
@@ -1136,8 +1139,7 @@ impl Driver {
                     .is_some_and(|until| until <= self.model.now_ms)
                 {
                     self.summary.retry_expiries += 1;
-                    self.actions.push(ReactorMachineAction::RetryElapsed);
-                    let _ = self.state.queries.retry_elapsed();
+                    self.actions.push(self.state.queries.retry_elapsed());
                     self.model.retry_until_ms = None;
                 }
             }
@@ -1164,12 +1166,16 @@ impl Driver {
                 self.summary.views += 1;
                 self.summary.reactions += usize::from(expected.is_some());
                 self.summary.resets += usize::from(expected.is_some_and(|(reset, _)| reset));
-                self.actions.push(ReactorMachineAction::View {
-                    tip,
-                    floor,
-                    reacted: expected.is_some(),
-                    reset: expected.is_some_and(|(reset, _)| reset),
-                });
+                if let ViewReaction::React {
+                    reset,
+                    tip_advanced,
+                } = actual
+                {
+                    self.actions.push(ReactorTransition::View {
+                        reset,
+                        tip_advanced,
+                    });
+                }
                 match expected {
                     None => assert_eq!(actual, ViewReaction::ObserveOnly, "{PROPERTY}"),
                     Some((reset, tip_advanced)) => {
@@ -1185,24 +1191,22 @@ impl Driver {
                         // outstanding work over the low-water target.
                         check(&self.state, &self.model, self.base);
                         self.observe_first_authority();
-                        let actual = refill(
+                        let answer = if refill_accept {
+                            Ok(())
+                        } else {
+                            Err(ActionRefusal::Full)
+                        };
+                        let actual = refill_recorded(
                             &mut self.state,
                             reset,
                             work(Some(floor + 1), refill_backlog, 10),
-                            refill_accept,
+                            answer,
                             now,
+                            &mut self.actions,
                         );
-                        let expected = self.model.refill(
-                            reset,
-                            Some(floor + 1),
-                            refill_backlog,
-                            10,
-                            if refill_accept {
-                                Ok(())
-                            } else {
-                                Err(ActionRefusal::Full)
-                            },
-                        );
+                        let expected =
+                            self.model
+                                .refill(reset, Some(floor + 1), refill_backlog, 10, answer);
                         if reset && floor < self.model.header_tip && !self.model.closed {
                             assert!(
                                 expected.is_some(),
@@ -1236,98 +1240,13 @@ fn run(
 
 // ---- semantic history ----
 
-/// A query's identity, authority, and bounds in a machine history.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReactorMachineQuery {
-    /// The query's exact ID.
-    pub query_id: u64,
-    /// The body-work authority that dispatched it.
-    pub scope: BodyWorkAuthority,
-    /// First requested height.
-    pub from: u32,
-    /// Requested height count.
-    pub limit: u32,
-    /// Header tip the query asked about.
-    pub header_tip: u32,
-    /// Whether the query bypassed the low-water gate.
-    pub forced: bool,
-}
-
-fn machine_query(query: PendingNeededQuery) -> ReactorMachineQuery {
-    ReactorMachineQuery {
-        query_id: query.query_id.get(),
-        scope: query.scope,
-        from: query.from.0,
-        limit: query.limit,
-        header_tip: query.best_header_tip.0,
-        forced: query.forced,
-    }
-}
-
-/// One transition an input caused, named by its exact identities.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReactorMachineAction {
-    /// The action channel accepted a query.
-    QueryAccepted(ReactorMachineQuery),
-    /// The action channel refused a query.
-    QueryRefused {
-        /// The refused proposal.
-        query: ReactorMachineQuery,
-        /// Whether the channel closed, rather than filled.
-        closed: bool,
-    },
-    /// A needed-block reply reached the state.
-    Reply {
-        /// The reply's query ID.
-        query_id: u64,
-        /// The reply's authority.
-        scope: BodyWorkAuthority,
-        /// The classification.
-        outcome: QueryReplyOutcome,
-    },
-    /// A query failure reached the state.
-    Failed {
-        /// The failure's query ID.
-        query_id: u64,
-        /// The failure's authority.
-        scope: BodyWorkAuthority,
-        /// Whether it retired the pending query.
-        matched: bool,
-    },
-    /// The retry gate's deadline passed.
-    RetryElapsed,
-    /// A Sequencer view reached the state.
-    View {
-        /// The view's verified tip.
-        tip: u32,
-        /// The view's download floor.
-        floor: u32,
-        /// Whether the view's reaction epoch advanced.
-        reacted: bool,
-        /// Whether the reaction was a destructive reset.
-        reset: bool,
-    },
-}
-
-/// Reactor query and progress state at a completed input.
+/// Reactor state at a completed input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReactorMachineView {
-    /// The accepted query awaiting a reply.
-    pub pending: Option<ReactorMachineQuery>,
-    /// The next accepted query's ID.
-    pub next_query_id: Option<u64>,
+    /// The logical state production reports.
+    pub state: ReactorSnapshot,
     /// The retry gate's deadline, as an offset from the history's clock origin.
     pub retry_after_ms: Option<u64>,
-    /// Whether the next proposal owes a refused or failed query's force.
-    pub retry_forced: bool,
-    /// Whether the action channel reported closed.
-    pub dispatch_closed: bool,
-    /// Verified-tip mirror.
-    pub verified_tip: u32,
-    /// Query and scheduling floor.
-    pub request_floor: u32,
-    /// Header-tip mirror.
-    pub header_tip: u32,
 }
 
 /// One decoder-v2 operation.
@@ -1338,7 +1257,7 @@ pub struct BlockReactorStep {
     /// The operation's causal bytes, including a short final operation.
     pub input: Vec<u8>,
     /// The transitions the operation caused.
-    pub actions: Vec<ReactorMachineAction>,
+    pub actions: Vec<ReactorTransition>,
     /// State read from production.
     pub actual: ReactorMachineView,
     /// State derived by the independent model.
@@ -1358,37 +1277,40 @@ pub struct BlockReactorHistory {
 
 fn actual_view(state: &ReactorState, base: Instant) -> ReactorMachineView {
     ReactorMachineView {
-        pending: state.queries.pending().map(machine_query),
-        next_query_id: state.queries.next_id().map(NonZeroU64::get),
+        state: state.snapshot(),
         retry_after_ms: state.queries.retry_at().map(|at| {
             u64::try_from(at.duration_since(base).as_millis())
                 .expect("a history's deadlines fit in u64 milliseconds")
         }),
-        retry_forced: state.queries.retry_forced(),
-        dispatch_closed: state.queries.dispatch_closed(),
-        verified_tip: state.progress.verified_block_tip.0,
-        request_floor: state.progress.request_floor.0,
-        header_tip: state.progress.best_header_tip.0,
     }
 }
 
 fn expected_view(model: &Model) -> ReactorMachineView {
+    let query_id = |id| NonZeroU64::new(id).expect("model query IDs start at one");
     ReactorMachineView {
-        pending: model.pending.map(|query| ReactorMachineQuery {
-            query_id: query.id,
-            scope: authority(query.scope),
-            from: query.from,
-            limit: query.limit,
-            header_tip: query.header_tip,
-            forced: query.forced,
-        }),
-        next_query_id: Some(model.next_id),
+        state: ReactorSnapshot {
+            pending: model.pending.map(|query| PendingNeededQuery {
+                query_id: query_id(query.id),
+                scope: authority(query.scope),
+                from: block::Height(query.from),
+                limit: query.limit,
+                best_header_tip: block::Height(query.header_tip),
+                best_header_hash: header_hash(query.header_tip),
+                hint_revision: None,
+                forced: query.forced,
+            }),
+            next_query_id: Some(query_id(model.next_id)),
+            retry_armed: model.retry_until_ms.is_some(),
+            retry_forced: model.retry_forced,
+            dispatch_closed: model.closed,
+            scope: model.authority.map(authority),
+            verified_block_tip: block::Height(model.verified_tip),
+            request_floor: block::Height(model.floor),
+            best_header_tip: block::Height(model.header_tip),
+            last_reset_epoch: model.seen_reset_epoch,
+            last_reaction_epoch: model.seen_reaction_epoch,
+        },
         retry_after_ms: model.retry_until_ms,
-        retry_forced: model.retry_forced,
-        dispatch_closed: model.closed,
-        verified_tip: model.verified_tip,
-        request_floor: model.floor,
-        header_tip: model.header_tip,
     }
 }
 
@@ -1545,22 +1467,22 @@ fn reactor_history_records_exact_query_identities() {
         .all(|step| step.actual == step.expected));
     let first = history.steps[0]
         .actions
-        .first()
+        .last()
         .expect("the witness's first refill dispatches");
     assert!(
-        matches!(first, ReactorMachineAction::QueryAccepted(query) if query.query_id == 1),
+        matches!(first, ReactorTransition::QueryAccepted(query) if query.query_id.get() == 1),
         "{first:?}"
     );
     assert!(history.steps.iter().any(|step| step
         .actions
         .iter()
-        .any(|action| matches!(action, ReactorMachineAction::QueryRefused { query, closed: false } if query.query_id == 2))));
+        .any(|action| matches!(action, ReactorTransition::QueryRefused { query, refusal: ActionRefusal::Full } if query.query_id.get() == 2))));
 }
 
 #[test]
 fn reactor_history_holds_refills_after_a_closed_channel() {
     let history = trace_block_reactor_bytes(&[0, 24, 1, 200, 0, 0, 1, 200]);
-    assert!(history.steps[0].actual.dispatch_closed);
+    assert!(history.steps[0].actual.state.dispatch_closed);
     assert_eq!(history.steps[0].actual, history.steps[0].expected);
     assert!(
         history.steps[1].actions.is_empty(),
@@ -1609,8 +1531,8 @@ fn reactor_witness_exercises_a_stale_reply() {
 fn reactor_history_retires_the_pending_query_on_an_authority_change() {
     let history = trace_block_reactor_bytes(&[0, 0, 1, 200, 5, 0, 1, 0]);
     assert!(history.summary.is_some());
-    assert!(history.steps[0].actual.pending.is_some());
-    assert_eq!(history.steps[1].actual.pending, None);
+    assert!(history.steps[0].actual.state.pending.is_some());
+    assert_eq!(history.steps[1].actual.state.pending, None);
     assert_eq!(history.steps[1].actual, history.steps[1].expected);
 }
 

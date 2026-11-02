@@ -1423,7 +1423,7 @@ fn reactor_machine_replay_child() {
 
 #[test]
 fn reactor_machine_records_and_replays_query_identities() {
-    use zakura_sim::record::machine::{MachineStep, ReactorAction};
+    use zakura_sim::record::machine::{MachineStep, ReactorAction, ReactorRefusal};
     let entry = harness::find("block/reactor-policy").unwrap();
     let dir = record(entry, REACTOR_INPUT);
     let trace = open(dir.path());
@@ -1449,11 +1449,13 @@ fn reactor_machine_records_and_replays_query_identities() {
     };
     assert!(matches!(
         actions(0).as_slice(),
-        [ReactorAction::QueryAccepted { query }] if query.query_id == 1
+        [ReactorAction::AuthorityChanged { .. }, ReactorAction::QueryAccepted { query }]
+            if query.query_id == 1
     ));
     assert!(matches!(
         actions(1).as_slice(),
-        [ReactorAction::QueryRefused { query, closed: false }] if query.query_id == 2
+        [ReactorAction::QueryRefused { query, refusal: ReactorRefusal::Full }]
+            if query.query_id == 2
     ));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
@@ -1469,7 +1471,7 @@ fn reactor_machine_records_and_replays_query_identities() {
     );
 
     edit(dir.path(), |lines| {
-        step(lines, 2)["machine"]["step"]["actual"]["next_query_id"] = json!(99);
+        step(lines, 2)["machine"]["step"]["actual"]["state"]["next_query_id"] = json!(99);
     });
     assert!(matches!(
         replayed(dir.path(), ReplayOptions::default()),

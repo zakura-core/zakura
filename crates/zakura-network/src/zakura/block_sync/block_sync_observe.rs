@@ -19,7 +19,7 @@ use zakura_header_chain::BodyWorkOwner;
 
 pub use super::{
     reactor::{
-        ActionRefusal, QueryIdentity, QueryReplyOutcome, ReactorSnapshot, ReactorTransition,
+        ActionRefusal, PendingNeededQuery, QueryReplyOutcome, ReactorSnapshot, ReactorTransition,
     },
     regulated::session::AdmittedRange,
     reorder::RetainedBody,

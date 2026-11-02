@@ -53,11 +53,10 @@ pub use fuzz::{replay_block_query_bytes, BlockQueryReplaySummary};
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use tests::{
     replay_block_reactor_bytes, trace_block_reactor_bytes, BlockReactorHistory,
-    BlockReactorReplaySummary, BlockReactorStep, ReactorMachineAction, ReactorMachineQuery,
-    ReactorMachineView,
+    BlockReactorReplaySummary, BlockReactorStep, ReactorMachineView,
 };
 
-pub use evidence::{QueryIdentity, QueryReplyOutcome, ReactorSnapshot, ReactorTransition};
+pub use evidence::{QueryReplyOutcome, ReactorSnapshot, ReactorTransition};
 
 /// The block-sync reactor's logical state.
 #[derive(Debug)]
@@ -263,17 +262,24 @@ impl ReactorState {
 
 /// Identity, authority, and bounds of one body-missing metadata query.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct PendingNeededQuery {
-    pub(super) query_id: NonZeroU64,
-    pub(super) scope: BodyWorkAuthority,
-    pub(super) from: block::Height,
-    pub(super) limit: u32,
-    pub(super) best_header_tip: block::Height,
-    pub(super) best_header_hash: block::Hash,
-    pub(super) hint_revision: Option<u64>,
+pub struct PendingNeededQuery {
+    /// The query's exact ID.
+    pub query_id: NonZeroU64,
+    /// The body-work authority that dispatched it.
+    pub scope: BodyWorkAuthority,
+    /// First requested height.
+    pub from: block::Height,
+    /// Requested height count.
+    pub limit: u32,
+    /// Header tip the query asked about.
+    pub best_header_tip: block::Height,
+    /// Header hash at that tip.
+    pub best_header_hash: block::Hash,
+    /// The hint revision this query refreshes, if any.
+    pub hint_revision: Option<u64>,
     /// The query bypassed the low-water gate. Its refusal or failure carries
     /// that bypass into the retry.
-    pub(super) forced: bool,
+    pub forced: bool,
 }
 
 impl PendingNeededQuery {
@@ -438,29 +444,12 @@ impl QueryState {
         (self.gate() != before).then_some(ReactorTransition::QueryGateChanged)
     }
 
-    #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn next_id(&self) -> Option<NonZeroU64> {
-        self.next_id
-    }
-
     pub(super) fn retry_at(&self) -> Option<Instant> {
         self.retry_at
     }
 
     pub(super) fn hint_refresh(&self) -> Option<HintRefresh> {
         self.hint_refresh
-    }
-
-    /// Whether a refused or failed forced query still owes a forced retry.
-    #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn retry_forced(&self) -> bool {
-        self.retry_forced
-    }
-
-    /// Whether the action channel reported closed.
-    #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn dispatch_closed(&self) -> bool {
-        self.dispatch_closed
     }
 
     /// Apply the closed-channel, retry, quiet-period, and floor gates.
@@ -559,7 +548,7 @@ impl QueryState {
         self.retry_at = None;
         self.retry_forced = false;
         self.next_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
-        ReactorTransition::QueryAccepted(proposal.query.into())
+        ReactorTransition::QueryAccepted(proposal.query)
     }
 
     /// The action channel refused `proposal`. The pending query and the next
@@ -586,7 +575,7 @@ impl QueryState {
             }
         }
         ReactorTransition::QueryRefused {
-            query: proposal.query.into(),
+            query: proposal.query,
             refusal,
         }
     }

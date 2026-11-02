@@ -73,23 +73,14 @@ impl DiscoveryDialResult {
     }
 }
 
-/// How one dial worker's task ended.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum WorkerEnd {
-    /// The task returned its classified result.
-    Finished,
-    /// Shutdown aborted the task, possibly before its first poll.
-    Cancelled,
-    /// The task panicked.
-    Panicked,
-}
-
 #[derive(Debug)]
 struct DiscoveryDialOutcome {
     /// The IP whose handshake TLS authenticated, if this worker's dial got that far.
     admitted_ip: Option<IpAddr>,
     result: DiscoveryDialResult,
-    worker: WorkerEnd,
+    /// How the worker's task ended. Shutdown can abort a task before its first
+    /// poll.
+    phase: DialPhase,
 }
 
 /// Spawn the long-lived discovery candidate dialer for `endpoint`.
@@ -246,7 +237,7 @@ impl CandidateDialerIO {
         attempt: DialAttemptKey,
         outcome: DiscoveryDialOutcome,
     ) {
-        trace_dial_phase(&self.trace, attempt, outcome.worker.phase());
+        trace_dial_phase(&self.trace, attempt, outcome.phase);
         if !state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()) {
             return;
         }
@@ -266,7 +257,7 @@ impl CandidateDialerIO {
             worker.task.abort();
         }
         while let Some((attempt, outcome)) = self.workers.next().await {
-            trace_dial_phase(&self.trace, attempt, outcome.worker.phase());
+            trace_dial_phase(&self.trace, attempt, outcome.phase);
             state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now());
         }
     }
@@ -300,17 +291,17 @@ impl Future for DiscoveryDialWorker {
             Err(error) => {
                 debug!(?error, attempt = ?self.attempt, "Zakura discovery dial worker failed");
                 metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
-                let worker = if error.is_panic() {
+                let phase = if error.is_panic() {
                     metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
                     tracing::error!(attempt = ?self.attempt, "Zakura discovery dial worker panicked");
-                    WorkerEnd::Panicked
+                    DialPhase::WorkerPanicked
                 } else {
-                    WorkerEnd::Cancelled
+                    DialPhase::WorkerCancelled
                 };
                 DiscoveryDialOutcome {
                     admitted_ip: None,
                     result: DiscoveryDialResult::Failed,
-                    worker,
+                    phase,
                 }
             }
         };
@@ -365,7 +356,7 @@ async fn run_discovery_dial_once(
     let finished = |result| DiscoveryDialOutcome {
         admitted_ip: None,
         result,
-        worker: WorkerEnd::Finished,
+        phase: DialPhase::WorkerFinished,
     };
     let Ok(peer_id) = ZakuraPeerId::new(attempt.node_id.as_bytes().to_vec()) else {
         return finished(DiscoveryDialResult::Failed);
@@ -427,7 +418,7 @@ impl DialWatch {
         DiscoveryDialOutcome {
             admitted_ip,
             result,
-            worker: WorkerEnd::Finished,
+            phase: DialPhase::WorkerFinished,
         }
     }
 
@@ -557,16 +548,6 @@ fn trace_dial_phase(trace: &ZakuraTrace, attempt: DialAttemptKey, phase: DialPha
     });
 }
 
-impl WorkerEnd {
-    fn phase(self) -> DialPhase {
-        match self {
-            Self::Finished => DialPhase::WorkerFinished,
-            Self::Cancelled => DialPhase::WorkerCancelled,
-            Self::Panicked => DialPhase::WorkerPanicked,
-        }
-    }
-}
-
 async fn apply_discovery_dial_result(
     discovery: &ZakuraDiscoveryHandle,
     node_id: &NodeId,
@@ -642,6 +623,7 @@ mod tests {
         );
         assert_eq!(attempt, first);
         assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+        assert_eq!(outcome.phase, DialPhase::WorkerCancelled);
         assert!(state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()));
         assert_eq!(state.in_flight_dials_to(ip), 1);
         assert_eq!(state.in_flight_node_ids(), vec![second.node_id]);
@@ -928,18 +910,6 @@ mod tests {
     }
 
     /// A cancelled worker reports its identity and its end.
-    #[tokio::test]
-    async fn a_cancelled_worker_reports_how_it_ended() {
-        let mut state =
-            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
-        let attempt = state.record_attempt(node_id(14), vec![DIAL_IP]).unwrap();
-        let worker = DiscoveryDialWorker::spawn(attempt, std::future::pending());
-        worker.task.abort();
-        let (settled, outcome) = worker.await;
-        assert_eq!(settled, attempt);
-        assert_eq!(outcome.worker, WorkerEnd::Cancelled);
-    }
-
     // V12 F-71: the reservation counts one dial per IP, and the endpoint
     // starts one handshake per address. A record that lists several ports on
     // one IP must get one address per IP, so attempts equal reservations.

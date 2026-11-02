@@ -1,7 +1,7 @@
 //! State [`tower::Service`] response types.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -170,14 +170,21 @@ pub enum Response {
 }
 
 /// The result of checking a candidate block's external inputs against its parent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentInputs {
+    /// Every input is unspent at the parent, with the output each one spends.
+    ///
+    /// The block verifier hands these outputs to its transaction checks, so they are read once
+    /// per block. The map holds each output once while the block verifies. The transaction checks
+    /// already copy every output they spend, so peak memory stays about the same.
+    Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),
     /// The parent is neither in a non-finalized chain nor the finalized tip,
     /// so no chain can accept the candidate now.
     ParentUnavailable,
-    /// Every input is unspent at the parent, or the parent context changed during the read.
+    /// The state could not decide, for example because the parent context changed during the read,
+    /// or every input was found but their outputs were too large to keep.
     Inconclusive,
 }
 

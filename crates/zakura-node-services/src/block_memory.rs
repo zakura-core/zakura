@@ -426,9 +426,9 @@ impl OwnedBlock {
 
     /// Retain one transaction through verification or a detached worker.
     /// The handle keeps the block's entire decoded charge until it drops.
-    pub fn transaction(&self, index: usize) -> Option<OwnedBlockTransaction> {
+    pub fn transaction(&self, index: usize) -> Option<TransactionHandle> {
         self.0.block.transactions.get(index)?;
-        Some(OwnedBlockTransaction {
+        Some(TransactionHandle::Block {
             block: self.clone(),
             index,
         })
@@ -438,21 +438,6 @@ impl OwnedBlock {
     /// charge. Repeating the call changes nothing.
     pub fn leave_pipeline(&self) {
         self.0.charge.leave_pipeline();
-    }
-}
-
-/// A transaction handle that cannot outlive its block's decoded charge.
-#[derive(Clone, Debug)]
-pub struct OwnedBlockTransaction {
-    block: OwnedBlock,
-    index: usize,
-}
-
-impl Deref for OwnedBlockTransaction {
-    type Target = Transaction;
-
-    fn deref(&self) -> &Transaction {
-        &self.block.0.block.transactions[self.index]
     }
 }
 
@@ -503,7 +488,7 @@ impl BlockHandle {
     pub fn transaction(&self, index: usize) -> Option<TransactionHandle> {
         match self {
             Self::Shared(block) => block.transactions.get(index).cloned().map(Into::into),
-            Self::Owned(block) => block.transaction(index).map(Into::into),
+            Self::Owned(block) => block.transaction(index),
         }
     }
 
@@ -591,32 +576,6 @@ impl Deref for HeaderHandle {
     }
 }
 
-impl AsRef<Header> for HeaderHandle {
-    fn as_ref(&self) -> &Header {
-        self
-    }
-}
-
-impl std::borrow::Borrow<Header> for HeaderHandle {
-    fn borrow(&self) -> &Header {
-        self
-    }
-}
-
-impl PartialEq for HeaderHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for HeaderHandle {}
-
-impl From<Arc<Header>> for HeaderHandle {
-    fn from(header: Arc<Header>) -> Self {
-        Self::Shared(header)
-    }
-}
-
 impl ZcashSerialize for HeaderHandle {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         self.as_ref().zcash_serialize(writer)
@@ -629,7 +588,13 @@ pub enum TransactionHandle {
     /// A caller whose memory admission has not yet migrated to block ownership.
     Shared(Arc<Transaction>),
     /// A transaction that retains its block's decoded-memory charge.
-    Owned(OwnedBlockTransaction),
+    /// [`OwnedBlock::transaction`] checks `index`, and the block is immutable.
+    Block {
+        /// The block whose charge this handle retains.
+        block: OwnedBlock,
+        /// The transaction's position in `block`.
+        index: usize,
+    },
 }
 
 impl Deref for TransactionHandle {
@@ -638,42 +603,44 @@ impl Deref for TransactionHandle {
     fn deref(&self) -> &Transaction {
         match self {
             Self::Shared(transaction) => transaction,
-            Self::Owned(transaction) => transaction,
+            Self::Block { block, index } => &block.0.block.transactions[*index],
         }
     }
 }
 
-impl AsRef<Transaction> for TransactionHandle {
-    fn as_ref(&self) -> &Transaction {
-        self
-    }
+/// The comparison and conversion impls of a handle that derefs to its payload.
+macro_rules! payload_handle {
+    ($handle:ident, $payload:ty) => {
+        impl AsRef<$payload> for $handle {
+            fn as_ref(&self) -> &$payload {
+                self
+            }
+        }
+
+        impl std::borrow::Borrow<$payload> for $handle {
+            fn borrow(&self) -> &$payload {
+                self
+            }
+        }
+
+        impl PartialEq for $handle {
+            fn eq(&self, other: &Self) -> bool {
+                self.as_ref() == other.as_ref()
+            }
+        }
+
+        impl Eq for $handle {}
+
+        impl From<Arc<$payload>> for $handle {
+            fn from(payload: Arc<$payload>) -> Self {
+                Self::Shared(payload)
+            }
+        }
+    };
 }
 
-impl std::borrow::Borrow<Transaction> for TransactionHandle {
-    fn borrow(&self) -> &Transaction {
-        self
-    }
-}
-
-impl PartialEq for TransactionHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for TransactionHandle {}
-
-impl From<Arc<Transaction>> for TransactionHandle {
-    fn from(transaction: Arc<Transaction>) -> Self {
-        Self::Shared(transaction)
-    }
-}
-
-impl From<OwnedBlockTransaction> for TransactionHandle {
-    fn from(transaction: OwnedBlockTransaction) -> Self {
-        Self::Owned(transaction)
-    }
-}
+payload_handle!(HeaderHandle, Header);
+payload_handle!(TransactionHandle, Transaction);
 
 #[cfg(test)]
 mod tests {
@@ -789,7 +756,7 @@ mod tests {
         let header = handle.retained_header();
         let transaction = handle.transaction(0).unwrap();
         assert!(matches!(header, HeaderHandle::Block(_)));
-        assert!(matches!(transaction, TransactionHandle::Owned(_)));
+        assert!(matches!(transaction, TransactionHandle::Block { .. }));
         assert_eq!(handle.transactions().len(), 1);
         drop(handle);
         assert_eq!(pool.reserved_bytes(), bytes);

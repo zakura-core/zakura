@@ -1025,7 +1025,7 @@ async fn cancelled_block_verification_keeps_downstream_payloads_charged() {
                 let tx::Request::Block { transaction, .. } = &request else {
                     panic!("block verification sends a block transaction");
                 };
-                assert!(matches!(transaction, TransactionHandle::Owned(_)));
+                assert!(matches!(transaction, TransactionHandle::Block { .. }));
                 if stop_at_transaction {
                     *holder.lock().unwrap() = Some(transaction.clone());
                     reached.notify_one();

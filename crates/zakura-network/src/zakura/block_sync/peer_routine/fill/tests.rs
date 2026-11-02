@@ -326,6 +326,34 @@ async fn closed_accounting_stops_before_any_acquisition() {
     fixture.assert_settled(0);
 }
 
+/// A funding audit that finds drift closes the budget under a live request. The
+/// next pass reports the accounting stop, sends nothing, and asks for no more
+/// work. The live request keeps its work.
+#[tokio::test]
+async fn funding_drift_stops_the_fill_pass() {
+    let mut fixture = fixture(1, &[1]);
+    assert_eq!(fixture.routine.try_fill().sent, 1);
+    fixture.outbound.try_recv().unwrap();
+    while fixture.events.try_recv().is_ok() {}
+    let retained = fixture.routine.io.work.retain_funding_for_test(1);
+    assert!(!fixture.routine.io.work.audit_funding());
+
+    let report = fixture.routine.try_fill();
+
+    assert_eq!(report.stop, FillStop::AccountingClosed);
+    let traced = &fixture.routine.io.fill_stop_trace_at;
+    assert!(traced.contains_key("accounting_closed"));
+    assert!(!traced.contains_key("budget"));
+    assert!(fixture.outbound.try_recv().is_err(), "nothing was sent");
+    assert!(
+        fixture.events.try_recv().is_err(),
+        "closed accounting cannot request more work"
+    );
+    assert_eq!(fixture.routine.io.budget.available(), 0);
+    assert_eq!(fixture.routine.io.work.in_flight_len(), 1);
+    drop(retained);
+}
+
 /// Funding refuses a take that a reset retired after selection. The reset
 /// already removed the work, so no later cleanup can restore or charge it.
 #[tokio::test]

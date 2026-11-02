@@ -163,7 +163,11 @@ impl Drop for Verifier {
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
-            let _ = tx.send(Some(validate_batch(batch)));
+            // Closing the channel on panic makes pending items fail closed,
+            // without letting a detached Rayon panic abort the process.
+            if let Ok(result) = std::panic::catch_unwind(|| validate_batch(batch)) {
+                let _ = tx.send(Some(result));
+            }
         });
     }
 }

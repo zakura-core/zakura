@@ -1896,6 +1896,8 @@ struct ConnectionServeContext {
     conn: ZakuraConnTrace,
     /// Counts an inbound connection against its IP until registration.
     control_handshake: Option<ControlHandshakeGuard>,
+    /// Tells a discovery dial how registration ended. See [`DialReport`].
+    registration_report: Option<oneshot::Sender<DialRegistration>>,
 }
 
 struct RegisteredConnectionServeContext {
@@ -2687,6 +2689,7 @@ impl ZakuraProtocolHandler {
                     ),
                     conn,
                     control_handshake: Some(control_handshake),
+                    registration_report: None,
                 },
             )
             .await;
@@ -3894,6 +3897,19 @@ impl ZakuraProtocolHandler {
         }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
+        if let Some(report) = context.registration_report {
+            let reported = match &registration {
+                ZakuraRegistration::Registered { .. } => Some(DialRegistration::Registered),
+                ZakuraRegistration::Rejected(
+                    ZakuraRejectReason::ResourceLimit | ZakuraRejectReason::TemporaryUnavailable,
+                ) => Some(DialRegistration::LocalLimit),
+                ZakuraRegistration::Rejected(_) | ZakuraRegistration::Duplicate { .. } => None,
+            };
+            if let Some(reported) = reported {
+                // The receiver is gone when the caller stopped waiting for the result.
+                let _ = report.send(reported);
+            }
+        }
 
         match registration {
             ZakuraRegistration::Registered {
@@ -4654,6 +4670,27 @@ fn trace_conn_id(connection: &Connection) -> u64 {
     connection.stable_id() as u64
 }
 
+/// How a dialed connection's registration ended, as the dial reports it to
+/// its discovery attempt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DialRegistration {
+    /// The supervisor registered the peer on this connection.
+    Registered,
+    /// This node's admission limits refused to register the peer.
+    LocalLimit,
+}
+
+/// The channels on which a discovery dial reports its progress.
+pub(crate) struct DialReport {
+    /// Receives the IP whose handshake TLS authenticated, before the control
+    /// handshake starts.
+    pub(crate) admitted_ip: oneshot::Sender<IpAddr>,
+    /// Receives how registration ended. The dial drops it unsent when it ends
+    /// before registration, or when this node refuses the peer for a reason
+    /// other than a local limit.
+    pub(crate) registration: oneshot::Sender<DialRegistration>,
+}
+
 /// Selects whether a native dial may use the transport's reserved capacity.
 pub(crate) enum NativeDialKind {
     /// Bootstrap and maintained dials may use every live slot.
@@ -4668,7 +4705,7 @@ pub(crate) async fn serve_native_dial_connection(
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
-    serve_native_dial_connection_reporting_admitted_ip(
+    serve_reported_native_dial_connection(
         endpoint,
         node_addr,
         limits,
@@ -4680,13 +4717,14 @@ pub(crate) async fn serve_native_dial_connection(
 
 /// Dials `node_addr` and serves the connection, like [`serve_native_dial_connection`].
 ///
-/// Sends the admitted IP on `admitted_ip` once TLS authenticates the remote node at
-/// one of the dialed addresses, before the control handshake starts.
-pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
+/// Sends the admitted IP on `report` once TLS authenticates the remote node at
+/// one of the dialed addresses, before the control handshake starts. Then
+/// reports how registration ended, before the connection is served.
+pub(crate) async fn serve_reported_native_dial_connection(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
-    admitted_ip: Option<oneshot::Sender<IpAddr>>,
+    report: Option<DialReport>,
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     let _admission = endpoint
@@ -4722,10 +4760,11 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
         }
         Err(error) => return Err(error.into()),
     };
-    if let Some(admitted_ip) = admitted_ip {
+    let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
-        let _ = admitted_ip.send(connection.admitted_ip());
-    }
+        let _ = report.admitted_ip.send(connection.admitted_ip());
+        report.registration
+    });
     let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::new(
@@ -4790,6 +4829,7 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
                 i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
                 control_handshake: None,
+                registration_report,
             },
         )
         .await

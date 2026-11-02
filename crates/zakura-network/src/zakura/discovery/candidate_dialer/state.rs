@@ -43,9 +43,12 @@ impl DialAttemptKey {
 /// How one attempt's own dial ended.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum DialFinish {
-    /// The dial finished serving its connection.
+    /// The dial registered its peer and finished serving the connection.
     Served,
-    /// This node hit a local limit.
+    /// The dial authenticated its peer, and this node refused to register it
+    /// for a reason other than a local limit.
+    Refused,
+    /// This node hit a local limit, before or at registration.
     LocalLimit,
     /// The peer speaks another ALPN.
     AlpnMismatch,
@@ -85,6 +88,8 @@ pub(super) enum DialObservation {
 /// from. `authenticated` says whether this attempt's dial passed TLS, which the
 /// dial reports before it registers the peer. A registration without it belongs
 /// to another connection, so it earns this attempt no success and no failure.
+/// A dial that ended without registering its peer, as [`DialFinish::Refused`]
+/// says, earns no registration credit even when it authenticated.
 pub(super) fn classify_dial(
     observation: DialObservation,
     authenticated: bool,
@@ -102,7 +107,7 @@ pub(super) fn classify_dial(
         DialObservation::DialEnded(finish, _) => match finish {
             DialFinish::LocalLimit => Result::LocalResourceLimit,
             DialFinish::AlpnMismatch => Result::AlpnMismatch,
-            DialFinish::Served | DialFinish::Failed => Result::Failed,
+            DialFinish::Served | DialFinish::Refused | DialFinish::Failed => Result::Failed,
         },
         DialObservation::RegistrationHealthy if authenticated => Result::Registered,
         DialObservation::RegistrationHealthy => Result::ConnectedElsewhere,

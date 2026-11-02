@@ -400,10 +400,10 @@ fn candidate_witness_rejects_lost_backoff() {
 
 /// Every observation against the outcome the attempt's identity earns. A
 /// registration without this attempt's authentication never credits or charges
-/// the attempt.
+/// the attempt, and a dial refused before registration earns no credit.
 #[test]
 fn registrations_credit_only_the_attempt_that_authenticated() {
-    use DialFinish::{AlpnMismatch, Failed, LocalLimit, Served};
+    use DialFinish::{AlpnMismatch, Failed, LocalLimit, Refused, Served};
     use DialObservation::{RegistrationEnded as RegEnded, RegistrationHealthy, WatchClosed};
     use DiscoveryDialResult as R;
     use PeerRegistration::{Absent, Ended, Live};
@@ -419,6 +419,9 @@ fn registrations_credit_only_the_attempt_that_authenticated() {
         (dial(AlpnMismatch, Ended), false, Some(R::AlpnMismatch)),
         (dial(Served, Absent), true, Some(R::ShortLivedRegistered)),
         (dial(Served, Absent), false, Some(R::Failed)),
+        (dial(Refused, Absent), true, Some(R::Failed)),
+        (dial(Refused, Ended), true, Some(R::ShortLivedRegistered)),
+        (dial(Refused, Live), true, Some(R::ConnectedElsewhere)),
         (dial(Failed, Absent), true, Some(R::Failed)),
         (dial(LocalLimit, Absent), true, Some(R::LocalResourceLimit)),
         (dial(AlpnMismatch, Absent), false, Some(R::AlpnMismatch)),
@@ -436,6 +439,49 @@ fn registrations_credit_only_the_attempt_that_authenticated() {
             "{observation:?} authenticated={authenticated}"
         );
     }
+}
+
+/// A dial that returns `Ok(())` served its connection only if it reported its
+/// own registration. A refusal before registration fails the attempt, and a
+/// local admission refusal pauses the dialer instead.
+#[test]
+fn a_dial_refused_before_registration_is_not_served() {
+    let served = || Ok(Ok(()));
+    assert_eq!(
+        dial_finish(served(), Some(DialRegistration::Registered)),
+        DialFinish::Served
+    );
+    assert_eq!(
+        dial_finish(served(), Some(DialRegistration::LocalLimit)),
+        DialFinish::LocalLimit
+    );
+    assert_eq!(dial_finish(served(), None), DialFinish::Refused);
+
+    let refused = DialObservation::DialEnded(dial_finish(served(), None), PeerRegistration::Absent);
+    assert_eq!(
+        classify_dial(refused, true),
+        Some(DiscoveryDialResult::Failed)
+    );
+    let local = DialObservation::DialEnded(
+        dial_finish(served(), Some(DialRegistration::LocalLimit)),
+        PeerRegistration::Absent,
+    );
+    assert_eq!(
+        classify_dial(local, true),
+        Some(DiscoveryDialResult::LocalResourceLimit)
+    );
+
+    // The refused attempt keeps its backoff and charges every reserved IP.
+    let ip = IpAddr::from([93, 184, 216, 34]);
+    let now = Instant::now();
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let first = state.record_attempt(node_id(5), vec![ip]).unwrap();
+    state.complete(first, DiscoveryDialResult::Failed, None, now);
+    let second = state.record_attempt(node_id(5), vec![ip]).unwrap();
+    let result = classify_dial(refused, true).expect("a finished dial classifies");
+    state.complete(second, result, Some(ip), now);
+    assert!(state.is_backed_off(node_id(5), ip, now));
 }
 
 fn peer_id(byte: u8) -> ZakuraPeerId {
@@ -629,18 +675,16 @@ async fn panicked_worker_returns_metadata_needed_to_release_reservations() {
 const DIAL_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
 
 /// One attempt's watch of a dial that runs `dial`, with the registration
-/// watch's sender and the sender that reports the authenticated IP.
+/// watch's sender and the senders that report the authenticated IP and the
+/// dial's own registration.
 fn dial_watch(
     byte: u8,
     registered: Vec<ZakuraPeerId>,
     dial: impl Future<Output = Result<(), ZakuraHandlerError>> + Send + 'static,
-) -> (
-    DialWatch,
-    watch::Sender<Vec<ZakuraPeerId>>,
-    oneshot::Sender<IpAddr>,
-) {
+) -> (DialWatch, watch::Sender<Vec<ZakuraPeerId>>, DialReport) {
     let (registered_tx, registered_rx) = watch::channel(registered);
     let (admitted_tx, admitted_ip_rx) = oneshot::channel();
+    let (registration_tx, registration_rx) = oneshot::channel();
     let mut state =
         CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
     let watch = DialWatch {
@@ -652,17 +696,22 @@ fn dial_watch(
         dial: AbortOnDropHandle::new(zakura_rt::task::spawn(dial)),
         admitted_ip_rx,
         admitted_ip: None,
+        registration_rx,
         registration: PeerRegistration::Absent,
         trace: ZakuraTrace::default(),
     };
-    (watch, registered_tx, admitted_tx)
+    let report = DialReport {
+        admitted_ip: admitted_tx,
+        registration: registration_tx,
+    };
+    (watch, registered_tx, report)
 }
 
 #[tokio::test(start_paused = true)]
 async fn registration_drop_before_healthy_threshold_is_short_lived() {
     let peer = peer_id(7);
-    let (watch, registered_tx, admitted_tx) = dial_watch(7, vec![peer], std::future::pending());
-    admitted_tx.send(DIAL_IP).unwrap();
+    let (watch, registered_tx, report) = dial_watch(7, vec![peer], std::future::pending());
+    report.admitted_ip.send(DIAL_IP).unwrap();
 
     let settled = tokio::spawn(watch.run());
     tokio::task::yield_now().await;
@@ -676,7 +725,7 @@ async fn registration_drop_before_healthy_threshold_is_short_lived() {
 
 #[tokio::test(start_paused = true)]
 async fn dial_completion_with_live_registration_is_connected_elsewhere() {
-    let (watch, _registered_tx, _admitted_tx) =
+    let (watch, _registered_tx, _report) =
         dial_watch(9, vec![peer_id(9)], std::future::ready(Ok(())));
     assert_eq!(
         watch.run().await.result,
@@ -688,12 +737,39 @@ async fn dial_completion_with_live_registration_is_connected_elsewhere() {
 /// a real, short connection, not a failed dial.
 #[tokio::test(start_paused = true)]
 async fn a_served_dial_with_a_delayed_registration_is_short_lived() {
-    let (watch, _registered_tx, admitted_tx) =
-        dial_watch(10, Vec::new(), std::future::ready(Ok(())));
-    admitted_tx.send(DIAL_IP).unwrap();
+    let (watch, _registered_tx, report) = dial_watch(10, Vec::new(), std::future::ready(Ok(())));
+    report.admitted_ip.send(DIAL_IP).unwrap();
+    report
+        .registration
+        .send(DialRegistration::Registered)
+        .unwrap();
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
     assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+}
+
+/// A dial that authenticated its peer and was refused before registration
+/// ends with `Ok(())` too. It fails the attempt and keeps the IP's backoff.
+/// A local admission refusal pauses the dialer instead.
+#[tokio::test(start_paused = true)]
+async fn a_dial_refused_before_registration_fails_the_attempt() {
+    let (watch, _registered_tx, report) = dial_watch(14, Vec::new(), std::future::ready(Ok(())));
+    report.admitted_ip.send(DIAL_IP).unwrap();
+    drop(report.registration);
+    let outcome = watch.run().await;
+    assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+    assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+
+    let (watch, _registered_tx, report) = dial_watch(15, Vec::new(), std::future::ready(Ok(())));
+    report.admitted_ip.send(DIAL_IP).unwrap();
+    report
+        .registration
+        .send(DialRegistration::LocalLimit)
+        .unwrap();
+    assert_eq!(
+        watch.run().await.result,
+        DiscoveryDialResult::LocalResourceLimit
+    );
 }
 
 /// Another connection's registration ending says nothing about this
@@ -701,7 +777,7 @@ async fn a_served_dial_with_a_delayed_registration_is_short_lived() {
 #[tokio::test(start_paused = true)]
 async fn another_connections_registration_ending_keeps_the_attempt_waiting() {
     let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
-    let (watch, registered_tx, _admitted_tx) = dial_watch(11, vec![peer_id(11)], async move {
+    let (watch, registered_tx, _report) = dial_watch(11, vec![peer_id(11)], async move {
         let _ = fail_rx.await;
         Err(ZakuraHandlerError::ResourceLimit(
             "the test dial hit a limit",
@@ -726,7 +802,7 @@ async fn another_connections_registration_ending_keeps_the_attempt_waiting() {
 async fn another_connections_healthy_registration_ends_the_unfinished_dial() {
     let retained = std::sync::Arc::new(());
     let observed = std::sync::Arc::downgrade(&retained);
-    let (watch, _registered_tx, _admitted_tx) = dial_watch(12, vec![peer_id(12)], async move {
+    let (watch, _registered_tx, _report) = dial_watch(12, vec![peer_id(12)], async move {
         let _retained = retained;
         std::future::pending().await
     });
@@ -744,11 +820,11 @@ async fn another_connections_healthy_registration_ends_the_unfinished_dial() {
 async fn an_authenticated_healthy_registration_hands_the_dial_to_its_connection() {
     let retained = std::sync::Arc::new(());
     let observed = std::sync::Arc::downgrade(&retained);
-    let (watch, _registered_tx, admitted_tx) = dial_watch(13, vec![peer_id(13)], async move {
+    let (watch, _registered_tx, report) = dial_watch(13, vec![peer_id(13)], async move {
         let _retained = retained;
         std::future::pending().await
     });
-    admitted_tx.send(DIAL_IP).unwrap();
+    report.admitted_ip.send(DIAL_IP).unwrap();
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::Registered);
     assert_eq!(outcome.admitted_ip, Some(DIAL_IP));

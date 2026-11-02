@@ -32,6 +32,7 @@ use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
+    handler::{DialRegistration, DialReport},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
     ZakuraTrace,
 };
@@ -361,9 +362,14 @@ async fn run_discovery_dial_once(
 
     let trace = endpoint.trace();
     let (admitted_ip_tx, admitted_ip_rx) = oneshot::channel();
+    let (registration_tx, registration_rx) = oneshot::channel();
+    let report = DialReport {
+        admitted_ip: admitted_ip_tx,
+        registration: registration_tx,
+    };
     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
-        async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
+        async move { native_discovery_dial(&endpoint, node_addr, &limits, report).await }
     }));
     DialWatch {
         attempt,
@@ -372,6 +378,7 @@ async fn run_discovery_dial_once(
         dial,
         admitted_ip_rx,
         admitted_ip: None,
+        registration_rx,
         registration: PeerRegistration::Absent,
         trace,
     }
@@ -389,6 +396,9 @@ struct DialWatch {
     /// before it registers the peer.
     admitted_ip_rx: oneshot::Receiver<IpAddr>,
     admitted_ip: Option<IpAddr>,
+    /// Carries how this attempt's own registration ended. The dial sends it
+    /// before it serves the connection, so it is final once the dial ends.
+    registration_rx: oneshot::Receiver<DialRegistration>,
     registration: PeerRegistration,
     trace: ZakuraTrace,
 }
@@ -491,7 +501,8 @@ impl DialWatch {
         } else {
             PeerRegistration::Ended
         };
-        DialObservation::DialEnded(dial_finish(dial), registration)
+        let own_registration = self.registration_rx.try_recv().ok();
+        DialObservation::DialEnded(dial_finish(dial, own_registration), registration)
     }
 
     /// The IP this attempt's dial authenticated, once the dial reported it.
@@ -503,14 +514,20 @@ impl DialWatch {
     }
 }
 
-/// How a finished dial task ended.
+/// How a finished dial task ended, given what the dial reported about its own
+/// registration.
 fn dial_finish(
     dial: Result<Result<(), ZakuraHandlerError>, zakura_rt::task::JoinError>,
+    own_registration: Option<DialRegistration>,
 ) -> DialFinish {
     match dial {
-        // `native_bootstrap_dial` returns `Ok(())` only after the connection
-        // finishes.
-        Ok(Ok(())) => DialFinish::Served,
+        // The dial returns `Ok(())` after it serves its connection, and also
+        // when this node refuses the authenticated peer before registration.
+        Ok(Ok(())) => match own_registration {
+            Some(DialRegistration::Registered) => DialFinish::Served,
+            Some(DialRegistration::LocalLimit) => DialFinish::LocalLimit,
+            None => DialFinish::Refused,
+        },
         Ok(Err(ZakuraHandlerError::ResourceLimit(_))) => DialFinish::LocalLimit,
         Ok(Err(error)) if error.is_alpn_mismatch() => {
             debug!(

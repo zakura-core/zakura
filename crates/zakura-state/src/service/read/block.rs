@@ -337,10 +337,12 @@ static PARENT_INPUT_READ_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::n
 
 /// The most locking-script bytes a parent input check keeps for the transaction checks.
 ///
-/// Real blocks need far less: 50,000 inputs with typical scripts keep a few MB. A block over this
-/// limit gets [`ParentInputs::Inconclusive`], so its transactions look their inputs up one by
-/// one, as they did before the check returned outputs.
-const MAX_KEPT_PARENT_INPUT_BYTES: usize = 32 * 1024 * 1024;
+/// The check keeps this map while the block's transaction checks run, on top of the copies those
+/// checks already make, so it is kept small. A full 2 MB block of standard 25-byte scripts keeps
+/// at most about 1.2 MB; only blocks spending large nonstandard scripts can pass this limit. Those
+/// get [`ParentInputs::Inconclusive`], so their transactions look their inputs up one by one, as
+/// they did before the check returned outputs.
+const MAX_KEPT_PARENT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The result of reading one input in [`read_parent_inputs`].
 enum ParentInputRead {

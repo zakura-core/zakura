@@ -460,10 +460,16 @@ enum Admission {
 }
 
 /// How a page in progress finished.
+// The page's frame and send slot trip clippy's size threshold, more so in the
+// simulator build. One `Progress` is returned and moved once per page, so
+// boxing the page would only add an allocation per page.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation per served page"
+)]
 enum Progress<'a> {
-    /// The encoded page and its transport slot, boxed because the slot's send
-    /// handle dwarfs the other variants.
-    Page(Box<(EncodedPage, PushSend<'a>)>),
+    /// The encoded page and its transport slot.
+    Page(EncodedPage, PushSend<'a>),
     Refused(Refusal),
     Closed,
 }
@@ -610,8 +616,7 @@ fn settle(
     match progress {
         // A page whose subscription closed meanwhile spends nothing and drops
         // its slot.
-        Progress::Page(page) => {
-            let (encoded, slot) = *page;
+        Progress::Page(encoded, slot) => {
             if lock(shared).state.commit(key, &encoded.page) {
                 slot.send(encoded.frame);
             }
@@ -725,7 +730,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         {
             return Progress::Refused(Output::Retry.into());
         }
-        Progress::Page(Box::new((encoded, slot)))
+        Progress::Page(encoded, slot)
     })
 }
 

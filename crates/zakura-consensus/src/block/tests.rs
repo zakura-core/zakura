@@ -1287,6 +1287,63 @@ fn difficulty_validation_failure() -> Result<(), Report> {
     Ok(())
 }
 
+/// The shared proof of work check returns the verifier's errors, and on a network that waives
+/// proof of work only checks the difficulty threshold.
+#[test]
+fn header_proof_of_work_matches_the_verifier() {
+    let _init_guard = zakura_test::init();
+
+    let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_415000_BYTES[..])
+        .expect("block should deserialize");
+    let height = block
+        .coinbase_height()
+        .expect("historical block has a height");
+    let hash = block.hash();
+
+    check::header_proof_of_work_is_valid(&block.header, &Network::Mainnet, &height, &hash)
+        .expect("a historical Mainnet block has valid proof of work");
+
+    let bad_hash = block::Hash([0xff; 32]);
+    let missed_target =
+        check::header_proof_of_work_is_valid(&block.header, &Network::Mainnet, &height, &bad_hash)
+            .unwrap_err();
+    assert!(
+        matches!(
+            missed_target,
+            VerifyBlockError::Block {
+                source: BlockError::DifficultyFilter(..)
+            }
+        ),
+        "a hash that misses its target fails the difficulty filter, got {missed_target:?}",
+    );
+    assert_eq!(missed_target.misbehavior_score(), 100);
+
+    let mut bad_solution = block.clone();
+    let header = Arc::make_mut(&mut bad_solution.header);
+    header.nonce.0[0] ^= 1;
+    let bad_solution_hash = bad_solution.hash();
+    // Keep the original hash so only the Equihash check can fail.
+    let bad_equihash = check::header_proof_of_work_is_valid(
+        &bad_solution.header,
+        &Network::Mainnet,
+        &height,
+        &hash,
+    )
+    .unwrap_err();
+    assert_ne!(bad_solution_hash, hash);
+    assert!(
+        matches!(bad_equihash, VerifyBlockError::Equihash { .. }),
+        "a changed nonce invalidates the Equihash solution, got {bad_equihash:?}",
+    );
+    assert_eq!(bad_equihash.misbehavior_score(), 100);
+
+    let waived = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let genesis = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+        .expect("genesis block should deserialize");
+    check::header_proof_of_work_is_valid(&genesis.header, &waived, &Height(1), &bad_hash)
+        .expect("a waived network checks only the difficulty threshold");
+}
+
 #[test]
 fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zakura_test::init();

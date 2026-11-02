@@ -23,6 +23,7 @@ use zakura_chain::{
 };
 use zakura_header_chain::{CompactTargetError, PowPolicy};
 
+use super::VerifyBlockError;
 use crate::{error::*, funding_stream_address};
 
 /// Coinbase outputs that have not yet matched a required subsidy payment.
@@ -169,6 +170,30 @@ pub fn equihash_solution_is_valid(
     // downgrade the proof of work to the trivial Regtest `(48, 5)` parameters
     // by sending a short 36-byte solution on Mainnet or Testnet.
     PowPolicy::validating(network).validate_solution(header)
+}
+
+/// Runs the block verifier's context-free proof of work checks on `header` for `network`.
+///
+/// On a network that waives proof of work, only the difficulty threshold is checked. Otherwise
+/// `hash` must pass the difficulty filter and the Equihash solution must be valid. Returns the
+/// same error the verifier returns for the same header. It does not check the block's difficulty
+/// against the chain.
+pub fn header_proof_of_work_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> Result<(), VerifyBlockError> {
+    if PowPolicy::for_network(network)?.is_authenticated_custom_waiver() {
+        difficulty_threshold_is_valid(header, network, height, hash)?;
+    } else {
+        // Do the difficulty checks first, to raise the threshold for
+        // attacks that use any other fields.
+        difficulty_is_valid(header, network, height, hash)?;
+        equihash_solution_is_valid(header, network)?;
+    }
+
+    Ok(())
 }
 
 /// Returns `true` if `header` passes the context-free proof of work checks of the block verifier

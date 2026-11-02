@@ -1,9 +1,9 @@
 --- a/crates/zakura-node-services/src/block_memory.rs
 +++ b/crates/zakura-node-services/src/block_memory.rs
-@@ -765,7 +765,10 @@
-         Ok(decode().map(|payload| {
+@@ -859,7 +859,10 @@
              OwnedPayload(Arc::new(RetainedPayload {
                  payload,
+                 _retained: None,
 -                _permit: permit,
 +                _permit: {
 +                    drop(permit);

@@ -4035,6 +4035,164 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
     }
 }
 
+/// Unsolved hard targets and malformed historical targets must not affect scheduling.
+#[tokio::test(start_paused = true)]
+async fn rejected_blocks_and_hash_discovery_cannot_keep_a_sync_round_alive() {
+    use zakura_chain::work::difficulty::ParameterDifficulty as _;
+
+    let (mut syncer, _status, mut verifier, mut peers, mut state, sender) =
+        setup_chain_sync_with_options(Height(0), STALLED_SERVICE_REQUEST_DELAY);
+    let boundary = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+    sender.send_best_tip_height(boundary);
+    sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let mut template = poison_coinbase_height(&canonical, boundary.next().unwrap());
+    let block = Arc::make_mut(&mut template);
+    block.transactions.truncate(1);
+    *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = boundary.next().unwrap();
+    let header = Arc::make_mut(&mut block.header);
+    header.previous_block_hash = block::Hash([0x55; 32]);
+    header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
+    header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
+    let blocks: Vec<_> = (0..2000_u32)
+        .map(|nonce| {
+            let mut block = (*template).clone();
+            Arc::make_mut(&mut block.header).nonce.0[..4].copy_from_slice(&nonce.to_le_bytes());
+            Arc::new(block)
+        })
+        .collect();
+    let lookup: HashMap<_, _> = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.hash(), index))
+        .collect();
+    syncer.prospective_tips.insert(sync::CheckedTip {
+        tip: blocks[0].hash(),
+        expected_next: blocks[1].hash(),
+    });
+    let reserve = IndexSet::from([blocks[0].hash()]);
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let extensions = Arc::new(AtomicUsize::new(0));
+    let download_count = downloads.clone();
+    let extension_count = extensions.clone();
+    let peer_task = tokio::spawn(async move {
+        while let Some(request) = peers.try_next_request().await {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let response = match request.request() {
+                zn::Request::BlocksByHash(hashes) => {
+                    download_count.fetch_add(1, Ordering::SeqCst);
+                    zn::Response::Blocks(
+                        hashes
+                            .iter()
+                            .map(|hash| Available((blocks[lookup[hash]].clone(), None)))
+                            .collect(),
+                    )
+                }
+                zn::Request::FindBlocks { known_blocks, .. } => {
+                    extension_count.fetch_add(1, Ordering::SeqCst);
+                    let index = lookup[&known_blocks[0]];
+                    zn::Response::BlockHashes(
+                        blocks[index + 1..index + 5]
+                            .iter()
+                            .map(|block| block.hash())
+                            .collect(),
+                    )
+                }
+                other => panic!("unexpected peer request: {other:?}"),
+            };
+            request.respond(response);
+        }
+    });
+    let state_task = tokio::spawn(async move {
+        while let Some(request) = state.try_next_request().await {
+            assert!(matches!(request.request(), zs::Request::KnownBlock(_)));
+            request.respond(zs::Response::KnownBlock(None));
+        }
+    });
+    let result = tokio::time::timeout(
+        sync::BLOCK_VERIFY_TIMEOUT * 2,
+        syncer.sync_round(reserve, None),
+    )
+    .await
+    .expect("untrusted activity must not postpone the chain progress deadline");
+    peer_task.abort();
+    state_task.abort();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("no verified chain progress"));
+    assert!(downloads.load(Ordering::SeqCst) > 10);
+    assert!(extensions.load(Ordering::SeqCst) > 10);
+    verifier.expect_no_requests().await;
+}
+
+/// Unsolved hard targets and malformed historical targets must not affect scheduling.
+#[tokio::test]
+async fn invalid_header_work_is_scored_before_sync_throttling() {
+    use zakura_chain::work::difficulty::CompactDifficulty;
+
+    let boundary = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+    let (_, pause, _) = lookahead_heights(Some(boundary), sync::MIN_CONCURRENCY_LIMIT, 1);
+    for (bits, height, tip_height) in [
+        (0x1b6aac57_u32, pause.next().unwrap(), boundary),
+        (0, boundary, boundary.previous().unwrap()),
+        (0x23010000, boundary, boundary.previous().unwrap()),
+    ] {
+        for initially_paused in [false, true] {
+            let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            let mut candidate = poison_coinbase_height(&canonical, height);
+            let block = Arc::make_mut(&mut candidate);
+            *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
+            let header = Arc::make_mut(&mut block.header);
+            header.previous_block_hash = block::Hash([0x55; 32]);
+            header.difficulty_threshold = CompactDifficulty::from_le_bytes(bits.to_le_bytes());
+            header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
+            let hash = candidate.hash();
+            let address: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+            let mut peers = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+            let mut verifier =
+                MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+            let (tip, sender) = MockChainTip::new();
+            sender.send_best_tip_height(tip_height);
+            sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+            let (pause_sender, pause_receiver) = tokio::sync::watch::channel(initially_paused);
+            let mut downloads = Downloads::new(
+                peers.clone(),
+                verifier.clone(),
+                tip,
+                pause_sender,
+                sync::MIN_CONCURRENCY_LIMIT,
+                Network::Mainnet,
+                Height(0),
+                LegacySyncTrace::new(None, false),
+            );
+            downloads.download_and_verify(hash).await.unwrap();
+            peers
+                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+                .await
+                .respond(zn::Response::Blocks(vec![Available((
+                    candidate,
+                    Some(address),
+                ))]));
+            let error = tokio::time::timeout(Duration::from_secs(10), downloads.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, BlockDownloadVerifyError::Invalid { ref error, advertiser_addr: Some(supplier), .. }
+                if supplier == address && error.misbehavior_score() == 100)
+            );
+            assert_eq!(*pause_receiver.borrow(), initially_paused);
+            verifier.expect_no_requests().await;
+        }
+    }
+}
+
 /// A poisoned tip child must be requeued immediately, and its supplier scored,
 /// instead of leaving the newest block for the next discovery round.
 #[tokio::test]

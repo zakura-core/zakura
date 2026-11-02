@@ -47,7 +47,9 @@ pub mod error;
 pub mod router;
 pub mod transaction;
 
-pub use block::check::proof_of_work_is_valid;
+pub use block::check::{
+    check_proof_of_work, difficulty_threshold_is_valid, proof_of_work_is_valid,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use block::check::difficulty_is_valid;

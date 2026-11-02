@@ -34,7 +34,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::has_sufficient_work,
+    download_work::{check_admission_work, check_header_work},
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -43,6 +43,9 @@ use crate::components::{
         FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
+
+mod pressure;
+use pressure::{DownloadPressure, PressureLease};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -360,12 +363,8 @@ where
 
     // Shared syncer state
     //
-    /// Sender that is set to `true` when the downloader is past the lookahead limit.
-    /// This is based on the downloaded block height and the state tip height.
-    past_lookahead_limit_sender: Arc<std::sync::Mutex<watch::Sender<bool>>>,
-
-    /// Receiver for `past_lookahead_limit_sender`, which is used to avoid accessing the mutex.
-    past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
+    /// Tracks admitted work and invalidates task updates when a round resets.
+    download_pressure: Arc<Mutex<DownloadPressure>>,
 
     // Internal downloads state
     //
@@ -483,20 +482,18 @@ where
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
     ) -> Self {
-        let past_lookahead_limit_receiver =
-            zs::WatchReceiver::new(past_lookahead_limit_sender.subscribe());
-
         Self {
             network,
             verifier,
             latest_chain_tip,
             lookahead_limit,
-            chain_network,
+            chain_network: chain_network.clone(),
             max_checkpoint_height,
-            past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
+            download_pressure: Arc::new(Mutex::new(DownloadPressure::new(
                 past_lookahead_limit_sender,
-            )),
-            past_lookahead_limit_receiver,
+                chain_network.clone(),
+                lookahead_limit,
+            ))),
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
@@ -622,8 +619,11 @@ where
         let chain_network = self.chain_network.clone();
         let max_checkpoint_height = self.max_checkpoint_height;
 
-        let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
-        let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
+        let download_pressure = self.download_pressure.clone();
+        let pressure_generation = download_pressure
+            .lock()
+            .expect("pressure updates never panic")
+            .generation();
         let task_states = self.task_states.clone();
         let trace = self.trace.clone();
 
@@ -713,7 +713,7 @@ where
                 // The target spacing at the tip scales the lookahead limit.
                 let multiplier =
                     tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
-                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) =
+                let (lookahead_drop_height, _, _) =
                     lookahead_heights(tip_height, lookahead_limit, multiplier);
 
                 // Get the finalized tip height, assuming we're using the non-finalized state.
@@ -802,55 +802,16 @@ where
 
                 // Admission must precede shared flow-control changes: a rejected
                 // body must not pause or resume downloads using its claimed height.
-                if !has_sufficient_work(&chain_network, block_height, tip_height, block.header.difficulty_threshold) {
+                if !check_admission_work(&chain_network, &block, block_height, tip_height)
+                    .map_err(|error| BlockDownloadVerifyError::Invalid { error: zakura_consensus::VerifyBlockError::from(error).into(), height: block_height, hash, advertiser_addr })? {
                     metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }
 
-                if block_height > lookahead_pause_height {
-                    // This log can be very verbose, usually hundreds of blocks are dropped.
-                    // So we only log at info level for the first above-height block.
-                    if !past_lookahead_limit_receiver.cloned_watch_data() {
-                        info!(
-                            ?hash,
-                            ?block_height,
-                            ?tip_height,
-                            ?lookahead_pause_height,
-                            ?lookahead_reset_height,
-                            lookahead_limit = ?lookahead_limit,
-                            "synced block height too far ahead of the tip: \
-                             waiting for downloaded blocks to commit to the state",
-                        );
+                check_header_work(&block, &chain_network, block_height).await.map_err(|error| {
+                    BlockDownloadVerifyError::Invalid { error: error.into(), height: block_height, hash, advertiser_addr }
+                })?;
 
-                        // Set the watched value to true, since we're over the limit.
-                        //
-                        // It is ok to block here, because we're going to pause new downloads anyway.
-                        // But if Zebra is shutting down, ignore the send error.
-                        let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(true);
-                    } else {
-                        debug!(
-                            ?hash,
-                            ?block_height,
-                            ?tip_height,
-                            ?lookahead_pause_height,
-                            ?lookahead_reset_height,
-                            lookahead_limit = ?lookahead_limit,
-                            "synced block height too far ahead of the tip: \
-                             waiting for downloaded blocks to commit to the state",
-                        );
-                    }
-
-                    metrics::counter!("sync.max.height.limit.paused.count").increment(1);
-                } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
-                    // Reset the watched value to false, since we're well under the limit.
-                    // We need to block here, because if we don't the syncer can hang.
-
-                    // But if Zebra is shutting down, ignore the send error.
-                    let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(false);
-                    metrics::counter!("sync.max.height.limit.reset.count").increment(1);
-
-                    metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
-                }
 
                 // Wait for the verifier service to be ready.
                 let readiness = verifier.ready();
@@ -871,6 +832,14 @@ where
                     "verifying",
                     Some(block_height),
                 );
+
+                if !check_admission_work(&chain_network, &block, block_height, latest_chain_tip.best_tip_height())
+                    .map_err(|error| BlockDownloadVerifyError::Invalid { error: zakura_consensus::VerifyBlockError::from(error).into(), height: block_height, hash, advertiser_addr })? {
+                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
+                }
+
+                let _pressure = PressureLease::admit(download_pressure, pressure_generation, block_height, latest_chain_tip.clone())
+                    .ok_or(BlockDownloadVerifyError::CancelledDuringDownload { hash })?;
 
                 // Verify the block.
                 let verify_start = std::time::Instant::now();
@@ -962,15 +931,10 @@ where
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
 
-        // Set the lookahead limit to false, since we're empty (so we're under the limit).
-        //
-        // It is ok to block here, because we're doing a reset and sleep anyway.
-        // But if Zebra is shutting down, ignore the send error.
-        let _ = self
-            .past_lookahead_limit_sender
+        self.download_pressure
             .lock()
-            .expect("thread panicked while holding the past_lookahead_limit_sender mutex guard")
-            .send(false);
+            .expect("pressure updates never panic")
+            .reset();
     }
 
     /// Returns true if `hash` has an in-flight download and verify task.

@@ -171,7 +171,8 @@ impl Harness {
                     .expect("gate lock is not poisoned")
                     .remove(&hash);
                 if let Some(gate) = gate {
-                    let _ = gate.await;
+                    gate.await
+                        .map_err(|_| -> BoxError { "the held request failed".into() })?;
                 }
 
                 match blocks.get(&hash) {
@@ -408,6 +409,44 @@ async fn child_before_slow_parent_attaches_to_the_parent_download() {
 
     assert_eq!(harness.next_commit().await, parent.hash());
     assert_eq!(harness.next_commit().await, child.hash());
+}
+
+/// A child retries its failed attached parent from the child's advertiser.
+#[tokio::test(start_paused = true)]
+async fn failed_attached_parent_is_recovered_from_the_childs_advertiser() {
+    let parent = block_1();
+    let child = block_2();
+    let mut harness = Harness::new([parent.clone(), child.clone()]);
+    let release_parent = harness.hold(parent.hash());
+    harness
+        .downloads
+        .download_and_verify(parent.hash(), Some(legacy(1)));
+    assert_eq!(
+        harness.next_request().await,
+        request_from(parent.hash(), legacy(1))
+    );
+    harness
+        .downloads
+        .download_and_verify(child.hash(), Some(legacy(2)));
+    assert_eq!(
+        harness.next_request().await,
+        request_from(child.hash(), legacy(2))
+    );
+    harness
+        .assert_no_request("the child attaches before the original parent fails")
+        .await;
+    // Dropping the gate makes the original network request fail. The replacement
+    // must not inherit that gate or the failed source.
+    drop(release_parent);
+    assert_eq!(
+        harness.next_request().await,
+        request_from(parent.hash(), legacy(2))
+    );
+    assert_eq!(harness.next_commit().await, parent.hash());
+    assert_eq!(harness.next_commit().await, child.hash());
+    harness
+        .assert_no_request("one replacement is enough after the parent commits")
+        .await;
 }
 
 /// Two children of the same missing parent share one parent download.

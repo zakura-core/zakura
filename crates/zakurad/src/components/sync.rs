@@ -42,6 +42,7 @@ use crate::{
     components::sync::downloads::BlockDownloadVerifyError, config::ZakuradConfig, BoxError,
 };
 
+mod chain_progress;
 mod downloads;
 pub mod end_of_support;
 mod gossip;
@@ -1550,8 +1551,16 @@ where
         // extension finished, or more full-block downloads were queued. If none
         // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
         let mut last_progress = Instant::now();
+        let mut chain_progress =
+            chain_progress::ChainProgress::new(self.latest_chain_tip.best_tip_height_and_hash());
 
         'sync_round: loop {
+            chain_progress.observe(self.latest_chain_tip.best_tip_height_and_hash(), false);
+            if tokio::time::Instant::now() >= chain_progress.deadline() {
+                return Err(eyre!(
+                    "sync round stalled: no verified chain progress within timeout"
+                ));
+            }
             if header_runtime_status
                 .as_ref()
                 .is_some_and(|status| status.borrow().is_ready())
@@ -1577,6 +1586,10 @@ where
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
+                chain_progress.observe(
+                    self.latest_chain_tip.best_tip_height_and_hash(),
+                    rsp.is_ok(),
+                );
                 let result = self.handle_block_response_with_missing_retry(rsp).await;
                 if header_runtime_status
                     .as_ref()
@@ -1674,6 +1687,10 @@ where
 
                 match completed {
                     Ok(Some(rsp)) => {
+                        chain_progress.observe(
+                            self.latest_chain_tip.best_tip_height_and_hash(),
+                            rsp.is_ok(),
+                        );
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
                         if header_runtime_status
                             .as_ref()
@@ -1758,6 +1775,9 @@ where
             let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
+                    _ = tokio::time::sleep_until(chain_progress.deadline()) => {
+                        return Err(eyre!("sync round stalled: no verified chain progress within timeout"));
+                    }
 
                     // Retry required blocks that registry-missed once their backoff elapses. This
                     // is not gated by speculative lookahead dispatch, so the head-of-line block gets
@@ -1790,6 +1810,7 @@ where
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
+                        chain_progress.observe(self.latest_chain_tip.best_tip_height_and_hash(), rsp.is_ok());
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
                         if header_runtime_status
                             .as_ref()

@@ -15,7 +15,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::{
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
@@ -31,7 +31,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::{has_sufficient_work, target_meets_work_floor},
+    download_work::{check_admission_work, check_header_work, target_meets_work_floor},
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -127,13 +127,13 @@ struct DownloadTask {
 }
 
 /// What happened when an advertised child revealed that its parent is missing.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum ParentRecovery {
     /// The downloads stream has shut down.
     Closed,
 
     /// The parent already has an inbound download, which the child now waits on.
-    Attached,
+    Attached(watch::Receiver<Option<bool>>),
 
     /// A recovery download for the parent was started.
     Requested,
@@ -146,21 +146,17 @@ enum ParentRecovery {
 
     /// The inbound queue is at capacity.
     FullQueue,
-
-    /// The child's header fails the proof of work checks, so it did not start a recovery.
-    InvalidProofOfWork,
 }
 
 impl ParentRecovery {
-    fn metric_label(self) -> &'static str {
+    fn metric_label(&self) -> &'static str {
         match self {
             Self::Closed => "closed",
-            Self::Attached => "attached",
+            Self::Attached(_) => "attached",
             Self::Requested => "requested",
             Self::TooManyRecoveries => "too_many_recoveries",
             Self::SourceRecoveryInFlight => "source_recovery_in_flight",
             Self::FullQueue => "full_queue",
-            Self::InvalidProofOfWork => "invalid_proof_of_work",
         }
     }
 }
@@ -335,6 +331,14 @@ pub const MAX_PARENT_RECOVERIES: usize = 4;
 /// more than one hop, which is the syncer's job.
 const MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 
+/// One inbound task's cancellation, source charge, and completion notification.
+#[derive(Debug)]
+struct AdmittedDownload {
+    _cancel: oneshot::Sender<()>,
+    advertiser: Option<AdvertiserSource>,
+    completion: watch::Receiver<Option<bool>>,
+}
+
 /// Admission bookkeeping, shared by the [`Downloads`] stream and its download tasks.
 ///
 /// Tasks need it because a downloaded child is the first point where a missing parent becomes
@@ -348,7 +352,7 @@ struct Admission {
     /// recorded so completion can clear [`Self::source_counts`] and [`Self::source_locks`].
     ///
     /// Every admitted task has exactly one entry, so this is the inbound queue.
-    cancel_handles: HashMap<block::Hash, (oneshot::Sender<()>, Option<AdvertiserSource>)>,
+    cancel_handles: HashMap<block::Hash, AdmittedDownload>,
 
     /// Fair source-local verification gates for admitted downloads.
     ///
@@ -380,7 +384,11 @@ impl Admission {
     fn release(&mut self, hash: &block::Hash) {
         self.parent_recoveries.remove(hash);
 
-        if let Some((_, Some(source))) = self.cancel_handles.remove(hash) {
+        if let Some(AdmittedDownload {
+            advertiser: Some(source),
+            ..
+        }) = self.cancel_handles.remove(hash)
+        {
             let source_count = self
                 .source_counts
                 .get_mut(&source)
@@ -837,8 +845,8 @@ where
             return ParentRecovery::Closed;
         }
 
-        if admission.cancel_handles.contains_key(&parent) {
-            return ParentRecovery::Attached;
+        if let Some(task) = admission.cancel_handles.get(&parent) {
+            return ParentRecovery::Attached(task.completion.clone());
         }
 
         if admission.parent_recoveries.len() >= MAX_PARENT_RECOVERIES {
@@ -874,6 +882,47 @@ where
         ParentRecovery::Requested
     }
 
+    /// Rechecks admission after source ordering and immediately dispatches verification.
+    async fn verify_downloaded(
+        &self,
+        block: Arc<block::Block>,
+        height: block::Height,
+        source_lock: Option<Arc<Mutex<()>>>,
+        advertiser_addr: Option<PeerSocketAddr>,
+    ) -> Result<(block::Hash, block::Height), (BoxError, Option<PeerSocketAddr>)> {
+        let _source_guard = match source_lock {
+            Some(source_lock) => Some(source_lock.lock_owned().await),
+            None => None,
+        };
+        let mut verifier = self.verifier.clone();
+        let verifier = verifier
+            .ready()
+            .await
+            .map_err(|error| (error, advertiser_addr))?;
+        if !check_admission_work(
+            &self.chain_network,
+            &block,
+            height,
+            self.latest_chain_tip.best_tip_height(),
+        )
+        .map_err(|error| {
+            (
+                BoxError::from(zakura_consensus::VerifyBlockError::from(error)),
+                advertiser_addr,
+            )
+        })? {
+            return Err((
+                "gossiped block target is easier than the Mainnet admission floor".into(),
+                advertiser_addr,
+            ));
+        }
+        verifier
+            .call(zakura_consensus::Request::Commit(block))
+            .await
+            .map(|hash| (hash, height))
+            .map_err(|error| (error, advertiser_addr))
+    }
+
     /// Spawns the download and verify task for `download`, and records it in `admission`.
     fn spawn_download_task(
         &self,
@@ -898,11 +947,11 @@ where
 
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        let (completion_sender, completion_receiver) = watch::channel(None);
 
         let spawner = self.clone();
         let network = self.network.clone();
         let chain_network = self.chain_network.clone();
-        let verifier = self.verifier.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
@@ -1088,18 +1137,24 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
-            if !has_sufficient_work(
-                &chain_network,
-                block_height,
-                tip_height,
-                block.header.difficulty_threshold,
-            ) {
+            if !check_admission_work(&chain_network, &block, block_height, tip_height).map_err(
+                |error| {
+                    (
+                        BoxError::from(zakura_consensus::VerifyBlockError::from(error)),
+                        advertiser_addr,
+                    )
+                },
+            )? {
                 metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
                 return Err((
                     "gossiped block target is easier than the Mainnet admission floor".into(),
                     advertiser_addr,
                 ));
             }
+
+            check_header_work(&block, &chain_network, block_height)
+                .await
+                .map_err(|error| (BoxError::from(error), advertiser_addr))?;
 
             // The parent is checked after the height policies, so only blocks this node would
             // verify can start a recovery, and before the source lock, so a recovery is not
@@ -1123,23 +1178,20 @@ where
                     );
 
                 if parent_is_missing {
-                    let header = block.header.clone();
-                    let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
-                        zakura_consensus::proof_of_work_is_valid(
-                            &header,
-                            &chain_network,
-                            &block_height,
-                            &hash,
+                    let recovery = spawner.recover_parent(parent, download_source.clone());
+                    // An existing parent download can fail after this child attaches.
+                    // Retry once from the child's advertiser, under the same recovery bounds.
+                    if let ParentRecovery::Attached(mut completion) = recovery.clone() {
+                        let outcome = tokio::time::timeout(
+                            crate::components::sync::BLOCK_VERIFY_TIMEOUT,
+                            completion.wait_for(|result| result.is_some()),
                         )
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    let recovery = if proof_of_work_is_valid {
-                        spawner.recover_parent(parent, download_source)
-                    } else {
-                        ParentRecovery::InvalidProofOfWork
-                    };
+                        .await;
+                        let succeeded = matches!(outcome, Ok(Ok(result)) if *result == Some(true));
+                        if !succeeded {
+                            let _ = spawner.recover_parent(parent, download_source.clone());
+                        }
+                    }
                     debug!(
                         ?hash,
                         ?parent,
@@ -1155,16 +1207,9 @@ where
                 }
             }
 
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
-            };
-
-            verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
+            spawner
+                .verify_downloaded(block, block_height, source_lock, advertiser_addr)
                 .await
-                .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
         }
         .map_ok(move |(hash, height)| {
             match kind {
@@ -1205,6 +1250,7 @@ where
                 .lock()
                 .expect("admission is only mutated by non-panicking bookkeeping code")
                 .release(&hash);
+            completion_sender.send_replace(Some(result.is_ok()));
 
             result
         });
@@ -1212,7 +1258,14 @@ where
         assert!(
             admission
                 .cancel_handles
-                .insert(hash, (cancel_tx, advertiser))
+                .insert(
+                    hash,
+                    AdmittedDownload {
+                        _cancel: cancel_tx,
+                        advertiser,
+                        completion: completion_receiver
+                    }
+                )
                 .is_none(),
             "blocks are only queued once"
         );
@@ -1900,6 +1953,40 @@ mod tests {
             assert_eq!(addr, Some(advertiser_addr));
             assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
         }
+    }
+
+    /// Waiting on a source lock must not preserve an expired historical exemption.
+    #[tokio::test]
+    async fn queued_historical_gossip_is_rechecked_after_the_tip_crosses_the_boundary() {
+        let historical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
+        let (mut tip_sender, tip) = chain_tip_at(block::Height(0), hash(0xAA));
+        let mut downloads = downloads_returning(historical.clone(), advertiser_addr, tip);
+        downloads.spawner.verifier = BoxCloneService::new(service_fn(|_| async {
+            Err::<block::Hash, BoxError>("queued historical block reached verification".into())
+        }));
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let verify = downloads.spawner.verify_downloaded(
+            historical,
+            block::Height(1),
+            Some(gate),
+            Some(advertiser_addr),
+        );
+        tokio::pin!(verify);
+        assert!(futures::poll!(&mut verify).is_pending());
+        set_tip(
+            &mut tip_sender,
+            crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT,
+            hash(0xBB),
+        );
+        drop(held);
+        let (error, addr) = verify.await.unwrap_err();
+        assert!(error.to_string().contains("Mainnet admission floor"));
+        assert_eq!(addr, Some(advertiser_addr));
+        assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
     }
 
     /// Historical admission must not authorize a missing-parent download.

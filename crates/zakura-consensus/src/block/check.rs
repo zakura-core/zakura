@@ -192,6 +192,27 @@ pub fn proof_of_work_is_valid(
     }
 }
 
+/// Checks a downloaded header's target, hash filter, and Equihash solution.
+///
+/// Authenticated custom networks may waive the hash and solution checks, but
+/// must still supply a valid target. Errors retain the verifier's peer scoring.
+/// This does not check the target against the header's parent chain.
+pub fn check_proof_of_work(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> Result<(), crate::VerifyBlockError> {
+    let policy = PowPolicy::for_network(network)?;
+    if policy.is_authenticated_custom_waiver() {
+        difficulty_threshold_is_valid(header, network, height, hash)?;
+    } else {
+        difficulty_is_valid(header, network, height, hash)?;
+        equihash_solution_is_valid(header, network)?;
+    }
+    Ok(())
+}
+
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
 /// subsidy in `block` is valid for `network`
 ///

@@ -19,6 +19,7 @@ pub mod block;
 pub mod chain_tips;
 pub mod difficulty;
 pub mod find;
+pub(crate) mod header_admission;
 pub mod historical_tree;
 pub mod tree;
 

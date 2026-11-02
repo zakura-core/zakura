@@ -217,6 +217,7 @@ impl Harness {
                 match request {
                     // Gossip always fetches the body, so the state never reports it present.
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
                     zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
                         known
                             .borrow()
@@ -515,9 +516,9 @@ async fn recovered_parent_does_not_recover_its_own_parent() {
     );
 }
 
-/// A child more than one block beyond the tip's child leaves the gap to the syncer.
+/// A claimed height does not select recovery; even a wider gap gets at most one hop.
 #[tokio::test(start_paused = true)]
-async fn child_beyond_one_hop_from_the_tip_does_not_recover_its_parent() {
+async fn child_beyond_one_hop_recovers_only_its_immediate_parent() {
     // The tip is at height 0, so block 3 is missing two blocks.
     let child = block_3();
     let mut harness = Harness::new([block_2(), child.clone()]);
@@ -531,7 +532,10 @@ async fn child_beyond_one_hop_from_the_tip_does_not_recover_its_parent() {
 
     assert_eq!(
         harness.drain_requests().await,
-        vec![request_from(child.hash(), legacy(2))]
+        vec![
+            request_from(child.hash(), legacy(2)),
+            request_from(block_2().hash(), legacy(2))
+        ]
     );
 }
 

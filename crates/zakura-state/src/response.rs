@@ -122,6 +122,10 @@ pub enum Response {
     /// specified block's chain value pools.
     BlockInfo(Option<BlockInfo>),
 
+    /// Authenticated candidate height after checking its committed parent's
+    /// difficulty context, or `None` when that context is unavailable.
+    HeaderAdmission(Option<block::Height>),
+
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
@@ -501,6 +505,10 @@ pub enum ReadResponse {
     /// the block info after the specified block.
     BlockInfo(Option<BlockInfo>),
 
+    /// Authenticated candidate height after checking its committed parent's
+    /// difficulty context, or `None` when that context is unavailable.
+    HeaderAdmission(Option<block::Height>),
+
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -752,6 +760,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
+            ReadResponse::HeaderAdmission(height) => Ok(Response::HeaderAdmission(height)),
             ReadResponse::BlockAndSize(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

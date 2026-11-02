@@ -1388,6 +1388,13 @@ pub enum Request {
     /// has committed, and [`Response::BlockInfo(None)`](Response::BlockInfo) otherwise.
     BlockInfo(block::Hash),
 
+    /// Checks a header's difficulty and time against its committed parent branch.
+    ///
+    /// Returns [`Response::HeaderAdmission`] with its authenticated height, or `None`
+    /// when complete, hash-linked parent context is unavailable. Does not check PoW,
+    /// commit the header, or mark it invalid. Contextual failures return an error.
+    CheckHeaderAdmission(Arc<block::Header>),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1577,6 +1584,7 @@ impl Request {
             Request::Block(_) => "block",
             Request::AwaitBlockInfo(_) => "await_block_info",
             Request::BlockInfo(_) => "block_info",
+            Request::CheckHeaderAdmission(_) => "check_header_admission",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
@@ -1643,6 +1651,9 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is found;
     /// * [`ReadResponse::BlockInfo(None)`](ReadResponse::BlockInfo) otherwise.
     BlockInfo(HashOrHeight),
+
+    /// Read-only counterpart of [`Request::CheckHeaderAdmission`].
+    CheckHeaderAdmission(Arc<block::Header>),
 
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
@@ -2162,6 +2173,7 @@ impl ReadRequest {
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
             ReadRequest::BlockInfo(_) => "block_info",
+            ReadRequest::CheckHeaderAdmission(_) => "check_header_admission",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
@@ -2247,6 +2259,7 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::Block(hash_or_height) => Ok(ReadRequest::Block(hash_or_height)),
             Request::BlockInfo(hash) => Ok(ReadRequest::BlockInfo(hash.into())),
+            Request::CheckHeaderAdmission(header) => Ok(ReadRequest::CheckHeaderAdmission(header)),
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }

@@ -31,24 +31,23 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::has_sufficient_work,
+    download_work::WorkAdmission,
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// A gossiped block claims our best tip as its parent, but its coinbase height is not one
-/// above the tip height.
+/// A gossiped block has a committed parent, but claims a height other than parent height + 1.
 ///
 /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
 /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
-/// canonical body without changing the advertised hash. A tip child's real height is known
-/// from our own committed tip, so a mismatch is definitively a poisoned body.
+/// canonical body without changing the advertised hash. Its real height is known
+/// from our committed parent, so a mismatch is definitively a poisoned body.
 ///
 /// This is a distinct type rather than a string error so [`super::Inbound`] can score the
 /// supplying peer for it.
 #[derive(Copy, Clone, Debug, thiserror::Error)]
-#[error("gossiped tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
+#[error("gossiped child of a committed parent claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
 pub struct GossipedTipChildHeightMismatch {
     pub height: block::Height,
     pub expected_height: block::Height,
@@ -146,9 +145,6 @@ enum ParentRecovery {
 
     /// The inbound queue is at capacity.
     FullQueue,
-
-    /// The child's header fails the proof of work checks, so it did not start a recovery.
-    InvalidProofOfWork,
 }
 
 impl ParentRecovery {
@@ -160,7 +156,6 @@ impl ParentRecovery {
             Self::TooManyRecoveries => "too_many_recoveries",
             Self::SourceRecoveryInFlight => "source_recovery_in_flight",
             Self::FullQueue => "full_queue",
-            Self::InvalidProofOfWork => "invalid_proof_of_work",
         }
     }
 }
@@ -328,12 +323,6 @@ impl PoisonedRetryBudgets {
 /// only one recovery charged to it, so children with unavailable parents cannot turn into
 /// unbounded requests.
 pub const MAX_PARENT_RECOVERIES: usize = 4;
-
-/// The farthest above the tip an advertised child can be while still recovering its parent.
-///
-/// A child two blocks above the tip is missing exactly one block, its parent. Larger gaps need
-/// more than one hop, which is the syncer's job.
-const MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 
 /// Admission bookkeeping, shared by the [`Downloads`] stream and its download tasks.
 ///
@@ -808,7 +797,7 @@ where
             .expect("admission is only mutated by non-panicking bookkeeping code")
     }
 
-    /// Starts recovering `parent`, which an advertised child at `child_height` revealed to be
+    /// Starts recovering `parent`, which an advertised child revealed to be
     /// missing from the state.
     ///
     /// If `parent` already has an inbound download, the child waits on it. Otherwise one
@@ -823,9 +812,8 @@ where
     ///
     /// Recoveries are bounded by [`MAX_PARENT_RECOVERIES`] in total, by one per child
     /// advertiser, by the inbound queue limit, and to a single hop, because recovered parents
-    /// never recover their own parents. The caller only calls this for children close enough
-    /// to the tip that one hop could connect them, and whose headers carry valid proof of work,
-    /// so a peer cannot occupy these slots with blocks that cost nothing to make.
+    /// never recover their own parents. The caller checks real proof of work before recovery;
+    /// a peer cannot acquire these slots just by claiming a hard target or a near-tip height.
     fn recover_parent(
         &self,
         parent: block::Hash,
@@ -1061,6 +1049,23 @@ where
                 ))?;
             }
 
+            let admitted_height = WorkAdmission::new(state.clone())
+                .check(chain_network.clone(), block.clone())
+                .await
+                .map_err(|error| (error, advertiser_addr))?;
+            if let Some(expected_height) = admitted_height.filter(|height| *height != block_height)
+            {
+                return Err((
+                    BoxError::from(GossipedTipChildHeightMismatch {
+                        height: block_height,
+                        expected_height,
+                        hash,
+                        parent_recovery: kind == DownloadKind::ParentRecovery,
+                    }),
+                    advertiser_addr,
+                ));
+            }
+
             if block_height > max_lookahead_height {
                 debug!(
                     ?hash,
@@ -1088,59 +1093,21 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
-            if !has_sufficient_work(
-                &chain_network,
-                tip_height,
-                block.header.difficulty_threshold,
-            ) {
-                metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
-                return Err((
-                    "gossiped block target is easier than the Mainnet admission floor".into(),
-                    advertiser_addr,
-                ));
-            }
-
-            // The parent is checked after the height policies, so only blocks this node would
-            // verify can start a recovery, and before the source lock, so a recovery is not
-            // delayed by earlier blocks from the same source.
-            if kind == DownloadKind::Advertised {
+            // Admission already checked real proof of work. Only an advertised block can
+            // recover one parent: recovery tasks never recurse, and existing global,
+            // per-source and deduplication budgets bound the extra request.
+            if kind == DownloadKind::Advertised && admitted_height.is_none() {
                 let parent = block.header.previous_block_hash;
-                let one_hop_from_tip = tip_height
-                    .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
-                    .is_some_and(|max_height| block_height <= max_height);
-
-                // A failed read only skips the recovery: the verifier still waits for the
-                // parent as before.
-                let parent_is_missing = one_hop_from_tip
-                    && matches!(
-                        state.oneshot(zs::Request::KnownBlock(parent)).await,
-                        Ok(zs::Response::KnownBlock(None))
-                    );
-
-                if parent_is_missing {
-                    let header = block.header.clone();
-                    let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
-                        zakura_consensus::proof_of_work_is_valid(
-                            &header,
-                            &chain_network,
-                            &block_height,
-                            &hash,
-                        )
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    let recovery = if proof_of_work_is_valid {
-                        spawner.recover_parent(parent, download_source)
-                    } else {
-                        ParentRecovery::InvalidProofOfWork
-                    };
+                if matches!(
+                    state.oneshot(zs::Request::KnownBlock(parent)).await,
+                    Ok(zs::Response::KnownBlock(None))
+                ) {
+                    let recovery = spawner.recover_parent(parent, download_source);
                     debug!(
                         ?hash,
                         ?parent,
-                        ?block_height,
                         ?recovery,
-                        "gossiped block's parent is missing",
+                        "gossiped block's parent is missing"
                     );
                     metrics::counter!(
                         "gossip.missing.parent.count",
@@ -1494,6 +1461,8 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1604,6 +1573,8 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1679,6 +1650,8 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1782,6 +1755,8 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1847,12 +1822,12 @@ mod tests {
 
     /// Weak-work gossip must fail before parent recovery or semantic verification.
     #[tokio::test]
-    async fn mainnet_work_floor_rejects_gossip_before_parent_recovery() {
+    async fn invalid_work_rejects_gossip_before_parent_recovery() {
         use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
         let tip_height = Network::Mainnet.checkpoint_list().max_height();
         // An unrelated parent skips tip-child authentication. Neither an old nor a
-        // new claimed height can bypass the floor once our tip reaches the checkpoint.
+        // new claimed height can bypass proof-of-work validation.
         for height in [
             tip_height.previous().unwrap(),
             tip_height,
@@ -1885,11 +1860,11 @@ mod tests {
             );
             let (error, addr) = tokio::time::timeout(Duration::from_secs(5), downloads.next())
                 .await
-                .expect("the work floor rejects without waiting on the parent")
+                .expect("invalid proof of work rejects without waiting on the parent")
                 .unwrap()
                 .unwrap_err();
             assert!(
-                error.to_string().contains("Mainnet admission floor"),
+                error.to_string().contains("invalid proof of work"),
                 "{error}"
             );
             assert_eq!(addr, Some(advertiser_addr));

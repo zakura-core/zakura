@@ -1,119 +1,161 @@
-//! A fixed Mainnet work floor for downloaded block admission.
+//! Download admission uses actual proof of work and the candidate's own parent branch.
 //!
-//! This is a resource policy, separate from consensus validation. If Mainnet
-//! difficulty falls below this floor, otherwise valid downloaded blocks will be
-//! refused until the policy is updated. Rejections must not score peers or mark
-//! blocks consensus-invalid.
+//! No sampled target or best-tip-relative floor can exclude a valid difficulty decline.
+//! Unknown ancestry stays subject to the downloader's existing capacity and timeout bounds;
+//! it cannot authorize height-based changes to shared sync throttling.
 
-use zakura_chain::{block::Height, parameters::Network, work::difficulty::CompactDifficulty};
+use std::{sync::Arc, time::Duration};
 
-/// Target of Mainnet block 3,538,452, observed on November 1, 2026 UTC.
-///
-/// Block hash:
-/// `0000000000044089828cb43eee6f528cb2e333cc1380b4308fc07a7babd01bd1`.
-/// Source: <https://ccnodes.net/explorer/v1/zcash/blocks>.
-const MAINNET_REFERENCE_TARGET: CompactDifficulty =
-    CompactDifficulty::from_le_bytes(0x1b6aac57_u32.to_le_bytes());
+use tower::{util::BoxCloneService, Service, ServiceExt};
+use zakura_chain::{block, parameters::Network};
+use zakura_state as zs;
 
-/// Allow one tenth of the reference difficulty: targets at most ten times larger.
-const MAINNET_TARGET_MULTIPLIER: u32 = 10;
+use crate::BoxError;
 
-/// Whether a downloaded header's claimed target meets the admission work floor.
-///
-/// This does not verify the header hash or Equihash solution, or replace the
-/// parent-dependent difficulty check. All Mainnet downloads remain exempt while
-/// the committed tip is below the network's last checkpoint or absent. Only our
-/// own chain progress determines this exemption, never a peer's claimed height.
-/// Other networks retain their existing validation rules.
-pub(super) fn has_sufficient_work(
-    network: &Network,
-    committed_tip_height: Option<Height>,
-    target: CompactDifficulty,
-) -> bool {
-    if !matches!(network, Network::Mainnet)
-        || committed_tip_height.is_none_or(|tip| tip < network.checkpoint_list().max_height())
+/// Bounds state readiness and the parent-context read together.
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Checks downloaded headers without waiting for their parents to commit.
+#[derive(Clone)]
+pub(super) struct WorkAdmission {
+    state: BoxCloneService<zs::Request, zs::Response, BoxError>,
+}
+
+impl std::fmt::Debug for WorkAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkAdmission")
+    }
+}
+
+impl WorkAdmission {
+    pub(super) fn new<S>(state: S) -> Self
+    where
+        S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+        S::Future: Send + 'static,
     {
-        return true;
+        Self {
+            state: BoxCloneService::new(state),
+        }
     }
 
-    // The fixed reference is valid, and multiplying its 215-bit target by ten
-    // fits in the 256-bit expanded target representation.
-    let max_target = MAINNET_REFERENCE_TARGET
-        .to_expanded()
-        .expect("the fixed Mainnet reference target has a valid compact encoding")
-        * MAINNET_TARGET_MULTIPLIER;
-
-    target
-        .to_expanded()
-        .is_some_and(|target| target <= max_target)
+    /// Returns an authenticated height only when the committed parent context is
+    /// complete and the header's difficulty and time agree with that branch.
+    /// `None` permits bounded recovery and full verification, never shared throttling.
+    /// Unavailable state falls back to full verification without authenticating height.
+    /// Invalid work rejects this attempt without caching the block as consensus-invalid.
+    pub(super) async fn check(
+        self,
+        network: Network,
+        block: Arc<block::Block>,
+    ) -> Result<Option<block::Height>, BoxError> {
+        let header = block.header.clone();
+        let hash = block.hash();
+        let height = block
+            .coinbase_height()
+            .ok_or("downloaded block has no height")?;
+        let proof_header = header.clone();
+        let valid = tokio::task::spawn_blocking(move || {
+            zakura_consensus::proof_of_work_is_valid(&proof_header, &network, &height, &hash)
+        })
+        .await?;
+        if !valid {
+            return Err("downloaded header has invalid proof of work".into());
+        }
+        let response = tokio::time::timeout(
+            ADMISSION_TIMEOUT,
+            self.state
+                .oneshot(zs::Request::CheckHeaderAdmission(header)),
+        )
+        .await;
+        match response {
+            Ok(Ok(zs::Response::HeaderAdmission(height))) => Ok(height),
+            Ok(Err(error)) if error.is::<zakura_header_chain::ContextualValidationError>() => {
+                Err(error)
+            }
+            unavailable => {
+                // An unavailable optional read is not evidence against the block. Full
+                // verification remains mandatory, and no authenticated height is returned.
+                tracing::debug!(
+                    ?unavailable,
+                    "header admission context unavailable; deferring to full verification"
+                );
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::work::difficulty::ParameterDifficulty as _;
+    use zakura_chain::serialization::ZcashDeserializeInto;
 
-    #[test]
-    fn mainnet_work_floor_activates_at_the_last_checkpoint() {
-        let network = Network::Mainnet;
-        let checkpoint = network.checkpoint_list().max_height();
-        let easiest_target = network.target_difficulty_limit().to_compact();
-        for tip in [None, Some(checkpoint.previous().unwrap())] {
-            assert!(has_sufficient_work(&network, tip, easiest_target));
-        }
-        for tip in [checkpoint, checkpoint.next().unwrap()] {
-            assert!(!has_sufficient_work(&network, Some(tip), easiest_target));
-            assert!(has_sufficient_work(
-                &network,
-                Some(tip),
-                MAINNET_REFERENCE_TARGET,
-            ));
+    #[tokio::test]
+    async fn historical_work_passes_without_a_sampled_floor() {
+        let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        for height in [None, Some(block::Height(1))] {
+            let admission = WorkAdmission::new(tower::service_fn(move |request| async move {
+                assert!(matches!(request, zs::Request::CheckHeaderAdmission(_)));
+                Ok::<_, BoxError>(zs::Response::HeaderAdmission(height))
+            }));
+            assert_eq!(
+                admission
+                    .check(Network::Mainnet, block.clone())
+                    .await
+                    .unwrap(),
+                height
+            );
         }
     }
 
-    #[test]
-    fn mainnet_work_floor_preserves_other_networks() {
-        for network in [
-            Network::new_default_testnet(),
-            Network::new_regtest(Default::default()),
+    #[tokio::test]
+    async fn invalid_proof_cannot_reach_parent_context_even_with_a_hard_target() {
+        use zakura_chain::work::difficulty::{CompactDifficulty, ParameterDifficulty};
+        let canonical: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        for target in [
+            Network::Mainnet.target_difficulty_limit().to_compact(),
+            CompactDifficulty::from_bytes_in_display_order(&0x03000001u32.to_be_bytes()).unwrap(),
         ] {
-            let checkpoint = network.checkpoint_list().max_height();
-            let easiest_target = network.target_difficulty_limit().to_compact();
-            for tip in [None, Some(checkpoint), Some(checkpoint.next().unwrap())] {
-                assert!(has_sufficient_work(&network, tip, easiest_target));
-            }
+            let mut block = canonical.clone();
+            Arc::make_mut(&mut Arc::make_mut(&mut block).header).difficulty_threshold = target;
+            let admission = WorkAdmission::new(tower::service_fn(|_| async {
+                panic!("invalid proof must be rejected before reading parent context");
+                #[allow(unreachable_code)]
+                Ok::<_, BoxError>(zs::Response::HeaderAdmission(None))
+            }));
+            assert!(admission
+                .check(Network::Mainnet, block)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid proof of work"));
         }
     }
-
-    #[test]
-    fn mainnet_work_floor_compares_expanded_targets_at_the_boundary() {
-        let tip = Some(Network::Mainnet.checkpoint_list().max_height());
-        let max_target =
-            MAINNET_REFERENCE_TARGET.to_expanded().unwrap() * MAINNET_TARGET_MULTIPLIER;
-        let easiest_allowed_encoding = max_target.to_compact();
-        let easier_encoding = CompactDifficulty::from_le_bytes(
-            (u32::from_le_bytes(easiest_allowed_encoding.to_le_bytes()) + 1).to_le_bytes(),
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_parent_read_preserves_bounded_full_verification() {
+        let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let admission = WorkAdmission::new(tower::service_fn(|_| {
+            std::future::pending::<Result<zs::Response, BoxError>>()
+        }));
+        assert_eq!(
+            admission
+                .check(Network::Mainnet, block.clone())
+                .await
+                .unwrap(),
+            None
         );
-
-        assert!(has_sufficient_work(
-            &Network::Mainnet,
-            tip,
-            MAINNET_REFERENCE_TARGET
-        ));
-        assert!(has_sufficient_work(
-            &Network::Mainnet,
-            tip,
-            easiest_allowed_encoding
-        ));
-        assert!(!has_sufficient_work(
-            &Network::Mainnet,
-            tip,
-            easier_encoding
-        ));
-        assert!(!has_sufficient_work(
-            &Network::Mainnet,
-            tip,
-            CompactDifficulty::from_le_bytes([0; 4]),
-        ));
+        let admission = WorkAdmission::new(tower::service_fn(|_| async {
+            Err::<zs::Response, BoxError>("state unavailable".into())
+        }));
+        assert_eq!(
+            admission.check(Network::Mainnet, block).await.unwrap(),
+            None
+        );
     }
 }

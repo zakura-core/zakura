@@ -34,7 +34,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::has_sufficient_work,
+    download_work::WorkAdmission,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -166,25 +166,23 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
-    /// A downloaded header claims a target easier than the Mainnet admission floor.
-    /// This is an unscored resource-policy rejection, not a consensus verdict.
-    #[error(
-        "downloaded block target is easier than the Mainnet admission floor: {height:?} {hash:?}"
-    )]
-    BelowMinimumWork {
+    /// Header proof of work or committed-branch difficulty admission failed.
+    /// This rejects only the current attempt, with no permanent invalid-block cache.
+    #[error("downloaded block failed work admission: {height:?} {hash:?}: {error}")]
+    WorkAdmissionFailed {
         height: block::Height,
         hash: block::Hash,
+        error: BoxError,
     },
 
-    /// A downloaded block claims our best tip as its parent, but its coinbase height is not
-    /// one above the tip height.
+    /// A downloaded block has a committed parent, but claims a height other than parent height + 1.
     ///
     /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
     /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
-    /// canonical body without changing the requested hash. A tip child's real height is known
-    /// from our own committed tip, so a mismatch is definitively a poisoned body.
+    /// canonical body without changing the requested hash. Its real height is known
+    /// from our committed parent, so a mismatch is definitively a poisoned body.
     #[error(
-        "downloaded tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}"
+        "downloaded child of a committed parent claimed height {height:?} instead of {expected_height:?}: {hash:?}"
     )]
     TipChildHeightMismatch {
         height: block::Height,
@@ -376,6 +374,8 @@ where
     /// Waits for a parent before verifying again a block whose authorizing data binding was
     /// unconfirmed.
     parent_wait: ParentWait,
+    /// Authenticates work and height against committed parent context.
+    pub(super) work_admission: WorkAdmission,
 
     // Configuration
     //
@@ -508,6 +508,7 @@ where
         verifier: ZV,
         latest_chain_tip: ZSTip,
         parent_wait: ParentWait,
+        work_admission: WorkAdmission,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         chain_network: Network,
@@ -522,6 +523,7 @@ where
             verifier,
             latest_chain_tip,
             parent_wait,
+            work_admission,
             lookahead_limit,
             chain_network,
             max_checkpoint_height,
@@ -650,6 +652,7 @@ where
         let mut verifier = self.verifier.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let parent_wait = self.parent_wait.clone();
+        let work_admission = self.work_admission.clone();
 
         let lookahead_limit = self.lookahead_limit;
         let chain_network = self.chain_network.clone();
@@ -801,6 +804,21 @@ where
                     });
                 }
 
+                let admitted_height = tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => {
+                        return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash });
+                    }
+                    result = work_admission.check(chain_network.clone(), block.clone()) => {
+                        result.map_err(|error| BlockDownloadVerifyError::WorkAdmissionFailed { height: block_height, hash, error })?
+                    }
+                };
+                if let Some(expected_height) = admitted_height.filter(|height| *height != block_height) {
+                    return Err(BlockDownloadVerifyError::TipChildHeightMismatch {
+                        height: block_height, expected_height, hash, advertiser_addr,
+                    });
+                }
+
                 trace.block_downloaded(
                     hash,
                     block_height,
@@ -833,56 +851,58 @@ where
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
                 }
 
-                // Admission must precede shared flow-control changes: a rejected
-                // body must not pause or resume downloads using its claimed height.
-                if !has_sufficient_work(&chain_network, tip_height, block.header.difficulty_threshold) {
-                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
-                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
-                }
+                if admitted_height.is_some() {
+                    // Reset takes this same lock after signalling cancellation. A detached task
+                    // cannot write a stale throttle value after that reset.
+                    let throttle_sender = past_lookahead_limit_sender.lock().expect("throttle sender mutex is not poisoned");
+                    if !matches!(cancel_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                        return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash });
+                    }
+                    if block_height > lookahead_pause_height {
+                        // This log can be very verbose, usually hundreds of blocks are dropped.
+                        // So we only log at info level for the first above-height block.
+                        if !past_lookahead_limit_receiver.cloned_watch_data() {
+                            info!(
+                                ?hash,
+                                ?block_height,
+                                ?tip_height,
+                                ?lookahead_pause_height,
+                                ?lookahead_reset_height,
+                                lookahead_limit = ?lookahead_limit,
+                                "synced block height too far ahead of the tip: \
+                                 waiting for downloaded blocks to commit to the state",
+                            );
 
-                if block_height > lookahead_pause_height {
-                    // This log can be very verbose, usually hundreds of blocks are dropped.
-                    // So we only log at info level for the first above-height block.
-                    if !past_lookahead_limit_receiver.cloned_watch_data() {
-                        info!(
-                            ?hash,
-                            ?block_height,
-                            ?tip_height,
-                            ?lookahead_pause_height,
-                            ?lookahead_reset_height,
-                            lookahead_limit = ?lookahead_limit,
-                            "synced block height too far ahead of the tip: \
-                             waiting for downloaded blocks to commit to the state",
-                        );
+                            // Set the watched value to true, since we're over the limit.
+                            //
+                            // It is ok to block here, because we're going to pause new downloads anyway.
+                            // But if Zebra is shutting down, ignore the send error.
+                            let _ = throttle_sender.send(true);
+                        } else {
+                            debug!(
+                                ?hash,
+                                ?block_height,
+                                ?tip_height,
+                                ?lookahead_pause_height,
+                                ?lookahead_reset_height,
+                                lookahead_limit = ?lookahead_limit,
+                                "synced block height too far ahead of the tip: \
+                                 waiting for downloaded blocks to commit to the state",
+                            );
+                        }
 
-                        // Set the watched value to true, since we're over the limit.
-                        //
-                        // It is ok to block here, because we're going to pause new downloads anyway.
+                        metrics::counter!("sync.max.height.limit.paused.count").increment(1);
+                    } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
+                        // Reset the watched value to false, since we're well under the limit.
+                        // We need to block here, because if we don't the syncer can hang.
+
                         // But if Zebra is shutting down, ignore the send error.
-                        let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(true);
-                    } else {
-                        debug!(
-                            ?hash,
-                            ?block_height,
-                            ?tip_height,
-                            ?lookahead_pause_height,
-                            ?lookahead_reset_height,
-                            lookahead_limit = ?lookahead_limit,
-                            "synced block height too far ahead of the tip: \
-                             waiting for downloaded blocks to commit to the state",
-                        );
+                        let _ = throttle_sender.send(false);
+                        metrics::counter!("sync.max.height.limit.reset.count").increment(1);
+
+                        metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
                     }
 
-                    metrics::counter!("sync.max.height.limit.paused.count").increment(1);
-                } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
-                    // Reset the watched value to false, since we're well under the limit.
-                    // We need to block here, because if we don't the syncer can hang.
-
-                    // But if Zebra is shutting down, ignore the send error.
-                    let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(false);
-                    metrics::counter!("sync.max.height.limit.reset.count").increment(1);
-
-                    metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
                 }
 
                 // A body that fails before its parent commits can't be attributed yet, so wait for

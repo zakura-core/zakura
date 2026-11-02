@@ -38,6 +38,7 @@ use zakura_state as zs;
 use crate::{
     components::{
         auth_download_height::poison_coinbase_height,
+        download_work::WorkAdmission,
         sync::{
             self,
             downloads::{
@@ -3520,7 +3521,7 @@ fn setup_chain_sync_with_options(
     let (mock_chain_tip, mock_chain_tip_sender) = MockChainTip::new();
 
     let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
-    let (chain_sync, sync_status) = ChainSync::new(
+    let (mut chain_sync, sync_status) = ChainSync::new(
         &config,
         max_checkpoint_height,
         peer_set.clone(),
@@ -3529,6 +3530,8 @@ fn setup_chain_sync_with_options(
         mock_chain_tip,
         misbehavior_tx,
     );
+    // Scheduler tests control state requests separately from header admission.
+    chain_sync.downloads.work_admission = unknown_parent_admission();
 
     (
         chain_sync,
@@ -3614,6 +3617,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         ParentWait(Arc::new(|parent| {
             panic!("unexpected parent wait for {parent:?}")
         })),
+        unknown_parent_admission(),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3665,6 +3669,7 @@ async fn block_download_network_readiness_times_out() {
         ParentWait(Arc::new(|parent| {
             panic!("unexpected parent wait for {parent:?}")
         })),
+        unknown_parent_admission(),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3722,6 +3727,7 @@ fn setup_downloads_with_parent_wait(
         verifier,
         chain_tip,
         parent_wait,
+        unknown_parent_admission(),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -4204,7 +4210,7 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
 
 /// Weak-work blocks must fail admission without verification, scoring, or a restart.
 #[tokio::test]
-async fn mainnet_work_floor_rejects_downloads_before_verification() {
+async fn invalid_work_rejects_downloads_before_verification() {
     use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
     let _init_guard = zakura_test::init();
@@ -4255,6 +4261,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
                 ParentWait(Arc::new(|parent| {
                     panic!("rejected block must not wait for parent {parent}")
                 })),
+                unknown_parent_admission(),
                 pause_sender,
                 sync::MIN_CONCURRENCY_LIMIT,
                 Network::Mainnet,
@@ -4270,7 +4277,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
             let error = downloads.next().await.unwrap().unwrap_err();
             assert!(matches!(
                 error,
-                BlockDownloadVerifyError::BelowMinimumWork { height: rejected_height, hash: rejected_hash }
+                BlockDownloadVerifyError::WorkAdmissionFailed { height: rejected_height, hash: rejected_hash, .. }
                     if rejected_height == height && rejected_hash == hash
             ));
             assert_eq!(
@@ -4747,5 +4754,77 @@ fn scaled_lookahead_stays_below_the_drop_height() {
             Height(u32::try_from(LOOKAHEAD_LIMIT * multiplier).expect("fits")) <= genesis_drop,
             "multiplier {multiplier}"
         );
+    }
+}
+
+/// The scheduler fixtures have no committed parent context. Real PoW remains checked.
+fn unknown_parent_admission() -> WorkAdmission {
+    WorkAdmission::new(tower::service_fn(|request| async move {
+        assert!(matches!(request, zs::Request::CheckHeaderAdmission(_)));
+        Ok::<_, crate::BoxError>(zs::Response::HeaderAdmission(None))
+    }))
+}
+
+/// A mined header with unknown ancestry cannot pause or resume other downloads.
+/// The state response is mocked here; the state tests exercise its authentication.
+#[tokio::test]
+async fn shared_throttling_requires_authenticated_parent_context() {
+    let _guard = zakura_test::init();
+    let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let height = candidate.coinbase_height().unwrap();
+    let hash = candidate.hash();
+    for admitted_height in [None, Some(height)] {
+        for initially_paused in [false, true] {
+            let mut peer_set =
+                MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+            let mut verifier =
+                MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+            let (tip, sender) = MockChainTip::new();
+            sender.send_best_tip_height(if initially_paused {
+                height
+            } else {
+                (height - 10_000).unwrap()
+            });
+            sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+            let (pause_sender, pause_receiver) = tokio::sync::watch::channel(initially_paused);
+            let admission = WorkAdmission::new(tower::service_fn(move |_| async move {
+                Ok::<_, crate::BoxError>(zs::Response::HeaderAdmission(admitted_height))
+            }));
+            let mut downloads = Downloads::new(
+                peer_set.clone(),
+                verifier.clone(),
+                tip,
+                ParentWait(Arc::new(|_| panic!("no parent wait expected"))),
+                admission,
+                pause_sender,
+                sync::MIN_CONCURRENCY_LIMIT,
+                Network::Mainnet,
+                Height(0),
+                LegacySyncTrace::new(None, false),
+            );
+            downloads.download_and_verify(hash).await.unwrap();
+            peer_set
+                .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+                .await
+                .respond(zn::Response::Blocks(vec![Available((
+                    candidate.clone(),
+                    None,
+                ))]));
+            verifier
+                .expect_request(zakura_consensus::Request::Commit(candidate.clone()))
+                .await
+                .respond(hash);
+            assert!(downloads.next().await.unwrap().is_ok());
+            assert_eq!(
+                *pause_receiver.borrow(),
+                if admitted_height.is_some() {
+                    !initially_paused
+                } else {
+                    initially_paused
+                }
+            );
+        }
     }
 }

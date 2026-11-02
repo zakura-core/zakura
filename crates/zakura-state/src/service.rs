@@ -2200,6 +2200,7 @@ impl Service<Request> for StateService {
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
             | Request::BlockInfo(_)
+            | Request::CheckHeaderAdmission(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
@@ -2947,6 +2948,15 @@ impl Service<ReadRequest> for ReadStateService {
                     &state.db,
                     hash_or_height,
                 ),
+            )),
+
+            ReadRequest::CheckHeaderAdmission(header) => Ok(ReadResponse::HeaderAdmission(
+                read::header_admission::check(
+                    &state.latest_non_finalized_state(),
+                    &state.db,
+                    &state.network,
+                    &header,
+                )?,
             )),
 
             // Used by the StateService.

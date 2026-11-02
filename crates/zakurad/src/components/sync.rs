@@ -1106,6 +1106,7 @@ where
             verifier,
             latest_chain_tip.clone(),
             parent_wait,
+            super::download_work::WorkAdmission::new(state.clone()),
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
@@ -3130,11 +3131,11 @@ where
                 );
                 false
             }
-            BlockDownloadVerifyError::BelowMinimumWork { .. } => {
+            BlockDownloadVerifyError::WorkAdmissionFailed { .. } => {
                 debug!(
                     error = ?e,
                     %peer,
-                    "block target is easier than the Mainnet admission floor, continuing sync"
+                    "block failed header work admission, continuing sync"
                 );
                 false
             }

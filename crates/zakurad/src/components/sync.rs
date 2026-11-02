@@ -173,10 +173,14 @@ where
         return Ok(true);
     }
 
+    // The state reports a written block by its chain rather than as being written, so a parent
+    // whose write finished since the first question is in a chain here.
     let location = state.oneshot(zs::Request::KnownBlock(parent)).await?;
     Ok(matches!(
         location,
-        zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel))
+        zs::Response::KnownBlock(Some(
+            zs::KnownBlock::WriteChannel | zs::KnownBlock::BestChain | zs::KnownBlock::SideChain
+        ))
     ))
 }
 

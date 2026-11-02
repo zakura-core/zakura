@@ -4581,25 +4581,31 @@ async fn checkpoint_block_skips_the_parent_check() {
 }
 
 /// The state adapter reports a parent as unknown only when the state says it doesn't have it.
-/// Any location, a failed request, or no answer within the timeout lets the block be verified.
+/// Any location that can be built on, a failed request, or no answer within the timeout, at
+/// either step, lets the block be verified.
 #[tokio::test(start_paused = true)]
 async fn state_parent_extendable_drops_only_on_a_definite_no() {
     let parent = block::Hash([0xAA; 32]);
-    let unavailable = zs::Response::ParentInputs(zs::ParentInputs::ParentUnavailable);
+    let unavailable = || {
+        Some(Ok(zs::Response::ParentInputs(
+            zs::ParentInputs::ParentUnavailable,
+        )))
+    };
+    let located = |location: Option<zs::KnownBlock>| Some(Ok(zs::Response::KnownBlock(location)));
 
-    // Answers the chain check with `check` and the location lookup with `location`. `None` never
-    // answers the chain check.
+    // Answers the chain check with `check` and the location lookup with `lookup`. `None` never
+    // answers.
     async fn ask(
         parent: block::Hash,
         check: Option<Result<zs::Response, &'static str>>,
-        location: Option<zs::KnownBlock>,
+        lookup: Option<Result<zs::Response, &'static str>>,
     ) -> bool {
         let state = tower::service_fn(move |request: zs::Request| {
             let answer = if request == parent_check(parent) {
                 check.clone()
             } else {
                 assert_eq!(request, zs::Request::KnownBlock(parent));
-                Some(Ok(zs::Response::KnownBlock(location.clone())))
+                lookup.clone()
             };
             async move {
                 match answer {
@@ -4616,19 +4622,21 @@ async fn state_parent_extendable_drops_only_on_a_definite_no() {
     // No chain can take a child of an unknown block, or of a known block below the finalized tip.
     for location in [None, Some(zs::KnownBlock::Finalized)] {
         assert!(
-            !ask(parent, Some(Ok(unavailable.clone())), location.clone()).await,
+            !ask(parent, unavailable(), located(location.clone())).await,
             "{location:?}"
         );
     }
-    assert!(
-        ask(
-            parent,
-            Some(Ok(unavailable.clone())),
-            Some(zs::KnownBlock::WriteChannel)
-        )
-        .await,
-        "a parent the state is still writing"
-    );
+    // A parent the state is still writing, or whose write finished between the two questions.
+    for location in [
+        zs::KnownBlock::WriteChannel,
+        zs::KnownBlock::BestChain,
+        zs::KnownBlock::SideChain,
+    ] {
+        assert!(
+            ask(parent, unavailable(), located(Some(location.clone()))).await,
+            "{location:?}"
+        );
+    }
     for answer in [
         zs::ParentInputs::Inconclusive,
         zs::ParentInputs::Missing(zakura_chain::transparent::OutPoint {
@@ -4643,11 +4651,19 @@ async fn state_parent_extendable_drops_only_on_a_definite_no() {
     }
     assert!(
         ask(parent, Some(Err("state failed")), None).await,
-        "a failed request"
+        "a failed chain check"
     );
     assert!(
         ask(parent, None, None).await,
-        "no answer within the timeout"
+        "no answer to the chain check within the timeout"
+    );
+    assert!(
+        ask(parent, unavailable(), Some(Err("state failed"))).await,
+        "a failed location lookup"
+    );
+    assert!(
+        ask(parent, unavailable(), None).await,
+        "no answer to the location lookup within the timeout"
     );
 }
 

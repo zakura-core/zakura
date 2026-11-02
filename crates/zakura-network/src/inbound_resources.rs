@@ -69,11 +69,8 @@ impl InboundBudget {
     /// The caller bounds this work itself. A TCP connection has one outstanding
     /// request and serves one request at a time.
     pub(crate) fn charge_committed(&self, bytes: u64) -> InboundCharge {
-        let _ = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_add(bytes))
-            });
+        // Each charge covers live memory, so the sum cannot reach `u64::MAX`.
+        self.used.fetch_add(bytes, Ordering::AcqRel);
         self.charge_of(bytes)
     }
 
@@ -115,11 +112,7 @@ impl InboundCharge {
 
 impl Drop for InboundCharge {
     fn drop(&mut self) {
-        let _ = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(self.bytes))
-            });
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 

@@ -230,6 +230,7 @@ impl PublisherOwner {
 
     /// Take the next terminal outcome state lets the task write, and bind it
     /// to its encoded frame and its slot's permit.
+    #[allow(clippy::unwrap_in_result)] // Its expects are local slot and encoding invariants.
     fn next_terminal<const HEADER_BYTES: usize>(&mut self) -> Option<OwnedTerminal> {
         let terminal = self.state.next_terminal()?;
         let permit = self
@@ -960,8 +961,11 @@ fn page_output<const HEADER_BYTES: usize>(
     let Some(last) = entries.last() else {
         return Err(on_empty_page(job.following).into());
     };
-    let sent = u32::try_from(entries.len()).expect("a page holds at most MAX_HS_RANGE headers");
-    let Some(height) = page.common_ancestor.height.0.checked_add(sent) else {
+    // A page holds at most `job.count` headers, a u32, so the count converts.
+    let Some((sent, height)) = u32::try_from(entries.len()).ok().and_then(|sent| {
+        let height = page.common_ancestor.height.0.checked_add(sent)?;
+        Some((sent, height))
+    }) else {
         return Err(Output::Stall(Stall::Local, "page_shape").into());
     };
     let last = Frontier::new(block::Height(height), last.header.hash());

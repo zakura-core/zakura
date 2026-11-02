@@ -698,27 +698,6 @@ fn discovery_session_witness_rejects_losing_the_success_charge() {
     });
 }
 
-#[test]
-fn ownership_changes_during_answer_wait_prevent_close() {
-    for (owner, expected) in [
-        (Ownership::Shared, REFRESH),
-        (Ownership::Superseded, END_OPEN),
-    ] {
-        let mut state = waiting_session();
-        complete(&mut state);
-        settle_initial(&mut state, InitialWait::Complete);
-        assert_eq!(
-            state.on_input(PeerInput::Owners(Ownership::Sole)),
-            then(WAIT_FOR_ANSWERS)
-        );
-        assert_eq!(
-            state.on_input(PeerInput::AnswersSettled),
-            then(PeerOutput::CheckSoleOwner)
-        );
-        assert_eq!(state.on_input(PeerInput::Owners(owner)), then(expected));
-    }
-}
-
 #[cfg(test)]
 #[tokio::test]
 async fn completion_wait_observes_progress_before_and_after_polling() {

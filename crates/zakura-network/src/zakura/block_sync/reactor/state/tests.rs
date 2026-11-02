@@ -935,38 +935,7 @@ fn model_reply(reply: NeededReply) -> ModelReply {
 }
 
 fn check(state: &ReactorState, model: &Model, base: Instant) {
-    assert_eq!(
-        state.queries.pending().map(model_query),
-        model.pending,
-        "{PROPERTY}"
-    );
-    assert_eq!(
-        state.queries.next_id().map(NonZeroU64::get),
-        Some(model.next_id),
-        "{PROPERTY}"
-    );
-    assert_eq!(
-        state.queries.retry_at(),
-        model
-            .retry_until_ms
-            .map(|ms| base + Duration::from_millis(ms)),
-        "{PROPERTY}"
-    );
-    assert_eq!(
-        state.progress.verified_block_tip.0, model.verified_tip,
-        "{PROPERTY}"
-    );
-    assert_eq!(
-        state.queries.retry_forced(),
-        model.retry_forced,
-        "{PROPERTY}"
-    );
-    assert_eq!(state.queries.dispatch_closed(), model.closed, "{PROPERTY}");
-    assert_eq!(state.progress.request_floor.0, model.floor, "{PROPERTY}");
-    assert_eq!(
-        state.progress.best_header_tip.0, model.header_tip,
-        "{PROPERTY}"
-    );
+    assert_eq!(actual_view(state, base), expected_view(model), "{PROPERTY}");
 }
 
 const PROPERTY: &str = "block/reactor-policy";

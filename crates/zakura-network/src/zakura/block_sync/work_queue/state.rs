@@ -24,11 +24,10 @@ use super::super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use tests::{
-    trace_work_funding_bytes, trace_work_ownership_bytes,
-    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
-    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
-    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
-    WorkOwnershipView,
+    trace_work_funding_bytes, trace_work_ownership_bytes, FundingReceiptView, FundingRequestPhase,
+    FundingRequestView, WorkFundingHistory, WorkFundingStep, WorkFundingView, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
 };
 
 /// Lower clamp on a body-size estimate.

@@ -46,6 +46,8 @@ pub(super) mod state;
 #[cfg(any(test, zakura_sim))]
 pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
+#[cfg(feature = "internal-bench")]
+pub(super) use request_write::UnpublishedRequest;
 pub(super) use request_write::{AdmitRefusal, RequestWrite, RequestWriteStatus, TakenRequest};
 pub(super) use state::{WorkItem, WorkReturnOutcome};
 #[cfg(any(test, zakura_sim))]
@@ -690,9 +692,8 @@ impl WorkQueue {
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state::{
-    trace_work_funding_bytes, trace_work_ownership_bytes,
-    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
-    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
-    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
-    WorkOwnershipView,
+    trace_work_funding_bytes, trace_work_ownership_bytes, FundingReceiptView, FundingRequestPhase,
+    FundingRequestView, WorkFundingHistory, WorkFundingStep, WorkFundingView, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
 };

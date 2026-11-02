@@ -13,7 +13,9 @@ from typing import Any
 
 REFERENCE_BITS = 0x1B6AAC57
 TARGET_MULTIPLIER = 10
-FLOOR_HEIGHT = 3_535_411
+# Fleet nodes use the default checkpoint-sync boundary. A source test keeps
+# this value aligned with the bundled Mainnet checkpoint list.
+FLOOR_HEIGHT = 3_536_611
 MAX_AGE = 600
 MAX_POLL_GAP = 180
 HOLD_SECONDS = 900

@@ -573,6 +573,7 @@ where
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,

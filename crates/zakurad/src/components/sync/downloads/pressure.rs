@@ -45,12 +45,22 @@ impl DownloadPressure {
         let multiplier = tip.map_or(1, |tip| lookahead_limit_multiplier(&self.network, tip));
         let (_, pause, reset) = lookahead_heights(tip, self.limit, multiplier);
         let highest = self.heights.last_key_value().map(|(height, _)| *height);
+        let was_paused = *self.sender.borrow();
         let paused = match highest {
             None => false,
             Some(height) if height > pause => true,
             Some(height) if height <= reset => false,
-            Some(_) => *self.sender.borrow(),
+            Some(_) => was_paused,
         };
+        if paused != was_paused {
+            tracing::debug!(paused, ?tip, ?highest, "updated admitted download pressure");
+            if paused {
+                metrics::counter!("sync.max.height.limit.paused.count").increment(1);
+            } else {
+                metrics::counter!("sync.max.height.limit.reset.count").increment(1);
+                metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
+            }
+        }
         self.sender.send_replace(paused);
     }
 }

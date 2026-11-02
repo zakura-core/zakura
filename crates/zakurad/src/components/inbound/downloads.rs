@@ -884,7 +884,7 @@ where
 
     /// Rechecks admission after source ordering and immediately dispatches verification.
     async fn verify_downloaded(
-        &self,
+        self,
         block: Arc<block::Block>,
         height: block::Height,
         source_lock: Option<Arc<Mutex<()>>>,
@@ -1969,7 +1969,7 @@ mod tests {
         }));
         let gate = Arc::new(Mutex::new(()));
         let held = gate.clone().lock_owned().await;
-        let verify = downloads.spawner.verify_downloaded(
+        let verify = downloads.spawner.clone().verify_downloaded(
             historical,
             block::Height(1),
             Some(gate),

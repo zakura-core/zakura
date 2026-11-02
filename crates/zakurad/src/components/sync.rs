@@ -1776,7 +1776,11 @@ where
                 tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(chain_progress.deadline()) => {
-                        return Err(eyre!("sync round stalled: no verified chain progress within timeout"));
+                        // Another ingestion path may have committed while this round waited.
+                        chain_progress.observe(self.latest_chain_tip.best_tip_height_and_hash(), false);
+                        if tokio::time::Instant::now() >= chain_progress.deadline() {
+                            return Err(eyre!("sync round stalled: no verified chain progress within timeout"));
+                        }
                     }
 
                     // Retry required blocks that registry-missed once their backoff elapses. This

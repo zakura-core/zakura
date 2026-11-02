@@ -461,6 +461,9 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    // Keys are built off the async workers; nothing waits for them, so startup is not delayed.
+    let _key_preload = crate::primitives::halo2::spawn_key_preload();
+
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
 

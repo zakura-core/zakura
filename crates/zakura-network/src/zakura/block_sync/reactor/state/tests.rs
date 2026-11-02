@@ -973,7 +973,7 @@ fn check(state: &ReactorState, model: &Model, base: Instant) {
 
 const PROPERTY: &str = "block/reactor-policy";
 
-/// Applicable transitions in a decoder-v2 reactor history.
+/// Applicable transitions in a decoder-v3 reactor history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct BlockReactorReplaySummary {
     /// Inputs decoded.
@@ -1249,7 +1249,7 @@ pub struct ReactorMachineView {
     pub retry_after_ms: Option<u64>,
 }
 
-/// One decoder-v2 operation.
+/// One decoder-v3 operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockReactorStep {
     /// One-based operation number.
@@ -1266,7 +1266,7 @@ pub struct BlockReactorStep {
     pub failure: Option<WorkOwnershipFailure>,
 }
 
-/// A decoder-v2 history, captured until its first failure.
+/// A decoder-v3 history, captured until its first failure.
 #[derive(Debug)]
 pub struct BlockReactorHistory {
     /// Captured operations.
@@ -1314,7 +1314,7 @@ fn expected_view(model: &Model) -> ReactorMachineView {
     }
 }
 
-/// Capture decoder-v2 operations with the exact identity of each accepted or
+/// Capture decoder-v3 operations with the exact identity of each accepted or
 /// refused query. The history holds at most 128 steps. A driver panic stays
 /// distinct from a property failure.
 pub fn trace_block_reactor_bytes(data: &[u8]) -> BlockReactorHistory {
@@ -1387,7 +1387,7 @@ mod committed;
 #[cfg(test)]
 mod status;
 
-/// Replay decoder-v2 quadruples against the existing reactor policy model.
+/// Replay decoder-v3 quadruples against the existing reactor policy model.
 /// Read at most 512 bytes and express deadlines relative to one clock origin.
 pub fn replay_block_reactor_bytes(data: &[u8]) -> BlockReactorReplaySummary {
     run(decode(data), |_| {})
@@ -1515,7 +1515,7 @@ fn reactor_witness_exercises_refusal_retry_reset_and_authority() {
         replay_block_reactor_bytes(&[]),
         BlockReactorReplaySummary::default()
     );
-    println!("tier=Machine target=block_reactor decoder=2 {summary:?}");
+    println!("tier=Machine target=block_reactor decoder=3 {summary:?}");
 }
 
 /// A reply under another authority leaves the pending query in place.

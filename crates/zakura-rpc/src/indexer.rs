@@ -4,6 +4,7 @@ use zakura_chain::{
     block,
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 #[cfg(test)]
 mod tests;
@@ -43,10 +44,7 @@ impl BlockAndHash {
     /// # Panics
     ///
     /// This function will panic if the block serialization fails (if the header version is invalid).
-    pub fn new(
-        hash: block::Hash,
-        block: impl Into<zakura_node_services::block_memory::BlockHandle>,
-    ) -> Self {
+    pub fn new(hash: block::Hash, block: impl Into<BlockHandle>) -> Self {
         let block = block.into();
         BlockAndHash {
             hash: hash.bytes_in_display_order().to_vec(),

@@ -384,30 +384,21 @@ impl BufferedBlockBody {
         }
     }
 
-    /// The body a peer routine hands the sequencer for `block`, which it
-    /// decoded from `raw_frame_payload`. The body keeps the decoded block only
-    /// when `charged`, that is when
+    /// The body a peer routine hands the sequencer for `block`, which it decoded
+    /// from `raw_frame_payload`. The caller holds a
     /// [`charge_decoded_handoff`](super::sequencer_task::charge_decoded_handoff)
-    /// found room for it under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
-    /// Otherwise the body keeps the raw frame payload alone, and the sequencer
-    /// decodes it when it submits it (#1522).
+    /// charge, so the block fits under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
+    /// A routine without that charge hands over the raw frame payload alone, and
+    /// the sequencer decodes it when it submits it (#1522).
     ///
     /// One cap holds at every height, because the input queue is not the
     /// checkpoint window.
-    pub(super) fn for_handoff(
-        block: OwnedBlock,
-        raw_frame_payload: Arc<[u8]>,
-        charged: bool,
-    ) -> Self {
-        if charged {
-            let decoded_attributed_memory_size_bytes = block.decoded_bytes();
-            BufferedBlockBody::DecodedWithRawFramePayload {
-                block: BlockHandle::Owned(block),
-                raw_frame_payload,
-                decoded_attributed_memory_size_bytes,
-            }
-        } else {
-            BufferedBlockBody::RawFramePayload(raw_frame_payload)
+    pub(super) fn for_handoff(block: OwnedBlock, raw_frame_payload: Arc<[u8]>) -> Self {
+        let decoded_attributed_memory_size_bytes = block.decoded_bytes();
+        BufferedBlockBody::DecodedWithRawFramePayload {
+            block: BlockHandle::Owned(block),
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
         }
     }
 

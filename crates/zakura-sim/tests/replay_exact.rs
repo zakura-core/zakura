@@ -1317,7 +1317,14 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
         panic!("missing closed-pool read")
     };
     assert!(closed.actual.as_ref().unwrap().pools[2].closed);
-    assert_eq!(closed.actual.as_ref().unwrap().pools[2].blocks, Some(1));
+    // Closing pool 2 while a handle retains its charge keeps that charge until the drain.
+    let charged = record(entry, &[0, 0, 0, 2, 6, 0, 0, 2]);
+    let charged = open(charged.path());
+    let Some(MachineStep::DecodedRetention(closed)) = charged.steps[1].machine.as_deref() else {
+        panic!("missing charged closed-pool read")
+    };
+    assert!(closed.actual.as_ref().unwrap().pools[2].closed);
+    assert_eq!(closed.actual.as_ref().unwrap().pools[2].blocks, 1);
     let Some(MachineStep::DecodedRetention(drain)) = trace.steps.last().unwrap().machine.as_deref()
     else {
         panic!("missing pre-destruction drain")

@@ -836,9 +836,13 @@ where
                         .clone()
                         .oneshot(zs::Request::UnspentBestChainUtxo(*outpoint));
 
-                    let zakura_state::Response::UnspentBestChainUtxo(utxo) = query
-                        .await
-                        .map_err(|_| TransactionError::TransparentInputNotFound)?
+                    let zakura_state::Response::UnspentBestChainUtxo(utxo) =
+                        query.await.map_err(|boxed_error| {
+                            match boxed_error.downcast::<Elapsed>() {
+                                Ok(_) => TransactionError::TransparentInputNotFound,
+                                Err(boxed_error) => TransactionError::from(boxed_error),
+                            }
+                        })?
                     else {
                         unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
                     };

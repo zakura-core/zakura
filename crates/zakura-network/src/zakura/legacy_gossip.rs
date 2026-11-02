@@ -3690,7 +3690,7 @@ mod tests {
 
         fn call(&mut self, _request: Request) -> Self::Future {
             std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(self.block.clone()),
+                self.block.clone().into(),
                 None,
             ))])))
         }
@@ -3718,7 +3718,7 @@ mod tests {
                 return std::future::ready(Ok(Response::Nil));
             }
             std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(self.block.clone()),
+                self.block.clone().into(),
                 None,
             ))])))
         }
@@ -6947,7 +6947,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             7,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             max_frame_bytes,
@@ -6999,7 +6999,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             7,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             max_frame_bytes,
@@ -7099,7 +7099,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             7,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             frame_cap,
@@ -7254,7 +7254,7 @@ mod tests {
         LegacyResponseCodec::encode_response(
             1,
             Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]),
             frame_cap,
@@ -7972,10 +7972,7 @@ mod tests {
 
         record_block_response_source(
             &trace,
-            Response::Blocks(vec![InventoryResponse::Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
-                None,
-            ))]),
+            Response::Blocks(vec![InventoryResponse::Available((block.into(), None))]),
             BlockBodySource::Legacy,
             Some(&requested_hashes),
         );

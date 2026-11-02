@@ -1,4 +1,5 @@
 use super::{wire::*, *};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 /// Blocks this node requests per `GetBlocks` message and advertises per response.
 ///
@@ -423,7 +424,7 @@ impl ZakuraBlockSyncConfig {
     pub fn decoded_block_pool(
         &self,
         backend_blocks: u64,
-    ) -> Result<zakura_node_services::block_memory::DecodedBlockPool, &'static str> {
+    ) -> Result<DecodedBlockPool, &'static str> {
         let windows = u64::try_from(self.submitted_apply_limit())
             .ok()
             .and_then(|count| count.checked_mul(4));
@@ -438,12 +439,10 @@ impl ZakuraBlockSyncConfig {
             .and_then(|count| count.checked_add(backend_blocks))
             .and_then(std::num::NonZeroU64::new)
             .ok_or("decoded block-count allowance overflow")?;
-        Ok(
-            zakura_node_services::block_memory::DecodedBlockPool::for_pipeline(
-                limit,
-                self.decoded_pipeline_byte_bound(),
-            ),
-        )
+        Ok(DecodedBlockPool::for_pipeline(
+            limit,
+            self.decoded_pipeline_byte_bound(),
+        ))
     }
 
     /// Decoded bytes the pipeline may hold before gated work must wait or stay raw.

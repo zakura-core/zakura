@@ -8,6 +8,7 @@
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
 use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
@@ -65,7 +66,7 @@ pub(super) enum Handler {
     FindHeaders,
     BlocksByHash {
         pending_hashes: HashSet<block::Hash>,
-        blocks: Vec<zakura_node_services::block_memory::BlockHandle>,
+        blocks: Vec<BlockHandle>,
     },
     TransactionsById {
         pending_ids: HashSet<UnminedTxId>,

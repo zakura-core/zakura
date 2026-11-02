@@ -118,10 +118,14 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if !shutting_down && block_sync.is_accounting_closed() {
             error!("stopping the critical block-sync driver after local accounting failure");
             shutting_down = true;
-            block_sync_handoff.request_apply_shutdown();
-            release_pending_applies(&block_sync, &mut pending_applies, &trace);
-            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-            deferred_actions.clear();
+            begin_shutdown(
+                &block_sync_handoff,
+                &block_sync,
+                &mut pending_applies,
+                &mut pending_probe_applies,
+                &mut deferred_actions,
+                &trace,
+            );
         }
         if block_sync_handoff.is_yielded_to_legacy() {
             release_pending_applies(&block_sync, &mut pending_applies, &trace);
@@ -151,10 +155,14 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
         if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
             shutting_down = true;
-            block_sync_handoff.request_apply_shutdown();
-            release_pending_applies(&block_sync, &mut pending_applies, &trace);
-            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-            deferred_actions.clear();
+            begin_shutdown(
+                &block_sync_handoff,
+                &block_sync,
+                &mut pending_applies,
+                &mut pending_probe_applies,
+                &mut deferred_actions,
+                &trace,
+            );
         }
 
         if shutting_down {
@@ -215,21 +223,18 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             action
         } else {
             select! {
-                _ = &mut accounting_closed => {
-                    error!("stopping the critical block-sync driver after local accounting failure");
-                    shutting_down = true;
-                    block_sync_handoff.request_apply_shutdown();
-                    release_pending_applies(&block_sync, &mut pending_applies, &trace);
-                    release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-                    deferred_actions.clear();
-                    continue;
-                },
+                // The closure check at the top of the loop starts the drain.
+                _ = &mut accounting_closed => continue,
                 _ = &mut shutdown => {
                     shutting_down = true;
-                    block_sync_handoff.request_apply_shutdown();
-                    release_pending_applies(&block_sync, &mut pending_applies, &trace);
-                    release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-                    deferred_actions.clear();
+                    begin_shutdown(
+                        &block_sync_handoff,
+                        &block_sync,
+                        &mut pending_applies,
+                        &mut pending_probe_applies,
+                        &mut deferred_actions,
+                        &trace,
+                    );
                     continue;
                 },
                 _ = block_sync_handoff.wait_for_zakura_ownership(),
@@ -1142,6 +1147,21 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     }
 }
 
+/// Stop new applies, release held applies and drop unauthorized deferred actions.
+fn begin_shutdown(
+    block_sync_handoff: &super::SyncCoordinator,
+    block_sync: &BlockSyncHandle,
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+    deferred_actions: &mut VecDeque<BlockSyncAction>,
+    trace: &ZakuraTrace,
+) {
+    block_sync_handoff.request_apply_shutdown();
+    release_pending_applies(block_sync, pending_applies, trace);
+    release_pending_probe_applies(block_sync, pending_probe_applies, trace);
+    deferred_actions.clear();
+}
+
 fn release_pending_applies(
     block_sync: &BlockSyncHandle,
     pending_applies: &mut VecDeque<PendingBlockApply>,
@@ -2018,7 +2038,7 @@ mod tests {
             .zcash_deserialize_into()
             .expect("block vector parses");
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let probe = Probe::new(&block);
         let ready_polls = Arc::new(AtomicUsize::new(0));
@@ -2076,7 +2096,7 @@ mod tests {
             .expect("block vector parses");
         let transaction_hash = block.transactions[0].hash();
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let probe = Probe::new(&block);
         let (retained_tx, mut retained_rx) = mpsc::unbounded_channel();

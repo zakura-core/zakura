@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     future,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use proptest::{prop_assert, prop_assert_eq};
 
@@ -567,9 +568,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
         legacy_frontiers,
         legacy_header,
         snapshot_rx,
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.header_tip.is_none());
@@ -658,9 +657,7 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         },
         (finalized.height, finalized.hash),
         snapshot_rx,
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -749,9 +746,7 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         },
         (header.height, header.hash),
         snapshot_rx,
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -823,12 +818,7 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (_snapshots, receiver) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        ZakuraBlockSyncConfig::default(),
-    );
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.committed_views = Some(receiver);
     let (handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -860,12 +850,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        ZakuraBlockSyncConfig::default(),
-    );
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -995,12 +980,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
-    let mut startup = BlockSyncStartup::inert(
-        config
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        config.clone(),
-    );
+    let mut startup = BlockSyncStartup::inert(config.clone()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -1699,15 +1679,14 @@ fn work_queue_returned_height_is_contestable_by_any_peer() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
 
     // A peer takes the floor height (it leaves `pending` → `in_flight`).
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
     assert!(queue.in_flight_contains(block::Height(1)));
     assert!(!queue.pending_contains(block::Height(1)));
 
     // Its request times out: the height returns to `pending`, where any servable
     // peer (not just the original holder) can take it again. No bias toward or
     // away from any particular peer exists in WorkQueue.
-    queue.return_items([block::Height(1)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
     assert!(queue.pending_contains(block::Height(1)));
     assert_eq!(
         queue
@@ -2424,17 +2403,9 @@ fn work_queue_refreshes_queued_authority_and_preserves_registered_requests() {
         queue.extend(obsolete, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.scope, obsolete);
-    let owner = obsolete.bind(
-        12,
-        std::num::NonZeroU64::new(13).expect("thirteen is nonzero"),
-    );
-    assert_eq!(
-        queue.mark_reserved_for_owner(owner, [block::Height(1)]),
-        100
-    );
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(owner.authority(), obsolete);
+    assert_eq!(queue.reserved_bytes(), 100);
     assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
 
     queue.refresh_authority(current);
@@ -2478,7 +2449,6 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
     assert_ne!(refreshed, scope);
     assert_eq!(refreshed.body_work_epoch, scope.body_work_epoch);
 
-    let owner = test_work_owner();
     let height = block::Height(1);
     let hash = block::Hash([1; 32]);
     let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
@@ -2487,8 +2457,8 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
         queue.extend(scope, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
-    assert_eq!(queue.mark_reserved_for_owner(owner, [height]), 100);
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(queue.reserved_bytes(), 100);
 
     let config = ZakuraBlockSyncConfig::default();
     let registry = PeerRegistry::new();
@@ -2717,36 +2687,62 @@ fn work_queue_take_respects_servable_range_contiguity_and_max() {
     );
 }
 
+/// A provisional take with a byte cap, returned to `pending` when it drops.
+fn take_for_fixture(
+    queue: &Arc<WorkQueue>,
+    low: block::Height,
+    high: block::Height,
+    max_count: usize,
+    max_estimated_bytes: u64,
+) -> super::work_queue::TakenRequest {
+    queue.take_request(
+        low,
+        high,
+        max_count,
+        max_estimated_bytes,
+        1,
+        std::num::NonZeroU64::MIN,
+    )
+}
+
 #[test]
 fn work_queue_budgeted_take_respects_count_cap() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         (1..=4).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(4), 2, u64::MAX);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(4), 2, u64::MAX);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
 }
 
 #[test]
 fn work_queue_budgeted_take_respects_estimated_byte_cap() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(1, BlockSizeEstimate::Advertised(100)),
             needed(2, BlockSizeEstimate::Advertised(150)),
             needed(3, BlockSizeEstimate::Advertised(1)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(3), 3, 250);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(3), 3, 250);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
     assert!(queue.pending_contains(block::Height(3)));
@@ -2754,19 +2750,23 @@ fn work_queue_budgeted_take_respects_estimated_byte_cap() {
 
 #[test]
 fn work_queue_budgeted_take_stops_at_gaps() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(10, BlockSizeEstimate::Advertised(100)),
             needed(11, BlockSizeEstimate::Advertised(100)),
             needed(13, BlockSizeEstimate::Advertised(100)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(13), 3, u64::MAX);
+    let taken = take_for_fixture(&queue, block::Height(10), block::Height(13), 3, u64::MAX);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![10, 11]
     );
     assert!(queue.pending_contains(block::Height(13)));
@@ -2774,36 +2774,43 @@ fn work_queue_budgeted_take_stops_at_gaps() {
 
 #[test]
 fn work_queue_budgeted_take_takes_one_oversized_first_item_for_progress() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(1, BlockSizeEstimate::Advertised(500)),
             needed(2, BlockSizeEstimate::Advertised(1)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(2), 2, 100);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(2), 2, 100);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1]
     );
-    assert_eq!(taken[0].1.estimated_bytes, 500);
+    assert_eq!(taken.items()[0].1.estimated_bytes, 500);
     assert!(queue.pending_contains(block::Height(2)));
 }
 
 #[test]
 fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
-    let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(10, BlockSizeEstimate::Advertised(12_345))],
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.estimated_bytes, 12_345);
+    let taken = take_for_fixture(&queue, block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(taken.items().len(), 1);
+    assert_eq!(taken.items()[0].1.estimated_bytes, 12_345);
 
-    queue.return_items([block::Height(10)]);
-    let retaken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
-    assert_eq!(retaken.len(), 1);
-    assert_eq!(retaken[0].1.estimated_bytes, 12_345);
+    drop(taken);
+    let retaken = take_for_fixture(&queue, block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(retaken.items().len(), 1);
+    assert_eq!(retaken.items()[0].1.estimated_bytes, 12_345);
 }
 
 /// Test shorthand: the grant for an admitted take, or `None` on any refusal.
@@ -3302,23 +3309,23 @@ fn commit_window_stays_fundable_at_exact_floor() {
 #[test]
 fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(queue.budget().reserved(), 100);
 
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
-    assert_eq!(budget.reserved(), 100);
-
-    let watchdog_released = queue.release_and_return_items([block::Height(1)]);
+    let watchdog_released = queue
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
+        .released_bytes;
 
     assert_eq!(watchdog_released, 100);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
-    let late_owner_released = queue.release_and_return_items([block::Height(1)]);
+    let late_owner_released = queue
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
+        .released_bytes;
 
     assert_eq!(late_owner_released, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 }
 
@@ -3341,36 +3348,36 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     assert_eq!(queue.reserved_bytes(), 0);
     check("seed");
 
-    // take + mark_reserved: Released -> Reserved.
-    let taken = queue.take_in_range(block::Height(1), block::Height(6), 6);
-    assert_eq!(taken.len(), 6);
-    assert_eq!(queue.mark_reserved((1..=6).map(block::Height)), 600);
+    // publication: Released -> Reserved.
+    let owner = queue.publish_fixture(1..=6);
     assert_eq!(queue.reserved_bytes(), 600);
-    check("mark_reserved");
+    check("publish_fixture");
 
     // receipt: Reserved -> Released drops the reservation for height 1.
-    assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        Some(100),
-    );
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
     assert_eq!(queue.reserved_bytes(), 500);
-    check("release_active_reserved_height");
+    check("receive_fixture");
 
-    // claim_received: Reserved -> Released drops height 2's reservation.
-    assert_eq!(queue.claim_received(block::Height(2)), 100);
+    // claim_receipt_for_owner: Reserved -> Released drops height 2's reservation.
+    let claimed = queue
+        .claim_receipt_for_owner(owner, block::Height(2))
+        .expect("fixture funding matches the queue");
+    assert_eq!(claimed.bytes(), 100);
+    drop(claimed);
     assert_eq!(queue.reserved_bytes(), 400);
-    check("claim_received");
+    check("claim_receipt_for_owner");
 
-    // release_heights: Reserved -> Released for height 3.
-    queue.release_reserved_heights([block::Height(3)]);
+    // release_reserved_heights_for_owner: Reserved -> Released for height 3.
+    queue.release_reserved_heights_for_owner(owner, [block::Height(3)]);
     assert_eq!(queue.reserved_bytes(), 300);
-    check("release_heights");
+    check("release_reserved_heights_for_owner");
 
-    // release_reserved_and_return_items: only the still-reserved height 4 releases.
-    let released = queue.release_reserved_and_return_items([block::Height(4)]);
-    assert_eq!(released, 100);
+    // Return: only the still-reserved height 4 releases.
+    let returned =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(4)]);
+    assert_eq!(returned.released_bytes, 100);
     assert_eq!(queue.reserved_bytes(), 200);
-    check("release_reserved_and_return_items");
+    check("release_reserved_and_return_items_detailed_for_owner");
 
     // advance_floor drops the committed `<= floor` prefix. Heights 1 and 2
     // (received) and 3 (released) contribute no reservation. Only heights 5 and 6
@@ -3403,8 +3410,8 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
         (1..=10).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
     );
     // Reserve a contiguous run so we can see the reservation accounting on GC.
-    let _ = queue.take_in_range(block::Height(1), block::Height(10), 10);
-    assert_eq!(queue.mark_reserved((1..=10).map(block::Height)), 1000);
+    queue.publish_fixture(1..=10);
+    assert_eq!(queue.reserved_bytes(), 1000);
 
     // advance_floor to 4: drops heights 1..=4 (still reserved -> released), keeps 5..=10.
     let before = queue.budget().reserved();
@@ -3432,20 +3439,13 @@ fn receipt_releases_wire_reservation_while_body_retained() {
     // Receipt ends the wire reservation: the estimate returns to the budget while
     // the caller still owns the body (the height stays claimed in `in_flight`).
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
     assert_eq!(queue.reserved_bytes(), 100);
 
-    assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        Some(100)
-    );
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
     assert_eq!(queue.reserved_bytes(), 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(
         queue.in_flight_contains(block::Height(1)),
         "the received height stays claimed; the body handoff owns it"
@@ -3457,20 +3457,14 @@ fn floor_watchdog_skips_received_heights() {
     // After receipt released the reservation, the watchdog must neither requeue
     // the height (the body handoff owns it) nor release a second time.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
 
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        Some(100)
-    );
+    assert_eq!(queue.budget().reserved(), 0);
 
-    assert_eq!(budget.reserved(), 0);
-
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    let outcome =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
     let watchdog_released = outcome.released_bytes;
 
     assert_eq!(
@@ -3485,7 +3479,7 @@ fn floor_watchdog_skips_received_heights() {
     assert_eq!(outcome.returned_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     let before = queue.budget().reserved();
     queue.advance_floor(block::Height(1));
     assert_eq!(queue.budget().reserved(), before);
@@ -3607,55 +3601,56 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
 #[test]
 fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
 
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
-
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    let outcome =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
 
     assert_eq!(outcome.returned_count, 1);
     assert_eq!(outcome.released_count, 0);
     assert_eq!(outcome.missing_count, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
-    let duplicate =
-        queue.release_reserved_and_return_items_detailed([block::Height(1), block::Height(2)]);
+    let duplicate = queue.release_reserved_and_return_items_detailed_for_owner(
+        owner,
+        [block::Height(1), block::Height(2)],
+    );
     assert_eq!(duplicate.already_pending_count, 1);
     assert_eq!(duplicate.missing_count, 1);
     assert_eq!(duplicate.min_height, Some(block::Height(1)));
     assert_eq!(duplicate.max_height, Some(block::Height(2)));
 
     assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
+        queue.receive_fixture(owner, block::Height(1)),
         None,
         "a late body cannot release a claim the watchdog already released"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
 fn claim_received_does_not_orphan_a_charge() {
-    // An unmatched queued body claims its height without a new reservation, but
-    // any stale request reservation it still owned is handed back exactly once.
+    // An unmatched body claims its height without a new reservation, but any stale
+    // request reservation it still owned is handed back exactly once.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
 
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let old_charge = queue
+        .claim_receipt_for_owner(owner, block::Height(1))
+        .expect("fixture funding matches the queue");
 
-    let old_charge = queue.claim_received(block::Height(1));
+    assert_eq!(old_charge.bytes(), 100);
+    drop(old_charge);
+    assert_eq!(queue.budget().reserved(), 0);
 
-    assert_eq!(old_charge, 100);
-    assert_eq!(budget.reserved(), 0);
+    queue.release_reserved_heights_for_owner(owner, [block::Height(1)]);
 
-    let released = queue.release_reserved_heights([block::Height(1)]);
-
-    assert_eq!(released, 0, "a received height owns no further charge");
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(
+        queue.budget().reserved(),
+        0,
+        "a received height owns no further charge"
+    );
 }
 
 #[test]
@@ -3667,22 +3662,13 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(taken.len(), 2);
-
-    assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
-        200
-    );
+    let owner = queue.publish_fixture(1..=2);
+    assert_eq!(queue.reserved_bytes(), 200);
 
     // Height 1 is received: its whole estimate returns to the budget.
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.budget().reserved(), 100);
 
     // Floor GC releases only the still-reserved (unreceived) height 2.
     let before = queue.budget().reserved();
@@ -3693,14 +3679,14 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
         released, 100,
         "WorkQueue releases only the still-reserved height; received bodies hold no charge"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
 fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
     // `stale_adjusted_disposition`, `finish_detached`) releases via
-    // `release_reserved_heights`. When a competing peer delivered a height late,
+    // `release_reserved_heights_for_owner`. When a competing peer delivered a height late,
     // its receipt ended that height's reservation in the shared queue; the owner
     // must release only the still-reserved estimates and leave the received body
     // to the winner (which releases the ended estimate after its forward) — never
@@ -3712,41 +3698,33 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let budget = queue.budget();
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(taken.len(), 2);
-
-    assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
-        200
-    );
+    let owner = queue.publish_fixture(1..=2);
+    assert_eq!(queue.reserved_bytes(), 200);
 
     // A competing peer's late body ends height 1's reservation; height 2 stays
     // reserved (never delivered). The winner releases the estimate after its
     // forward.
-    let estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("height 1 is reserved");
-    assert_eq!(estimate, 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.budget().reserved(), 100);
 
     // GC both heights: only the still-reserved height 2 releases. The received
     // height 1 is skipped (its reservation already ended) and stays in `in_flight`.
-    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
+    queue.release_reserved_heights_for_owner(owner, [block::Height(1), block::Height(2)]);
 
     assert_eq!(
-        released, 100,
-        "release_reserved_heights frees only the still-reserved estimate, exactly once"
+        queue.reserved_bytes(),
+        0,
+        "release_reserved_heights_for_owner frees only the still-reserved estimate, exactly once"
     );
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 
     // Floor GC clears the bookkeeping; nothing drifts.
     let before = queue.budget().reserved();
     queue.advance_floor(block::Height(2));
     assert_eq!(queue.budget().reserved(), before);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
@@ -3778,16 +3756,18 @@ fn work_queue_preserves_work_item_estimate_through_take_and_return() {
     // a height moves pending → in_flight → pending. Estimator overridden so the
     // clamp is wide enough to keep the hinted size.
     let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
-    let taken = queue.take_in_range(block::Height(10), block::Height(10), 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.estimated_bytes, 12_345);
-    assert_eq!(taken[0].1.hash, block::Hash([10; 32]));
+    let owner = queue.publish_fixture(10..=10);
+    let taken = queue
+        .item_for_height(block::Height(10))
+        .expect("the fixture keeps the height in flight");
+    assert_eq!(taken.estimated_bytes, 12_345);
+    assert_eq!(taken.hash, block::Hash([10; 32]));
 
-    queue.return_items([block::Height(10)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(10)]);
     let retaken = queue.take_in_range(block::Height(10), block::Height(10), 1);
     assert_eq!(
         retaken[0].1.estimated_bytes, 12_345,
-        "return_items must restore the stored WorkItem unchanged"
+        "a return must restore the stored WorkItem unchanged"
     );
 }
 
@@ -3829,9 +3809,9 @@ fn work_queue_height_is_in_exactly_one_set() {
     let h = block::Height(10);
 
     assert_eq!(in_one_set(h), 1, "pending only after extend");
-    queue.take_in_range(h, h, 1);
+    let owner = queue.publish_fixture(10..=10);
     assert_eq!(in_one_set(h), 1, "in_flight only after take");
-    queue.return_items([h]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [h]);
     assert_eq!(in_one_set(h), 1, "pending only after return");
     queue.take_in_range(h, h, 1);
     queue.advance_floor(h);
@@ -4706,7 +4686,7 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
 
 #[test]
 fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
-    use super::work_queue::DEFAULT_BS_SIZE_FLOOR_BYTES;
+    use super::work_queue::state::DEFAULT_BS_SIZE_FLOOR_BYTES;
 
     // Default estimator: Unknown -> worst case; tiny hints clamp up to the floor;
     // huge hints clamp down to MAX_BLOCK_BYTES; ordinary hints pass through.
@@ -4908,7 +4888,7 @@ struct TestSequencer {
 
 struct TestSubmission {
     intent: SubmitItem,
-    block: zakura_node_services::block_memory::BlockHandle,
+    block: BlockHandle,
 }
 
 impl std::ops::Deref for TestSubmission {
@@ -4925,20 +4905,21 @@ impl std::ops::Deref for TestSequencer {
     }
 }
 
-impl std::ops::DerefMut for TestSequencer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.policy
-    }
-}
-
 impl TestSequencer {
     fn settle_payloads(&mut self) {
-        self.payloads.apply(&mut self.policy);
+        self.payloads.apply(self.policy.take_payload_changes());
         assert_eq!(
             self.payloads.retained_ids().collect::<BTreeSet<_>>(),
             self.policy.retained_ids().collect::<BTreeSet<_>>(),
             "runtime payloads match every retained policy identity",
         );
+    }
+
+    /// Run one policy mutation, then apply its payload changes and check the inventory.
+    fn settled<T>(&mut self, mutate: impl FnOnce(&mut Sequencer) -> T) -> T {
+        let result = mutate(&mut self.policy);
+        self.settle_payloads();
+        result
     }
 
     fn with_decoded_window_cap(mut self, height: block::Height, bytes: u64) -> Self {
@@ -4994,84 +4975,23 @@ impl TestSequencer {
 
     fn prepare_submit(&mut self, height: block::Height) -> Option<TestSubmission> {
         self.settle_payloads();
-        let prepared = self
+        let facts = self.policy.submission_body(height)?;
+        let materialized = self
             .payloads
-            .prepare(
-                &mut self.policy,
-                height,
-                &ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .unwrap(),
+            .materialize(
+                facts.id,
+                &test_decoded_pool(),
+                admission::submission_decode_admission(self.policy.verified_tip(), height),
             )
-            .unwrap()?;
+            .unwrap();
+        let intent = self
+            .policy
+            .prepare_submit(height, facts.id, materialized.decoded_bytes)?;
         self.settle_payloads();
         Some(TestSubmission {
-            intent: prepared.intent,
-            block: prepared.block,
+            intent,
+            block: materialized.block,
         })
-    }
-
-    fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
-        let result = self.policy.drain_ready_into_applying();
-        self.settle_payloads();
-        result
-    }
-
-    fn unsubmit(&mut self, height: block::Height, token: BlockApplyToken) {
-        self.policy.unsubmit(height, token);
-        self.settle_payloads();
-    }
-
-    fn remove_applying(
-        &mut self,
-        height: block::Height,
-    ) -> Option<super::sequencer::ApplyingBlock> {
-        let result = self.policy.remove_applying(height);
-        self.settle_payloads();
-        result
-    }
-
-    fn advance_verified_tip(
-        &mut self,
-        height: block::Height,
-        release: bool,
-    ) -> super::sequencer::AdvanceOutcome {
-        let result = self.policy.advance_verified_tip(height, release);
-        self.settle_payloads();
-        result
-    }
-
-    fn reset_to(&mut self, height: block::Height, keep: bool) -> u64 {
-        let result = self.policy.reset_to(height, keep);
-        self.settle_payloads();
-        result
-    }
-
-    fn release_applying_blocks_from(&mut self, height: block::Height) -> u64 {
-        let result = self.policy.release_applying_blocks_from(height);
-        self.settle_payloads();
-        result
-    }
-
-    fn release_applied_through(&mut self, height: block::Height) -> u64 {
-        let result = self.policy.release_applied_through(height);
-        self.settle_payloads();
-        result
-    }
-
-    fn finish_attached_submission(
-        &mut self,
-        owner: zakura_header_chain::BodyWorkOwner,
-        source: zakura_header_chain::SourceId,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-    ) -> bool {
-        let result = self
-            .policy
-            .finish_attached_submission(owner, source, token, height, hash);
-        self.settle_payloads();
-        result
     }
 }
 
@@ -5152,7 +5072,9 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
             covered: block::Height(2)
         }
     );
-    assert!(seq.drain_ready_into_applying().is_empty());
+    assert!(seq
+        .settled(|policy| policy.drain_ready_into_applying())
+        .is_empty());
     assert!(seq.reorder_contains(block::Height(2)));
     assert_eq!(seq.reorder_decoded_attributed_memory_bytes(), 0);
     assert_eq!(
@@ -5173,7 +5095,7 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         }
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2)]
     );
     assert_eq!(seq.applying_hash(block::Height(2)), Some(block2.hash()));
@@ -5229,7 +5151,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     }
 
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_len(), 3);
@@ -5247,7 +5169,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     assert_eq!(seq.decoded_applying_count(), limit);
 
     // Rolling a submission back also rolls its body out of the decode window.
-    seq.unsubmit(block::Height(1), 1);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), 1));
     assert_eq!(seq.decoded_applying_count(), limit - 1);
 }
 
@@ -5277,7 +5199,7 @@ fn capped_sequencer_with_blocks_1_to_3(
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     (seq, blocks)
 }
 
@@ -5297,8 +5219,14 @@ fn submit_all(seq: &mut TestSequencer) -> Vec<TestSubmission> {
 
 /// Retire a submission the way a committed apply completion does.
 fn finish_committed(seq: &mut TestSequencer, item: &TestSubmission) {
-    seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    seq.settled(|policy| policy.remove_applying(item.height));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
 }
 
 #[test]
@@ -5433,7 +5361,7 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
         );
     }
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_buffered_bytes(), 600);
@@ -5453,36 +5381,36 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     check(&seq, "submit 1,2");
 
     // Roll back the submit for height 1.
-    seq.unsubmit(block::Height(1), item1.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item1.token));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     check(&seq, "unsubmit 1");
 
     // Detaching the still-submitted height 2 does not release the driver-owned
     // decoded body or its submission-window charge.
-    seq.remove_applying(block::Height(2));
+    seq.settled(|policy| policy.remove_applying(block::Height(2)));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     assert_eq!(seq.applying_buffered_bytes(), 400);
     check(&seq, "detach submitted 2");
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item2.owner,
         item2.source,
         item2.token,
         item2.height,
         item2.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "finish detached 2");
 
     // Commit through height 1: releases the applied body (height 1) from `applying`.
-    seq.advance_verified_tip(block::Height(1), true);
+    seq.settled(|policy| policy.advance_verified_tip(block::Height(1), true));
     assert_eq!(seq.applying_buffered_bytes(), 300);
     check(&seq, "advance_verified_tip");
 
     // Reset drops all applying state; there are no in-flight submissions left.
-    seq.reset_to(block::Height(0), false);
+    seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(seq.applying_buffered_bytes(), 0);
     assert_eq!(seq.applying_decoded_attributed_memory_bytes(), 0);
     assert_eq!(seq.in_flight_submission_count(), 0);
@@ -5599,7 +5527,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     }
     assert_eq!(
         pool.reserved_blocks(),
-        Some(BACKEND_BLOCKS + submission_limit_u64),
+        BACKEND_BLOCKS + submission_limit_u64,
         "backend retention must leave room for the complete checkpoint range"
     );
     for (index, (_, block)) in initial_submissions.iter().enumerate() {
@@ -5709,7 +5637,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(
         pool.reserved_blocks(),
-        Some(BACKEND_BLOCKS + submission_limit_u64 + 1),
+        BACKEND_BLOCKS + submission_limit_u64 + 1,
         "completed submissions stay charged while driver and backend handles remain"
     );
     let held_bytes: u64 = backend
@@ -5721,9 +5649,9 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     assert_eq!(pool.reserved_bytes(), held_bytes);
     drop(initial_submissions);
     drop(block_402);
-    assert_eq!(pool.reserved_blocks(), Some(BACKEND_BLOCKS));
+    assert_eq!(pool.reserved_blocks(), BACKEND_BLOCKS);
     drop(backend);
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
@@ -5731,10 +5659,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
 async fn next_submission(
     actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
     timeout: Duration,
-) -> Option<(
-    BlockApplyToken,
-    zakura_node_services::block_memory::BlockHandle,
-)> {
+) -> Option<(BlockApplyToken, BlockHandle)> {
     time::timeout(timeout, async {
         loop {
             let action = actions_rx
@@ -5794,9 +5719,7 @@ impl CappedSequencerTask {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            test_decoded_pool(),
         );
         Self {
             body_tx,
@@ -6258,9 +6181,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
     );
     let task = tokio::spawn(task.run());
 
@@ -6444,7 +6365,7 @@ struct DetachedWindow {
         zakura_header_chain::BodyWorkOwner,
         zakura_header_chain::SourceId,
         BlockApplyToken,
-        zakura_node_services::block_memory::BlockHandle,
+        BlockHandle,
     )>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -6484,9 +6405,7 @@ impl DetachedWindow {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            test_decoded_pool(),
         );
         let mut window = Self {
             blocks: fake_sequential_blocks(block_count),
@@ -6718,7 +6637,7 @@ fn a_raw_body_reports_its_decode_estimate_until_submitted() {
         None,
         peer(0),
     );
-    let _ = sequencer.drain_ready_into_applying();
+    let _ = sequencer.settled(|policy| policy.drain_ready_into_applying());
 
     assert_eq!(
         sequencer.submission_decode_charge_at(block::Height(1)),
@@ -6761,7 +6680,10 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     // Only the contiguous prefix above the floor (height 1) drains.
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying()),
+        vec![block::Height(1)]
+    );
     assert_eq!(seq.floor(), block::Height(1));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.applying_len(), 1);
@@ -6774,7 +6696,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.floor(), block::Height(3));
@@ -6789,7 +6711,11 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying())
+            .len(),
+        3
+    );
     // The submission window of 2 caps the eligible heights.
     assert_eq!(
         seq.submittable_heights(),
@@ -6802,7 +6728,7 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     // The window is now full, so nothing else is submittable.
     assert!(seq.submittable_heights().is_empty());
     // Rolling back a failed dispatch frees the slot and re-offers the height.
-    seq.unsubmit(block::Height(2), item2.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(2), item2.token));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
@@ -6827,25 +6753,25 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert!(seq.submittable_heights().is_empty());
 
     // A duplicate completion can arrive before the frontier proving that block
     // advances. Keep its applying entry attached, but drop the decoded copy and
     // free the global submission slot because the driver released its Arc.
-    assert!(seq.finish_attached_submission(
+    assert!(seq.settled(|policy| policy.finish_attached_submission(
         item.owner,
         item.source,
         item.token,
         item.height,
         item.hash
-    ));
+    )));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.decoded_applying_count(), 0);
@@ -6859,15 +6785,21 @@ fn sequencer_records_and_decrements_submitted_applies() {
     let hash = block.hash();
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     seq.accept_body(block::Height(1), hash, block, 100, peer(0));
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
-    seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    seq.settled(|policy| policy.remove_applying(item.height));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
 }
@@ -6889,12 +6821,12 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert!(seq.submitted_contains(block::Height(1)));
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6905,7 +6837,10 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "submitted-apply window is full"
     );
 
-    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert_eq!(
+        seq.settled(|policy| policy.release_applied_through(block::Height(1))),
+        100
+    );
     assert!(!seq.submitted_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
@@ -6918,13 +6853,13 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "detached driver submission still occupies the decode window"
     );
 
-    assert!(!seq.finish_submission(
+    assert!(!seq.settled(|policy| policy.finish_submission(
         item.owner,
         item.source,
         item.token,
         item.height,
         block::Hash([99; 32])
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6935,16 +6870,28 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
             .expect("incremented test request ID is nonzero"),
         ..item.owner
     };
-    assert!(!seq.finish_submission(wrong_owner, item.source, item.token, item.height, item.hash));
-    assert!(!seq.finish_submission(
+    assert!(!seq.settled(|policy| policy.finish_submission(
+        wrong_owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
+    assert!(!seq.settled(|policy| policy.finish_submission(
         item.owner,
         zakura_header_chain::SourceId::from_digest([99; 32]),
         item.token,
         item.height,
         item.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6973,13 +6920,13 @@ fn sequencer_advance_verified_tip_releases_bytes_and_reports_change() {
     );
     // Advancing the verified tip drops buffered bodies at or below it and reports
     // their bytes for the reactor to release.
-    let advance = seq.advance_verified_tip(block::Height(2), false);
+    let advance = seq.settled(|policy| policy.advance_verified_tip(block::Height(2), false));
     assert!(advance.changed);
     assert_eq!(advance.release_bytes, 300);
     assert_eq!(seq.verified_tip(), block::Height(2));
     assert!(seq.floor() >= block::Height(2));
     // A no-op advance to the same tip frees nothing and reports unchanged.
-    let advance = seq.advance_verified_tip(block::Height(2), false);
+    let advance = seq.settled(|policy| policy.advance_verified_tip(block::Height(2), false));
     assert!(!advance.changed);
     assert_eq!(advance.release_bytes, 0);
 }
@@ -6995,7 +6942,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
         100,
         peer(0),
     );
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     seq.accept_body(
         block::Height(2),
         blocks[1].hash(),
@@ -7005,7 +6952,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
     );
     // Reset drops everything (one applying@100 + one reorder@200) and pins the
     // floor/tip to the reset target.
-    let released = seq.reset_to(block::Height(0), false);
+    let released = seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(released, 300);
     assert_eq!(seq.floor(), block::Height(0));
     assert_eq!(seq.verified_tip(), block::Height(0));
@@ -7026,14 +6973,16 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let old_items: Vec<_> = seq
         .submittable_heights()
         .into_iter()
         .map(|height| {
             let item = seq.prepare_submit(height).expect("height is applying");
-            seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+            seq.settled(|policy| {
+                policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes)
+            });
             item
         })
         .collect();
@@ -7041,7 +6990,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.in_flight_submission_count(), 2);
 
     // Keep `old_items` alive to model the driver's pending/in-flight Arc<Block>s.
-    seq.reset_to(block::Height(0), false);
+    seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(seq.applying_len(), 0);
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
@@ -7056,7 +7005,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, replacement.hash(), replacement, 100, peer(1));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     assert!(
         seq.submittable_heights().is_empty(),
         "replacement bodies must not exceed the live decode window"
@@ -7066,13 +7015,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
 
     let first = &old_items[0];
     assert!(
-        !seq.finish_submission(
+        !seq.settled(|policy| policy.finish_submission(
             first.owner,
             first.source,
             first.token,
             first.height,
             block::Hash([99; 32])
-        ),
+        )),
         "a mismatched completion must not release a detached charge"
     );
     assert_eq!(seq.in_flight_submission_count(), 2);
@@ -7080,13 +7029,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         seq.applying_decoded_attributed_memory_bytes(),
         decoded_attributed_memory_bytes_before_completion
     );
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         first.owner,
         first.source,
         first.token,
         first.height,
         first.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -7096,13 +7045,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.submittable_heights().len(), 1);
 
     let second = &old_items[1];
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         second.owner,
         second.source,
         second.token,
         second.height,
         second.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -7120,18 +7069,21 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     assert_eq!(seq.floor(), block::Height(3));
     // A reject at height 2 drops applying >= 2 (200 bytes) and rolls the floor
     // back below 2, never below the verified tip.
-    let released = seq.release_applying_blocks_from(block::Height(2));
+    let released = seq.settled(|policy| policy.release_applying_blocks_from(block::Height(2)));
     assert_eq!(released, 200);
     assert!(seq.applying_contains(block::Height(1)));
     assert!(!seq.applying_contains(block::Height(2)));
-    seq.reset_floor_below(block::Height(2));
+    seq.settled(|policy| policy.reset_floor_below(block::Height(2)));
     assert_eq!(seq.floor(), block::Height(1));
     // The committed prefix at or below height 1 is releasable.
-    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert_eq!(
+        seq.settled(|policy| policy.release_applied_through(block::Height(1))),
+        100
+    );
     assert_eq!(seq.applying_len(), 0);
 }
 
@@ -7149,7 +7101,7 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     // Submit heights 2 and 3 so the released prefix (>= 2) is all submitted work.
     let item2 = seq
         .prepare_submit(block::Height(2))
@@ -7160,7 +7112,7 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200 + 300);
 
-    let released = seq.release_applying_blocks_from(block::Height(2));
+    let released = seq.settled(|policy| policy.release_applying_blocks_from(block::Height(2)));
     assert_eq!(released, 500);
     assert_eq!(seq.applying_len(), 1);
     // Only unsubmitted height 1 survives in `applying`, but both decoded
@@ -7182,21 +7134,21 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
         seq.in_flight_submission_bytes_scanned()
     );
 
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item2.owner,
         item2.source,
         item2.token,
         item2.height,
         item2.hash
-    ));
+    )));
     assert_eq!(seq.submittable_heights(), vec![block::Height(1)]);
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item3.owner,
         item3.source,
         item3.token,
         item3.height,
         item3.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
 }
 
@@ -7208,7 +7160,7 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     seq.accept_body(block::Height(1), block.hash(), block.clone(), 100, peer(0));
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
@@ -7217,7 +7169,7 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
 
     // A rollback carrying a non-matching token is ignored: the submission and the
     // counters are untouched.
-    seq.unsubmit(block::Height(1), item.token + 1);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token + 1));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 100);
     assert_eq!(
@@ -7230,12 +7182,12 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     );
 
     // The matching rollback frees the slot exactly once.
-    seq.unsubmit(block::Height(1), item.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
 
     // Replaying the now-stale token must not decrement a second time.
-    seq.unsubmit(block::Height(1), item.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     assert_eq!(
@@ -7282,7 +7234,10 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
             covered: block::Height(1)
         }
     );
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying()),
+        vec![block::Height(1)]
+    );
     // The drained body is inside the submission window, so the kept decoded
     // block is submitted directly, not a re-decode of the raw payload.
     let submitted = seq
@@ -7908,12 +7863,9 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 /// reactor, where its sender would hold the session's reservation.
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(BlockSyncStartup::inert(
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        ZakuraBlockSyncConfig::default(),
-    ))
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(
+        BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
+    )
     .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
     let cancel = CancellationToken::new();
@@ -8344,7 +8296,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
-        accounting: ByteBudget::new(config.max_inflight_block_bytes).closure_reader(),
+        accounting: ByteBudget::new(config.max_inflight_block_bytes).reader(),
         events,
         lifecycle,
         needed_query_failures,
@@ -15342,21 +15294,8 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
             needed(3, BlockSizeEstimate::Advertised(1_024)),
         ],
     );
-    let owner = queue.take_for_request(
-        block::Height(2),
-        block::Height(2),
-        1,
-        2_000_000,
-        1,
-        std::num::NonZeroU64::new(1).unwrap(),
-    )[0]
-    .1
-    .owner
-    .unwrap();
-    assert_eq!(
-        queue.mark_reserved_for_owner(owner, [block::Height(2)]),
-        2_000_000
-    );
+    let owner = queue.publish_fixture(2..=2);
+    assert_eq!(queue.reserved_bytes(), 2_000_000);
     queue.refresh_size_estimates(
         test_work_scope(),
         [
@@ -15380,21 +15319,9 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
         [3_146, 3_146]
     );
 
-    let owner = queue.take_for_request(
-        block::Height(3),
-        block::Height(3),
-        1,
-        1_024,
-        2,
-        std::num::NonZeroU64::new(1).unwrap(),
-    )[0]
-    .1
-    .owner
-    .unwrap();
-    queue.mark_reserved_for_owner(owner, [block::Height(3)]);
-    let receipt_budget = queue.budget();
+    let owner = queue.publish_fixture(3..=3);
     drop(queue.begin_receipt_for_owner(owner, block::Height(3)));
-    assert_eq!(receipt_budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     queue.refresh_size_estimates(
         test_work_scope(),
         [needed(3, BlockSizeEstimate::Advertised(7_000))],
@@ -15412,13 +15339,15 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
     );
     queue.refresh_size_estimates(test_work_scope(), [needed(3, BlockSizeEstimate::Unknown)]);
     queue.advance_floor(block::Height(1));
+    let retry = queue.publish_fixture(3..=3);
     assert_eq!(
-        queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
-            .1
+        queue
+            .item_for_height(block::Height(3))
+            .expect("the fixture keeps the height in flight")
             .estimated_bytes,
         5_000
     );
-    queue.return_items([block::Height(3)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(retry, [block::Height(3)]);
     assert_eq!(
         queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
             .1
@@ -15558,11 +15487,7 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         ],
     );
     // A missed correction must also reach the next retry of an issued body.
-    assert_eq!(
-        work.take_in_range(block::Height(2), block::Height(2), 1)
-            .len(),
-        1
-    );
+    let owner = work.publish_fixture(2..=2);
     changed_view.snapshot.state_version = zakura_header_chain::StateVersion::new(21);
     changed_view.body_size_hint_revision = 20;
     changed_view.body_size_hint_batches = Some(
@@ -15607,7 +15532,7 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
     tokio::time::timeout(Duration::from_secs(1), changed)
         .await
         .unwrap();
-    work.return_items([block::Height(2)]);
+    work.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(2)]);
     assert!(work
         .take_in_range(block::Height(2), block::Height(3), 2)
         .iter()

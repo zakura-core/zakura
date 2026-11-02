@@ -130,9 +130,8 @@ impl std::error::Error for RecordError {}
 /// meta names them.
 ///
 /// For a full input, the first [`HarnessEntry::scenario_bytes`] bytes
-/// decode the scenario. Fixed-prefix harnesses pad missing bytes with 0.
-/// Machine harnesses can preserve short inputs. `input.bin` is written before `trace.jsonl`, so a
-/// trace that names it never lacks it.
+/// decode the scenario ([`HarnessEntry::scenario`]). `input.bin` is written
+/// before `trace.jsonl`, so a trace that names it never lacks it.
 ///
 /// A run that ends in a harness failure still writes a complete trace, whose
 /// `end` record says so.

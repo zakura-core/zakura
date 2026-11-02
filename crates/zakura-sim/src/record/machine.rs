@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::observe::{WorkOwner, WorkScope};
 
+/// A machine harness's scenario.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineScenario {
+    /// Complete causal machine input, independent of scheduling choices.
+    pub input: Vec<u8>,
+}
+
 /// Typed semantic evidence from one transport-free machine operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -13,6 +21,10 @@ use crate::observe::{WorkOwner, WorkScope};
     deny_unknown_fields
 )]
 pub enum MachineStep {
+    /// A fixture machine's operation. It tests machine-trace support itself, as
+    /// [`crate::harness::fixtures`] tests the simulator. No production machine
+    /// records it.
+    Fixture(FixtureStep),
     /// Logical block-work ownership and its independent model.
     Work(WorkStep),
     /// Runtime block-work funding and retained request/receipt owners.
@@ -33,24 +45,84 @@ pub struct DecodedRetentionStep {
     pub actual: Option<zakura_node_services::block_memory::model::RetentionView>,
     /// The independent model's retained handle graph and expected pool charges.
     pub expected: zakura_node_services::block_memory::model::RetentionView,
-    /// Unavailable capture or a driver panic, never a property detection.
+    /// The model's disagreement. An unavailable capture or a driver panic is
+    /// marked as no property detection.
     pub failure: Option<MachineFailure>,
 }
 
 impl From<zakura_node_services::block_memory::model::RetentionStep> for DecodedRetentionStep {
+    /// A capture error is driver evidence. A captured view that differs from the
+    /// model is the property's failure.
     fn from(value: zakura_node_services::block_memory::model::RetentionStep) -> Self {
+        let failure = match (&value.capture_error, &value.actual) {
+            (Some(message), _) => Some(MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message: message.clone(),
+            }),
+            (None, None) => Some(MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message: "decoded owner allocation capture is missing".into(),
+            }),
+            (None, Some(actual)) => (actual != &value.expected).then(|| MachineFailure {
+                property_failure: true,
+                phase: FailurePhase::Invariant,
+                message: format!("expected {:?}, actual {actual:?}", value.expected),
+            }),
+        };
         Self {
             input: value.input,
             drain: value.drain,
             actual: value.actual,
             expected: value.expected,
-            failure: value.capture_error.map(|message| MachineFailure {
-                property_failure: false,
-                phase: FailurePhase::Invariant,
-                message,
-            }),
+            failure,
         }
     }
+}
+
+impl MachineStep {
+    /// The failure that stopped the run at this operation, if any.
+    pub fn failure(&self) -> Option<MachineFailure> {
+        match self {
+            Self::Fixture(step) => step.failure.clone(),
+            Self::Work(step) => step.failure.clone(),
+            Self::WorkFunding(step) => step.failure.clone(),
+            Self::DecodedRetention(step) => step.failure.clone(),
+        }
+    }
+}
+
+/// The phase that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailurePhase {
+    /// Applying the input and checking its immediate outcome.
+    Transition,
+    /// Comparing the resulting owner with the independent model.
+    Invariant,
+}
+
+/// Exact failure evidence. Driver panics cannot become property detections.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineFailure {
+    /// Whether the independent checker named its property.
+    pub property_failure: bool,
+    /// Where execution stopped.
+    pub phase: FailurePhase,
+    /// Panic payload without the panic hook's source location.
+    pub message: String,
+}
+
+/// One operation of a fixture machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureStep {
+    /// Original causal bytes.
+    pub input: Vec<u8>,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
 }
 
 /// Body-work authority, including every generation that controls eligibility.
@@ -101,28 +173,6 @@ pub struct WorkView {
     pub scanned: u64,
     /// Charged bytes and item count above the floor.
     pub above_floor: (u64, u64),
-}
-
-/// The phase that failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FailurePhase {
-    /// Applying the input and checking its immediate outcome.
-    Transition,
-    /// Comparing the resulting owner with the independent model.
-    Invariant,
-}
-
-/// Exact failure evidence. Driver panics cannot become property detections.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MachineFailure {
-    /// Whether the independent checker named its property.
-    pub property_failure: bool,
-    /// Where execution stopped.
-    pub phase: FailurePhase,
-    /// Panic payload without the panic hook's source location.
-    pub message: String,
 }
 
 /// One decoder-v1 block ownership operation.
@@ -336,5 +386,44 @@ impl From<zakura_network::zakura::WorkOwnershipFailure> for MachineFailure {
             },
             message: value.message,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_node_services::block_memory::model::{trace_retention_bytes, RetentionStep};
+
+    use super::*;
+
+    fn retention_step() -> RetentionStep {
+        trace_retention_bytes(&[0, 0, 0, 0]).remove(0)
+    }
+
+    #[test]
+    fn missing_allocation_capture_is_not_a_resource_violation() {
+        let mut step = retention_step();
+        step.actual = None;
+        let failure = MachineStep::DecodedRetention(step.into())
+            .failure()
+            .unwrap();
+        assert!(!failure.property_failure);
+        assert_eq!(
+            failure.message,
+            "decoded owner allocation capture is missing"
+        );
+    }
+
+    #[test]
+    fn a_retention_view_mismatch_is_the_property_failure() {
+        let mut step = retention_step();
+        assert_eq!(
+            MachineStep::DecodedRetention(step.clone().into()).failure(),
+            None
+        );
+        step.actual.as_mut().unwrap().pools[0].bytes += 1;
+        let failure = MachineStep::DecodedRetention(step.into())
+            .failure()
+            .unwrap();
+        assert!(failure.property_failure);
     }
 }

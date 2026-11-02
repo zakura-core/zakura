@@ -12,8 +12,7 @@
 //! The per-peer task runs the throughput-critical matched-body
 //! `sequencer_input.send(..).await`. Sequencer backpressure therefore stalls only
 //! one routine. The download decision uses the byte budget and per-peer slots.
-//! `take_in_range(servable_low, servable_high, n)` uses `servable_high` as its
-//! upper bound.
+//! [`WorkQueue::take_request`] uses `servable_high` as its upper bound.
 //!
 //! The routine or shared [`PeerRegistry`] owns all per-peer download state. The
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
@@ -46,7 +45,7 @@ use super::{
     regulated::{wire::Outcome, CompletedRange},
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
-    sequencer_task::{charge_decoded_handoff, SequencedBody, SequencerView},
+    sequencer_task::{charge_decoded_handoff, DecodedHandoffCharge, SequencedBody, SequencerView},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker, RequestKey,
         ThroughputMeter,
@@ -337,52 +336,59 @@ enum Disposition {
     RetryMissing,
 }
 
+/// A body the decoded pool admitted, with its input-queue charge.
+struct AdmittedBody {
+    block: OwnedBlock,
+    charge: DecodedHandoffCharge,
+}
+
 /// Keeps a receipt charge live until the synchronous send finishes or unwinds.
-/// Other peers can serve the floor while this peer transfers and settles its body.
-struct ReceiptSettlement<'a> {
-    _blocked: HandoffBlocked<'a>,
+struct ReceiptSettlement {
     funding: Option<crate::zakura::transport::ByteReservation>,
+    /// The routine's flag for [`PeerRegistry::floor_has_preferred_unsaturated_server`].
+    /// A routine stalled anywhere in its handoff isn't a floor carrier, so
+    /// the flag stays set from this settlement's creation through the release.
+    handoff_blocked: Arc<AtomicBool>,
     #[cfg(any(test, zakura_sim))]
+    handoff: HandoffReport,
+}
+
+/// What a [`ReceiptSettlement`] reports when its handoff ends.
+#[cfg(any(test, zakura_sim))]
+struct HandoffReport {
     observer: super::block_sync_observe::ObserverSlot,
-    #[cfg(any(test, zakura_sim))]
     peer: ZakuraPeerId,
-    #[cfg(any(test, zakura_sim))]
     owner: zakura_header_chain::BodyWorkOwner,
-    #[cfg(any(test, zakura_sim))]
     height: block::Height,
 }
 
-impl<'a> ReceiptSettlement<'a> {
+impl ReceiptSettlement {
     fn new(
-        routine: &'a PeerRoutine,
+        routine: &PeerRoutine,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
         funding: crate::zakura::transport::ByteReservation,
     ) -> Self {
-        // A concurrent ranker must skip this peer if the transfer is preempted.
-        // The synchronous transfer does not need to wake parked rankers.
         routine.handoff_blocked.store(true, Ordering::Relaxed);
-        let blocked = HandoffBlocked(&routine.handoff_blocked);
         #[cfg(any(test, zakura_sim))]
         routine.observe_handoff_started(owner, height, funding.bytes());
         #[cfg(not(any(test, zakura_sim)))]
-        let _ = (routine, owner, height);
+        let _ = (owner, height);
         Self {
-            _blocked: blocked,
             funding: Some(funding),
+            handoff_blocked: Arc::clone(&routine.handoff_blocked),
             #[cfg(any(test, zakura_sim))]
-            observer: routine.observer.clone(),
-            #[cfg(any(test, zakura_sim))]
-            peer: routine.peer.clone(),
-            #[cfg(any(test, zakura_sim))]
-            owner,
-            #[cfg(any(test, zakura_sim))]
-            height,
+            handoff: HandoffReport {
+                observer: routine.observer.clone(),
+                peer: routine.peer.clone(),
+                owner,
+                height,
+            },
         }
     }
 }
 
-impl Drop for ReceiptSettlement<'_> {
+impl Drop for ReceiptSettlement {
     fn drop(&mut self) {
         let funding = self
             .funding
@@ -393,18 +399,20 @@ impl Drop for ReceiptSettlement<'_> {
         #[cfg(any(test, zakura_sim))]
         {
             let charge = funding.bytes();
+            let handoff = &self.handoff;
             funding.release_then(|| {
                 observe!(
-                    self.observer,
+                    handoff.observer,
                     super::block_sync_observe::BlockEvent::HandoffEnded {
-                        peer: self.peer.clone(),
-                        owner: self.owner,
-                        height: self.height,
+                        peer: handoff.peer.clone(),
+                        owner: handoff.owner,
+                        height: handoff.height,
                         charge,
                     }
                 );
             });
         }
+        self.handoff_blocked.store(false, Ordering::Relaxed);
     }
 }
 
@@ -517,7 +525,7 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
-    budget: super::work_queue::BudgetReader,
+    budget: crate::zakura::transport::BudgetReader,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     received_throughput: Arc<Mutex<ThroughputMeter>>,
@@ -2341,10 +2349,13 @@ impl PeerRoutine {
 
     /// Adopt the parser's exclusive payloads before retaining a decoded body.
     /// Refusal keeps only the raw frame for a later admission attempt.
+    ///
+    /// The input-queue room check comes first. A pool admission that the check
+    /// then refused would release its charge at once and wake every capacity waiter.
     fn admit_decoded_body(
         &self,
         block: Arc<block::Block>,
-    ) -> Result<(Option<OwnedBlock>, u64), AdmissionFailure> {
+    ) -> Result<(Option<AdmittedBody>, u64), AdmissionFailure> {
         if self.decoded_pool.is_closed() {
             self.cancel.cancel();
             return Err(AdmissionFailure::Closed);
@@ -2353,11 +2364,16 @@ impl PeerRoutine {
             Ok(block) => block,
             Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
         };
+        let bytes = block.attributed_memory_size_bytes();
+        let Some(charge) = charge_decoded_handoff(
+            &self.sequencer_input_decoded_attributed_memory_bytes,
+            &self.sequencer_view,
+            bytes,
+        ) else {
+            return Ok((None, bytes));
+        };
         match self.decoded_pool.try_admit(block, Admission::WithinLimit) {
-            Ok(block) => {
-                let bytes = block.decoded_bytes();
-                Ok((Some(block), bytes))
-            }
+            Ok(block) => Ok((Some(AdmittedBody { block, charge }), bytes)),
             Err(rejected) => {
                 if !matches!(
                     rejected.reason,
@@ -2379,7 +2395,7 @@ impl PeerRoutine {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        block: Option<OwnedBlock>,
+        admitted: Option<AdmittedBody>,
         raw_block_payload: Arc<[u8]>,
         serialized_bytes: u64,
         admitted_estimate_bytes: Option<u64>,
@@ -2388,15 +2404,11 @@ impl PeerRoutine {
         let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
         // The body owns the decoded charge from here, with no await between.
-        let charged = block.as_ref().is_some_and(|block| {
-            charge_decoded_handoff(
-                &self.sequencer_input_decoded_attributed_memory_bytes,
-                &self.sequencer_view,
-                block.decoded_bytes(),
-            )
-        });
-        let body = match block {
-            Some(block) => BufferedBlockBody::for_handoff(block, raw_block_payload, charged),
+        let body = match admitted {
+            Some(AdmittedBody { block, charge }) => {
+                charge.hand_over();
+                BufferedBlockBody::for_handoff(block, raw_block_payload)
+            }
             None => BufferedBlockBody::RawFramePayload(raw_block_payload),
         };
         let body = SequencedBody::new_handed_off(
@@ -2744,7 +2756,7 @@ impl PeerRoutine {
             }
             // With fanout = 1 a received height is already buffered and must never
             // be re-fetched, so both retry dispositions return only the still-reserved
-            // unreceived heights to `pending`. `return_items` is idempotent.
+            // unreceived heights to `pending`. Returning is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
                 let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
                 let outcome = self
@@ -2763,7 +2775,7 @@ impl PeerRoutine {
                 // This peer just failed these heights (RangeUnavailable / short
                 // BlocksDone): bias away from re-grabbing them so another peer
                 // contests the range first (and so the routine cannot self-wake
-                // into a re-take spin off its own `return_items`).
+                // into a re-take spin off its own return).
                 self.note_retry_avoid(unreceived);
             }
         }
@@ -2775,7 +2787,7 @@ impl PeerRoutine {
 
     /// A body arrived for a request this peer owns, but its per-height ledger was
     /// already `Released` by a competing receipt, watchdog, or floor GC, so
-    /// `release_active_reserved_height` returned `None`. Record the height as
+    /// `begin_receipt_for_owner` returned `None`. Record the height as
     /// received so the request can complete without re-queueing it or touching
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
@@ -2999,6 +3011,8 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use zakura_node_services::block_memory::BlockHandle;
+    use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
@@ -3127,9 +3141,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         (routine, out_recv, routine_to_reactor_rx)
     }
@@ -3693,9 +3705,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -3802,9 +3812,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         // The routine learns these from a `Status` frame in production; set them directly
         // so a single `try_fill` pass exercises the floor arm.
@@ -3917,9 +3925,7 @@ mod tests {
             view,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -4150,9 +4156,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
@@ -4415,9 +4419,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
@@ -4605,9 +4607,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -4931,9 +4931,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         if unanswered {
             routine.handle_status(super::BlockSyncStatus {
@@ -5201,9 +5199,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),
@@ -5273,9 +5269,7 @@ mod tests {
         hand_off_mainnet_block_1_with_pool(
             applying_decoded_bytes,
             queued_decoded_bytes,
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .unwrap(),
+            super::super::test_decoded_pool(),
             false,
             false,
         )
@@ -5286,7 +5280,7 @@ mod tests {
     async fn hand_off_mainnet_block_1_with_pool(
         applying_decoded_bytes: u64,
         queued_decoded_bytes: u64,
-        pool: zakura_node_services::block_memory::DecodedBlockPool,
+        pool: DecodedBlockPool,
         late: bool,
         close_decoded_pool: bool,
     ) -> Option<(u64, SequencedBody, u64)> {
@@ -5545,14 +5539,11 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(queued, bytes);
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             assert_eq!(pool.reserved_bytes(), bytes);
             let block = sequenced
                 .body
-                .decoded_block(
-                    &pool,
-                    zakura_node_services::block_memory::Admission::WithinLimit,
-                )
+                .decoded_block(&pool, Admission::WithinLimit)
                 .unwrap();
             assert!(
                 matches!(block, BlockHandle::Owned(_)),
@@ -5581,10 +5572,10 @@ mod tests {
                 "a full pool retains only the original frame bytes"
             );
             assert_eq!(queued, 0);
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             drop(refused);
             drop(retained);
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
         }
     }
@@ -5610,14 +5601,14 @@ mod tests {
                     .is_none()
             );
             assert!(pool.is_closed());
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             assert_eq!(
                 pool.reserved_bytes(),
                 bytes,
                 "closure preserves earlier holders"
             );
             drop(retained);
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
         }
     }
@@ -5647,6 +5638,26 @@ mod tests {
                 .unwrap();
             assert_eq!(block.view().attributed_memory_size_bytes(), bytes);
             assert_eq!(pool.pipeline_bytes(), bytes);
+        }
+    }
+
+    /// A body without handoff room never enters the pool, so its refusal bumps no
+    /// capacity version and wakes no waiter.
+    #[tokio::test]
+    async fn a_handoff_without_room_wakes_no_capacity_waiter() {
+        use zakura_node_services::block_memory::DecodedBlockPool;
+        let cap = super::super::config::BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+        for late in [false, true] {
+            let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(1).unwrap());
+            let version = pool.capacity_version();
+            let (_, sequenced, queued) =
+                hand_off_mainnet_block_1_with_pool(cap, 0, pool.clone(), late, false)
+                    .await
+                    .unwrap();
+            assert!(!sequenced.body.is_decoded());
+            assert_eq!(queued, 0, "the refused charge returned");
+            assert_eq!(pool.reserved_blocks(), 0);
+            assert_eq!(pool.capacity_version(), version);
         }
     }
 
@@ -5688,12 +5699,7 @@ mod tests {
         // The body holds the routine's decode, so this reads it back.
         let routine_decode = sequenced
             .body
-            .decoded_block(
-                &ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .unwrap(),
-                zakura_node_services::block_memory::Admission::WithinLimit,
-            )
+            .decoded_block(&super::super::test_decoded_pool(), Admission::WithinLimit)
             .unwrap();
 
         let frontiers = genesis_frontiers();
@@ -5719,9 +5725,7 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         body_tx
             .try_send(sequenced)
@@ -5736,10 +5740,7 @@ mod tests {
         let BlockSyncAction::SubmitBlock { block, .. } = action else {
             panic!("expected a body submission, got {action:?}");
         };
-        assert!(matches!(
-            block,
-            zakura_node_services::block_memory::BlockHandle::Owned(_)
-        ));
+        assert!(matches!(block, BlockHandle::Owned(_)));
         assert_eq!(block, routine_decode);
         assert!(std::ptr::eq(block.header(), routine_decode.header()));
         for (submitted, received) in block

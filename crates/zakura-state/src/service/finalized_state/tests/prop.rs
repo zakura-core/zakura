@@ -7,6 +7,7 @@ use std::{
     fs,
     sync::{Arc, Mutex},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -65,9 +66,7 @@ type SaplingTree = Arc<zakura_chain::sapling::tree::NoteCommitmentTree>;
 type OrchardTree = Arc<zakura_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zakura_chain::sprout::tree::NoteCommitmentTree>;
 
-fn vct_successor_witness(
-    block: impl Into<zakura_node_services::block_memory::BlockHandle>,
-) -> VctSuccessorWitness {
+fn vct_successor_witness(block: impl Into<BlockHandle>) -> VctSuccessorWitness {
     let block = block.into();
     VctSuccessorWitness::from_header(
         Arc::new(*block.view().header()),
@@ -78,9 +77,7 @@ fn vct_successor_witness(
     )
 }
 
-fn next_vct_block(
-    block: impl Into<zakura_node_services::block_memory::BlockHandle>,
-) -> Option<VctSuccessorWitness> {
+fn next_vct_block(block: impl Into<BlockHandle>) -> Option<VctSuccessorWitness> {
     Some(vct_successor_witness(block))
 }
 

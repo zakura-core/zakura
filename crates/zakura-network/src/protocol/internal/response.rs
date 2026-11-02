@@ -1,6 +1,7 @@
 //! Zebra's internal peer message response format.
 
 use std::{fmt, time::Duration};
+use zakura_node_services::block_memory::BlockHandle;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::sync::Arc;
@@ -92,15 +93,7 @@ pub enum Response {
             any(test, feature = "proptest-impl"),
             proptest(strategy = "block_responses()")
         )]
-        Vec<
-            InventoryResponse<
-                (
-                    zakura_node_services::block_memory::BlockHandle,
-                    Option<PeerSocketAddr>,
-                ),
-                block::Hash,
-            >,
-        >,
+        Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>,
     ),
 
     /// A list of found unmined transactions, and missing unmined transaction IDs.
@@ -194,17 +187,9 @@ fn header_responses() -> impl Strategy<Value = Vec<zakura_node_services::block_m
 }
 
 #[cfg(any(test, feature = "proptest-impl"))]
-fn block_responses() -> impl Strategy<
-    Value = Vec<
-        InventoryResponse<
-            (
-                zakura_node_services::block_memory::BlockHandle,
-                Option<PeerSocketAddr>,
-            ),
-            block::Hash,
-        >,
-    >,
-> {
+fn block_responses(
+) -> impl Strategy<Value = Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>>
+{
     any::<Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>>().prop_map(
         |responses| {
             responses

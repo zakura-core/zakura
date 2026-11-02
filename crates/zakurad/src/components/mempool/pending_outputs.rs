@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tower::BoxError;
 use zakura_chain::transparent;
 
-use zakura_node_services::mempool::Response;
+use zakura_node_services::{mempool::Response, prune_cadence::PruneCadence};
 
 /// The most distinct outpoints that callers can wait for at once.
 ///
@@ -15,13 +15,6 @@ use zakura_node_services::mempool::Response;
 /// package to three transactions. An unknown outpoint stays here until a chain tip
 /// change, so verification churn must not grow this map while the tip stalls.
 pub(crate) const MAX_PENDING_OUTPUTS: usize = 65_536;
-
-/// The fewest `queue` calls between scans for abandoned waiters.
-///
-/// A scan costs the live waiters plus the calls since the last scan, so it runs after at
-/// least as many calls as the live waiters it kept. This
-/// keeps the cost of each call constant while the map stays full of live waiters.
-const MIN_QUEUES_BETWEEN_PRUNES: usize = 1_024;
 
 /// A mempool output request refused because too many other requests are waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -33,8 +26,7 @@ pub struct PendingOutputsFull;
 #[derive(Debug, Default)]
 pub struct PendingOutputs {
     waiting: HashMap<transparent::OutPoint, broadcast::Sender<transparent::Output>>,
-    queued_since_prune: usize,
-    live_after_prune: usize,
+    prune_cadence: PruneCadence,
 }
 
 impl PendingOutputs {
@@ -47,8 +39,7 @@ impl PendingOutputs {
         &mut self,
         outpoint: transparent::OutPoint,
     ) -> impl Future<Output = Result<Response, BoxError>> {
-        self.queued_since_prune = self.queued_since_prune.saturating_add(1);
-        if self.queued_since_prune >= self.live_after_prune.max(MIN_QUEUES_BETWEEN_PRUNES) {
+        if self.prune_cadence.queued() {
             self.prune();
         }
         let refused =
@@ -90,8 +81,7 @@ impl PendingOutputs {
     /// have been dropped and remove the corresponding sender.
     pub fn prune(&mut self) {
         self.waiting.retain(|_, chan| chan.receiver_count() > 0);
-        self.queued_since_prune = 0;
-        self.live_after_prune = self.waiting.len();
+        self.prune_cadence.pruned(self.waiting.len());
     }
 
     /// Clears the inner [`HashMap`] of queued pending output requests.
@@ -105,6 +95,7 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use zakura_chain::transaction;
+    use zakura_node_services::prune_cadence::MIN_QUEUES_BETWEEN_PRUNES;
 
     const LIVE_INDEX: usize = 4_000_000_000;
 

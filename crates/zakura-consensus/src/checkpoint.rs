@@ -20,6 +20,7 @@ use std::{
     sync::{mpsc, Arc},
     task::{Context, Poll},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
@@ -646,7 +647,7 @@ where
     /// whether the transaction hashes are unique.
     fn check_block(
         &self,
-        block: zakura_node_services::block_memory::BlockHandle,
+        block: BlockHandle,
     ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
         let hash = zakura_header_chain::validate_encoding_version_hash(block.header())
             .map_err(BlockError::from)?;
@@ -704,10 +705,7 @@ where
     /// If the block does not pass basic validity checks,
     /// returns an error immediately.
     #[allow(clippy::unwrap_in_result)]
-    fn queue_block(
-        &mut self,
-        block: zakura_node_services::block_memory::BlockHandle,
-    ) -> Result<RequestBlock, VerifyCheckpointError> {
+    fn queue_block(&mut self, block: BlockHandle) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
@@ -1235,7 +1233,7 @@ impl VerifyCheckpointError {
 /// The CheckpointVerifier service implementation.
 ///
 /// After verification, the block futures resolve to their hashes.
-impl<S> Service<zakura_node_services::block_memory::BlockHandle> for CheckpointVerifier<S>
+impl<S> Service<BlockHandle> for CheckpointVerifier<S>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
@@ -1250,7 +1248,7 @@ where
     }
 
     #[instrument(name = "checkpoint", skip(self, block))]
-    fn call(&mut self, block: zakura_node_services::block_memory::BlockHandle) -> Self::Future {
+    fn call(&mut self, block: BlockHandle) -> Self::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();

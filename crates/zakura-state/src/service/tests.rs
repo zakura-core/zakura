@@ -5,6 +5,7 @@
 // TODO: move these tests into tests::vectors and tests::prop modules.
 
 use std::{env, sync::Arc, time::Duration};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 use tokio::{runtime::Runtime, time::timeout};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
@@ -232,7 +233,7 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
         .unwrap();
     let bytes = child.attributed_memory_size_bytes();
     let hash = child.hash();
-    let pool = DecodedBlockPool::new(bytes);
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
     let probe = Probe::new(&child);
     drop(
@@ -270,7 +271,7 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
 
 fn assert_decoded_payload_retained(
     probe: &zakura_node_services::block_memory::model::Probe,
-    pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    pool: &DecodedBlockPool,
     bytes: u64,
 ) {
     let allocation = probe.read(1, std::slice::from_ref(pool)).unwrap();
@@ -299,7 +300,7 @@ fn assert_decoded_payload_retained(
 
 async fn wait_for_decoded_payload_release(
     probe: &zakura_node_services::block_memory::model::Probe,
-    pool: &zakura_node_services::block_memory::DecodedBlockPool,
+    pool: &DecodedBlockPool,
     limit: Duration,
 ) {
     timeout(limit, async {
@@ -463,7 +464,7 @@ async fn retired_state_snapshots_and_read_results_keep_decoded_ownership() {
         let bytes = child.attributed_memory_size_bytes();
         let hash = child.hash();
         let transaction_hash = child.transactions[0].hash();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
         let probe = Probe::new(&child);
         let child = SemanticallyVerifiedBlock::from(BlockHandle::from(child));
@@ -975,7 +976,7 @@ impl Fixture {
             &self.non_finalized,
             &self.finalized.db,
             crate::BlockCommitmentData {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(child),
+                block: child.into(),
                 auth_data_root: None,
             },
         )
@@ -2037,16 +2038,12 @@ async fn test_populated_state_responds_correctly(
 
         transcript.push((
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-            ))),
+            Ok(Response::Block(Some(block.clone().into()))),
         ));
 
         transcript.push((
             Request::Block(height.into()),
-            Ok(Response::Block(Some(
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-            ))),
+            Ok(Response::Block(Some(block.clone().into()))),
         ));
 
         // Spec: transactions in the genesis block are ignored.

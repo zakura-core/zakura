@@ -2,6 +2,6 @@
 +++ b/crates/zakura-node-services/src/block_memory.rs
 @@ -296,3 +296,3 @@
              .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
--                used.checked_sub(self.units)
-+                used.checked_sub(self.units.saturating_mul(2))
+-                used.checked_sub(1)
++                used.checked_sub(2)
              })

@@ -147,7 +147,7 @@ def summarize_capacity(samples: list[dict], interval: float, *, at_tip: bool = F
                 continue
             if any(b < a for a, b in zip(counters, counters[1:])):
                 failures.append(f"Counter reset: {name}.")
-            if max(counters) > 0:
+            if name != "capacity_reduction_overage_count" and max(counters) > 0:
                 failures.append(f"Nonzero {name}: {max(counters):g}.")
         utilization = sorted(v["active"] / v["limit"] for v in values
                              if v.get("active") is not None and (v.get("limit") or 0) > 0)

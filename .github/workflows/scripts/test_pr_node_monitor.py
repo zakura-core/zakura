@@ -82,6 +82,16 @@ class CapacityQualification(unittest.TestCase):
         self.assertEqual(measured["sync"]["verdict"], "ok")
         self.assertEqual(measured["sync"]["minimum_headroom"], 1)
 
+    def test_grandfathered_reductions_are_reported_separately_from_admission_saturation(self):
+        first = self.observation(0, active=8)
+        reduced = self.observation(1, active=8)
+        for values in reduced["missing_parent"].values():
+            values.update(capacity=8, reserved=2, limit=6, headroom=0, capacity_reduction_overage_count=1)
+        measured = monitor.summarize_capacity([first, reduced], 1)
+        self.assertEqual(measured["sync"]["verdict"], "ok")
+        self.assertEqual(measured["sync"]["events_since_process_start"]["capacity_reduction_overage_count"], 1)
+        self.assertIsNone(measured["sync"]["minimum_headroom"])
+
     def test_missing_samples_counter_resets_and_process_changes_fail(self):
         for broken in (self.observation(5), {"elapsed": 1},
                        dict(self.observation(1), pid="456")):

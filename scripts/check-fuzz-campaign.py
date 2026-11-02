@@ -129,7 +129,7 @@ def campaign_matrix(root, package):
         rows.append(
             {
                 "target": name,
-                # An empty decoder makes the workflow key the corpus on the trace format.
+                # An empty decoder makes the workflow key the corpus on the harness's versions.
                 "decoder": "" if decoder is None else f"d{decoder}",
                 "harness": harnesses.get(name, ""),
                 "seconds": target.get("campaign-seconds", defaults["seconds"]),

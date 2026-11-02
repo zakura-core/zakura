@@ -424,13 +424,16 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     let original = weak
         .upgrade()
         .expect("the runtime owner retains the input decode");
+    let facts = policy.submission_body(block::Height(1)).unwrap();
     let prepared = payloads
-        .prepare(
-            &mut policy,
-            block::Height(1),
+        .materialize(
+            facts.id,
             &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
+            zakura_node_services::block_memory::Admission::WithinLimit,
         )
-        .unwrap()
+        .unwrap();
+    policy
+        .prepare_submit(block::Height(1), facts.id, prepared.decoded_bytes)
         .unwrap();
     assert!(
         matches!(&prepared.block, BlockHandle::Shared(block) if Arc::ptr_eq(&original, block)),

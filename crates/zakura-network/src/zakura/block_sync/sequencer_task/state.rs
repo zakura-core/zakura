@@ -189,6 +189,15 @@ pub(super) struct BodyAccepted {
     pub(super) payload_changes: Vec<PayloadChange>,
 }
 
+/// The retained body a submission of one height needs, and how to admit its decode.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SubmissionBody {
+    /// The payload that IO materializes.
+    pub(super) id: super::super::reorder::BodyId,
+    /// The admission class of this height's decode.
+    pub(super) admission: zakura_node_services::block_memory::Admission,
+}
+
 /// The result of rolling back a submission the action channel refused.
 #[derive(Debug)]
 pub(super) struct SubmissionRefused {
@@ -227,7 +236,7 @@ impl zakura_header_chain::Clock for WallClock {
 /// Pure sequencing state of the commit pipeline; see the module docs.
 #[derive(Debug)]
 pub(super) struct SequencerState {
-    pub(super) sequencer: Sequencer,
+    sequencer: Sequencer,
     retained_body_limit: u64,
     /// Tracks the finalized height so the published view carries it forward; the
     /// reactor folds it into its `finalized_height` mirror with a `max`.
@@ -1123,6 +1132,28 @@ impl SequencerState {
             return None;
         }
         Some(height)
+    }
+
+    /// The body to materialize for a submission of `height`, if one is due.
+    pub(super) fn submission_body(&self, height: block::Height) -> Option<SubmissionBody> {
+        let facts = self.sequencer.submission_body(height)?;
+        Some(SubmissionBody {
+            id: facts.id,
+            admission: super::super::admission::submission_decode_admission(
+                self.sequencer.verified_tip(),
+                height,
+            ),
+        })
+    }
+
+    /// Record the materialized size of the payload `id` and assign an apply token.
+    pub(super) fn prepare_submit(
+        &mut self,
+        height: block::Height,
+        id: super::super::reorder::BodyId,
+        decoded_bytes: u64,
+    ) -> Option<super::super::sequencer::SubmitItem> {
+        self.sequencer.prepare_submit(height, id, decoded_bytes)
     }
 
     /// The driver accepted the submission of `height`.

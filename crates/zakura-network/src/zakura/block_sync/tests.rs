@@ -4994,20 +4994,24 @@ impl TestSequencer {
 
     fn prepare_submit(&mut self, height: block::Height) -> Option<TestSubmission> {
         self.settle_payloads();
-        let prepared = self
+        let facts = self.policy.submission_body(height)?;
+        let materialized = self
             .payloads
-            .prepare(
-                &mut self.policy,
-                height,
+            .materialize(
+                facts.id,
                 &ZakuraBlockSyncConfig::default()
                     .decoded_block_pool(10_000)
                     .unwrap(),
+                admission::submission_decode_admission(self.policy.verified_tip(), height),
             )
-            .unwrap()?;
+            .unwrap();
+        let intent = self
+            .policy
+            .prepare_submit(height, facts.id, materialized.decoded_bytes)?;
         self.settle_payloads();
         Some(TestSubmission {
-            intent: prepared.intent,
-            block: prepared.block,
+            intent,
+            block: materialized.block,
         })
     }
 

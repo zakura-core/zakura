@@ -25,7 +25,9 @@
 //! A submitted body also lives in the driver's `SubmitBlock` action, and
 //! the `Sequencer` keeps its in-flight charge until the exact completion arrives.
 
-use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle, DecodedBlockPool};
+use zakura_node_services::block_memory::{
+    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool,
+};
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
@@ -459,9 +461,9 @@ pub(super) struct SequencerPayloads {
     next_id: u64,
 }
 
-pub(super) struct PreparedSubmission {
-    pub(super) intent: super::sequencer::SubmitItem,
+pub(super) struct MaterializedBody {
     pub(super) block: BlockHandle,
+    pub(super) decoded_bytes: u64,
     pub(super) newly_decoded_wire_bytes: Option<usize>,
 }
 
@@ -521,19 +523,18 @@ impl SequencerPayloads {
         }
     }
 
+    /// Decode the payload `id` under `admission` when it is still raw, and borrow
+    /// its charged block for a submission.
     #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
-    pub(super) fn prepare(
+    pub(super) fn materialize(
         &mut self,
-        sequencer: &mut Sequencer,
-        height: block::Height,
+        id: super::reorder::BodyId,
         pool: &DecodedBlockPool,
-    ) -> Result<Option<PreparedSubmission>, AdmissionFailure> {
-        let Some(facts) = sequencer.submission_body(height) else {
-            return Ok(None);
-        };
+        admission: Admission,
+    ) -> Result<MaterializedBody, AdmissionFailure> {
         let body = self
             .entries
-            .get_mut(&facts.id)
+            .get_mut(&id)
             .expect("policy names a retained payload");
         let newly_decoded_wire_bytes = match body {
             BufferedBlockBody::RawFramePayload(raw) => Some(
@@ -542,22 +543,12 @@ impl SequencerPayloads {
             ),
             _ => None,
         };
-        let admission =
-            super::admission::submission_decode_admission(sequencer.verified_tip(), height);
         let block = body.decoded_block(pool, admission)?;
-        let decoded_bytes = body.decoded_attributed_memory_size_bytes();
-        let intent = sequencer
-            .prepare_submit(height, facts.id, decoded_bytes)
-            .expect("materialization and submission run synchronously under one owner");
-        assert_eq!(
-            intent.body_id, facts.id,
-            "submission names its materialized payload"
-        );
-        Ok(Some(PreparedSubmission {
-            intent,
+        Ok(MaterializedBody {
             block,
+            decoded_bytes: body.decoded_attributed_memory_size_bytes(),
             newly_decoded_wire_bytes,
-        }))
+        })
     }
 }
 
@@ -977,55 +968,37 @@ impl SequencerIO {
                 self.publish_decoded_ownership_view_with(decode_charge);
             }
             let capacity_version = self.decoded_pool.capacity_version();
-            let prepared =
-                match self
-                    .payloads
-                    .prepare(&mut self.state.sequencer, height, &self.decoded_pool)
-                {
-                    Ok(Some(prepared)) => prepared,
-                    Ok(None) => {
-                        self.publish_decoded_ownership_view();
-                        continue;
-                    }
-                    Err(AdmissionFailure::Capacity) => {
-                        self.decoded_capacity_blocked = Some(capacity_version);
-                        self.publish_decoded_ownership_view();
-                        break;
-                    }
-                    Err(_) => {
-                        self.decoded_pool.close();
-                        self.publish_decoded_ownership_view();
-                        break;
-                    }
-                };
-            let item = prepared.intent;
-            let decoded_bytes = item.decoded_bytes;
-            if let Some(wire_bytes) = prepared.newly_decoded_wire_bytes {
-                // Metrics use f64; admission and collection totals remain integers.
-                metrics::histogram!(
-                    "sync.block.body.decoded.attributed_memory_size_bytes",
-                    "stage" => "reorder"
-                )
-                .record(decoded_bytes as f64);
-                if wire_bytes > 0 {
-                    metrics::histogram!(
-                        "sync.block.body.decoded.to_serialized_ratio",
-                        "stage" => "reorder"
-                    )
-                    .record(decoded_bytes as f64 / wire_bytes as f64);
+            let Some(submission) = self.state.submission_body(height) else {
+                self.publish_decoded_ownership_view();
+                continue;
+            };
+            let materialized = match self.payloads.materialize(
+                submission.id,
+                &self.decoded_pool,
+                submission.admission,
+            ) {
+                Ok(materialized) => materialized,
+                Err(AdmissionFailure::Capacity) => {
+                    self.decoded_capacity_blocked = Some(capacity_version);
+                    self.publish_decoded_ownership_view();
+                    break;
                 }
-            }
-            metrics::counter!("sync.block.submit.sent").increment(1);
-            let queue_depth = self
-                .actions
-                .max_capacity()
-                .saturating_sub(self.actions.capacity());
-            // Metrics accepts f64 samples; this lossy conversion is observability-only.
-            metrics::histogram!(
-                "sync.block.action.queue.depth",
-                "action" => "submit_block"
-            )
-            .record(queue_depth as f64);
+                Err(_) => {
+                    self.decoded_pool.close();
+                    self.publish_decoded_ownership_view();
+                    break;
+                }
+            };
+            let item = self
+                .state
+                .prepare_submit(height, submission.id, materialized.decoded_bytes)
+                .expect("materialization and submission run synchronously under one owner");
+            assert_eq!(
+                item.body_id, submission.id,
+                "submission names its materialized payload"
+            );
+            let decoded_bytes = item.decoded_bytes;
+            self.record_submission_metrics(decoded_bytes, materialized.newly_decoded_wire_bytes);
             let (height, hash, token) = (item.height, item.hash, item.token);
             let send_started = time::Instant::now();
             // Publish the decode before the send can wait on a slow verifier, so
@@ -1038,7 +1011,7 @@ impl SequencerIO {
                     owner: item.owner,
                     source: item.source,
                     token,
-                    block: prepared.block,
+                    block: materialized.block,
                 })
                 .await;
             metrics::histogram!("sync.block.submit.queue_wait_seconds")
@@ -1065,6 +1038,39 @@ impl SequencerIO {
             }
             self.trace_body_submitted(height, token);
         }
+    }
+
+    fn record_submission_metrics(
+        &self,
+        decoded_bytes: u64,
+        newly_decoded_wire_bytes: Option<usize>,
+    ) {
+        if let Some(wire_bytes) = newly_decoded_wire_bytes {
+            // Metrics use f64; admission and collection totals remain integers.
+            metrics::histogram!(
+                "sync.block.body.decoded.attributed_memory_size_bytes",
+                "stage" => "reorder"
+            )
+            .record(decoded_bytes as f64);
+            if wire_bytes > 0 {
+                metrics::histogram!(
+                    "sync.block.body.decoded.to_serialized_ratio",
+                    "stage" => "reorder"
+                )
+                .record(decoded_bytes as f64 / wire_bytes as f64);
+            }
+        }
+        metrics::counter!("sync.block.submit.sent").increment(1);
+        let queue_depth = self
+            .actions
+            .max_capacity()
+            .saturating_sub(self.actions.capacity());
+        // Metrics accepts f64 samples; this lossy conversion is observability-only.
+        metrics::histogram!(
+            "sync.block.action.queue.depth",
+            "action" => "submit_block"
+        )
+        .record(queue_depth as f64);
     }
 
     async fn send_action(&self, action: BlockSyncAction) -> bool {

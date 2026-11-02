@@ -90,9 +90,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
         view_rx,
         cancel,
         crate::zakura::trace::ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        crate::zakura::block_sync::test_decoded_pool(),
     );
     routine.handle_status(BlockSyncStatus {
         servable_low: block::Height(1),

@@ -42,9 +42,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         view_tx,
         Duration::from_secs(60),
         ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        crate::zakura::block_sync::test_decoded_pool(),
     );
     let check = |task: &mut SequencerIO, label: &str| {
         let changes = task.state.sequencer_mut().take_payload_changes();
@@ -292,9 +290,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
         view_tx,
         Duration::from_secs(60),
         ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        crate::zakura::block_sync::test_decoded_pool(),
     )
     .with_observer(ObserverSlot(Some(log.clone())));
 

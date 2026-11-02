@@ -3141,9 +3141,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         (routine, out_recv, routine_to_reactor_rx)
     }
@@ -3707,9 +3705,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -3816,9 +3812,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         // The routine learns these from a `Status` frame in production; set them directly
         // so a single `try_fill` pass exercises the floor arm.
@@ -3931,9 +3925,7 @@ mod tests {
             view,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -4164,9 +4156,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
@@ -4429,9 +4419,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
@@ -4619,9 +4607,7 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -4945,9 +4931,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         if unanswered {
             routine.handle_status(super::BlockSyncStatus {
@@ -5215,9 +5199,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),
@@ -5287,9 +5269,7 @@ mod tests {
         hand_off_mainnet_block_1_with_pool(
             applying_decoded_bytes,
             queued_decoded_bytes,
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .unwrap(),
+            super::super::test_decoded_pool(),
             false,
             false,
         )
@@ -5719,12 +5699,7 @@ mod tests {
         // The body holds the routine's decode, so this reads it back.
         let routine_decode = sequenced
             .body
-            .decoded_block(
-                &ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .unwrap(),
-                Admission::WithinLimit,
-            )
+            .decoded_block(&super::super::test_decoded_pool(), Admission::WithinLimit)
             .unwrap();
 
         let frontiers = genesis_frontiers();
@@ -5750,9 +5725,7 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::super::test_decoded_pool(),
         );
         body_tx
             .try_send(sequenced)

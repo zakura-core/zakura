@@ -1480,9 +1480,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         )
         .with_retained_body_limit(limit)
     }
@@ -1644,9 +1642,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         assert!(
@@ -1692,9 +1688,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
         let mut advanced_scope = old_scope;
         advanced_scope.header.header_generation = zakura_header_chain::HeaderGeneration::new(8);
@@ -1756,9 +1750,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -1812,9 +1804,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
@@ -1910,9 +1900,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2028,9 +2016,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2155,9 +2141,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2239,9 +2223,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2343,9 +2325,7 @@ mod tests {
                     view_tx,
                     Duration::from_secs(1),
                     ZakuraTrace::noop(),
-                    ZakuraBlockSyncConfig::default()
-                        .decoded_block_pool(10_000)
-                        .expect("fixture decoded allowance fits"),
+                    super::test_decoded_pool(),
                 );
 
                 let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2449,9 +2429,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2562,9 +2540,7 @@ mod tests {
                 view_tx,
                 Duration::from_secs(1),
                 ZakuraTrace::noop(),
-                ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
+                super::test_decoded_pool(),
             );
 
             let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2690,9 +2666,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
         let task = tokio::spawn(task.run());
 
@@ -2785,9 +2759,7 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         body.leave_queue();
@@ -2845,9 +2817,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         drop(task);

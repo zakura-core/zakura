@@ -331,12 +331,7 @@ impl BlockSyncServiceInner {
 
 impl BlockSyncService {
     pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
-        Self::new_with_startup(BlockSyncStartup::inert(
-            config
-                .decoded_block_pool(0)
-                .map_err(BlockSyncStartError::InvalidConfig)?,
-            config,
-        ))
+        Self::new_with_startup(BlockSyncStartup::inert(config)?)
     }
 
     /// Builds the service that admits block-sync sessions for the reactor
@@ -1111,12 +1106,7 @@ mod requester_session_tests {
             with_session_slots(usize::MAX, usize::MAX),
         ] {
             assert!(matches!(
-                spawn_block_sync_reactor(BlockSyncStartup::inert(
-                    ZakuraBlockSyncConfig::default()
-                        .decoded_block_pool(10_000)
-                        .expect("fixture decoded allowance fits"),
-                    config.clone()
-                )),
+                BlockSyncStartup::inert(config.clone()).and_then(spawn_block_sync_reactor),
                 Err(BlockSyncStartError::InvalidConfig(_))
             ));
             assert!(matches!(
@@ -1138,13 +1128,9 @@ mod requester_session_tests {
     #[tokio::test]
     async fn a_handle_serves_with_the_config_its_reactor_validated() {
         let config = with_session_slots(7, 9);
-        let (handle, _actions, _task) = spawn_block_sync_reactor(BlockSyncStartup::inert(
-            config
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
-            config.clone(),
-        ))
-        .expect("valid block-sync config");
+        let (handle, _actions, _task) =
+            spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()).unwrap())
+                .expect("valid block-sync config");
         let service = BlockSyncService::new_with_handle(handle);
         assert_eq!(service.inner.config.peer_limits, config.peer_limits);
     }
@@ -1372,13 +1358,9 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn an_older_connection_cannot_clear_a_newer_gap_claim() {
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(
-                ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
-                ZakuraBlockSyncConfig::default(),
-            )
-            .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
@@ -1438,13 +1420,9 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn status_cadence_survives_session_replacement_and_ends_with_its_connection() {
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(
-                ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
-                ZakuraBlockSyncConfig::default(),
-            )
-            .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
@@ -1524,13 +1502,9 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn reconnect_churn_returns_block_sync_maps_to_baseline() {
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(
-                ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
-                ZakuraBlockSyncConfig::default(),
-            )
-            .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![43; 32]).unwrap();
@@ -1626,13 +1600,9 @@ mod regulated_frame_tests {
     async fn negotiation_requires_the_regulated_capability() {
         let service = Arc::new(
             BlockSyncService::new_with_startup(
-                BlockSyncStartup::inert(
-                    ZakuraBlockSyncConfig::default()
-                        .decoded_block_pool(10_000)
-                        .expect("fixture decoded allowance fits"),
-                    ZakuraBlockSyncConfig::default(),
-                )
-                .with_range_source(Arc::new(EmptySource)),
+                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .unwrap()
+                    .with_range_source(Arc::new(EmptySource)),
             )
             .expect("valid block-sync config"),
         );
@@ -1662,13 +1632,9 @@ mod regulated_frame_tests {
     async fn sessions_install_fences_and_reject_version_two_or_one_slot() {
         for (version, depth) in [(2, 2), (3, 1), (3, 2)] {
             let service = BlockSyncService::new_with_startup(
-                BlockSyncStartup::inert(
-                    ZakuraBlockSyncConfig::default()
-                        .decoded_block_pool(10_000)
-                        .expect("fixture decoded allowance fits"),
-                    ZakuraBlockSyncConfig::default(),
-                )
-                .with_range_source(Arc::new(EmptySource)),
+                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .unwrap()
+                    .with_range_source(Arc::new(EmptySource)),
             )
             .expect("valid block-sync config");
             let peer = ZakuraPeerId::new(vec![45; 32]).unwrap();
@@ -1721,13 +1687,9 @@ mod regulated_frame_tests {
         config.peer_limits.max_outbound_peers = 1;
         config.peer_limits.max_pending_escalations = 2;
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(
-                (config)
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
-                config,
-            )
-            .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(config)
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![47; 32]).unwrap();

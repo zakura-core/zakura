@@ -568,9 +568,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
         legacy_frontiers,
         legacy_header,
         snapshot_rx,
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.header_tip.is_none());
@@ -659,9 +657,7 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         },
         (finalized.height, finalized.hash),
         snapshot_rx,
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -750,9 +746,7 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         },
         (header.height, header.hash),
         snapshot_rx,
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -824,12 +818,7 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (_snapshots, receiver) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        ZakuraBlockSyncConfig::default(),
-    );
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.committed_views = Some(receiver);
     let (handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -861,12 +850,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        ZakuraBlockSyncConfig::default(),
-    );
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -996,12 +980,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
-    let mut startup = BlockSyncStartup::inert(
-        config
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        config.clone(),
-    );
+    let mut startup = BlockSyncStartup::inert(config.clone()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -5000,9 +4979,7 @@ impl TestSequencer {
             .payloads
             .materialize(
                 facts.id,
-                &ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .unwrap(),
+                &test_decoded_pool(),
                 admission::submission_decode_admission(self.policy.verified_tip(), height),
             )
             .unwrap();
@@ -5796,9 +5773,7 @@ impl CappedSequencerTask {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            test_decoded_pool(),
         );
         Self {
             body_tx,
@@ -6260,9 +6235,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        test_decoded_pool(),
     );
     let task = tokio::spawn(task.run());
 
@@ -6486,9 +6459,7 @@ impl DetachedWindow {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            test_decoded_pool(),
         );
         let mut window = Self {
             blocks: fake_sequential_blocks(block_count),
@@ -7910,12 +7881,9 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 /// reactor, where its sender would hold the session's reservation.
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(BlockSyncStartup::inert(
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
-        ZakuraBlockSyncConfig::default(),
-    ))
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(
+        BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
+    )
     .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
     let cancel = CancellationToken::new();

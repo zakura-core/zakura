@@ -158,8 +158,11 @@ impl BlockSyncStartup {
         self
     }
 
-    pub(super) fn inert(decoded_pool: DecodedBlockPool, config: ZakuraBlockSyncConfig) -> Self {
-        Self {
+    pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
+        let decoded_pool = config
+            .decoded_block_pool(0)
+            .map_err(BlockSyncStartError::InvalidConfig)?;
+        Ok(Self {
             body_retention: None,
             decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
@@ -178,7 +181,7 @@ impl BlockSyncStartup {
             max_checkpoint_height: None,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
-        }
+        })
     }
 }
 

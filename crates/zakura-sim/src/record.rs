@@ -38,8 +38,8 @@ use crate::{
 /// block-sync body. Version 18 added the decoded size of the block a
 /// submission carries. Version 19 added the runtime object a task's point
 /// touches. Version 20 adds causal inputs and independent state views for
-/// block ownership machine steps. Version 21 tags each machine step by its kind.
-/// Version 22 adds runtime queue funding and retained-owner evidence.
+/// machine steps, tagged by kind. Version 22 adds block ownership and runtime
+/// queue funding evidence.
 pub const FORMAT_VERSION: u32 = 22;
 
 /// What records mean: the identity grammar, the default-pick and default-draw

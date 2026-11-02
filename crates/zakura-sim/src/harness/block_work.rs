@@ -427,7 +427,7 @@ impl RecordSink for WitnessSink<'_> {
                     self.drained |=
                         work.drain && work.actual.reserved == 0 && work.expected.reserved == 0;
                 }
-                None => {}
+                Some(MachineStep::Fixture(_)) | None => {}
             }
         }
         self.sink.record(record);
@@ -439,7 +439,7 @@ pub const ENTRY: HarnessEntry = HarnessEntry {
     name: Target::Ownership.name(),
     generator: 1,
     scenario_bytes: 512,
-    pad_scenario: false,
+    machine: true,
     composes: &[],
     planted: false,
     run: |value, input, sink| run(Target::Ownership, value, input, sink),
@@ -460,7 +460,7 @@ pub const FUNDING_ENTRY: HarnessEntry = HarnessEntry {
     name: Target::Funding.name(),
     generator: 1,
     scenario_bytes: 512,
-    pad_scenario: false,
+    machine: true,
     composes: &[],
     planted: false,
     run: |value, input, sink| run(Target::Funding, value, input, sink),

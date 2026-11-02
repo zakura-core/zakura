@@ -110,6 +110,11 @@ target/
 /qa/fuzz/header-chain/coverage/
 /qa/fuzz/header-chain/*.profdata
 /qa/fuzz/header-chain/*.profraw
+/qa/fuzz/p2p/artifacts/
+/qa/fuzz/p2p/corpus/
+/qa/fuzz/p2p/coverage/
+/qa/fuzz/p2p/*.profdata
+/qa/fuzz/p2p/*.profraw
 /qa/fuzz/rpc/Cargo.lock
 /qa/fuzz/rpc/artifacts/
 /qa/fuzz/rpc/corpus/

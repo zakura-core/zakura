@@ -116,6 +116,10 @@ pub struct SuiteFile {
     /// sanitizer builds.
     #[serde(default)]
     pub lane: Vec<Lane>,
+    /// Each fuzz package's scheduled campaign defaults, by its directory under
+    /// `qa/fuzz/`. `scripts/check-fuzz-campaign.py` reads them.
+    #[serde(default)]
+    pub campaign: BTreeMap<String, Campaign>,
     /// The fuzz targets the suite runs, and the harnesses each one runs.
     #[serde(default)]
     pub target: Vec<Target>,
@@ -199,6 +203,18 @@ pub struct Lane {
     pub timeout_secs: u64,
 }
 
+/// A fuzz package's scheduled campaign defaults.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Campaign {
+    /// A daily run's length for each target.
+    pub seconds: u64,
+    /// A weekly run's length for each target.
+    pub weekly_seconds: u64,
+    /// libFuzzer's memory limit, for a target whose `args` set none.
+    pub rss_mb: u64,
+}
+
 /// A fuzz target the suite runs. A simulator target's harness comes from
 /// its package's `[package.metadata.zakura-sim.targets]` table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -216,6 +232,13 @@ pub struct Target {
     pub covers: Vec<String>,
     /// The smoke run's length.
     pub smoke_secs: u64,
+    /// A daily campaign's length, in place of its package's [`Campaign::seconds`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_seconds: Option<u64>,
+    /// A weekly campaign's length, in place of its package's
+    /// [`Campaign::weekly_seconds`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_weekly_seconds: Option<u64>,
     /// More libFuzzer arguments, such as `-max_len=512`.
     #[serde(default)]
     pub args: Vec<String>,

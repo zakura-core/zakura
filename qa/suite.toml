@@ -191,11 +191,31 @@ covers = [
 smoke-secs = 60
 timeout-secs = 1800
 
-# The header-chain targets, with header-fuzz.yml's limits.
+# Each package's scheduled campaign. `scripts/check-fuzz-campaign.py --matrix` joins
+# these defaults with each target's `campaign-*` overrides and its `args`, so a
+# target's limits have one home. A target without `-max_len` lets libFuzzer choose.
+[campaign.header-chain]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
+[campaign.p2p]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
+[campaign.sim]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 4096
+
+# The header-chain targets. Their `args` also set their campaign's limits.
 [[target]]
 package = "header-chain"
 name = "fork_transitions"
 smoke-secs = 60
+campaign-seconds = 1800
+campaign-weekly-seconds = 7200
 args = ["-rss_limit_mb=4096", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
@@ -214,8 +234,8 @@ args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
 # RocksDB keeps process-global allocations after each temporary database
-# closes, so the exit-time leak check is off too, as header-fuzz.yml and the
-# package's README say.
+# closes, so the exit-time leak check is off too, as the package's README
+# says.
 [[target]]
 package = "header-chain"
 name = "recovery_rows"

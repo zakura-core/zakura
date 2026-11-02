@@ -22,6 +22,11 @@ name = "alpha"
 path = "fuzz_targets/alpha.rs"
 """
 SUITE = """
+[campaign.p2p]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
 [[target]]
 package = "p2p"
 name = "alpha"
@@ -34,14 +39,9 @@ on:
   workflow_dispatch:
 jobs:
   fuzz:
-    strategy:
-      matrix:
-        include:
-          - target: alpha
-            decoder: 2
-            max_len: 512
-
-    steps: []
+    uses: ./.github/workflows/fuzz-campaign.yml
+    with:
+      package: p2p
 """
 
 
@@ -80,10 +80,15 @@ class CampaignCheck(unittest.TestCase):
         self.write("crates/demo/src/lib.rs", "")
         self.assert_problem("names the unknown property `a/one`")
 
-    def test_an_unscheduled_target_fails(self):
-        self.write(".github/workflows/p2p-fuzz.yml", WORKFLOW.replace("alpha", "beta"))
-        self.assert_problem("doesn't schedule `alpha`")
-        self.assert_problem("schedules `beta`, which qa/suite.toml doesn't run")
+    def test_a_workflow_that_skips_the_shared_campaign_fails(self):
+        self.write(".github/workflows/p2p-fuzz.yml", WORKFLOW.replace("uses: ./", "uses: ./other/"))
+        self.assert_problem("doesn't run fuzz-campaign.yml")
+        self.write(".github/workflows/p2p-fuzz.yml", WORKFLOW.replace("package: p2p", "package: sim"))
+        self.assert_problem("doesn't run the package `p2p`")
+
+    def test_a_package_without_a_campaign_table_fails(self):
+        self.write("qa/suite.toml", SUITE.replace("[campaign.p2p]", "[campaign.sim]"))
+        self.assert_problem("qa/fuzz/p2p has no [campaign] table")
 
     def test_a_campaign_on_pull_requests_fails(self):
         self.write(
@@ -92,11 +97,39 @@ class CampaignCheck(unittest.TestCase):
         )
         self.assert_problem("must not run on pull_request")
 
-    def test_a_stale_matrix_field_fails(self):
-        self.write(".github/workflows/p2p-fuzz.yml", WORKFLOW.replace("max_len: 512", "max_len: 64"))
-        self.assert_problem("has max_len 64")
-        self.write(".github/workflows/p2p-fuzz.yml", WORKFLOW.replace("decoder: 2", "decoder: 1"))
-        self.assert_problem("has decoder 1")
+    def test_the_matrix_joins_the_suite_and_the_decoder(self):
+        self.assertEqual(
+            CAMPAIGN.campaign_matrix(self.root, "p2p"),
+            {
+                "include": [
+                    {
+                        "target": "alpha",
+                        "decoder": "d2",
+                        "harness": "",
+                        "seconds": 900,
+                        "weekly_seconds": 3600,
+                        "rss_mb": 2048,
+                        "max_len": 512,
+                        "detect_leaks": 1,
+                    }
+                ]
+            },
+        )
+
+    def test_a_target_overrides_its_package_budgets_and_limits(self):
+        self.write(
+            "qa/suite.toml",
+            SUITE.replace(
+                'args = ["-max_len=512"]',
+                'campaign-seconds = 1800\ncampaign-weekly-seconds = 7200\n'
+                'args = ["-rss_limit_mb=4096", "-max_len=256", "-detect_leaks=0"]',
+            ),
+        )
+        row = CAMPAIGN.campaign_matrix(self.root, "p2p")["include"][0]
+        self.assertEqual(
+            (row["seconds"], row["weekly_seconds"], row["rss_mb"], row["max_len"], row["detect_leaks"]),
+            (1800, 7200, 4096, 256, 0),
+        )
 
     def test_a_coverage_row_without_a_declaration_fails(self):
         self.write(

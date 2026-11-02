@@ -4,9 +4,12 @@
 This reads `qa/suite.toml`, the fuzz packages' `Cargo.toml` tables, the fuzz workflows
 and the crates' sources. It compiles nothing, so it runs on every pull request. The
 simulator's suite manifest makes the checks that need the compiled harness registry.
+
+`--matrix <package>` prints the matrix that `fuzz-campaign.yml` runs for a package.
 """
 
 import argparse
+import json
 import re
 import sys
 import tomllib
@@ -20,26 +23,7 @@ WORKFLOWS = {
     "p2p": "p2p-fuzz.yml",
     SIM_PACKAGE: "sim-fuzz.yml",
 }
-MATRIX_ROW = re.compile(r"^\s*- target: (\S+)\s*$")
-MATRIX_FIELD = re.compile(r"^\s+([a-z_]+): (\S+)\s*$")
 COVERAGE_PROPERTY = re.compile(r'^\s*property: "([^"]+)"', re.MULTILINE)
-
-
-def matrix_rows(workflow_text):
-    """Return each `- target:` row of a workflow's matrix, as its fields by target."""
-    rows = {}
-    current = None
-    for line in workflow_text.splitlines():
-        row = MATRIX_ROW.match(line)
-        if row:
-            current = rows.setdefault(row.group(1), {})
-            continue
-        field = MATRIX_FIELD.match(line)
-        if field and current is not None:
-            current[field.group(1)] = field.group(2)
-        elif not line.lstrip().startswith("#"):
-            current = None
-    return rows
 
 
 def suite_arg(target, flag):
@@ -103,8 +87,8 @@ def package_problems(root, package, manifest, suite_names, excluded, sources):
     return problems
 
 
-def schedule_problems(root, package, targets, machines):
-    """Check that one package's workflow schedules exactly the suite's targets."""
+def schedule_problems(root, package, suite):
+    """Check that one package's workflow runs the shared campaign on its schedule."""
     workflow = WORKFLOWS[package]
     path = root / ".github/workflows" / workflow
     if not path.is_file():
@@ -117,29 +101,45 @@ def schedule_problems(root, package, targets, machines):
     for trigger in ("schedule", "workflow_dispatch"):
         if not re.search(rf"^\s*{trigger}:", text, re.MULTILINE):
             problems.append(f"{workflow}: a campaign must run on {trigger}")
-
-    rows = matrix_rows(text)
-    for name in sorted(rows.keys() - targets.keys()):
-        problems.append(f"{workflow}: schedules `{name}`, which qa/suite.toml doesn't run")
-    for name, target in sorted(targets.items()):
-        row = rows.get(name)
-        if row is None:
-            problems.append(f"{workflow}: doesn't schedule `{name}`")
-            continue
-        for flag, field in (("rss_limit_mb", "rss_mb"), ("max_len", "max_len")):
-            expected = suite_arg(target, flag)
-            if expected is not None and row.get(field) != expected:
-                problems.append(
-                    f"{workflow}: `{name}` has {field} {row.get(field)}, "
-                    f"and qa/suite.toml has {expected}"
-                )
-        decoder = machines.get(name, {}).get("decoder")
-        if decoder is not None and row.get("decoder") != str(decoder):
-            problems.append(
-                f"{workflow}: `{name}` has decoder {row.get('decoder')}, "
-                f"and its machine table has {decoder}"
-            )
+    if "uses: ./.github/workflows/fuzz-campaign.yml" not in text:
+        problems.append(f"{workflow}: doesn't run fuzz-campaign.yml")
+    if not re.search(rf"^\s*package: {re.escape(package)}\s*$", text, re.MULTILINE):
+        problems.append(f"{workflow}: doesn't run the package `{package}`")
+    if package not in suite.get("campaign", {}):
+        problems.append(f"qa/suite.toml: qa/fuzz/{package} has no [campaign] table")
     return problems
+
+
+def campaign_matrix(root, package):
+    """Return the `fuzz-campaign.yml` matrix of one package, one row per suite target."""
+    suite = tomllib.loads((root / "qa/suite.toml").read_text(encoding="utf-8"))
+    manifest = tomllib.loads(
+        (root / "qa/fuzz" / package / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    metadata = manifest.get("package", {}).get("metadata", {})
+    machines = metadata.get("zakura-machine", {}).get("targets", {})
+    harnesses = metadata.get("zakura-sim", {}).get("targets", {})
+    defaults = suite["campaign"][package]
+    rows = []
+    for target in suite.get("target", []):
+        if target["package"] != package:
+            continue
+        name = target["name"]
+        decoder = machines.get(name, {}).get("decoder")
+        rows.append(
+            {
+                "target": name,
+                # An empty decoder makes the workflow key the corpus on the trace format.
+                "decoder": "" if decoder is None else f"d{decoder}",
+                "harness": harnesses.get(name, ""),
+                "seconds": target.get("campaign-seconds", defaults["seconds"]),
+                "weekly_seconds": target.get("campaign-weekly-seconds", defaults["weekly-seconds"]),
+                "rss_mb": int(suite_arg(target, "rss_limit_mb") or defaults["rss-mb"]),
+                "max_len": int(suite_arg(target, "max_len") or 0),
+                "detect_leaks": int(suite_arg(target, "detect_leaks") or 1),
+            }
+        )
+    return {"include": rows}
 
 
 def coverage_problems(root, suite, sources):
@@ -178,9 +178,7 @@ def problems_at(root):
         }
         problems += package_problems(root, package, manifest, targets, excluded, sources)
         if package in WORKFLOWS:
-            metadata = manifest.get("package", {}).get("metadata", {})
-            machines = metadata.get("zakura-machine", {}).get("targets", {})
-            problems += schedule_problems(root, package, targets, machines)
+            problems += schedule_problems(root, package, suite)
         elif targets:
             problems.append(f"qa/fuzz/{package}: no campaign workflow schedules its targets")
     return problems
@@ -189,7 +187,11 @@ def problems_at(root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--matrix", metavar="PACKAGE", choices=sorted(WORKFLOWS))
     args = parser.parse_args(argv)
+    if args.matrix:
+        print(json.dumps(campaign_matrix(args.root.resolve(), args.matrix)))
+        return 0
     problems = problems_at(args.root.resolve())
     for problem in problems:
         print(problem, file=sys.stderr)

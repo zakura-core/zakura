@@ -130,6 +130,7 @@ fn scratch_suite(tests: Option<&[&str]>, ignored: &[&str]) -> SuiteFile {
             })
             .collect(),
         lane: Vec::new(),
+        campaign: std::collections::BTreeMap::new(),
         target: ["mapped", "unmapped"]
             .into_iter()
             .map(|name| Target {
@@ -137,6 +138,8 @@ fn scratch_suite(tests: Option<&[&str]>, ignored: &[&str]) -> SuiteFile {
                 name: name.to_owned(),
                 covers: Vec::new(),
                 smoke_secs: 1,
+                campaign_seconds: None,
+                campaign_weekly_seconds: None,
                 args: Vec::new(),
                 env: Vec::new(),
                 timeout_secs: 1,

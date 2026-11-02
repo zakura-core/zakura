@@ -186,7 +186,8 @@ pub enum BlockDownloadVerifyError {
     /// A downloaded block above the checkpoints names a parent that this downloader is not
     /// downloading and that the state can't build on: unknown, or known but below the finalized
     /// tip. Verifying it could only wait for a parent that may never arrive. This is an unscored
-    /// drop, not a consensus verdict.
+    /// drop, not a consensus verdict. The syncer requests the block again if its parent is still
+    /// waiting to be requested.
     #[error("downloaded block's parent can't be built on: {height:?} {hash:?} parent {parent:?}")]
     ParentUnknown {
         height: block::Height,
@@ -282,6 +283,43 @@ pub(super) enum NotFoundKind {
 }
 
 impl BlockDownloadVerifyError {
+    /// Whether the syncer requests this block again (within its retry budget, or else restarts
+    /// the round) instead of treating it as verified or rejected: a failed download, a
+    /// verification without a verdict, or a body that has to be fetched again.
+    pub(super) fn is_requested_again(&self) -> bool {
+        matches!(self, BlockDownloadVerifyError::DownloadFailed { .. })
+            || self.is_retried_verification()
+            || self.refetched_body().is_some()
+    }
+
+    /// Returns the hash of a block whose body a peer forged or whose ancestor's body was forged,
+    /// so the syncer fetches it again under the same hash, and the peer to blame for it.
+    ///
+    /// A forged body disagrees with its header: a coinbase height that doesn't follow the tip it
+    /// claims, or a transaction or authorizing data commitment mismatch. A block the state dropped
+    /// for a forged ancestor names no peer: the peer that served it is not at fault.
+    pub(super) fn refetched_body(&self) -> Option<(block::Hash, Option<PeerSocketAddr>)> {
+        match self {
+            BlockDownloadVerifyError::TipChildHeightMismatch {
+                hash,
+                advertiser_addr,
+                ..
+            } => Some((*hash, *advertiser_addr)),
+            BlockDownloadVerifyError::Invalid {
+                error,
+                hash,
+                advertiser_addr,
+                ..
+            } if is_forged_body(error) => Some((*hash, *advertiser_addr)),
+            BlockDownloadVerifyError::Invalid { error, hash, .. }
+                if error.is_descendant_of_auth_commitment_mismatch() =>
+            {
+                Some((*hash, None))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether verification ended without a verdict, so the syncer requests the block again
     /// (within its retry budget) instead of treating it as rejected.
     pub(super) fn is_retried_verification(&self) -> bool {
@@ -396,6 +434,19 @@ impl std::fmt::Debug for ParentExtendable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ParentExtendable")
     }
+}
+
+/// Whether a body disagrees with its transaction or authorizing data commitments, or its coinbase
+/// height disagrees with its expiry height.
+fn is_forged_body(error: &RouterError) -> bool {
+    use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+
+    matches!(
+        error.body_verification_class(),
+        BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+    ) || matches!(error, RouterError::Block { source }
+            if matches!(**source, VerifyBlockError::Transaction(TransactionError::CoinbaseExpiryBlockHeight { .. })))
+        || error.is_auth_commitment_mismatch()
 }
 
 /// Returns the parent that a failed verification needs before its authorizing data binding can
@@ -539,15 +590,13 @@ where
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
-                    // A failed download, or a verification that ended without a verdict, is
-                    // neither verified nor rejected: the syncer requests the block again or
-                    // restarts the round, so its children keep waiting until then. A retried
-                    // block must pass its parent check again before its children may rely on it.
-                    // A retry only starts after this result is polled, so this never changes a
-                    // newer task's entry.
-                    if matches!(e, BlockDownloadVerifyError::DownloadFailed { .. })
-                        || e.is_retried_verification()
-                    {
+                    // A block the syncer requests again (a failed download, a verification
+                    // without a verdict, or a forged body) stays pending: the syncer either
+                    // starts its retry or restarts the round, which clears the gate, so its
+                    // children keep waiting until then. A retried block must pass its parent
+                    // check again before its children may rely on it. A retry only starts after
+                    // this result is polled, so this never changes a newer task's entry.
+                    if e.is_requested_again() {
                         this.parent_gate.unpass(hash);
                     } else {
                         this.parent_gate.finish(hash);
@@ -946,7 +995,8 @@ where
                 // still writing) or still being downloaded here. A block whose parent is none of
                 // these can only wait for a parent that may never arrive, so drop it before it
                 // takes a verifier slot. A parent that is merely known, such as a finalized block
-                // below the tip, doesn't count.
+                // below the tip, doesn't count. A block requested before its parent is dropped
+                // too, and the syncer requests it again after the parent.
                 //
                 // Blocks at or below the last checkpoint skip this: the checkpoint verifier only
                 // accepts the checkpointed chain. They also never count as passed, so a fake

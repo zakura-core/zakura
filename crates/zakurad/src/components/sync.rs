@@ -35,7 +35,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
 };
-use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
+use zakura_consensus::{RouterError, VerifyBlockError};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -1049,6 +1049,11 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
+    /// Blocks this round that were dropped because they were requested before their parent, and
+    /// were put back in the round's queue behind it. Each block is put back at most once per round,
+    /// so a peer that keeps adding the parent to the queue can't make the block download forever.
+    reordered_behind_parent: HashSet<block::Hash>,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -1205,6 +1210,7 @@ where
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            reordered_behind_parent: HashSet::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1568,6 +1574,7 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        self.reordered_behind_parent.clear();
         self.downloads.start_round();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
@@ -1683,7 +1690,7 @@ where
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
                 let verified = rsp.is_ok();
-                let result = self.handle_block_response_with_missing_retry(rsp).await;
+                let result = self.handle_round_block_response(rsp, &mut reserve).await;
                 if header_runtime_status
                     .as_ref()
                     .is_some_and(|status| status.borrow().is_ready())
@@ -1783,7 +1790,7 @@ where
                 match completed {
                     Ok(Some(rsp)) => {
                         let verified = rsp.is_ok();
-                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        let result = self.handle_round_block_response(rsp, &mut reserve).await;
                         if header_runtime_status
                             .as_ref()
                             .is_some_and(|status| status.borrow().is_ready())
@@ -1902,7 +1909,7 @@ where
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
                         let verified = rsp.is_ok();
-                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        let result = self.handle_round_block_response(rsp, &mut reserve).await;
                         if header_runtime_status
                             .as_ref()
                             .is_some_and(|status| status.borrow().is_ready())
@@ -2642,6 +2649,37 @@ where
         Self::handle_response(response, self.expose_peer_addresses)
     }
 
+    /// Handles a downloaded block response during a sync round whose undispatched hashes are
+    /// `reserve`.
+    ///
+    /// A block dropped for an unknown parent that is still in `reserve` was requested before its
+    /// parent: the parent check can't wait for a parent that hasn't been requested. The block goes
+    /// back to the end of `reserve`, behind its parent, so the parent is requested first and the
+    /// block waits for it when it is requested again. This happens at most once per block per
+    /// round. Every other response goes to [`Self::handle_block_response_with_missing_retry`].
+    async fn handle_round_block_response(
+        &mut self,
+        response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
+        reserve: &mut IndexSet<block::Hash>,
+    ) -> Result<(), Report> {
+        if let Err(BlockDownloadVerifyError::ParentUnknown { hash, parent, .. }) = response {
+            if reserve.contains(&parent) && self.reordered_behind_parent.insert(hash) {
+                debug!(
+                    ?hash,
+                    ?parent,
+                    "block was requested before its parent, requesting it again after the parent"
+                );
+                metrics::counter!("sync.unknown.parent.reordered.block.count").increment(1);
+                reserve.shift_remove(&hash);
+                reserve.insert(hash);
+                return Ok(());
+            }
+        }
+
+        self.handle_block_response_with_missing_retry(response)
+            .await
+    }
+
     /// Handles a downloaded block response and requeues a required hash when retrying one block can
     /// preserve the rest of the round.
     ///
@@ -2788,28 +2826,11 @@ where
             return Ok(());
         }
 
-        if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
+        if let Some((hash, advertiser_addr)) = response
+            .as_ref()
+            .err()
+            .and_then(BlockDownloadVerifyError::refetched_body)
         {
-            BlockDownloadVerifyError::TipChildHeightMismatch {
-                hash,
-                advertiser_addr,
-                ..
-            } => Some((*hash, *advertiser_addr)),
-            BlockDownloadVerifyError::Invalid {
-                error,
-                hash,
-                advertiser_addr,
-                ..
-            } if Self::is_poisoned_body(error) => Some((*hash, *advertiser_addr)),
-            // The state dropped this block because its ancestor's body was forged. The peer
-            // that served this block is not at fault, so requeue it without scoring.
-            BlockDownloadVerifyError::Invalid { error, hash, .. }
-                if error.is_descendant_of_auth_commitment_mismatch() =>
-            {
-                Some((*hash, None))
-            }
-            _ => None,
-        }) {
             let retry_count = self.poisoned_block_retry_counts.entry(hash).or_default();
 
             if *retry_count < POISONED_BLOCK_RETRY_LIMIT {
@@ -3083,18 +3104,6 @@ where
         );
     }
 
-    /// Identifies a body that disagrees with its transaction or authorizing data commitments.
-    fn is_poisoned_body(error: &RouterError) -> bool {
-        use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
-
-        matches!(
-            error.body_verification_class(),
-            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
-        ) || matches!(error, RouterError::Block { source }
-                if matches!(**source, VerifyBlockError::Transaction(TransactionError::CoinbaseExpiryBlockHeight { .. })))
-            || error.is_auth_commitment_mismatch()
-    }
-
     /// Returns the block and parent hashes of a verification failure whose authorizing data
     /// binding is still unconfirmed after the download task waited for the parent.
     fn unconfirmed_binding(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
@@ -3201,9 +3210,10 @@ where
                 false
             }
             BlockDownloadVerifyError::ParentUnknown { .. } => {
-                // The download task found no way for this block's parent to arrive. A real block
-                // is found again by a later tip refresh or sync round, so drop it without a
-                // restart, a retry or a score.
+                // The download task found no way for this block's parent to arrive, and the
+                // parent isn't waiting in this round's queue either. A real block is found again
+                // by a later tip refresh or sync round, so drop it without a restart, a retry or
+                // a score.
                 debug!(
                     error = ?e,
                     %peer,

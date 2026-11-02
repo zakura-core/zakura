@@ -2459,6 +2459,59 @@ async fn parent_unknown_is_dropped_without_a_restart_retry_or_score() {
     }
 }
 
+/// A block dropped for an unknown parent that is still in the round's queue was requested before
+/// its parent. It goes back to the end of the queue, behind its parent, so the parent is requested
+/// first. It goes back once per round: a second drop is final, like a drop whose parent isn't
+/// queued. Neither is a restart, a request, a score or a state question.
+#[tokio::test]
+async fn parent_unknown_child_goes_back_behind_its_queued_parent() {
+    let (mut chain_sync, _, mut verifier, mut peers, mut state, _) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let parent = block::Hash([0xAA; 32]);
+    let other = block::Hash([0xBB; 32]);
+    let child = block::Hash([0xCC; 32]);
+    let orphan = block::Hash([0xDD; 32]);
+    let mut reserve: IndexSet<block::Hash> = [parent, other].into_iter().collect();
+    let order = |reserve: &IndexSet<block::Hash>| reserve.iter().copied().collect::<Vec<_>>();
+
+    chain_sync
+        .handle_round_block_response(Err(parent_unknown(child, parent)), &mut reserve)
+        .await
+        .expect("a reordered block does not restart sync");
+    assert_eq!(order(&reserve), vec![parent, other, child]);
+
+    // The child is requested again, still before its parent, and dropped again.
+    reserve.shift_remove(&child);
+    chain_sync
+        .handle_round_block_response(Err(parent_unknown(child, parent)), &mut reserve)
+        .await
+        .expect("an unknown parent does not restart sync");
+    assert_eq!(
+        order(&reserve),
+        vec![parent, other],
+        "a block goes back once"
+    );
+
+    chain_sync
+        .handle_round_block_response(
+            Err(parent_unknown(orphan, block::Hash([0xEE; 32]))),
+            &mut reserve,
+        )
+        .await
+        .expect("an unknown parent does not restart sync");
+    assert_eq!(
+        order(&reserve),
+        vec![parent, other],
+        "a block whose parent isn't queued is dropped"
+    );
+
+    assert!(receiver.try_recv().is_err(), "no supplier is scored");
+    verifier.expect_no_requests().await;
+    state.expect_no_requests().await;
+    peers.expect_no_requests().await;
+}
+
 /// Only a verified block (or a finished tip extension) holds off the round's stall restart.
 ///
 /// Block 1,687,107 is the last checkpoint. Its first verification fails a minute in with a
@@ -4984,12 +5037,30 @@ async fn child_keeps_waiting_while_its_parent_download_is_retried() {
     );
 }
 
-/// A parent whose verification ends without a verdict (here a missing-input timeout) stays
-/// pending while the syncer requests it again. A child downloaded before the retry waits for the
-/// retry to pass its check, instead of asking the state about a parent it may still be holding.
+/// A parent the syncer requests again after its verification stays pending: one whose
+/// verification ends without a verdict (a missing-input timeout), and one whose body a peer forged
+/// (a coinbase height that disagrees with its expiry height). A child downloaded before the retry
+/// waits for the retry to pass its check, instead of asking the state about a parent that isn't
+/// there.
 #[tokio::test]
-async fn child_waits_while_its_parent_verification_is_retried() {
+async fn child_waits_while_its_parent_is_requested_again() {
     let _init_guard = zakura_test::init();
+    let missing_input =
+        || VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound);
+    let forged_body = || {
+        VerifyBlockError::Transaction(TransactionError::CoinbaseExpiryBlockHeight {
+            expiry_height: Some(Height(2)),
+            block_height: Height(1),
+            transaction_hash: zakura_chain::transaction::Hash([0xAB; 32]),
+        })
+    };
+    let parent_failures: [&dyn Fn() -> VerifyBlockError; 2] = [&missing_input, &forged_body];
+    for parent_failure in parent_failures {
+        child_waits_while_its_parent_is_requested_again_after(parent_failure()).await;
+    }
+}
+
+async fn child_waits_while_its_parent_is_requested_again_after(parent_failure: VerifyBlockError) {
     let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
         downloading_parent_setup(true, Height(0));
     let serve = |block: &Arc<Block>| zn::Response::Blocks(vec![Available((block.clone(), None))]);
@@ -5008,16 +5079,14 @@ async fn child_waits_while_its_parent_verification_is_retried() {
         .expect_request_that(|req| req.block().hash() == block1.hash())
         .await
         .respond(Err(crate::BoxError::from(RouterError::Block {
-            source: Box::new(VerifyBlockError::Transaction(
-                TransactionError::TransparentInputNotFound,
-            )),
+            source: Box::new(parent_failure),
         })));
     let error = downloads
         .next()
         .await
         .expect("the download task produces a result instead of panicking")
-        .expect_err("the parent's verification ends without a verdict");
-    assert!(error.is_retried_verification(), "{error:?}");
+        .expect_err("the parent's verification fails");
+    assert!(error.is_requested_again(), "{error:?}");
 
     // The child arrives before the parent is requested again, and waits for it.
     downloads
@@ -5562,7 +5631,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
 /// instead of leaving the newest block for the next discovery round.
 #[tokio::test]
 async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
-    for error_kind in 0..4 {
+    for error_kind in 0..FORGED_BODY_ERROR_KINDS {
         let (
             mut chain_sync,
             _sync_status,
@@ -5578,53 +5647,7 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
         let block_hash = block::Hash::from([0xAB; 32]);
         let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
 
-        let error = match error_kind {
-            0 => BlockDownloadVerifyError::TipChildHeightMismatch {
-                height: Height(1),
-                expected_height: Height(1_687_107),
-                hash: block_hash,
-                advertiser_addr: Some(addr),
-            },
-            1 => BlockDownloadVerifyError::Invalid {
-                error: RouterError::Block {
-                    source: Box::new(VerifyBlockError::Transaction(
-                        TransactionError::CoinbaseExpiryBlockHeight {
-                            expiry_height: Some(Height(1_687_107)),
-                            block_height: Height(1_687_105),
-                            transaction_hash: zakura_chain::transaction::Hash([0xAB; 32]),
-                        },
-                    )),
-                },
-                height: Height(1_687_105),
-                hash: block_hash,
-                advertiser_addr: Some(addr),
-            },
-            2 => BlockDownloadVerifyError::Invalid {
-                error: RouterError::Checkpoint {
-                    source: Box::new(zakura_consensus::VerifyCheckpointError::VerifyBlock(
-                        VerifyBlockError::Block {
-                            source: zakura_consensus::BlockError::BadMerkleRoot {
-                                actual: block::merkle::Root([0; 32]),
-                                expected: block::merkle::Root([1; 32]),
-                            },
-                        },
-                    )),
-                },
-                height: Height(1_687_105),
-                hash: block_hash,
-                advertiser_addr: Some(addr),
-            },
-            _ => checkpoint_commit_error(
-                zs::ValidateContextError::InvalidBlockCommitment(
-                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
-                        expected: [0; 32],
-                        actual: [1; 32],
-                    },
-                ),
-                block_hash,
-                addr,
-            ),
-        };
+        let error = forged_body_error(error_kind, block_hash, addr);
 
         let requeue = tokio::spawn(async move {
             let result = chain_sync
@@ -5655,6 +5678,112 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
         block_verifier_router.expect_no_requests().await;
     }
     Ok(())
+}
+
+/// The number of kinds [`forged_body_error`] builds.
+const FORGED_BODY_ERROR_KINDS: usize = 4;
+
+/// A failure of block `hash` served by `addr` whose body disagrees with its header, of kind
+/// `error_kind` (below [`FORGED_BODY_ERROR_KINDS`]): a tip child with the wrong coinbase height,
+/// a coinbase expiry height mismatch, a transaction Merkle root mismatch, and an authorizing data
+/// commitment mismatch.
+fn forged_body_error(
+    error_kind: usize,
+    block_hash: block::Hash,
+    addr: PeerSocketAddr,
+) -> BlockDownloadVerifyError {
+    match error_kind {
+        0 => BlockDownloadVerifyError::TipChildHeightMismatch {
+            height: Height(1),
+            expected_height: Height(1_687_107),
+            hash: block_hash,
+            advertiser_addr: Some(addr),
+        },
+        1 => BlockDownloadVerifyError::Invalid {
+            error: RouterError::Block {
+                source: Box::new(VerifyBlockError::Transaction(
+                    TransactionError::CoinbaseExpiryBlockHeight {
+                        expiry_height: Some(Height(1_687_107)),
+                        block_height: Height(1_687_105),
+                        transaction_hash: zakura_chain::transaction::Hash([0xAB; 32]),
+                    },
+                )),
+            },
+            height: Height(1_687_105),
+            hash: block_hash,
+            advertiser_addr: Some(addr),
+        },
+        2 => BlockDownloadVerifyError::Invalid {
+            error: RouterError::Checkpoint {
+                source: Box::new(zakura_consensus::VerifyCheckpointError::VerifyBlock(
+                    VerifyBlockError::Block {
+                        source: zakura_consensus::BlockError::BadMerkleRoot {
+                            actual: block::merkle::Root([0; 32]),
+                            expected: block::merkle::Root([1; 32]),
+                        },
+                    },
+                )),
+            },
+            height: Height(1_687_105),
+            hash: block_hash,
+            advertiser_addr: Some(addr),
+        },
+        _ => checkpoint_commit_error(
+            zs::ValidateContextError::InvalidBlockCommitment(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                    expected: [0; 32],
+                    actual: [1; 32],
+                },
+            ),
+            block_hash,
+            addr,
+        ),
+    }
+}
+
+/// The downloader keeps a failed block pending exactly when the syncer requests it again: a
+/// failed download, a verification without a verdict, a forged body, or a descendant of a forged
+/// body. Any other failure ends the block, so its children stop waiting for it.
+#[test]
+fn requested_again_matches_the_syncer_retries() {
+    let hash = block::Hash([0xAB; 32]);
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+
+    let requested_again = (0..FORGED_BODY_ERROR_KINDS)
+        .map(|kind| forged_body_error(kind, hash, addr))
+        .chain([
+            checkpoint_commit_error(
+                zs::ValidateContextError::AncestorBodyRejected(block::Hash([0xAA; 32])),
+                hash,
+                addr,
+            ),
+            utxo_lookup_timeout(hash),
+            BlockDownloadVerifyError::DownloadFailed {
+                error: not_found_block_error(hash),
+                hash,
+            },
+        ]);
+    for error in requested_again {
+        assert!(error.is_requested_again(), "{error:?}");
+    }
+
+    let ended = [
+        parent_unknown(hash, block::Hash([0xAA; 32])),
+        BlockDownloadVerifyError::BelowMinimumWork {
+            height: Height(42),
+            hash,
+        },
+        checkpoint_commit_error(
+            zs::ValidateContextError::InvalidBlockCommitment(
+                block::CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },
+            ),
+            hash,
+            addr,
+        ),
+    ];
+    for error in ended {
+        assert!(!error.is_requested_again(), "{error:?}");
+    }
 }
 
 /// Wraps a contextual error the way a failed checkpoint commit reports it to the syncer.

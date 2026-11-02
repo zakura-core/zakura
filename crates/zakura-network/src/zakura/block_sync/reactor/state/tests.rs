@@ -36,11 +36,22 @@ fn header_hash(height: u32) -> block::Hash {
     hash(0xB0, height)
 }
 
+/// The header tip of every [`authority_view`] and of a new machine driver.
+const VIEW_HEADER_TIP: u32 = 20;
+
 /// A committed view whose body-work authority is the `generation`th test authority.
+///
+/// An authority covers its view's header hash, so each view names one header
+/// frontier. A state observes that frontier only from its first view. The
+/// verified frontier stays below it, so the verified tip never diverges.
 fn authority_view(generation: u8) -> CommittedHeaderChainView {
     let frontier = Frontier {
         height: block::Height(0),
         hash: verified_hash(0),
+    };
+    let header_best = Frontier {
+        height: block::Height(VIEW_HEADER_TIP),
+        hash: header_hash(VIEW_HEADER_TIP),
     };
     CommittedHeaderChainView::new(
         EngineSnapshot {
@@ -50,10 +61,10 @@ fn authority_view(generation: u8) -> CommittedHeaderChainView {
             verified_generation: VerifiedGeneration::new(3),
             frontiers: FrontierSet {
                 finalized: frontier,
-                header_best: frontier,
+                header_best,
                 verified_best: frontier,
             },
-            header_best_score: ChainScore::new(SuffixWork::zero(), frontier.hash),
+            header_best_score: ChainScore::new(SuffixWork::zero(), header_best.hash),
             oldest_retained_height: frontier.height,
             alarms: Default::default(),
         },
@@ -64,32 +75,6 @@ fn authority_view(generation: u8) -> CommittedHeaderChainView {
 /// The `generation`th test authority.
 fn authority(generation: u8) -> BodyWorkAuthority {
     BodyWorkAuthority::for_view(&authority_view(generation))
-}
-
-/// Make `scope` the authority of `state`'s committed view. The view's other
-/// fields stay out of the query policy, and the state's verified tip never
-/// diverges from its header tip.
-fn set_authority(state: &mut ReactorState, scope: Option<BodyWorkAuthority>) {
-    if state.body_work_scope() != scope {
-        state.committed_view = scope.map(|scope| {
-            let generation = (0..=u8::MAX)
-                .find(|generation| authority(*generation) == scope)
-                .expect("the tests name only the generated authorities");
-            authority_view(generation)
-        });
-    }
-}
-
-/// Classify a reply under the committed authority `current`.
-fn complete_query(
-    state: &mut ReactorState,
-    query_id: NonZeroU64,
-    scope: BodyWorkAuthority,
-    body_anchor: Frontier,
-    current: Option<BodyWorkAuthority>,
-) -> NeededReply {
-    set_authority(state, current);
-    state.complete_needed_query(query_id, scope, body_anchor)
 }
 
 fn frontiers(tip: u32) -> BlockSyncFrontiers {
@@ -112,6 +97,15 @@ fn reactor_state(tip: u32, header_tip: u32) -> ReactorState {
         BootstrapGate::new(true, None),
         None,
     )
+}
+
+/// A started reactor state that holds the first test authority's committed view.
+#[cfg(test)]
+fn authorized_state(tip: u32, header_tip: u32) -> ReactorState {
+    ReactorState {
+        committed_view: Some(authority_view(0)),
+        ..reactor_state(tip, header_tip)
+    }
 }
 
 fn work(first_unclaimed: Option<u32>, backlog: usize, low_water: usize) -> WorkFacts {
@@ -137,7 +131,6 @@ fn refill(
     state: &mut ReactorState,
     force: bool,
     facts: WorkFacts,
-    scope: Option<BodyWorkAuthority>,
     accept: bool,
     now: Instant,
 ) -> Refill {
@@ -146,7 +139,7 @@ fn refill(
     } else {
         Err(ActionRefusal::Full)
     };
-    refill_answered(state, force, facts, scope, answer, now)
+    refill_answered(state, force, facts, answer, now)
 }
 
 /// Run one refill with the action channel's exact `answer`, which reaches the
@@ -155,7 +148,6 @@ fn refill_answered(
     state: &mut ReactorState,
     force: bool,
     facts: WorkFacts,
-    scope: Option<BodyWorkAuthority>,
     answer: Result<(), ActionRefusal>,
     now: Instant,
 ) -> Refill {
@@ -164,7 +156,6 @@ fn refill_answered(
         QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
         QueryOpening::NeedsWork => QueryStart::Work(facts),
     };
-    set_authority(state, scope);
     let QueryPlan::Dispatch(proposal) = state.propose_query(force, start) else {
         return Refill::Held;
     };
@@ -211,29 +202,15 @@ fn view(tip: u32, reset_epoch: u64, reaction_epoch: u64) -> SequencerView {
 #[test]
 fn refused_replacement_keeps_accepted_query() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let a = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     let next_id = state.queries.next_id();
 
     // A changed header tip makes the next proposal differ from `a`.
     state
         .progress
         .observe_header_tip(block::Height(120), header_hash(120));
-    let b = refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        false,
-        now,
-    );
+    let b = refill(&mut state, false, work(Some(1), 0, 10), false, now);
 
     assert!(
         matches!(b, Refill::Refused(b) if Some(b.query_id) == next_id && b.query_id != a.query_id)
@@ -249,34 +226,14 @@ fn refused_replacement_keeps_accepted_query() {
 #[test]
 fn rejected_replacement_then_old_reply_completes_old_query() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let a = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     state
         .progress
         .observe_header_tip(block::Height(120), header_hash(120));
-    let _ = refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        false,
-        now,
-    );
+    let _ = refill(&mut state, false, work(Some(1), 0, 10), false, now);
 
-    let reply = complete_query(
-        &mut state,
-        a.query_id,
-        a.scope,
-        anchor(0),
-        Some(authority(0)),
-    );
+    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0));
 
     assert_eq!(reply, NeededReply::Accept(a));
     assert_eq!(state.queries.pending(), None);
@@ -286,35 +243,15 @@ fn rejected_replacement_then_old_reply_completes_old_query() {
 #[test]
 fn unrelated_stale_reply_keeps_replacement_query() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let a = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     state
         .progress
         .observe_header_tip(block::Height(120), header_hash(120));
-    let b = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let b = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     assert_ne!(a.query_id, b.query_id);
 
-    let reply = complete_query(
-        &mut state,
-        a.query_id,
-        a.scope,
-        anchor(0),
-        Some(authority(0)),
-    );
+    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0));
     assert_eq!(reply, NeededReply::Stale);
     assert!(!state.queries.fail(a.query_id, a.scope, now));
     assert_eq!(state.queries.pending(), Some(b));
@@ -324,23 +261,13 @@ fn unrelated_stale_reply_keeps_replacement_query() {
 #[test]
 fn matching_reply_under_stale_authority_retires_query() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let a = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
 
-    let reply = complete_query(
-        &mut state,
-        a.query_id,
-        a.scope,
-        anchor(0),
-        Some(authority(1)),
-    );
+    // A production authority change also retires the pending query, so only a
+    // direct write reaches this defensive arm.
+    state.committed_view = Some(authority_view(1));
+    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0));
 
     assert_eq!(reply, NeededReply::StaleAuthority);
     assert_eq!(state.queries.pending(), None);
@@ -379,23 +306,10 @@ fn anchor_change_during_query_takes_frontier_path() {
             }),
         ),
     ] {
-        let mut state = reactor_state(5, 100);
-        let a = expect_accepted(refill(
-            &mut state,
-            false,
-            work(Some(6), 0, 10),
-            Some(authority(0)),
-            true,
-            now,
-        ));
+        let mut state = authorized_state(5, 100);
+        let a = expect_accepted(refill(&mut state, false, work(Some(6), 0, 10), true, now));
 
-        let reply = complete_query(
-            &mut state,
-            a.query_id,
-            a.scope,
-            body_anchor,
-            Some(authority(0)),
-        );
+        let reply = state.complete_needed_query(a.query_id, a.scope, body_anchor);
 
         assert_eq!(reply, expected);
         assert_eq!(state.queries.pending(), None);
@@ -405,15 +319,8 @@ fn anchor_change_during_query_takes_frontier_path() {
 #[test]
 fn view_with_unchanged_reaction_epoch_only_refreshes_mirrors() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let a = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
 
     let mut changed = view(7, 0, 0);
     changed.download_floor = block::Height(3);
@@ -442,27 +349,13 @@ fn view_with_unchanged_reaction_epoch_only_refreshes_mirrors() {
 #[test]
 fn refused_forced_refill_retries_past_low_water() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let refused = refill(
-        &mut state,
-        true,
-        work(Some(1), 50, 10),
-        Some(authority(0)),
-        false,
-        now,
-    );
+    let mut state = authorized_state(0, 100);
+    let refused = refill(&mut state, true, work(Some(1), 50, 10), false, now);
     assert!(matches!(refused, Refill::Refused(query) if query.forced));
     assert!(state.queries.retry_forced());
 
     state.queries.retry_elapsed();
-    let retried = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 50, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let retried = expect_accepted(refill(&mut state, false, work(Some(1), 50, 10), true, now));
     assert!(retried.forced);
     assert!(!state.queries.retry_forced());
 
@@ -472,14 +365,7 @@ fn refused_forced_refill_retries_past_low_water() {
         .complete(retried.query_id, retried.scope)
         .expect("the retry is pending");
     assert_eq!(
-        refill(
-            &mut state,
-            false,
-            work(Some(1), 50, 10),
-            Some(authority(0)),
-            true,
-            now,
-        ),
+        refill(&mut state, false, work(Some(1), 50, 10), true, now,),
         Refill::Held
     );
 }
@@ -488,30 +374,13 @@ fn refused_forced_refill_retries_past_low_water() {
 #[test]
 fn failed_forced_query_retries_past_low_water() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let query = expect_accepted(refill(
-        &mut state,
-        true,
-        work(Some(1), 50, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let query = expect_accepted(refill(&mut state, true, work(Some(1), 50, 10), true, now));
 
     assert!(state.queries.fail(query.query_id, query.scope, now));
     state.queries.retry_elapsed();
 
-    assert!(
-        expect_accepted(refill(
-            &mut state,
-            false,
-            work(Some(1), 50, 10),
-            Some(authority(0)),
-            true,
-            now,
-        ))
-        .forced
-    );
+    assert!(expect_accepted(refill(&mut state, false, work(Some(1), 50, 10), true, now,)).forced);
 }
 
 /// The old query's reply lifts a refused replacement's retry gate. The refused
@@ -519,27 +388,13 @@ fn failed_forced_query_retries_past_low_water() {
 #[test]
 fn old_reply_keeps_the_force_a_refused_replacement_owes() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let old = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let old = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     state
         .progress
         .observe_header_tip(block::Height(120), header_hash(120));
     assert!(matches!(
-        refill(
-            &mut state,
-            true,
-            work(Some(1), 0, 10),
-            Some(authority(0)),
-            false,
-            now,
-        ),
+        refill(&mut state, true, work(Some(1), 0, 10), false, now,),
         Refill::Refused(_)
     ));
 
@@ -552,16 +407,9 @@ fn old_reply_keeps_the_force_a_refused_replacement_owes() {
 #[test]
 fn reset_clears_the_owed_force() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
+    let mut state = authorized_state(0, 100);
     assert!(matches!(
-        refill(
-            &mut state,
-            true,
-            work(Some(1), 0, 10),
-            Some(authority(0)),
-            false,
-            now,
-        ),
+        refill(&mut state, true, work(Some(1), 0, 10), false, now,),
         Refill::Refused(_)
     ));
 
@@ -578,15 +426,8 @@ fn reset_clears_the_owed_force() {
 #[test]
 fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let accepted = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let accepted = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     let next_id = state.queries.next_id();
     state
         .progress
@@ -596,7 +437,6 @@ fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
         &mut state,
         false,
         work(Some(1), 0, 10),
-        Some(authority(0)),
         Err(ActionRefusal::Closed),
         now,
     );
@@ -618,28 +458,14 @@ fn closed_channel_ends_dispatch_and_keeps_the_accepted_query() {
 #[test]
 fn reset_view_forces_refill_past_retry_and_low_water() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 100);
-    let a = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let mut state = authorized_state(0, 100);
+    let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
     // A refused replacement arms the retry gate.
     state
         .progress
         .observe_header_tip(block::Height(120), header_hash(120));
     assert!(matches!(
-        refill(
-            &mut state,
-            false,
-            work(Some(1), 0, 10),
-            Some(authority(0)),
-            false,
-            now,
-        ),
+        refill(&mut state, false, work(Some(1), 0, 10), false, now,),
         Refill::Refused(_)
     ));
 
@@ -659,14 +485,7 @@ fn reset_view_forces_refill_past_retry_and_low_water() {
     // Stale outstanding work exceeds the low-water target, but the forced
     // refill still dispatches, even right after a no-op view.
     assert_eq!(state.observe_view(view(0, 1, 1)), ViewReaction::ObserveOnly);
-    let b = expect_accepted(refill(
-        &mut state,
-        true,
-        work(Some(1), 50, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let b = expect_accepted(refill(&mut state, true, work(Some(1), 50, 10), true, now));
     assert_eq!(b.query_id.get(), a.query_id.get() + 1);
     assert_eq!(state.queries.pending(), Some(b));
 }
@@ -682,7 +501,7 @@ fn header_quiet_holds_queries_until_body_sync_starts() {
             initial_view(frontiers(0)),
         ),
         BootstrapGate::new(false, None),
-        None,
+        Some(authority_view(0)),
     );
     state
         .bootstrap
@@ -696,63 +515,32 @@ fn header_quiet_holds_queries_until_body_sync_starts() {
         .bootstrap
         .hold_for_headers(zakura_rt::time::Instant::now() + Duration::from_secs(30));
     assert!(!state.bootstrap.is_header_quiet());
-    let _ = expect_accepted(refill(
-        &mut state,
-        false,
-        work(Some(1), 0, 10),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let _ = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
 }
 
 #[test]
 fn hint_refresh_walks_its_interval_in_query_batches() {
     let now = Instant::now();
-    let mut state = reactor_state(0, 20_000);
+    let mut state = authorized_state(0, 20_000);
     state
         .queries
         .start_hint_refresh(7, Some((block::Height(1), block::Height(5_000))));
 
-    let first = expect_accepted(refill(
-        &mut state,
-        false,
-        work(None, 0, 0),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let first = expect_accepted(refill(&mut state, false, work(None, 0, 0), true, now));
     assert_eq!(
         (first.from, first.limit, first.hint_revision),
         (block::Height(1), NEEDED_BLOCK_REFILL_LIMIT, Some(7))
     );
-    let NeededReply::Accept(first) = complete_query(
-        &mut state,
-        first.query_id,
-        first.scope,
-        anchor(0),
-        Some(authority(0)),
-    ) else {
+    let NeededReply::Accept(first) =
+        state.complete_needed_query(first.query_id, first.scope, anchor(0))
+    else {
         panic!("the reply matches the pending query and its anchor");
     };
     assert!(state.queries.advance_hint_refresh(&first));
 
-    let second = expect_accepted(refill(
-        &mut state,
-        false,
-        work(None, 0, 0),
-        Some(authority(0)),
-        true,
-        now,
-    ));
+    let second = expect_accepted(refill(&mut state, false, work(None, 0, 0), true, now));
     assert_eq!((second.from, second.limit), (block::Height(4_001), 1_000));
-    let _ = complete_query(
-        &mut state,
-        second.query_id,
-        second.scope,
-        anchor(0),
-        Some(authority(0)),
-    );
+    let _ = state.complete_needed_query(second.query_id, second.scope, anchor(0));
     assert!(!state.queries.advance_hint_refresh(&second));
     assert_eq!(state.queries.hint_refresh(), None);
 }
@@ -784,6 +572,8 @@ enum Input {
         first_unclaimed: Option<u32>,
         backlog: usize,
         low_water: usize,
+        /// The first committed view arrives before this refill, if it hasn't yet.
+        /// A refill before any view has no authority.
         has_authority: bool,
         answer: Result<(), ActionRefusal>,
     },
@@ -921,7 +711,8 @@ struct Model {
     retry_forced: bool,
     /// The action channel reported closed.
     closed: bool,
-    authority: u8,
+    /// The generation of the latest committed view, once one arrived.
+    authority: Option<u8>,
     header_tip: u32,
     verified_tip: u32,
     floor: u32,
@@ -945,7 +736,7 @@ impl Model {
             retry_until_ms: None,
             retry_forced: false,
             closed: false,
-            authority: 0,
+            authority: None,
             header_tip,
             verified_tip: 0,
             floor: 0,
@@ -964,7 +755,6 @@ impl Model {
         first_unclaimed: Option<u32>,
         backlog: usize,
         low_water: usize,
-        has_authority: bool,
         answer: Result<(), ActionRefusal>,
     ) -> Option<(ModelQuery, bool)> {
         if self.closed {
@@ -987,13 +777,11 @@ impl Model {
         if !forced && backlog >= low_water {
             return None;
         }
-        if !has_authority {
-            return None;
-        }
+        let scope = self.authority?;
         let window = u32::try_from((low_water * 2).max(1)).expect("small test window");
         let query = ModelQuery {
             id: self.next_id,
-            scope: self.authority,
+            scope,
             from,
             limit: (self.header_tip - from + 1).min(window).min(READ_LIMIT),
             header_tip: self.header_tip,
@@ -1054,7 +842,7 @@ impl Model {
         };
         self.pending = None;
         self.retry_until_ms = None;
-        if scope != self.authority {
+        if Some(scope) != self.authority {
             return ModelReply::StaleAuthority;
         }
         if anchor == (self.verified_tip, verified_hash(self.verified_tip)) {
@@ -1063,6 +851,20 @@ impl Model {
             ModelReply::Advanced(anchor.0, anchor.1)
         } else {
             ModelReply::Reset(anchor.0, anchor.1)
+        }
+    }
+
+    /// A committed view of another authority supersedes the query state. The
+    /// first view also names the header tip.
+    fn observe_authority(&mut self, generation: u8) {
+        if self.authority.is_none() {
+            self.header_tip = VIEW_HEADER_TIP;
+        }
+        if self.authority != Some(generation) {
+            self.authority = Some(generation);
+            self.pending = None;
+            self.retry_until_ms = None;
+            self.retry_forced = false;
         }
     }
 
@@ -1206,11 +1008,28 @@ impl Driver {
     fn new() -> Self {
         Self {
             base: Instant::now(),
-            state: reactor_state(0, 20),
+            state: reactor_state(0, VIEW_HEADER_TIP),
             // The finalized height stays at zero: no generated view raises it.
-            model: Model::new(20),
+            model: Model::new(VIEW_HEADER_TIP),
             summary: BlockReactorReplaySummary::default(),
             actions: Vec::new(),
+        }
+    }
+
+    /// Deliver the committed view of authority `generation` through production's
+    /// transition, and apply the same rule to the model.
+    fn observe_authority(&mut self, generation: u8) {
+        let now = self.base + Duration::from_millis(self.model.now_ms);
+        let _ = self
+            .state
+            .observe_committed_view(authority_view(generation), now);
+        self.model.observe_authority(generation);
+    }
+
+    /// Deliver the first committed view, unless one already arrived.
+    fn observe_first_authority(&mut self) {
+        if self.model.authority.is_none() {
+            self.observe_authority(0);
         }
     }
 
@@ -1249,23 +1068,19 @@ impl Driver {
                 has_authority,
                 answer,
             } => {
-                let scope = has_authority.then(|| authority(self.model.authority));
+                if has_authority {
+                    self.observe_first_authority();
+                }
                 let actual = refill_answered(
                     &mut self.state,
                     force,
                     work(first_unclaimed, backlog, low_water),
-                    scope,
                     answer,
                     now,
                 );
-                let expected = self.model.refill(
-                    force,
-                    first_unclaimed,
-                    backlog,
-                    low_water,
-                    has_authority,
-                    answer,
-                );
+                let expected =
+                    self.model
+                        .refill(force, first_unclaimed, backlog, low_water, answer);
                 self.record_refill(actual, expected);
             }
             Input::Reply {
@@ -1287,15 +1102,13 @@ impl Driver {
                     AnchorKind::OtherHash => (tip, hash(0xCC, tip)),
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = complete_query(
-                    &mut self.state,
+                let actual = self.state.complete_needed_query(
                     query_id,
                     authority(scope),
                     Frontier {
                         height: block::Height(body_anchor.0),
                         hash: body_anchor.1,
                     },
-                    Some(authority(self.model.authority)),
                 );
                 let expected = self.model.reply(id, scope, body_anchor);
                 self.summary.replies += 1;
@@ -1341,7 +1154,7 @@ impl Driver {
                     .observe_header_tip(block::Height(tip), header_hash(tip));
                 self.model.header_tip = tip;
             }
-            Input::Authority(generation) => self.model.authority = generation,
+            Input::Authority(generation) => self.observe_authority(generation),
             Input::View {
                 tip,
                 floor_lag,
@@ -1378,12 +1191,11 @@ impl Driver {
                         // The reaction refills, forced after a reset, with
                         // outstanding work over the low-water target.
                         check(&self.state, &self.model, self.base);
-                        let scope = Some(authority(self.model.authority));
+                        self.observe_first_authority();
                         let actual = refill(
                             &mut self.state,
                             reset,
                             work(Some(floor + 1), refill_backlog, 10),
-                            scope,
                             refill_accept,
                             now,
                         );
@@ -1392,7 +1204,6 @@ impl Driver {
                             Some(floor + 1),
                             refill_backlog,
                             10,
-                            true,
                             if refill_accept {
                                 Ok(())
                             } else {
@@ -1794,8 +1605,8 @@ fn reactor_witness_exercises_refusal_retry_reset_and_authority() {
             transitions: 15,
             accepted: 4,
             refused: 1,
-            replies: 2,
-            stale_replies: 1,
+            replies: 1,
+            stale_replies: 0,
             retry_expiries: 2,
             views: 3,
             reactions: 2,
@@ -1807,6 +1618,24 @@ fn reactor_witness_exercises_refusal_retry_reset_and_authority() {
         BlockReactorReplaySummary::default()
     );
     println!("tier=Machine target=block_reactor decoder=2 {summary:?}");
+}
+
+/// A reply under another authority leaves the pending query in place.
+#[test]
+fn reactor_witness_exercises_a_stale_reply() {
+    let summary = replay_block_reactor_bytes(&[0, 0, 1, 200, 1, 0, 1, 0]);
+    assert_eq!((summary.replies, summary.stale_replies), (1, 1));
+}
+
+/// A committed view of another authority retires the pending query through
+/// production's transition, in the state and in the model.
+#[test]
+fn reactor_history_retires_the_pending_query_on_an_authority_change() {
+    let history = trace_block_reactor_bytes(&[0, 0, 1, 200, 5, 0, 1, 0]);
+    assert!(history.summary.is_some());
+    assert!(history.steps[0].actual.pending.is_some());
+    assert_eq!(history.steps[1].actual.pending, None);
+    assert_eq!(history.steps[1].actual, history.steps[1].expected);
 }
 
 #[test]

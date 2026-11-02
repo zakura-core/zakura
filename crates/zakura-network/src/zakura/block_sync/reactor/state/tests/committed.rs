@@ -144,8 +144,7 @@ fn observe(state: &mut ReactorState, spec: &Spec, now: time::Instant) -> Committ
 
 /// Open a forced refill against the state's own authority.
 fn committed_refill(state: &mut ReactorState, accept: bool, now: Instant) -> Refill {
-    let scope = state.body_work_scope();
-    refill(state, true, work(Some(1), 0, 1), scope, accept, now)
+    refill(state, true, work(Some(1), 0, 1), accept, now)
 }
 
 #[test]

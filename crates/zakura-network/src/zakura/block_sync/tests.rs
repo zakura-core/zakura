@@ -36,7 +36,7 @@ use super::{
 };
 use crate::zakura::{
     framed_channel,
-    testkit::{await_until, TraceCapture, TraceValue},
+    testkit::{await_until, startup_committed_view, TraceCapture, TraceValue},
     trace::BlockBodySource,
     wire_codec::WireError,
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
@@ -201,23 +201,7 @@ fn header_tip_startup(
     config: ZakuraBlockSyncConfig,
 ) -> BlockSyncStartup {
     let mut startup = BlockSyncStartup::new(frontiers, best_header_tip, header_tip, config);
-    let verified = zakura_header_chain::Frontier::new(
-        frontiers.verified_block_tip,
-        frontiers.verified_block_hash,
-    );
-    let snapshot = committed_snapshot(
-        0,
-        0,
-        0,
-        zakura_header_chain::Frontier::new(
-            frontiers.finalized_height,
-            frontiers.verified_block_hash,
-        ),
-        verified,
-        zakura_header_chain::Frontier::new(best_header_tip.0, best_header_tip.1),
-    );
-    let (_views, committed_views) = watch::channel(Some(committed_view(snapshot, 0)));
-    startup.committed_views = Some(committed_views);
+    startup.committed_views = Some(startup_committed_view(frontiers, best_header_tip));
     startup
 }
 

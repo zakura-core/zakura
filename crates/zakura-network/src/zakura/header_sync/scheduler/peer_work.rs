@@ -195,10 +195,13 @@ impl Drop for HeaderCapacityLeaseInner {
 /// the two. Dropping this value ends the call's ownership once.
 #[derive(Debug)]
 pub(in crate::zakura::header_sync) struct RetainedHeaders {
+    #[cfg(any(test, zakura_sim))]
     peer: ZakuraPeerId,
     incarnation: WorkIncarnation,
-    /// The call that holds the headers, once one does.
-    call: Option<StorageCall>,
+    /// The call that holds the headers.
+    call: StorageCall,
+    /// The capacity these headers hold until this value drops.
+    #[cfg_attr(not(any(test, zakura_sim)), allow(dead_code))]
     leases: Vec<HeaderCapacityLease>,
     end: HeaderWorkEnd,
     #[cfg(any(test, zakura_sim))]
@@ -207,19 +210,21 @@ pub(in crate::zakura::header_sync) struct RetainedHeaders {
 
 impl RetainedHeaders {
     /// The peer whose work these headers belong to.
+    #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::header_sync) fn peer(&self) -> &ZakuraPeerId {
         &self.peer
     }
 
-    /// The round and call holding these headers, once a call does.
-    pub(in crate::zakura::header_sync) fn work(&self) -> Option<WorkCall> {
-        self.call.map(|call| WorkCall {
+    /// The round and call holding these headers.
+    pub(in crate::zakura::header_sync) fn work(&self) -> WorkCall {
+        WorkCall {
             incarnation: self.incarnation,
-            call,
-        })
+            call: self.call,
+        }
     }
 
     /// The number of headers retained.
+    #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::header_sync) fn headers(&self) -> usize {
         self.leases
             .iter()
@@ -227,10 +232,11 @@ impl RetainedHeaders {
             .fold(0usize, usize::saturating_add)
     }
 
-    /// Report this ownership's events to `observer`.
+    /// Report this ownership's events to `observer`, starting with its hold.
     #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::header_sync) fn observed_by(&mut self, observer: &ObserverSlot) {
         self.observer = observer.clone();
+        self.report_held();
     }
 
     /// Record how this ownership will end when it drops.
@@ -238,24 +244,27 @@ impl RetainedHeaders {
         self.end = end;
     }
 
-    /// Move these headers to `call`. A call that already holds them is a prepare,
-    /// and `call` is its apply.
-    pub(in crate::zakura::header_sync) fn enter_call(&mut self, call: StorageCall) {
-        if let Some(previous) = self.call {
-            debug_assert!(
-                previous.kind == StorageCallKind::Prepare && call.kind == StorageCallKind::Apply,
-                "retained headers move only from a prepare to its apply"
-            );
-            self.end = HeaderWorkEnd::HandedToApply { apply: call.number };
-            self.record_end();
-        }
-        self.call = Some(call);
+    /// Move these headers from their prepare to its `apply`, with no release between.
+    pub(in crate::zakura::header_sync) fn hand_to_apply(&mut self, apply: StorageCall) {
+        debug_assert!(
+            self.call.kind == StorageCallKind::Prepare && apply.kind == StorageCallKind::Apply,
+            "retained headers move only from a prepare to its apply"
+        );
+        self.end = HeaderWorkEnd::HandedToApply { apply: apply.number };
+        self.record_end();
+        self.call = apply;
         self.end = HeaderWorkEnd::Dropped;
         #[cfg(any(test, zakura_sim))]
+        self.report_held();
+    }
+
+    /// Report that this ownership's call holds its headers.
+    #[cfg(any(test, zakura_sim))]
+    fn report_held(&self) {
         if let Some(observer) = &self.observer.0 {
             observer.observe(ReactorEvent::HeadersHeld {
-                call: call.number,
-                kind: call.kind,
+                call: self.call.number,
+                kind: self.call.kind,
                 peer: self.peer.clone(),
                 incarnation: self.incarnation.get(),
                 headers: self.headers(),
@@ -263,25 +272,20 @@ impl RetainedHeaders {
         }
     }
 
-    /// Count this ownership's end and report it before any lease can release.
+    /// Report this ownership's end before any lease can release.
     fn record_end(&self) {
-        let Some(call) = self.call else {
-            return;
-        };
         #[cfg(any(test, zakura_sim))]
         if let Some(observer) = &self.observer.0 {
             // An unwinding reactor reports nothing, as `HeaderSyncObserver` says.
             if !std::thread::panicking() {
                 observer.observe(ReactorEvent::HeadersEnded {
-                    call: call.number,
+                    call: self.call.number,
                     incarnation: self.incarnation.get(),
                     headers: self.headers(),
                     end: self.end,
                 });
             }
         }
-        #[cfg(not(any(test, zakura_sim)))]
-        let _ = call;
     }
 }
 
@@ -591,12 +595,14 @@ impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn retain_headers(
         &self,
         peer: &ZakuraPeerId,
+        call: StorageCall,
     ) -> Option<RetainedHeaders> {
         let incarnation = self.policy.active(peer)?.incarnation;
         Some(RetainedHeaders {
+            #[cfg(any(test, zakura_sim))]
             peer: peer.clone(),
             incarnation,
-            call: None,
+            call,
             leases: self.staged_capacity.get(peer).cloned().unwrap_or_default(),
             end: HeaderWorkEnd::Dropped,
             #[cfg(any(test, zakura_sim))]

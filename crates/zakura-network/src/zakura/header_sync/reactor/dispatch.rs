@@ -436,17 +436,11 @@ impl HeaderSyncReactor {
         let call = locator_key
             .as_ref()
             .map_or_else(|| self.state.calls.propose(kind), |key| key.call);
-        let mut retained = match &action {
+        let holder = match &action {
             HeaderPortOperation::PrepareHeaderTarget { peer, .. }
-            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
-                held.or_else(|| self.peer_work_queue.retain_headers(peer))
-            }
+            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => Some(peer.clone()),
             _ => None,
         };
-        #[cfg(any(test, zakura_sim))]
-        if let Some(retained) = &mut retained {
-            retained.observed_by(&self.startup.observer);
-        }
         let panic_context = self.port_panic_context(&action, locator_key.clone(), call);
         #[cfg(any(test, zakura_sim))]
         let (tap, dispatched) = self.begin_port_call(&action, call);
@@ -522,12 +516,11 @@ impl HeaderSyncReactor {
                 }
             );
         }
-        if let Some(retained) = &mut retained {
-            retained.enter_call(call);
-            let work = retained.work().expect("the call was just entered");
-            let peer = retained.peer().clone();
-            self.peer_work_queue.bind_call(&peer, work);
-        }
+        let mut retained = holder.and_then(|peer| {
+            let retained = self.retain_for_call(&peer, held, call)?;
+            self.peer_work_queue.bind_call(&peer, retained.work());
+            Some(retained)
+        });
         let operation = AssertUnwindSafe(operation)
             .catch_unwind()
             .map(move |result| {
@@ -558,6 +551,26 @@ impl HeaderSyncReactor {
         let operation = observe::PendingCall::new(operation, pending_tap);
         self.pending_port_operations.push(Box::pin(operation));
         StorageDispatch::Started(call)
+    }
+
+    /// Give `peer`'s headers to `call`: from the prepare that holds them, or else
+    /// from the peer's current round. The caller reports `Dispatched` first, so
+    /// the hold follows it.
+    fn retain_for_call(
+        &mut self,
+        peer: &ZakuraPeerId,
+        held: Option<RetainedHeaders>,
+        call: StorageCall,
+    ) -> Option<RetainedHeaders> {
+        if let Some(mut held) = held {
+            held.hand_to_apply(call);
+            return Some(held);
+        }
+        #[cfg_attr(not(any(test, zakura_sim)), allow(unused_mut))]
+        let mut retained = self.peer_work_queue.retain_headers(peer, call)?;
+        #[cfg(any(test, zakura_sim))]
+        retained.observed_by(&self.startup.observer);
+        Some(retained)
     }
 
     /// Returns the tap `call`'s future reports through and, when an observer is

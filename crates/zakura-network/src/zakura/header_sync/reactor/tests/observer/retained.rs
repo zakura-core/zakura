@@ -73,15 +73,16 @@ fn held_by_prepare(
 ) -> RetainedHeaders {
     let mut retained = reactor
         .peer_work_queue
-        .retain_headers(peer)
+        .retain_headers(
+            peer,
+            StorageCall {
+                number,
+                kind: StorageCallKind::Prepare,
+            },
+        )
         .expect("the peer has a started round");
     retained.observed_by(&reactor.startup.observer);
-    retained.enter_call(StorageCall {
-        number,
-        kind: StorageCallKind::Prepare,
-    });
-    let work = retained.work().expect("the call was just entered");
-    reactor.peer_work_queue.bind_call(peer, work);
+    reactor.peer_work_queue.bind_call(peer, retained.work());
     retained
 }
 

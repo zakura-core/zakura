@@ -665,7 +665,11 @@ impl Harness {
             } => {
                 let id = peer_id(peer);
                 let operation = self.queue.begin_prepare(&id, bounded_prefix);
-                let retained = self.queue.retain_headers(&id);
+                let storage_call = StorageCall {
+                    number: self.last_call + 1,
+                    kind: StorageCallKind::Prepare,
+                };
+                let retained = self.queue.retain_headers(&id, storage_call);
                 let Some(ModelWork::Active {
                     tip,
                     incarnation,
@@ -722,20 +726,13 @@ impl Harness {
                 };
                 assert_eq!(completion, expected_completion, "{PROPERTY}: completion");
                 let incarnation = *incarnation;
-                let mut retained =
-                    retained.expect("the queue holds the round that the model holds");
+                let retained = retained.expect("the queue holds the round that the model holds");
                 self.last_call += 1;
                 self.last_hold += 1;
                 *phase = HeaderTargetPhase::Preparing;
                 *call = Some(self.last_call);
                 *staged = 0;
-                let storage_call = StorageCall {
-                    number: self.last_call,
-                    kind: StorageCallKind::Prepare,
-                };
-                retained.enter_call(storage_call);
-                self.queue
-                    .bind_call(&id, retained.work().expect("the call was just entered"));
+                self.queue.bind_call(&id, retained.work());
                 let mut headers = 0;
                 for lease in &mut self.leases {
                     if lease.queued_for == Some(peer) {
@@ -758,7 +755,7 @@ impl Harness {
                 let Some(mut hold) = self.take_hold(hold) else {
                     return self.check();
                 };
-                let work = hold.retained.work().expect("every hold entered a call");
+                let work = hold.retained.work();
                 let actual = self.queue.settle_call(&peer_id(hold.peer), work);
                 let current = matches!(
                     self.work.get(&hold.peer),
@@ -778,14 +775,12 @@ impl Harness {
                     self.last_call += 1;
                     hold.call = self.last_call;
                     hold.kind = StorageCallKind::Apply;
-                    hold.retained.enter_call(StorageCall {
+                    hold.retained.hand_to_apply(StorageCall {
                         number: self.last_call,
                         kind: StorageCallKind::Apply,
                     });
-                    self.queue.bind_call(
-                        &peer_id(hold.peer),
-                        hold.retained.work().expect("the call was just entered"),
-                    );
+                    self.queue
+                        .bind_call(&peer_id(hold.peer), hold.retained.work());
                     assert!(
                         self.queue.begin_apply(&peer_id(hold.peer)),
                         "{PROPERTY}: a current prepare's work is preparing"
@@ -973,7 +968,7 @@ impl Harness {
                 "{PROPERTY}: call {} headers",
                 hold.call
             );
-            let work = hold.retained.work().expect("every hold entered a call");
+            let work = hold.retained.work();
             assert_eq!(
                 (work.incarnation.get(), work.call.number, work.call.kind),
                 (hold.incarnation, hold.call, hold.kind),

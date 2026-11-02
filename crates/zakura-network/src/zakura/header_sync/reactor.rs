@@ -1539,10 +1539,7 @@ impl HeaderSyncReactor {
         peer: &ZakuraPeerId,
         retained: Option<&RetainedHeaders>,
     ) -> bool {
-        match retained.and_then(RetainedHeaders::work) {
-            Some(work) => self.peer_work_queue.settle_call(peer, work),
-            None => true,
-        }
+        retained.is_none_or(|retained| self.peer_work_queue.settle_call(peer, retained.work()))
     }
 
     fn handle_target_admission(

@@ -3260,16 +3260,15 @@ fn commit_window_stays_fundable_at_exact_floor() {
 #[test]
 fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=1);
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.budget().reserved(), 100);
 
     let watchdog_released = queue
         .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
         .released_bytes;
 
     assert_eq!(watchdog_released, 100);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
     let late_owner_released = queue
@@ -3277,7 +3276,7 @@ fn work_queue_force_cancel_and_owner_timeout_release_once() {
         .released_bytes;
 
     assert_eq!(late_owner_released, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 }
 
@@ -3391,14 +3390,13 @@ fn receipt_releases_wire_reservation_while_body_retained() {
     // Receipt ends the wire reservation: the estimate returns to the budget while
     // the caller still owns the body (the height stays claimed in `in_flight`).
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=1);
     assert_eq!(queue.reserved_bytes(), 100);
 
     assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
     assert_eq!(queue.reserved_bytes(), 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(
         queue.in_flight_contains(block::Height(1)),
         "the received height stays claimed; the body handoff owns it"
@@ -3410,12 +3408,11 @@ fn floor_watchdog_skips_received_heights() {
     // After receipt released the reservation, the watchdog must neither requeue
     // the height (the body handoff owns it) nor release a second time.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=1);
 
     assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 
     let outcome =
         queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
@@ -3433,7 +3430,7 @@ fn floor_watchdog_skips_received_heights() {
     assert_eq!(outcome.returned_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     let before = queue.budget().reserved();
     queue.advance_floor(block::Height(1));
     assert_eq!(queue.budget().reserved(), before);
@@ -3555,7 +3552,6 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
 #[test]
 fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=1);
 
     let outcome =
@@ -3564,7 +3560,7 @@ fn late_body_does_not_resurrect_charge() {
     assert_eq!(outcome.returned_count, 1);
     assert_eq!(outcome.released_count, 0);
     assert_eq!(outcome.missing_count, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
     let duplicate = queue.release_reserved_and_return_items_detailed_for_owner(
@@ -3581,7 +3577,7 @@ fn late_body_does_not_resurrect_charge() {
         None,
         "a late body cannot release a claim the watchdog already released"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
@@ -3589,7 +3585,6 @@ fn claim_received_does_not_orphan_a_charge() {
     // An unmatched body claims its height without a new reservation, but any stale
     // request reservation it still owned is handed back exactly once.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=1);
 
     let old_charge = queue
@@ -3598,12 +3593,12 @@ fn claim_received_does_not_orphan_a_charge() {
 
     assert_eq!(old_charge.bytes(), 100);
     drop(old_charge);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 
     queue.release_reserved_heights_for_owner(owner, [block::Height(1)]);
 
     assert_eq!(
-        budget.reserved(),
+        queue.budget().reserved(),
         0,
         "a received height owns no further charge"
     );
@@ -3618,14 +3613,13 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=2);
     assert_eq!(queue.reserved_bytes(), 200);
 
     // Height 1 is received: its whole estimate returns to the budget.
     assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.budget().reserved(), 100);
 
     // Floor GC releases only the still-reserved (unreceived) height 2.
     let before = queue.budget().reserved();
@@ -3636,7 +3630,7 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
         released, 100,
         "WorkQueue releases only the still-reserved height; received bodies hold no charge"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
@@ -3655,7 +3649,6 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let budget = queue.budget();
     let owner = queue.publish_fixture(1..=2);
     assert_eq!(queue.reserved_bytes(), 200);
 
@@ -3664,7 +3657,7 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     // forward.
     assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.budget().reserved(), 100);
 
     // GC both heights: only the still-reserved height 2 releases. The received
     // height 1 is skipped (its reservation already ended) and stays in `in_flight`.
@@ -3676,13 +3669,13 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
         "release_reserved_heights_for_owner frees only the still-reserved estimate, exactly once"
     );
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 
     // Floor GC clears the bookkeeping; nothing drifts.
     let before = queue.budget().reserved();
     queue.advance_floor(block::Height(2));
     assert_eq!(queue.budget().reserved(), before);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
@@ -15068,9 +15061,8 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
     );
 
     let owner = queue.publish_fixture(3..=3);
-    let receipt_budget = queue.budget();
     drop(queue.begin_receipt_for_owner(owner, block::Height(3)));
-    assert_eq!(receipt_budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     queue.refresh_size_estimates(
         test_work_scope(),
         [needed(3, BlockSizeEstimate::Advertised(7_000))],

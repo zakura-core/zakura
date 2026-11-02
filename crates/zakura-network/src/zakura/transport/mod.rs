@@ -24,6 +24,8 @@ pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 // unused *here* until a later service imports them through `crate::zakura`.
 #[cfg(any(test, zakura_sim))]
 pub(crate) use guard::BudgetObserver;
+#[cfg(test)]
+pub(crate) use guard::tests::callback_waker;
 #[allow(unused_imports)]
 pub(crate) use guard::{
     Admit, BudgetClosure, BudgetReader, ByteBudget, ByteRelease,

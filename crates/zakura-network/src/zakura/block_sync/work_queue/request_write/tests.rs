@@ -2,7 +2,7 @@ use super::*;
 use crate::zakura::block_sync::block_sync_observe::{
     BlockEvent, BlockSyncObserver, ObserverSlot, RequestStep,
 };
-use crate::zakura::transport::ByteBudget;
+use crate::zakura::transport::{callback_waker, ByteBudget};
 use crate::zakura::{
     block_sync::{test_work_scope, BlockSizeEstimate},
     transport::worker_framed_channel,
@@ -1274,27 +1274,8 @@ fn stale_take_cannot_fund_or_return_replacement_work() {
 
 #[test]
 fn capacity_release_wakes_after_unlocking_the_work_queue() {
-    use std::{
-        future::Future,
-        task::{Context, Wake, Waker},
-    };
+    use std::{future::Future, task::Context};
     use zakura_rt::sync::atomic::{AtomicBool, AtomicUsize};
-
-    struct CapacityWake {
-        work: Arc<WorkQueue>,
-        unlocked: AtomicBool,
-        count: AtomicUsize,
-    }
-    impl Wake for CapacityWake {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.unlocked
-                .store(self.work.inner.try_lock().is_ok(), Ordering::SeqCst);
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
 
     for operation in 0..4 {
         let mut f = Fixture::new();
@@ -1304,12 +1285,15 @@ fn capacity_release_wakes_after_unlocking_the_work_queue() {
         assert!(claim.try_start());
         claim.written();
         drop(claim);
-        let wake = Arc::new(CapacityWake {
-            work: f.work.clone(),
-            unlocked: AtomicBool::new(false),
-            count: AtomicUsize::new(0),
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = callback_waker({
+            let (work, unlocked, wakes) = (f.work.clone(), unlocked.clone(), wakes.clone());
+            move || {
+                unlocked.store(work.inner.try_lock().is_ok(), Ordering::SeqCst);
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }
         });
-        let waker = Waker::from(wake.clone());
         let mut context = Context::from_waker(&waker);
         let mut notified = Box::pin(f.budget.subscribe_capacity().notified());
         assert!(notified.as_mut().poll(&mut context).is_pending());
@@ -1335,13 +1319,9 @@ fn capacity_release_wakes_after_unlocking_the_work_queue() {
             _ => unreachable!(),
         }
         assert_eq!(f.budget.reserved(), 0, "operation {operation}");
-        assert_eq!(
-            wake.count.load(Ordering::SeqCst),
-            1,
-            "operation {operation}"
-        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "operation {operation}");
         assert!(
-            wake.unlocked.load(Ordering::SeqCst),
+            unlocked.load(Ordering::SeqCst),
             "operation {operation} woke under the work lock"
         );
     }
@@ -1349,71 +1329,84 @@ fn capacity_release_wakes_after_unlocking_the_work_queue() {
 
 #[test]
 fn funding_drift_closes_publication_and_survives_reset() {
-    let mut f = Fixture::new();
-    let request = f.take(1);
-    assert!(
-        f.work.audit_funding(),
-        "unpublished funding may exceed the ledger"
-    );
-    {
-        let mut inner = f.work.lock();
-        // Inject an untracked owner without changing the logical ledger.
-        inner
-            .funding
-            .merge(&mut f.budget.reserve_owned(1).unwrap())
-            .unwrap();
+    for close_budget in [false, true] {
+        let f = Fixture::new();
+        let take_height = |raw, request| {
+            f.work
+                .take_request(
+                    block::Height(raw),
+                    block::Height(raw),
+                    1,
+                    100,
+                    7,
+                    NonZeroU64::new(request).unwrap(),
+                )
+                .admit(block::Height(0), f.cancel.clone())
+                .unwrap()
+        };
+        let claim = take_height(1, 1).publish(|_| {}).unwrap();
+        let request = take_height(2, 2);
+        assert!(
+            f.work.audit_funding(),
+            "unpublished funding may exceed the ledger"
+        );
+        if close_budget {
+            f.budget.close(BudgetClosure::Funding {
+                logical: 200,
+                funded: 199,
+            });
+        } else {
+            // Inject an untracked owner without changing the logical ledger.
+            f.work
+                .lock()
+                .funding
+                .merge(&mut f.budget.reserve_owned(1).unwrap())
+                .unwrap();
+            assert!(!f.work.audit_funding());
+        }
+        assert!(f.budget.is_closed());
+        assert_eq!(
+            f.budget.available(),
+            0,
+            "closed admission has no available capacity"
+        );
+        assert!(request
+            .publish(|_| panic!("closed queue published"))
+            .is_none());
+        assert!(!claim.try_start(), "closed owner authorized a writer");
+        drop(claim);
+        assert_eq!(f.budget.reserved(), if close_budget { 0 } else { 1 });
+        if !close_budget {
+            // Remove the injected owner so reset exercises a consistent drained queue.
+            drop(f.work.lock().funding.split(1).unwrap());
+        }
+        f.work.reset_above(block::Height(0));
+        assert_eq!(f.budget.reserved(), 0);
+        assert!(!f.work.audit_funding(), "reset must preserve closure");
     }
-    assert!(!f.work.audit_funding());
-    assert!(f.budget.is_closed());
-    assert_eq!(
-        f.budget.available(),
-        0,
-        "closed admission has no available capacity"
-    );
-    assert!(request
-        .publish(|_| panic!("closed queue published"))
-        .is_none());
-    // Remove the injected owner so reset exercises a consistent drained queue.
-    let funding = f.work.lock().funding.split(1).unwrap();
-    drop(funding);
-    f.work.reset_above(block::Height(0));
-    assert_eq!(f.budget.reserved(), 0);
-    assert!(!f.work.audit_funding(), "reset must preserve closure");
 }
 
 #[test]
 fn accounting_closure_wakes_its_waiter() {
-    use std::{
-        future::Future,
-        task::{Context, Wake, Waker},
-    };
+    use std::{future::Future, task::Context};
     use zakura_rt::sync::atomic::AtomicUsize;
-
-    struct ClosureWake {
-        count: AtomicUsize,
-    }
-    impl Wake for ClosureWake {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
 
     for operation in 0..6 {
         let mut f = Fixture::new();
         let reader = f.budget.reader();
         let mut closed = Box::pin(reader.closed());
-        let wake = Arc::new(ClosureWake {
-            count: AtomicUsize::new(0),
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = callback_waker({
+            let wakes = wakes.clone();
+            move || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }
         });
-        let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
         assert!(closed.as_mut().poll(&mut cx).is_pending());
         drop(f.budget.reserve_owned(17).unwrap());
         assert_eq!(
-            wake.count.load(Ordering::SeqCst),
+            wakes.load(Ordering::SeqCst),
             0,
             "normal release must not signal closure"
         );
@@ -1471,7 +1464,7 @@ fn accounting_closure_wakes_its_waiter() {
             _ => unreachable!(),
         }
         assert!(
-            wake.count.load(Ordering::SeqCst) > 0,
+            wakes.load(Ordering::SeqCst) > 0,
             "closure did not wake its waiter: {operation}"
         );
         assert!(closed.as_mut().poll(&mut cx).is_ready());
@@ -1621,19 +1614,15 @@ fn rejected_publication_releases_funding_after_unlock() {
     use std::{
         future::Future,
         sync::atomic::{AtomicBool, Ordering},
-        task::{Context, Wake, Waker},
+        task::Context,
     };
-    struct Probe(Arc<WorkQueue>, AtomicBool);
-    impl Wake for Probe {
-        fn wake(self: Arc<Self>) {
-            self.1
-                .store(self.0.inner.try_lock().is_ok(), Ordering::SeqCst);
-        }
-    }
     let mut f = Fixture::new();
     let request = f.take(1);
-    let probe = Arc::new(Probe(f.work.clone(), AtomicBool::new(false)));
-    let waker = Waker::from(probe.clone());
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let waker = callback_waker({
+        let (work, unlocked) = (f.work.clone(), unlocked.clone());
+        move || unlocked.store(work.inner.try_lock().is_ok(), Ordering::SeqCst)
+    });
     let mut context = Context::from_waker(&waker);
     let mut released = Box::pin(f.budget.subscribe_capacity().notified());
     assert!(released.as_mut().poll(&mut context).is_pending());
@@ -1643,7 +1632,7 @@ fn rejected_publication_releases_funding_after_unlock() {
         .is_none());
     assert_eq!(f.budget.reserved(), 0);
     assert!(
-        probe.1.load(Ordering::SeqCst),
+        unlocked.load(Ordering::SeqCst),
         "rejected funding woke under the queue lock"
     );
     assert_eq!(f.work.reserved_bytes(), 0);
@@ -1665,30 +1654,6 @@ fn publication_amount_mismatch_quarantines_funding() {
     assert_eq!(f.budget.reserved(), 200);
     drop(retained);
     assert_eq!(f.budget.reserved(), 199);
-}
-
-#[test]
-fn closed_queue_never_starts_previously_published_request() {
-    for close_budget in [false, true] {
-        let mut f = Fixture::new();
-        let claim = f.take(1).publish(|_| {}).unwrap();
-        if close_budget {
-            f.budget.close(BudgetClosure::Funding {
-                logical: 200,
-                funded: 199,
-            });
-        } else {
-            f.work
-                .lock()
-                .funding
-                .merge(&mut f.budget.reserve_owned(1).unwrap())
-                .unwrap();
-            assert!(!f.work.audit_funding());
-        }
-        assert!(!claim.try_start(), "closed owner authorized a writer");
-        drop(claim);
-        assert_eq!(f.budget.reserved(), if close_budget { 0 } else { 1 });
-    }
 }
 
 impl WorkQueue {

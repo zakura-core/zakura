@@ -562,10 +562,21 @@ impl SessionGuard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const ALLOWED: &[u8] = &[1, 2];
+
+    /// A waker that runs `on_wake` each time something wakes it.
+    pub(crate) fn callback_waker(on_wake: impl Fn() + Send + Sync + 'static) -> std::task::Waker {
+        struct Callback<F>(F);
+        impl<F: Fn() + Send + Sync + 'static> std::task::Wake for Callback<F> {
+            fn wake(self: Arc<Self>) {
+                (self.0)();
+            }
+        }
+        std::task::Waker::from(Arc::new(Callback(on_wake)))
+    }
 
     fn frame(message_type: u16, payload_len: usize) -> Frame {
         Frame {
@@ -632,26 +643,17 @@ mod tests {
 
     #[test]
     fn underflow_keeps_charge_and_closes_all_admission() {
-        use std::{
-            future::Future,
-            task::{Context, Wake, Waker},
-        };
-        struct ClosureWake(std::sync::atomic::AtomicUsize);
-        impl Wake for ClosureWake {
-            fn wake(self: Arc<Self>) {
-                self.wake_by_ref();
-            }
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
+        use std::{future::Future, task::Context};
         let budget = ByteBudget::new(1_000);
         let funding = budget.reserve_owned(400).unwrap();
         let clone = budget.clone();
         let reader = budget.reader();
         let mut closed = Box::pin(reader.closed());
-        let wake = Arc::new(ClosureWake(std::sync::atomic::AtomicUsize::new(0)));
-        let waker = Waker::from(wake.clone());
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = wakes.clone();
+        let waker = callback_waker(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
         let mut cx = Context::from_waker(&waker);
         assert!(closed.as_mut().poll(&mut cx).is_pending());
         // A corrupt owner must not release the valid owner's charge.
@@ -660,7 +662,7 @@ mod tests {
             bytes: 401,
         });
         assert!(
-            wake.0.load(Ordering::SeqCst) > 0,
+            wakes.load(Ordering::SeqCst) > 0,
             "counter failure must notify closure"
         );
         assert!(closed.as_mut().poll(&mut cx).is_ready());

@@ -419,25 +419,32 @@ impl DiscoveryState {
         excluded
     }
 
-    /// Returns the stored evidence for `record` if the book or the service
-    /// hints hold exactly that record.
+    /// Returns `record` as verified if the book or the service hints hold
+    /// exactly that record, or returns it back unverified.
     ///
     /// A stored record passed its author checks when it was stored, so an
-    /// identical record needs no new verification.
-    pub(super) fn stored_evidence(&self, record: &ZakuraNodeRecord) -> Option<VerifiedRecord> {
-        let node_id = &record.body.node_id;
-        if let Some(entry) = self
-            .book
-            .get(node_id)
-            .filter(|entry| entry.record() == record)
-        {
-            return Some(entry.verified_record().clone());
-        }
-        self.active_services
-            .get(node_id)
+    /// identical record needs no new verification. The evidence wraps
+    /// `record` itself, so this copies no record under the discovery lock.
+    pub(super) fn stored_evidence(
+        &self,
+        record: ZakuraNodeRecord,
+    ) -> Result<VerifiedRecord, ZakuraNodeRecord> {
+        let node_id = record.body.node_id;
+        let record = match self.book.get(&node_id) {
+            Some(entry) => match entry.verified_record().covering(record) {
+                Ok(verified) => return Ok(verified),
+                Err(record) => record,
+            },
+            None => record,
+        };
+        match self
+            .active_services
+            .get(&node_id)
             .and_then(|active| active.record.as_ref())
-            .filter(|stored| ***stored == *record)
-            .cloned()
+        {
+            Some(stored) => stored.covering(record),
+            None => Err(record),
+        }
     }
 
     /// Installs relayed records from `source` into the book, up to the

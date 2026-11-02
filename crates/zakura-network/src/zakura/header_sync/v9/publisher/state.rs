@@ -240,7 +240,7 @@ pub(super) struct Activity {
 pub(super) struct PublisherState {
     /// The serving limits this node advertises, constant for the session.
     limits: PageLimits,
-    pub(super) publications: PublicationLedger<u64, Cursor>,
+    publications: PublicationLedger<u64, Cursor>,
     /// Live and closing subscriptions, in the same set as `publications`.
     subscriptions: BTreeMap<u64, Subscription>,
     /// The subscription served last, so two subscriptions take turns.
@@ -701,6 +701,19 @@ impl PublisherState {
                 subscription.stall = None;
             }
         }
+    }
+
+    /// The credit, cursors, and tombstones of each subscription, to read.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn publications(&self) -> &PublicationLedger<u64, Cursor> {
+        &self.publications
+    }
+
+    /// End `id` in the ledger alone, which plants lost credit for the model's
+    /// `publisher_witness_rejects_lost_credit`.
+    #[cfg(test)]
+    pub(super) fn lose_publication(&mut self, id: u64) {
+        self.publications.end(&id);
     }
 
     /// What state is doing now.

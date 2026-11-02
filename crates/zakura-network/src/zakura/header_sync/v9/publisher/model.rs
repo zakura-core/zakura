@@ -507,20 +507,20 @@ impl Machine {
         HeaderPublisherView {
             subscriptions: (1..=IDS)
                 .filter_map(|id| {
-                    let credit = state.publications.credit(&id)?;
-                    let last = state.publications.last_sent(&id)?;
+                    let credit = state.publications().credit(&id)?;
+                    let last = state.publications().last_sent(&id)?;
                     Some(HeaderPublisherSubscriptionView {
                         id,
                         granted: (credit.granted().objects, credit.granted().bytes),
                         consumed: (credit.consumed().objects, credit.consumed().bytes),
-                        unacknowledged: state.publications.unacknowledged(&id)?,
+                        unacknowledged: state.publications().unacknowledged(&id)?,
                         last_height: last.height.0,
                         last_hash: last.hash,
-                        closing: state.publications.is_closing(&id),
+                        closing: state.publications().is_closing(&id),
                     })
                 })
                 .collect(),
-            tombstones: state.publications.tombstones(),
+            tombstones: state.publications().tombstones(),
             job: activity.job,
             terminals: activity.terminals,
             writing: activity.writing,

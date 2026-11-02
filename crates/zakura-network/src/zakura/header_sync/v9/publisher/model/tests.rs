@@ -179,7 +179,7 @@ fn a_stale_page_after_replacement_spends_no_replacement_credit() {
         machine
             .owner
             .state
-            .publications
+            .publications()
             .credit(&a)
             .map(|credit| credit.consumed()),
         Some(Totals::default()),
@@ -350,7 +350,7 @@ fn a_terminal_holds_its_slot_until_its_write_finishes() {
         ack: 0,
     });
     machine.run(&Step::EndDue);
-    assert_eq!(machine.owner.state.publications.keys().count(), 0);
+    assert_eq!(machine.owner.state.publications().keys().count(), 0);
     assert_eq!(machine.owner.slots.held(), 1, "the queued outcome holds it");
     machine.run(&Step::NextTerminal);
     assert_eq!(machine.owner.slots.held(), 1, "the permit holds it");
@@ -501,7 +501,7 @@ proptest! {
 fn publisher_witness_rejects_lost_credit() {
     run(decode(WITNESS), |machine, step| {
         if matches!(step, Step::Open { .. }) {
-            machine.owner.state.publications.end(&1);
+            machine.owner.state.lose_publication(1);
         }
     });
 }

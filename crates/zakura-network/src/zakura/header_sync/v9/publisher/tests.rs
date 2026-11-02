@@ -754,8 +754,8 @@ impl Publisher {
     fn tally(&self) -> (usize, usize) {
         let shared = lock(&self.shared);
         (
-            shared.state.publications.keys().count(),
-            shared.state.publications.tombstones(),
+            shared.state.publications().keys().count(),
+            shared.state.publications().tombstones(),
         )
     }
 
@@ -766,7 +766,7 @@ impl Publisher {
 
     /// Unacknowledged pages of `id`, if it is live.
     fn unacknowledged(&self, id: u64) -> Option<usize> {
-        lock(&self.shared).state.publications.unacknowledged(&id)
+        lock(&self.shared).state.publications().unacknowledged(&id)
     }
 }
 

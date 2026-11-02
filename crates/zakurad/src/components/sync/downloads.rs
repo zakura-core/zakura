@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use futures::{
@@ -43,6 +43,12 @@ use crate::components::{
         FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
+
+mod parent_gate;
+
+use parent_gate::ParentGate;
+#[cfg(test)]
+pub(super) use parent_gate::PARENT_ADMISSION_TIMEOUT;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -341,27 +347,6 @@ impl std::fmt::Debug for ParentWait {
     }
 }
 
-/// How far an in-flight block has got through the parent check before verification.
-///
-/// A block's children may wait on it as their parent only once it is [`Admission::Admitted`].
-/// If its download fails, the block stays [`Admission::Pending`] for its retry, which reuses the
-/// same channel. If its task ends any other way first, the channel closes while still pending.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
-    /// The block has not been checked yet.
-    Pending,
-    /// The block is on its way to the verifier: its parent can be built on or was itself
-    /// admitted, or it is at or below the last checkpoint.
-    Admitted,
-}
-
-/// Bounds a download task's wait for its in-flight parent to be admitted.
-///
-/// The parent's own task is already bounded: its download by [`BLOCK_DOWNLOAD_TIMEOUT`] (with
-/// at most one hedged request), then its own parent check. This only keeps one stuck task from
-/// stalling its children indefinitely.
-const PARENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Whether a block could be built on this parent: the parent is the finalized tip, in a
 /// non-finalized chain, or being written by the state. Returns `true` when the state can't
 /// answer, so an unanswered question never drops a block.
@@ -459,34 +444,12 @@ where
     /// Current lifecycle phase for each pending legacy block task.
     task_states: Arc<Mutex<HashMap<block::Hash, LegacyTaskState>>>,
 
-    /// Whether each pending block has passed its parent check, so its children can rely on it.
-    ///
-    /// A block whose download failed keeps its entry, so its children keep waiting for the retry.
-    admissions: Arc<Mutex<HashMap<block::Hash, Arc<watch::Sender<Admission>>>>>,
+    /// The blocks requested this round, and which of them passed the parent check, so their
+    /// children may use them as a parent.
+    parent_gate: Arc<ParentGate>,
 
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
-}
-
-fn remove_admission(
-    admissions: &Mutex<HashMap<block::Hash, Arc<watch::Sender<Admission>>>>,
-    hash: block::Hash,
-) {
-    admissions
-        .lock()
-        .expect("admission lock is only held for synchronous updates")
-        .remove(&hash);
-}
-
-/// Waits until an in-flight parent is admitted, returning `false` if it is dropped first or
-/// [`PARENT_ADMISSION_TIMEOUT`] passes. A failed download that is being retried keeps waiting.
-async fn parent_admitted(mut admission: watch::Receiver<Admission>) -> bool {
-    timeout(
-        PARENT_ADMISSION_TIMEOUT,
-        admission.wait_for(|admission| *admission == Admission::Admitted),
-    )
-    .await
-    .is_ok_and(|admitted| admitted.is_ok())
 }
 
 fn take_task_state(
@@ -528,7 +491,7 @@ where
             match join_result.expect("block download and verify tasks must not panic") {
                 Ok((height, hash)) => {
                     this.cancel_handles.remove(&hash);
-                    remove_admission(this.admissions, hash);
+                    this.parent_gate.finish(hash);
                     let state = take_task_state(this.task_states, hash);
                     this.trace
                         .block_finish(hash, LegacyBlockOutcome::Verified(height), state);
@@ -537,10 +500,12 @@ where
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
-                    // The syncer requests a block whose download failed again, or restarts the
-                    // round, which clears every entry. Until then its children keep waiting.
+                    // A failed download is neither verified nor rejected: the syncer requests it
+                    // again or restarts the round, so its children keep waiting until then. A
+                    // retry only starts after this result is polled, so this never finishes a
+                    // newer task for the same hash.
                     if !matches!(e, BlockDownloadVerifyError::DownloadFailed { .. }) {
-                        remove_admission(this.admissions, hash);
+                        this.parent_gate.finish(hash);
                     }
                     let state = take_task_state(this.task_states, hash);
                     this.trace
@@ -613,7 +578,7 @@ where
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
-            admissions: Arc::new(Mutex::new(HashMap::new())),
+            parent_gate: Arc::default(),
             trace,
         }
     }
@@ -741,16 +706,10 @@ where
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
         let task_states = self.task_states.clone();
-        let admissions = self.admissions.clone();
-        // Registered before the task starts, so a child that downloads first waits for it. A
-        // retry after a failed download reuses the entry its children are already waiting on.
-        let admission_tx = self
-            .admissions
-            .lock()
-            .expect("admission lock is only held for synchronous updates")
-            .entry(hash)
-            .or_insert_with(|| Arc::new(watch::channel(Admission::Pending).0))
-            .clone();
+        // Recorded before the task starts, so a child that downloads first waits for it. A retry
+        // after a failed download finds the entry its children are already waiting on.
+        self.parent_gate.request(hash);
+        let parent_gate = self.parent_gate.clone();
         let trace = self.trace.clone();
 
         let task = tokio::spawn(
@@ -910,7 +869,104 @@ where
 
                 if block_height > lookahead_drop_height {
                     Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
-                } else if block_height > lookahead_pause_height {
+                }
+
+                if block_height < min_accepted_height {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        ?tip_height,
+                        ?min_accepted_height,
+                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+                        "synced block height behind the finalized tip: dropped downloaded block"
+                    );
+                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+                    Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
+                }
+
+                if !has_sufficient_work(&chain_network, block_height, block.header.difficulty_threshold) {
+                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
+                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
+                }
+
+                // Security: a block above the checkpoints goes to the full verifier, which waits
+                // for a missing parent: up to the UTXO lookup timeout for a block that spends
+                // outputs, or in the state's queue until the finalized tip passes it for a
+                // coinbase-only block. The syncer only downloads chains that start at a block in
+                // its own locator, so a connected block's parent is either one the state can build
+                // on (the finalized tip, a block in a non-finalized chain, or a block the state is
+                // still writing) or still being downloaded here. A block whose parent is none of
+                // these can only wait for a parent that may never arrive, so drop it before it
+                // takes a verifier slot. A parent that is merely known, such as a finalized block
+                // below the tip, doesn't count.
+                //
+                // Blocks at or below the last checkpoint skip this: the checkpoint verifier only
+                // accepts the checkpointed chain. They also never count as passed, so a fake
+                // checkpoint height can't vouch for a child; their children wait until the state
+                // has them.
+                if block_height > max_checkpoint_height {
+                    // Reject a header without real proof of work before anything else, with the
+                    // verifier's own error, so a dropped block always cost its sender real work.
+                    // Below the last checkpoint the checkpoint verifier runs the same checks and no
+                    // block is dropped for its parent, so this would only repeat work there. It
+                    // runs inline, as in the verifiers: one Equihash solution takes about a
+                    // millisecond to check.
+                    let proof_of_work = zakura_consensus::header_proof_of_work_is_valid(
+                        &block.header,
+                        &chain_network,
+                        &block_height,
+                        &hash,
+                    );
+                    if let Err(error) = proof_of_work {
+                        debug!(
+                            ?hash,
+                            ?block_height,
+                            ?error,
+                            "synced block has invalid proof of work: rejected downloaded block"
+                        );
+                        metrics::counter!("sync.invalid.pow.dropped.block.count").increment(1);
+                        return Err(BlockDownloadVerifyError::Invalid {
+                            error: error.into(),
+                            height: block_height,
+                            hash,
+                            advertiser_addr,
+                        });
+                    }
+
+                    let parent = block.header.previous_block_hash;
+                    let parent_ready = tokio::select! {
+                        biased;
+                        // Prefer the cancel handle if both are ready.
+                        _ = &mut cancel_rx => {
+                            trace!("task cancelled waiting for the parent check");
+                            return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
+                        }
+                        ready = parent_gate.parent_ready(parent, &parent_extendable) => ready,
+                    };
+
+                    if !parent_ready {
+                        debug!(
+                            ?hash,
+                            ?parent,
+                            ?block_height,
+                            "synced block's parent is not downloading and can't be built on: dropped downloaded block"
+                        );
+                        metrics::counter!("sync.unknown.parent.dropped.block.count").increment(1);
+                        return Err(BlockDownloadVerifyError::ParentUnknown {
+                            height: block_height,
+                            hash,
+                            parent,
+                        });
+                    }
+
+                    // Children waiting on this block can now go ahead.
+                    parent_gate.pass(hash);
+                }
+
+                // Only a block that passed every check above moves the pause flag, so a rejected
+                // block can't leave it stuck.
+                if block_height > lookahead_pause_height {
                     // This log can be very verbose, usually hundreds of blocks are dropped.
                     // So we only log at info level for the first above-height block.
                     if !past_lookahead_limit_receiver.cloned_watch_data() {
@@ -954,86 +1010,6 @@ where
 
                     metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
                 }
-
-                if block_height < min_accepted_height {
-                    debug!(
-                        ?hash,
-                        ?block_height,
-                        ?tip_height,
-                        ?min_accepted_height,
-                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                        "synced block height behind the finalized tip: dropped downloaded block"
-                    );
-                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
-
-                    Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
-                }
-
-                if !has_sufficient_work(&chain_network, block_height, block.header.difficulty_threshold) {
-                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
-                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
-                }
-
-                // Security: a block above the checkpoints goes to the full verifier, which waits
-                // for a missing parent: up to the UTXO lookup timeout for a block that spends
-                // outputs, or in the state's queue until the finalized tip passes it for a
-                // coinbase-only block. The syncer only downloads chains that start at a block in
-                // its own locator, so a connected block's parent is either one the state can build
-                // on (the finalized tip or a block in a non-finalized chain) or still being
-                // downloaded here. A parent the state is still writing counts too, because sync
-                // skips such a block as already known. A block whose parent is none of these can
-                // only wait for a parent that may never arrive, so drop it before it takes a
-                // verifier slot. A parent that is merely known, such as a finalized block below
-                // the tip, doesn't count.
-                if block_height > max_checkpoint_height {
-                    let parent = block.header.previous_block_hash;
-                    // A downloading parent only counts once it has passed this check itself:
-                    // its hash came from a peer, so being requested proves nothing about where
-                    // it connects. Its admission is published before it reaches the verifier, and
-                    // it leaves this map only after its verification returns, by when the state
-                    // has added it to a chain. So a connected parent is always admitted here or
-                    // extendable in the state. If its download fails, this keeps waiting for the
-                    // retry. If it is dropped any other way without being admitted, the state
-                    // decides.
-                    let parent_admission = admissions
-                        .lock()
-                        .expect("admission lock is only held for synchronous updates")
-                        .get(&parent)
-                        .map(|admission| admission.subscribe());
-
-                    let parent_is_extendable = tokio::select! {
-                        biased;
-                        // Prefer the cancel handle if both are ready.
-                        _ = &mut cancel_rx => {
-                            trace!("task cancelled waiting for the parent check");
-                            return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
-                        }
-                        extendable = async {
-                            let admitted = match parent_admission {
-                                Some(admission) => parent_admitted(admission).await,
-                                None => false,
-                            };
-                            admitted || (parent_extendable.0)(parent).await
-                        } => extendable,
-                    };
-
-                    if !parent_is_extendable {
-                        debug!(
-                            ?hash,
-                            ?parent,
-                            ?block_height,
-                            "synced block's parent can't be built on and wasn't admitted: dropped downloaded block"
-                        );
-                        metrics::counter!("sync.unknown.parent.dropped.block.count").increment(1);
-                        return Err(BlockDownloadVerifyError::ParentUnknown {
-                            height: block_height,
-                            hash,
-                            parent,
-                        });
-                    }
-                }
-                // Children waiting on this block can now go ahead.
-                admission_tx.send_replace(Admission::Admitted);
 
                 // A body that fails before its parent commits can't be attributed yet, so wait for
                 // the parent once and verify the same body again. The task keeps its lookahead slot
@@ -1165,10 +1141,7 @@ where
         for (_hash, cancel) in self.cancel_handles.drain() {
             let _ = cancel.send(());
         }
-        self.admissions
-            .lock()
-            .expect("admission lock is only held for synchronous updates")
-            .clear();
+        self.parent_gate.clear();
         self.task_states
             .lock()
             .expect("legacy task state lock is only held for synchronous updates")

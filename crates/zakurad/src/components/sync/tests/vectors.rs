@@ -42,7 +42,7 @@ use crate::{
             self,
             downloads::{
                 lookahead_heights, BlockDownloadVerifyError, Downloads, ParentExtendable,
-                ParentWait, VERIFICATION_PIPELINE_DROP_LIMIT,
+                ParentWait, PARENT_ADMISSION_TIMEOUT, VERIFICATION_PIPELINE_DROP_LIMIT,
             },
             legacy_trace::LegacySyncTrace,
             SyncStatus,
@@ -2428,192 +2428,35 @@ fn parent_unknown(hash: block::Hash, parent: block::Hash) -> BlockDownloadVerify
     }
 }
 
-/// A block the download task dropped for an unknown parent stays dropped, without a restart, a
-/// retry or a score, when its parent still cannot arrive.
+/// The syncer drops a block the download task dropped for an unknown parent: no restart, no
+/// retry, no score and no state question, even when its parent is still being retried. A real
+/// block is found again by the next tip refresh or round.
 #[tokio::test]
-async fn parent_unknown_drops_block_when_parent_cannot_arrive() {
-    // Unknown, or known but below the finalized tip: either way no chain can accept the block.
-    for location in [None, Some(zs::KnownBlock::Finalized)] {
+async fn parent_unknown_is_dropped_without_a_restart_retry_or_score() {
+    for parent_retrying in [false, true] {
         let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         chain_sync.misbehavior_sender = sender;
         let hash = block::Hash([0xCC; 32]);
         let parent = block::Hash([0xAA; 32]);
-
-        let (response, _) = tokio::join!(
-            chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
-            answer_parent_unavailable(&mut state, parent, location.clone()),
-        );
-
-        response.expect("an unknown parent does not restart sync");
-        assert!(receiver.try_recv().is_err(), "the supplier is not scored");
-        assert!(
-            !chain_sync.registry_miss_retry.contains_key(&hash),
-            "{location:?}"
-        );
-        assert!(
-            chain_sync.registry_miss_retry_counts.is_empty(),
-            "{location:?}"
-        );
-        peers.expect_no_requests().await;
-    }
-}
-
-/// A block the download task dropped for an unknown parent waits, without being downloaded
-/// again, while its parent is still pending: waiting for a retry, or itself waiting for its own
-/// parent. It doesn't pause new downloads, and never restarts sync.
-#[tokio::test]
-async fn parent_unknown_waits_while_its_parent_is_pending() {
-    #[derive(Clone, Copy, Debug)]
-    enum Parent {
-        RegistryRetry,
-        AwaitingItsParent,
-    }
-    for parent_state in [Parent::RegistryRetry, Parent::AwaitingItsParent] {
-        let (mut chain_sync, _, _, mut peers, _state, _) = setup_chain_sync();
-        let hash = block::Hash([0xCC; 32]);
-        let parent = block::Hash([0xAA; 32]);
-        match parent_state {
-            Parent::RegistryRetry => {
-                chain_sync
-                    .registry_miss_retry
-                    .insert(parent, tokio::time::Instant::now());
-            }
-            Parent::AwaitingItsParent => {
-                chain_sync
-                    .blocks_awaiting_parent
-                    .insert(parent, block::Hash([0x99; 32]));
-            }
+        if parent_retrying {
+            chain_sync
+                .registry_miss_retry
+                .insert(parent, tokio::time::Instant::now());
         }
 
         chain_sync
             .handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent)))
             .await
-            .expect("a parent that can arrive doesn't restart sync");
+            .expect("an unknown parent does not restart sync");
 
-        assert_eq!(
-            chain_sync.blocks_awaiting_parent.get(&hash),
-            Some(&parent),
-            "{parent_state:?}"
-        );
-        assert!(
-            !chain_sync.registry_miss_retry.contains_key(&hash),
-            "a waiting block doesn't pause new downloads: {parent_state:?}"
-        );
-        assert!(
-            chain_sync.registry_miss_retry_counts.is_empty(),
-            "{parent_state:?}"
-        );
+        assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+        assert!(!chain_sync.registry_miss_retry.contains_key(&hash));
+        assert!(chain_sync.registry_miss_retry_counts.is_empty());
+        assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+        state.expect_no_requests().await;
         peers.expect_no_requests().await;
     }
-
-    assert!(!TestChainSync::should_restart_sync(
-        &parent_unknown(block::Hash([0xCC; 32]), block::Hash([0xAA; 32])),
-        false
-    ));
-}
-
-/// A block the download task dropped for an unknown parent is downloaded again at once when its
-/// parent can now be built on: committed, or still being written by the state.
-#[tokio::test]
-async fn parent_unknown_downloads_again_once_its_parent_can_be_built_on() {
-    #[derive(Clone, Copy, Debug)]
-    enum Parent {
-        Committed,
-        BeingWritten,
-    }
-    for parent_state in [Parent::Committed, Parent::BeingWritten] {
-        let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
-        let hash = block::Hash([0xCC; 32]);
-        let parent = block::Hash([0xAA; 32]);
-
-        let (response, _) = tokio::join!(
-            chain_sync.handle_block_response_with_missing_retry(Err(parent_unknown(hash, parent))),
-            async {
-                match parent_state {
-                    Parent::Committed => answer_parent_extendable(&mut state, parent).await,
-                    Parent::BeingWritten => {
-                        answer_parent_unavailable(
-                            &mut state,
-                            parent,
-                            Some(zs::KnownBlock::WriteChannel),
-                        )
-                        .await
-                    }
-                }
-            },
-        );
-
-        response.expect("a parent that can be built on doesn't restart sync");
-        assert!(
-            chain_sync.blocks_awaiting_parent.is_empty(),
-            "{parent_state:?}"
-        );
-        let _download = peers
-            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-            .await;
-    }
-}
-
-/// A held block is not downloaded again when sync rediscovers its hash; it is requested once its
-/// parent verifies.
-#[tokio::test]
-async fn rediscovered_held_block_is_not_downloaded_again() {
-    let (mut chain_sync, _, _, mut peers, _state, _) = setup_chain_sync();
-    let held = block::Hash([0xCC; 32]);
-    chain_sync
-        .blocks_awaiting_parent
-        .insert(held, block::Hash([0xAA; 32]));
-
-    let extra = chain_sync
-        .request_blocks([held].into_iter().collect())
-        .await
-        .expect("requesting a held hash skips it");
-
-    assert!(extra.is_empty());
-    assert!(!chain_sync.downloads.contains(&held));
-    peers.expect_no_requests().await;
-}
-
-/// Once a parent verifies, every block waiting on it, directly or through another waiting block,
-/// is downloaded again. Blocks waiting on other parents keep waiting.
-#[tokio::test]
-async fn verified_parent_downloads_its_waiting_blocks_again() {
-    let (mut chain_sync, _, _, mut peers, _state, _) = setup_chain_sync();
-    let parent = block::Hash([0xAA; 32]);
-    let child = block::Hash([0xBB; 32]);
-    let grandchild = block::Hash([0xCC; 32]);
-    let other_parent = block::Hash([0xDD; 32]);
-    let unrelated = block::Hash([0xEE; 32]);
-    chain_sync.blocks_awaiting_parent.insert(child, parent);
-    chain_sync.blocks_awaiting_parent.insert(grandchild, child);
-    chain_sync
-        .blocks_awaiting_parent
-        .insert(unrelated, other_parent);
-
-    chain_sync
-        .handle_block_response_with_missing_retry(Ok((Height(41), parent)))
-        .await
-        .expect("a verified block doesn't restart sync");
-
-    let mut requested = HashSet::new();
-    for _ in 0..2 {
-        let _download = peers
-            .expect_request_that(|request| match request {
-                zn::Request::BlocksByHash(hashes) if hashes.len() == 1 => {
-                    requested.extend(hashes.iter().copied());
-                    true
-                }
-                _ => false,
-            })
-            .await;
-    }
-    assert_eq!(requested, [child, grandchild].into());
-    assert_eq!(
-        chain_sync.blocks_awaiting_parent,
-        [(unrelated, other_parent)].into()
-    );
-    peers.expect_no_requests().await;
 }
 
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
@@ -4467,14 +4310,40 @@ async fn serve_non_tip_child(
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
         .zcash_deserialize_into()
         .expect("test vector deserializes");
+    let (result, _paused) = serve_block(
+        block,
+        verifier,
+        parent_extendable,
+        max_checkpoint_height,
+        Height(1_687_106),
+        false,
+    )
+    .await;
+    result
+}
+
+/// Serves `block` to a downloader whose best tip is at `tip_height` on another chain, with the
+/// pause flag starting at `paused`. Returns the download task's result and the final flag.
+async fn serve_block(
+    block: Arc<Block>,
+    verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    parent_extendable: ParentExtendable,
+    max_checkpoint_height: Height,
+    tip_height: Height,
+    paused: bool,
+) -> (
+    Result<(Height, block::Hash), BlockDownloadVerifyError>,
+    bool,
+) {
     let hash = block.hash();
 
     let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
     let (chain_tip, chain_tip_sender) = MockChainTip::new();
-    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_height(tip_height);
     chain_tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+    let (past_lookahead_limit_sender, past_lookahead_limit) = tokio::sync::watch::channel(paused);
 
-    let mut downloads = setup_downloads_with_parent_checks(
+    let mut downloads = Downloads::new(
         peer_set.clone(),
         verifier,
         chain_tip,
@@ -4482,7 +4351,11 @@ async fn serve_non_tip_child(
             panic!("unexpected parent wait for {parent:?}")
         })),
         parent_extendable,
+        past_lookahead_limit_sender,
+        sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         max_checkpoint_height,
+        LegacySyncTrace::new(None, false),
     );
 
     downloads
@@ -4494,10 +4367,176 @@ async fn serve_non_tip_child(
         .await
         .respond(zn::Response::Blocks(vec![Available((block, None))]));
 
-    downloads
+    let result = downloads
         .next()
         .await
-        .expect("the download task produces a result instead of panicking")
+        .expect("the download task produces a result instead of panicking");
+    let paused = *past_lookahead_limit.borrow();
+    (result, paused)
+}
+
+/// A [`ParentExtendable`] for a block whose parent must not be checked.
+fn no_parent_check() -> ParentExtendable {
+    ParentExtendable(Arc::new(|parent| {
+        panic!("the block is rejected before its parent check, asked about {parent:?}")
+    }))
+}
+
+/// Block 1,687,107 with its nonce changed, so its hash misses its target.
+fn block_without_proof_of_work() -> Arc<Block> {
+    let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    Arc::make_mut(&mut block.header).nonce.0[0] ^= 1;
+    Arc::new(block)
+}
+
+/// A header without real proof of work above the checkpoints is rejected before the parent
+/// check, with the verifier's own error and score, so dropping a block for its parent always
+/// costs the sender real mining work.
+#[tokio::test]
+async fn invalid_proof_of_work_is_rejected_before_the_parent_check() {
+    let _init_guard = zakura_test::init();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+
+    let (result, _) = serve_block(
+        block_without_proof_of_work(),
+        verifier.clone(),
+        no_parent_check(),
+        Height(0),
+        Height(1_687_106),
+        false,
+    )
+    .await;
+
+    match result {
+        Err(BlockDownloadVerifyError::Invalid { error, height, .. }) => {
+            assert_eq!(height, Height(1_687_107));
+            assert_eq!(error.misbehavior_score(), 100, "{error:?}");
+            assert!(
+                matches!(
+                    &error,
+                    RouterError::Block { source }
+                        if matches!(**source, VerifyBlockError::Block { .. })
+                ),
+                "{error:?}"
+            );
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+    verifier.expect_no_requests().await;
+}
+
+/// At or below the last checkpoint the early proof of work check is skipped: the checkpoint
+/// verifier runs the same checks, so initial sync doesn't check each header twice.
+#[tokio::test]
+async fn checkpoint_block_skips_the_early_proof_of_work_check() {
+    let _init_guard = zakura_test::init();
+    let block = block_without_proof_of_work();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+
+    let (result, _) = tokio::join!(
+        serve_block(
+            block.clone(),
+            verifier.clone(),
+            no_parent_check(),
+            Height(1_687_107),
+            Height(1_687_106),
+            false,
+        ),
+        async {
+            verifier
+                .expect_request_that(|req| req.block().hash() == block.hash())
+                .await
+                .respond(block.hash());
+        },
+    );
+
+    assert_eq!(
+        result.0.expect("the verifier decides"),
+        (Height(1_687_107), block.hash())
+    );
+}
+
+/// A block that is rejected before verification leaves the pause flag as it was. Only a block
+/// that passed every early check resets it.
+#[tokio::test]
+async fn only_an_accepted_block_resets_the_pause_flag() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let parent = block.header.previous_block_hash;
+
+    for extendable in [false, true] {
+        let mut verifier =
+            MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+        let ((result, paused), _) = tokio::join!(
+            serve_block(
+                block.clone(),
+                verifier.clone(),
+                parent_extendable_answer(parent, extendable),
+                Height(0),
+                Height(1_687_106),
+                true,
+            ),
+            async {
+                if extendable {
+                    verifier
+                        .expect_request_that(|req| req.block().hash() == block.hash())
+                        .await
+                        .respond(block.hash());
+                }
+            },
+        );
+
+        assert_eq!(result.is_ok(), extendable, "{result:?}");
+        assert_eq!(paused, !extendable, "parent extendable: {extendable}");
+    }
+    let (result, paused) = serve_block(
+        block_without_proof_of_work(),
+        MockService::build().for_unit_tests(),
+        no_parent_check(),
+        Height(0),
+        Height(1_687_106),
+        true,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(
+        paused,
+        "a block with invalid proof of work leaves the flag set"
+    );
+}
+
+/// A block above the drop height is dropped before the parent check, so it never waits for a
+/// parent.
+#[tokio::test]
+async fn block_above_the_drop_height_is_dropped_before_the_parent_check() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+
+    let (result, _) = serve_block(
+        block,
+        MockService::build().for_unit_tests(),
+        no_parent_check(),
+        Height(0),
+        Height(1_000_000),
+        false,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { .. })
+        ),
+        "{result:?}"
+    );
 }
 
 /// A [`ParentExtendable`] that expects to be asked about `expected` only, and answers `known`.
@@ -4572,10 +4611,19 @@ async fn extendable_parent_reaches_the_verifier() {
     );
 }
 
+/// The parents a test downloader's parent check asked the state about, in order.
+type AskedParents = Arc<std::sync::Mutex<Vec<block::Hash>>>;
+
+fn asked_parents(asked: &AskedParents) -> Vec<block::Hash> {
+    asked.lock().expect("test lock").clone()
+}
+
 /// Mainnet blocks 1 and 2, and a downloader that verifies both in full, whose parent check
-/// answers `genesis_extendable` about genesis and `false` about anything else.
+/// answers `genesis_extendable` about genesis and `false` about anything else, and records each
+/// question. Blocks at or below `max_checkpoint_height` skip the parent check.
 fn downloading_parent_setup(
     genesis_extendable: bool,
+    max_checkpoint_height: Height,
 ) -> (
     Arc<Block>,
     Arc<Block>,
@@ -4586,6 +4634,7 @@ fn downloading_parent_setup(
         MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
         MockChainTip,
     >,
+    AskedParents,
 ) {
     let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
@@ -4594,7 +4643,10 @@ fn downloading_parent_setup(
         .zcash_deserialize_into()
         .expect("test vector deserializes");
     let genesis_hash = block1.header.previous_block_hash;
+    let block1_hash = block1.hash();
 
+    let asked = AskedParents::default();
+    let recorded = asked.clone();
     let peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
     let verifier =
         MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
@@ -4607,45 +4659,28 @@ fn downloading_parent_setup(
             panic!("unexpected parent wait for {parent:?}")
         })),
         ParentExtendable(Arc::new(move |parent| {
-            let extendable = genesis_extendable && parent == genesis_hash;
+            recorded.lock().expect("test lock").push(parent);
+            let extendable = (genesis_extendable && parent == genesis_hash)
+                // Below the checkpoint, block 1 only counts once the state has it.
+                || (max_checkpoint_height >= Height(1) && parent == block1_hash);
             async move { extendable }.boxed()
         })),
-        Height(0),
+        max_checkpoint_height,
     );
 
-    (block1, block2, peer_set, verifier, downloads)
+    (block1, block2, peer_set, verifier, downloads, asked)
 }
 
 /// A block whose parent is still downloading waits until the parent passes its own check, then
 /// both reach the verifier, without asking the state about the downloading parent.
 #[tokio::test]
-async fn child_waits_for_its_downloading_parent_to_be_admitted() {
+async fn child_waits_for_its_downloading_parent_to_pass() {
     let _init_guard = zakura_test::init();
-    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
-        downloading_parent_setup(true);
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(true, Height(0));
 
-    downloads
-        .download_and_verify(block1.hash())
-        .await
-        .expect("queuing a fresh hash succeeds");
-    let parent_download = peer_set
-        .expect_request(zn::Request::BlocksByHash(
-            iter::once(block1.hash()).collect(),
-        ))
-        .await;
-    downloads
-        .download_and_verify(block2.hash())
-        .await
-        .expect("queuing a fresh hash succeeds");
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(
-            iter::once(block2.hash()).collect(),
-        ))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
-            None,
-        ))]));
+    let parent_download =
+        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
 
     // The child is downloaded, but its parent hasn't been checked yet.
     verifier.expect_no_requests().await;
@@ -4669,15 +4704,20 @@ async fn child_waits_for_its_downloading_parent_to_be_admitted() {
             .expect("the download task produces a result instead of panicking")
             .expect("both blocks verify");
     }
+    assert_eq!(
+        asked_parents(&asked),
+        vec![block1.header.previous_block_hash],
+        "only the parent's own check asks the state"
+    );
 }
 
-/// A block whose downloading parent fails its own check is dropped before the verifier: a
-/// requested hash proves nothing about where the block connects.
+/// A block whose downloading parent fails its own check is dropped before the verifier, as soon
+/// as the parent is rejected: a requested hash proves nothing about where the block connects.
 #[tokio::test]
 async fn child_of_a_parent_that_fails_its_check_is_dropped() {
     let _init_guard = zakura_test::init();
-    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
-        downloading_parent_setup(false);
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(false, Height(0));
 
     let parent_download =
         request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
@@ -4701,16 +4741,21 @@ async fn child_of_a_parent_that_fails_its_check_is_dropped() {
     }
     assert_eq!(dropped, [block1.hash(), block2.hash()].into());
     verifier.expect_no_requests().await;
+    assert_eq!(
+        asked_parents(&asked),
+        vec![block1.header.previous_block_hash, block1.hash()],
+        "the child asks the state once, after its parent was rejected"
+    );
 }
 
 /// A block whose downloading parent fails to download keeps waiting while the parent is
 /// requested again, and both are verified once the retry passes its check. The child is not
-/// dropped and downloaded again.
+/// dropped and downloaded again, and the state isn't asked about the pending parent.
 #[tokio::test]
 async fn child_keeps_waiting_while_its_parent_download_is_retried() {
     let _init_guard = zakura_test::init();
-    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
-        downloading_parent_setup(true);
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(true, Height(0));
 
     let parent_download =
         request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
@@ -4754,15 +4799,20 @@ async fn child_keeps_waiting_while_its_parent_download_is_retried() {
             .expect("both blocks verify");
     }
     peer_set.expect_no_requests().await;
+    assert_eq!(
+        asked_parents(&asked),
+        vec![block1.header.previous_block_hash]
+    );
 }
 
 /// A block whose downloading parent fails to download and is never requested again waits for
-/// the admission timeout, then the state decides, and here drops it.
+/// [`PARENT_ADMISSION_TIMEOUT`], then is dropped without asking the state.
 #[tokio::test(start_paused = true)]
 async fn child_of_a_parent_that_is_never_retried_is_dropped_after_the_wait() {
     let _init_guard = zakura_test::init();
-    let (block1, block2, mut peer_set, mut verifier, mut downloads) =
-        downloading_parent_setup(false);
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(true, Height(0));
+    let start = tokio::time::Instant::now();
 
     let parent_download =
         request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
@@ -4784,7 +4834,112 @@ async fn child_of_a_parent_that_is_never_retried_is_dropped_after_the_wait() {
         }
     }
     assert!(child_dropped);
+    assert!(start.elapsed() >= PARENT_ADMISSION_TIMEOUT);
     verifier.expect_no_requests().await;
+    assert!(asked_parents(&asked).is_empty());
+}
+
+/// Cancelling the round forgets every pending block, so a later child of a block whose
+/// download failed asks the state instead of waiting for a retry that will never come.
+#[tokio::test]
+async fn cancel_all_forgets_pending_parents() {
+    let _init_guard = zakura_test::init();
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(true, Height(0));
+
+    downloads
+        .download_and_verify(block1.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block1.hash()).collect(),
+        ))
+        .await
+        .respond(Err(client_dropped_error()));
+    match downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking")
+    {
+        Err(BlockDownloadVerifyError::DownloadFailed { hash, .. }) if hash == block1.hash() => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+
+    downloads.cancel_all();
+
+    downloads
+        .download_and_verify(block2.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block2.hash()).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            block2.clone(),
+            None,
+        ))]));
+    match downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking")
+    {
+        Err(BlockDownloadVerifyError::ParentUnknown { hash, .. }) if hash == block2.hash() => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+    verifier.expect_no_requests().await;
+    assert_eq!(asked_parents(&asked), vec![block1.hash()]);
+}
+
+/// A parent at or below the last checkpoint never counts as passed, even though it skips the
+/// parent check: its claimed height is unauthenticated. Its child waits while it is pending, and
+/// once it verifies the state, which now has it, lets the child through.
+#[tokio::test]
+async fn checkpoint_parent_does_not_count_as_passed() {
+    let _init_guard = zakura_test::init();
+    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(false, Height(1));
+
+    let parent_download =
+        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
+    parent_download.respond(zn::Response::Blocks(vec![Available((
+        block1.clone(),
+        None,
+    ))]));
+
+    // The checkpoint parent reaches the verifier without a parent check. The child keeps
+    // waiting, without asking the state, until the parent has verified.
+    verifier
+        .expect_request_that(|req| req.block().hash() == block1.hash())
+        .await
+        .respond_with(|req| req.block().hash());
+    verifier.expect_no_requests().await;
+    assert!(asked_parents(&asked).is_empty());
+
+    assert_eq!(
+        downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking")
+            .expect("the checkpoint parent verifies"),
+        (Height(1), block1.hash())
+    );
+
+    verifier
+        .expect_request_that(|req| req.block().hash() == block2.hash())
+        .await
+        .respond_with(|req| req.block().hash());
+    assert_eq!(
+        downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking")
+            .expect("the child verifies"),
+        (Height(2), block2.hash())
+    );
+    assert_eq!(asked_parents(&asked), vec![block1.hash()]);
 }
 
 /// Requests `parent` and then `child`, serves the child, and returns the parent's pending

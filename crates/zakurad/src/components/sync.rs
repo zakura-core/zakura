@@ -1049,13 +1049,6 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
-    /// Blocks dropped before verification because their parent was not yet usable but could
-    /// still arrive, keyed by block hash with the parent each one waits for.
-    ///
-    /// They are not downloaded again until that parent verifies, so a parent that never arrives
-    /// costs nothing more. They don't pause new downloads. Cleared at the start of each round.
-    blocks_awaiting_parent: HashMap<block::Hash, block::Hash>,
-
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -1212,7 +1205,6 @@ where
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
-            blocks_awaiting_parent: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1576,7 +1568,6 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
-        self.blocks_awaiting_parent.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1671,7 +1662,6 @@ where
                 reserve.clear();
                 self.prospective_tips.clear();
                 self.registry_miss_retry.clear();
-                self.blocks_awaiting_parent.clear();
 
                 while let Some(response) = self.downloads.next().await {
                     if let Err(error) = response {
@@ -1690,6 +1680,7 @@ where
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
+                let verified = rsp.is_ok();
                 let result = self.handle_block_response_with_missing_retry(rsp).await;
                 if header_runtime_status
                     .as_ref()
@@ -1705,7 +1696,10 @@ where
                     continue 'sync_round;
                 }
                 result?;
-                last_progress = Instant::now();
+                // Only a verified block is progress: a dropped or rejected one is not.
+                if verified {
+                    last_progress = Instant::now();
+                }
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
@@ -1766,7 +1760,6 @@ where
                 .await
                 .map_err(Report::from)?;
                 reserve = Self::handle_hash_response(response, self.expose_peer_addresses)?;
-                last_progress = Instant::now();
                 continue;
             }
 
@@ -1787,6 +1780,7 @@ where
 
                 match completed {
                     Ok(Some(rsp)) => {
+                        let verified = rsp.is_ok();
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
                         if header_runtime_status
                             .as_ref()
@@ -1802,7 +1796,10 @@ where
                             continue 'sync_round;
                         }
                         result?;
-                        last_progress = Instant::now();
+                        // Only a verified block is progress: a dropped or rejected one is not.
+                        if verified {
+                            last_progress = Instant::now();
+                        }
                         self.update_metrics();
                     }
                     // `downloads` only yields `None` when nothing is in flight, which we just ruled
@@ -1898,11 +1895,11 @@ where
                             }
                         }
 
-                        last_progress = Instant::now();
                     }
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
+                        let verified = rsp.is_ok();
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
                         if header_runtime_status
                             .as_ref()
@@ -1918,7 +1915,10 @@ where
                             return Ok(());
                         }
                         result?;
-                        last_progress = Instant::now();
+                        // Only a verified block is progress: a dropped or rejected one is not.
+                        if verified {
+                            last_progress = Instant::now();
+                        }
                         self.update_metrics();
                     }
 
@@ -2538,10 +2538,6 @@ where
         // propagating — this prevents dropping unprocessed hashes from the
         // batch, which would create frontier gaps and stalls (#5709).
         for hash in hashes.into_iter() {
-            // A held block is requested again once its parent verifies.
-            if self.blocks_awaiting_parent.contains_key(&hash) {
-                continue;
-            }
             match self.downloads.download_and_verify(hash).await {
                 Ok(()) => {}
                 Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
@@ -2671,56 +2667,6 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
-    /// Downloads `hash` again, for a block that was dropped before verification.
-    async fn request_block_again(&mut self, hash: block::Hash) -> Result<(), Report> {
-        match self.downloads.download_and_verify(hash).await {
-            Ok(()) | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
-                Ok(())
-            }
-            Err(error) => Ok(self.handle_block_response(Err(error))?),
-        }
-    }
-
-    /// Downloads again every block waiting for `parent`, directly or through other waiting
-    /// blocks, now that `parent` has verified. Parents are requested before their children, so
-    /// each child finds its parent in flight.
-    async fn request_blocks_awaiting(&mut self, parent: block::Hash) -> Result<(), Report> {
-        if self.blocks_awaiting_parent.is_empty() {
-            return Ok(());
-        }
-
-        let mut ready = vec![parent];
-        let mut next = 0;
-        while let Some(&waited_on) = ready.get(next) {
-            next += 1;
-            let children: Vec<block::Hash> = self
-                .blocks_awaiting_parent
-                .iter()
-                .filter(|(_, block_parent)| **block_parent == waited_on)
-                .map(|(child, _)| *child)
-                .collect();
-            for child in &children {
-                self.blocks_awaiting_parent.remove(child);
-            }
-            ready.extend(children);
-        }
-
-        for hash in ready.into_iter().skip(1) {
-            debug!(
-                ?hash,
-                ?parent,
-                "block's parent verified, downloading the block again"
-            );
-            self.request_block_again(hash).await?;
-        }
-        Ok(())
-    }
-
-    /// The download task drops a block whose parent is neither admitted in flight nor a block the
-    /// state can build on, before verifying it. The syncer drops it too, unless the parent can still
-    /// arrive. If the parent can now be built on, the block is downloaded again at once. If the
-    /// parent is in flight, waiting for a retry, or itself waiting for its own parent, the block
-    /// waits in [`Self::blocks_awaiting_parent`] and is downloaded again once the parent verifies.
     /// A block whose authorizing data binding is still unconfirmed after the download task waited
     /// for its parent is dropped the same way, without scoring its supplier.
     ///
@@ -2761,8 +2707,6 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
-            self.blocks_awaiting_parent.remove(hash);
-            self.request_blocks_awaiting(*hash).await?;
         }
 
         // The download task already waited for the parent and verified the body again.
@@ -2780,10 +2724,8 @@ where
             // The parent may have committed after the verifier's state read. A known parent below
             // the finalized tip can never be built on, so the state is asked whether the parent
             // can be extended, not whether it exists.
-            let parent_pending = self.downloads.contains(&parent)
+            let parent_can_arrive = self.downloads.contains(&parent)
                 || self.registry_miss_retry.contains_key(&parent)
-                || self.blocks_awaiting_parent.contains_key(&parent);
-            let parent_can_arrive = parent_pending
                 // Boxing lets rustc prove this future is `Send` for spawned callers.
                 || futures::FutureExt::boxed(parent_can_be_built_on(self.state.clone(), parent))
                     .await
@@ -2795,22 +2737,6 @@ where
                     "block parent is neither committed nor in flight, dropping block"
                 );
                 self.verify_timeout_retry_counts.remove(&hash);
-                return Ok(());
-            }
-
-            // The download task dropped this block before verification, but its parent can still
-            // arrive. Download it again only once the parent can be built on, so a parent that
-            // never arrives costs no further downloads.
-            if matches!(
-                response,
-                Err(BlockDownloadVerifyError::ParentUnknown { .. })
-            ) {
-                if parent_pending {
-                    debug!(?hash, ?parent, "block waits for its parent to verify");
-                    self.blocks_awaiting_parent.insert(hash, parent);
-                } else {
-                    self.request_block_again(hash).await?;
-                }
                 return Ok(());
             }
         }
@@ -3204,12 +3130,10 @@ where
         }
     }
 
-    /// Returns the block and parent hashes of a block that could not verify for lack of its
-    /// parent: a UTXO lookup timeout whose parent is not in a chain that can accept the block, or
-    /// a block the download task dropped because no chain could accept it.
+    /// Returns the block and parent hashes of a UTXO lookup timeout whose parent is not in a
+    /// chain that can accept the block.
     fn unavailable_parent(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
         match error {
-            BlockDownloadVerifyError::ParentUnknown { hash, parent, .. } => Some((*hash, *parent)),
             BlockDownloadVerifyError::Invalid {
                 error: RouterError::Block { source },
                 hash,
@@ -3308,8 +3232,9 @@ where
                 false
             }
             BlockDownloadVerifyError::ParentUnknown { .. } => {
-                // The missing-retry handler drops or holds these blocks, so this is not reached
-                // in normal operation. A block nothing can be built on doesn't need a restart.
+                // The download task found no way for this block's parent to arrive. A real block
+                // is found again by the next tip refresh or round, so drop it without a restart,
+                // a retry or a score.
                 debug!(
                     error = ?e,
                     %peer,

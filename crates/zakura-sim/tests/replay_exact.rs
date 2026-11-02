@@ -1410,11 +1410,11 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
     assert!(report.end.is_none());
 }
 
-const REACTOR_INPUT: &[u8] = include_bytes!("fixtures/block-reactor-policy.bin");
+const BLOCK_REACTOR_INPUT: &[u8] = include_bytes!("fixtures/block-reactor-policy.bin");
 
 #[test]
-fn reactor_machine_replay_child() {
-    if let Some(dir) = std::env::var_os("ZAKURA_REACTOR_MACHINE_CHILD") {
+fn block_reactor_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_BLOCK_REACTOR_MACHINE_CHILD") {
         let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
         assert!(report.verified(), "{report:?}");
         assert_eq!(report.end.unwrap().steps, 15);
@@ -1425,7 +1425,7 @@ fn reactor_machine_replay_child() {
 fn reactor_machine_records_and_replays_query_identities() {
     use zakura_sim::record::machine::{MachineStep, ReactorAction, ReactorRefusal};
     let entry = harness::find("block/reactor-policy").unwrap();
-    let dir = record(entry, REACTOR_INPUT);
+    let dir = record(entry, BLOCK_REACTOR_INPUT);
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1436,7 +1436,7 @@ fn reactor_machine_records_and_replays_query_identities() {
     )
     .unwrap();
     assert_eq!(trace.steps.len(), 15);
-    assert_eq!(trace.meta.scenario["input"], json!(REACTOR_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(BLOCK_REACTOR_INPUT));
     assert!(trace
         .steps
         .iter()
@@ -1460,8 +1460,8 @@ fn reactor_machine_records_and_replays_query_identities() {
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     let child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "reactor_machine_replay_child"])
-        .env("ZAKURA_REACTOR_MACHINE_CHILD", dir.path())
+        .args(["--exact", "block_reactor_machine_replay_child"])
+        .env("ZAKURA_BLOCK_REACTOR_MACHINE_CHILD", dir.path())
         .output()
         .unwrap();
     assert!(child.status.success(), "{child:?}");

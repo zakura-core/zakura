@@ -1053,7 +1053,7 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: Arc::new(*block.block.header()),
+            header: block.header.clone(),
         })
         .collect()
 }
@@ -1065,7 +1065,7 @@ fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: Arc::new(*block.block.header()),
+            header: block.header.clone(),
         })
         .collect::<Vec<_>>();
     headers.sort_unstable_by_key(|header| (header.height, header.hash.0));
@@ -1097,7 +1097,7 @@ fn verified_side_paths(
                 .map(|block| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: Arc::new(*block.block.header()),
+                    header: block.header.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1179,7 +1179,7 @@ fn verified_path_through(
                 .map(|(_, block)| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: Arc::new(*block.block.header()),
+                    header: block.header.clone(),
                 })
                 .collect::<Vec<_>>()
         })

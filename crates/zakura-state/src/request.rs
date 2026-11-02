@@ -448,6 +448,11 @@ pub struct ContextuallyVerifiedBlock {
     /// The block to commit to the state.
     pub(crate) block: BlockHandle,
 
+    /// One copy of the block's header, made when the block enters the
+    /// non-finalized state. Header-chain records share it, so they neither
+    /// pin the block's body nor copy the header on every commit.
+    pub(crate) header: Arc<block::Header>,
+
     /// The hash of the block.
     pub(crate) hash: block::Hash,
 
@@ -673,6 +678,7 @@ impl ContextuallyVerifiedBlock {
         )?;
 
         Ok(Self {
+            header: Arc::new(*block.header()),
             block,
             hash,
             height,

@@ -18,6 +18,8 @@
 //! - no job starts while a terminal outcome waits or after the publisher
 //!   stops, and nothing at all happens after it stops;
 //! - a result of an abandoned or settled job changes nothing;
+//! - each storage reply means what the model's own table says, through state's
+//!   selection functions;
 //! - the owner holds exactly one slot per live subscription and unwritten
 //!   terminal outcome, and one capacity signal per distinct stalled wait.
 //!
@@ -293,6 +295,138 @@ enum Answer {
     Retry,
     Extends,
     ReachedAtOpen,
+    /// A storage reply, which state's selection functions read.
+    Reply(Reply),
+}
+
+/// A storage reply to a job.
+#[derive(Copy, Clone, Debug)]
+enum Reply {
+    ProbeSelected,
+    ProbeNotSelected,
+    ProbeNotRetained,
+    Refused(LeaseRefused),
+    /// A lease from the header the job must extend.
+    Lease,
+    /// A lease from another header.
+    LeaseWrongParent,
+    /// A page with no record for its first header.
+    EmptyPage,
+    CheckExtends,
+    /// A check that finds another header at the last header's hash.
+    CheckElsewhere,
+    CheckNotSelected,
+}
+
+const REPLIES: [Reply; 13] = [
+    Reply::ProbeSelected,
+    Reply::ProbeNotSelected,
+    Reply::ProbeNotRetained,
+    Reply::Refused(LeaseRefused::NoLocatorIntersection),
+    Reply::Refused(LeaseRefused::TargetNotRetained),
+    Reply::Refused(LeaseRefused::HistoryPruned),
+    Reply::Refused(LeaseRefused::Busy),
+    Reply::Lease,
+    Reply::LeaseWrongParent,
+    Reply::EmptyPage,
+    Reply::CheckExtends,
+    Reply::CheckElsewhere,
+    Reply::CheckNotSelected,
+];
+
+/// Whether storage can send `reply` to `job`: only a first page probes, only a
+/// check without a page gets a check's reply, and only a page job leases.
+fn reply_applies(reply: Reply, job: &Job) -> bool {
+    match reply {
+        Reply::ProbeSelected | Reply::ProbeNotSelected | Reply::ProbeNotRetained => job.probe,
+        Reply::CheckExtends | Reply::CheckElsewhere | Reply::CheckNotSelected => job.count == 0,
+        _ => job.count > 0,
+    }
+}
+
+/// What state's selection functions make of `reply` to `record`'s job.
+fn selected_output(reply: Reply, record: &JobRecord) -> Option<Output> {
+    use SelectedChainMembership::{NotRetained, NotSelected, Selected};
+    let job = &record.job;
+    let other = frontier(2, 99);
+    let last = || job.parent.expect("a check's follower has a last header");
+    match reply {
+        Reply::ProbeSelected => on_probe(Selected(record.target)),
+        Reply::ProbeNotSelected => on_probe(NotSelected),
+        Reply::ProbeNotRetained => on_probe(NotRetained),
+        Reply::Refused(refused) => Some(on_lease_refused(refused, job.following)),
+        Reply::Lease | Reply::LeaseWrongParent => {
+            let ancestor = match (reply, job.parent) {
+                (Reply::LeaseWrongParent, Some(_)) => other,
+                (_, Some(parent)) => parent,
+                (_, None) if record.at_target => record.target,
+                (_, None) => record.start,
+            };
+            on_lease_acquired(job.parent, ancestor, record.target)
+        }
+        Reply::EmptyPage => Some(on_empty_page(job.following)),
+        Reply::CheckExtends => Some(on_following_check(
+            Selected(last()),
+            last(),
+            job.lease_target,
+        )),
+        Reply::CheckElsewhere => Some(on_following_check(
+            Selected(other),
+            last(),
+            job.lease_target,
+        )),
+        Reply::CheckNotSelected => Some(on_following_check(NotSelected, last(), job.lease_target)),
+    }
+}
+
+/// The model's own table of what `reply` to `record`'s job means. `None` means
+/// the job goes on, which the machine plays as a lost read.
+fn reply_meaning(reply: Reply, record: &JobRecord) -> Option<Answer> {
+    use HeadersOutcomeCode::*;
+    let following = record.job.following;
+    let parent = record.job.parent;
+    Some(match reply {
+        Reply::ProbeSelected => return None,
+        Reply::ProbeNotSelected => Answer::End(TargetNotSelected),
+        Reply::ProbeNotRetained => Answer::End(TargetNotRetained),
+        Reply::Refused(LeaseRefused::NoLocatorIntersection) if following => {
+            Answer::End(SubscriptionSuperseded)
+        }
+        Reply::Refused(LeaseRefused::NoLocatorIntersection) => Answer::End(NoLocatorIntersection),
+        Reply::Refused(LeaseRefused::TargetNotRetained) if following => Answer::Local,
+        Reply::Refused(LeaseRefused::TargetNotRetained) => Answer::End(TargetNotRetained),
+        Reply::Refused(LeaseRefused::HistoryPruned) => Answer::End(HistoryPruned),
+        Reply::Refused(LeaseRefused::Busy) => Answer::Local,
+        Reply::Lease | Reply::LeaseWrongParent if parent.is_none() && record.at_target => {
+            Answer::ReachedAtOpen
+        }
+        Reply::LeaseWrongParent if parent.is_some() => Answer::Local,
+        Reply::Lease | Reply::LeaseWrongParent => return None,
+        Reply::EmptyPage if following => Answer::Local,
+        Reply::EmptyPage => Answer::End(HistoryPruned),
+        Reply::CheckExtends => Answer::Extends,
+        Reply::CheckElsewhere | Reply::CheckNotSelected => Answer::End(SubscriptionSuperseded),
+    })
+}
+
+/// The output state hears for `answer` to `record`'s job. A capacity refusal
+/// needs the owner's wait, so its caller builds that output.
+fn answer_output(answer: Answer, record: &JobRecord) -> Output {
+    match answer {
+        Answer::End(code) => Output::End(code),
+        Answer::Local => Output::Stall(Stall::Local, "test"),
+        Answer::Extends => Output::Extends(record.job.lease_target),
+        Answer::ReachedAtOpen => Output::ReachedAtOpen(record.target),
+        Answer::Retry | Answer::Capacity | Answer::Reply(_) => Output::Retry,
+    }
+}
+
+/// `output` without its metric label, which only the runtime owner reads.
+fn unlabelled(output: Output) -> Output {
+    match output {
+        Output::Stall(stall, _) => Output::Stall(stall, ""),
+        output => output,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -819,12 +953,18 @@ impl Machine {
         let count = headers.min(job.count).min(end - parent.height.0);
         let last = frontier(branch, parent.height.0 + count);
         let bytes = fixed() + u64::from(count) * entry() - shave;
+        let reaches = reaches_target(job.following, last.hash, job.initial_target);
+        assert_eq!(
+            reaches,
+            !job.following && last == record.target,
+            "{PROPERTY}: whether the page reaches its target"
+        );
         let page = Page {
             parent,
             last,
             target,
             count,
-            reaches_target: !job.following && last == record.target,
+            reaches_target: reaches,
             payload_len: usize::try_from(bytes).expect("small page"),
         };
         let before = self.actual_view();
@@ -886,22 +1026,30 @@ impl Machine {
         let job = &record.job;
         let reachable = record.at_target && job.parent.is_none();
         let answer = match answer {
+            Answer::Reply(reply) if reply_applies(reply, job) => {
+                let meaning = reply_meaning(reply, &record);
+                assert_eq!(
+                    selected_output(reply, &record).map(unlabelled),
+                    meaning.map(|meaning| unlabelled(answer_output(meaning, &record))),
+                    "{PROPERTY}: what {reply:?} means for {job:?}"
+                );
+                meaning.unwrap_or(Answer::Retry)
+            }
+            Answer::Reply(_) => Answer::Retry,
+            answer => answer,
+        };
+        let answer = match answer {
             Answer::ReachedAtOpen if !reachable => Answer::Retry,
             Answer::Extends if job.count > 0 => Answer::Retry,
             answer => answer,
         };
-        let output = match answer {
-            Answer::End(code) => Output::End(code),
-            Answer::Local => Output::Stall(Stall::Local, "test"),
-            Answer::Capacity => {
-                let signal = ServingCapacitySignal::default();
-                let wait = self.owner.waits.register(signal.clone());
-                self.signals.push((wait, signal));
-                Output::Stall(Stall::Capacity(wait), "test")
-            }
-            Answer::Retry => Output::Retry,
-            Answer::Extends => Output::Extends(job.lease_target),
-            Answer::ReachedAtOpen => Output::ReachedAtOpen(record.target),
+        let output = if let Answer::Capacity = answer {
+            let signal = ServingCapacitySignal::default();
+            let wait = self.owner.waits.register(signal.clone());
+            self.signals.push((wait, signal));
+            Output::Stall(Stall::Capacity(wait), "test")
+        } else {
+            answer_output(answer, &record)
         };
         let latest = self.selected();
         let before = self.actual_view();
@@ -1079,10 +1227,7 @@ impl Machine {
         }
         let selected = self.selected();
         assert!(
-            self.owner
-                .state
-                .next_job::<HB>(selected.as_ref())
-                .is_none(),
+            self.owner.state.next_job::<HB>(selected.as_ref()).is_none(),
             "{PROPERTY}: no job starts after the publisher stops"
         );
         assert!(
@@ -1234,6 +1379,10 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
             15..=19 => Step::Page {
                 headers: u32::from(b % 3) + 1,
                 shave: u64::from(c % 3),
+                stale,
+            },
+            20..=22 if c & 1 == 1 => Step::Finish {
+                answer: Answer::Reply(REPLIES[usize::from(b) % REPLIES.len()]),
                 stale,
             },
             20..=22 => Step::Finish {

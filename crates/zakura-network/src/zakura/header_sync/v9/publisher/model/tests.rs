@@ -19,12 +19,13 @@ fn answer() -> impl Strategy<Value = Answer> {
         .filter(|code| *code != HeadersOutcomeCode::SubscriptionClosed)
         .collect::<Vec<_>>();
     prop_oneof![
-        prop::sample::select(own).prop_map(Answer::End),
-        Just(Answer::Local),
-        Just(Answer::Capacity),
-        Just(Answer::Retry),
-        Just(Answer::Extends),
-        Just(Answer::ReachedAtOpen),
+        5 => prop::sample::select(own).prop_map(Answer::End),
+        5 => prop::sample::select(REPLIES.to_vec()).prop_map(Answer::Reply),
+        1 => Just(Answer::Local),
+        1 => Just(Answer::Capacity),
+        1 => Just(Answer::Retry),
+        1 => Just(Answer::Extends),
+        1 => Just(Answer::ReachedAtOpen),
     ]
 }
 

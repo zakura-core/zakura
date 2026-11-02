@@ -98,7 +98,9 @@ pub use model::{
 };
 pub(crate) use state::is_legal;
 use state::{
-    recheck, CapacityWait, Exit, Job, JobKey, Output, Page, PublisherState, Recheck, Stall,
+    on_empty_page, on_following_check, on_lease_acquired, on_lease_refused, on_probe,
+    reaches_target, recheck, CapacityWait, Exit, Job, JobKey, LeaseRefused, Output, Page,
+    PublisherState, Recheck, Stall,
 };
 
 #[cfg(test)]
@@ -518,9 +520,7 @@ async fn publish<const HEADER_BYTES: usize>(
         if work.is_none() {
             let snapshot = selected.borrow().clone();
             let mut shared = lock(&task.shared);
-            let job = shared
-                .state
-                .next_job::<HEADER_BYTES>(snapshot.as_ref());
+            let job = shared.state.next_job::<HEADER_BYTES>(snapshot.as_ref());
             let ending = shared.state.end_queued();
             drop(shared);
             if let Some(job) = job {
@@ -776,14 +776,10 @@ async fn run_job<const HEADER_BYTES: usize>(
         return Err(check_following(port, job).await.into());
     }
     if job.probe {
-        match port.selected_chain_contains(job.initial_target).await {
-            Ok(SelectedChainMembership::Selected(_)) => {}
-            Ok(SelectedChainMembership::NotSelected) => {
-                return Err(Output::End(HeadersOutcomeCode::TargetNotSelected).into())
-            }
-            Ok(SelectedChainMembership::NotRetained) => {
-                return Err(Output::End(HeadersOutcomeCode::TargetNotRetained).into())
-            }
+        let reply = port.selected_chain_contains(job.initial_target).await;
+        match reply.map(on_probe) {
+            Ok(None) => {}
+            Ok(Some(output)) => return Err(output.into()),
             Err(error) => return Err(port_failure(job.id, "probe", &error).into()),
         }
     }
@@ -797,43 +793,30 @@ async fn run_job<const HEADER_BYTES: usize>(
         },
         None => job.lease_target,
     };
+    let refused = |refused| Refusal::from(on_lease_refused(refused, job.following));
     for _ in 0..LEASE_ATTEMPTS {
         let locators = job.locators.clone();
         let reply = acquire(port, owner, job.selected.as_ref(), lease_target, locators).await;
         let path = match reply {
             Ok(AcquirePathReply::Acquired(path)) => *path,
-            Ok(AcquirePathReply::CapacityBusy(signal)) => return Err(Refusal::CapacityBusy(signal)),
-            // The selected chain no longer extends the last header sent.
-            Ok(AcquirePathReply::NoLocatorIntersection) if job.following => {
-                return Err(Output::End(HeadersOutcomeCode::SubscriptionSuperseded).into())
+            Ok(AcquirePathReply::CapacityBusy(signal)) => {
+                return Err(Refusal::CapacityBusy(signal))
             }
             Ok(AcquirePathReply::NoLocatorIntersection) => {
-                return Err(Output::End(HeadersOutcomeCode::NoLocatorIntersection).into())
-            }
-            // A stale selected tip: the next selected-chain change retries.
-            Ok(AcquirePathReply::TargetNotRetained) if job.following => {
-                return Err(Output::Stall(Stall::Local, "selected_tip").into())
+                return Err(refused(LeaseRefused::NoLocatorIntersection))
             }
             Ok(AcquirePathReply::TargetNotRetained) => {
-                return Err(Output::End(HeadersOutcomeCode::TargetNotRetained).into())
+                return Err(refused(LeaseRefused::TargetNotRetained))
             }
             Ok(AcquirePathReply::HistoryPruned) => {
-                return Err(Output::End(HeadersOutcomeCode::HistoryPruned).into())
+                return Err(refused(LeaseRefused::HistoryPruned))
             }
-            Ok(AcquirePathReply::Busy) => return Err(Output::Stall(Stall::Local, "acquire").into()),
+            Ok(AcquirePathReply::Busy) => return Err(refused(LeaseRefused::Busy)),
             Err(error) => return Err(port_failure(job.id, "acquire", &error).into()),
         };
-        if job.parent.is_none() && path.common_ancestor == path.target {
-            let target = path.target;
+        if let Some(output) = on_lease_acquired(job.parent, path.common_ancestor, path.target) {
             release(port, job.id, path).await;
-            return Err(Output::ReachedAtOpen(target).into());
-        }
-        if job
-            .parent
-            .is_some_and(|parent| parent != path.common_ancestor)
-        {
-            release(port, job.id, path).await;
-            return Err(Output::Stall(Stall::Local, "lease_parent").into());
+            return Err(output.into());
         }
         let read = ReadPath {
             after_hash: path.common_ancestor.hash,
@@ -877,18 +860,12 @@ fn log_port_failure(id: u64, operation: &'static str, error: &PortError) {
 /// fits the subscription's credit, because a conformant subscriber need not
 /// keep page credit after its target, and the publisher still owes it
 /// `SubscriptionSuperseded` when the chain stops extending that header.
-///
-/// The selected tip is above the last header, so the chain extends that
-/// header exactly when it contains it.
 async fn check_following(port: &dyn Port, job: &Job) -> Output {
     let last = job
         .parent
         .expect("a following subscription has sent or reached a header");
     match port.selected_chain_contains(last.hash).await {
-        Ok(SelectedChainMembership::Selected(found)) if found == last => {
-            Output::Extends(job.lease_target)
-        }
-        Ok(_) => Output::End(HeadersOutcomeCode::SubscriptionSuperseded),
+        Ok(reply) => on_following_check(reply, last, job.lease_target),
         Err(error) => port_failure(job.id, "check", &error),
     }
 }
@@ -935,10 +912,7 @@ fn scope(selected: Option<&EngineSnapshot>, target: block::Hash) -> HeaderWorkAu
 ///
 /// A schema-1 page stops before the first header without a record, because a
 /// page's schema must match its subscription and a page cannot skip a header.
-/// With none for its first header, a subscription on the path to its target
-/// ends with `HistoryPruned`: a pruned node never gains records below its
-/// index height, so waiting would stall the subscriber forever. A following
-/// subscription waits instead, because `HistoryPruned` is past its window.
+/// [`on_empty_page`] decides what a page with no first record means.
 fn page_output<const HEADER_BYTES: usize>(
     job: &Job,
     page: RetainedHeaderPathPage,
@@ -984,19 +958,14 @@ fn page_output<const HEADER_BYTES: usize>(
         });
     }
     let Some(last) = entries.last() else {
-        let output = if job.following {
-            Output::Stall(Stall::Local, "aux_unavailable")
-        } else {
-            Output::End(HeadersOutcomeCode::HistoryPruned)
-        };
-        return Err(output.into());
+        return Err(on_empty_page(job.following).into());
     };
     let sent = u32::try_from(entries.len()).expect("a page holds at most MAX_HS_RANGE headers");
     let Some(height) = page.common_ancestor.height.0.checked_add(sent) else {
         return Err(Output::Stall(Stall::Local, "page_shape").into());
     };
     let last = Frontier::new(block::Height(height), last.header.hash());
-    let reaches_target = !job.following && last.hash == job.initial_target;
+    let reaches_target = reaches_target(job.following, last.hash, job.initial_target);
     let frame = encode_frame(&Message::<HEADER_BYTES>::Headers(Headers {
         subscription_id: job.id,
         initial_target_tip_hash: job.initial_target,

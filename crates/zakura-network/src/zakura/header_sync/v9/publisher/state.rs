@@ -29,6 +29,7 @@ use std::{
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
+use zakura_node_services::header_chain::SelectedChainMembership;
 
 use super::{
     super::{
@@ -747,6 +748,99 @@ pub(super) fn recheck(
         return Recheck::Drop;
     }
     Recheck::Query
+}
+
+/// Why storage refused a job's lease, other than for capacity. A capacity
+/// refusal carries a signal, which only the runtime owner holds.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LeaseRefused {
+    NoLocatorIntersection,
+    TargetNotRetained,
+    HistoryPruned,
+    Busy,
+}
+
+/// What a first page's check of its initial target means: an outcome, or `None`
+/// if the selected chain contains the target and the job goes on.
+pub(super) fn on_probe(reply: SelectedChainMembership) -> Option<Output> {
+    match reply {
+        SelectedChainMembership::Selected(_) => None,
+        SelectedChainMembership::NotSelected => {
+            Some(Output::End(HeadersOutcomeCode::TargetNotSelected))
+        }
+        SelectedChainMembership::NotRetained => {
+            Some(Output::End(HeadersOutcomeCode::TargetNotRetained))
+        }
+    }
+}
+
+/// What a check without a page means, for a follower whose last header sent is
+/// `last`, under the selected tip `tip`. The tip is above `last`, so the chain
+/// extends `last` exactly when it contains it.
+pub(super) fn on_following_check(
+    reply: SelectedChainMembership,
+    last: Frontier,
+    tip: block::Hash,
+) -> Output {
+    match reply {
+        SelectedChainMembership::Selected(found) if found == last => Output::Extends(tip),
+        _ => Output::End(HeadersOutcomeCode::SubscriptionSuperseded),
+    }
+}
+
+/// What a refused lease means. A follower's selected chain no longer extends its
+/// last header when no locator intersects. A follower's target that is not
+/// retained is a stale selected tip, which the next selected-chain change
+/// retries.
+pub(super) fn on_lease_refused(refused: LeaseRefused, following: bool) -> Output {
+    match refused {
+        LeaseRefused::NoLocatorIntersection if following => {
+            Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
+        }
+        LeaseRefused::NoLocatorIntersection => {
+            Output::End(HeadersOutcomeCode::NoLocatorIntersection)
+        }
+        LeaseRefused::TargetNotRetained if following => Output::Stall(Stall::Local, "selected_tip"),
+        LeaseRefused::TargetNotRetained => Output::End(HeadersOutcomeCode::TargetNotRetained),
+        LeaseRefused::HistoryPruned => Output::End(HeadersOutcomeCode::HistoryPruned),
+        LeaseRefused::Busy => Output::Stall(Stall::Local, "acquire"),
+    }
+}
+
+/// What an acquired lease from `ancestor` to `target` means for a job that must
+/// extend `parent`: a result, or `None` if the job goes on to read a page.
+pub(super) fn on_lease_acquired(
+    parent: Option<Frontier>,
+    ancestor: Frontier,
+    target: Frontier,
+) -> Option<Output> {
+    match parent {
+        None if ancestor == target => Some(Output::ReachedAtOpen(target)),
+        Some(parent) if parent != ancestor => Some(Output::Stall(Stall::Local, "lease_parent")),
+        _ => None,
+    }
+}
+
+/// What a schema-1 page with no record for its first header means. A pruned node
+/// never gains records below its index height, so waiting would stall a
+/// subscriber on the path forever, and it ends with `HistoryPruned`. A follower
+/// waits instead, because `HistoryPruned` is past its window.
+pub(super) fn on_empty_page(following: bool) -> Output {
+    if following {
+        Output::Stall(Stall::Local, "aux_unavailable")
+    } else {
+        Output::End(HeadersOutcomeCode::HistoryPruned)
+    }
+}
+
+/// Whether a page ending at `last` reaches a subscription's `initial_target`.
+/// A follower reached it already.
+pub(super) fn reaches_target(
+    following: bool,
+    last: block::Hash,
+    initial_target: block::Hash,
+) -> bool {
+    !following && last == initial_target
 }
 
 /// Whether `outcome` is legal for a subscription that has or has not sent a

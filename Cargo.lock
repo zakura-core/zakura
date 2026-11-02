@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.0-rc1"
+version = "1.8.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "11.0.0-rc1"
+version = "11.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "12.0.0-rc1"
+version = "12.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.1-rc1"
+version = "5.0.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "11.0.0-rc1"
+version = "11.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.0.1-rc1"
+version = "5.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3228,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-quic"
-version = "0.2.0-rc1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "curve25519-dalek",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "13.0.1-rc1"
+version = "13.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3351,7 +3351,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rt"
-version = "0.1.0-rc0"
+version = "0.1.0"
 dependencies = [
  "pin-project-lite",
  "rand 0.10.2",
@@ -3401,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.1-rc1"
+version = "5.0.1"
 dependencies = [
  "hex",
  "ripemd",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "12.0.0-rc0"
+version = "12.0.0"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3562,7 +3562,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "4.0.0-rc1"
+version = "4.0.0"
 dependencies = [
  "eyre",
  "futures",
@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.8-rc1"
+version = "2.2.8"
 dependencies = [
  "clap",
  "eyre",

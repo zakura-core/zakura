@@ -82,7 +82,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     };
     let probe = Probe::new(owner);
     let bytes = owner.decoded_bytes();
-    let pool = read.db.read_blocks.clone();
+    let pool = read.db.read_capacity.blocks.clone();
     let header = block.retained_header();
     let transaction = block.transaction(0).unwrap();
     drop(block);
@@ -214,7 +214,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     };
     assert_eq!(result.tx.hash(), hash);
     assert_eq!(result.height, Height(0));
-    let pool = read.db.read_transactions.clone();
+    let pool = read.db.read_capacity.transactions.clone();
     assert_eq!(
         pool.available_slots(),
         0,
@@ -378,7 +378,7 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         panic!("the stored genesis header is available")
     };
     assert_eq!(*header, *genesis.header);
-    let pool = read.db.read_headers.clone();
+    let pool = read.db.read_capacity.headers.clone();
     assert_eq!(
         pool.available_slots(),
         0,
@@ -435,7 +435,7 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         .is_none());
     assert_eq!(pool.available_slots(), 1);
 
-    let raw_pool = read.db.read_raw_blocks.clone();
+    let raw_pool = read.db.read_capacity.raw_blocks.clone();
     let raw = read.db.raw_block_result(height_zero).unwrap().unwrap();
     assert_eq!(
         raw.as_slice(),
@@ -541,7 +541,7 @@ fn transaction_index_migrations_progress_with_one_decode_slot() {
         #[cfg(not(feature = "indexer"))]
         upgrade::drop_tx_locs_by_spends::run(Height(31), &db, &receiver).unwrap();
     });
-    assert_eq!(db.read_transactions.available_slots(), 1);
+    assert_eq!(db.read_capacity.transactions.available_slots(), 1);
 }
 
 /// Storage round-trip test for block and transaction data in the finalized state database.
@@ -850,7 +850,7 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
 
     let mut db = read.db.clone();
     let budget = ReadMemoryBudget::new(NonZeroU64::MAX, NonZeroU64::MIN);
-    db.read_memory = budget.clone();
+    db.read_capacity.memory = budget.clone();
     let height = Height(0).into();
 
     let block = db.block(height).unwrap().unwrap();
@@ -945,7 +945,7 @@ async fn parser_limit_refuses_reads_while_another_parser_holds_it() {
 
     let mut db = read.db.clone();
     let budget = ReadMemoryBudget::new(NonZeroU64::new(8).unwrap(), NonZeroU64::MAX);
-    db.read_memory = budget.clone();
+    db.read_capacity.memory = budget.clone();
 
     let pool = DecodedBlockPool::for_block_count(NonZeroU64::new(4).unwrap());
     let outer = pool.try_decode_bounded(&budget, |outer_scope| {

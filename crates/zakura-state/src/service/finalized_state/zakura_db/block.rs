@@ -192,7 +192,7 @@ impl ZakuraDb {
         &self,
         hash_or_height: HashOrHeight,
     ) -> Result<Option<HeaderHandle>, PayloadAdmissionFailure> {
-        let header = self.read_headers.try_decode(|| {
+        let header = self.read_capacity.headers.try_decode(|| {
             let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
             let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
             self.db
@@ -227,13 +227,14 @@ impl ZakuraDb {
         &self,
         hash_or_height: HashOrHeight,
     ) -> Result<Option<BlockHandle>, AdmissionFailure> {
-        let block = self
-            .read_blocks
-            .try_decode_bounded(&self.read_memory, |scope| {
-                Ok(self
-                    .decode_stored_block(hash_or_height, scope)?
-                    .map(|(block, _)| block))
-            })?;
+        let block =
+            self.read_capacity
+                .blocks
+                .try_decode_bounded(&self.read_capacity.memory, |scope| {
+                    Ok(self
+                        .decode_stored_block(hash_or_height, scope)?
+                        .map(|(block, _)| block))
+                })?;
         Ok(block.map(Into::into))
     }
 
@@ -281,16 +282,18 @@ impl ZakuraDb {
         hash_or_height: HashOrHeight,
     ) -> Result<Option<(BlockHandle, usize)>, AdmissionFailure> {
         let mut size = 0;
-        let block = self
-            .read_blocks
-            .try_decode_bounded(&self.read_memory, |scope| {
-                let Some((block, stored_size)) = self.decode_stored_block(hash_or_height, scope)?
-                else {
-                    return Ok(None);
-                };
-                size = stored_size;
-                Ok(Some(block))
-            })?;
+        let block =
+            self.read_capacity
+                .blocks
+                .try_decode_bounded(&self.read_capacity.memory, |scope| {
+                    let Some((block, stored_size)) =
+                        self.decode_stored_block(hash_or_height, scope)?
+                    else {
+                        return Ok(None);
+                    };
+                    size = stored_size;
+                    Ok(Some(block))
+                })?;
         Ok(block.map(|block| (block.into(), size)))
     }
 
@@ -304,8 +307,9 @@ impl ZakuraDb {
         &self,
         hash_or_height: HashOrHeight,
     ) -> Result<Option<OwnedRawBlock>, PayloadAdmissionFailure> {
-        self.read_raw_blocks
-            .try_decode_bounded(&self.read_memory, |scope| {
+        self.read_capacity
+            .raw_blocks
+            .try_decode_bounded(&self.read_capacity.memory, |scope| {
                 self.raw_block_bytes_within(hash_or_height, usize::MAX, scope)
             })
     }
@@ -488,7 +492,7 @@ impl ZakuraDb {
             return Ok(None);
         };
         // The fixed partition's block count bounds this parser with its results.
-        let block = self.chain_tip_blocks.try_decode(|| {
+        let block = self.read_capacity.chain_tip_blocks.try_decode(|| {
             self.decode_stored_block(height.into(), &mut ParseScope::statically_bounded())
                 .expect("a statically bounded parser scope never refuses a charge")
                 .map(|(block, _)| block)
@@ -565,9 +569,10 @@ impl ZakuraDb {
         hash: transaction::Hash,
     ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure> {
         let mut location_and_time = None;
-        let transaction = self.read_transactions.try_decode_bounded::<Transaction>(
-            &self.read_memory,
-            |scope| {
+        let transaction = self
+            .read_capacity
+            .transactions
+            .try_decode_bounded::<Transaction>(&self.read_capacity.memory, |scope| {
                 scope.try_charge(MAX_BLOCK_BYTES)?;
                 let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
                 let Some(location) = self.transaction_location(hash) else {
@@ -582,8 +587,7 @@ impl ZakuraDb {
                     scope.try_charge(transaction.decoded_memory_size_bytes())?;
                 }
                 Ok(transaction)
-            },
-        )?;
+            })?;
         Ok(transaction.map(|transaction| {
             let (height, time) = location_and_time.expect("a decoded transaction has its location");
             (transaction.into(), height, time)
@@ -639,9 +643,10 @@ impl ZakuraDb {
                 return None;
             }
             let mut location = None;
-            let result = self.read_transactions.try_decode_bounded::<Transaction>(
-                &self.read_memory,
-                |scope| {
+            let result = self
+                .read_capacity
+                .transactions
+                .try_decode_bounded::<Transaction>(&self.read_capacity.memory, |scope| {
                     scope.try_charge(MAX_BLOCK_BYTES)?;
                     let Some((next_location, transaction)) = transactions.next() else {
                         return Ok(None);
@@ -650,8 +655,7 @@ impl ZakuraDb {
                     let transaction: Transaction = transaction;
                     scope.try_charge(transaction.decoded_memory_size_bytes())?;
                     Ok(Some(transaction))
-                },
-            );
+                });
             match result {
                 Ok(Some(transaction)) => Some(Ok((
                     location.expect("the decoded item has a location"),

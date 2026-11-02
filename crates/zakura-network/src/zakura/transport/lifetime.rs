@@ -62,7 +62,7 @@ pub(crate) struct TransportLimits {
     pub(crate) max_frame_bytes: u32,
 }
 
-/// The node's transport byte and worker bounds, derived from its transport limits.
+/// The node's transport byte bounds, derived from its transport limits.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceEnvelope {
     /// Raw inbound frame bytes that one connection may retain.
@@ -73,8 +73,6 @@ pub(crate) struct ResourceEnvelope {
     pub(crate) connection_output_bytes: u64,
     /// Queued frame bytes without another owner that the node may retain.
     pub(crate) node_output_bytes: u64,
-    /// Request-stream executions that open streams allow at once across the node.
-    pub(crate) request_executions: usize,
     /// The frames each stream's raw and output floor slots may retain, in bytes.
     pub(crate) floor_frame_bytes: u128,
     /// Unspent transport credit the peer memory budget funds, in bytes.
@@ -103,7 +101,6 @@ impl ResourceEnvelope {
             node_raw_bytes: node_bytes(connection_raw_bytes),
             connection_output_bytes,
             node_output_bytes: node_bytes(connection_output_bytes),
-            request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
             floor_frame_bytes: 2 * streams * u128::from(limits.max_frame_bytes),
             transport_credit_bytes: live_connections
                 * u128::from(zakura_quic::connection_memory_bytes(

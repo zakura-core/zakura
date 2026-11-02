@@ -1368,30 +1368,6 @@ fn expected_view(model: &Model) -> ReactorMachineView {
     }
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| {
-            payload
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-        })
-        .unwrap_or_else(|| "non-string panic payload".to_owned())
-}
-
-fn machine_failure(
-    payload: &(dyn std::any::Any + Send),
-    phase: WorkOwnershipPhase,
-) -> WorkOwnershipFailure {
-    let message = panic_message(payload);
-    WorkOwnershipFailure {
-        property_failure: message.contains(PROPERTY),
-        phase,
-        message,
-    }
-}
-
 /// Capture decoder-v2 operations with the exact identity of each accepted or
 /// refused query. The history holds at most 128 steps. A driver panic stays
 /// distinct from a property failure.
@@ -1406,9 +1382,10 @@ pub fn trace_block_reactor_bytes(data: &[u8]) -> BlockReactorHistory {
         driver.actions.clear();
         let mut failure = match catch_unwind(AssertUnwindSafe(|| driver.apply(operation))) {
             Ok(_) => None,
-            Err(payload) => Some(machine_failure(
+            Err(payload) => Some(WorkOwnershipFailure::from_panic(
                 payload.as_ref(),
                 WorkOwnershipPhase::Transition,
+                PROPERTY,
             )),
         };
         if failure.is_none() {
@@ -1416,7 +1393,13 @@ pub fn trace_block_reactor_bytes(data: &[u8]) -> BlockReactorHistory {
                 check(&driver.state, &driver.model, driver.base);
             }))
             .err()
-            .map(|payload| machine_failure(payload.as_ref(), WorkOwnershipPhase::Invariant));
+            .map(|payload| {
+                WorkOwnershipFailure::from_panic(
+                    payload.as_ref(),
+                    WorkOwnershipPhase::Invariant,
+                    PROPERTY,
+                )
+            });
         }
         let failed = failure.is_some();
         steps.push(BlockReactorStep {

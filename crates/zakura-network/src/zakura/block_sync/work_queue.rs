@@ -79,10 +79,12 @@ impl WorkQueueInner {
     }
 }
 
-/// Publishes a changed reservation gauge before releasing the queue lock.
+/// Publishes a changed reservation gauge and closes the budget on a ledger fault
+/// before releasing the queue lock.
 struct WorkQueueGuard<'a> {
     inner: MutexGuard<'a, WorkQueueInner>,
     reserved_bytes: u64,
+    budget: &'a ByteBudget,
 }
 
 impl std::ops::Deref for WorkQueueGuard<'_> {
@@ -105,6 +107,13 @@ impl Drop for WorkQueueGuard<'_> {
         if bytes != self.reserved_bytes {
             // This lossy cast affects diagnostics only; the state keeps an integer.
             metrics::gauge!("sync.block.work.reserved_bytes").set(bytes as f64);
+        }
+        if let Some(fault) = self.inner.state.ledger_fault() {
+            self.budget.close(BudgetClosure::Arithmetic {
+                operation: fault.operation,
+                owned: fault.total,
+                amount: fault.amount,
+            });
         }
     }
 }
@@ -222,6 +231,7 @@ impl WorkQueue {
         WorkQueueGuard {
             inner,
             reserved_bytes,
+            budget: &self.budget,
         }
     }
 

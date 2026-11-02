@@ -194,6 +194,101 @@ fn duplicate_settlement_releases_each_charge_once() {
 }
 
 #[test]
+fn ledger_underflow_latches_a_fault_without_clamping() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100)]);
+    let a = take(&mut state, 1, 1, 1, 1);
+    assert_eq!(publish(&mut state, &a), 100);
+    state.reserved_bytes = 40;
+
+    let (outcome, _) = state.return_owned(owner_of(&a), heights_of(&a));
+
+    assert_eq!(outcome.released_bytes, 100);
+    assert_eq!(
+        state.reserved_bytes(),
+        40,
+        "a failed settlement never clamps"
+    );
+    assert_eq!(
+        state.ledger_fault(),
+        Some(LedgerFault {
+            operation: "ledger settlement",
+            total: 40,
+            amount: 100,
+        })
+    );
+}
+
+#[test]
+fn ledger_overflow_latches_a_fault_without_clamping() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100)]);
+    let a = take(&mut state, 1, 1, 1, 1);
+    state.reserved_bytes = u64::MAX;
+
+    assert_eq!(state.publish_claim(&a), Some(100));
+
+    assert_eq!(state.reserved_bytes(), u64::MAX);
+    assert_eq!(
+        state.ledger_fault().map(|fault| fault.operation),
+        Some("ledger charge")
+    );
+}
+
+#[test]
+fn in_flight_tally_underflow_latches_a_fault() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100)]);
+    let a = take(&mut state, 1, 1, 1, 1);
+    assert_eq!(publish(&mut state, &a), 100);
+    state.in_flight_reserved.items = 0;
+
+    assert_eq!(
+        state.end_reservation_at_receipt(owner_of(&a), height(1), false),
+        Some(100)
+    );
+
+    assert_eq!(
+        state.ledger_fault().map(|fault| fault.operation),
+        Some("in-flight settlement")
+    );
+}
+
+#[test]
+fn ledger_fault_closes_admission_under_the_lock_and_stays_closed() {
+    let budget = crate::zakura::transport::ByteBudget::new(1_000);
+    let queue = super::super::WorkQueue::new(height(0), budget.clone());
+    queue.set_estimate_floor_for_tests(1);
+    queue.extend(
+        authority(0),
+        [
+            (height(1), hash(1), confirmed(100)),
+            (height(2), hash(2), confirmed(100)),
+        ],
+    );
+    let owner = queue.publish_fixture(1..=1);
+    let other_owner = queue.publish_fixture(2..=2);
+    assert!(!budget.is_closed());
+    queue.lock().state.reserved_bytes = 0;
+
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [height(1)]);
+
+    assert!(budget.is_closed(), "the fault closes without an audit");
+    assert_eq!(budget.available(), 0);
+    assert!(budget.reserve_owned(1).is_none());
+    assert!(budget.charge_owned(1).is_none());
+    assert_eq!(
+        budget.reserved(),
+        100,
+        "the other owner stays charged after closure"
+    );
+    assert_eq!(queue.owner_for_height(height(2)), Some(other_owner));
+    queue.reset_above(height(0));
+    assert_eq!(budget.reserved(), 0);
+    assert!(budget.is_closed(), "drain cannot reopen admission");
+}
+
+#[test]
 fn adjacent_takes_by_two_peers_stay_disjoint() {
     let mut state = new_state();
     extend(

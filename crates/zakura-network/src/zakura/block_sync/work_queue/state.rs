@@ -148,24 +148,37 @@ struct ReservedTally {
 }
 
 impl ReservedTally {
-    fn add(&mut self, charge: u64) {
-        if charge > 0 {
-            self.bytes = self.bytes.saturating_add(charge);
-            self.items = self.items.saturating_add(1);
+    fn checked_add(self, charge: u64) -> Option<Self> {
+        if charge == 0 {
+            return Some(self);
         }
+        Some(Self {
+            bytes: self.bytes.checked_add(charge)?,
+            items: self.items.checked_add(1)?,
+        })
     }
 
-    fn sub(&mut self, charge: u64) {
-        if charge > 0 {
-            self.bytes = self.bytes.saturating_sub(charge);
-            self.items = self.items.saturating_sub(1);
+    fn checked_sub(self, charge: u64) -> Option<Self> {
+        if charge == 0 {
+            return Some(self);
         }
+        Some(Self {
+            bytes: self.bytes.checked_sub(charge)?,
+            items: self.items.checked_sub(1)?,
+        })
     }
+}
 
-    fn sub_tally(&mut self, other: Self) {
-        self.bytes = self.bytes.saturating_sub(other.bytes);
-        self.items = self.items.saturating_sub(other.items);
-    }
+/// The first failed arithmetic in the logical ledger. The ledger keeps its last
+/// valid values, and IO closes the budget under the same lock.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct LedgerFault {
+    /// The ledger operation that failed.
+    pub(in crate::zakura::block_sync) operation: &'static str,
+    /// The value the operation started from.
+    pub(in crate::zakura::block_sync) total: u64,
+    /// The amount the operation could not apply.
+    pub(in crate::zakura::block_sync) amount: u64,
 }
 
 /// Compute a clamped body-size estimate from a [`BlockSizeEstimate`] hint.
@@ -195,6 +208,8 @@ pub(in crate::zakura::block_sync) struct WorkQueueState {
     /// Nonzero reservations held by `in_flight` items, maintained at each
     /// `in_flight` ledger transition so admission never scans the map.
     in_flight_reserved: ReservedTally,
+    /// The first ledger arithmetic failure, if any. It never clears.
+    ledger_fault: Option<LedgerFault>,
 }
 
 impl WorkQueueState {
@@ -234,6 +249,62 @@ impl WorkQueueState {
             floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
             reserved_bytes: 0,
             in_flight_reserved: ReservedTally::default(),
+            ledger_fault: None,
+        }
+    }
+
+    // ---- checked ledger arithmetic ----
+
+    /// The first ledger arithmetic failure. IO must close the budget on one.
+    pub(in crate::zakura::block_sync) fn ledger_fault(&self) -> Option<LedgerFault> {
+        self.ledger_fault
+    }
+
+    fn note_fault(&mut self, operation: &'static str, total: u64, amount: u64) {
+        self.ledger_fault.get_or_insert(LedgerFault {
+            operation,
+            total,
+            amount,
+        });
+    }
+
+    /// Add to a transition's running byte total. Overflow keeps `total`.
+    fn add_to_total(&mut self, total: u64, amount: u64) -> u64 {
+        total.checked_add(amount).unwrap_or_else(|| {
+            self.note_fault("transition total", total, amount);
+            total
+        })
+    }
+
+    fn charge_ledger(&mut self, bytes: u64) {
+        match self.reserved_bytes.checked_add(bytes) {
+            Some(total) => self.reserved_bytes = total,
+            None => self.note_fault("ledger charge", self.reserved_bytes, bytes),
+        }
+    }
+
+    fn settle_ledger(&mut self, bytes: u64) {
+        match self.reserved_bytes.checked_sub(bytes) {
+            Some(total) => self.reserved_bytes = total,
+            None => self.note_fault("ledger settlement", self.reserved_bytes, bytes),
+        }
+    }
+
+    fn charge_in_flight(&mut self, charge: u64) {
+        match self.in_flight_reserved.checked_add(charge) {
+            Some(tally) => self.in_flight_reserved = tally,
+            None => self.note_fault("in-flight charge", self.in_flight_reserved.bytes, charge),
+        }
+    }
+
+    fn settle_in_flight(&mut self, charge: u64) {
+        match self.in_flight_reserved.checked_sub(charge) {
+            Some(tally) => self.in_flight_reserved = tally,
+            None => self.note_fault(
+                "in-flight settlement",
+                self.in_flight_reserved.bytes,
+                charge,
+            ),
         }
     }
 
@@ -396,7 +467,7 @@ impl WorkQueueState {
         }
         for (height, item) in &taken {
             self.pending.remove(height);
-            self.in_flight_reserved.add(item.budget.reserved_charge());
+            self.charge_in_flight(item.budget.reserved_charge());
             self.in_flight.insert(*height, *item);
         }
         taken
@@ -480,7 +551,7 @@ impl WorkQueueState {
         }
         for (height, item) in &taken {
             self.pending.remove(height);
-            self.in_flight_reserved.add(item.budget.reserved_charge());
+            self.charge_in_flight(item.budget.reserved_charge());
             self.in_flight.insert(*height, *item);
         }
         taken
@@ -503,7 +574,7 @@ impl WorkQueueState {
                 continue;
             }
             if let Some(mut item) = self.in_flight.remove(height) {
-                self.in_flight_reserved.sub(item.budget.reserved_charge());
+                self.settle_in_flight(item.budget.reserved_charge());
                 item.owner = None;
                 if let Some(estimate) = item.retry_estimated_bytes.take() {
                     item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -547,10 +618,10 @@ impl WorkQueueState {
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
             let charge = item.estimated_bytes;
-            self.in_flight_reserved.add(charge);
-            transferred = transferred.saturating_add(charge);
+            self.charge_in_flight(charge);
+            transferred = self.add_to_total(transferred, charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_add(transferred);
+        self.charge_ledger(transferred);
         complete.then_some(transferred)
     }
 
@@ -586,8 +657,8 @@ impl WorkQueueState {
         }
         item.answered_elsewhere = answered_elsewhere;
         let released = item.budget.release_reserved();
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
-        self.in_flight_reserved.sub(released);
+        self.settle_ledger(released);
+        self.settle_in_flight(released);
         Some(released)
     }
 
@@ -603,8 +674,8 @@ impl WorkQueueState {
             return None;
         }
         let released = item.budget.release_reserved();
-        self.in_flight_reserved.sub(released);
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
+        self.settle_in_flight(released);
+        self.settle_ledger(released);
         Some(released)
     }
 
@@ -657,7 +728,6 @@ impl WorkQueueState {
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         let mut released = 0u64;
-        let mut released_in_flight = ReservedTally::default();
         for height in heights {
             let Some(item) = self.in_flight.get_mut(&height) else {
                 continue;
@@ -666,11 +736,10 @@ impl WorkQueueState {
                 continue;
             }
             let charge = item.budget.release_reserved();
-            released = released.saturating_add(charge);
-            released_in_flight.add(charge);
+            released = self.add_to_total(released, charge);
+            self.settle_in_flight(charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
-        self.in_flight_reserved.sub_tally(released_in_flight);
+        self.settle_ledger(released);
         released
     }
 
@@ -715,8 +784,8 @@ impl WorkQueueState {
                     .remove(&height)
                     .expect("owned item exists because it was just checked");
                 let charge = item.budget.release_reserved();
-                self.in_flight_reserved.sub(charge);
-                outcome.released_bytes = outcome.released_bytes.saturating_add(charge);
+                self.settle_in_flight(charge);
+                outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
                 outcome.committed_count = outcome.committed_count.saturating_add(1);
                 continue;
             }
@@ -732,8 +801,8 @@ impl WorkQueueState {
                 .remove(&height)
                 .expect("reserved item exists because it was just checked");
             let charge = item.budget.release_reserved();
-            self.in_flight_reserved.sub(charge);
-            outcome.released_bytes = outcome.released_bytes.saturating_add(charge);
+            self.settle_in_flight(charge);
+            outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
             item.owner = None;
             if let Some(estimate) = item.retry_estimated_bytes.take() {
                 item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -741,7 +810,7 @@ impl WorkQueueState {
             outcome.returned_count = outcome.returned_count.saturating_add(1);
             self.pending.insert(height, item);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(outcome.released_bytes);
+        self.settle_ledger(outcome.released_bytes);
         let wake = WorkWake {
             available: outcome.returned_count > 0,
             ..WorkWake::default()
@@ -776,7 +845,7 @@ impl WorkQueueState {
                 .pending
                 .pop_first()
                 .expect("first_key_value returned Some");
-            released = released.saturating_add(item.budget.release_reserved());
+            released = self.add_to_total(released, item.budget.release_reserved());
         }
         let mut revocation = false;
         while let Some((&height, _)) = self.in_flight.first_key_value() {
@@ -789,10 +858,10 @@ impl WorkQueueState {
                 .expect("first_key_value returned Some");
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
-            self.in_flight_reserved.sub(charge);
-            released = released.saturating_add(charge);
+            self.settle_in_flight(charge);
+            released = self.add_to_total(released, charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
+        self.settle_ledger(released);
         WorkDelta {
             released_bytes: released,
             wake: WorkWake {
@@ -820,7 +889,7 @@ impl WorkQueueState {
                 .pending
                 .pop_last()
                 .expect("last_key_value returned Some");
-            released = released.saturating_add(item.budget.release_reserved());
+            released = self.add_to_total(released, item.budget.release_reserved());
         }
         let mut revocation = false;
         while let Some((&height, _)) = self.in_flight.last_key_value() {
@@ -833,10 +902,10 @@ impl WorkQueueState {
                 .expect("last_key_value returned Some");
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
-            self.in_flight_reserved.sub(charge);
-            released = released.saturating_add(charge);
+            self.settle_in_flight(charge);
+            released = self.add_to_total(released, charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
+        self.settle_ledger(released);
         WorkDelta {
             released_bytes: released,
             wake: WorkWake {
@@ -888,7 +957,10 @@ impl WorkQueueState {
     pub(in crate::zakura::block_sync) fn reserved_above(&self, floor: block::Height) -> (u64, u64) {
         let mut above = self.in_flight_reserved;
         for (_, item) in self.in_flight.range(..=floor) {
-            above.sub(item.budget.reserved_charge());
+            // The tally falls below its items only after a transition latched a fault.
+            if let Some(remaining) = above.checked_sub(item.budget.reserved_charge()) {
+                above = remaining;
+            }
         }
         debug_assert_eq!(
             (above.bytes, above.items),

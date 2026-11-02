@@ -2096,20 +2096,19 @@ impl ServiceSessionIO {
     fn on_exit(&mut self, exit: SessionExit, connection_cancelled: bool) -> Option<Duration> {
         let kind = exit.stream.kind;
         let session = self.sessions.get_mut(&kind)?;
-        let current = session.records(exit);
-        let delay = session.exited(exit, connection_cancelled);
+        let outcome = session.exited(exit, connection_cancelled);
         self.trace(
             kind,
             SessionStep::GenerationExited {
                 generation: exit.session_id,
                 opened_locally: exit.opened_locally,
-                current,
+                current: outcome.current,
             },
         );
-        if let Some(delay) = delay {
+        if let Some(delay) = outcome.reopen_after {
             self.start_backoff(kind, delay);
         }
-        delay
+        outcome.reopen_after
     }
 
     /// `kind`'s reopen wait fired. Returns the stream to check demand for, if

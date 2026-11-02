@@ -693,7 +693,9 @@ impl SessionHarness {
             session_id: id,
             opened_locally,
         };
-        let delay = self.session.exited(exit, false);
+        let outcome = self.session.exited(exit, false);
+        check(ONE_ACTIVE_GENERATION, outcome.current, !stale);
+        let delay = outcome.reopen_after;
         check(LEGAL_REOPEN, delay, self.model.exit(opened_locally, id));
         if stale {
             self.summary.stale_exits += 1;

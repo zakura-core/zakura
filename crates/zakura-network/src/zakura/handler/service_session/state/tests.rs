@@ -280,7 +280,7 @@ fn an_old_generation_exit_leaves_the_replacement_active() {
         session_id: 1,
         opened_locally: false,
     };
-    assert_eq!(session.exited(old, false), None);
+    assert_eq!(session.exited(old, false).reopen_after, None);
     assert_eq!(session.remote_session_id, Some(2));
     assert!(!session.is_waiting(), "a stale exit schedules no reopen");
 
@@ -289,7 +289,7 @@ fn an_old_generation_exit_leaves_the_replacement_active() {
         ..old
     };
     assert_eq!(
-        session.exited(current, false),
+        session.exited(current, false).reopen_after,
         Some(ORDERED_STREAM_REOPEN_BACKOFF)
     );
     assert!(!session.has_active_session());
@@ -313,7 +313,7 @@ fn a_lost_collision_keeps_the_adopted_generation_after_the_local_exit() {
         session_id: 1,
         opened_locally: true,
     };
-    assert_eq!(session.exited(local, false), None);
+    assert_eq!(session.exited(local, false).reopen_after, None);
     assert_eq!(session.local_session_id, None);
     assert_eq!(session.remote_session_id, Some(2));
 }
@@ -691,8 +691,8 @@ fn fixed_seeds_exercise_every_session_rule() {
     }
 }
 
-/// A trace names the attempt that opened a generation, and only the exit of
-/// that exact generation clears it.
+/// Attempts count every local open, and only the exit of the exact generation
+/// is current.
 #[test]
 fn attempts_name_local_generations_and_stale_exits_keep_them() {
     let roles = ConnectionRoles {
@@ -709,16 +709,16 @@ fn attempts_name_local_generations_and_stale_exits_keep_them() {
     assert_eq!(session.begin_attempt(), 1);
     assert_eq!(session.begin_attempt(), 2, "a failed open keeps its number");
     session.opened(40);
-    assert_eq!(session.local_attempt(), Some(2));
 
     for stale in [exit(39, true), exit(40, false)] {
-        assert!(!session.records(stale));
-        assert_eq!(session.exited(stale, false), None);
-        assert_eq!(session.local_attempt(), Some(2));
+        let outcome = session.exited(stale, false);
+        assert!(!outcome.current);
+        assert_eq!(outcome.reopen_after, None);
+        assert_eq!(session.local_session_id, Some(40));
     }
 
-    assert!(session.records(exit(40, true)));
-    assert!(session.exited(exit(40, true), false).is_some());
-    assert_eq!(session.local_attempt(), None);
+    let outcome = session.exited(exit(40, true), false);
+    assert!(outcome.current);
+    assert!(outcome.reopen_after.is_some());
     assert_eq!(session.begin_attempt(), 3, "reopens keep counting");
 }

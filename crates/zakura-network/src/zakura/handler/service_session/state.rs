@@ -174,6 +174,16 @@ pub(in crate::zakura::handler) struct SessionExit {
     pub(in crate::zakura::handler) opened_locally: bool,
 }
 
+/// What an exit did to its service.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::handler) struct ExitOutcome {
+    /// Whether the exit named a generation the state still recorded.
+    pub(in crate::zakura::handler) current: bool,
+    /// The transport backoff to wait before reopening, if the generation was
+    /// the last active one and this endpoint reopens the service.
+    pub(in crate::zakura::handler) reopen_after: Option<Duration>,
+}
+
 /// This endpoint's roles on its connection, which select a service's opener.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::handler) struct ConnectionRoles {
@@ -259,8 +269,6 @@ pub(in crate::zakura::handler) struct ServiceSessionState {
     reopen_state: SessionReopenState,
     /// Local opens started on this connection, which name each attempt in traces.
     open_attempts: u64,
-    /// The attempt that opened the active local generation.
-    local_attempt: Option<u64>,
 }
 
 impl ServiceSessionState {
@@ -279,7 +287,6 @@ impl ServiceSessionState {
             reopen_attempts: 0,
             reopen_state: SessionReopenState::Idle,
             open_attempts: 0,
-            local_attempt: None,
         }
     }
 
@@ -287,21 +294,6 @@ impl ServiceSessionState {
     pub(in crate::zakura::handler) fn begin_attempt(&mut self) -> u64 {
         self.open_attempts = self.open_attempts.saturating_add(1);
         self.open_attempts
-    }
-
-    /// The attempt that opened the active local generation.
-    pub(in crate::zakura::handler) fn local_attempt(&self) -> Option<u64> {
-        self.local_attempt
-    }
-
-    /// Whether `exit` names a generation the state still records.
-    pub(in crate::zakura::handler) fn records(&self, exit: SessionExit) -> bool {
-        let active = if exit.opened_locally {
-            self.local_session_id
-        } else {
-            self.remote_session_id
-        };
-        active == Some(exit.session_id)
     }
 
     /// The service's primary stream.
@@ -340,7 +332,6 @@ impl ServiceSessionState {
     pub(in crate::zakura::handler) fn opened(&mut self, session_id: u64) {
         self.cancel_wait();
         self.local_session_id = Some(session_id);
-        self.local_attempt = Some(self.open_attempts);
     }
 
     /// Record a complete inbound generation, unless this endpoint wins the
@@ -385,17 +376,13 @@ impl ServiceSessionState {
 
     /// Record that `exit`'s generation ended. A stale generation changes
     /// nothing.
-    ///
-    /// Returns the transport backoff to wait before reopening, if the matching
-    /// generation was the last active one and this endpoint reopens the
-    /// service.
     pub(in crate::zakura::handler) fn exited(
         &mut self,
         exit: SessionExit,
         connection_cancelled: bool,
-    ) -> Option<Duration> {
-        let removed = self.remove_active_session(exit.opened_locally, exit.session_id);
-        if removed
+    ) -> ExitOutcome {
+        let current = self.remove_active_session(exit.opened_locally, exit.session_id);
+        let reopen_after = if current
             && !self.has_active_session()
             && should_reopen_ordered_session(
                 exit,
@@ -403,11 +390,14 @@ impl ServiceSessionState {
                 self.roles.is_initiator,
                 self.roles.i_open_collision_winner,
                 connection_cancelled,
-            )
-        {
+            ) {
             self.schedule_transport_backoff()
         } else {
             None
+        };
+        ExitOutcome {
+            current,
+            reopen_after,
         }
     }
 
@@ -422,9 +412,6 @@ impl ServiceSessionState {
         }
 
         *active_session = None;
-        if opened_locally {
-            self.local_attempt = None;
-        }
         true
     }
 

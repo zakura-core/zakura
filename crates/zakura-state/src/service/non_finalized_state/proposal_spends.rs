@@ -82,17 +82,23 @@ impl Entry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use zakura_chain::{
-        amount::NonNegative, block::Block, parameters::Network, value_balance::ValueBalance,
+        amount::{Amount, NonNegative},
+        block::{Block, CommitmentError, Height},
+        parameters::{Network, NetworkUpgrade},
+        serialization::ZcashDeserializeInto,
+        transaction::{LockTime, Transaction},
+        transparent,
+        value_balance::ValueBalance,
     };
 
     use crate::{
         arbitrary::Prepare,
-        service::{finalized_state::FinalizedState, non_finalized_state::NonFinalizedState},
+        service::{check, finalized_state::FinalizedState, non_finalized_state::NonFinalizedState},
         tests::FakeChainHelper,
-        Config,
+        Config, ValidateContextError,
     };
 
     use super::{ProposalSpends, MAX_ENTRIES};
@@ -107,6 +113,83 @@ mod tests {
         let child = parent.make_fake_child().set_work(10);
         let other_child = parent.make_fake_child().set_work(1).make_fake_child();
         (parent, child, other_child)
+    }
+
+    fn spend_transaction(version: u32, outpoint: transparent::OutPoint) -> Transaction {
+        let inputs = vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[0x51]),
+            sequence: u32::MAX,
+        }];
+        match version {
+            4 => Transaction::V4 {
+                inputs,
+                outputs: vec![],
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                joinsplit_data: None,
+                sapling_shielded_data: None,
+            },
+            5 => Transaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                inputs,
+                outputs: vec![],
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+            },
+            6 => Transaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu7,
+                inputs,
+                outputs: vec![],
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+                ironwood_shielded_data: None,
+            },
+            _ => unreachable!("the tests cover transaction versions 4, 5, and 6"),
+        }
+    }
+
+    /// Builds contextual-validation inputs; signatures and the transaction's shielded
+    /// destination are outside this state-layer test, as they are checked by consensus.
+    fn state_with_spend() -> (
+        FinalizedState,
+        NonFinalizedState,
+        Arc<Block>,
+        transparent::OutPoint,
+        transparent::OrderedUtxo,
+    ) {
+        let (parent, ..) = blocks();
+        let outpoint = transparent::OutPoint {
+            hash: parent.transactions[0].hash(),
+            index: 0,
+        };
+        let expected = parent.clone().prepare().new_outputs[&outpoint].clone();
+        assert!(expected.utxo.output.value > Amount::<NonNegative>::zero());
+        assert!(!expected.utxo.output.lock_script.as_raw_bytes().is_empty());
+
+        let finalized = FinalizedState::new(&Config::ephemeral(), &Network::Mainnet)
+            .expect("opening an ephemeral database succeeds");
+        finalized.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+        let mut state = NonFinalizedState::new(&Network::Mainnet);
+        state
+            .commit_new_chain(parent.clone().prepare(), &finalized)
+            .expect("the parent commits");
+        let mut tip = parent;
+        for _ in 0..crate::constants::MIN_TRANSPARENT_COINBASE_MATURITY {
+            tip = tip.make_fake_child();
+            state
+                .commit_block(tip.clone().prepare(), &finalized)
+                .expect("the coinbase matures on the parent chain");
+        }
+        let mut child = tip.make_fake_child();
+        Arc::make_mut(&mut child)
+            .transactions
+            .push(Arc::new(spend_transaction(4, outpoint)));
+        (finalized, state, child, outpoint, expected)
     }
 
     #[test]
@@ -164,19 +247,37 @@ mod tests {
     }
 
     #[test]
+    fn transaction_order_and_parent_are_each_part_of_the_cache_key() {
+        let _init_guard = zakura_test::init();
+        let (parent, mut child, _) = blocks();
+        Arc::make_mut(&mut child)
+            .transactions
+            .push(parent.transactions[0].clone());
+        let spends = ProposalSpends::default();
+        spends.remember(&child.clone().prepare(), &HashMap::new());
+        let mut reordered = child.clone();
+        Arc::make_mut(&mut reordered).transactions.swap(0, 1);
+        assert!(spends.take(&reordered.prepare()).is_none());
+        let mut different_parent = child.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut different_parent).header).previous_block_hash =
+            parent.header.previous_block_hash;
+        assert!(spends.take(&different_parent.prepare()).is_none());
+        assert!(spends.take(&child.prepare()).is_some());
+    }
+
+    #[test]
     fn a_proposal_clone_records_spends_that_the_commit_then_uses() {
         let _init_guard = zakura_test::init();
-        let network = Network::Mainnet;
-        let (parent, child, _) = blocks();
-        let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
-            .expect("opening an ephemeral database succeeds");
-        finalized_state
-            .set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
-
-        let mut state = NonFinalizedState::new(&network);
-        state
-            .commit_new_chain(parent.prepare(), &finalized_state)
-            .expect("the parent commits");
+        let (finalized_state, mut state, child, outpoint, expected) = state_with_spend();
+        // Independently constructed state has no shared cache with the proposal.
+        let (_, mut uncached_state, _, _, _) = state_with_spend();
+        assert!(uncached_state
+            .proposal_spends
+            .take(&child.clone().prepare())
+            .is_none());
+        uncached_state
+            .commit_block(child.clone().prepare(), &finalized_state)
+            .expect("the uncached spend is valid");
 
         let mut proposal_state = state.clone();
         proposal_state.disable_metrics();
@@ -189,6 +290,7 @@ mod tests {
             .proposal_spends
             .take(&child.clone().prepare())
             .expect("the proposal clone shares its results with the original state");
+        assert_eq!(recorded, HashMap::from([(outpoint, expected)]));
         state
             .proposal_spends
             .remember(&child.clone().prepare(), &recorded);
@@ -200,5 +302,162 @@ mod tests {
             state.proposal_spends.take(&child.prepare()).is_none(),
             "the commit used the proposal's result"
         );
+        let cached_chain = state.best_chain().expect("the solved block committed");
+        let uncached_chain = uncached_state
+            .best_chain()
+            .expect("the uncached block committed");
+        assert!(cached_chain.eq_internal_state(uncached_chain));
+        assert!(!cached_chain.unspent_utxos().contains_key(&outpoint));
+    }
+
+    #[test]
+    fn an_invalid_spend_on_a_cache_miss_is_still_rejected() {
+        let _init_guard = zakura_test::init();
+        let (finalized, mut state, child, outpoint, _) = state_with_spend();
+        let mut proposal_state = state.clone();
+        proposal_state.record_proposal_spends();
+        proposal_state
+            .commit_block(child.clone().prepare(), &finalized)
+            .unwrap();
+        let before = state.clone();
+        let missing = transparent::OutPoint {
+            index: u32::MAX,
+            ..outpoint
+        };
+        let mut invalid = child.clone();
+        Arc::make_mut(&mut invalid).transactions[1] = Arc::new(spend_transaction(4, missing));
+        assert!(state
+            .proposal_spends
+            .take(&invalid.clone().prepare())
+            .is_none());
+        assert!(matches!(
+            state.commit_block(invalid.prepare(), &finalized),
+            Err(ValidateContextError::MissingTransparentOutput { outpoint, .. }) if outpoint == missing
+        ));
+        assert!(state.eq_internal_state(&before));
+        assert!(state.proposal_spends.take(&child.prepare()).is_some());
+    }
+
+    #[test]
+    fn a_failed_proposal_does_not_bypass_later_checks_on_a_cache_hit() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let height = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .unwrap();
+        let parent: Arc<Block> = network.block_map()[&(height.0 - 1)]
+            .zcash_deserialize_into()
+            .unwrap();
+        let finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+        let mut state = NonFinalizedState::new(&network);
+        state
+            .commit_new_chain(parent.clone().prepare(), &finalized)
+            .unwrap();
+        let before = state.clone();
+        // Heartwood's activation block requires an all-zero reserved commitment.
+        let invalid = parent.make_fake_child().set_block_commitment([1; 32]);
+        let mut proposal_state = state.clone();
+        proposal_state.record_proposal_spends();
+        let proposal_error = proposal_state.commit_block(invalid.clone().prepare(), &finalized);
+        assert!(matches!(
+            proposal_error,
+            Err(ValidateContextError::InvalidBlockCommitment(
+                CommitmentError::InvalidChainHistoryActivationReserved { .. }
+            ))
+        ));
+        let recorded = state
+            .proposal_spends
+            .take(&invalid.clone().prepare())
+            .expect("the spend check succeeded before the proposal's commitment failed");
+        state
+            .proposal_spends
+            .remember(&invalid.clone().prepare(), &recorded);
+        assert_eq!(
+            state.commit_block(invalid.clone().prepare(), &finalized),
+            proposal_error
+        );
+        assert!(state.proposal_spends.take(&invalid.prepare()).is_none());
+        assert!(state.eq_internal_state(&before));
+        state
+            .commit_block(
+                parent
+                    .make_fake_child()
+                    .set_block_commitment([0; 32])
+                    .prepare(),
+                &finalized,
+            )
+            .expect("the corrected commitment is accepted");
+    }
+
+    #[test]
+    fn modern_authorization_changes_match_but_spend_effect_changes_do_not() {
+        let _init_guard = zakura_test::init();
+        let (finalized, state, child, outpoint, expected) = state_with_spend();
+        let chain = state.best_chain().expect("the parent chain is present");
+        for version in [5, 6] {
+            let mut proposal = child.clone();
+            Arc::make_mut(&mut proposal).transactions[1] =
+                Arc::new(spend_transaction(version, outpoint));
+            let spends = ProposalSpends::default();
+            let recorded = HashMap::from([(outpoint, expected.clone())]);
+            assert_eq!(
+                check::utxo::transparent_spend(
+                    &proposal.clone().prepare(),
+                    &chain.created_utxos,
+                    &chain.spent_utxos,
+                    &finalized,
+                ),
+                Ok(recorded.clone())
+            );
+            spends.remember(&proposal.clone().prepare(), &recorded);
+
+            let mut authorized = proposal.clone();
+            let tx = Arc::make_mut(&mut Arc::make_mut(&mut authorized).transactions[1]);
+            let transparent::Input::PrevOut { unlock_script, .. } = &mut tx.inputs_mut()[0] else {
+                unreachable!("the fixture spends a prior output")
+            };
+            *unlock_script = transparent::Script::new(&[0x52]);
+            assert_eq!(
+                proposal.transactions[1].hash(),
+                authorized.transactions[1].hash()
+            );
+            assert_ne!(
+                proposal.transactions[1].auth_digest(),
+                authorized.transactions[1].auth_digest()
+            );
+            assert_eq!(
+                check::utxo::transparent_spend(
+                    &authorized.clone().prepare(),
+                    &chain.created_utxos,
+                    &chain.spent_utxos,
+                    &finalized,
+                ),
+                Ok(recorded.clone())
+            );
+            assert_eq!(spends.take(&authorized.prepare()), Some(recorded.clone()));
+
+            for change_input in [true, false] {
+                spends.remember(&proposal.clone().prepare(), &recorded);
+                let mut changed = proposal.clone();
+                let tx = Arc::make_mut(&mut Arc::make_mut(&mut changed).transactions[1]);
+                if change_input {
+                    tx.inputs_mut()[0].set_outpoint(transparent::OutPoint {
+                        index: u32::MAX,
+                        ..outpoint
+                    });
+                } else {
+                    tx.outputs_mut().push(expected.utxo.output.clone());
+                }
+                assert_ne!(
+                    proposal.transactions[1].hash(),
+                    changed.transactions[1].hash()
+                );
+                assert!(spends.take(&changed.prepare()).is_none());
+                assert_eq!(
+                    spends.take(&proposal.clone().prepare()),
+                    Some(recorded.clone())
+                );
+            }
+        }
     }
 }

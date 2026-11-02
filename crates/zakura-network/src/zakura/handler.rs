@@ -4407,6 +4407,7 @@ async fn spawn_zakura_endpoint_inner(
         request_executions = limits.resource_envelope().request_executions,
         decoded_blocks = node_envelope.decoded_blocks,
         decoded_pipeline_bytes = node_envelope.decoded_pipeline_bytes,
+        serve_output_bytes = %node_envelope.serve_output_bytes,
         "Zakura node resource envelope"
     );
     validate_idle_invariant(&limits)?;

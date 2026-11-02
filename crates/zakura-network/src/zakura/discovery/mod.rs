@@ -47,6 +47,7 @@ pub(crate) use runtime::{
     build_discovery_handle, default_advertised_services, effective_discovery_connection_headroom,
 };
 pub use service::{DiscoveryPeerSession, DiscoveryService};
+pub(crate) use serving::node_output_bytes as discovery_serving_output_bytes;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use requester::{

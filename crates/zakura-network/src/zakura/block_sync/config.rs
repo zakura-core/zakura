@@ -327,6 +327,21 @@ pub struct ZakuraBlockSyncConfig {
     pub floor_bypass_slots: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
+    /// The most unsent `GetBlocks` response bytes this node holds across every
+    /// serving session.
+    ///
+    /// Unset uses the derived budget: inbound plus outbound `peer_limits` sessions,
+    /// times one session's output budget. One session's budget is twice the default
+    /// QUIC send window or the largest response, whichever is larger: 64 MiB at
+    /// defaults, so the node budget is 32 GiB. Every session can then hold its whole
+    /// budget at once, so a fast reader never pauses another peer's serving. These
+    /// bytes are reserved before each response is produced and held until its last frame
+    /// is written; idle sessions hold nothing.
+    ///
+    /// A smaller value bounds this memory more tightly, but lets peers that read
+    /// at full speed pause each other's serving. A value below one session's budget
+    /// rises to that budget.
+    pub node_serve_output_bytes: Option<u64>,
 }
 
 fn deserialize_ignored_replace_legacy_syncer<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -370,6 +385,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
+            node_serve_output_bytes: None,
         }
     }
 }
@@ -425,8 +441,9 @@ impl ZakuraBlockSyncConfig {
         &self,
         backend_blocks: u64,
     ) -> Result<DecodedBlockPool, &'static str> {
-        self.decoded_block_allowance(backend_blocks)
-            .map(|blocks| DecodedBlockPool::for_pipeline(blocks, self.decoded_pipeline_byte_bound()))
+        self.decoded_block_allowance(backend_blocks).map(|blocks| {
+            DecodedBlockPool::for_pipeline(blocks, self.decoded_pipeline_byte_bound())
+        })
     }
 
     /// Return the block count that a [decoded pool](Self::decoded_block_pool) admits.

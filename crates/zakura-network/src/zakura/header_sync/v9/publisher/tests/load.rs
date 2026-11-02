@@ -275,7 +275,7 @@ async fn run_load(peers: usize) {
     ];
     let port = FakePort::new(0);
     let tip = *port.grow(TIP).last().expect("the chain grew");
-    let capacity = serving_capacity(peers);
+    let capacity = serving_capacity(peers, None);
     let (started, wall) = (tokio::time::Instant::now(), std::time::Instant::now());
     // Session `id` of peer `index`, after its `Open` applies.
     let connect = |index: usize, id: u64| {

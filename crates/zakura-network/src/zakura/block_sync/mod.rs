@@ -91,6 +91,7 @@ pub use events::{
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
+pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
 pub use request::BlockSizeEstimate;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;

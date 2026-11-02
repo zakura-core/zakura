@@ -202,11 +202,8 @@ fn build_header_sync_reactor(
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
         serving: v9::serving_capacity(
-            startup
-                .config
-                .peer_limits
-                .max_inbound_peers
-                .saturating_add(startup.config.peer_limits.max_outbound_peers),
+            startup.config.serving_sessions(),
+            startup.config.node_serve_output_bytes,
         ),
         page_limits,
     };

@@ -13,6 +13,11 @@
 //! hold their incomplete messages under a connection limit of their own. Decoded
 //! blocks stay a separate allowance: a count across every holder, and a byte limit
 //! only on what the block pipeline still holds.
+//!
+//! Serving output is a separate bound too. Block sync, header sync and discovery
+//! reserve a response's whole cap before producing it, and hold it until the last
+//! frame is written. Queued frames can also hold transport output grants, so adding
+//! the serving bound to the retained bound would count them twice.
 
 use std::num::NonZeroU64;
 
@@ -20,7 +25,10 @@ use thiserror::Error;
 
 use crate::{
     config::Config,
-    zakura::{transport::TransportLimits, OwnerBound, ResourceEnvelope, ZakuraLocalLimits},
+    zakura::{
+        block_sync::getblocks_serving_limits, discovery::discovery_serving_output_bytes,
+        header_sync, transport::TransportLimits, OwnerBound, ResourceEnvelope, ZakuraLocalLimits,
+    },
 };
 
 #[cfg(test)]
@@ -54,6 +62,9 @@ pub(crate) struct NodeEnvelope {
     pub(crate) decoded_blocks: u64,
     /// The most decoded bytes that the block pipeline holds within its limit.
     pub(crate) decoded_pipeline_bytes: u64,
+    /// The most unsent response bytes that serving reactors reserve together: each
+    /// family's node output budget, summed.
+    pub(crate) serve_output_bytes: u128,
 }
 
 impl NodeEnvelope {
@@ -64,6 +75,7 @@ impl NodeEnvelope {
         tcp_ingress_bytes: u64,
         decoded_blocks: NonZeroU64,
         decoded_pipeline_bytes: u64,
+        serve_output_bytes: u128,
     ) -> Result<Self, NodeEnvelopeError> {
         Ok(Self {
             owners: OwnerBound::new(
@@ -77,6 +89,7 @@ impl NodeEnvelope {
             tcp_ingress_bytes,
             decoded_blocks: decoded_blocks.get(),
             decoded_pipeline_bytes,
+            serve_output_bytes,
         })
     }
 
@@ -95,6 +108,7 @@ impl NodeEnvelope {
                 .decoded_block_allowance(decoded_backend_blocks)
                 .map_err(NodeEnvelopeError::DecodedAllowance)?,
             block_sync.decoded_pipeline_byte_bound(),
+            serve_output_bytes(config, limits),
         )
     }
 
@@ -102,4 +116,22 @@ impl NodeEnvelope {
     pub(crate) fn retained_bytes_bound(&self) -> u128 {
         self.transport_bytes + u128::from(self.quic_bytes) + u128::from(self.tcp_ingress_bytes)
     }
+}
+
+/// The node output budgets of every serving family on a node with this
+/// configuration, summed.
+fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
+    let headers = &config.zakura.header_sync;
+    [
+        getblocks_serving_limits(&config.zakura.block_sync).node_output_bytes,
+        header_sync::v9::serving_limits(
+            headers.serving_sessions(),
+            headers.node_serve_output_bytes,
+        )
+        .node_output_bytes,
+        discovery_serving_output_bytes(limits.max_connections),
+    ]
+    .into_iter()
+    .map(u128::from)
+    .sum()
 }

@@ -660,4 +660,11 @@ fn getblocks_node_output_funds_every_session() {
         limits.node_output_bytes,
         u64::try_from(sessions).unwrap() * limits.peer_output_bytes
     );
+    assert_eq!(limits.node_output_bytes, 32 << 30, "512 sessions × 64 MiB");
+
+    let configured = ZakuraBlockSyncConfig {
+        node_serve_output_bytes: Some(1 << 30),
+        ..config
+    };
+    assert_eq!(serving_limits(&configured).node_output_bytes, 1 << 30);
 }

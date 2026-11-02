@@ -38,19 +38,30 @@ const NODE_EXECUTION: usize = 8;
 /// time.
 const PEER_EXECUTION: usize = 2;
 
-/// The production serving capacity for published pages: [`NODE_EXECUTION`]
+/// The production serving limits for published pages: [`NODE_EXECUTION`]
 /// and [`PEER_EXECUTION`] page reads, and output sized for the largest page
-/// across `peers` header-sync sessions.
-pub(crate) fn serving_capacity(peers: usize) -> ServeCapacity {
+/// across `peers` header-sync sessions. `node_output_bytes` replaces the node
+/// output budget when set.
+pub(crate) fn serving_limits(peers: usize, node_output_bytes: Option<u64>) -> ServeLimits {
     // The largest page is about 2 MiB, so it fits u64.
     let largest = largest_page(COMMON_HEADER_BYTES) as u64;
-    let limits = ServeLimits {
+    let derived = ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
         ..sizing::serve_limits(largest, sizing::TARGET_RTT, peers)
     };
-    ServeCapacity::new("header-sync", &SUBSCRIBE_HEADERS, limits)
-        .expect("the header-sync serving limits are positive")
+    sizing::with_node_output_bytes(derived, node_output_bytes)
+}
+
+/// The production serving capacity for published pages, with
+/// [`serving_limits`].
+pub(crate) fn serving_capacity(peers: usize, node_output_bytes: Option<u64>) -> ServeCapacity {
+    ServeCapacity::new(
+        "header-sync",
+        &SUBSCRIBE_HEADERS,
+        serving_limits(peers, node_output_bytes),
+    )
+    .expect("the header-sync serving limits are positive")
 }
 
 impl Status {

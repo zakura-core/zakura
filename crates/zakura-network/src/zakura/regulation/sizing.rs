@@ -16,6 +16,8 @@
 
 use std::time::Duration;
 
+use zakura_rt::sync::Semaphore;
+
 use super::ServeLimits;
 use crate::zakura::DEFAULT_ZAKURA_SEND_WINDOW;
 
@@ -97,6 +99,27 @@ pub(crate) const fn serve_limits(
         peer_execution: node_execution.div_ceil(2),
         peer_output_bytes: peer_bytes,
         node_output_bytes: node_bytes,
+    }
+}
+
+/// `limits` with the node output budget an operator configured, if any.
+///
+/// Unset keeps the derived budget. A configured budget below one peer's budget
+/// rises to it, so the largest response still fits. A budget above what a byte
+/// budget can hold falls to that maximum. The node's response count follows the
+/// byte budget, as in [`serve_limits`].
+pub(crate) fn with_node_output_bytes(limits: ServeLimits, configured: Option<u64>) -> ServeLimits {
+    let Some(configured) = configured else {
+        return limits;
+    };
+    // Widening usize to u64 is lossless on supported targets.
+    let node_bytes = configured
+        .max(limits.peer_output_bytes)
+        .min(Semaphore::MAX_PERMITS as u64);
+    ServeLimits {
+        node_output_bytes: node_bytes,
+        node_output_responses: output_responses(node_bytes),
+        ..limits
     }
 }
 
@@ -201,6 +224,24 @@ mod tests {
     fn no_peers_still_fund_one_peers_output() {
         let limits = serve_limits(12, Duration::from_micros(1), 0);
         assert_eq!(limits.node_output_bytes, limits.peer_output_bytes);
+    }
+
+    #[test]
+    fn a_configured_node_output_budget_replaces_the_derived_one() {
+        let derived = serve_limits(12, Duration::from_micros(1), 512);
+        assert_eq!(with_node_output_bytes(derived, None), derived);
+        let configured = with_node_output_bytes(derived, Some(4 * derived.peer_output_bytes));
+        assert_eq!(configured.node_output_bytes, 4 * derived.peer_output_bytes);
+        assert_eq!(
+            configured.node_output_responses,
+            4 * derived.peer_output_responses
+        );
+        assert_eq!(configured.peer_output_bytes, derived.peer_output_bytes);
+        // Below one peer's budget, the largest response would never fit.
+        let floor = with_node_output_bytes(derived, Some(1));
+        assert_eq!(floor.node_output_bytes, derived.peer_output_bytes);
+        let ceiling = with_node_output_bytes(derived, Some(u64::MAX));
+        assert_eq!(ceiling.node_output_bytes, Semaphore::MAX_PERMITS as u64);
     }
 
     #[test]

@@ -38,7 +38,14 @@ fn transport() -> ResourceEnvelope {
 }
 
 fn envelope(limits: TransportLimits) -> Result<NodeEnvelope, NodeEnvelopeError> {
-    NodeEnvelope::new(limits, 1 << 20, TCP_INGRESS_BYTES, NonZeroU64::MIN, 1 << 30)
+    NodeEnvelope::new(
+        limits,
+        1 << 20,
+        TCP_INGRESS_BYTES,
+        NonZeroU64::MIN,
+        1 << 30,
+        1 << 40,
+    )
 }
 
 fn bound() -> OwnerBound {
@@ -65,6 +72,10 @@ fn the_default_node_config_composes() {
             .expect("the default allowance fits")
             .get()
     );
+    // Block sync and header sync each fund 512 sessions × 64 MiB; discovery adds its
+    // answers.
+    assert!(envelope.serve_output_bytes >= 2 * 512 * (64 << 20));
+    assert!(envelope.serve_output_bytes < 2 * 512 * (64 << 20) + (1 << 30));
     // The transport bound depends on the host's memory, so only its parts are fixed.
     assert_eq!(
         envelope.retained_bytes_bound(),
@@ -87,10 +98,27 @@ fn the_byte_bound_adds_each_owner_once() {
 
     assert_eq!(envelope.transport_bytes, retained_bound());
     assert_eq!(envelope.decoded_pipeline_bytes, 1 << 30);
+    assert_eq!(envelope.serve_output_bytes, 1 << 40);
     assert_eq!(
         envelope.retained_bytes_bound(),
         retained_bound() + (1 << 20) + u128::from(TCP_INGRESS_BYTES)
     );
+}
+
+/// A configured serving budget replaces each family's derived one in the envelope.
+#[test]
+fn configured_serving_budgets_set_the_serve_output_bound() {
+    let mut config = Config::default();
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let derived = NodeEnvelope::for_node(&config, &limits, 16)
+        .expect("the default config fits")
+        .serve_output_bytes;
+    config.zakura.block_sync.node_serve_output_bytes = Some(1 << 30);
+    config.zakura.header_sync.node_serve_output_bytes = Some(1 << 30);
+    let configured = NodeEnvelope::for_node(&config, &limits, 16)
+        .expect("the configured budgets fit")
+        .serve_output_bytes;
+    assert_eq!(derived - configured, 2 * (512 * (64 << 20) - (1 << 30)));
 }
 
 /// A reconnect gets fresh connection budgets, but it finds the old generation's

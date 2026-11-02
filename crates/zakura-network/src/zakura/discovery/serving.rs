@@ -58,6 +58,15 @@ fn serving_limits(largest: ResponseCap, max_connections: usize) -> ServeLimits {
     }
 }
 
+/// The most unsent answer bytes that discovery's request rows reserve together on
+/// a node that admits `max_connections`.
+pub(crate) fn node_output_bytes(max_connections: usize) -> u64 {
+    [LARGEST_PEERS, LARGEST_SERVICES]
+        .into_iter()
+        .map(|largest| serving_limits(largest, max_connections).node_output_bytes)
+        .fold(0, u64::saturating_add)
+}
+
 /// The in-flight limit this node advertises for `row`: the limit the row
 /// declares.
 fn advertised(row: &MessageRule) -> u32 {

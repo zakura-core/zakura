@@ -47,6 +47,21 @@ pub struct ZakuraHeaderSyncConfig {
     /// When unset, header sync starts from genesis. When set, [`anchor_height`](Self::anchor_height)
     /// must also be set and must match genesis or a configured checkpoint.
     pub anchor_hash: Option<block::Hash>,
+    /// The most unsent header-sync page bytes this node holds across every
+    /// serving session.
+    ///
+    /// Unset uses the derived budget: inbound plus outbound `peer_limits` sessions,
+    /// times one session's output budget. One session's budget is twice the default
+    /// QUIC send window or the largest page, whichever is larger: 64 MiB at
+    /// defaults, so the node budget is 32 GiB. Every session can then hold its whole
+    /// budget at once, so a fast reader never pauses another peer's serving. These
+    /// bytes are reserved before each page is produced and held until its last frame
+    /// is written; idle sessions hold nothing.
+    ///
+    /// A smaller value bounds this memory more tightly, but lets peers that read
+    /// at full speed pause each other's serving. A value below one session's budget
+    /// rises to that budget.
+    pub node_serve_output_bytes: Option<u64>,
 }
 
 impl Default for ZakuraHeaderSyncConfig {
@@ -59,11 +74,19 @@ impl Default for ZakuraHeaderSyncConfig {
             unproductive_peer_cooldown: DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN,
             anchor_height: None,
             anchor_hash: None,
+            node_serve_output_bytes: None,
         }
     }
 }
 
 impl ZakuraHeaderSyncConfig {
+    /// Inbound plus outbound header-sync session slots.
+    pub(crate) fn serving_sessions(&self) -> usize {
+        self.peer_limits
+            .max_inbound_peers
+            .saturating_add(self.peer_limits.max_outbound_peers)
+    }
+
     /// Return the clamped served-range advertisement for wire status messages.
     pub fn advertised_max_headers_per_response(&self) -> u32 {
         self.max_headers_per_response.clamp(1, MAX_HS_RANGE)

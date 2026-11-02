@@ -39,17 +39,19 @@ const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_E
 /// The production GetBlocks serving limits. Execution is fixed by
 /// [`NODE_EXECUTION`]; output sizing covers the largest possible response on
 /// every session, so the response configuration cannot inflate execution
-/// concurrency.
+/// concurrency. `node_serve_output_bytes` replaces the node output budget when
+/// set.
 pub(crate) fn serving_limits(config: &ZakuraBlockSyncConfig) -> ServeLimits {
     let largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
         .expect("the protocol's largest range starts at height zero")
         .response_cap(MAX_BS_RESPONSE_BYTES)
         .output_bytes();
-    ServeLimits {
+    let derived = ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
         ..sizing::serve_limits(largest, sizing::TARGET_RTT, serving_sessions(config))
-    }
+    };
+    sizing::with_node_output_bytes(derived, config.node_serve_output_bytes)
 }
 
 /// The in-flight limit advertised to and enforced on regulated GetBlocks peers.

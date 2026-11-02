@@ -434,9 +434,7 @@ impl GuardedFrameSlot<'_> {
         }
         let sent = self.sender.send(QueuedFrame {
             frame,
-            guard: None,
-            claim: Some(claim),
-            output: None,
+            owner: FrameOwner::Claim(claim),
             queue_slot: Some(self.slot),
         });
         sent.is_ok() && !self.sender.is_closed()
@@ -491,14 +489,23 @@ impl FrameGuard {
     }
 }
 
-/// Frame plus optional response ownership retained through its transport write.
+/// What keeps a queued frame's resources owned through its transport write.
+#[derive(Debug)]
+enum FrameOwner {
+    /// No other owner funds this frame. The grant is absent on a queue without
+    /// an output gate.
+    Output(Option<FrameGrant>),
+    /// Another owner's capacity funds this frame until its write ends.
+    Guard(FrameGuard),
+    /// This request's owner claims it before its first byte.
+    Claim(Arc<dyn FrameWriteClaim>),
+}
+
+/// Frame plus the ownership retained through its transport write.
 #[derive(Debug)]
 pub(crate) struct QueuedFrame {
     frame: Frame,
-    guard: Option<FrameGuard>,
-    claim: Option<Arc<dyn FrameWriteClaim>>,
-    /// Funds a frame that has no guard from another owner.
-    output: Option<FrameGrant>,
+    owner: FrameOwner,
     /// This frame's place in the queue, which ends when the receiver dequeues
     /// it. A terminal frame's exchange slot funds its place instead.
     queue_slot: Option<SlotPermit>,
@@ -507,7 +514,7 @@ pub(crate) struct QueuedFrame {
 impl QueuedFrame {
     /// Complete an in-process channel delivery if its claim can still start.
     fn receive(self) -> Option<Frame> {
-        if let Some(claim) = &self.claim {
+        if let FrameOwner::Claim(claim) = &self.owner {
             if !claim.try_start() {
                 return None;
             }
@@ -519,9 +526,7 @@ impl QueuedFrame {
     fn plain(frame: Frame, output: Option<FrameGrant>, queue_slot: SlotPermit) -> Self {
         Self {
             frame,
-            guard: None,
-            claim: None,
-            output,
+            owner: FrameOwner::Output(output),
             queue_slot: Some(queue_slot),
         }
     }
@@ -529,16 +534,18 @@ impl QueuedFrame {
     fn guarded(frame: Frame, guard: FrameGuard, queue_slot: Option<SlotPermit>) -> Self {
         Self {
             frame,
-            guard: Some(guard),
-            claim: None,
-            output: None,
+            owner: FrameOwner::Guard(guard),
             queue_slot,
         }
     }
 
     /// Split the frame from its guard while retaining both in the caller.
     pub(crate) fn into_parts(self) -> (Frame, Option<FrameGuard>) {
-        (self.frame, self.guard)
+        let guard = match self.owner {
+            FrameOwner::Guard(guard) => Some(guard),
+            FrameOwner::Output(_) | FrameOwner::Claim(_) => None,
+        };
+        (self.frame, guard)
     }
 
     /// Run the transport write while retaining this frame's guard.
@@ -569,17 +576,19 @@ impl QueuedFrame {
     {
         let Self {
             frame,
-            guard: _guard,
-            claim,
-            output: _output,
+            owner,
             queue_slot: _,
         } = self;
         let encoded = encode(frame)?;
-        if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
+        let claim = match &owner {
+            FrameOwner::Claim(claim) => Some(claim),
+            FrameOwner::Output(_) | FrameOwner::Guard(_) => None,
+        };
+        if claim.is_some_and(|claim| !claim.try_start()) {
             return Ok(());
         }
         write(encoded).await?;
-        if let Some(claim) = &claim {
+        if let Some(claim) = claim {
             claim.written();
         }
         Ok(())

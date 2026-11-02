@@ -26,19 +26,31 @@ pub(crate) struct ByteBudget {
     inner: Arc<ByteBudgetInner>,
 }
 
-/// A closure signal with no reservation or settlement authority.
+/// Capacity and closure observations without admission or settlement authority.
 #[derive(Clone, Debug)]
-pub(crate) struct BudgetClosureReader(Arc<ByteBudgetInner>);
+pub(crate) struct BudgetReader(ByteBudget);
 
-impl BudgetClosureReader {
+impl BudgetReader {
+    pub(crate) fn available(&self) -> u64 {
+        self.0.available()
+    }
+
+    pub(crate) fn reserved(&self) -> u64 {
+        self.0.reserved()
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
-        self.0.closed.load(Ordering::Acquire)
+        self.0.is_closed()
+    }
+
+    pub(crate) fn subscribe_capacity(&self) -> &Notify {
+        self.0.subscribe_capacity()
     }
 
     /// Wait for permanent closure, including closure before registration.
     pub(crate) async fn closed(&self) {
         loop {
-            let notified = self.0.closure.notified();
+            let notified = self.0.inner.closure.notified();
             zakura_rt::pin!(notified);
             notified.as_mut().enable();
             if self.is_closed() {
@@ -122,16 +134,6 @@ pub(crate) struct ByteRelease<'a> {
     bytes: u64,
 }
 
-/// Publishes closure after the caller releases its synchronization guard.
-#[must_use = "retain this notification until the protected lock is released"]
-pub(crate) struct BudgetClosureNotification<'a>(&'a ByteBudget);
-
-impl Drop for BudgetClosureNotification<'_> {
-    fn drop(&mut self) {
-        self.0.publish_closure();
-    }
-}
-
 impl Drop for ByteRelease<'_> {
     fn drop(&mut self) {
         self.budget.release_charge(self.bytes);
@@ -141,8 +143,6 @@ impl Drop for ByteRelease<'_> {
 /// A rejected ownership transfer leaves both owners unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ReservationError {
-    #[error("reservation belongs to another budget")]
-    Budget,
     #[error("transfer amount exceeds owned funding")]
     Amount,
 }
@@ -152,8 +152,6 @@ pub(crate) enum ReservationError {
 pub(crate) enum BudgetClosure {
     #[error("queue transition poisoned the accounting lock")]
     QueuePoisoned,
-    #[error("ownership transfer crossed budgets")]
-    WrongBudget,
     #[error("{operation} cannot transfer {amount} bytes from {owned} owned bytes")]
     Arithmetic {
         operation: &'static str,
@@ -177,17 +175,12 @@ impl ByteReservation {
         self.bytes
     }
 
-    pub(crate) fn same_budget(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.budget.inner, &other.budget.inner)
-    }
-
     /// Transfer an admitted charge. Rejection preserves both owners and closes admission.
     pub(crate) fn merge(&mut self, other: &mut Self) -> Result<(), ReservationError> {
-        if !self.same_budget(other) {
-            self.budget.close(BudgetClosure::WrongBudget);
-            other.budget.close(BudgetClosure::WrongBudget);
-            return Err(ReservationError::Budget);
-        }
+        debug_assert!(
+            Arc::ptr_eq(&self.budget.inner, &other.budget.inner),
+            "the owning queue admits all its funding from one budget"
+        );
         let Some(total) = self.bytes.checked_add(other.bytes) else {
             self.budget.close(BudgetClosure::Arithmetic {
                 operation: "merge",
@@ -207,11 +200,10 @@ impl ByteReservation {
         release: &mut ByteRelease<'_>,
         bytes: u64,
     ) -> Result<(), ReservationError> {
-        if !Arc::ptr_eq(&self.budget.inner, &release.budget.inner) {
-            self.budget.close(BudgetClosure::WrongBudget);
-            release.budget.close(BudgetClosure::WrongBudget);
-            return Err(ReservationError::Budget);
-        }
+        debug_assert!(
+            Arc::ptr_eq(&self.budget.inner, &release.budget.inner),
+            "the owning queue starts its release from its own budget"
+        );
         let amounts = self
             .bytes
             .checked_sub(bytes)
@@ -348,9 +340,8 @@ impl ByteBudget {
         self.inner.closed.load(Ordering::Acquire)
     }
 
-    /// Close admission immediately. The caller must retain a deferred closure
-    /// notification until its locks are released. Counter release publishes its
-    /// own closure notification after settlement.
+    /// Close admission immediately and wake closure waiters. A waiter registers
+    /// before it reads the latch, so it cannot miss this wake.
     pub(crate) fn close(&self, cause: BudgetClosure) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             metrics::counter!("sync.block.budget.closed").increment(1);
@@ -360,21 +351,12 @@ impl ByteBudget {
                 limit_bytes = self.inner.max_bytes,
                 "block request accounting closed; retained owners remain charged"
             );
-        }
-    }
-
-    pub(crate) fn defer_closure_notification(&self) -> BudgetClosureNotification<'_> {
-        BudgetClosureNotification(self)
-    }
-
-    fn publish_closure(&self) {
-        if self.is_closed() {
             self.inner.closure.notify_waiters();
         }
     }
 
-    pub(crate) fn closure_reader(&self) -> BudgetClosureReader {
-        BudgetClosureReader(self.inner.clone())
+    pub(crate) fn reader(&self) -> BudgetReader {
+        BudgetReader(self.clone())
     }
 
     pub(crate) fn available(&self) -> u64 {
@@ -430,10 +412,9 @@ impl ByteBudget {
     }
 
     /// Invoke `released` after the settlement attempt and before waking capacity
-    /// waiters. A zero-byte release only publishes pending closure.
+    /// waiters. A zero-byte release does nothing.
     fn release_then(&self, bytes: u64, released: impl FnOnce()) {
         if bytes == 0 {
-            self.publish_closure();
             return;
         }
         let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
@@ -458,7 +439,6 @@ impl ByteBudget {
             }
         }
         released();
-        self.publish_closure();
         self.inner.capacity.notify_waiters();
     }
 
@@ -582,10 +562,21 @@ impl SessionGuard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const ALLOWED: &[u8] = &[1, 2];
+
+    /// A waker that runs `on_wake` each time something wakes it.
+    pub(crate) fn callback_waker(on_wake: impl Fn() + Send + Sync + 'static) -> std::task::Waker {
+        struct Callback<F>(F);
+        impl<F: Fn() + Send + Sync + 'static> std::task::Wake for Callback<F> {
+            fn wake(self: Arc<Self>) {
+                (self.0)();
+            }
+        }
+        std::task::Waker::from(Arc::new(Callback(on_wake)))
+    }
 
     fn frame(message_type: u16, payload_len: usize) -> Frame {
         Frame {
@@ -613,26 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_settlement_rejects_wrong_budget_without_transferring() {
-        let budget = ByteBudget::new(1000);
-        let other = ByteBudget::new(1000);
-        let mut funding = budget.reserve_owned(200).unwrap();
-        let mut release = other.deferred_release();
-        assert_eq!(
-            funding.settle_into(&mut release, 200),
-            Err(ReservationError::Budget)
-        );
-        assert!(budget.is_closed());
-        assert!(other.is_closed());
-        assert_eq!(funding.bytes(), 200);
-        drop(release);
-        assert_eq!(other.reserved(), 0);
-        assert_eq!(budget.reserved(), 200);
-        drop(funding);
-        assert_eq!(budget.reserved(), 0);
-    }
-
-    #[test]
     fn deferred_settlement_survives_unwind() {
         let budget = ByteBudget::new(1000);
         let unrelated = budget.reserve_owned(17).unwrap();
@@ -645,26 +616,6 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(budget.reserved(), 17);
         drop(unrelated);
-    }
-
-    #[test]
-    fn rejected_merge_preserves_equal_charges_in_both_budgets() {
-        let first = ByteBudget::new(400);
-        let second = ByteBudget::new(400);
-        let mut destination = first.reserve_owned(200).unwrap();
-        let mut source = second.reserve_owned(200).unwrap();
-        assert_eq!(
-            destination.merge(&mut source),
-            Err(ReservationError::Budget),
-            "equal charges do not authorize cross-budget transfer"
-        );
-        assert_eq!((destination.bytes(), source.bytes()), (200, 200));
-        assert_eq!((first.reserved(), second.reserved()), (200, 200));
-        assert!(first.is_closed() && second.is_closed());
-        drop(source);
-        assert_eq!((first.reserved(), second.reserved()), (200, 0));
-        drop(destination);
-        assert_eq!(first.reserved(), 0);
     }
 
     #[test]
@@ -692,26 +643,17 @@ mod tests {
 
     #[test]
     fn underflow_keeps_charge_and_closes_all_admission() {
-        use std::{
-            future::Future,
-            task::{Context, Wake, Waker},
-        };
-        struct ClosureWake(std::sync::atomic::AtomicUsize);
-        impl Wake for ClosureWake {
-            fn wake(self: Arc<Self>) {
-                self.wake_by_ref();
-            }
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
+        use std::{future::Future, task::Context};
         let budget = ByteBudget::new(1_000);
         let funding = budget.reserve_owned(400).unwrap();
         let clone = budget.clone();
-        let reader = budget.closure_reader();
+        let reader = budget.reader();
         let mut closed = Box::pin(reader.closed());
-        let wake = Arc::new(ClosureWake(std::sync::atomic::AtomicUsize::new(0)));
-        let waker = Waker::from(wake.clone());
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = wakes.clone();
+        let waker = callback_waker(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
         let mut cx = Context::from_waker(&waker);
         assert!(closed.as_mut().poll(&mut cx).is_pending());
         // A corrupt owner must not release the valid owner's charge.
@@ -720,7 +662,7 @@ mod tests {
             bytes: 401,
         });
         assert!(
-            wake.0.load(Ordering::SeqCst) > 0,
+            wakes.load(Ordering::SeqCst) > 0,
             "counter failure must notify closure"
         );
         assert!(closed.as_mut().poll(&mut cx).is_ready());

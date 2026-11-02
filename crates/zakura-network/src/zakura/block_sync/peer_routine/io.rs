@@ -19,7 +19,7 @@ use super::super::{
     regulated::{live_requester::LiveRequester, session::ServingSession},
     sequencer_task::{SequencedBody, SequencerView},
     state::{RequestKey, ThroughputMeter, WriteOutcome},
-    work_queue::{BudgetReader, RequestWriteStatus, WorkQueue},
+    work_queue::{RequestWriteStatus, WorkQueue},
     BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
 };
 use crate::zakura::{FramedRecv, ZakuraConnId};
@@ -49,7 +49,7 @@ pub(super) struct PeerIO {
     /// old task's async Drop runs) cannot corrupt the live entry.
     pub(super) generation: u64,
     /// Reads the budget that `work` owns. Only queue transitions change it.
-    pub(super) budget: BudgetReader,
+    pub(super) budget: crate::zakura::transport::BudgetReader,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<PeerRegistry>,
     pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,

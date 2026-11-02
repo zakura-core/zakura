@@ -37,7 +37,7 @@ use zakura_sim::{
 fn fast_run(harness: &HarnessEntry, input: &[u8]) -> (Value, RunReport) {
     let split = harness.scenario_bytes.min(input.len());
     let mut prefix = input[..split].to_vec();
-    if harness.pad_scenario {
+    if !harness.machine {
         prefix.resize(harness.scenario_bytes, 0);
     }
     let scenario = (harness.draw)(&prefix);

@@ -289,7 +289,13 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
             routine.gc_committed_outstanding();
         } else {
             // The shared work ledger records another peer's receipt before ours.
-            routine.io.work.claim_received(block::Height(1));
+            let owner = routine.io.work.owner_for_height(block::Height(1)).unwrap();
+            drop(
+                routine
+                    .io
+                    .work
+                    .begin_competing_receipt(owner, block::Height(1)),
+            );
         }
         assert_eq!(pool.held(), 1);
         deliver(&mut routine, BlockSyncMessage::Block(block)).await;

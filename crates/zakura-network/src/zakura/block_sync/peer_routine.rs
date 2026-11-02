@@ -15,8 +15,7 @@
 //! under that permit, so no suspension point separates a request's funding from
 //! the body that replaces it. The download decision uses the byte budget and
 //! per-peer slots.
-//! `take_in_range(servable_low, servable_high, n)` uses `servable_high` as its
-//! upper bound.
+//! [`WorkQueue::take_request`] uses `servable_high` as its upper bound.
 //!
 //! The routine or shared [`PeerRegistry`] owns all per-peer download state. The
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
@@ -215,12 +214,15 @@ struct ReceiptSettlement {
     /// the flag stays set from this settlement's creation through the release.
     handoff_blocked: Arc<AtomicBool>,
     #[cfg(any(test, zakura_sim))]
+    handoff: HandoffReport,
+}
+
+/// What a [`ReceiptSettlement`] reports when its handoff ends.
+#[cfg(any(test, zakura_sim))]
+struct HandoffReport {
     observer: super::block_sync_observe::ObserverSlot,
-    #[cfg(any(test, zakura_sim))]
     peer: ZakuraPeerId,
-    #[cfg(any(test, zakura_sim))]
     owner: zakura_header_chain::BodyWorkOwner,
-    #[cfg(any(test, zakura_sim))]
     height: block::Height,
 }
 
@@ -240,13 +242,12 @@ impl ReceiptSettlement {
             funding: Some(funding),
             handoff_blocked: Arc::clone(&routine.io.handoff_blocked),
             #[cfg(any(test, zakura_sim))]
-            observer: routine.io.observer.clone(),
-            #[cfg(any(test, zakura_sim))]
-            peer: routine.io.peer.clone(),
-            #[cfg(any(test, zakura_sim))]
-            owner,
-            #[cfg(any(test, zakura_sim))]
-            height,
+            handoff: HandoffReport {
+                observer: routine.io.observer.clone(),
+                peer: routine.io.peer.clone(),
+                owner,
+                height,
+            },
         }
     }
 }
@@ -262,13 +263,14 @@ impl Drop for ReceiptSettlement {
         #[cfg(any(test, zakura_sim))]
         {
             let charge = funding.bytes();
+            let handoff = &self.handoff;
             funding.release_then(|| {
                 observe!(
-                    self.observer,
+                    handoff.observer,
                     super::block_sync_observe::BlockEvent::HandoffEnded {
-                        peer: self.peer.clone(),
-                        owner: self.owner,
-                        height: self.height,
+                        peer: handoff.peer.clone(),
+                        owner: handoff.owner,
+                        height: handoff.height,
                         charge,
                     }
                 );
@@ -1778,7 +1780,7 @@ impl PeerRoutine {
             }
             // With fanout = 1 a received height is already buffered and must never
             // be re-fetched, so both retry dispositions return only the still-reserved
-            // unreceived heights to `pending`. `return_items` is idempotent.
+            // unreceived heights to `pending`. Returning is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
                 let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
                 let outcome = self
@@ -1797,7 +1799,7 @@ impl PeerRoutine {
                 // This peer just failed these heights (RangeUnavailable / short
                 // BlocksDone): bias away from re-grabbing them so another peer
                 // contests the range first (and so the routine cannot self-wake
-                // into a re-take spin off its own `return_items`).
+                // into a re-take spin off its own return).
                 self.note_retry_avoid(unreceived);
             }
         }
@@ -1809,7 +1811,7 @@ impl PeerRoutine {
 
     /// A body arrived for a request this peer owns, but its per-height ledger was
     /// already `Released` by a competing receipt, watchdog, or floor GC, so
-    /// `release_active_reserved_height` returned `None`. Record the height as
+    /// `begin_receipt_for_owner` returned `None`. Record the height as
     /// received so the request can complete without re-queueing it or touching
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.

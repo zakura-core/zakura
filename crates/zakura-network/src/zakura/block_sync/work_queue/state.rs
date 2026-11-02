@@ -5,33 +5,118 @@
 //! clock, lock, atomic, or channel. [`WorkQueue`](super::WorkQueue) calls each
 //! transition under the queue lock and delivers the returned [`WorkWake`] at the
 //! transition's existing linearization point. Request-write registrations, their
-//! write-status fences, and byte-budget guards stay in IO.
+//! write-status fences, and pooled byte funding stay in IO.
 //!
 //! Every height is in exactly one of `{below-floor (gone), pending, in_flight}`.
 //! A charge enters the ledger only at claim publication and leaves it exactly once,
-//! through the `released_bytes` of the transition that ended it. The caller returns
-//! those bytes to the byte budget that funded the request.
+//! through the `released_bytes` of the transition that ended it. IO settles those
+//! bytes from the queue's pooled funding. Ledger arithmetic is checked: a failure keeps
+//! the last valid values and latches a [`LedgerFault`], which closes the budget.
 
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, BodyWorkOwner};
 
-use super::{
-    super::{request::BlockSizeEstimate, state::BlockBudgetLedger},
-    WorkItem, WorkReturnOutcome, DEFAULT_BS_SIZE_FLOOR_BYTES,
-};
+use super::super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use tests::{
-    replay_work_ownership_bytes, trace_work_funding_bytes, trace_work_ownership_bytes,
-    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
-    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
-    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
-    WorkOwnershipView,
+    trace_work_funding_bytes, trace_work_ownership_bytes, FundingReceiptView, FundingRequestPhase,
+    FundingRequestView, WorkFundingHistory, WorkFundingStep, WorkFundingView, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
 };
+
+/// Lower clamp on a body-size estimate.
+pub(in crate::zakura::block_sync) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
+
+/// Per-height download metadata held in the [`WorkQueue`](super::WorkQueue).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct WorkItem {
+    /// Exact durable coordinates that authorized this body download.
+    pub(in crate::zakura::block_sync) scope: zakura_header_chain::BodyWorkAuthority,
+    /// Exact attempt, retained from provisional take through response receipt.
+    pub(in crate::zakura::block_sync) owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Taken by an attempt that has not yet published its reservation and frame.
+    provisional: bool,
+    /// Expected hash of the block at this height (drives the response match).
+    pub(in crate::zakura::block_sync) hash: block::Hash,
+    /// The block's size estimate. Used for request budget reservation and the receive-path size-hint mismatch metric.
+    pub(in crate::zakura::block_sync) estimated_bytes: u64,
+    /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
+    observed_bytes: u64,
+    /// Refreshed hint for a future retry while an issued reservation stays fixed.
+    retry_estimated_bytes: Option<u64>,
+    /// A pressure refusal waits for verified progress before it can be retried.
+    retry_after_tip: Option<block::Height>,
+    /// Request reservation; received bodies use `Released`.
+    pub(in crate::zakura::block_sync) budget: BlockBudgetLedger,
+    /// Another attempt's body ended this owner's reservation. The owner's request
+    /// still claims the height, so dropping or moving the item is a revocation.
+    answered_elsewhere: bool,
+}
+
+/// Where a queued item sits in its download lifecycle.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WorkItemPlace {
+    /// Waiting for a request.
+    Pending,
+    /// Taken by a request that has not yet published its reservation here.
+    Provisional,
+    /// Taken by a published request.
+    InFlight,
+}
+
+/// One queued item's owner and byte quantities.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemOwnership {
+    /// The item's height.
+    pub height: block::Height,
+    /// The request that took the item, if one did.
+    pub owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Where the item sits.
+    pub place: WorkItemPlace,
+    /// The size estimate a request for this item reserves.
+    pub estimated_bytes: u64,
+    /// The estimate bytes this item currently charges to the queue's tally.
+    pub reserved_bytes: u64,
+}
+
+/// Diagnostics for an attempted `in_flight -> pending` retry transition.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct WorkReturnOutcome {
+    /// This owner's frame was skipped before writing, atomically with settlement.
+    pub(in crate::zakura::block_sync) request_was_unwritten: bool,
+    /// Reserved bytes released while returning or discarding items.
+    pub(in crate::zakura::block_sync) released_bytes: u64,
+    /// Reserved items successfully moved back to `pending`.
+    pub(in crate::zakura::block_sync) returned_count: u64,
+    /// Owned heights discarded because they are already committed.
+    pub(in crate::zakura::block_sync) committed_count: u64,
+    /// Requested heights that were already back in `pending`.
+    pub(in crate::zakura::block_sync) already_pending_count: u64,
+    /// Received items still present in `in_flight` with a `Released` ledger.
+    pub(in crate::zakura::block_sync) released_count: u64,
+    /// Requested heights absent from both `pending` and `in_flight`.
+    pub(in crate::zakura::block_sync) missing_count: u64,
+    /// Lowest height considered by the cleanup.
+    pub(in crate::zakura::block_sync) min_height: Option<block::Height>,
+    /// Highest height considered by the cleanup.
+    pub(in crate::zakura::block_sync) max_height: Option<block::Height>,
+}
+
+impl WorkReturnOutcome {
+    /// Whether the cleanup took unreceived work away from its owner: it returned
+    /// a reserved height or discarded a committed one.
+    pub(in crate::zakura::block_sync) fn revoked_work(&self) -> bool {
+        self.returned_count > 0 || self.committed_count > 0
+    }
+}
 
 /// Wakeups that a logical work transition requires.
 #[must_use]
@@ -48,21 +133,11 @@ pub(in crate::zakura::block_sync) struct WorkWake {
 #[must_use]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::zakura::block_sync) struct WorkDelta {
-    /// Reservation bytes that left the ledger. The caller returns exactly these
-    /// bytes to the funding byte budget, once.
+    /// Reservation bytes that left the ledger. The queue settles exactly these
+    /// bytes from its pooled funding, once.
     pub(in crate::zakura::block_sync) released_bytes: u64,
     /// Wakeups the change requires.
     pub(in crate::zakura::block_sync) wake: WorkWake,
-}
-
-/// A request reservation that ended at body receipt.
-#[must_use]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(in crate::zakura::block_sync) struct EndedReservation {
-    /// Reservation bytes that left the ledger.
-    pub(in crate::zakura::block_sync) released_bytes: u64,
-    /// The request that held the height. IO retires its queued frame.
-    pub(in crate::zakura::block_sync) owner: Option<BodyWorkOwner>,
 }
 
 /// A running count and byte sum of nonzero reservations.
@@ -73,30 +148,37 @@ struct ReservedTally {
 }
 
 impl ReservedTally {
-    fn add(&mut self, charge: u64) {
-        if charge > 0 {
-            self.bytes = self.bytes.saturating_add(charge);
-            self.items = self.items.saturating_add(1);
+    fn checked_add(self, charge: u64) -> Option<Self> {
+        if charge == 0 {
+            return Some(self);
         }
+        Some(Self {
+            bytes: self.bytes.checked_add(charge)?,
+            items: self.items.checked_add(1)?,
+        })
     }
 
-    fn sub(&mut self, charge: u64) {
-        if charge > 0 {
-            self.bytes = self.bytes.saturating_sub(charge);
-            self.items = self.items.saturating_sub(1);
+    fn checked_sub(self, charge: u64) -> Option<Self> {
+        if charge == 0 {
+            return Some(self);
         }
+        Some(Self {
+            bytes: self.bytes.checked_sub(charge)?,
+            items: self.items.checked_sub(1)?,
+        })
     }
+}
 
-    #[cfg(test)]
-    fn add_tally(&mut self, other: Self) {
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.items = self.items.saturating_add(other.items);
-    }
-
-    fn sub_tally(&mut self, other: Self) {
-        self.bytes = self.bytes.saturating_sub(other.bytes);
-        self.items = self.items.saturating_sub(other.items);
-    }
+/// The first failed arithmetic in the logical ledger. The ledger keeps its last
+/// valid values, and IO closes the budget under the same lock.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct LedgerFault {
+    /// The ledger operation that failed.
+    pub(in crate::zakura::block_sync) operation: &'static str,
+    /// The value the operation started from.
+    pub(in crate::zakura::block_sync) total: u64,
+    /// The amount the operation could not apply.
+    pub(in crate::zakura::block_sync) amount: u64,
 }
 
 /// Compute a clamped body-size estimate from a [`BlockSizeEstimate`] hint.
@@ -126,27 +208,29 @@ pub(in crate::zakura::block_sync) struct WorkQueueState {
     /// Nonzero reservations held by `in_flight` items, maintained at each
     /// `in_flight` ledger transition so admission never scans the map.
     in_flight_reserved: ReservedTally,
+    /// The first ledger arithmetic failure, if any. It never clears.
+    ledger_fault: Option<LedgerFault>,
 }
 
 impl WorkQueueState {
     /// Read each item's ownership and charge from the maps, not the tallies.
     #[cfg(any(test, zakura_sim))]
-    pub(super) fn ownership(&self) -> Vec<super::WorkItemOwnership> {
+    pub(super) fn ownership(&self) -> Vec<WorkItemOwnership> {
         let pending = self
             .pending
             .iter()
-            .map(|(height, item)| (height, item, super::WorkItemPlace::Pending));
+            .map(|(height, item)| (height, item, WorkItemPlace::Pending));
         let in_flight = self.in_flight.iter().map(|(height, item)| {
             let place = if item.provisional {
-                super::WorkItemPlace::Provisional
+                WorkItemPlace::Provisional
             } else {
-                super::WorkItemPlace::InFlight
+                WorkItemPlace::InFlight
             };
             (height, item, place)
         });
         pending
             .chain(in_flight)
-            .map(|(height, item, place)| super::WorkItemOwnership {
+            .map(|(height, item, place)| WorkItemOwnership {
                 height: *height,
                 owner: item.owner,
                 place,
@@ -165,6 +249,62 @@ impl WorkQueueState {
             floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
             reserved_bytes: 0,
             in_flight_reserved: ReservedTally::default(),
+            ledger_fault: None,
+        }
+    }
+
+    // ---- checked ledger arithmetic ----
+
+    /// The first ledger arithmetic failure. IO must close the budget on one.
+    pub(in crate::zakura::block_sync) fn ledger_fault(&self) -> Option<LedgerFault> {
+        self.ledger_fault
+    }
+
+    fn note_fault(&mut self, operation: &'static str, total: u64, amount: u64) {
+        self.ledger_fault.get_or_insert(LedgerFault {
+            operation,
+            total,
+            amount,
+        });
+    }
+
+    /// Add to a transition's running byte total. Overflow keeps `total`.
+    fn add_to_total(&mut self, total: u64, amount: u64) -> u64 {
+        total.checked_add(amount).unwrap_or_else(|| {
+            self.note_fault("transition total", total, amount);
+            total
+        })
+    }
+
+    fn charge_ledger(&mut self, bytes: u64) {
+        match self.reserved_bytes.checked_add(bytes) {
+            Some(total) => self.reserved_bytes = total,
+            None => self.note_fault("ledger charge", self.reserved_bytes, bytes),
+        }
+    }
+
+    fn settle_ledger(&mut self, bytes: u64) {
+        match self.reserved_bytes.checked_sub(bytes) {
+            Some(total) => self.reserved_bytes = total,
+            None => self.note_fault("ledger settlement", self.reserved_bytes, bytes),
+        }
+    }
+
+    fn charge_in_flight(&mut self, charge: u64) {
+        match self.in_flight_reserved.checked_add(charge) {
+            Some(tally) => self.in_flight_reserved = tally,
+            None => self.note_fault("in-flight charge", self.in_flight_reserved.bytes, charge),
+        }
+    }
+
+    fn settle_in_flight(&mut self, charge: u64) {
+        match self.in_flight_reserved.checked_sub(charge) {
+            Some(tally) => self.in_flight_reserved = tally,
+            None => self.note_fault(
+                "in-flight settlement",
+                self.in_flight_reserved.bytes,
+                charge,
+            ),
         }
     }
 
@@ -327,7 +467,7 @@ impl WorkQueueState {
         }
         for (height, item) in &taken {
             self.pending.remove(height);
-            self.in_flight_reserved.add(item.budget.reserved_charge());
+            self.charge_in_flight(item.budget.reserved_charge());
             self.in_flight.insert(*height, *item);
         }
         taken
@@ -341,17 +481,17 @@ impl WorkQueueState {
     /// guarantee progress, the first eligible item is always taken when
     /// `max_count > 0`, even if its estimate alone exceeds the cap.
     ///
-    /// With an `attempt`, every taken item becomes a provisional, unpublished
-    /// claim of that exact owner. A reset followed by a new take cannot be undone
-    /// by this attempt's cleanup. The take charges nothing: the attempt's own
-    /// budget guard holds its bytes until publication.
+    /// Every taken item becomes a provisional, unpublished claim of `attempt`'s
+    /// exact owner. A reset followed by a new take cannot be undone by this
+    /// attempt's cleanup. The take charges nothing: the attempt's own funding
+    /// holds its bytes until publication.
     pub(in crate::zakura::block_sync) fn take_budgeted(
         &mut self,
         low: block::Height,
         high: block::Height,
         max_count: usize,
         max_estimated_bytes: u64,
-        attempt: Option<(u64, std::num::NonZeroU64)>,
+        attempt: (u64, std::num::NonZeroU64),
     ) -> Vec<(block::Height, WorkItem)> {
         // An empty count or inverted range is a caller bug, not a real "nothing to
         // take": every caller computes `low <= high` and a positive count before
@@ -359,7 +499,7 @@ impl WorkQueueState {
         // a miscomputation degrades to a no-op rather than panicking a live node.
         debug_assert!(
             max_count > 0 && low <= high,
-            "take_in_range_budgeted requires a positive count and low <= high, \
+            "take_budgeted requires a positive count and low <= high, \
              got max_count={max_count}, low={low:?}, high={high:?}"
         );
         if max_count == 0 || low > high {
@@ -405,13 +545,13 @@ impl WorkQueueState {
             }
         }
         for (_, item) in &mut taken {
-            item.owner = attempt.map(|(session, request)| item.scope.bind(session, request));
-            item.provisional = attempt.is_some();
+            item.owner = Some(item.scope.bind(attempt.0, attempt.1));
+            item.provisional = true;
             item.answered_elsewhere = false;
         }
         for (height, item) in &taken {
             self.pending.remove(height);
-            self.in_flight_reserved.add(item.budget.reserved_charge());
+            self.charge_in_flight(item.budget.reserved_charge());
             self.in_flight.insert(*height, *item);
         }
         taken
@@ -421,8 +561,8 @@ impl WorkQueueState {
     /// provisionally move back to `pending`, so a stale claim cannot return a
     /// replacement owner's work. Returns no wake: the returning routine would
     /// otherwise wake itself, and the failure that freed the work already woke
-    /// other routines. Releases no ledger charge: the attempt's own budget guard
-    /// still holds the funded bytes.
+    /// other routines. Releases no ledger charge: the attempt's own funding
+    /// still holds its bytes.
     pub(in crate::zakura::block_sync) fn return_unpublished(
         &mut self,
         items: &[(block::Height, WorkItem)],
@@ -434,7 +574,7 @@ impl WorkQueueState {
                 continue;
             }
             if let Some(mut item) = self.in_flight.remove(height) {
-                self.in_flight_reserved.sub(item.budget.reserved_charge());
+                self.settle_in_flight(item.budget.reserved_charge());
                 item.owner = None;
                 if let Some(estimate) = item.retry_estimated_bytes.take() {
                     item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -478,10 +618,10 @@ impl WorkQueueState {
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
             let charge = item.estimated_bytes;
-            self.in_flight_reserved.add(charge);
-            transferred = transferred.saturating_add(charge);
+            self.charge_in_flight(charge);
+            transferred = self.add_to_total(transferred, charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_add(transferred);
+        self.charge_ledger(transferred);
         complete.then_some(transferred)
     }
 
@@ -502,63 +642,41 @@ impl WorkQueueState {
     // ---- receipt ----
 
     /// End an active reservation at receipt. `answered_elsewhere` records that
-    /// another attempt's body ended this owner's reservation. Returns `None` when
-    /// `owner` does not hold a reservation on `height`.
+    /// another attempt's body ended this owner's reservation. Returns the bytes
+    /// that left the ledger, or `None` when `owner` does not hold a reservation on
+    /// `height`.
     pub(in crate::zakura::block_sync) fn end_reservation_at_receipt(
         &mut self,
-        owner: Option<BodyWorkOwner>,
+        owner: BodyWorkOwner,
         height: block::Height,
         answered_elsewhere: bool,
-    ) -> Option<EndedReservation> {
+    ) -> Option<u64> {
         let item = self.in_flight.get_mut(&height)?;
-        if owner.is_some_and(|owner| item.owner != Some(owner)) {
-            return None;
-        }
-        if !item.budget.is_reserved() {
+        if item.owner != Some(owner) || !item.budget.is_reserved() {
             return None;
         }
         item.answered_elsewhere = answered_elsewhere;
-        let ended = EndedReservation {
-            released_bytes: item.budget.release_reserved(),
-            owner: item.owner,
-        };
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(ended.released_bytes);
-        self.in_flight_reserved.sub(ended.released_bytes);
-        Some(ended)
+        let released = item.budget.release_reserved();
+        self.settle_ledger(released);
+        self.settle_in_flight(released);
+        Some(released)
     }
 
-    /// Claim a received height into `in_flight` and end any reservation it owned.
-    /// Returns `None` when another owner holds the height or it is not queued.
+    /// End any reservation `owner` holds on a received height. Returns the bytes
+    /// that left the ledger, or `None` when `owner` does not hold the in-flight height.
     pub(in crate::zakura::block_sync) fn claim_received(
         &mut self,
-        owner: Option<BodyWorkOwner>,
+        owner: BodyWorkOwner,
         height: block::Height,
-    ) -> Option<EndedReservation> {
-        let ended = if let Some(item) = self.in_flight.get_mut(&height) {
-            if owner.is_some_and(|owner| item.owner != Some(owner)) {
-                return None;
-            }
-            let ended = EndedReservation {
-                released_bytes: item.budget.release_reserved(),
-                owner: item.owner,
-            };
-            self.in_flight_reserved.sub(ended.released_bytes);
-            ended
-        } else {
-            let mut item = self.pending.remove(&height)?;
-            if owner.is_some_and(|owner| item.owner != Some(owner)) {
-                self.pending.insert(height, item);
-                return None;
-            }
-            let ended = EndedReservation {
-                released_bytes: item.budget.release_reserved(),
-                owner: item.owner,
-            };
-            self.in_flight.insert(height, item);
-            ended
-        };
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(ended.released_bytes);
-        Some(ended)
+    ) -> Option<u64> {
+        let item = self.in_flight.get_mut(&height)?;
+        if item.owner != Some(owner) {
+            return None;
+        }
+        let released = item.budget.release_reserved();
+        self.settle_in_flight(released);
+        self.settle_ledger(released);
+        Some(released)
     }
 
     /// Return an exact received attempt without releasing its request credit twice.
@@ -606,28 +724,22 @@ impl WorkQueueState {
     /// Returns the released bytes.
     pub(in crate::zakura::block_sync) fn release_reserved_heights(
         &mut self,
-        owner: Option<BodyWorkOwner>,
+        owner: BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         let mut released = 0u64;
-        let mut released_in_flight = ReservedTally::default();
         for height in heights {
-            if let Some(item) = self.in_flight.get_mut(&height) {
-                if owner.is_some_and(|owner| item.owner != Some(owner)) {
-                    continue;
-                }
-                let charge = item.budget.release_reserved();
-                released = released.saturating_add(charge);
-                released_in_flight.add(charge);
-            } else if let Some(item) = self.pending.get_mut(&height) {
-                if owner.is_some_and(|owner| item.owner != Some(owner)) {
-                    continue;
-                }
-                released = released.saturating_add(item.budget.release_reserved());
+            let Some(item) = self.in_flight.get_mut(&height) else {
+                continue;
+            };
+            if item.owner != Some(owner) {
+                continue;
             }
+            let charge = item.budget.release_reserved();
+            released = self.add_to_total(released, charge);
+            self.settle_in_flight(charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
-        self.in_flight_reserved.sub_tally(released_in_flight);
+        self.settle_ledger(released);
         released
     }
 
@@ -639,7 +751,7 @@ impl WorkQueueState {
     /// that observation in the outcome.
     pub(in crate::zakura::block_sync) fn return_owned(
         &mut self,
-        owner: Option<BodyWorkOwner>,
+        owner: BodyWorkOwner,
         heights: BTreeSet<block::Height>,
     ) -> (WorkReturnOutcome, WorkWake) {
         let mut outcome = WorkReturnOutcome::default();
@@ -662,7 +774,7 @@ impl WorkQueueState {
                 }
                 continue;
             };
-            if owner.is_some_and(|owner| item.owner != Some(owner)) {
+            if item.owner != Some(owner) {
                 outcome.missing_count = outcome.missing_count.saturating_add(1);
                 continue;
             }
@@ -672,8 +784,8 @@ impl WorkQueueState {
                     .remove(&height)
                     .expect("owned item exists because it was just checked");
                 let charge = item.budget.release_reserved();
-                self.in_flight_reserved.sub(charge);
-                outcome.released_bytes = outcome.released_bytes.saturating_add(charge);
+                self.settle_in_flight(charge);
+                outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
                 outcome.committed_count = outcome.committed_count.saturating_add(1);
                 continue;
             }
@@ -689,8 +801,8 @@ impl WorkQueueState {
                 .remove(&height)
                 .expect("reserved item exists because it was just checked");
             let charge = item.budget.release_reserved();
-            self.in_flight_reserved.sub(charge);
-            outcome.released_bytes = outcome.released_bytes.saturating_add(charge);
+            self.settle_in_flight(charge);
+            outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
             item.owner = None;
             if let Some(estimate) = item.retry_estimated_bytes.take() {
                 item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -698,7 +810,7 @@ impl WorkQueueState {
             outcome.returned_count = outcome.returned_count.saturating_add(1);
             self.pending.insert(height, item);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(outcome.released_bytes);
+        self.settle_ledger(outcome.released_bytes);
         let wake = WorkWake {
             available: outcome.returned_count > 0,
             ..WorkWake::default()
@@ -733,7 +845,7 @@ impl WorkQueueState {
                 .pending
                 .pop_first()
                 .expect("first_key_value returned Some");
-            released = released.saturating_add(item.budget.release_reserved());
+            released = self.add_to_total(released, item.budget.release_reserved());
         }
         let mut revocation = false;
         while let Some((&height, _)) = self.in_flight.first_key_value() {
@@ -746,10 +858,10 @@ impl WorkQueueState {
                 .expect("first_key_value returned Some");
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
-            self.in_flight_reserved.sub(charge);
-            released = released.saturating_add(charge);
+            self.settle_in_flight(charge);
+            released = self.add_to_total(released, charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
+        self.settle_ledger(released);
         WorkDelta {
             released_bytes: released,
             wake: WorkWake {
@@ -777,7 +889,7 @@ impl WorkQueueState {
                 .pending
                 .pop_last()
                 .expect("last_key_value returned Some");
-            released = released.saturating_add(item.budget.release_reserved());
+            released = self.add_to_total(released, item.budget.release_reserved());
         }
         let mut revocation = false;
         while let Some((&height, _)) = self.in_flight.last_key_value() {
@@ -790,102 +902,14 @@ impl WorkQueueState {
                 .expect("last_key_value returned Some");
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
-            self.in_flight_reserved.sub(charge);
-            released = released.saturating_add(charge);
+            self.settle_in_flight(charge);
+            released = self.add_to_total(released, charge);
         }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
+        self.settle_ledger(released);
         WorkDelta {
             released_bytes: released,
             wake: WorkWake {
                 revocation,
-                ..WorkWake::default()
-            },
-        }
-    }
-
-    // ---- test-only transitions ----
-
-    /// Move each given height `in_flight → pending`, preserving its ledger.
-    #[cfg(test)]
-    pub(in crate::zakura::block_sync) fn return_items(
-        &mut self,
-        heights: impl IntoIterator<Item = block::Height>,
-    ) -> WorkWake {
-        let mut moved = false;
-        for height in heights {
-            if let Some(mut item) = self.in_flight.remove(&height) {
-                self.in_flight_reserved.sub(item.budget.reserved_charge());
-                item.owner = None;
-                if let Some(estimate) = item.retry_estimated_bytes.take() {
-                    item.estimated_bytes = estimate.max(item.observed_bytes);
-                }
-                self.pending.insert(height, item);
-                moved = true;
-            }
-        }
-        WorkWake {
-            available: moved,
-            ..WorkWake::default()
-        }
-    }
-
-    /// Mark taken heights as owning their estimated reservation. Returns the sum.
-    #[cfg(test)]
-    pub(in crate::zakura::block_sync) fn mark_reserved(
-        &mut self,
-        owner: Option<BodyWorkOwner>,
-        heights: impl IntoIterator<Item = block::Height>,
-    ) -> u64 {
-        let mut marked = 0u64;
-        let mut added = ReservedTally::default();
-        for height in heights {
-            let Some(item) = self.in_flight.get_mut(&height) else {
-                continue;
-            };
-            if owner.is_some_and(|owner| item.scope != owner.authority()) {
-                continue;
-            }
-            if item.budget.is_reserved() {
-                continue;
-            }
-            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
-            item.owner = owner;
-            marked = marked.saturating_add(item.estimated_bytes);
-            added.add(item.estimated_bytes);
-        }
-        // Released (0) -> Reserved(estimate): the reserved total grows by exactly
-        // the bytes just marked.
-        self.reserved_bytes = self.reserved_bytes.saturating_add(marked);
-        self.in_flight_reserved.add_tally(added);
-        marked
-    }
-
-    /// Release and return heights, including received ones.
-    #[cfg(test)]
-    pub(in crate::zakura::block_sync) fn release_and_return_items(
-        &mut self,
-        heights: impl IntoIterator<Item = block::Height>,
-    ) -> WorkDelta {
-        let mut moved = false;
-        let mut released = 0u64;
-        for height in heights {
-            if let Some(mut item) = self.in_flight.remove(&height) {
-                let charge = item.budget.release_reserved();
-                released = released.saturating_add(charge);
-                self.in_flight_reserved.sub(charge);
-                item.owner = None;
-                if let Some(estimate) = item.retry_estimated_bytes.take() {
-                    item.estimated_bytes = estimate.max(item.observed_bytes);
-                }
-                self.pending.insert(height, item);
-                moved = true;
-            }
-        }
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
-        WorkDelta {
-            released_bytes: released,
-            wake: WorkWake {
-                available: moved,
                 ..WorkWake::default()
             },
         }
@@ -933,7 +957,10 @@ impl WorkQueueState {
     pub(in crate::zakura::block_sync) fn reserved_above(&self, floor: block::Height) -> (u64, u64) {
         let mut above = self.in_flight_reserved;
         for (_, item) in self.in_flight.range(..=floor) {
-            above.sub(item.budget.reserved_charge());
+            // The tally falls below its items only after a transition latched a fault.
+            if let Some(remaining) = above.checked_sub(item.budget.reserved_charge()) {
+                above = remaining;
+            }
         }
         debug_assert_eq!(
             (above.bytes, above.items),

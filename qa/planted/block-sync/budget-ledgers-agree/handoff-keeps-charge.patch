@@ -1,26 +1,26 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-index c6163d2c1..6caf696eb 100644
 --- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-@@ -380,20 +380,7 @@ impl Drop for ReceiptSettlement {
+@@ -387,21 +387,7 @@ impl Drop for ReceiptSettlement {
          #[cfg(not(any(test, zakura_sim)))]
          drop(funding);
          #[cfg(any(test, zakura_sim))]
 -        {
 -            let charge = funding.bytes();
+-            let handoff = &self.handoff;
 -            funding.release_then(|| {
 -                observe!(
--                    self.observer,
+-                    handoff.observer,
 -                    super::block_sync_observe::BlockEvent::HandoffEnded {
--                        peer: self.peer.clone(),
--                        owner: self.owner,
--                        height: self.height,
+-                        peer: handoff.peer.clone(),
+-                        owner: handoff.owner,
+-                        height: handoff.height,
 -                        charge,
 -                    }
 -                );
 -            });
 -        }
 +        std::mem::forget(funding);
+         self.handoff_blocked.store(false, Ordering::Relaxed);
      }
  }
- 

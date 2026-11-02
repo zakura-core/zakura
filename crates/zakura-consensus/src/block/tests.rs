@@ -299,6 +299,80 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
     }
 }
 
+/// Duplicate spends and nullifiers are part of the transaction ID, so a semantic duplicate stays
+/// the block's own failure without asking state for the authorizing data binding.
+#[tokio::test]
+async fn txid_committed_semantic_failures_skip_the_binding_check() {
+    use zakura_header_chain::BodyVerificationClass;
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+    let orchard_nullifier = orchard::Nullifier::try_from([0; 32])
+        .expect("zero is a canonical Orchard nullifier encoding");
+
+    for duplicate in [
+        TransactionError::DuplicateTransparentSpend(transparent::OutPoint {
+            hash: zakura_chain::transaction::Hash([1; 32]),
+            index: 0,
+        }),
+        TransactionError::DuplicateSproutNullifier(zakura_chain::sprout::Nullifier::from([0; 32])),
+        TransactionError::DuplicateSaplingNullifier(zakura_chain::sapling::Nullifier::from(
+            [0; 32],
+        )),
+        TransactionError::DuplicateOrchardNullifier(orchard_nullifier),
+        TransactionError::DuplicateIronwoodNullifier(orchard_nullifier),
+    ] {
+        let state = service_fn(|request: zs::Request| async move {
+            Ok::<_, BoxError>(match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::CheckParentInputs { .. } => {
+                    zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                }
+                _ => panic!("unexpected state request: {request:?}"),
+            })
+        });
+        let failure = duplicate.clone();
+        let transaction = service_fn(move |request: tx::Request| {
+            let failure = failure.clone();
+            async move {
+                let tx::Request::Block { transaction, .. } = &request else {
+                    panic!("block verification sent a mempool transaction request");
+                };
+                if transaction.is_coinbase() {
+                    Ok(accept_block_transaction(request))
+                } else {
+                    Err::<tx::Response, BoxError>(failure.into())
+                }
+            }
+        });
+
+        let error = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(Request::Commit(block.clone()))
+        .await
+        .expect_err("the duplicate fails verification");
+
+        assert!(
+            matches!(&error, VerifyBlockError::Transaction(found) if *found == duplicate),
+            "{error:?}"
+        );
+        assert!(
+            matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(_)
+            ),
+            "{error:?}"
+        );
+    }
+}
+
 fn accept_block_transaction(request: tx::Request) -> tx::Response {
     let tx::Request::Block { transaction, .. } = request else {
         panic!("prepared-path test received a mempool transaction request");

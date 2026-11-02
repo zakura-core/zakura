@@ -1586,10 +1586,10 @@ pub(crate) fn validate_and_commit_non_finalized(
 ///
 /// Contextual rules can read authorizing data before the commitment check runs, such as v6
 /// anchors, so a consensus failure is only the block's if its header commits to that data (see
-/// `check::auth_data_commitment`, which `commitment` runs). Sapling and Orchard nullifiers are part
-/// of the transaction ID (ZIP 244), and the Merkle root was checked before this, so every body for
-/// the block repeats a duplicate nullifier: that failure is the block's whatever the authorizing
-/// data says.
+/// `check::auth_data_commitment`, which `commitment` runs). Transaction IDs commit to spent
+/// outpoints and nullifiers (ZIP 244, and the whole v4 encoding), and the Merkle root was checked
+/// before this, so every body for the block repeats a duplicate spend or nullifier: that failure is
+/// the block's whatever the authorizing data says.
 fn attribute_contextual_failure(
     error: ValidateContextError,
     commitment: impl FnOnce() -> crate::AuthDataCommitment,
@@ -1599,8 +1599,11 @@ fn attribute_contextual_failure(
         zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
     ) || matches!(
         error,
-        ValidateContextError::DuplicateSaplingNullifier { .. }
+        ValidateContextError::DuplicateTransparentSpend { .. }
+            | ValidateContextError::DuplicateSproutNullifier { .. }
+            | ValidateContextError::DuplicateSaplingNullifier { .. }
             | ValidateContextError::DuplicateOrchardNullifier { .. }
+            | ValidateContextError::DuplicateIronwoodNullifier { .. }
     ) {
         return error;
     }

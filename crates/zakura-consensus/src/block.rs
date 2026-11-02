@@ -290,6 +290,10 @@ where
 /// body can differ in that data under the same block hash, so a failure found earlier
 /// is intrinsic only if the header commits to the delivered authorizing data. A mismatch is
 /// reported as the commitment failure state would report, and an unknown binding is retryable.
+///
+/// Duplicate spends and nullifiers are kept as they are: transaction IDs commit to outpoints and
+/// nullifiers (ZIP 244, and the whole v4 encoding), and the Merkle root was checked before this,
+/// so every body for the block repeats them.
 async fn confirm_auth_data_binding<S>(
     state_service: S,
     network: &Network,
@@ -300,16 +304,23 @@ where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone,
 {
     // Commit already checked the binding, and only a deterministic verdict needs it.
-    if matches!(error, VerifyBlockError::Commit(_))
-        || !matches!(
-            error.body_verification_class(),
-            zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
-        )
-        || !matches!(
-            block.commitment(network),
-            Ok(block::Commitment::ChainHistoryBlockTxAuthCommitment(_))
-        )
-    {
+    if matches!(
+        error,
+        VerifyBlockError::Commit(_)
+            | VerifyBlockError::Transaction(
+                TransactionError::DuplicateTransparentSpend(_)
+                    | TransactionError::DuplicateSproutNullifier(_)
+                    | TransactionError::DuplicateSaplingNullifier(_)
+                    | TransactionError::DuplicateOrchardNullifier(_)
+                    | TransactionError::DuplicateIronwoodNullifier(_)
+            )
+    ) || !matches!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+    ) || !matches!(
+        block.commitment(network),
+        Ok(block::Commitment::ChainHistoryBlockTxAuthCommitment(_))
+    ) {
         return error;
     }
 

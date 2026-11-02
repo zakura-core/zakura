@@ -69,7 +69,6 @@ impl Target {
 /// Causal input for the selected harness's decoder-v2.
 ///
 /// Each harness has its own decoder identity and consumes at most 512 bytes.
-/// Decoder-v1 remains the `qa/fuzz/p2p` targets' corpus format.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {

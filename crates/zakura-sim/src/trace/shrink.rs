@@ -1,7 +1,7 @@
 //! The shrinker: reduce a failing trace to fewer non-default picks on the
 //! build that recorded it (traces.md, Trace shrinking).
 //!
-//! Machine histories delete aligned decoder-v1 operations and preserve the exact
+//! Machine histories delete aligned decoder operations and preserve the exact
 //! failure phase and payload. Scheduler histories use five passes:
 //!
 //! 1. **Confirm.** Replay the trace Exact. A trace that doesn't replay, such
@@ -687,7 +687,7 @@ impl Shrinker<'_> {
         self.default_scheduling(base)
     }
 
-    /// Delete decoder-v1 operations, preserving alignment and the exact failure.
+    /// Delete decoder operations, preserving alignment and the exact failure.
     fn reduce_machine(&mut self, base: &mut Run) -> Result<(), Stop> {
         let Some(mut input) = machine_input(self.harness.name, &self.scenario) else {
             return Ok(());

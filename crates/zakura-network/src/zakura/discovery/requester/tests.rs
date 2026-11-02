@@ -577,8 +577,7 @@ async fn answers_settled_sees_a_claim_that_takes_the_queued_frame() {
     // Let the wait reach the lock this test holds.
     std::thread::sleep(std::time::Duration::from_millis(100));
     let answer = queries
-        .claim_locked(&mut live, PEERS, peers_len(1))
-        .unwrap()
+        .claim_locked(&mut live, QueryKind::Peers, PEERS, peers_len(1))
         .unwrap();
     drop(live);
     std::thread::sleep(std::time::Duration::from_millis(100));

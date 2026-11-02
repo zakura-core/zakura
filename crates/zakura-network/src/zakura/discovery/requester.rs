@@ -490,20 +490,23 @@ impl Queries {
         message_type: u16,
         payload_len: usize,
     ) -> Result<Option<ClaimedAnswer>, ClaimRefused> {
-        self.claim_locked(&mut self.lock(), message_type, payload_len)
-    }
-
-    /// [`Self::claim`], with the live queries already locked. The claim takes
-    /// the queued frame and counts its answer under this one lock.
-    fn claim_locked(
-        &self,
-        live: &mut LiveQueries,
-        message_type: u16,
-        payload_len: usize,
-    ) -> Result<Option<ClaimedAnswer>, ClaimRefused> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
             return Ok(None);
         };
+        self.claim_locked(&mut self.lock(), kind, message_type, payload_len)
+            .map(Some)
+    }
+
+    /// [`Self::claim`] of a `kind` answer, with the live queries already
+    /// locked. The claim takes the queued frame and counts its answer under
+    /// this one lock.
+    fn claim_locked(
+        &self,
+        live: &mut LiveQueries,
+        kind: QueryKind,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<ClaimedAnswer, ClaimRefused> {
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
@@ -514,11 +517,11 @@ impl Queries {
             .state
             .claim(kind, payload_len)
             .expect("every live reservation records its live query")?;
-        Ok(Some(ClaimedAnswer {
+        Ok(ClaimedAnswer {
             admitted,
             _entry: entry,
             _settling: SettlingHold::new(Held::Answer(kind), &self.settling),
-        }))
+        })
     }
 
     /// Counts one `Hello` in verification until the returned hold drops.

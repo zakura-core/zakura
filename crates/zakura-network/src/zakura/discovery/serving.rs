@@ -145,14 +145,10 @@ impl Serving {
 pub(super) struct AnswersWritten([ResponsesWritten; 2]);
 
 impl AnswersWritten {
-    /// Resolves once both rows have written every admitted answer. The reader
-    /// keeps admitting requests during the wait, so a row that a later request
-    /// reopened is waited for again.
+    /// Resolves once both rows have written every admitted answer.
     pub(super) async fn wait(&self) {
-        while !self.is_written() {
-            for row in &self.0 {
-                row.wait().await;
-            }
+        for row in &self.0 {
+            row.wait().await;
         }
     }
 

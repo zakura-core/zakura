@@ -320,7 +320,9 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
     for address in state.candidate_addresses(candidate, now) {
-        if can_accept_discovery_dial_ip(endpoint, address.ip, state.in_flight_dials_to(address.ip))
+        if endpoint
+            .supervisor()
+            .can_accept_remote_ip_with_in_flight(address.ip, state.in_flight_dials_to(address.ip))
             .await
         {
             reserved_ips.push(address.ip);
@@ -334,17 +336,6 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
             reserved_ips,
         )
     })
-}
-
-async fn can_accept_discovery_dial_ip(
-    endpoint: &ZakuraEndpoint,
-    remote_ip: IpAddr,
-    in_flight: usize,
-) -> bool {
-    endpoint
-        .supervisor()
-        .can_accept_remote_ip_with_in_flight(remote_ip, in_flight)
-        .await
 }
 
 async fn run_discovery_dial_once(

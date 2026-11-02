@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A machine harness's scenario.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineScenario {
+    /// Complete causal machine input, independent of scheduling choices.
+    pub input: Vec<u8>,
+}
+
 /// Typed semantic evidence from one transport-free machine operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -11,15 +19,20 @@ use serde::{Deserialize, Serialize};
     deny_unknown_fields
 )]
 pub enum MachineStep {
+    /// A fixture machine's operation. It tests machine-trace support itself, as
+    /// [`crate::harness::fixtures`] tests the simulator. No production machine
+    /// records it.
+    Fixture(FixtureStep),
     /// Header reactor scheduling and locator policy, with its independent model.
     HeaderReactor(HeaderReactorStep),
 }
 
 impl MachineStep {
     /// The failure that stopped the run at this operation, if any.
-    pub fn failure(&self) -> Option<&MachineFailure> {
+    pub fn failure(&self) -> Option<MachineFailure> {
         match self {
-            Self::HeaderReactor(step) => step.failure.as_ref(),
+            Self::Fixture(step) => step.failure.clone(),
+            Self::HeaderReactor(step) => step.failure.clone(),
         }
     }
 }
@@ -44,6 +57,16 @@ pub struct MachineFailure {
     pub phase: FailurePhase,
     /// Panic payload without the panic hook's source location.
     pub message: String,
+}
+
+/// One operation of a fixture machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureStep {
+    /// Original causal bytes.
+    pub input: Vec<u8>,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
 }
 
 /// One storage call's exact identity.

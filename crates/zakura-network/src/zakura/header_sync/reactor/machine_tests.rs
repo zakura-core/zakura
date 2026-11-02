@@ -1779,6 +1779,19 @@ fn header_reactor_witness_rejects_lost_locator() {
     });
 }
 
+/// The shared adapter judges only a step's failure, so a view mismatch must
+/// become a property failure.
+#[test]
+fn a_view_mismatch_is_a_property_failure() {
+    let mut harness = run(decode(WITNESS));
+    harness.state.scheduling_revision += 1;
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.check()))
+        .expect_err("the views disagree");
+    let failure =
+        HeaderMachineFailure::of_panic(PROPERTY, HeaderMachinePhase::Invariant, payload.as_ref());
+    assert!(failure.property_failure, "{}", failure.message);
+}
+
 #[test]
 #[should_panic(expected = "header/reactor-policy")]
 fn header_reactor_witness_rejects_wrong_revision() {

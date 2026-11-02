@@ -176,11 +176,55 @@ mod machine_tests {
     use super::*;
     use crate::{
         plan::By,
-        record::machine::{FailurePhase, MachineFailure, MachineStep},
+        record::machine::{FailurePhase, FixtureStep, MachineFailure, MachineStep},
     };
+
+    fn fixture(record: &mut StepRecord) -> &mut FixtureStep {
+        match record.machine.as_deref_mut() {
+            Some(MachineStep::Fixture(step)) => step,
+            other => panic!("the record holds fixture evidence, not {other:?}"),
+        }
+    }
 
     #[test]
     fn machine_evidence_round_trips_and_changes_exact_replay() {
+        let record = StepRecord {
+            step: 1,
+            pick: "machine:fixture:1".into(),
+            key: None,
+            options: 1,
+            by: By::Forced,
+            offset: None,
+            draws: Vec::new(),
+            obs: None,
+            machine: Some(Box::new(MachineStep::Fixture(FixtureStep {
+                input: vec![0, 0, 0, 0],
+                failure: None,
+            }))),
+        };
+        let json = Record::Step(record.clone()).to_line();
+        let mut encoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(encoded["machine"]["kind"], "fixture");
+        assert!(encoded["machine"]["step"]["input"].is_array());
+        encoded["machine"]["kind"] = serde_json::json!("unsupported-machine");
+        assert!(serde_json::from_value::<Record>(encoded).is_err());
+        let decoded: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, Record::Step(record.clone()));
+        assert_eq!(step_difference(&record, &record), None);
+        let mut changed = record.clone();
+        fixture(&mut changed).input[0] ^= 1;
+        assert_eq!(step_difference(&record, &changed), Some("machine"));
+        let mut changed = record.clone();
+        fixture(&mut changed).failure = Some(MachineFailure {
+            property_failure: true,
+            phase: FailurePhase::Invariant,
+            message: "changed owner".into(),
+        });
+        assert_eq!(step_difference(&record, &changed), Some("machine"));
+    }
+
+    #[test]
+    fn reactor_evidence_round_trips_and_changes_exact_replay() {
         let input = [0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0];
         let history = zakura_network::zakura::trace_header_reactor_bytes(&input);
         assert_eq!(history.steps.len(), 3);
@@ -206,15 +250,21 @@ mod machine_tests {
             assert_eq!(decoded, Record::Step(record.clone()));
             assert_eq!(step_difference(&record, &record), None);
             let mut changed = record.clone();
-            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            let Some(MachineStep::HeaderReactor(work)) = changed.machine.as_deref_mut() else {
+                panic!("the record holds header reactor evidence");
+            };
             work.actual.revision += 1;
             assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            let Some(MachineStep::HeaderReactor(work)) = changed.machine.as_deref_mut() else {
+                panic!("the record holds header reactor evidence");
+            };
             work.input[0] ^= 1;
             assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            let MachineStep::HeaderReactor(work) = changed.machine.as_deref_mut().unwrap();
+            let Some(MachineStep::HeaderReactor(work)) = changed.machine.as_deref_mut() else {
+                panic!("the record holds header reactor evidence");
+            };
             work.failure = Some(MachineFailure {
                 property_failure: true,
                 phase: FailurePhase::Invariant,

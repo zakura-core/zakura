@@ -87,6 +87,31 @@ def package_problems(root, package, manifest, suite_names, excluded, sources):
     return problems
 
 
+def package_bins(root, package):
+    """Return the binary names of one fuzz package, or None if it has no manifest."""
+    path = root / "qa/fuzz" / package / "Cargo.toml"
+    if not path.is_file():
+        return None
+    manifest = tomllib.loads(path.read_text(encoding="utf-8"))
+    return {binary["name"] for binary in manifest.get("bin", [])}
+
+
+def suite_target_problems(root, suite):
+    """Check that each suite target and exclusion names a binary of a fuzz package."""
+    problems = []
+    bins = {}
+    for table in ("target", "excluded-target"):
+        for target in suite.get(table, []):
+            package, name = target["package"], target["name"]
+            if package not in bins:
+                bins[package] = package_bins(root, package)
+            if bins[package] is None:
+                problems.append(f"qa/suite.toml: `{name}` names the missing package qa/fuzz/{package}")
+            elif name not in bins[package]:
+                problems.append(f"qa/suite.toml: qa/fuzz/{package} has no target `{name}`")
+    return problems
+
+
 def schedule_problems(root, package, suite):
     """Check that one package's workflow runs the shared campaign on its schedule."""
     workflow = WORKFLOWS[package]
@@ -162,7 +187,7 @@ def problems_at(root):
     """Return every problem with the fuzz campaign wiring of the checkout at `root`."""
     suite = tomllib.loads((root / "qa/suite.toml").read_text(encoding="utf-8"))
     sources = source_literals(root)
-    problems = coverage_problems(root, suite, sources)
+    problems = coverage_problems(root, suite, sources) + suite_target_problems(root, suite)
     for manifest_path in sorted((root / "qa/fuzz").glob("*/Cargo.toml")):
         package = manifest_path.parent.name
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))

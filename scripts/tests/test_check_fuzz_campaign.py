@@ -72,6 +72,19 @@ class CampaignCheck(unittest.TestCase):
         self.write("qa/suite.toml", "")
         self.assert_problem("qa/suite.toml neither runs nor excludes `alpha`")
 
+    def test_a_suite_target_without_a_binary_fails(self):
+        self.write("qa/suite.toml", SUITE + '\n[[target]]\npackage = "p2p"\nname = "gone"\n')
+        self.assert_problem("qa/fuzz/p2p has no target `gone`")
+        self.write(
+            "qa/suite.toml",
+            SUITE + '\n[[excluded-target]]\npackage = "p2p"\nname = "gone"\nreason = "x"\n',
+        )
+        self.assert_problem("qa/fuzz/p2p has no target `gone`")
+
+    def test_a_suite_target_of_a_missing_package_fails(self):
+        self.write("qa/suite.toml", SUITE + '\n[[target]]\npackage = "removed"\nname = "beta"\n')
+        self.assert_problem("`beta` names the missing package qa/fuzz/removed")
+
     def test_a_target_without_a_registration_fails(self):
         self.write("qa/fuzz/p2p/Cargo.toml", CARGO.replace("alpha = {", "beta = {"))
         self.assert_problem("`alpha` has no machine registration")

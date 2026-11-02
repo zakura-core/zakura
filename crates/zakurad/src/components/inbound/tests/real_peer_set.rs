@@ -1071,7 +1071,6 @@ async fn setup(
         state: state_service.clone(),
         latest_chain_tip,
         network: network.clone(),
-        max_checkpoint_height: network.checkpoint_list().max_height(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);

@@ -2058,14 +2058,13 @@ class DifficultyPolicyTests(unittest.TestCase):
         source = (SCRIPT_PATH.parents[2] / "crates/zakurad/src/components/download_work.rs").read_text()
         reference = re.search(r"CompactDifficulty::from_le_bytes\((0x[0-9a-fA-F]+)_u32", source)
         multiplier = re.search(r"const MAINNET_TARGET_MULTIPLIER: u32 = (\d+);", source)
+        height = re.search(r"const MAINNET_WORK_FLOOR_HEIGHT: Height = Height\(([0-9_]+)\);", source)
         self.assertIsNotNone(reference)
         self.assertIsNotNone(multiplier)
+        self.assertIsNotNone(height)
         self.assertEqual(difficulty.REFERENCE_BITS, int(reference[1], 16))
         self.assertEqual(difficulty.TARGET_MULTIPLIER, int(multiplier[1]))
-        checkpoints = (SCRIPT_PATH.parents[2] /
-                       "crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt")
-        last_checkpoint = max(int(line.split()[0]) for line in checkpoints.read_text().splitlines())
-        self.assertEqual(difficulty.FLOOR_HEIGHT, last_checkpoint)
+        self.assertEqual(difficulty.FLOOR_HEIGHT, int(height[1].replace("_", "")))
 
     def test_fleet_payload_keeps_the_target_with_its_tip(self):
         collected = collector(network="mainnet")

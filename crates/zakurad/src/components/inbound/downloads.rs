@@ -423,9 +423,6 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// The network whose target spacing scales the gossip lookahead window.
     chain_network: Network,
 
-    /// The last height handled by the configured checkpoint verifier.
-    max_checkpoint_height: block::Height,
-
     admission: Arc<std::sync::Mutex<Admission>>,
 
     /// Hands handles of tasks spawned by other tasks to the stream, which collects their
@@ -442,7 +439,6 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             state: self.state.clone(),
             latest_chain_tip: self.latest_chain_tip.clone(),
             chain_network: self.chain_network.clone(),
-            max_checkpoint_height: self.max_checkpoint_height,
             admission: self.admission.clone(),
             spawned_sender: self.spawned_sender.clone(),
         }
@@ -582,7 +578,6 @@ where
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
         chain_network: Network,
-        max_checkpoint_height: block::Height,
     ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
@@ -599,7 +594,6 @@ where
                 state,
                 latest_chain_tip,
                 chain_network,
-                max_checkpoint_height,
                 admission: Arc::default(),
                 spawned_sender,
             },
@@ -909,7 +903,6 @@ where
         let spawner = self.clone();
         let network = self.network.clone();
         let chain_network = self.chain_network.clone();
-        let max_checkpoint_height = self.max_checkpoint_height;
         let verifier = self.verifier.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
@@ -1099,7 +1092,6 @@ where
             if !has_sufficient_work(
                 &chain_network,
                 tip_height,
-                max_checkpoint_height,
                 block.header.difficulty_threshold,
             ) {
                 metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
@@ -1285,7 +1277,6 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
-            Network::Mainnet.checkpoint_list().max_height(),
         )
     }
 
@@ -1407,7 +1398,6 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
-            Network::Mainnet.checkpoint_list().max_height(),
         );
 
         for index in 0..MIN_CONCURRENCY_LIMIT {
@@ -1510,7 +1500,6 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
-            Network::Mainnet.checkpoint_list().max_height(),
         );
 
         assert_eq!(
@@ -1621,7 +1610,6 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
-            Network::Mainnet.checkpoint_list().max_height(),
         );
 
         assert_eq!(
@@ -1697,7 +1685,6 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
-            Network::Mainnet.checkpoint_list().max_height(),
         );
 
         assert_eq!(
@@ -1801,7 +1788,6 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
-            Network::Mainnet.checkpoint_list().max_height(),
         )
     }
 
@@ -1865,63 +1851,50 @@ mod tests {
     async fn mainnet_work_floor_rejects_gossip_before_parent_recovery() {
         use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
-        for checkpoint_sync in [true, false] {
-            let config = zakura_consensus::Config {
-                checkpoint_sync,
-                ..Default::default()
-            };
-            let (_, max_checkpoint_height) =
-                zakura_consensus::router::init_checkpoint_list(config, &Network::Mainnet);
-            let tip_height = max_checkpoint_height;
-            // An unrelated parent skips tip-child authentication. Neither an old nor a
-            // new claimed height can bypass the floor once our tip reaches the checkpoint.
-            for height in [
-                tip_height.previous().unwrap(),
-                tip_height,
-                tip_height.next().unwrap(),
-            ] {
-                let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
-                    .zcash_deserialize_into()
-                    .expect("test vector deserializes");
-                let mut candidate = poison_coinbase_height(&canonical, height);
-                let block = Arc::make_mut(&mut candidate);
-                *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
-                let header = Arc::make_mut(&mut block.header);
-                header.previous_block_hash = hash(0x55);
-                header.difficulty_threshold =
-                    Network::Mainnet.target_difficulty_limit().to_compact();
-                header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
-                let candidate_hash = candidate.hash();
-                let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
-                let (_tip_sender, latest_chain_tip) = chain_tip_at(tip_height, hash(0xAA));
-                let mut downloads =
-                    downloads_returning(candidate, advertiser_addr, latest_chain_tip);
-                downloads.spawner.max_checkpoint_height = max_checkpoint_height;
-                downloads.spawner.verifier = BoxCloneService::new(service_fn(|_| async {
-                    Err::<block::Hash, BoxError>(
-                        "weak-work block reached semantic verification".into(),
-                    )
-                }));
+        let tip_height = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+        // An unrelated parent skips tip-child authentication. Neither an old nor a
+        // new claimed height can bypass the floor once our tip reaches the fixed height.
+        for height in [
+            tip_height.previous().unwrap(),
+            tip_height,
+            tip_height.next().unwrap(),
+        ] {
+            let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .expect("test vector deserializes");
+            let mut candidate = poison_coinbase_height(&canonical, height);
+            let block = Arc::make_mut(&mut candidate);
+            *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
+            let header = Arc::make_mut(&mut block.header);
+            header.previous_block_hash = hash(0x55);
+            header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
+            header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
+            let candidate_hash = candidate.hash();
+            let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
+            let (_tip_sender, latest_chain_tip) = chain_tip_at(tip_height, hash(0xAA));
+            let mut downloads = downloads_returning(candidate, advertiser_addr, latest_chain_tip);
+            downloads.spawner.verifier = BoxCloneService::new(service_fn(|_| async {
+                Err::<block::Hash, BoxError>("weak-work block reached semantic verification".into())
+            }));
 
-                assert_eq!(
-                    downloads.download_and_verify(
-                        candidate_hash,
-                        Some(zn::PeerSource::LegacySocket(advertiser_addr)),
-                    ),
-                    DownloadAction::AddedToQueue
-                );
-                let (error, addr) = tokio::time::timeout(Duration::from_secs(5), downloads.next())
-                    .await
-                    .expect("the work floor rejects without waiting on the parent")
-                    .unwrap()
-                    .unwrap_err();
-                assert!(
-                    error.to_string().contains("Mainnet admission floor"),
-                    "{error}"
-                );
-                assert_eq!(addr, Some(advertiser_addr));
-                assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
-            }
+            assert_eq!(
+                downloads.download_and_verify(
+                    candidate_hash,
+                    Some(zn::PeerSource::LegacySocket(advertiser_addr)),
+                ),
+                DownloadAction::AddedToQueue
+            );
+            let (error, addr) = tokio::time::timeout(Duration::from_secs(5), downloads.next())
+                .await
+                .expect("the work floor rejects without waiting on the parent")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Mainnet admission floor"),
+                "{error}"
+            );
+            assert_eq!(addr, Some(advertiser_addr));
+            assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
         }
     }
 

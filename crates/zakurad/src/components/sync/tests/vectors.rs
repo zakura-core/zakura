@@ -4215,7 +4215,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
         };
         let (_, max_checkpoint_height) =
             zakura_consensus::router::init_checkpoint_list(config, &Network::Mainnet);
-        let tip_height = max_checkpoint_height;
+        let tip_height = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
         let (_, pause_height, _) = lookahead_heights(
             Some(tip_height),
             sync::MIN_CONCURRENCY_LIMIT,

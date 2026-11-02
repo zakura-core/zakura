@@ -835,7 +835,7 @@ where
 
                 // Admission must precede shared flow-control changes: a rejected
                 // body must not pause or resume downloads using its claimed height.
-                if !has_sufficient_work(&chain_network, tip_height, max_checkpoint_height, block.header.difficulty_threshold) {
+                if !has_sufficient_work(&chain_network, tip_height, block.header.difficulty_threshold) {
                     metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }

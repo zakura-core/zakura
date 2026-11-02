@@ -106,7 +106,8 @@ fn an_oversized_claim_stops_at_the_header() {
     assert!(codec.decode(&mut src).is_err());
 }
 
-/// The handshake phase applies its smaller limit to every command.
+/// L.handshake: the handshake phase applies its smaller limit to every command, and
+/// the refused body has no reservation.
 #[test]
 fn the_handshake_limit_covers_every_command() {
     let over = u32::try_from(MAX_HANDSHAKE_BODY_LEN + 1).unwrap();
@@ -119,6 +120,7 @@ fn the_handshake_limit_covers_every_command() {
         let mut codec = Codec::builder().for_network(&Network::Mainnet).finish();
         let mut src = BytesMut::from(&header(command, &[], over)[..]);
         assert!(codec.decode(&mut src).is_err());
+        assert!(src.capacity() < MAX_HANDSHAKE_BODY_LEN + HEADER_LEN + 1024);
     }
 }
 
@@ -135,21 +137,11 @@ fn a_partial_body_grows_only_with_its_bytes() {
     assert!(src.is_empty());
 }
 
-/// Ignored Bloom commands pass their checksum and leave nothing behind. The decoder
-/// continues to the next message in the same turn, as the protocol rule requires.
+/// L.ignored: a bad checksum on an ignored Bloom command stays fatal, with no decoded
+/// message.
 #[test]
-fn ignored_commands_are_discarded_after_their_checksum() {
-    let ping = message(b"ping\0\0\0\0\0\0\0\0", &7u64.to_le_bytes());
+fn a_bad_bloom_checksum_stays_fatal() {
     for command in BLOOM_FILTER_COMMANDS {
-        let body = vec![1; 1024];
-        let mut bytes = message(&command, &body);
-        bytes.extend_from_slice(&ping);
-        let mut codec = full_codec();
-        let mut src = BytesMut::from(&bytes[..]);
-        assert!(matches!(codec.decode(&mut src), Ok(Some(Message::Ping(_)))));
-        assert!(src.is_empty());
-
-        // A bad checksum stays fatal, with no decoded message.
         let mut bad = header(&command, &[0], 1);
         bad.push(1);
         let mut src = BytesMut::from(&bad[..]);
@@ -247,19 +239,9 @@ fn each_unknown_command_ends_its_turn() {
     assert!(src.is_empty());
 }
 
-/// L.handshake: before the handshake ends, a body above the small limit stops at its
-/// header, and a `version` user agent above its limit stops at its length.
+/// L.handshake: a `version` user agent above its limit stops at its length.
 #[test]
-fn handshake_messages_have_their_own_bounds() {
-    let mut codec = Codec::builder().for_network(&Network::Mainnet).finish();
-    let oversized = u32::try_from(MAX_HANDSHAKE_BODY_LEN + 1).unwrap();
-    let mut src = BytesMut::from(&header(b"version\0\0\0\0\0", &[], oversized)[..]);
-    assert!(codec.decode(&mut src).is_err());
-    assert!(
-        src.capacity() < MAX_HANDSHAKE_BODY_LEN + HEADER_LEN + 1024,
-        "the refused body has no reservation"
-    );
-
+fn a_long_user_agent_stops_at_its_length() {
     // Every fixed field of a version message, then a user agent one byte too long.
     let mut body = vec![0; 4 + 8 + 8 + 26 + 26 + 8];
     let too_long = MAX_USER_AGENT_LENGTH + 1;

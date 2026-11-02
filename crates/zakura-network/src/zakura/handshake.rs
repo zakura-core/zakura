@@ -2138,10 +2138,13 @@ mod tests {
         );
     }
 
+    /// T.upgrade.accept: an accept must echo this attempt's exact transcript before
+    /// it can install anything.
     #[test]
     fn accept_validation_distinguishes_upgrade_nonce_mismatch() {
         let local = local_config();
         let init = init();
+        assert!(accept(&init).validate(&local, nonces(), &init).is_ok());
         let mut accept = accept(&init);
         accept.initiator_upgrade_nonce = [9; 32];
 
@@ -2272,6 +2275,7 @@ mod tests {
         assert_eq!(native.validate(&native_expected), Ok(()));
     }
 
+    /// T.control.ack: an ack for another handshake's nonces cannot validate.
     #[test]
     fn control_ack_echoes_exact_peer_nonces() {
         let ack = ZakuraControlAck {
@@ -2561,22 +2565,6 @@ mod tests {
         assert_eq!(registry.len(), 1);
     }
 
-    /// T.upgrade.accept: an accept must echo this attempt's exact transcript before
-    /// it can install anything.
-    #[test]
-    fn row_upgrade_accept_validates_the_exact_transcript() {
-        let local = local_config();
-        let init = init();
-        assert!(accept(&init).validate(&local, nonces(), &init).is_ok());
-
-        let mut stale = accept(&init);
-        stale.initiator_upgrade_nonce = [9; 32];
-        assert_eq!(
-            stale.validate(&local, nonces(), &init),
-            Err(ZakuraValidationError::UpgradeNonceMismatch)
-        );
-    }
-
     /// T.upgrade.reject: a reject is fixed-size, and settling its attempt consumes the
     /// pending slot once.
     #[test]
@@ -2621,34 +2609,13 @@ mod tests {
         assert!(ZakuraControlHello::decode(&encoded[..encoded.len() - 1]).is_err());
     }
 
-    /// T.control.ack: the control cap applies before any decode, and an ack for
-    /// another handshake's nonces cannot validate.
+    /// T.control.ack: the control cap applies before any decode.
     #[test]
-    fn row_control_ack_is_bound_to_its_exact_handshake() {
+    fn row_control_ack_is_bounded_before_decoding() {
         assert!(matches!(
             ZakuraControlAck::decode(&vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1]),
             Err(ZakuraProtocolError::OversizedPayload { .. })
         ));
-        let ack = control_ack();
-        let limits = ack.accepted_limits;
-        let requested = ZakuraInitialLimits {
-            max_frame_bytes: limits.max_frame_bytes,
-            max_message_bytes: limits.max_message_bytes,
-            max_open_streams: limits.max_open_streams,
-            max_inbound_queue_depth: limits.max_inbound_queue_depth,
-            idle_timeout_millis: limits.idle_timeout_millis,
-        };
-        assert_eq!(
-            ack.validate(
-                ack.selected_zakura_protocol,
-                [0xAB; 32],
-                [0xCD; 32],
-                ack.accepted_capabilities,
-                &requested,
-                &local_config(),
-            ),
-            Err(ZakuraValidationError::ControlNonceMismatch)
-        );
     }
 
     /// T.stream: a prelude has one fixed shape. A partial prelude, another magic, an

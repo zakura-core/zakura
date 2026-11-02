@@ -54,8 +54,7 @@ cadence_witness -- --nocapture` from the repository root. Their printed counters
 are witness evidence; they do not claim applicability for every fuzz input.
 An empty input has zero applicability.
 
-No CI workflow schedules this target or the machine targets below. Run them
-with `cargo fuzz run` as shown above.
+`.github/workflows/p2p-fuzz.yml` runs each target in a bounded daily campaign.
 Machine bytes are compatible with their target and decoder version. They are
 not portable simulator traces. The planned P1 registry will index these local
 property IDs and their witness paths.

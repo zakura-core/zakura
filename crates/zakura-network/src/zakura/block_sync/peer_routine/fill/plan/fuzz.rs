@@ -6,18 +6,19 @@
 //! Takes hold up to 30 items, so this driver exercises multi-item behavior that
 //! the one-block production cap does not reach.
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::sync::Arc;
 
 use zakura_chain::block;
-use zakura_rt::sync::CancellationToken;
 
-use super::{plan_floor, select_retry_run, FillLimits, RetryFact, RetryRun, TakePlan};
+use super::{
+    model::{expected_retry_run, fund_through_queue, Funding},
+    plan_floor, select_retry_run, FillLimits, RetryFact, RetryRun, TakePlan,
+};
 use crate::zakura::{
     block_sync::{
         admission::{AdmissionSnapshot, RequestPriority},
         config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
         request::BlockSizeEstimate,
-        test_work_scope,
         work_queue::{WorkItem, WorkQueue},
         ZakuraBlockSyncConfig,
     },
@@ -41,21 +42,13 @@ pub struct BlockFillReplaySummary {
     pub window_grants: usize,
 }
 
-/// What queue admission charged a retained run.
-#[derive(Copy, Clone, Debug)]
-struct Funding {
-    priority: RequestPriority,
-    reserved_bytes: u64,
-}
-
 /// One case's estimate for the item selected by `byte`.
 fn estimate(byte: u8) -> BlockSizeEstimate {
     BlockSizeEstimate::Confirmed(u32::from(byte) * 1024)
 }
 
-/// Take every item above `floor + raced`, keep `keep`, and fund it through the
-/// production queue. Returns the retained items and their funding. A separate
-/// exhausted-budget queue reports whether the run may overdraft.
+/// Fund `keep` of the items above `floor + raced` through the production queue.
+/// A separate exhausted-budget queue reports whether the run may overdraft.
 fn fund_retained(
     floor: u32,
     raced: u32,
@@ -67,43 +60,16 @@ fn fund_retained(
         block::Height(floor),
         ByteBudget::new(budget_bytes),
     ));
-    let count = u32::try_from(bytes.len()).expect("a case has at most 30 items");
     let first = floor + 1;
-    let raced_estimates = (first..first + raced).map(|height| (height, estimate(0)));
-    let wanted = bytes
+    let rival: Vec<_> = (first..first + raced)
+        .map(|height| (block::Height(height), estimate(0)))
+        .collect();
+    let wanted: Vec<_> = bytes
         .iter()
         .zip(first + raced..)
-        .map(|(byte, height)| (height, estimate(*byte)));
-    work.extend(
-        test_work_scope(),
-        raced_estimates
-            .chain(wanted)
-            .map(|(height, size)| (block::Height(height), block::Hash([7; 32]), size)),
-    );
-    let high = block::Height(first + raced + count);
-    let id = |id| NonZeroU64::new(id).expect("request IDs start at one");
-    let rival = (raced > 0).then(|| {
-        work.take_request(
-            block::Height(first),
-            block::Height(first + raced - 1),
-            usize::try_from(raced).expect("a case races at most three items"),
-            u64::MAX,
-            1,
-            id(1),
-        )
-    });
-    let mut take = work.take_request(block::Height(first), high, bytes.len(), u64::MAX, 2, id(2));
-    take.retain_range(keep);
-    let items = take.items().to_vec();
-    let funded = take
-        .admit(block::Height(floor), CancellationToken::new())
-        .ok()?;
-    let funding = Funding {
-        priority: funded.priority(),
-        reserved_bytes: funded.bytes(),
-    };
-    drop((funded, rival));
-    Some((items, funding))
+        .map(|(byte, height)| (block::Height(height), estimate(*byte)))
+        .collect();
+    fund_through_queue(&work, block::Height(floor), &rival, &wanted, keep)
 }
 
 /// Replay at most 512 bytes in cases of at most 32 bytes.
@@ -135,18 +101,7 @@ fn replay(
                 _ => RetryFact::Avoided,
             })
             .collect();
-        let first = facts.iter().position(|fact| *fact == RetryFact::Allowed);
-        let expected = first.map(|start| {
-            let count = facts[start..]
-                .iter()
-                .take_while(|fact| **fact == RetryFact::Allowed)
-                .count();
-            start..start + count
-        });
-        let visited = expected
-            .as_ref()
-            .map_or(facts.len(), |run| (run.end + 1).min(facts.len()));
-        let timed = facts[..visited].contains(&RetryFact::Avoided);
+        let expected = expected_retry_run(&facts);
         let mut reads = Vec::new();
         let indexes: Vec<_> = (0..facts.len()).collect();
         let mut actual = select_retry_run(&indexes, |index| {
@@ -154,11 +109,14 @@ fn replay(
             facts[*index]
         });
         after_filter(&mut actual, facts.len());
-        assert_eq!(actual.keep, expected, "{RETRY}: contiguous first run");
-        assert_eq!(actual.timed_rejection, timed, "{RETRY}: visited avoidance");
+        assert_eq!(actual.keep, expected.keep, "{RETRY}: contiguous first run");
+        assert_eq!(
+            actual.timed_rejection, expected.timed_rejection,
+            "{RETRY}: visited avoidance"
+        );
         assert_eq!(
             reads,
-            (0..visited).collect::<Vec<_>>(),
+            (0..expected.visited).collect::<Vec<_>>(),
             "{RETRY}: each visited item once"
         );
         summary.takes += 1;

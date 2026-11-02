@@ -6110,47 +6110,7 @@ impl LegacyResponseBudget {
             max_message_bytes,
         })
     }
-}
 
-/// The most output one response to a request can need.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct ResponseBound {
-    /// Whether the whole response fits one frame, which a stream's floor slot can fund.
-    one_frame: bool,
-    /// Wire bytes, including each frame's header.
-    bytes: u64,
-}
-
-impl ResponseBound {
-    /// The bound of a request whose response has no derivable limit: any number of
-    /// frames, up to the compatibility response cap.
-    const MAX: Self = Self {
-        one_frame: false,
-        // Widening usize to u64 is lossless on supported targets.
-        bytes: COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
-    };
-}
-
-/// The most output this service's response to `frame` can need under these caps.
-///
-/// A request that the legacy budget cannot parse gets [`ResponseBound::MAX`], so the
-/// service stays the one owner that rejects it.
-fn response_bound(
-    stream_kind: u16,
-    frame: &Frame,
-    limits: ZakuraConnectionLimits,
-    max_frame_bytes: u32,
-) -> ResponseBound {
-    if stream_kind != LEGACY_REQUEST_STREAM_KIND {
-        return ResponseBound::MAX;
-    }
-    LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
-        .map_or(ResponseBound::MAX, |budget| {
-            budget.response_bound(max_frame_bytes)
-        })
-}
-
-impl LegacyResponseBudget {
     /// The output the local responder can need for this request.
     ///
     /// This differs from the budget's own byte limit, which checks a peer's
@@ -6218,9 +6178,7 @@ impl LegacyResponseBudget {
             bytes: payload_bytes.saturating_add(frames.saturating_mul(FRAME_HEADER_BYTES)) as u64,
         }
     }
-}
 
-impl LegacyResponseBudget {
     /// The bytes one exchange under this budget retains at its peak: its frames,
     /// plus the validator's and the decoder's reassembly copies of one object.
     fn retained_bytes(&self) -> u64 {
@@ -6237,6 +6195,44 @@ impl LegacyResponseBudget {
         // Widening usize to u64 is lossless on supported targets.
         self.max_bytes.saturating_add(copies) as u64
     }
+}
+
+/// The most output one response to a request can need.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ResponseBound {
+    /// Whether the whole response fits one frame, which a stream's floor slot can fund.
+    one_frame: bool,
+    /// Wire bytes, including each frame's header.
+    bytes: u64,
+}
+
+impl ResponseBound {
+    /// The bound of a request whose response has no derivable limit: any number of
+    /// frames, up to the compatibility response cap.
+    const MAX: Self = Self {
+        one_frame: false,
+        // Widening usize to u64 is lossless on supported targets.
+        bytes: COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
+    };
+}
+
+/// The most output this service's response to `frame` can need under these caps.
+///
+/// A request that the legacy budget cannot parse gets [`ResponseBound::MAX`], so the
+/// service stays the one owner that rejects it.
+fn response_bound(
+    stream_kind: u16,
+    frame: &Frame,
+    limits: ZakuraConnectionLimits,
+    max_frame_bytes: u32,
+) -> ResponseBound {
+    if stream_kind != LEGACY_REQUEST_STREAM_KIND {
+        return ResponseBound::MAX;
+    }
+    LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
+        .map_or(ResponseBound::MAX, |budget| {
+            budget.response_bound(max_frame_bytes)
+        })
 }
 
 #[derive(Debug)]

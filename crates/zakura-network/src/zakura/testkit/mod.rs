@@ -40,6 +40,7 @@ test_stack! {
     pub use cluster::{ClusterTopology, ZakuraTestCluster};
     pub use endpoint::LocalEndpointFactory;
     pub use hostile::HostilePeer;
+    pub(crate) use node::startup_committed_view;
     pub use node::{ZakuraTestNode, ZakuraTestNodeBuilder};
     pub use recorder::{InboundRecorder, RecordedInbound};
     pub use trace_capture::TraceCapture;

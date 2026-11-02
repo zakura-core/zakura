@@ -16,9 +16,11 @@ pub mod block_sync;
 pub mod block_work;
 pub mod coverage;
 pub mod discovery;
+pub mod discovery_machine;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod header_work;
 pub mod machine;
 pub mod policy;
 mod record;
@@ -442,6 +444,12 @@ pub static HARNESSES: &[HarnessEntry] = &[
     block_work::ENTRY,
     block_work::FUNDING_ENTRY,
     block_work::DECODED_RETENTION_ENTRY,
+    header_work::REACTOR_ENTRY,
+    header_work::PUBLISHER_ENTRY,
+    block_work::REACTOR_ENTRY,
+    discovery_machine::BOOK_ENTRY,
+    discovery_machine::STATE_ENTRY,
+    entry::<discovery::VerificationCapacity>(),
     entry::<fixtures::Race<fixtures::LostUpdate>>(),
     entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
     entry::<fixtures::Race<fixtures::MissedNotify>>(),

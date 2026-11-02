@@ -207,6 +207,13 @@ pub use work_queue::{
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{
+    replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes, ActionRefusal,
+    BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
+    PendingNeededQuery, QueryReplyOutcome, ReactorMachineView, ReactorSnapshot, ReactorTransition,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
 pub use peer_routine::{replay_block_fill_bytes, BlockFillReplaySummary};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]

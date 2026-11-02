@@ -596,6 +596,10 @@ impl BlockTap {
                     })
                     .collect(),
             },
+            BlockEvent::Reactor { transition, state } => BlockSyncFact::Reactor {
+                transition: (*transition).into(),
+                state: (**state).into(),
+            },
             BlockEvent::SequencerClosed => BlockSyncFact::SequencerClosed,
             // The enum is non-exhaustive, and an event the log can't hold
             // would leave the evidence silently incomplete.

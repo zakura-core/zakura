@@ -1,8 +1,9 @@
 //! Semantic evidence from transport-free machine drivers.
 
 use serde::{Deserialize, Serialize};
+use zakura_network::zakura::{BookStep, DiscoverySessionStep, DriverFailure};
 
-use crate::observe::{WorkOwner, WorkScope};
+use crate::observe::{BlockSyncReactorState, WorkOwner, WorkScope};
 
 /// A machine harness's scenario.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +32,32 @@ pub enum MachineStep {
     WorkFunding(WorkFundingStep),
     /// Decoded allocations retained by block, header, and transaction owners.
     DecodedRetention(DecodedRetentionStep),
+    /// Header reactor scheduling and locator policy, with its independent model.
+    HeaderReactor(HeaderReactorStep),
+    /// Reactor query and view policy and its independent model.
+    Reactor(ReactorStep),
+    /// The real discovery book, its independent model, and its signed samples.
+    DiscoveryBook(BookStep),
+    /// Discovery's real session and hint owner and its independent model.
+    DiscoveryState(DiscoverySessionStep),
+    /// Header publisher credit and terminal policy, with its independent model.
+    HeaderPublisher(HeaderPublisherStep),
+}
+
+impl MachineStep {
+    /// The failure that stopped the run at this operation, if any.
+    pub fn failure(&self) -> Option<MachineFailure> {
+        match self {
+            Self::Work(step) => step.failure.clone(),
+            Self::WorkFunding(step) => step.failure.clone(),
+            Self::DecodedRetention(step) => step.failure.clone(),
+            Self::HeaderReactor(step) => step.failure.clone(),
+            Self::Reactor(step) => step.failure.clone(),
+            Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
+            Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
+            Self::HeaderPublisher(step) => step.failure.clone(),
+        }
+    }
 }
 
 /// Decoder-v1 evidence for the decoded-block runtime owner.
@@ -85,9 +112,12 @@ impl MachineStep {
     /// The failure that stopped the run at this operation, if any.
     pub fn failure(&self) -> Option<MachineFailure> {
         match self {
+            Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
+            Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
             Self::Fixture(step) => step.failure.clone(),
             Self::Work(step) => step.failure.clone(),
             Self::WorkFunding(step) => step.failure.clone(),
+            Self::Reactor(step) => step.failure.clone(),
             Self::DecodedRetention(step) => step.failure.clone(),
         }
     }
@@ -113,6 +143,18 @@ pub struct MachineFailure {
     pub phase: FailurePhase,
     /// Panic payload without the panic hook's source location.
     pub message: String,
+}
+
+impl From<DriverFailure> for MachineFailure {
+    /// Discovery's drivers catch an operation and its model comparison together,
+    /// so each failure reports one phase.
+    fn from(failure: DriverFailure) -> Self {
+        Self {
+            property_failure: failure.property_failure,
+            phase: FailurePhase::Invariant,
+            message: failure.message,
+        }
+    }
 }
 
 /// One operation of a fixture machine.
@@ -185,6 +227,176 @@ pub struct WorkStep {
     pub actual: WorkView,
     /// State derived independently by the model.
     pub expected: WorkView,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
+}
+
+/// One storage call's exact identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallRef {
+    /// The call's number.
+    pub number: u64,
+    /// What the call asks storage for.
+    pub kind: CallKind,
+}
+
+/// What a storage call asks storage for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallKind {
+    /// A continuation-locator read.
+    Locator,
+    /// A VCT repair context read.
+    VctRepairContext,
+    /// A target preparation.
+    Prepare,
+    /// A prepared target's application.
+    Apply,
+}
+
+impl From<zakura_network::zakura::observe::StorageCallKind> for CallKind {
+    fn from(kind: zakura_network::zakura::observe::StorageCallKind) -> Self {
+        use zakura_network::zakura::observe::StorageCallKind as Kind;
+        match kind {
+            Kind::Locator => Self::Locator,
+            Kind::VctRepairContext => Self::VctRepairContext,
+            Kind::Prepare => Self::Prepare,
+            Kind::Apply => Self::Apply,
+        }
+    }
+}
+
+/// One admitted session in a reactor state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorSessionView {
+    /// The peer's model index.
+    pub peer: usize,
+    /// The selected tip of the peer's last status, in hex.
+    pub status: Option<String>,
+    /// Whether the status is spent.
+    pub spent: bool,
+    /// The session's unproductive requests.
+    pub unproductive_requests: u32,
+}
+
+/// A repair stall in a reactor state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorStallView {
+    /// The stalled repair's generation.
+    pub generation: u64,
+    /// Milliseconds from the run's clock origin to the first failed attempt.
+    pub since_millis: u64,
+    /// Milliseconds from the run's clock origin to the last trace row.
+    pub last_trace_millis: Option<u64>,
+    /// Whether the reactor reported this generation at error level.
+    pub reported: bool,
+}
+
+/// One pending locator read in a reactor state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorReadView {
+    /// The peer's model index.
+    pub peer: usize,
+    /// The read's exact call.
+    pub call: CallRef,
+}
+
+/// A reactor state view, read from the machine or derived by its model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderReactorView {
+    /// Admitted sessions, by peer.
+    pub sessions: Vec<ReactorSessionView>,
+    /// Pending locator reads, by peer.
+    pub reads: Vec<ReactorReadView>,
+    /// Accepted storage calls that have not settled, by number.
+    pub calls: Vec<CallRef>,
+    /// The scheduling revision.
+    pub revision: u64,
+    /// Repair supplier order, front first.
+    pub suppliers: Vec<usize>,
+    /// Whether a resource stall pauses ordinary discovery.
+    pub paused: bool,
+    /// The current repair: its generation and height.
+    pub repair: Option<(u64, u32)>,
+    /// The current repair's stall.
+    pub stall: Option<ReactorStallView>,
+    /// Whether a changed cached-pass key waits for its budget.
+    pub cached_deferred: bool,
+    /// Milliseconds from the run's clock origin to the next deadline. A deferred
+    /// cached pass adds a refill the model bounds rather than predicts, so
+    /// then this holds `None` on both sides.
+    pub next_deadline_millis: Option<u64>,
+}
+
+/// One decoder-v1 header reactor operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderReactorStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the production pure owner.
+    pub actual: HeaderReactorView,
+    /// State derived independently by the model.
+    pub expected: HeaderReactorView,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
+}
+
+/// One subscription in a publisher state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublisherSubscriptionView {
+    /// The subscription's ID.
+    pub id: u64,
+    /// Credit granted so far: headers and bytes.
+    pub granted: (u64, u64),
+    /// Credit consumed so far: headers and bytes.
+    pub consumed: (u64, u64),
+    /// Sent pages the subscriber has not acknowledged.
+    pub unacknowledged: usize,
+    /// The height of the cursor the next page follows.
+    pub last_height: u32,
+    /// The hash of the cursor the next page follows, in hex.
+    pub last_hash: String,
+    /// Whether the subscriber sent `Close`.
+    pub closing: bool,
+}
+
+/// A publisher state view, read from the owner or derived by its model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPublisherView {
+    /// Live and closing subscriptions, by ID.
+    pub subscriptions: Vec<PublisherSubscriptionView>,
+    /// Tombstones held.
+    pub tombstones: usize,
+    /// The subscription of the job in progress.
+    pub job: Option<u64>,
+    /// Subscriptions whose terminal outcome waits to be written, in order.
+    pub terminals: Vec<u64>,
+    /// Whether a terminal outcome is being written.
+    pub writing: bool,
+    /// Subscription slots held.
+    pub slots: usize,
+    /// Why the publisher stopped, if it did.
+    pub exit: Option<String>,
+}
+
+/// One decoder-v2 header publisher operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPublisherStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the production owner.
+    pub actual: HeaderPublisherView,
+    /// State derived independently by the model.
+    pub expected: HeaderPublisherView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -385,6 +597,390 @@ impl From<zakura_network::zakura::WorkOwnershipFailure> for MachineFailure {
                 WorkOwnershipPhase::Invariant => FailurePhase::Invariant,
             },
             message: value.message,
+        }
+    }
+}
+
+impl From<DriverFailure> for MachineFailure {
+    /// Discovery drivers stop only on a checked invariant or a driver panic.
+    fn from(value: DriverFailure) -> Self {
+        Self {
+            property_failure: value.property_failure,
+            phase: FailurePhase::Invariant,
+            message: value.message,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderMachineFailure> for MachineFailure {
+    fn from(value: zakura_network::zakura::HeaderMachineFailure) -> Self {
+        use zakura_network::zakura::HeaderMachinePhase as Phase;
+        Self {
+            property_failure: value.property_failure,
+            phase: match value.phase {
+                Phase::Transition => FailurePhase::Transition,
+                Phase::Invariant => FailurePhase::Invariant,
+            },
+            message: value.message,
+        }
+    }
+}
+
+/// A needed-block query's exact identity, authority, and bounds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorQuery {
+    /// The query's exact ID.
+    pub query_id: u64,
+    /// The body-work authority that dispatched it.
+    pub scope: BodyAuthority,
+    /// First requested height.
+    pub from: u32,
+    /// Requested height count.
+    pub limit: u32,
+    /// Header tip the query asked about.
+    pub header_tip: u32,
+    /// Whether the query bypassed the low-water gate.
+    pub forced: bool,
+}
+
+/// How the reactor classified a needed-block reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReactorReply {
+    /// The reply matched no pending query.
+    Stale,
+    /// The reply matched under a retired authority.
+    StaleAuthority,
+    /// State's anchor moved ahead of the verified mirror.
+    AnchorAdvanced,
+    /// State's anchor sits behind or beside the verified mirror.
+    AnchorReset,
+    /// The reply's blocks became current work.
+    Accepted,
+}
+
+/// Why the action channel refused a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReactorRefusal {
+    /// An optional action found only the control reserve free.
+    ControlReserve,
+    /// The channel is full.
+    Full,
+    /// The action driver closed the channel.
+    Closed,
+}
+
+/// One completed reactor transition, named by its exact identities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "action",
+    rename_all = "kebab-case",
+    rename_all_fields = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ReactorAction {
+    /// The action channel accepted a query.
+    QueryAccepted {
+        /// The accepted query.
+        query: ReactorQuery,
+    },
+    /// The action channel refused a query.
+    QueryRefused {
+        /// The refused proposal.
+        query: ReactorQuery,
+        /// Why the channel refused it.
+        refusal: ReactorRefusal,
+    },
+    /// A needed-block reply reached the state.
+    QueryReply {
+        /// The reply's query ID.
+        query_id: u64,
+        /// The reply's authority.
+        scope: BodyAuthority,
+        /// The classification.
+        outcome: ReactorReply,
+    },
+    /// A query failure reached the state.
+    QueryFailed {
+        /// The failure's query ID.
+        query_id: u64,
+        /// The failure's authority.
+        scope: BodyAuthority,
+        /// Whether it retired the pending query.
+        matched: bool,
+    },
+    /// A forced opening lifted the retry gate, or a covered range or a
+    /// body-size hint change retired the query state.
+    QueryGateChanged,
+    /// The retry gate's deadline passed.
+    RetryElapsed,
+    /// A Sequencer view asked for a reaction.
+    View {
+        /// The reaction is a destructive reset.
+        reset: bool,
+        /// The view advanced the verified tip.
+        tip_advanced: bool,
+    },
+    /// A committed view changed body-work authority.
+    AuthorityChanged {
+        /// The new authority.
+        authority: BodyAuthority,
+        /// Whether the change started a new body-work epoch.
+        epoch_changed: bool,
+    },
+    /// The reactor asked the Sequencer to reset to a verified tip.
+    TipReset {
+        /// The reset target.
+        tip: u32,
+    },
+}
+
+/// Reactor state, read from production or derived by the model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorView {
+    /// The logical state production reports.
+    pub state: BlockSyncReactorState,
+    /// The retry deadline as an offset from the history's clock origin.
+    pub retry_after_ms: Option<u64>,
+}
+
+/// One block-reactor decoder operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// The transitions the operation caused, with exact query identities.
+    pub actions: Vec<ReactorAction>,
+    /// State read from the production pure owner.
+    pub actual: ReactorView,
+    /// State derived independently by the model.
+    pub expected: ReactorView,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
+}
+
+impl From<zakura_network::zakura::PendingNeededQuery> for ReactorQuery {
+    fn from(value: zakura_network::zakura::PendingNeededQuery) -> Self {
+        Self {
+            query_id: value.query_id.get(),
+            scope: value.scope.into(),
+            from: value.from.0,
+            limit: value.limit,
+            header_tip: value.best_header_tip.0,
+            forced: value.forced,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::QueryReplyOutcome> for ReactorReply {
+    fn from(value: zakura_network::zakura::QueryReplyOutcome) -> Self {
+        use zakura_network::zakura::QueryReplyOutcome as Outcome;
+        match value {
+            Outcome::Stale => Self::Stale,
+            Outcome::StaleAuthority => Self::StaleAuthority,
+            Outcome::AnchorAdvanced => Self::AnchorAdvanced,
+            Outcome::AnchorReset => Self::AnchorReset,
+            Outcome::Accepted => Self::Accepted,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::ActionRefusal> for ReactorRefusal {
+    fn from(value: zakura_network::zakura::ActionRefusal) -> Self {
+        use zakura_network::zakura::ActionRefusal as Refusal;
+        match value {
+            Refusal::ControlReserve => Self::ControlReserve,
+            Refusal::Full => Self::Full,
+            Refusal::Closed => Self::Closed,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::ReactorTransition> for ReactorAction {
+    fn from(value: zakura_network::zakura::ReactorTransition) -> Self {
+        use zakura_network::zakura::ReactorTransition as Transition;
+        match value {
+            Transition::QueryAccepted(query) => Self::QueryAccepted {
+                query: query.into(),
+            },
+            Transition::QueryRefused { query, refusal } => Self::QueryRefused {
+                query: query.into(),
+                refusal: refusal.into(),
+            },
+            Transition::QueryReply {
+                query_id,
+                scope,
+                outcome,
+            } => Self::QueryReply {
+                query_id: query_id.get(),
+                scope: scope.into(),
+                outcome: outcome.into(),
+            },
+            Transition::QueryFailed {
+                query_id,
+                scope,
+                matched,
+            } => Self::QueryFailed {
+                query_id: query_id.get(),
+                scope: scope.into(),
+                matched,
+            },
+            Transition::QueryGateChanged => Self::QueryGateChanged,
+            Transition::RetryElapsed => Self::RetryElapsed,
+            Transition::View {
+                reset,
+                tip_advanced,
+            } => Self::View {
+                reset,
+                tip_advanced,
+            },
+            Transition::AuthorityChanged {
+                authority,
+                epoch_changed,
+            } => Self::AuthorityChanged {
+                authority: authority.into(),
+                epoch_changed,
+            },
+            Transition::TipReset { tip } => Self::TipReset { tip: tip.0 },
+        }
+    }
+}
+
+impl From<zakura_network::zakura::ReactorSnapshot> for BlockSyncReactorState {
+    fn from(value: zakura_network::zakura::ReactorSnapshot) -> Self {
+        Self {
+            pending: value.pending.map(Into::into),
+            next_query_id: value.next_query_id.map(std::num::NonZeroU64::get),
+            retry_armed: value.retry_armed,
+            retry_forced: value.retry_forced,
+            dispatch_closed: value.dispatch_closed,
+            scope: value.scope.map(Into::into),
+            verified_tip: value.verified_block_tip.0,
+            request_floor: value.request_floor.0,
+            header_tip: value.best_header_tip.0,
+            reset_epoch: value.last_reset_epoch,
+            reaction_epoch: value.last_reaction_epoch,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
+    fn from(value: zakura_network::zakura::HeaderReactorView) -> Self {
+        Self {
+            sessions: value
+                .sessions
+                .into_iter()
+                .map(|session| ReactorSessionView {
+                    peer: session.peer,
+                    status: session.status.map(|hash| hash.to_string()),
+                    spent: session.spent,
+                    unproductive_requests: session.unproductive_requests,
+                })
+                .collect(),
+            reads: value
+                .reads
+                .into_iter()
+                .map(|read| ReactorReadView {
+                    peer: read.peer,
+                    call: CallRef {
+                        number: read.call.0,
+                        kind: read.call.1.into(),
+                    },
+                })
+                .collect(),
+            calls: value
+                .calls
+                .into_iter()
+                .map(|(number, kind)| CallRef {
+                    number,
+                    kind: kind.into(),
+                })
+                .collect(),
+            revision: value.revision,
+            suppliers: value.suppliers,
+            paused: value.paused,
+            repair: value.repair,
+            stall: value.stall.map(|stall| ReactorStallView {
+                generation: stall.generation,
+                since_millis: stall.since_millis,
+                last_trace_millis: stall.last_trace_millis,
+                reported: stall.reported,
+            }),
+            cached_deferred: value.cached_deferred,
+            next_deadline_millis: value.next_deadline_millis,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::ReactorMachineView> for ReactorView {
+    fn from(value: zakura_network::zakura::ReactorMachineView) -> Self {
+        Self {
+            state: value.state.into(),
+            retry_after_ms: value.retry_after_ms,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderReactorStep> for HeaderReactorStep {
+    fn from(value: zakura_network::zakura::HeaderReactorStep) -> Self {
+        Self {
+            input: value.input,
+            actual: value.actual.into(),
+            expected: value.expected.into(),
+            failure: value.failure.map(Into::into),
+        }
+    }
+}
+
+impl From<zakura_network::zakura::BlockReactorStep> for ReactorStep {
+    fn from(value: zakura_network::zakura::BlockReactorStep) -> Self {
+        Self {
+            input: value.input,
+            actions: value.actions.into_iter().map(Into::into).collect(),
+            actual: value.actual.into(),
+            expected: value.expected.into(),
+            failure: value.failure.map(Into::into),
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderPublisherView> for HeaderPublisherView {
+    fn from(value: zakura_network::zakura::HeaderPublisherView) -> Self {
+        Self {
+            subscriptions: value
+                .subscriptions
+                .into_iter()
+                .map(|subscription| PublisherSubscriptionView {
+                    id: subscription.id,
+                    granted: subscription.granted,
+                    consumed: subscription.consumed,
+                    unacknowledged: subscription.unacknowledged,
+                    last_height: subscription.last_height,
+                    last_hash: subscription.last_hash.to_string(),
+                    closing: subscription.closing,
+                })
+                .collect(),
+            tombstones: value.tombstones,
+            job: value.job,
+            terminals: value.terminals,
+            writing: value.writing,
+            slots: value.slots,
+            exit: value.exit.map(str::to_owned),
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderPublisherStep> for HeaderPublisherStep {
+    fn from(value: zakura_network::zakura::HeaderPublisherStep) -> Self {
+        Self {
+            input: value.input,
+            actual: value.actual.into(),
+            expected: value.expected.into(),
+            failure: value.failure.map(Into::into),
         }
     }
 }

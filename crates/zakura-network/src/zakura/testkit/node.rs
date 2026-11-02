@@ -678,7 +678,7 @@ impl Drop for ZakuraTestNode {
 /// A committed header view that owns body work from `frontiers` toward
 /// `best_header_tip`. A test node publishes it once at startup; its header-tip
 /// watch then moves the body-download target.
-fn startup_committed_view(
+pub(crate) fn startup_committed_view(
     frontiers: BlockSyncFrontiers,
     best_header_tip: (block::Height, block::Hash),
 ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>> {

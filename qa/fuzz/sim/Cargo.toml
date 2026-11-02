@@ -11,11 +11,17 @@ cargo-fuzz = true
 # suite manifest and campaign tooling read the mapping from here.
 [package.metadata.zakura-sim.targets]
 discovery_wait_complete = "discovery/wait-complete"
+discovery_verification_capacity = "discovery/verification-capacity"
+discovery_record_book = "discovery/record-book"
+discovery_session_installation = "discovery/session-installation"
 header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
 block_work_ownership = "block/work-ownership"
 block_work_funding = "block/work-funding"
 block_decoded_retention = "block/decoded-retention"
+header_reactor_policy = "header/reactor-policy"
+block_reactor_policy = "block/reactor-policy"
+header_publisher_policy = "header/publisher-policy"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -71,6 +77,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discovery_verification_capacity"
+path = "fuzz_targets/discovery_verification_capacity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_work_funding"
 path = "fuzz_targets/block_work_funding.rs"
 test = false
@@ -78,8 +91,43 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discovery_record_book"
+path = "fuzz_targets/discovery_record_book.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_decoded_retention"
 path = "fuzz_targets/block_decoded_retention.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_publisher_policy"
+path = "fuzz_targets/header_publisher_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_reactor_policy"
+path = "fuzz_targets/header_reactor_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_reactor_policy"
+path = "fuzz_targets/block_reactor_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_session_installation"
+path = "fuzz_targets/discovery_session_installation.rs"
 test = false
 doc = false
 bench = false

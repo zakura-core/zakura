@@ -174,14 +174,12 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block0.clone()),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block0),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -257,14 +255,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1.clone()),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block2.clone()),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -334,14 +332,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block3.clone()),
+            block3.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block4.clone()),
+            block4.clone().into(),
             None,
         ))]));
 
@@ -410,14 +408,12 @@ async fn sync_singleton_obtain_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block0.clone()),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block0),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -471,14 +467,12 @@ async fn sync_singleton_obtain_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1.clone()),
+            block1.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block1),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block1.into()))
         .await
         .respond(block1_hash);
 
@@ -532,14 +526,12 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block0.clone()),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block0),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -605,14 +597,14 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1.clone()),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block2.clone()),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -675,14 +667,12 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block3.clone()),
+            block3.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block3),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block3.into()))
         .await
         .respond(block3_hash);
 
@@ -788,7 +778,7 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
             .expect_request(zn::Request::BlocksByHash(iter::once(*hash).collect()))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]));
     }
@@ -836,7 +826,7 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         .expect_request(zn::Request::BlocksByHash(iter::once(hashes[3]).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(blocks[3].clone()),
+            blocks[3].clone().into(),
             None,
         ))]));
     pending_verifications.push(
@@ -902,7 +892,7 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         .expect_request(zn::Request::BlocksByHash(iter::once(hashes[4]).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(blocks[4].clone()),
+            blocks[4].clone().into(),
             None,
         ))]));
     pending_verifications.push(
@@ -988,7 +978,7 @@ async fn sync_block_lookahead_drop() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block982k.clone()),
+            block982k.clone().into(),
             None,
         ))]));
 
@@ -1059,14 +1049,12 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block0.clone()),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block0),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -1154,21 +1142,21 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block982k.clone()),
+            block982k.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1.clone()),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block2.clone()),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -1247,14 +1235,12 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block0.clone()),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block0),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -1330,14 +1316,14 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1.clone()),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block2.clone()),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -1409,14 +1395,14 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block3.clone()),
+            block3.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block4.clone()),
+            block4.clone().into(),
             None,
         ))]));
     peer_set
@@ -1425,7 +1411,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block982k.clone()),
+            block982k.clone().into(),
             None,
         ))]));
 
@@ -1631,7 +1617,7 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
                 zn::Request::BlocksByHash(iter::once(block0_hash).collect())
             );
             Ok::<_, crate::BoxError>(zn::Response::Blocks(vec![Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(peer_block),
+                peer_block.into(),
                 None,
             ))]))
         }
@@ -1968,14 +1954,12 @@ async fn transient_download_failure_requeues_and_clears_on_success() -> Result<(
         .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+            block.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block),
-        ))
+        .expect_request(zakura_consensus::Request::Commit(block.into()))
         .await
         .respond(block_hash);
 
@@ -2063,7 +2047,7 @@ async fn transient_download_failure_has_eight_peer_request_ceiling() -> Result<(
             .expect_request(zn::Request::BlocksByHash(iter::once(prime_hash).collect()))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(prime_block.clone()),
+                prime_block.clone().into(),
                 None,
             ))]));
         block_verifier_router
@@ -2179,9 +2163,7 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
                 );
                 unrelated_response_sent = true;
                 response.respond(zn::Response::Blocks(vec![Available((
-                    zakura_node_services::block_memory::BlockHandle::Shared(
-                        unrelated_block.clone(),
-                    ),
+                    unrelated_block.clone().into(),
                     None,
                 ))]));
             }
@@ -2200,7 +2182,7 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
             ))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(retried_block.clone()),
+                retried_block.clone().into(),
                 None,
             ))]));
         block_verifier_router
@@ -2241,10 +2223,7 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
                     iter::once(block.hash()).collect(),
                 ))
                 .await
-                .respond(zn::Response::Blocks(vec![Available((
-                    zakura_node_services::block_memory::BlockHandle::Shared(block),
-                    None,
-                ))]));
+                .respond(zn::Response::Blocks(vec![Available((block.into(), None))]));
         }
         // The two verifier calls can arrive in either order.
         let first = verifier.expect_request_that(|_| true).await;
@@ -2271,13 +2250,11 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
             .await;
         parent_commit.respond(parent_hash);
         retry.respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(child.clone()),
+            child.clone().into(),
             None,
         ))]));
         verifier
-            .expect_request(zakura_consensus::Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(child),
-            ))
+            .expect_request(zakura_consensus::Request::Commit(child.into()))
             .await
             .respond(child_hash);
     };
@@ -2507,13 +2484,11 @@ async fn verification_timeout_requeues_and_recovers() -> Result<(), crate::BoxEr
             .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]));
         verifier
-            .expect_request(zakura_consensus::Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
-            ))
+            .expect_request(zakura_consensus::Request::Commit(block.into()))
             .await
             .respond(hash);
         let response = chain_sync
@@ -2567,13 +2542,11 @@ async fn verification_timeout_restarts_after_retry_limit() -> Result<(), crate::
                 .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
                 .await
                 .respond(zn::Response::Blocks(vec![Available((
-                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                    block.clone().into(),
                     None,
                 ))]));
             verifier
-                .expect_request(zakura_consensus::Request::Commit(
-                    zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-                ))
+                .expect_request(zakura_consensus::Request::Commit(block.clone().into()))
                 .await
                 .respond_error(
                     RouterError::Block {
@@ -2664,13 +2637,11 @@ async fn short_verify_timeout_starts_after_final_checkpoint() -> Result<(), crat
             .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+                block.clone().into(),
                 None,
             ))]));
         let commit = verifier
-            .expect_request(zakura_consensus::Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(block),
-            ))
+            .expect_request(zakura_consensus::Request::Commit(block.into()))
             .await;
         tokio::time::advance(sync::FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT + Duration::from_secs(1))
             .await;
@@ -3813,7 +3784,7 @@ async fn tip_child_rejects_poisoned_coinbase_height() {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(poisoned),
+            poisoned.into(),
             Some(addr),
         ))]));
 
@@ -3874,7 +3845,7 @@ async fn tip_child_rejects_forged_high_coinbase_height() {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(poisoned),
+            poisoned.into(),
             Some(addr),
         ))]));
 
@@ -3931,7 +3902,7 @@ async fn canonical_tip_child_reaches_the_verifier() {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(canonical.clone()),
+            canonical.clone().into(),
             None,
         ))]));
 
@@ -3982,10 +3953,7 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
-        .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1),
-            None,
-        ))]));
+        .respond(zn::Response::Blocks(vec![Available((block1.into(), None))]));
 
     let result = downloads
         .next()
@@ -4252,10 +4220,7 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
-        .respond(zn::Response::Blocks(vec![Available((
-            zakura_node_services::block_memory::BlockHandle::Shared(block1),
-            None,
-        ))]));
+        .respond(zn::Response::Blocks(vec![Available((block1.into(), None))]));
 
     let result = downloads
         .next()

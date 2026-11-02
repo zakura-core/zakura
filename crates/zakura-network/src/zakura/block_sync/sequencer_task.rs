@@ -25,7 +25,9 @@
 //! A submitted body also lives in the driver's `SubmitBlock` action, and
 //! the `Sequencer` keeps its in-flight charge until the exact completion arrives.
 
-use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle, DecodedBlockPool};
+use zakura_node_services::block_memory::{
+    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool,
+};
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
@@ -76,32 +78,59 @@ pub(super) struct SequencedBody {
     queue_accounting: SequencerInputAccounting,
 }
 
+/// A handed-off body's decoded bytes, charged to the input queue before the body
+/// exists. Dropping it returns the charge. [`Self::hand_over`] moves the charge to
+/// the [`SequencedBody`] that holds the decoded block.
+#[derive(Debug)]
+#[must_use = "dropping the charge returns its room"]
+pub(super) struct DecodedHandoffCharge {
+    input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    decoded_bytes: u64,
+}
+
+impl DecodedHandoffCharge {
+    /// End this owner's release obligation, because a new [`SequencedBody`] takes it.
+    pub(super) fn hand_over(mut self) {
+        self.decoded_bytes = 0;
+    }
+}
+
+impl Drop for DecodedHandoffCharge {
+    fn drop(&mut self) {
+        release_atomic_bytes(
+            &self.input_decoded_attributed_memory_bytes,
+            self.decoded_bytes,
+        );
+    }
+}
+
 /// Charges a handed-off body's `decoded_bytes` to the input queue when the
 /// queue, `applying` and the body fit under
-/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns whether it did.
+/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns that charge.
 ///
 /// The charge comes before the check, so routines that hand off at once each
 /// count the others' bodies, and no two take the same room. A routine whose
-/// check fails takes its charge back, and its body keeps only raw bytes.
+/// check fails takes its charge back. Its body keeps only raw bytes and never
+/// enters the decoded pool, so a refusal fires no capacity wakeup.
 ///
 /// The sequencer task publishes a body's decoded bytes in `applying` before it
 /// releases the body's input-queue charge, so a body that moves between the
 /// two is always counted.
 pub(super) fn charge_decoded_handoff(
-    input_decoded_attributed_memory_bytes: &AtomicU64,
+    input_decoded_attributed_memory_bytes: &Arc<AtomicU64>,
     view: &watch::Receiver<SequencerView>,
     decoded_bytes: u64,
-) -> bool {
+) -> Option<DecodedHandoffCharge> {
     let queued = input_decoded_attributed_memory_bytes
         .fetch_add(decoded_bytes, Ordering::AcqRel)
         .saturating_add(decoded_bytes);
-    if queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
-        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
-    {
-        return true;
-    }
-    release_atomic_bytes(input_decoded_attributed_memory_bytes, decoded_bytes);
-    false
+    let charge = DecodedHandoffCharge {
+        input_decoded_attributed_memory_bytes: input_decoded_attributed_memory_bytes.clone(),
+        decoded_bytes,
+    };
+    (queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES)
+        .then_some(charge)
 }
 
 impl SequencedBody {
@@ -432,9 +461,9 @@ pub(super) struct SequencerPayloads {
     next_id: u64,
 }
 
-pub(super) struct PreparedSubmission {
-    pub(super) intent: super::sequencer::SubmitItem,
+pub(super) struct MaterializedBody {
     pub(super) block: BlockHandle,
+    pub(super) decoded_bytes: u64,
     pub(super) newly_decoded_wire_bytes: Option<usize>,
 }
 
@@ -480,9 +509,9 @@ impl SequencerPayloads {
             .expect("policy releases a retained payload exactly once");
     }
 
-    pub(super) fn apply(&mut self, sequencer: &mut Sequencer) {
+    pub(super) fn apply(&mut self, changes: Vec<super::reorder::PayloadChange>) {
         use super::reorder::PayloadChange;
-        for change in sequencer.take_payload_changes() {
+        for change in changes {
             match change {
                 PayloadChange::KeepRaw(id) => self
                     .entries
@@ -494,19 +523,18 @@ impl SequencerPayloads {
         }
     }
 
+    /// Decode the payload `id` under `admission` when it is still raw, and borrow
+    /// its charged block for a submission.
     #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
-    pub(super) fn prepare(
+    pub(super) fn materialize(
         &mut self,
-        sequencer: &mut Sequencer,
-        height: block::Height,
+        id: super::reorder::BodyId,
         pool: &DecodedBlockPool,
-    ) -> Result<Option<PreparedSubmission>, AdmissionFailure> {
-        let Some(facts) = sequencer.submission_body(height) else {
-            return Ok(None);
-        };
+        admission: Admission,
+    ) -> Result<MaterializedBody, AdmissionFailure> {
         let body = self
             .entries
-            .get_mut(&facts.id)
+            .get_mut(&id)
             .expect("policy names a retained payload");
         let newly_decoded_wire_bytes = match body {
             BufferedBlockBody::RawFramePayload(raw) => Some(
@@ -515,22 +543,12 @@ impl SequencerPayloads {
             ),
             _ => None,
         };
-        let admission =
-            super::admission::submission_decode_admission(sequencer.verified_tip(), height);
         let block = body.decoded_block(pool, admission)?;
-        let decoded_bytes = body.decoded_attributed_memory_size_bytes();
-        let intent = sequencer
-            .prepare_submit(height, facts.id, decoded_bytes)
-            .expect("materialization and submission run synchronously under one owner");
-        assert_eq!(
-            intent.body_id, facts.id,
-            "submission names its materialized payload"
-        );
-        Ok(Some(PreparedSubmission {
-            intent,
+        Ok(MaterializedBody {
             block,
+            decoded_bytes: body.decoded_attributed_memory_size_bytes(),
             newly_decoded_wire_bytes,
-        }))
+        })
     }
 }
 
@@ -538,7 +556,7 @@ impl SequencerPayloads {
 /// `Arc<WorkQueue>` clone, the peer registry, an action
 /// sender clone, and the committed throughput meter. Runs the state's operations
 /// and emits `SubmitBlock` / `Misbehavior` on the same action channel the reactor
-/// uses.
+/// uses. It settles request bytes only through the work queue.
 pub(super) struct SequencerIO {
     state: SequencerState,
     payloads: SequencerPayloads,
@@ -587,13 +605,6 @@ impl Drop for SequencerIO {
         self.payloads.entries.clear();
         #[cfg(any(test, zakura_sim))]
         self.observe_teardown();
-
-        self.view_tx.send_modify(|view| {
-            view.reorder_decoded_attributed_memory_bytes = 0;
-            view.applying_decoded_attributed_memory_bytes = 0;
-            view.sequencer_input_decoded_attributed_memory_bytes = 0;
-            view.active_pipeline_decoded_attributed_memory_bytes = 0;
-        });
     }
 }
 
@@ -839,7 +850,7 @@ impl SequencerIO {
 
     /// Record one control transition's diagnostics and run its operations.
     async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
-        self.payloads.apply(&mut self.state.sequencer);
+        self.payloads.apply(outputs.payload_changes);
         self.publish_state_metrics();
         if let Some(classified) = outputs.frontier_reset {
             if classified.kind != state::FrontierResetKind::Growth {
@@ -861,7 +872,10 @@ impl SequencerIO {
         let queued_elapsed = body.received_at.elapsed();
         let height = body.height;
         let facts = self.payloads.insert(body.body);
-        let acceptance = self.state.accept_body(ReceivedBody {
+        let state::BodyAccepted {
+            acceptance,
+            payload_changes,
+        } = self.state.accept_body(ReceivedBody {
             owner: body.owner,
             source: body.source,
             height,
@@ -872,10 +886,7 @@ impl SequencerIO {
             admitted_estimate_bytes: body.admitted_estimate_bytes,
             peer: body.peer,
         });
-        if !matches!(acceptance, BodyAcceptance::Buffered) {
-            self.payloads.release(facts.id);
-        }
-        self.payloads.apply(&mut self.state.sequencer);
+        self.payloads.apply(payload_changes);
         if let BodyAcceptance::RetentionDeferred {
             owner,
             height,
@@ -894,7 +905,6 @@ impl SequencerIO {
 
     /// Run one transition's operations in order.
     async fn execute(&mut self, operations: Vec<SequencerOperation>) {
-        self.payloads.apply(&mut self.state.sequencer);
         for operation in operations {
             match operation {
                 SequencerOperation::RefreshWorkAuthority(authority) => {
@@ -958,55 +968,37 @@ impl SequencerIO {
                 self.publish_decoded_ownership_view_with(decode_charge);
             }
             let capacity_version = self.decoded_pool.capacity_version();
-            let prepared =
-                match self
-                    .payloads
-                    .prepare(&mut self.state.sequencer, height, &self.decoded_pool)
-                {
-                    Ok(Some(prepared)) => prepared,
-                    Ok(None) => {
-                        self.publish_decoded_ownership_view();
-                        continue;
-                    }
-                    Err(AdmissionFailure::Capacity) => {
-                        self.decoded_capacity_blocked = Some(capacity_version);
-                        self.publish_decoded_ownership_view();
-                        break;
-                    }
-                    Err(_) => {
-                        self.decoded_pool.close();
-                        self.publish_decoded_ownership_view();
-                        break;
-                    }
-                };
-            let item = prepared.intent;
-            let decoded_bytes = item.decoded_bytes;
-            if let Some(wire_bytes) = prepared.newly_decoded_wire_bytes {
-                // Metrics use f64; admission and collection totals remain integers.
-                metrics::histogram!(
-                    "sync.block.body.decoded.attributed_memory_size_bytes",
-                    "stage" => "reorder"
-                )
-                .record(decoded_bytes as f64);
-                if wire_bytes > 0 {
-                    metrics::histogram!(
-                        "sync.block.body.decoded.to_serialized_ratio",
-                        "stage" => "reorder"
-                    )
-                    .record(decoded_bytes as f64 / wire_bytes as f64);
+            let Some(submission) = self.state.submission_body(height) else {
+                self.publish_decoded_ownership_view();
+                continue;
+            };
+            let materialized = match self.payloads.materialize(
+                submission.id,
+                &self.decoded_pool,
+                submission.admission,
+            ) {
+                Ok(materialized) => materialized,
+                Err(AdmissionFailure::Capacity) => {
+                    self.decoded_capacity_blocked = Some(capacity_version);
+                    self.publish_decoded_ownership_view();
+                    break;
                 }
-            }
-            metrics::counter!("sync.block.submit.sent").increment(1);
-            let queue_depth = self
-                .actions
-                .max_capacity()
-                .saturating_sub(self.actions.capacity());
-            // Metrics accepts f64 samples; this lossy conversion is observability-only.
-            metrics::histogram!(
-                "sync.block.action.queue.depth",
-                "action" => "submit_block"
-            )
-            .record(queue_depth as f64);
+                Err(_) => {
+                    self.decoded_pool.close();
+                    self.publish_decoded_ownership_view();
+                    break;
+                }
+            };
+            let item = self
+                .state
+                .prepare_submit(height, submission.id, materialized.decoded_bytes)
+                .expect("materialization and submission run synchronously under one owner");
+            assert_eq!(
+                item.body_id, submission.id,
+                "submission names its materialized payload"
+            );
+            let decoded_bytes = item.decoded_bytes;
+            self.record_submission_metrics(decoded_bytes, materialized.newly_decoded_wire_bytes);
             let (height, hash, token) = (item.height, item.hash, item.token);
             let send_started = time::Instant::now();
             // Publish the decode before the send can wait on a slow verifier, so
@@ -1019,22 +1011,23 @@ impl SequencerIO {
                     owner: item.owner,
                     source: item.source,
                     token,
-                    block: prepared.block,
+                    block: materialized.block,
                 })
                 .await;
             metrics::histogram!("sync.block.submit.queue_wait_seconds")
                 .record(send_started.elapsed().as_secs_f64());
             if !sent {
-                if self.state.submission_refused(
+                let refused = self.state.submission_refused(
                     height,
                     token,
                     time::Instant::now(),
                     self.actions.is_closed(),
-                ) {
+                );
+                if refused.retry_scheduled {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
                     self.trace_submission_retry_scheduled(height);
                 }
-                self.payloads.apply(&mut self.state.sequencer);
+                self.payloads.apply(refused.payload_changes);
                 self.publish_state_metrics();
                 return;
             }
@@ -1045,6 +1038,39 @@ impl SequencerIO {
             }
             self.trace_body_submitted(height, token);
         }
+    }
+
+    fn record_submission_metrics(
+        &self,
+        decoded_bytes: u64,
+        newly_decoded_wire_bytes: Option<usize>,
+    ) {
+        if let Some(wire_bytes) = newly_decoded_wire_bytes {
+            // Metrics use f64; admission and collection totals remain integers.
+            metrics::histogram!(
+                "sync.block.body.decoded.attributed_memory_size_bytes",
+                "stage" => "reorder"
+            )
+            .record(decoded_bytes as f64);
+            if wire_bytes > 0 {
+                metrics::histogram!(
+                    "sync.block.body.decoded.to_serialized_ratio",
+                    "stage" => "reorder"
+                )
+                .record(decoded_bytes as f64 / wire_bytes as f64);
+            }
+        }
+        metrics::counter!("sync.block.submit.sent").increment(1);
+        let queue_depth = self
+            .actions
+            .max_capacity()
+            .saturating_sub(self.actions.capacity());
+        // Metrics accepts f64 samples; this lossy conversion is observability-only.
+        metrics::histogram!(
+            "sync.block.action.queue.depth",
+            "action" => "submit_block"
+        )
+        .record(queue_depth as f64);
     }
 
     async fn send_action(&self, action: BlockSyncAction) -> bool {
@@ -1454,9 +1480,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         )
         .with_retained_body_limit(limit)
     }
@@ -1492,16 +1516,7 @@ mod tests {
                 ),
             )],
         );
-        let taken = task.work.take_for_request(
-            height,
-            height,
-            1,
-            estimate,
-            u64::from(height.0),
-            std::num::NonZeroU64::new(1).unwrap(),
-        );
-        let owner = taken[0].1.owner.unwrap();
-        task.work.mark_reserved_for_owner(owner, [height]);
+        let owner = task.work.publish_fixture(height.0..=height.0);
         drop(
             task.work
                 .begin_receipt_for_owner(owner, height)
@@ -1551,7 +1566,7 @@ mod tests {
             block::Height(0)
         ));
         task.work.advance_floor(block::Height(1));
-        let retry = task.work.take_for_request(
+        let retry = task.work.take_request(
             block::Height(500),
             block::Height(500),
             1,
@@ -1559,7 +1574,7 @@ mod tests {
             99,
             std::num::NonZeroU64::new(2).unwrap(),
         );
-        assert_eq!(retry[0].1.estimated_bytes, bytes);
+        assert_eq!(retry.items()[0].1.estimated_bytes, bytes);
         assert!(!task.work.defer_received_for_owner(
             owner,
             block::Height(500),
@@ -1627,9 +1642,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         assert!(
@@ -1675,9 +1688,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
         let mut advanced_scope = old_scope;
         advanced_scope.header.header_generation = zakura_header_chain::HeaderGeneration::new(8);
@@ -1739,9 +1750,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -1795,9 +1804,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
@@ -1893,9 +1900,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2011,9 +2016,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2138,9 +2141,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2222,9 +2223,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2326,9 +2325,7 @@ mod tests {
                     view_tx,
                     Duration::from_secs(1),
                     ZakuraTrace::noop(),
-                    ZakuraBlockSyncConfig::default()
-                        .decoded_block_pool(10_000)
-                        .expect("fixture decoded allowance fits"),
+                    super::test_decoded_pool(),
                 );
 
                 let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2432,9 +2429,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2545,9 +2540,7 @@ mod tests {
                 view_tx,
                 Duration::from_secs(1),
                 ZakuraTrace::noop(),
-                ZakuraBlockSyncConfig::default()
-                    .decoded_block_pool(10_000)
-                    .expect("fixture decoded allowance fits"),
+                super::test_decoded_pool(),
             );
 
             let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2673,9 +2666,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
         let task = tokio::spawn(task.run());
 
@@ -2722,15 +2713,18 @@ mod tests {
     #[test]
     fn simultaneous_handoffs_cannot_share_one_body_of_room() {
         const BODY: u64 = 1_000;
-        let input_decoded = AtomicU64::new(0);
+        let input_decoded = Arc::new(AtomicU64::new(0));
         let mut view = initial_view(genesis_frontiers());
         view.applying_decoded_attributed_memory_bytes =
             BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES - BODY;
         let (_view_tx, view_rx) = watch::channel(view);
 
-        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY));
-        assert!(!charge_decoded_handoff(&input_decoded, &view_rx, BODY));
+        let first = charge_decoded_handoff(&input_decoded, &view_rx, BODY);
+        assert!(first.is_some());
+        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY).is_none());
         assert_eq!(input_decoded.load(Ordering::Relaxed), BODY);
+        drop(first);
+        assert_eq!(input_decoded.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2765,9 +2759,7 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         body.leave_queue();
@@ -2785,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
+    fn dropping_task_releases_queue_and_leaves_the_published_decoded_view() {
         let frontiers = genesis_frontiers();
         let (body_tx, body_rx) = mpsc::channel(1);
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2825,9 +2817,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
-            ZakuraBlockSyncConfig::default()
-                .decoded_block_pool(10_000)
-                .expect("fixture decoded allowance fits"),
+            super::test_decoded_pool(),
         );
 
         drop(task);
@@ -2841,10 +2831,8 @@ mod tests {
             0
         );
         let terminal = *view_rx.borrow();
-        assert_eq!(terminal.sequencer_input_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.active_pipeline_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 10);
+        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 20);
     }
 
     #[tokio::test(start_paused = true)]

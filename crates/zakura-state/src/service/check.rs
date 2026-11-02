@@ -1,6 +1,7 @@
 //! Consensus critical contextual checks
 
 use std::borrow::Borrow;
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle};
 
 use zakura_chain::{
     amount::{NegativeAllowed, NonNegative},
@@ -262,7 +263,7 @@ where
 /// the `history_tree` up to and including the previous block.
 #[tracing::instrument(skip(block, history_tree))]
 pub(crate) fn block_commitment_is_valid_for_chain_history(
-    block: zakura_node_services::block_memory::BlockHandle,
+    block: BlockHandle,
     network: &Network,
     history_tree: &HistoryTree,
     precomputed_auth_data_root: Option<AuthDataRoot>,
@@ -438,12 +439,7 @@ pub(crate) fn legacy_chain<I>(
     max_legacy_chain_blocks: usize,
 ) -> Result<(), BoxError>
 where
-    I: Iterator<
-        Item = Result<
-            zakura_node_services::block_memory::BlockHandle,
-            zakura_node_services::block_memory::AdmissionFailure,
-        >,
-    >,
+    I: Iterator<Item = Result<BlockHandle, AdmissionFailure>>,
 {
     let mut ancestors = ancestors.peekable();
     let tip_height = ancestors.peek().and_then(|block| {

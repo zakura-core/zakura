@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::{mem, sync::Arc};
+use zakura_node_services::block_memory::BlockHandle;
 
 use zakura_chain::{
     block::Block,
@@ -94,7 +95,7 @@ pub fn copy_block_fixture<'a>(block: impl Into<zakura_chain::block::BlockView<'a
     })
 }
 
-impl FakeChainHelper for zakura_node_services::block_memory::BlockHandle {
+impl FakeChainHelper for BlockHandle {
     fn make_fake_child(&self) -> Arc<Block> {
         copy_block_fixture(self).make_fake_child()
     }

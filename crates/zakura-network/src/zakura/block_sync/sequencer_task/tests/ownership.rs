@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use zakura_node_services::block_memory::Admission;
 
 use crate::zakura::block_sync::reorder::RetainedBody;
 
@@ -41,15 +42,14 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         view_tx,
         Duration::from_secs(60),
         ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        crate::zakura::block_sync::test_decoded_pool(),
     );
     let check = |task: &mut SequencerIO, label: &str| {
-        task.payloads.apply(&mut task.state.sequencer);
+        let changes = task.state.sequencer_mut().take_payload_changes();
+        task.payloads.apply(changes);
         let owners = task
             .state
-            .sequencer
+            .sequencer()
             .ownership_snapshot(&task.payloads.entries);
         assert!(
             owners.payloads_match_policy(),
@@ -181,7 +181,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     assert_eq!(check(&mut task, "submission").submissions.len(), 2);
 
     // Height 2 leaves `applying`, but the driver still holds its submission.
-    task.state.sequencer.remove_applying(block::Height(2));
+    task.state.sequencer_mut().remove_applying(block::Height(2));
     let owners = check(&mut task, "detachment");
     assert!(owners
         .submissions
@@ -189,7 +189,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         .any(|owner| owner.height == block::Height(2) && owner.detached));
 
     let (owner, source, token, block) = &submitted[1];
-    assert!(task.state.sequencer.finish_submission(
+    assert!(task.state.sequencer_mut().finish_submission(
         *owner,
         *source,
         *token,
@@ -199,7 +199,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     check(&mut task, "detached completion");
 
     task.state
-        .sequencer
+        .sequencer_mut()
         .advance_verified_tip(block::Height(1), true);
     check(&mut task, "commit");
 
@@ -210,9 +210,13 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     assert!(check(&mut task, "reset").reorder.is_empty());
 
     let (owner, source, token, block) = &submitted[0];
-    task.state
-        .sequencer
-        .finish_submission(*owner, *source, *token, block::Height(1), block.hash());
+    task.state.sequencer_mut().finish_submission(
+        *owner,
+        *source,
+        *token,
+        block::Height(1),
+        block.hash(),
+    );
     let owners = check(&mut task, "final completion");
     assert!(owners.applying.is_empty());
     assert!(owners.submissions.is_empty());
@@ -286,9 +290,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
         view_tx,
         Duration::from_secs(60),
         ZakuraTrace::noop(),
-        ZakuraBlockSyncConfig::default()
-            .decoded_block_pool(10_000)
-            .expect("fixture decoded allowance fits"),
+        crate::zakura::block_sync::test_decoded_pool(),
     )
     .with_observer(ObserverSlot(Some(log.clone())));
 
@@ -392,7 +394,7 @@ fn runtime_payload(
         super::super::sequencer::AcceptOutcome::Buffered { .. }
     ));
     policy.drain_ready_into_applying();
-    payloads.apply(&mut policy);
+    payloads.apply(policy.take_payload_changes());
     (policy, payloads, weak)
 }
 
@@ -419,13 +421,16 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     let original = weak
         .upgrade()
         .expect("the runtime owner retains the input decode");
+    let facts = policy.submission_body(block::Height(1)).unwrap();
     let prepared = payloads
-        .prepare(
-            &mut policy,
-            block::Height(1),
-            &DecodedBlockPool::new(u64::MAX),
+        .materialize(
+            facts.id,
+            &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
+            Admission::WithinLimit,
         )
-        .unwrap()
+        .unwrap();
+    policy
+        .prepare_submit(block::Height(1), facts.id, prepared.decoded_bytes)
         .unwrap();
     assert!(
         matches!(&prepared.block, BlockHandle::Shared(block) if Arc::ptr_eq(&original, block)),
@@ -435,7 +440,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     drop(original);
     let policy_snapshot = policy.clone();
     policy.reset_to(block::Height(0), false);
-    payloads.apply(&mut policy);
+    payloads.apply(policy.take_payload_changes());
     assert!(
         weak.upgrade().is_some(),
         "the driver still holds its submitted copy"
@@ -473,7 +478,7 @@ fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
         .ownership_snapshot(&payloads.entries)
         .payloads_match_policy());
     policy.reset_to(block::Height(0), false);
-    payloads.apply(&mut policy);
+    payloads.apply(policy.take_payload_changes());
     assert!(
         policy
             .ownership_snapshot(&payloads.entries)
@@ -546,7 +551,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
         task.submit_pending_blocks().await;
         assert!(task.decoded_capacity_blocked.is_some());
         assert!(actions_rx.try_recv().is_err());
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         assert!(
             task.payloads
                 .entries
@@ -593,7 +598,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
                 actions_rx.try_recv().is_err(),
                 "capacity release must not submit stale work"
             );
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
             continue;
         }
@@ -608,15 +613,15 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
         };
         assert!(matches!(submitted, BlockHandle::Owned(_)));
         assert_eq!(submitted.hash(), block.hash());
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         drop(running);
         assert_eq!(
             pool.reserved_blocks(),
-            Some(1),
+            1,
             "the driver still retains the allocation"
         );
         drop(submitted);
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         assert_eq!(pool.reserved_bytes(), 0);
     }
 }
@@ -692,6 +697,64 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
     drop(blocker);
     assert_eq!(pool.pipeline_bytes(), 0);
     assert_eq!(pool.reserved_bytes(), decoded_bytes);
+}
+
+/// Teardown leaves the decoded view and the pool charged while the driver holds a
+/// submitted block. Only the driver's release settles the pool.
+#[tokio::test]
+async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submission() {
+    let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(8).unwrap());
+    let mut task = retention_test_task(u64::MAX);
+    task.decoded_pool = pool.clone();
+    let (actions, mut actions_rx) = mpsc::channel(1);
+    task.actions = actions;
+    let view = task.view_tx.subscribe();
+    let block = test_block();
+    let raw = BlockSyncMessage::Block(block.clone())
+        .encode()
+        .unwrap()
+        .into();
+    let mut body = SequencedBody::new_queued(
+        super::super::test_work_owner(),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        block::Height(1),
+        block.hash(),
+        block.header.previous_block_hash,
+        BufferedBlockBody::RawFramePayload(raw),
+        BLOCK_MAINNET_1_BYTES.len() as u64,
+        None,
+        ZakuraPeerId::new(vec![1; 32]).unwrap(),
+        Instant::now(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    body.leave_queue();
+    task.handle_accept_body(body);
+    task.submit_pending_blocks().await;
+    let BlockSyncAction::SubmitBlock {
+        block: submitted, ..
+    } = actions_rx.try_recv().expect("the body submits")
+    else {
+        panic!("the body must submit");
+    };
+    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    assert_eq!(
+        view.borrow().applying_decoded_attributed_memory_bytes,
+        decoded_bytes
+    );
+
+    drop(task);
+
+    assert_eq!(
+        view.borrow().applying_decoded_attributed_memory_bytes,
+        decoded_bytes,
+        "teardown must not erase retention the driver still holds"
+    );
+    assert_eq!(pool.reserved_bytes(), decoded_bytes);
+    assert_eq!(pool.reserved_blocks(), 1);
+    drop(submitted);
+    assert_eq!(pool.reserved_bytes(), 0);
+    assert_eq!(pool.reserved_blocks(), 0);
 }
 
 /// Raw bodies cost the decoded pool nothing. A refused decode keeps them raw, an

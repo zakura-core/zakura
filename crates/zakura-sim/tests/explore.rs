@@ -162,7 +162,7 @@ static SPINNER: HarnessEntry = entry::<Spinner>();
 /// `input`'s scenario prefix, zero-padded, as `run_bytes` draws it.
 fn prefix(entry: &HarnessEntry, input: &[u8]) -> Vec<u8> {
     let mut prefix = input[..entry.scenario_bytes.min(input.len())].to_vec();
-    if entry.pad_scenario {
+    if !entry.machine {
         prefix.resize(entry.scenario_bytes, 0);
     }
     prefix

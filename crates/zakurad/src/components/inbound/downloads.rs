@@ -1439,10 +1439,7 @@ mod tests {
                     .cloned()
                     .expect("test network has a block for the requested hash");
 
-                Ok(zn::Response::Blocks(vec![Available((
-                    zakura_node_services::block_memory::BlockHandle::Shared(block),
-                    None,
-                ))]))
+                Ok(zn::Response::Blocks(vec![Available((block.into(), None))]))
             }
         }));
 
@@ -1646,7 +1643,7 @@ mod tests {
                     return Err("unexpected network request".into());
                 };
                 Ok(zn::Response::Blocks(vec![Available((
-                    zakura_node_services::block_memory::BlockHandle::Shared(substitute),
+                    substitute.into(),
                     None,
                 ))]))
             }
@@ -1762,7 +1759,7 @@ mod tests {
                 let block = block.clone();
                 async move {
                     Ok(zn::Response::Blocks(vec![Available((
-                        zakura_node_services::block_memory::BlockHandle::Shared(block),
+                        block.into(),
                         Some(advertiser_addr),
                     ))]))
                 }

@@ -16,6 +16,9 @@ use std::{
     ops::{RangeBounds, RangeInclusive},
     sync::Arc,
 };
+use zakura_node_services::block_memory::{
+    AdmissionFailure, BlockHandle, HeaderHandle, PayloadAdmissionFailure,
+};
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
@@ -70,10 +73,7 @@ where
 pub fn tip_block<C>(
     chain: Option<C>,
     db: &ZakuraDb,
-) -> Result<
-    Option<zakura_node_services::block_memory::BlockHandle>,
-    zakura_node_services::block_memory::AdmissionFailure,
->
+) -> Result<Option<BlockHandle>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -547,10 +547,7 @@ fn collect_chain_headers<C>(
     intersection: Option<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Result<
-    Vec<zakura_node_services::block_memory::HeaderHandle>,
-    zakura_node_services::block_memory::PayloadAdmissionFailure,
->
+) -> Result<Vec<HeaderHandle>, PayloadAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -647,10 +644,7 @@ pub fn find_chain_headers<C>(
     known_blocks: Vec<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Result<
-    Vec<zakura_node_services::block_memory::HeaderHandle>,
-    zakura_node_services::block_memory::PayloadAdmissionFailure,
->
+) -> Result<Vec<HeaderHandle>, PayloadAdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -705,7 +699,7 @@ pub fn next_median_time_past(
 fn best_relevant_chain(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-) -> Result<Vec<zakura_node_services::block_memory::HeaderHandle>, BoxError> {
+) -> Result<Vec<HeaderHandle>, BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
@@ -741,9 +735,7 @@ fn best_relevant_chain(
 /// The `relevant_chain` has blocks in reverse height order.
 ///
 /// See [`next_median_time_past()`] for details.
-pub(crate) fn calculate_median_time_past(
-    relevant_chain: Vec<zakura_node_services::block_memory::HeaderHandle>,
-) -> DateTime32 {
+pub(crate) fn calculate_median_time_past(relevant_chain: Vec<HeaderHandle>) -> DateTime32 {
     let relevant_data: Vec<DateTime<Utc>> =
         relevant_chain.iter().map(|header| header.time).collect();
 

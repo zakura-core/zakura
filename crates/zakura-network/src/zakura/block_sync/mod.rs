@@ -73,9 +73,9 @@ mod work_queue;
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchBudgetReceipts,
-    BenchCommitter, BenchReceiptBatch, BenchSequencerHandle, BenchSubmissions, BenchSubmit,
-    BenchWorkCapacity, BenchWorkChurn, SequencerProgress, WorkRequestEnd,
+    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchReceiptBatch,
+    BenchSequencerHandle, BenchSubmissions, BenchSubmit, BenchWorkCapacity, BenchWorkChurn,
+    SequencerProgress, WorkRequestEnd,
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
@@ -143,6 +143,13 @@ fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
 }
 
 #[cfg(test)]
+fn test_decoded_pool() -> zakura_node_services::block_memory::DecodedBlockPool {
+    ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(10_000)
+        .expect("fixture decoded allowance fits")
+}
+
+#[cfg(test)]
 fn test_work_owner() -> zakura_header_chain::BodyWorkOwner {
     test_work_scope().bind(6, std::num::NonZeroU64::new(7).expect("seven is nonzero"))
 }
@@ -193,11 +200,10 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use work_queue::{
-    replay_work_ownership_bytes, trace_work_funding_bytes, trace_work_ownership_bytes,
-    FundingReceiptView, FundingRequestPhase, FundingRequestView, WorkFundingHistory,
-    WorkFundingStep, WorkFundingView, WorkOwnershipEntry, WorkOwnershipFailure,
-    WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
-    WorkOwnershipView,
+    trace_work_funding_bytes, trace_work_ownership_bytes, FundingReceiptView, FundingRequestPhase,
+    FundingRequestView, WorkFundingHistory, WorkFundingStep, WorkFundingView, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]

@@ -105,7 +105,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
             .unwrap_err(),
         AdmissionFailure::Capacity
     );
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
     assert_eq!(actual.measured_bytes, Some(bytes));
     assert_eq!(actual.header_holders, 1);
@@ -125,21 +125,21 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         .unwrap()
         .unwrap();
     assert_eq!(tip.hash, genesis.hash());
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     drop(tip);
 
     drop(header);
     assert_eq!(transaction.hash(), genesis.transactions[0].hash());
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     drop(transaction);
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
     assert_eq!(pool.reserved_bytes(), 0);
     let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
     assert_eq!(actual.holders, 0);
     assert_eq!(actual.header_holders, 0);
     assert_eq!(actual.transaction_holders, vec![0]);
     assert!(read.db.block(Height(1).into()).unwrap().is_none());
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
 
     let (block, size) = read.db.block_and_size(Height(0).into()).unwrap().unwrap();
     assert_eq!(size, genesis.zcash_serialized_size());
@@ -150,7 +150,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     drop(state);
     drop(read);
     assert_eq!(block.hash(), genesis.hash());
-    assert_eq!(pool.reserved_blocks(), Some(1));
+    assert_eq!(pool.reserved_blocks(), 1);
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -159,7 +159,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         Some(bytes)
     );
     drop(block);
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -643,9 +643,7 @@ fn test_block_db_round_trip_with(
                 new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
 
             CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(
-                    original_block.clone(),
-                ),
+                block: original_block.clone().into(),
                 hash,
                 height: Height(0),
                 new_outputs,

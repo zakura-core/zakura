@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use hex::ToHex;
 use zakura_chain::{
@@ -147,7 +148,7 @@ pub(super) async fn run_backup_task(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NonFinalizedBlockBackup {
-    block: zakura_node_services::block_memory::BlockHandle,
+    block: BlockHandle,
     deferred_pool_balance_change: Amount,
 }
 

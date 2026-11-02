@@ -14,6 +14,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{
     future::{FutureExt, TryFutureExt},
@@ -227,7 +228,7 @@ async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<zakura_node_services::block_memory::BlockHandle>, zn::BoxError> {
+) -> Result<Option<BlockHandle>, zn::BoxError> {
     if let Some(block) = pending_blocks.get(hash) {
         return Ok(Some(block.into()));
     }
@@ -674,7 +675,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(zakura_node_services::block_memory::BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();

@@ -2,6 +2,7 @@
 //! tree roots.
 
 use std::{collections::HashMap, sync::Arc};
+use zakura_node_services::block_memory::BlockHandle;
 
 use rayon::prelude::*;
 
@@ -429,7 +430,7 @@ pub(crate) fn block_fetch_sprout_final_treestates(
 #[tracing::instrument(skip(sprout_final_treestates, block, transaction_hashes))]
 pub(crate) fn block_sprout_anchors_refer_to_treestates(
     sprout_final_treestates: HashMap<sprout::tree::Root, Arc<sprout::tree::NoteCommitmentTree>>,
-    block: zakura_node_services::block_memory::BlockHandle,
+    block: BlockHandle,
     // Only used for debugging
     transaction_hashes: Arc<[TransactionHash]>,
     height: Height,

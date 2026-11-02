@@ -122,9 +122,7 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                         view_tx,
                         Duration::from_secs(1),
                         ZakuraTrace::noop(),
-                        ZakuraBlockSyncConfig::default()
-                            .decoded_block_pool(10_000)
-                            .expect("fixture decoded allowance fits"),
+                        crate::zakura::block_sync::test_decoded_pool(),
                     );
                     let mut body = queued_test_body(input_bytes, input_decoded_bytes);
                     body.leave_queue();

@@ -151,9 +151,7 @@ async fn missing_input_requires_committed_parent_evidence() {
             crate::transaction::boxed_state(state),
             crate::transaction::boxed_transaction_verifier(transaction),
         )
-        .oneshot(Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-        ))
+        .oneshot(Request::Commit(block.clone().into()))
         .await
         .expect_err("the input cannot be resolved");
         assert_eq!(read_count.load(Ordering::SeqCst), reads.len(), "{reads:?}");
@@ -211,7 +209,7 @@ where
         .await
         .expect("the verifier is ready")
         .call(Request::Prepare {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(block),
+            block: block.into(),
             source: PreparedCandidateSource::ServerTemplate,
         })
         .await
@@ -302,7 +300,7 @@ async fn mined_orphan_replays_skip_transaction_verification() {
         .await
         .unwrap()
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(candidate),
+            block: candidate.into(),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
@@ -335,7 +333,7 @@ async fn assert_prepared_commit_rejects(
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(solved)),
+            block: Arc::new(solved).into(),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
@@ -396,7 +394,7 @@ async fn prepared_mined_commit_rechecks_difficulty() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(solved)),
+            block: Arc::new(solved).into(),
 
             admission: zs::BlockAdmission::pending(),
         })
@@ -520,11 +518,11 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
 
             for request in [
                 Request::Prepare {
-                    block: candidate.clone(),
+                    block: candidate.clone().into(),
                     source,
                 },
                 Request::CommitMined {
-                    block: candidate.clone(),
+                    block: candidate.clone().into(),
                     admission: zs::BlockAdmission::pending(),
                 },
             ] {
@@ -590,7 +588,7 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .await
         .expect("the verifier is ready")
         .call(Request::Prepare {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(candidate.clone()),
+            block: candidate.clone().into(),
             source: PreparedCandidateSource::ServerTemplate,
         })
         .await;
@@ -605,7 +603,7 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(candidate),
+            block: candidate.into(),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
@@ -670,7 +668,7 @@ where
         .await
         .expect("the verifier is ready")
         .call(Request::Prepare {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(block),
+            block: block.into(),
 
             source: PreparedCandidateSource::ServerTemplate,
         })
@@ -749,7 +747,7 @@ async fn a_client_proposal_is_verified_even_when_a_server_candidate_matches() {
         .await
         .expect("the verifier is ready")
         .call(Request::Prepare {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(candidate),
+            block: candidate.into(),
 
             source: PreparedCandidateSource::ClientProposal,
         })
@@ -817,7 +815,7 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(tampered)),
+            block: Arc::new(tampered).into(),
 
             admission: zs::BlockAdmission::pending(),
         })
@@ -878,9 +876,7 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         .await
         .expect("the verifier is ready")
         .call(Request::Prepare {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(
-                conflicting_proposal.clone(),
-            ),
+            block: conflicting_proposal.clone().into(),
             source: PreparedCandidateSource::ClientProposal,
         })
         .await;
@@ -893,7 +889,7 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(conflicting_proposal),
+            block: conflicting_proposal.into(),
             admission: admission.clone(),
         })
         .await;
@@ -961,9 +957,7 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .ready()
         .await
         .expect("the full verifier is ready")
-        .call(Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
-        ))
+        .call(Request::Commit(block.clone().into()))
         .await
         .expect("full verification commits the block");
 
@@ -978,7 +972,7 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .await
         .expect("the prepared verifier is ready")
         .call(Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(block),
+            block: block.into(),
 
             admission: zs::BlockAdmission::pending(),
         })
@@ -1013,7 +1007,7 @@ async fn cancelled_block_verification_keeps_downstream_payloads_charged() {
             Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
                 .expect("the genesis block deserializes");
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let transaction_holder = Arc::new(Mutex::new(None));
         let state_holder = Arc::new(Mutex::new(None));
@@ -1025,7 +1019,7 @@ async fn cancelled_block_verification_keeps_downstream_payloads_charged() {
                 let tx::Request::Block { transaction, .. } = &request else {
                     panic!("block verification sends a block transaction");
                 };
-                assert!(matches!(transaction, TransactionHandle::Owned(_)));
+                assert!(matches!(transaction, TransactionHandle::Block { .. }));
                 if stop_at_transaction {
                     *holder.lock().unwrap() = Some(transaction.clone());
                     reached.notify_one();
@@ -1105,7 +1099,7 @@ fn owned_block_view_preserves_consensus_checks_and_charge() -> Result<(), Report
     let hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
     let encoded = block.zcash_serialize_to_vec()?;
     let bytes = block.attributed_memory_size_bytes();
-    let pool = DecodedBlockPool::new(bytes);
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
     let view = BlockView::from(&owner);
     let coinbase = check::coinbase_is_first(&owner)?;
@@ -1660,9 +1654,7 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
         );
 
         let result = block_verifier
-            .oneshot(Request::CheckProposal(
-                zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-            ))
+            .oneshot(Request::CheckProposal(Arc::new(block).into()))
             .await;
 
         assert!(
@@ -2306,9 +2298,7 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
                 crate::transaction::boxed_transaction_verifier(transaction),
             );
 
-            verifier.oneshot(Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-            ))
+            verifier.oneshot(Request::Commit(Arc::new(block).into()))
         };
 
     // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
@@ -2456,9 +2446,7 @@ async fn derived_nsm_crossing_gates_block_verification() {
                     crate::transaction::boxed_state(state),
                     crate::transaction::boxed_transaction_verifier(transaction),
                 )
-                .oneshot(Request::Commit(
-                    zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-                )),
+                .oneshot(Request::Commit(Arc::new(block).into())),
             )
             .await
             .expect("semantic verification completes");
@@ -2522,9 +2510,7 @@ async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting(
         );
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            verifier.oneshot(Request::CheckProposal(
-                zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-            )),
+            verifier.oneshot(Request::CheckProposal(Arc::new(block).into())),
         )
         .await
         .expect("proposal verification completes");
@@ -2580,9 +2566,7 @@ async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        verifier.oneshot(Request::CheckProposal(
-            zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-        )),
+        verifier.oneshot(Request::CheckProposal(Arc::new(block).into())),
     )
     .await
     .expect("proposal verification does not wait for the parent");
@@ -2716,7 +2700,7 @@ async fn a_server_template_error_waits_for_the_checks_it_dispatched() {
 
     let preparation = tokio::spawn(verifier.ready().await.expect("the verifier is ready").call(
         Request::Prepare {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(candidate),
+            block: candidate.into(),
             source: PreparedCandidateSource::ServerTemplate,
         },
     ));
@@ -2783,9 +2767,7 @@ async fn pending_commit_retry_waits_for_state_outcome() {
         let start = tokio::time::Instant::now();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            verifier.oneshot(Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-            )),
+            verifier.oneshot(Request::Commit(Arc::new(block).into())),
         )
         .await
         .unwrap()
@@ -2824,9 +2806,7 @@ async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
             crate::transaction::boxed_state(state),
             crate::transaction::boxed_transaction_verifier(transaction),
         )
-        .oneshot(Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(block)),
-        )),
+        .oneshot(Request::Commit(Arc::new(block).into())),
     )
     .await
     .expect("the pending commit wait has a limit")
@@ -3252,11 +3232,9 @@ async fn malformed_headers_do_not_stop_buffered_verification() {
         header.time = time;
         let malformed = Arc::new(malformed);
         for request in [
-            Request::Commit(zakura_node_services::block_memory::BlockHandle::Shared(
-                malformed.clone(),
-            )),
+            Request::Commit(malformed.clone().into()),
             Request::CommitMined {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(malformed),
+                block: malformed.into(),
                 admission: zs::BlockAdmission::pending(),
             },
         ] {
@@ -3278,9 +3256,7 @@ async fn malformed_headers_do_not_stop_buffered_verification() {
 
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        verifier.oneshot(Request::Commit(
-            zakura_node_services::block_memory::BlockHandle::Shared(block),
-        )),
+        verifier.oneshot(Request::Commit(block.into())),
     )
     .await
     .expect("the verifier worker must still accept subsequent requests")
@@ -3352,16 +3328,14 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
         if cache_hit {
             verifier
                 .call(Request::Prepare {
-                    block: zakura_node_services::block_memory::BlockHandle::Shared(
-                        candidate.clone(),
-                    ),
+                    block: candidate.clone().into(),
                     source: PreparedCandidateSource::ClientProposal,
                 })
                 .await
                 .unwrap();
         }
         let request = || Request::CommitMined {
-            block: zakura_node_services::block_memory::BlockHandle::Shared(candidate.clone()),
+            block: candidate.clone().into(),
             admission: zs::BlockAdmission::pending(),
         };
         let early = verifier.call(request());
@@ -3425,7 +3399,7 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
                 for block in [a.clone(), b.clone()] {
                     verifier
                         .call(Request::Prepare {
-                            block: zakura_node_services::block_memory::BlockHandle::Shared(block),
+                            block: block.into(),
                             source: PreparedCandidateSource::ClientProposal,
                         })
                         .await
@@ -3435,17 +3409,13 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
 
             // A arrives first but its first verification is held. B and the
             // duplicate A finish before it, using the real state's deduplication.
-            let early_a = verifier.call(Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(a.clone()),
-            ));
+            let early_a = verifier.call(Request::Commit(a.clone().into()));
             let later_b = verifier.call(Request::CommitMined {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(b.clone()),
+                block: b.clone().into(),
                 admission: zs::BlockAdmission::pending(),
             });
             let duplicate_a = verifier.call(Request::CommitMined {
-                block: zakura_node_services::block_memory::BlockHandle::Shared(Arc::new(
-                    a.as_ref().clone(),
-                )),
+                block: Arc::new(a.as_ref().clone()).into(),
                 admission: zs::BlockAdmission::pending(),
             });
             later_b.await.unwrap();
@@ -3459,16 +3429,9 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
             let mut c = a.as_ref().clone();
             Arc::make_mut(&mut c.header).nonce.0[1] ^= 1;
             let c = Arc::new(c);
-            let cancelled = verifier.call(Request::Commit(
-                zakura_node_services::block_memory::BlockHandle::Shared(c.clone()),
-            ));
+            let cancelled = verifier.call(Request::Commit(c.clone().into()));
             drop(cancelled);
-            verifier
-                .call(Request::Commit(
-                    zakura_node_services::block_memory::BlockHandle::Shared(c),
-                ))
-                .await
-                .unwrap();
+            verifier.call(Request::Commit(c.into())).await.unwrap();
             assert_eq!(tip.best_tip_hash(), Some(a.hash()));
         }
     })

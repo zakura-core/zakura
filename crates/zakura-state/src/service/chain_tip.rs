@@ -6,6 +6,7 @@
 //! * [ChainTipChange] to `await` specific changes to the chain tip.
 
 use std::{fmt, sync::Arc};
+use zakura_node_services::block_memory::TransactionHandle;
 
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
@@ -68,7 +69,7 @@ pub struct ChainTipBlock {
             strategy = "any::<Vec<Arc<transaction::Transaction>>>().prop_map(|transactions| transactions.into_iter().map(Into::into).collect())"
         )
     )]
-    pub transactions: Vec<zakura_node_services::block_memory::TransactionHandle>,
+    pub transactions: Vec<TransactionHandle>,
 
     /// The mined transaction IDs of the transactions in `block`,
     /// in the same order as `block.transactions`.

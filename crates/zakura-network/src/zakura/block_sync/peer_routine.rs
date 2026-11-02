@@ -341,12 +341,15 @@ struct ReceiptSettlement {
     /// the flag stays set from this settlement's creation through the release.
     handoff_blocked: Arc<AtomicBool>,
     #[cfg(any(test, zakura_sim))]
+    handoff: HandoffReport,
+}
+
+/// What a [`ReceiptSettlement`] reports when its handoff ends.
+#[cfg(any(test, zakura_sim))]
+struct HandoffReport {
     observer: super::block_sync_observe::ObserverSlot,
-    #[cfg(any(test, zakura_sim))]
     peer: ZakuraPeerId,
-    #[cfg(any(test, zakura_sim))]
     owner: zakura_header_chain::BodyWorkOwner,
-    #[cfg(any(test, zakura_sim))]
     height: block::Height,
 }
 
@@ -366,13 +369,12 @@ impl ReceiptSettlement {
             funding: Some(funding),
             handoff_blocked: Arc::clone(&routine.handoff_blocked),
             #[cfg(any(test, zakura_sim))]
-            observer: routine.observer.clone(),
-            #[cfg(any(test, zakura_sim))]
-            peer: routine.peer.clone(),
-            #[cfg(any(test, zakura_sim))]
-            owner,
-            #[cfg(any(test, zakura_sim))]
-            height,
+            handoff: HandoffReport {
+                observer: routine.observer.clone(),
+                peer: routine.peer.clone(),
+                owner,
+                height,
+            },
         }
     }
 }
@@ -388,13 +390,14 @@ impl Drop for ReceiptSettlement {
         #[cfg(any(test, zakura_sim))]
         {
             let charge = funding.bytes();
+            let handoff = &self.handoff;
             funding.release_then(|| {
                 observe!(
-                    self.observer,
+                    handoff.observer,
                     super::block_sync_observe::BlockEvent::HandoffEnded {
-                        peer: self.peer.clone(),
-                        owner: self.owner,
-                        height: self.height,
+                        peer: handoff.peer.clone(),
+                        owner: handoff.owner,
+                        height: handoff.height,
                         charge,
                     }
                 );

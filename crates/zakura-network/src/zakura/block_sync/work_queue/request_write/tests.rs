@@ -12,7 +12,7 @@ use std::{num::NonZeroU64, time::Duration};
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)), None)
+        Self(Arc::new(AtomicU8::new(WRITTEN)), RequestReporter::default())
     }
 }
 

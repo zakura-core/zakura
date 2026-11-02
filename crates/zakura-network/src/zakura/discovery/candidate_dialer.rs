@@ -371,11 +371,7 @@ async fn run_discovery_dial_once(
         return finished(DiscoveryDialResult::Failed);
     };
     let mut registered = endpoint.supervisor().subscribe();
-    if registered
-        .borrow_and_update()
-        .iter()
-        .any(|id| id == &peer_id)
-    {
+    if registered.borrow_and_update().contains(&peer_id) {
         return finished(DiscoveryDialResult::ConnectedElsewhere);
     }
 
@@ -490,10 +486,7 @@ impl DialWatch {
 
     /// Whether the peer is registered now, marking the watch seen.
     fn peer_is_registered(&mut self) -> bool {
-        self.registered
-            .borrow_and_update()
-            .iter()
-            .any(|id| id == &self.peer_id)
+        self.registered.borrow_and_update().contains(&self.peer_id)
     }
 
     fn registration_began(&mut self) {

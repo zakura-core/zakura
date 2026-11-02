@@ -264,13 +264,9 @@ where
                 // every such peer re-dial at once, forever.
                 RedialStart::ScoreRegistration => {
                     let mut attempt = self.start_attempt();
-                    attempt.observe_registration(true);
-                    let Some(registered_for) =
-                        wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await
-                    else {
+                    let Some(registered_for) = self.await_deregistration(&mut attempt).await else {
                         return;
                     };
-                    attempt.observe_registration(false);
                     (DialResult::lasting(registered_for), attempt)
                 }
             };
@@ -281,13 +277,9 @@ where
             // next loop iteration. A concurrent registration that remains healthy
             // can still upgrade a failed dial to a healthy connection.
             if state.waits_for_lagging_deregistration() && self.peer_is_registered() {
-                attempt.observe_registration(true);
-                let Some(registered_for) =
-                    wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await
-                else {
+                let Some(registered_for) = self.await_deregistration(&mut attempt).await else {
                     return;
                 };
-                attempt.observe_registration(false);
                 result = result.with_lagging_registration(registered_for);
             }
 
@@ -305,6 +297,16 @@ where
                 }
             }
         }
+    }
+
+    /// Waits until the registered peer deregisters, and traces both changes.
+    /// Returns how long it stayed, or `None` when the registration watch closes.
+    async fn await_deregistration(&mut self, attempt: &mut TracedAttempt) -> Option<Duration> {
+        attempt.observe_registration(true);
+        let registered_for =
+            wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await?;
+        attempt.observe_registration(false);
+        Some(registered_for)
     }
 
     /// Numbers the next attempt and traces its start.
@@ -338,21 +340,18 @@ where
                 changed = registrations.changed(), if watching => {
                     watching = changed.is_ok();
                     if watching {
-                        attempt.observe_registration(peer_in(&registrations, &self.peer_id));
+                        attempt.observe_registration(registrations.borrow().contains(&self.peer_id));
                     }
                 }
             }
         };
-        attempt.observe_registration(peer_in(&self.registered, &self.peer_id));
+        attempt.observe_registration(self.registered.borrow().contains(&self.peer_id));
         result
     }
 
     /// Whether the peer is registered now, marking the watch seen.
     fn peer_is_registered(&mut self) -> bool {
-        self.registered
-            .borrow_and_update()
-            .iter()
-            .any(|id| id == &self.peer_id)
+        self.registered.borrow_and_update().contains(&self.peer_id)
     }
 }
 
@@ -413,12 +412,6 @@ impl Drop for TracedAttempt {
     }
 }
 
-/// Whether `peer_id` is in the watch's current value. It leaves the watch's
-/// change tracking alone.
-fn peer_in(registered: &watch::Receiver<Vec<ZakuraPeerId>>, peer_id: &ZakuraPeerId) -> bool {
-    registered.borrow().iter().any(|id| id == peer_id)
-}
-
 /// Sleeps for `wait`, waking early if `peer_id` registers from another
 /// connection. Ignores unrelated peer-set changes. Returns `false` when the
 /// registration watch closes (node shutdown).
@@ -435,7 +428,7 @@ async fn sleep_unless_registered(
                 if changed.is_err() {
                     return false;
                 }
-                if registered.borrow().iter().any(|id| id == peer_id) {
+                if registered.borrow().contains(peer_id) {
                     return true;
                 }
             }
@@ -455,11 +448,7 @@ async fn wait_for_peer_deregistration(
     let registered_at = Instant::now();
     loop {
         registered.changed().await.ok()?;
-        if !registered
-            .borrow_and_update()
-            .iter()
-            .any(|id| id == peer_id)
-        {
+        if !registered.borrow_and_update().contains(peer_id) {
             return Some(registered_at.elapsed());
         }
     }

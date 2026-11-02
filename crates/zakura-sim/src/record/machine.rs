@@ -92,6 +92,22 @@ pub struct ReactorSessionView {
     pub status: Option<String>,
     /// Whether the status is spent.
     pub spent: bool,
+    /// The session's unproductive requests.
+    pub unproductive_requests: u32,
+}
+
+/// A repair stall in a reactor state view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactorStallView {
+    /// The stalled repair's generation.
+    pub generation: u64,
+    /// Milliseconds from the run's clock origin to the first failed attempt.
+    pub since_millis: u64,
+    /// Milliseconds from the run's clock origin to the last trace row.
+    pub last_trace_millis: Option<u64>,
+    /// Whether the reactor reported this generation at error level.
+    pub reported: bool,
 }
 
 /// One pending locator read in a reactor state view.
@@ -122,6 +138,8 @@ pub struct HeaderReactorView {
     pub paused: bool,
     /// The current repair: its generation and height.
     pub repair: Option<(u64, u32)>,
+    /// The current repair's stall.
+    pub stall: Option<ReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
     /// Milliseconds from the run's clock origin to the next deadline. A deferred
@@ -168,6 +186,7 @@ impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
                     peer: session.peer,
                     status: session.status.map(|hash| hash.to_string()),
                     spent: session.spent,
+                    unproductive_requests: session.unproductive_requests,
                 })
                 .collect(),
             reads: value
@@ -193,6 +212,12 @@ impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
             suppliers: value.suppliers,
             paused: value.paused,
             repair: value.repair,
+            stall: value.stall.map(|stall| ReactorStallView {
+                generation: stall.generation,
+                since_millis: stall.since_millis,
+                last_trace_millis: stall.last_trace_millis,
+                reported: stall.reported,
+            }),
             cached_deferred: value.cached_deferred,
             next_deadline_millis: value.next_deadline_millis,
         }

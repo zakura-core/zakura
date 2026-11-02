@@ -70,14 +70,6 @@ impl Target {
             (Self::Reactor, MachineStep::HeaderReactor(work)) => !work.expected.calls.is_empty(),
         }
     }
-
-    /// The expected and actual views of `step`, when they disagree.
-    fn difference(self, step: &MachineStep) -> Option<(String, String)> {
-        match step {
-            MachineStep::HeaderReactor(work) => (work.actual != work.expected)
-                .then(|| (format!("{:?}", work.expected), format!("{:?}", work.actual))),
-        }
-    }
 }
 
 /// Whether `name` names a machine harness in this module.
@@ -143,15 +135,6 @@ fn check(target: Target, cx: &mut CheckCtx<'_, Handle>) -> Verdict {
             witness: (1..=cx.step).collect(),
             expected: "independent model agrees with the transition and retained state".into(),
             actual: format!("{:?}: {}", failure.phase, failure.message),
-        });
-    }
-    if let Some((expected, actual)) = target.difference(&view) {
-        return Verdict::Violated(Violation {
-            property: target.name().into(),
-            step: cx.step,
-            witness: (1..=cx.step).collect(),
-            expected,
-            actual,
         });
     }
     Verdict::Holds

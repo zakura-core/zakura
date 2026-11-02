@@ -892,128 +892,34 @@ impl Harness {
 
     /// Compare every observable fact of the machine with the model.
     fn check(&self) {
-        self.check_repair_suppliers();
-        assert_eq!(
-            self.state.scheduling_revision, self.model.revision,
-            "{PROPERTY}"
-        );
-        assert_eq!(
-            self.state.peers.len(),
-            self.model.sessions.len(),
-            "{PROPERTY}"
-        );
-        for peer in 0..PEERS {
-            let id = peer_id(peer);
-            let schedule = self.state.peers.get(&id).map(|schedule| {
-                (
-                    schedule
-                        .last_status
-                        .as_ref()
-                        .map(|status| status.selected_tip_hash),
-                    schedule.status_spent,
-                    schedule.unproductive_requests,
-                )
-            });
-            let expected = self.model.sessions.get(&peer).map(|session| {
-                (
-                    session.status.map(|tip| status(tip).selected_tip_hash),
-                    session.spent,
-                    0,
-                )
-            });
-            assert_eq!(schedule, expected, "{PROPERTY}: peer {} schedule", peer);
+        assert_eq!(self.actual_view(), self.expected_view(), "{PROPERTY}");
+        if self.model.cached_deferred {
+            // The views hide this deadline: the model bounds a deferred pass's
+            // refill rather than predicting it.
+            let next = self.state.next_deadline();
+            assert!(
+                next.is_some_and(|next| next <= self.now + CACHED_PASS_REFILL),
+                "{PROPERTY}"
+            );
             assert_eq!(
-                self.state.locators.contains(&id),
-                self.model.pending.contains_key(&peer),
-                "{PROPERTY}: peer {} pending read",
-                peer
+                next,
+                self.model_deadline()
+                    .map_or(next, |deadline| next.min(Some(deadline))),
+                "{PROPERTY}"
             );
         }
-        let mut expected_calls: Vec<_> = self
-            .model
-            .pending
-            .values()
-            .map(|pending| self.started[pending.read].1.call)
-            .collect();
-        expected_calls.sort_unstable_by_key(|call| call.number);
-        assert_eq!(
-            self.state.calls.pending(),
-            expected_calls,
-            "{PROPERTY}: accepted locator calls"
-        );
-        let suppliers: Vec<_> = self
-            .state
-            .vct_supplier_order
-            .iter()
-            .map(|peer| self.peer_index(peer))
-            .collect();
-        assert_eq!(
-            &suppliers,
-            &Vec::from(self.model.suppliers.clone()),
-            "{PROPERTY}"
-        );
-        let committed = self
-            .model
-            .committed
-            .map(|version| zakura_header_chain::StateVersion::new(u64::from(version)));
-        let paused = self.model.stalled_at.is_some_and(|stalled| {
-            self.model
-                .committed
-                .is_none_or(|version| version <= stalled)
-        });
-        assert_eq!(
-            self.state.ordinary_discovery_paused(committed),
-            paused,
-            "{PROPERTY}"
-        );
-        assert_eq!(
-            self.state
-                .vct_repair
-                .current()
-                .map(|task| (task.repair_generation, task.height)),
-            self.model.repair.map(|(generation, height)| (
-                u64::from(generation),
-                block::Height(u32::from(height) + 1)
-            )),
-            "{PROPERTY}"
-        );
-        assert_eq!(
-            self.state.vct_repair_stall.map(|stall| (
-                stall.generation,
-                stall.since,
-                stall.last_trace,
-                stall.reported
-            )),
-            self.model.stall.map(|stall| (
-                u64::from(stall.generation),
-                stall.since,
-                stall.last_trace,
-                stall.reported
-            )),
-            "{PROPERTY}"
-        );
-        // Every deadline the model knows, except the cached-pass refill.
-        let deadline = self
-            .model
+        self.check_repair_suppliers();
+    }
+
+    /// Every deadline the model knows, except the cached-pass refill.
+    fn model_deadline(&self) -> Option<Instant> {
+        self.model
             .close_retries
             .values()
             .chain(self.model.close_outcomes.values())
             .map(|(_, at)| *at)
             .chain(self.model.stall.map(ModelStall::next_deadline))
-            .min();
-        if self.model.cached_deferred {
-            // A deferred pass wakes the reactor within one refill.
-            let refill = self.now + CACHED_PASS_REFILL;
-            let next = self.state.next_deadline();
-            assert!(next.is_some_and(|next| next <= refill), "{PROPERTY}");
-            assert_eq!(
-                next,
-                deadline.map_or(next, |deadline| next.min(Some(deadline))),
-                "{PROPERTY}"
-            );
-        } else {
-            assert_eq!(self.state.next_deadline(), deadline, "{PROPERTY}");
-        }
+            .min()
     }
 }
 
@@ -1519,6 +1425,21 @@ pub struct HeaderReactorSessionView {
     pub status: Option<block::Hash>,
     /// Whether the status is spent.
     pub spent: bool,
+    /// The session's unproductive requests.
+    pub unproductive_requests: u32,
+}
+
+/// A repair stall in a [`HeaderReactorView`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReactorStallView {
+    /// The stalled repair's generation.
+    pub generation: u64,
+    /// Milliseconds from the clock origin to the first failed attempt.
+    pub since_millis: u64,
+    /// Milliseconds from the clock origin to the last trace row.
+    pub last_trace_millis: Option<u64>,
+    /// Whether the reactor reported this generation at error level.
+    pub reported: bool,
 }
 
 /// One pending locator read in a [`HeaderReactorView`].
@@ -1547,6 +1468,8 @@ pub struct HeaderReactorView {
     pub paused: bool,
     /// The current repair: its generation and height.
     pub repair: Option<(u64, u32)>,
+    /// The current repair's stall.
+    pub stall: Option<HeaderReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
     /// Milliseconds from the clock origin to the next deadline. A deferred
@@ -1596,6 +1519,7 @@ impl Harness {
                         .as_ref()
                         .map(|status| status.selected_tip_hash),
                     spent: schedule.status_spent,
+                    unproductive_requests: schedule.unproductive_requests,
                 })
             })
             .collect();
@@ -1635,6 +1559,15 @@ impl Harness {
                 .vct_repair
                 .current()
                 .map(|task| (task.repair_generation, task.height.0)),
+            stall: self
+                .state
+                .vct_repair_stall
+                .map(|stall| HeaderReactorStallView {
+                    generation: stall.generation,
+                    since_millis: self.millis(stall.since),
+                    last_trace_millis: stall.last_trace.map(|at| self.millis(at)),
+                    reported: stall.reported,
+                }),
             cached_deferred: self.state.cached_pass_deferred,
             next_deadline_millis: (!self.state.cached_pass_deferred)
                 .then(|| self.state.next_deadline())
@@ -1669,6 +1602,7 @@ impl Harness {
                     peer: *peer,
                     status: session.status.map(|tip| status(tip).selected_tip_hash),
                     spent: session.spent,
+                    unproductive_requests: 0,
                 })
                 .collect(),
             reads,
@@ -1684,17 +1618,15 @@ impl Harness {
                 .model
                 .repair
                 .map(|(generation, height)| (u64::from(generation), u32::from(height) + 1)),
+            stall: self.model.stall.map(|stall| HeaderReactorStallView {
+                generation: u64::from(stall.generation),
+                since_millis: self.millis(stall.since),
+                last_trace_millis: stall.last_trace.map(|at| self.millis(at)),
+                reported: stall.reported,
+            }),
             cached_deferred: self.model.cached_deferred,
             next_deadline_millis: (!self.model.cached_deferred)
-                .then(|| {
-                    self.model
-                        .close_retries
-                        .values()
-                        .chain(self.model.close_outcomes.values())
-                        .map(|(_, at)| *at)
-                        .chain(self.model.stall.map(ModelStall::next_deadline))
-                        .min()
-                })
+                .then(|| self.model_deadline())
                 .flatten()
                 .map(|at| self.millis(at)),
         }

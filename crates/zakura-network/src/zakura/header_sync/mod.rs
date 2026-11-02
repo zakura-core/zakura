@@ -21,7 +21,7 @@ mod service;
 pub use reactor::{
     replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
     HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
-    HeaderReactorSessionView, HeaderReactorStep, HeaderReactorView,
+    HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep, HeaderReactorView,
 };
 #[cfg(test)]
 mod tests;

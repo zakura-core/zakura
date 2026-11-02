@@ -2966,7 +2966,7 @@ mod machine_tests;
 pub use machine_tests::{
     replay_header_reactor_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
     HeaderMachinePhase, HeaderReactorHistory, HeaderReactorReadView, HeaderReactorReplaySummary,
-    HeaderReactorSessionView, HeaderReactorStep, HeaderReactorView,
+    HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep, HeaderReactorView,
 };
 
 #[cfg(test)]

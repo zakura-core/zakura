@@ -83,6 +83,22 @@ impl PeerState {
         self.pending_status.take()
     }
 
+    /// Whether a status must republish the slots because the requester's stop
+    /// changed. A stop publishes even when the meter defers the status, so no
+    /// routine keeps deferring the floor to this peer. A reopen waits for a
+    /// rate-limited publication, so a `Status` flood cannot toggle the shared
+    /// ranking on every frame.
+    pub(in super::super) fn status_changes_published_stop(
+        &self,
+        update: StatusUpdate,
+        requester_stopped: bool,
+    ) -> bool {
+        match update {
+            StatusUpdate::Deferred => requester_stopped && !self.published_requester_stopped,
+            StatusUpdate::Publish { .. } => requester_stopped != self.published_requester_stopped,
+        }
+    }
+
     /// Why the live requester refuses another request, whatever the window
     /// allows, given one read of its `occupancy`.
     pub(in super::super) fn requester_stop(

@@ -261,19 +261,26 @@ fn publish_after(
     let routine = &mut fixture.routine;
     let now = Instant::now();
     let limits = routine.state.fill_limits(&routine.config, now).unwrap();
-    let capacity = routine.acquire_request_capacity(&sender).unwrap();
+    let capacity = routine.io.acquire_request_capacity(&sender).unwrap();
     let request_id = routine.state.allocate_request_id().unwrap();
     let TakenWork {
         download_floor,
         request,
     } = routine.select_work(&limits, request_id, now).unwrap();
-    let unpublished = routine.fund(request, download_floor).unwrap();
+    let unpublished = routine.io.fund(request, download_floor).unwrap();
     assert!(routine.io.budget.reserved() > 0, "funding took its charge");
     let request = block_range_request(&unpublished).unwrap();
+    let max_response_bytes = routine.state.max_response_bytes;
     let writer = routine
-        .authorize_response(&request, capacity.entry, capacity.exchange)
+        .io
+        .authorize_response(
+            &request,
+            max_response_bytes,
+            capacity.entry,
+            capacity.exchange,
+        )
         .unwrap();
-    let frame = routine.encode_request(&request).unwrap();
+    let frame = routine.io.encode_request(&request).unwrap();
     interfere(routine, &mut fixture.outbound, &fixture.connection);
     routine.publish_request(
         unpublished,
@@ -317,7 +324,7 @@ async fn a_reset_after_selection_refuses_funding() {
     let taken = routine.select_work(&limits, request_id, now).unwrap();
     routine.io.work.reset_above(block::Height(0));
 
-    let refusal = routine.fund(taken.request, taken.download_floor);
+    let refusal = routine.io.fund(taken.request, taken.download_floor);
 
     assert_eq!(refusal.unwrap_err(), FillStop::StaleWork);
     assert_eq!(routine.io.budget.reserved(), 0);
@@ -334,19 +341,26 @@ async fn refused_authorization_rolls_back_funding() {
     let routine = &mut fixture.routine;
     let now = Instant::now();
     let limits = routine.state.fill_limits(&routine.config, now).unwrap();
-    let held = routine.acquire_request_capacity(&sender).unwrap();
+    let held = routine.io.acquire_request_capacity(&sender).unwrap();
     let request_id = routine.state.allocate_request_id().unwrap();
     let taken = routine.select_work(&limits, request_id, now).unwrap();
-    let unpublished = routine.fund(taken.request, taken.download_floor).unwrap();
+    let unpublished = routine
+        .io
+        .fund(taken.request, taken.download_floor)
+        .unwrap();
     let request = block_range_request(&unpublished).unwrap();
     // An exchange that still owns this range refuses the overlapping reservation.
+    let max_response_bytes = routine.state.max_response_bytes;
     let earlier = routine
-        .authorize_response(&request, held.entry, held.exchange)
+        .io
+        .authorize_response(&request, max_response_bytes, held.entry, held.exchange)
         .unwrap();
     let entry = routine.io.requester.pool.try_entry().unwrap();
     let exchange = routine.io.requester.open().unwrap();
 
-    let refusal = routine.authorize_response(&request, entry, exchange);
+    let refusal = routine
+        .io
+        .authorize_response(&request, max_response_bytes, entry, exchange);
 
     assert_eq!(refusal.err(), Some(FillStop::Internal));
     assert!(routine.io.cancel.is_cancelled());

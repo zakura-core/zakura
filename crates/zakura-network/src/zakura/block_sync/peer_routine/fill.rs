@@ -1,4 +1,4 @@
-//! The want-work fill pass (ports `fill_peer`).
+//! The want-work fill pass.
 //!
 //! [`PeerRoutine::try_fill`] runs one synchronous pass of request attempts, and
 //! [`PeerRoutine::try_issue_one`] shows one attempt's phases in order.
@@ -11,12 +11,11 @@ use std::{num::NonZeroU64, sync::Arc};
 use zakura_chain::block;
 use zakura_rt::time::Instant;
 
-use super::PeerRoutine;
+use super::{PeerIO, PeerRoutine};
 use crate::zakura::{
     block_sync::{
-        admission::{floor_rescue_high, request_deadline},
+        admission::floor_rescue_high,
         events::RoutineToReactor,
-        peer_registry::hard_outbound_capacity,
         regulated::live_requester::FencedRequest,
         request::{BlockRangeRequest, ExpectedBlock},
         state::{OutstandingBlockRange, ReceivedBlockTracker, RequestKey},
@@ -136,7 +135,7 @@ impl FillLimits {
 /// What one fill pass did.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct FillReport {
-    /// Why the pass stopped.
+    /// Why the pass stopped. Holds the empty-queue stop until the pass ends.
     pub(super) stop: FillStop,
     /// Requests the pass published.
     pub(super) sent: u32,
@@ -145,17 +144,6 @@ pub(super) struct FillReport {
     pub(super) filtered_heights: usize,
     /// When to retry work that the retry filter returned, if it returned any.
     pub(super) retry_at: Option<Instant>,
-}
-
-/// One fill pass's time and its retry wake.
-struct FillPass {
-    /// Sampled once at the start of the pass. Eligibility, floor ranking, and
-    /// retry checks all use it.
-    now: Instant,
-    /// The wake that the retry filter scheduled for work it returned.
-    retry_at: Option<Instant>,
-    /// Taken heights that the retry filter returned in this pass.
-    filtered_heights: usize,
 }
 
 /// Requester and transport capacity for one request, acquired before any work
@@ -195,26 +183,15 @@ enum PublishOutcome {
     TransportClosed(Arc<RequestWrite>),
 }
 
-/// The facts that a published request's diagnostics report.
-#[derive(Copy, Clone, Debug)]
-struct IssuedRequest {
-    owner: zakura_header_chain::BodyWorkOwner,
-    start_height: block::Height,
-    count: u32,
-    estimated_bytes: u64,
-    /// Whether the request used a floor-bypass slot.
-    floor_bypass: bool,
-}
-
 impl PeerRoutine {
     /// Fill this peer's available slots in a single pass, letting the byte budget
-    /// (re-checked each attempt via `try_reserve`) be the congestion window.
+    /// (re-checked by each attempt's funding) be the congestion window.
     ///
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag. The pass never
     /// awaits. Other tasks change shared state between its synchronous operations.
     pub(super) fn try_fill(&mut self) -> FillReport {
-        self.state.request_pool_waiting = false;
+        self.state.note_request_pool(false);
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
@@ -230,26 +207,21 @@ impl PeerRoutine {
         self.gc_committed_outstanding();
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
+        // Eligibility, floor ranking, and retry checks all use this one sample.
         let now = Instant::now();
         self.state.prune_retry_avoid(now);
-        let mut pass = FillPass {
-            now,
-            retry_at: None,
+        let mut report = FillReport {
+            stop: FillStop::NoWork,
+            sent: 0,
             filtered_heights: 0,
+            retry_at: None,
         };
         let request_sender = self.io.session.request_sender();
-        let mut sent = 0u32;
-        let stop = loop {
-            match self.try_issue_one(&request_sender, &mut pass) {
-                Ok(()) => sent = sent.saturating_add(1),
+        report.stop = loop {
+            match self.try_issue_one(&request_sender, now, &mut report) {
+                Ok(()) => report.sent = report.sent.saturating_add(1),
                 Err(stop) => break stop,
             }
-        };
-        let report = FillReport {
-            stop,
-            sent,
-            filtered_heights: pass.filtered_heights,
-            retry_at: pass.retry_at,
         };
         self.finish_fill_pass(report);
         report
@@ -260,25 +232,32 @@ impl PeerRoutine {
     fn try_issue_one(
         &mut self,
         request_sender: &FramedSend,
-        pass: &mut FillPass,
+        now: Instant,
+        report: &mut FillReport,
     ) -> Result<(), FillStop> {
         // A closed budget refuses every later phase, so stop before acquiring anything.
         if self.io.budget.is_closed() {
             return Err(FillStop::AccountingClosed);
         }
         // Local eligibility: status, the no-progress cap, and the congestion window.
-        let limits = self.state.fill_limits(&self.config, pass.now)?;
+        let limits = self.state.fill_limits(&self.config, now)?;
         // Capacity: a requester pool entry, an exchange, and a transport slot.
-        let capacity = self.acquire_request_capacity(request_sender)?;
+        if let Some(stop) = self.requester_stop() {
+            return Err(stop);
+        }
+        let capacity = self.io.acquire_request_capacity(request_sender);
+        self.state
+            .note_request_pool(matches!(capacity, Err(FillStop::Budget)));
+        let capacity = capacity?;
         // A later failure of this attempt still consumes its request ID.
         let request_id = self.state.allocate_request_id().ok_or(FillStop::Internal)?;
         // Selection: the floor lane, then the above-floor lane.
         let TakenWork {
             download_floor,
             mut request,
-        } = self.select_work(&limits, request_id, pass.now)?;
+        } = self.select_work(&limits, request_id, now)?;
         // Retry filter: keep the first allowed contiguous run.
-        self.filter_retry(&mut request, pass)?;
+        self.filter_retry(&mut request, now, report)?;
         self.trace_work_taken(
             limits.servable_low,
             limits.servable_high,
@@ -287,30 +266,28 @@ impl PeerRoutine {
 
         // Funding: the queue derives the charge and floor exception from the
         // retained run, never from the probe.
-        let unpublished = self.fund(request, download_floor)?;
+        let unpublished = self.io.fund(request, download_floor)?;
         self.trace_request_funded(&unpublished);
-        let first_height = unpublished
-            .items()
-            .first()
-            .map(|(height, _)| *height)
-            .ok_or(FillStop::Internal)?;
 
         // Preparation: the request, its response authorization, and its frame.
-        let owner = unpublished.owner();
         let request = block_range_request(&unpublished)?;
-        let writer = self.authorize_response(&request, capacity.entry, capacity.exchange)?;
+        let writer = self.io.authorize_response(
+            &request,
+            self.state.max_response_bytes,
+            capacity.entry,
+            capacity.exchange,
+        )?;
         let queued_at = Instant::now();
-        let frame = self.encode_request(&request)?;
-        let deadline = self.request_deadline(&unpublished, queued_at);
+        let frame = self.io.encode_request(&request)?;
+        let deadline = self.state.request_deadline(
+            &self.config,
+            unpublished.priority(),
+            unpublished.bytes(),
+            queued_at,
+        );
 
         // Publication: writer fence, work claim, outstanding record, then send.
-        let issued = IssuedRequest {
-            owner,
-            start_height: request.start_height,
-            count: request.count,
-            estimated_bytes: request.estimated_bytes,
-            floor_bypass: limits.floor_bypass_only,
-        };
+        let (start_height, count) = (request.start_height, request.count);
         match self.publish_request(
             unpublished,
             request,
@@ -321,23 +298,23 @@ impl PeerRoutine {
             deadline,
         ) {
             PublishOutcome::Published(key) => {
-                self.complete_request(key, issued, queued_at);
+                self.complete_request(key, limits.floor_bypass_only, queued_at);
                 Ok(())
             }
             PublishOutcome::FenceRefused | PublishOutcome::ClaimRefused => {
-                self.io.requester.retire(first_height, true);
+                self.io.requester.retire(start_height, true);
                 Err(FillStop::Internal)
             }
             PublishOutcome::TransportClosed(claim) => {
                 tracing::debug!(
                     peer = ?self.io.peer,
                     generation = self.io.generation,
-                    start_height = ?issued.start_height,
-                    count = issued.count,
+                    ?start_height,
+                    count,
                     "block request transport closed during publication"
                 );
                 claim.delivery_failed();
-                self.io.requester.retire(first_height, true);
+                self.io.requester.retire(start_height, true);
                 Err(FillStop::SendError)
             }
         }
@@ -366,51 +343,13 @@ impl PeerRoutine {
         // If pending work is running low, ping the reactor to re-query (the
         // producer self-gates on low-water, so this is idempotent/cheap).
         if report.stop != FillStop::AccountingClosed
-            && self.io.work.pending_len() < self.refill_low_water_blocks()
+            && self.io.work.pending_len() < self.state.refill_low_water_blocks(&self.config)
         {
             let _ = self
                 .io
                 .routine_to_reactor
                 .try_send(RoutineToReactor::RequeryNeeded);
         }
-    }
-
-    /// Acquire a requester pool entry, an exchange, and a guarded transport slot,
-    /// in that order. A refusal releases whatever this call already acquired.
-    fn acquire_request_capacity<'a>(
-        &mut self,
-        request_sender: &'a FramedSend,
-    ) -> Result<RequestCapacity<'a>, FillStop> {
-        self.state.request_pool_waiting = false;
-        if let Some(stop) = self.requester_stop() {
-            return Err(stop);
-        }
-        let Some(entry) = self.io.requester.pool.try_entry() else {
-            self.state.request_pool_waiting = true;
-            return Err(FillStop::Budget);
-        };
-        let Some(exchange) = self.io.requester.open() else {
-            return Err(FillStop::SendError);
-        };
-        let slot = match request_sender.try_reserve_guarded() {
-            Ok(slot) => slot,
-            Err(GuardedReserveError::Full) => return Err(FillStop::OutboundFull),
-            Err(error) => {
-                tracing::debug!(
-                    peer = ?self.io.peer,
-                    generation = self.io.generation,
-                    ?error,
-                    "could not reserve guarded block request transport capacity"
-                );
-                self.io.session.cancel_token().cancel();
-                return Err(FillStop::SendError);
-            }
-        };
-        Ok(RequestCapacity {
-            slot,
-            exchange,
-            entry,
-        })
     }
 
     /// Take one contiguous run for `request_id`: the floor lane first, then the
@@ -426,10 +365,10 @@ impl PeerRoutine {
         now: Instant,
     ) -> Result<TakenWork, FillStop> {
         let view = *self.io.sequencer_view.borrow();
-        let snapshot = self.admission_snapshot(&view);
+        let snapshot = self.io.admission_snapshot(&view);
         let floor_start = self.probe_floor(limits, view.download_floor, now);
         if let Some(take) = plan::plan_floor(&self.config, limits, snapshot, floor_start)? {
-            let request = self.take_work(take, request_id);
+            let request = self.io.take_work(take, request_id);
             if !request.items().is_empty() {
                 return Ok(TakenWork {
                     download_floor: view.download_floor,
@@ -443,13 +382,10 @@ impl PeerRoutine {
             .io
             .work
             .first_pending_in_range(limits.servable_low, limits.servable_high);
-        let take = plan::plan_above_floor(&self.config, limits, snapshot, start);
-        match take {
-            Ok(_) => metrics::gauge!("sync.block.backlog.at_cap").set(0.0),
-            Err(FillStop::LookaheadCap) => metrics::gauge!("sync.block.backlog.at_cap").set(1.0),
-            Err(_) => {}
-        }
-        let request = self.take_work(take?, request_id);
+        // A refusal stops the pass, and `finish_fill_pass` latches the gauge at cap.
+        let take = plan::plan_above_floor(&self.config, limits, snapshot, start)?;
+        metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
+        let request = self.io.take_work(take, request_id);
         if request.items().is_empty() {
             return Err(FillStop::NoWork);
         }
@@ -483,18 +419,6 @@ impl PeerRoutine {
         (!deferred).then_some(start)
     }
 
-    /// Take `take` from the work queue for this attempt's exact owner.
-    fn take_work(&self, take: TakePlan, request_id: NonZeroU64) -> TakenRequest {
-        self.io.work.take_request(
-            take.low,
-            take.high,
-            take.max_count,
-            take.max_bytes,
-            self.io.generation,
-            request_id,
-        )
-    }
-
     /// Peer-local retry bias: if the contiguous chunk we just took leads with
     /// heights this routine recently *failed* (RangeUnavailable / timeout /
     /// send-failure), quietly put those back so another peer can contest them
@@ -505,27 +429,32 @@ impl PeerRoutine {
     /// take/return spin. If the whole chunk is still avoided, the pass stops and
     /// dropping the take returns it; the routine wakes to retry when the avoid
     /// window expires (see `earliest_deadline_sleep`).
+    ///
+    /// Production requests one block at a time (`BS_BLOCKS_PER_RESPONSE`), so a
+    /// partially filtered run is unreachable today. The partial branch stays,
+    /// because the wire format allows longer ranges. The `multi_item_` tests and
+    /// the fill driver exercise it.
     fn filter_retry(
         &self,
         request: &mut TakenRequest,
-        pass: &mut FillPass,
+        now: Instant,
+        report: &mut FillReport,
     ) -> Result<(), FillStop> {
-        let now = pass.now;
         let run = plan::select_retry_run(request.items(), |(height, item)| {
             self.retry_fact(*height, item, now)
         });
         let Some(keep) = run.keep else {
-            pass.filtered_heights += request.items().len();
+            report.filtered_heights += request.items().len();
             // The pass stops here, and this wake replaces any earlier attempt's.
-            pass.retry_at = self.retry_filter_wake_deadline(now, run.timed_rejection);
+            report.retry_at = self.retry_filter_wake_deadline(now, run.timed_rejection);
             return Err(FillStop::RetryAvoid);
         };
         let filtered = request.items().len() - keep.len();
         if filtered > 0 {
-            pass.filtered_heights += filtered;
+            report.filtered_heights += filtered;
             request.retain_range(keep);
-            pass.retry_at = [
-                pass.retry_at,
+            report.retry_at = [
+                report.retry_at,
                 self.retry_filter_wake_deadline(now, run.timed_rejection),
             ]
             .into_iter()
@@ -583,98 +512,6 @@ impl PeerRoutine {
         )
     }
 
-    /// Fund the retained run. A refusal drops the take, which quietly returns
-    /// the run: the returning routine must not re-wake its own want-work arm
-    /// into a take/return spin, and any peer waiting on budget capacity wakes
-    /// when capacity actually returns.
-    fn fund(
-        &self,
-        request: TakenRequest,
-        download_floor: block::Height,
-    ) -> Result<UnpublishedRequest, FillStop> {
-        request
-            .admit(download_floor, self.io.session.cancel_token())
-            .map_err(|refusal| match refusal {
-                AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
-                AdmitRefusal::Capacity => FillStop::Budget,
-                AdmitRefusal::Cancelled => FillStop::Cancelled,
-                AdmitRefusal::StaleClaim => FillStop::StaleWork,
-                AdmitRefusal::Empty | AdmitRefusal::MissingOwner | AdmitRefusal::AmountOverflow => {
-                    FillStop::Internal
-                }
-            })
-    }
-
-    /// Reserve response authorization for `request`. A valid scheduler request
-    /// cannot fail here, so a failure cancels the routine.
-    fn authorize_response(
-        &self,
-        request: &BlockRangeRequest,
-        entry: PoolEntry,
-        exchange: Exchange,
-    ) -> Result<ExchangeWriter, FillStop> {
-        let expected: Vec<_> = request
-            .expected_blocks
-            .iter()
-            .map(|block| block.hash)
-            .collect();
-        self.io
-            .requester
-            .reserve(
-                request.start_height,
-                &expected,
-                self.state.max_response_bytes,
-                entry,
-                exchange,
-            )
-            .map_err(|error| {
-                tracing::error!(
-                    ?error,
-                    "valid scheduler request could not reserve its response"
-                );
-                self.io.cancel.cancel();
-                FillStop::Internal
-            })
-    }
-
-    /// Encode the request's `GetBlocks` frame. A failure cancels the session.
-    fn encode_request(&self, request: &BlockRangeRequest) -> Result<Frame, FillStop> {
-        BlockSyncMessage::GetBlocks {
-            start_height: request.start_height,
-            count: request.count,
-        }
-        .encode_frame()
-        .map_err(|_| {
-            self.io.session.cancel_token().cancel();
-            FillStop::SendError
-        })
-    }
-
-    /// The request's deadline, from its queue time and this peer's delivery rate.
-    fn request_deadline(&self, funded: &UnpublishedRequest, queued_at: Instant) -> Instant {
-        // A block-count delivery sample proves progress even though it cannot
-        // supply a byte rate for estimating transfer time.
-        let byte_rate = self.state.window.bbr_btlbw_bytes_per_sec(queued_at);
-        let has_delivery_measurement =
-            byte_rate.is_some() || self.state.window.bbr_btlbw_milliblocks(queued_at).is_some();
-        request_deadline(
-            funded.priority(),
-            queued_at,
-            self.config.request_timeout,
-            self.config.effective_floor_rescue_timeout(),
-            // Responses share an ordered stream. Include earlier unreceived
-            // work so this request cannot expire while those bodies arrive.
-            self.state
-                .window
-                .outstanding_reserved_bytes()
-                .saturating_add(funded.bytes()),
-            // Filter BtlBw by the request's send time so a stale-high rate from a
-            // now-slow peer cannot tighten the deadline below what it can meet.
-            byte_rate,
-            has_delivery_measurement,
-        )
-    }
-
     /// Publish a prepared request. The writer fence admits publication, then the
     /// work claim admits it under the work-queue lock. Inside both, the routine
     /// records the outstanding request and then sends the frame, so a reset or
@@ -723,17 +560,22 @@ impl PeerRoutine {
     }
 
     /// Record a published request: metrics, liveness, shared claims, and diagnostics.
-    fn complete_request(&mut self, key: RequestKey, issued: IssuedRequest, queued_at: Instant) {
+    fn complete_request(&mut self, key: RequestKey, floor_bypass: bool, queued_at: Instant) {
         metrics::counter!("sync.block.request.sent").increment(1);
-        let estimate_kind = if issued.estimated_bytes
-            >= u64::from(issued.count).saturating_mul(block::MAX_BLOCK_BYTES)
+        let request = &self
+            .state
+            .request(key)
+            .expect("publication recorded this request earlier in this synchronous attempt")
+            .request;
+        let estimate_kind = if request.estimated_bytes
+            >= u64::from(request.count).saturating_mul(block::MAX_BLOCK_BYTES)
         {
             "worst_case"
         } else {
             "hinted"
         };
         metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind).increment(1);
-        if issued.floor_bypass {
+        if floor_bypass {
             // A floor request borrowed a bypass slot while the cwnd was saturated.
             metrics::counter!("sync.block.request.floor_bypass").increment(1);
         }
@@ -742,23 +584,125 @@ impl PeerRoutine {
             .arm_liveness(queued_at, self.config.effective_liveness_timeout());
         self.publish_request_claims(key);
         self.publish_slot_diagnostics();
-        self.trace_get_blocks_sent(
-            &issued.owner,
-            issued.start_height,
-            issued.count,
-            issued.estimated_bytes,
-            issued.floor_bypass,
-        );
+        if let Some(outstanding) = self.state.request(key) {
+            self.trace_get_blocks_sent(&outstanding.request, floor_bypass);
+        }
+    }
+}
+
+impl PeerIO {
+    /// Acquire a requester pool entry, an exchange, and a guarded transport slot,
+    /// in that order. A refusal releases whatever this call already acquired.
+    /// `FillStop::Budget` means the node-wide requester pool is empty.
+    fn acquire_request_capacity<'a>(
+        &self,
+        request_sender: &'a FramedSend,
+    ) -> Result<RequestCapacity<'a>, FillStop> {
+        let Some(entry) = self.requester.pool.try_entry() else {
+            return Err(FillStop::Budget);
+        };
+        let Some(exchange) = self.requester.open() else {
+            return Err(FillStop::SendError);
+        };
+        let slot = match request_sender.try_reserve_guarded() {
+            Ok(slot) => slot,
+            Err(GuardedReserveError::Full) => return Err(FillStop::OutboundFull),
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    generation = self.generation,
+                    ?error,
+                    "could not reserve guarded block request transport capacity"
+                );
+                self.session.cancel_token().cancel();
+                return Err(FillStop::SendError);
+            }
+        };
+        Ok(RequestCapacity {
+            slot,
+            exchange,
+            entry,
+        })
     }
 
-    /// Refill low-water mark in blocks, computed from a single peer's caps.
-    fn refill_low_water_blocks(&self) -> usize {
-        let max_blocks_per_response =
-            usize::try_from(self.config.advertised_max_blocks_per_response()).unwrap_or(usize::MAX);
-        let max_inflight_per_peer = hard_outbound_capacity(self.state.window.max_inflight_requests);
-        max_inflight_per_peer
-            .saturating_mul(max_blocks_per_response)
-            .max(max_blocks_per_response)
+    /// Take `take` from the work queue for this attempt's exact owner.
+    fn take_work(&self, take: TakePlan, request_id: NonZeroU64) -> TakenRequest {
+        self.work.take_request(
+            take.low,
+            take.high,
+            take.max_count,
+            take.max_bytes,
+            self.generation,
+            request_id,
+        )
+    }
+
+    /// Fund the retained run. A refusal drops the take, which quietly returns
+    /// the run: the returning routine must not re-wake its own want-work arm
+    /// into a take/return spin, and any peer waiting on budget capacity wakes
+    /// when capacity actually returns.
+    fn fund(
+        &self,
+        request: TakenRequest,
+        download_floor: block::Height,
+    ) -> Result<UnpublishedRequest, FillStop> {
+        request
+            .admit(download_floor, self.session.cancel_token())
+            .map_err(|refusal| match refusal {
+                AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
+                AdmitRefusal::Capacity => FillStop::Budget,
+                AdmitRefusal::Cancelled => FillStop::Cancelled,
+                AdmitRefusal::StaleClaim => FillStop::StaleWork,
+                AdmitRefusal::Empty | AdmitRefusal::MissingOwner | AdmitRefusal::AmountOverflow => {
+                    FillStop::Internal
+                }
+            })
+    }
+
+    /// Reserve response authorization for `request`, up to this peer's
+    /// `max_response_bytes`. A valid scheduler request cannot fail here, so a
+    /// failure cancels the routine.
+    fn authorize_response(
+        &self,
+        request: &BlockRangeRequest,
+        max_response_bytes: u32,
+        entry: PoolEntry,
+        exchange: Exchange,
+    ) -> Result<ExchangeWriter, FillStop> {
+        let expected: Vec<_> = request
+            .expected_blocks
+            .iter()
+            .map(|block| block.hash)
+            .collect();
+        self.requester
+            .reserve(
+                request.start_height,
+                &expected,
+                max_response_bytes,
+                entry,
+                exchange,
+            )
+            .map_err(|error| {
+                tracing::error!(
+                    ?error,
+                    "valid scheduler request could not reserve its response"
+                );
+                self.cancel.cancel();
+                FillStop::Internal
+            })
+    }
+
+    /// Encode the request's `GetBlocks` frame. A failure cancels the session.
+    fn encode_request(&self, request: &BlockRangeRequest) -> Result<Frame, FillStop> {
+        BlockSyncMessage::GetBlocks {
+            start_height: request.start_height,
+            count: request.count,
+        }
+        .encode_frame()
+        .map_err(|_| {
+            self.session.cancel_token().cancel();
+            FillStop::SendError
+        })
     }
 }
 

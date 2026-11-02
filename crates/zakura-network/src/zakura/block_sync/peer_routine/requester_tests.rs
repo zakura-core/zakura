@@ -1610,7 +1610,7 @@ async fn byte_gauges_follow_work_and_input_owners() {
     next_sent(&mut outbound).await;
     let (charged, _) = check(&[], "charge");
     assert!(charged > 0);
-    routine.admission_snapshot(&view);
+    routine.io.admission_snapshot(&view);
     let above: u64 = work
         .ownership_snapshot()
         .iter()

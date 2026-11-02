@@ -436,11 +436,6 @@ impl HeaderSyncReactor {
         let call = locator_key
             .as_ref()
             .map_or_else(|| self.state.calls.propose(kind), |key| key.call);
-        let holder = match &action {
-            HeaderPortOperation::PrepareHeaderTarget { peer, .. }
-            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => Some(peer.clone()),
-            _ => None,
-        };
         let panic_context = self.port_panic_context(&action, locator_key.clone(), call);
         #[cfg(any(test, zakura_sim))]
         let (tap, dispatched) = self.begin_port_call(&action, call);
@@ -451,6 +446,32 @@ impl HeaderSyncReactor {
             request_timeout: self.startup.request_timeout,
             #[cfg(any(test, zakura_sim))]
             tap,
+        };
+        #[cfg(any(test, zakura_sim))]
+        if let Some(op) = dispatched {
+            observe!(
+                self,
+                ReactorEvent::Dispatched {
+                    call: call.number,
+                    op
+                }
+            );
+        }
+        // Retain the holder's headers while `action` still lends its peer ID,
+        // before the call takes `action`.
+        let mut retained = match &action {
+            HeaderPortOperation::PrepareHeaderTarget { peer, .. }
+            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
+                let retained = self.retain_for_call(peer, held, call);
+                if let Some(retained) = &retained {
+                    self.peer_work_queue.bind_call(peer, retained.work());
+                }
+                retained
+            }
+            _ => {
+                drop(held);
+                None
+            }
         };
         let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
             match action {
@@ -506,21 +527,6 @@ impl HeaderSyncReactor {
                     target,
                 )),
             };
-        #[cfg(any(test, zakura_sim))]
-        if let Some(op) = dispatched {
-            observe!(
-                self,
-                ReactorEvent::Dispatched {
-                    call: call.number,
-                    op
-                }
-            );
-        }
-        let mut retained = holder.and_then(|peer| {
-            let retained = self.retain_for_call(&peer, held, call)?;
-            self.peer_work_queue.bind_call(&peer, retained.work());
-            Some(retained)
-        });
         let operation = AssertUnwindSafe(operation)
             .catch_unwind()
             .map(move |result| {

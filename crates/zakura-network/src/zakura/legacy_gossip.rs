@@ -4653,6 +4653,72 @@ mod tests {
         Ok(())
     }
 
+    /// C.1 to C.4, C.9 to C.11, and L.mempool: the real worker runs one backend call per
+    /// request permit, refuses the next request locally, and adds one serial gossip
+    /// call. `inbound_resources` derives its static bound from this boundary.
+    #[tokio::test]
+    async fn the_compat_worker_holds_its_caller_bound() -> Result<(), BoxError> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn(legacy_gossip_worker(
+            CountingPendingService {
+                calls: calls.clone(),
+            },
+            inbound_rx,
+            LegacyGossipForwarder::new(ZakuraSupervisorHandle::new(1)),
+            ZakuraTrace::noop(),
+        ));
+        let calls_reach = |expected| {
+            let calls = calls.clone();
+            tokio::time::timeout(TEST_NET_TIMEOUT, async move {
+                while calls.load(Ordering::SeqCst) != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let mut responses = Vec::new();
+        for request_id in 0..=u64::try_from(LEGACY_REQUEST_IN_FLIGHT_LIMIT)? {
+            let (response_tx, response_rx) = oneshot::channel();
+            inbound_tx
+                .send(LegacyInboundWork::Request(LegacyRequestInbound {
+                    peer_id: inbound_peer(),
+                    request_id,
+                    frame: LegacyRequestFrame::MempoolTransactionIds,
+                    response_tx,
+                    _charge: free_charge(),
+                }))
+                .await?;
+            responses.push(response_rx);
+        }
+        let refused = responses.pop().ok_or("the loop sent a request")?;
+        let refused = tokio::time::timeout(TEST_NET_TIMEOUT, refused)
+            .await??
+            .expect_err("every permit is held");
+        assert!(refused.to_string().contains("concurrency limit"));
+        calls_reach(LEGACY_REQUEST_IN_FLIGHT_LIMIT).await?;
+
+        for byte in [1, 2] {
+            inbound_tx
+                .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    peer_id: inbound_peer(),
+                    frame: LegacyGossipFrame::AdvertiseBlock(block_hash(byte)),
+                    _charge: free_charge(),
+                }))
+                .await?;
+        }
+        calls_reach(LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1,
+            "the second gossip item waits for the first call"
+        );
+
+        worker.abort();
+        Ok(())
+    }
+
     /// Regression for `claude-legacy-request-orphaned-handler-permits`.
     ///
     /// The request-stream side (`LegacyGossipSink::request`) waits only

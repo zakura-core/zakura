@@ -4,12 +4,44 @@
 //!
 //! Nothing in this module waits, so no caller can wait for capacity while it holds a
 //! lock or an earlier reservation. Each limit acts only on work that a conformant
-//! peer cannot be waiting for, or on a count that conformant callers cannot reach:
+//! peer cannot be waiting for:
 //!
 //! | Owner | Refusal |
 //! | --- | --- |
 //! | [`InboundBudget::try_charge`] | Unsolicited work drops, as it does when a queue is full. |
 //! | [`InboundBudget::charge_committed`] | Never refuses. A response the node asked for cannot wait or drop without timing out a conformant peer. |
+//!
+//! # Static partitions
+//!
+//! Two limits need no counter here, because their callers' own limits derive them.
+//!
+//! **Inbound service calls (C.1 to C.4, C.9 to C.11, L.mempool).** Every caller holds
+//! a clone of one inbound service. These callers can run at once:
+//!
+//! - One call per TCP connection, because `Connection` awaits each call before it reads
+//!   the next message. `peerset_total_connection_limit` bounds the connections.
+//! - One call per permit of the compatibility request worker. The worker refuses a
+//!   request locally when its `LEGACY_REQUEST_IN_FLIGHT_LIMIT` permits run out.
+//! - One call from the compatibility gossip worker, which awaits each call.
+//!
+//! Every request kind therefore has at most `peerset_total_connection_limit +
+//! LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1` calls at once. A semaphore of that size per kind
+//! could never refuse a conformant caller, so this module has none. The `LoadShed`
+//! buffer in `zakurad` sheds calls above its queue, and the state's read pools own each
+//! lookup's backend work, including work that outlives a dropped caller.
+//!
+//! `a_tcp_connection_runs_one_inbound_call_at_a_time` and
+//! `the_compat_worker_holds_its_caller_bound` test these boundaries.
+//!
+//! **TCP handshakes (L.handshake).** The `ActiveConnectionCounter`s own the aggregate
+//! bound. The accept loop and the crawler reserve a connection before its handshake
+//! starts, and they stop at their limits, so `peerset_total_connection_limit` bounds
+//! the unfinished handshakes. `HANDSHAKE_TIMEOUT` ends each one. The codec's handshake
+//! body limit bounds its buffer, and the user-agent limit bounds its decoded `version`.
+//!
+//! The `crawler_peer_limit_*` and `listener_peer_limit_*` tests exercise the counters.
+//! `the_handshake_limit_covers_every_command` and `a_long_user_agent_stops_at_its_length`
+//! exercise the codec's limits.
 
 use std::sync::Arc;
 

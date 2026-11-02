@@ -1713,6 +1713,32 @@ async fn tcp_header_copies_charge_only_their_new_allocations() {
     .await;
 }
 
+/// C.1 to C.4, C.9, C.10, and L.mempool: a connection awaits each inbound service call
+/// before it reads the next message, so each connection adds one call to the static
+/// bound in `inbound_resources`.
+#[tokio::test]
+async fn a_tcp_connection_runs_one_inbound_call_at_a_time() {
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+        tcp.peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        let first = tcp
+            .inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await;
+
+        tcp.peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        tcp.inbound.expect_no_requests().await;
+
+        first.respond(Response::Nil);
+        tcp.inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await
+            .respond(Response::Nil);
+        tcp.task.abort();
+    })
+    .await;
+}
+
 /// L.mempool: an empty snapshot sends nothing, and a larger snapshot than one message
 /// allows sends exactly one message of the protocol's limit.
 #[tokio::test]

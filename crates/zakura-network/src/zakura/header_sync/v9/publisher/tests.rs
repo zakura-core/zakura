@@ -1260,7 +1260,7 @@ async fn a_queued_outcome_wins_over_a_later_close() {
         shared
             .state
             .queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
-        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
+        assert_eq!(shared.apply(&close), Ok(Applied::Live));
         let ended = shared.end_due();
         assert_eq!(ended, [HeadersOutcomeCode::SubscriptionSuperseded]);
         let terminal = shared.next_terminal::<HB>().expect("one subscription ends");
@@ -1980,16 +1980,16 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
 fn close_wins_over_an_outcome_found_after_it() {
     let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
     let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
-    let mut owner = PublisherOwner::new(PublisherState::new());
+    let mut owner = PublisherOwner::new(limits());
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(target.hash, vec![genesis], credit(), AuxSchema::None);
-    assert_eq!(owner.apply(&open, limits()), Ok(Applied::Live));
+    assert_eq!(owner.apply(&open), Ok(Applied::Live));
     let job = owner
         .state
-        .next_job::<HB>(None, limits())
+        .next_job::<HB>(None)
         .expect("the path has a page to read");
     let close = subscriber.close().expect("the subscription is live");
-    assert_eq!(owner.apply(&close, limits()), Ok(Applied::Live));
+    assert_eq!(owner.apply(&close), Ok(Applied::Live));
     let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
     owner.state.finish(job.key, found, None);
     assert_eq!(owner.end_due(), [HeadersOutcomeCode::SubscriptionClosed]);
@@ -2051,7 +2051,7 @@ async fn a_second_open_is_admitted_and_a_third_faults() {
         ..limits()
     };
     assert_eq!(
-        lock(&publisher.shared).apply(&records, without_records),
+        PublisherOwner::new(without_records).apply(&records),
         Err(PublisherFault::UnadvertisedSchema)
     );
 }

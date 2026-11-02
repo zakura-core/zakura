@@ -151,7 +151,6 @@ pub(crate) enum PublisherFault {
 pub(crate) struct Publisher {
     shared: Arc<Mutex<PublisherOwner>>,
     wake: Arc<Notify>,
-    limits: PageLimits,
 }
 
 /// The publisher's state beside the runtime resources it names by identity,
@@ -165,12 +164,12 @@ struct PublisherOwner {
 }
 
 impl PublisherOwner {
-    /// An owner of `state`, which has no subscription yet.
-    fn new(state: PublisherState) -> Self {
+    /// An owner with no subscription, under the advertised `page_limits`.
+    fn new(page_limits: PageLimits) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         Self {
-            state,
+            state: PublisherState::new(page_limits, limits),
             slots: PublicationSlots::new(&limits),
             waits: CapacityWaits::default(),
             reporter: PublicationReporter::new(limits),
@@ -187,16 +186,12 @@ impl PublisherOwner {
 
     /// Apply `update` and report the result. An `Open` reserves its slot
     /// first, and a refused `Open` frees it.
-    fn apply(
-        &mut self,
-        update: &SubscribeHeaders,
-        limits: PageLimits,
-    ) -> Result<Applied, PublisherFault> {
+    fn apply(&mut self, update: &SubscribeHeaders) -> Result<Applied, PublisherFault> {
         let id = update.subscription_id;
         let applied = match update.operation {
             Operation::Open => {
                 let offer = self.slots.offer();
-                let opened = self.state.open(update, limits, offer);
+                let opened = self.state.open(update, offer);
                 if opened.is_err() {
                     self.slots.refused(offer);
                 }
@@ -383,7 +378,7 @@ impl Publisher {
         #[cfg(any(test, zakura_sim))] tap: Option<crate::zakura::RegulationTap<u64>>,
     ) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Mutex::new(sim_chain!(
-            PublisherOwner::new(PublisherState::new()) => observed_by(tap)
+            PublisherOwner::new(limits) => observed_by(tap)
         )));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
@@ -397,7 +392,6 @@ impl Publisher {
                     port,
                     push,
                     owner,
-                    limits,
                     panics,
                 },
                 send,
@@ -405,14 +399,7 @@ impl Publisher {
                 cancel,
             ),
         );
-        (
-            Self {
-                shared,
-                wake,
-                limits,
-            },
-            task,
-        )
+        (Self { shared, wake }, task)
     }
 
     /// Apply one `SubscribeHeaders` update, in stream order.
@@ -422,7 +409,7 @@ impl Publisher {
     /// is bounded, and the call yields when the caller's cooperative budget
     /// runs out, so a burst of updates lets other peers progress.
     pub(crate) async fn apply(&self, update: &SubscribeHeaders) -> Result<Applied, PublisherFault> {
-        let applied = lock(&self.shared).apply(update, self.limits);
+        let applied = lock(&self.shared).apply(update);
         if applied == Ok(Applied::Live) {
             self.wake.notify_one();
         }
@@ -463,7 +450,6 @@ struct Task {
     port: Arc<dyn Port>,
     push: Push,
     owner: LeaseOwner,
-    limits: PageLimits,
     /// Page jobs report a panic here, even after their page was abandoned.
     panics: mpsc::Sender<Box<dyn Any + Send>>,
 }
@@ -543,7 +529,7 @@ async fn publish<const HEADER_BYTES: usize>(
             let mut shared = lock(&task.shared);
             let job = shared
                 .state
-                .next_job::<HEADER_BYTES>(snapshot.as_ref(), task.limits);
+                .next_job::<HEADER_BYTES>(snapshot.as_ref());
             let ending = shared.state.end_queued();
             drop(shared);
             if let Some(job) = job {

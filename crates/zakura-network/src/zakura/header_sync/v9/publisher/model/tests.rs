@@ -510,7 +510,7 @@ fn publisher_witness_rejects_lost_credit() {
 fn publisher_witness_rejects_lost_job() {
     run(decode(WITNESS), |machine, step| {
         if matches!(step, Step::Open { .. }) {
-            machine.owner.state.next_job::<HB>(None, page_limits());
+            machine.owner.state.next_job::<HB>(None);
         }
     });
 }

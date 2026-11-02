@@ -354,7 +354,7 @@ struct Machine {
 impl Machine {
     fn new() -> Self {
         Self {
-            owner: PublisherOwner::new(PublisherState::new()),
+            owner: PublisherOwner::new(page_limits()),
             model: Model::default(),
             stale: Vec::new(),
             writing: None,
@@ -558,11 +558,7 @@ impl Machine {
             } else {
                 Ok(Applied::Live)
             };
-        assert_eq!(
-            self.owner.apply(&update, page_limits()),
-            expected,
-            "{PROPERTY}"
-        );
+        assert_eq!(self.owner.apply(&update), expected, "{PROPERTY}");
         if expected.is_err() {
             return;
         }
@@ -695,11 +691,7 @@ impl Machine {
         } else {
             Err(SubscriptionFault::Unknown.into())
         };
-        assert_eq!(
-            self.owner.apply(&update, page_limits()),
-            expected,
-            "{PROPERTY}"
-        );
+        assert_eq!(self.owner.apply(&update), expected, "{PROPERTY}");
     }
 
     /// The job the model expects next, superseding followers on the way.
@@ -764,10 +756,7 @@ impl Machine {
         let busy = self.model.busy();
         let expected = self.expected_job();
         let selected = self.selected();
-        let job = self
-            .owner
-            .state
-            .next_job::<HB>(selected.as_ref(), page_limits());
+        let job = self.owner.state.next_job::<HB>(selected.as_ref());
         if busy {
             assert!(
                 job.is_none(),
@@ -1092,7 +1081,7 @@ impl Machine {
         assert!(
             self.owner
                 .state
-                .next_job::<HB>(selected.as_ref(), page_limits())
+                .next_job::<HB>(selected.as_ref())
                 .is_none(),
             "{PROPERTY}: no job starts after the publisher stops"
         );

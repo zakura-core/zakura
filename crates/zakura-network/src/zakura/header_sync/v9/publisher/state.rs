@@ -33,7 +33,7 @@ use zakura_header_chain::{EngineSnapshot, Frontier};
 use super::{
     super::{
         entry_bytes, Cursor, HeadersOutcomeCode, Operation, SubscribeHeaders,
-        HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
+        HEADERS_RESPONSE_FIXED_BYTES,
     },
     PageLimits, PublisherFault,
 };
@@ -237,6 +237,8 @@ pub(super) struct Activity {
 /// and the publisher task.
 #[derive(Debug)]
 pub(super) struct PublisherState {
+    /// The serving limits this node advertises, constant for the session.
+    limits: PageLimits,
     pub(super) publications: PublicationLedger<u64, Cursor>,
     /// Live and closing subscriptions, in the same set as `publications`.
     subscriptions: BTreeMap<u64, Subscription>,
@@ -254,12 +256,12 @@ pub(super) struct PublisherState {
 }
 
 impl PublisherState {
-    /// A publisher with no subscription.
-    pub(super) fn new() -> Self {
-        let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
-            .expect("SUBSCRIBE_HEADERS is a subscription row");
+    /// A publisher with no subscription, under its advertised `limits` and its
+    /// subscription row's `subscription_limits`.
+    pub(super) fn new(limits: PageLimits, subscription_limits: SubscriptionLimits) -> Self {
         Self {
-            publications: PublicationLedger::new(limits),
+            limits,
+            publications: PublicationLedger::new(subscription_limits),
             subscriptions: BTreeMap::new(),
             last_served: None,
             in_progress: None,
@@ -275,12 +277,11 @@ impl PublisherState {
     pub(super) fn open(
         &mut self,
         update: &SubscribeHeaders,
-        limits: PageLimits,
         offer: SlotOffer,
     ) -> Result<PublicationOpened, PublisherFault> {
         let id = update.subscription_id;
         let schema = update.tree_aux_schema;
-        if (limits.aux_schema_mask & schema.mask_bit()) != schema.mask_bit() {
+        if (self.limits.aux_schema_mask & schema.mask_bit()) != schema.mask_bit() {
             return Err(PublisherFault::UnadvertisedSchema);
         }
         let opened = self.publications.open(
@@ -464,7 +465,6 @@ impl PublisherState {
     pub(super) fn next_job<const HEADER_BYTES: usize>(
         &mut self,
         selected: Option<&EngineSnapshot>,
-        limits: PageLimits,
     ) -> Option<Job> {
         if self.in_progress.is_some()
             || self.writing.is_some()
@@ -503,7 +503,7 @@ impl PublisherState {
                 }
             }
             let schema = subscription.fixed.schema;
-            let count = page_room(unspent, schema, limits, HEADER_BYTES);
+            let count = page_room(unspent, schema, self.limits, HEADER_BYTES);
             if subscription.stall.is_some() {
                 continue;
             }

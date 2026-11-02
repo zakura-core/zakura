@@ -86,6 +86,28 @@ impl fmt::Display for AdmissionFailure {
 
 impl std::error::Error for AdmissionFailure {}
 
+/// A decoded block and its attributed size, measured once when the block is
+/// wrapped. Only [`MeasuredBlock::new`] builds one, so the size always
+/// matches the block.
+#[derive(Debug)]
+pub struct MeasuredBlock {
+    block: Block,
+    bytes: u64,
+}
+
+impl MeasuredBlock {
+    /// Measure `block`'s attributed size.
+    pub fn new(block: Block) -> Self {
+        let bytes = block.attributed_memory_size_bytes();
+        Self { block, bytes }
+    }
+
+    /// The attributed size measured when the block was wrapped.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 /// A refused parsed block remains with its caller's transient decode scope.
 #[derive(Debug)]
 pub struct RejectedBlock {
@@ -129,10 +151,19 @@ impl DecodedBlockPool {
     /// Existing strong or weak header/transaction aliases prevent adoption.
     pub fn try_admit(
         &self,
-        mut block: Block,
+        block: Block,
         admission: Admission,
     ) -> Result<OwnedBlock, RejectedBlock> {
-        let bytes = block.attributed_memory_size_bytes();
+        self.try_admit_measured(MeasuredBlock::new(block), admission)
+    }
+
+    /// [`Self::try_admit`] for a block whose caller already measured it.
+    pub fn try_admit_measured(
+        &self,
+        block: MeasuredBlock,
+        admission: Admission,
+    ) -> Result<OwnedBlock, RejectedBlock> {
+        let MeasuredBlock { mut block, bytes } = block;
         if Arc::get_mut(&mut block.header).is_none()
             || block
                 .transactions

@@ -20,7 +20,7 @@
 
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 use zakura_node_services::block_memory::{
-    Admission, AdmissionFailure, DecodedBlockPool, OwnedBlock,
+    Admission, AdmissionFailure, DecodedBlockPool, MeasuredBlock, OwnedBlock,
 };
 
 use zakura_rt::{
@@ -2364,7 +2364,8 @@ impl PeerRoutine {
             Ok(block) => block,
             Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
         };
-        let bytes = block.attributed_memory_size_bytes();
+        let block = MeasuredBlock::new(block);
+        let bytes = block.bytes();
         let Some(charge) = charge_decoded_handoff(
             &self.sequencer_input_decoded_attributed_memory_bytes,
             &self.sequencer_view,
@@ -2372,7 +2373,10 @@ impl PeerRoutine {
         ) else {
             return Ok((None, bytes));
         };
-        match self.decoded_pool.try_admit(block, Admission::WithinLimit) {
+        match self
+            .decoded_pool
+            .try_admit_measured(block, Admission::WithinLimit)
+        {
             Ok(block) => Ok((Some(AdmittedBody { block, charge }), bytes)),
             Err(rejected) => {
                 if !matches!(

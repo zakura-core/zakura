@@ -1,20 +1,20 @@
-diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-index c6163d2c1..6caf696eb 100644
---- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-+++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-@@ -380,20 +380,7 @@ impl Drop for ReceiptSettlement {
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
+@@ -423,21 +423,7 @@ impl Drop for ReceiptSettlement<'_> {
          #[cfg(not(any(test, zakura_sim)))]
          drop(funding);
          #[cfg(any(test, zakura_sim))]
 -        {
 -            let charge = funding.bytes();
+-            let handoff = &self.handoff;
 -            funding.release_then(|| {
 -                observe!(
--                    self.observer,
--                    super::block_sync_observe::BlockEvent::HandoffEnded {
--                        peer: self.peer.clone(),
--                        owner: self.owner,
--                        height: self.height,
+-                    handoff.observer,
+-                    super::super::block_sync_observe::BlockEvent::HandoffEnded {
+-                        peer: handoff.peer.clone(),
+-                        owner: handoff.owner,
+-                        height: handoff.height,
 -                        charge,
 -                    }
 -                );

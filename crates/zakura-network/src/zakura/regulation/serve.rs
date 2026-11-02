@@ -223,26 +223,14 @@ struct Commitments {
     limit: AtomicU32,
 }
 
-/// How `open` commitments compare with the advertised limit.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum CommitmentLoad {
-    Within,
-    /// Over the limit but within the margin a conformant peer can reach.
-    OverLimit,
-}
-
-/// Classify `open` commitments, this request's included, against `limit`.
-/// Only more than twice the limit is a protocol violation; see the module
-/// docs for the margin.
-fn commitment_load(open: u32, limit: u32) -> Result<CommitmentLoad, ServeViolation> {
+/// Whether `open` commitments, this request's included, exceed `limit` within
+/// the margin a conformant peer can reach. Only more than twice the limit is a
+/// protocol violation; see the module docs for the margin.
+fn commitment_over_limit(open: u32, limit: u32) -> Result<bool, ServeViolation> {
     if open > limit.saturating_mul(2) {
         return Err(ServeViolation::OverCommitted { open, limit });
     }
-    Ok(if open > limit {
-        CommitmentLoad::OverLimit
-    } else {
-        CommitmentLoad::Within
-    })
+    Ok(open > limit)
 }
 
 /// One open request. Dropping it releases the commitment.
@@ -483,7 +471,7 @@ impl<P: Produce> Serve<P> {
         let open = self.commitments.open.fetch_add(1, Ordering::AcqRel) + 1;
         let commitment = Commitment(Some(self.commitments.clone()), completed);
         let limit = self.commitments.limit.load(Ordering::Acquire);
-        if commitment_load(open, limit)? == CommitmentLoad::OverLimit {
+        if commitment_over_limit(open, limit)? {
             self.metrics.over_limit(open, limit);
         }
         self.metrics.admitted();

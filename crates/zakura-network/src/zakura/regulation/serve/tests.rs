@@ -1391,16 +1391,15 @@ fn only_more_than_twice_the_limit_is_over_committed() {
             if open > margin {
                 continue;
             }
-            let expected = if open > limit {
-                CommitmentLoad::OverLimit
-            } else {
-                CommitmentLoad::Within
-            };
-            assert_eq!(commitment_load(open, limit), Ok(expected), "{open}/{limit}");
+            assert_eq!(
+                commitment_over_limit(open, limit),
+                Ok(open > limit),
+                "{open}/{limit}"
+            );
         }
         if let Some(open) = limit.checked_mul(2).and_then(|twice| twice.checked_add(1)) {
             assert_eq!(
-                commitment_load(open, limit),
+                commitment_over_limit(open, limit),
                 Err(ServeViolation::OverCommitted { open, limit })
             );
         }

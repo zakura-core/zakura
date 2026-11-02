@@ -1,14 +1,16 @@
 //! Request lifecycle decisions: deadlines, expiry, and retry avoidance.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use zakura_chain::block;
 use zakura_rt::time::Instant;
 
 use super::{
     super::super::{
+        admission::{request_deadline, RequestPriority},
         regulated::wire::Outcome,
         state::{DeliverySnapshot, OutstandingBlockRange, RequestKey, WriteOutcome},
+        ZakuraBlockSyncConfig,
     },
     PeerState,
 };
@@ -137,6 +139,111 @@ pub(in super::super) struct SharedDeadlines {
 }
 
 impl PeerState {
+    /// The outstanding request under `key`.
+    pub(in super::super) fn request(&self, key: RequestKey) -> Option<&OutstandingBlockRange> {
+        self.window.outstanding.get(key)
+    }
+
+    /// How many requests are outstanding.
+    pub(in super::super) fn outstanding_len(&self) -> usize {
+        self.window.outstanding.len()
+    }
+
+    /// Remove request `key` from the window.
+    pub(in super::super) fn remove_request(
+        &mut self,
+        key: RequestKey,
+    ) -> Option<OutstandingBlockRange> {
+        self.window.outstanding.remove(key)
+    }
+
+    /// Remove every outstanding request, in issue order.
+    pub(in super::super) fn drain_requests(&mut self) -> Vec<(RequestKey, OutstandingBlockRange)> {
+        self.window.outstanding.drain()
+    }
+
+    /// Requests whose whole range is at or below `floor`.
+    pub(in super::super) fn requests_ending_at_or_below(
+        &self,
+        floor: block::Height,
+    ) -> Vec<RequestKey> {
+        self.window.outstanding.ending_at_or_below(floor)
+    }
+
+    /// Every unreceived height with its request and exact owner.
+    #[allow(clippy::type_complexity)]
+    pub(in super::super) fn unreceived_claims(
+        &self,
+    ) -> Vec<(
+        block::Height,
+        (RequestKey, zakura_header_chain::BodyWorkOwner),
+    )> {
+        self.window
+            .outstanding
+            .entries()
+            .flat_map(|(key, outstanding)| {
+                unreceived_heights(outstanding)
+                    .map(move |height| (height, (key, outstanding.request.owner)))
+            })
+            .collect()
+    }
+
+    /// Requests that lost every unreceived height, given the heights each lost.
+    pub(in super::super) fn requests_losing_all_work(
+        &self,
+        lost: &BTreeMap<RequestKey, Vec<block::Height>>,
+    ) -> Vec<RequestKey> {
+        self.window
+            .outstanding
+            .entries()
+            .filter(|(key, outstanding)| {
+                let lost = lost.get(key).map_or(0, Vec::len);
+                lost == unreceived_heights(outstanding).count()
+            })
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// Each outstanding request with the write phase that `phase` reports.
+    #[cfg(any(test, zakura_sim))]
+    pub(in super::super) fn request_ownership(
+        &self,
+        phase: impl Fn(RequestKey) -> Option<crate::zakura::block_sync::work_queue::RequestWritePhase>,
+    ) -> Vec<crate::zakura::block_sync::state::RequestOwnership> {
+        self.window.outstanding.ownership(phase)
+    }
+
+    /// The deadline of a funded request queued at `queued_at`, from its priority
+    /// and this peer's delivery rate.
+    pub(in super::super) fn request_deadline(
+        &self,
+        config: &ZakuraBlockSyncConfig,
+        priority: RequestPriority,
+        funded_bytes: u64,
+        queued_at: Instant,
+    ) -> Instant {
+        // A block-count delivery sample proves progress even though it cannot
+        // supply a byte rate for estimating transfer time.
+        let byte_rate = self.window.bbr_btlbw_bytes_per_sec(queued_at);
+        let has_delivery_measurement =
+            byte_rate.is_some() || self.window.bbr_btlbw_milliblocks(queued_at).is_some();
+        request_deadline(
+            priority,
+            queued_at,
+            config.request_timeout,
+            config.effective_floor_rescue_timeout(),
+            // Responses share an ordered stream. Include earlier unreceived
+            // work so this request cannot expire while those bodies arrive.
+            self.window
+                .outstanding_reserved_bytes()
+                .saturating_add(funded_bytes),
+            // Filter BtlBw by the request's send time so a stale-high rate from a
+            // now-slow peer cannot tighten the deadline below what it can meet.
+            byte_rate,
+            has_delivery_measurement,
+        )
+    }
+
     /// Match an authorized body for `height` with hash `hash` to the oldest
     /// outstanding request that covers the height.
     pub(in super::super) fn match_body(

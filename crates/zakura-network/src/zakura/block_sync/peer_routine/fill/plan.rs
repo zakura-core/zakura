@@ -17,6 +17,8 @@ use super::{FillLimits, FillStop};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod model;
 #[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]

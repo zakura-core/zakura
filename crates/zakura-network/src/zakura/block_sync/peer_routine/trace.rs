@@ -1,5 +1,6 @@
 use super::super::{
     admission::RequestPriority,
+    request::BlockRangeRequest,
     trace::{
         elapsed_us, height as trace_height, peer as trace_peer, request_owner as trace_owner,
         saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
@@ -11,14 +12,12 @@ use crate::zakura::trace::block_sync_trace as bs_trace;
 
 impl PeerRoutine {
     pub(super) fn emit(&self, event: &'static str, build: impl FnOnce(&mut BlockTraceFields)) {
-        self.io
-            .trace
-            .emit_event(|| BlockTraceEvent::build(event, build));
+        self.io.emit(event, build);
     }
 
     pub(super) fn trace_wake(&self, reason: &'static str) {
         self.emit("block_peer_wake", |row| {
-            row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
+            row.outstanding = Some(saturating_usize(self.state.outstanding_len()));
             row.reason = Some(reason);
         });
     }
@@ -28,7 +27,7 @@ impl PeerRoutine {
             row.peer = Some(trace_peer(&self.io.peer));
             row.reason = Some(PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS);
             row.error = Some(error.to_string());
-            row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
+            row.outstanding = Some(saturating_usize(self.state.outstanding_len()));
             row.bbr_cwnd = Some(saturating_usize(self.state.window.bbr_effective_cwnd()));
             row.available_slots = Some(saturating_usize(
                 self.state.window.available_slots_at(Instant::now()),
@@ -42,7 +41,7 @@ impl PeerRoutine {
     pub(super) fn trace_ending_timeout(&self) {
         self.emit(bs_trace::BLOCK_PEER_ENDING_TIMEOUT, |row| {
             row.peer = Some(trace_peer(&self.io.peer));
-            row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
+            row.outstanding = Some(saturating_usize(self.state.outstanding_len()));
         });
     }
 
@@ -69,32 +68,6 @@ impl PeerRoutine {
             row.servable_low = Some(trace_height(low));
             row.servable_high = Some(trace_height(high));
             row.range_count = Some(saturating_usize(count));
-        });
-    }
-
-    pub(super) fn trace_work_returned(
-        &self,
-        reason: &'static str,
-        outstanding: &OutstandingBlockRange,
-        unreceived_count: usize,
-        outcome: WorkReturnOutcome,
-    ) {
-        let unreceived_count = u64::try_from(unreceived_count).unwrap_or(u64::MAX);
-        if outcome.missing_count == 0
-            && outcome.released_count == 0
-            && outcome.committed_count == 0
-            && outcome.returned_count == unreceived_count
-        {
-            return;
-        }
-
-        self.emit(bs_trace::BLOCK_WORK_RETURNED, |row| {
-            row.peer = Some(trace_peer(&self.io.peer));
-            row.reason = Some(reason);
-            row.range_start = Some(trace_height(outstanding.request.start_height));
-            row.range_count = Some(u64::from(outstanding.request.count));
-            row.unreceived_count = Some(unreceived_count);
-            insert_work_return_outcome(row, outcome);
         });
     }
 
@@ -144,24 +117,17 @@ impl PeerRoutine {
         });
     }
 
-    pub(super) fn trace_get_blocks_sent(
-        &self,
-        owner: &zakura_header_chain::BodyWorkOwner,
-        start_height: block::Height,
-        count: u32,
-        estimated_bytes: u64,
-        floor_bypass: bool,
-    ) {
+    pub(super) fn trace_get_blocks_sent(&self, request: &BlockRangeRequest, floor_bypass: bool) {
         self.emit(bs_trace::BLOCK_GET_BLOCKS_SENT, |row| {
             row.peer = Some(trace_peer(&self.io.peer));
-            row.request_owner = Some(trace_owner(owner));
-            row.range_start = Some(trace_height(start_height));
-            row.range_count = Some(u64::from(count));
-            row.estimated_bytes = Some(estimated_bytes);
+            row.request_owner = Some(trace_owner(&request.owner));
+            row.range_start = Some(trace_height(request.start_height));
+            row.range_count = Some(u64::from(request.count));
+            row.estimated_bytes = Some(request.estimated_bytes);
             row.available_slots = Some(saturating_usize(
                 self.state.window.available_slots_at(Instant::now()),
             ));
-            row.peer_outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
+            row.peer_outstanding = Some(saturating_usize(self.state.outstanding_len()));
             self.insert_no_progress_fields(row);
             // The reliability estimate discounts the admission cwnd, so trace it at
             // request time too (not only on delivery): a dropping peer keeps requesting at
@@ -259,7 +225,7 @@ impl PeerRoutine {
     pub(super) fn trace_bbr_sample(&mut self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             row.peer = Some(trace_peer(&self.io.peer));
-            row.peer_outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
+            row.peer_outstanding = Some(saturating_usize(self.state.outstanding_len()));
             row.budget_reserved = Some(self.io.budget.reserved());
             self.insert_no_progress_fields(row);
             self.insert_bbr_fields(row);
@@ -269,30 +235,6 @@ impl PeerRoutine {
         // `publish_slot_diagnostics` re-reads `bbr_rtprop_ms(now)`, filtering out samples
         // aged past the horizon (→ `None` = worst floor server).
         self.publish_slot_diagnostics();
-    }
-
-    pub(super) fn trace_body_sequencer_sent(
-        &self,
-        height: block::Height,
-        elapsed: Duration,
-        ok: bool,
-    ) {
-        self.emit(bs_trace::BLOCK_BODY_SEQUENCER_SENT, |row| {
-            row.peer = Some(trace_peer(&self.io.peer));
-            row.height = Some(trace_height(height));
-            row.sequencer_send_elapsed_us = Some(elapsed_us(elapsed));
-            row.ok = Some(ok);
-        });
-    }
-
-    pub(super) fn trace_body_decode_permit(&self, elapsed: Duration, capacity_before: usize) {
-        self.emit(bs_trace::BLOCK_BODY_DECODE_PERMIT, |row| {
-            row.peer = Some(trace_peer(&self.io.peer));
-            row.decode_permit_wait_us = Some(elapsed_us(elapsed));
-            row.sequencer_input_capacity_before = Some(saturating_usize(capacity_before));
-            row.sequencer_input_max_capacity =
-                Some(saturating_usize(self.io.sequencer_input.max_capacity()));
-        });
     }
 
     pub(super) fn trace_range_unavailable(
@@ -306,6 +248,59 @@ impl PeerRoutine {
             row.range_start = Some(trace_height(start_height));
             row.range_count = Some(u64::from(range_count));
             row.request_elapsed_ms = Some(request_elapsed_ms);
+        });
+    }
+}
+
+impl PeerIO {
+    pub(super) fn emit(&self, event: &'static str, build: impl FnOnce(&mut BlockTraceFields)) {
+        self.trace
+            .emit_event(|| BlockTraceEvent::build(event, build));
+    }
+
+    pub(super) fn trace_work_returned(
+        &self,
+        reason: &'static str,
+        outstanding: &OutstandingBlockRange,
+        unreceived_count: usize,
+        outcome: WorkReturnOutcome,
+    ) {
+        let unreceived_count = u64::try_from(unreceived_count).unwrap_or(u64::MAX);
+        if outcome.missing_count == 0
+            && outcome.released_count == 0
+            && outcome.committed_count == 0
+            && outcome.returned_count == unreceived_count
+        {
+            return;
+        }
+
+        self.emit(bs_trace::BLOCK_WORK_RETURNED, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.reason = Some(reason);
+            row.range_start = Some(trace_height(outstanding.request.start_height));
+            row.range_count = Some(u64::from(outstanding.request.count));
+            row.unreceived_count = Some(unreceived_count);
+            insert_work_return_outcome(row, outcome);
+        });
+    }
+
+    pub(super) fn trace_body_sequencer_sent(&self, height: block::Height, elapsed: Duration) {
+        self.emit(bs_trace::BLOCK_BODY_SEQUENCER_SENT, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.height = Some(trace_height(height));
+            row.sequencer_send_elapsed_us = Some(elapsed_us(elapsed));
+            // A permitted send cannot fail. The row keeps the field for trace readers.
+            row.ok = Some(true);
+        });
+    }
+
+    pub(super) fn trace_body_decode_permit(&self, elapsed: Duration, capacity_before: usize) {
+        self.emit(bs_trace::BLOCK_BODY_DECODE_PERMIT, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.decode_permit_wait_us = Some(elapsed_us(elapsed));
+            row.sequencer_input_capacity_before = Some(saturating_usize(capacity_before));
+            row.sequencer_input_max_capacity =
+                Some(saturating_usize(self.sequencer_input.max_capacity()));
         });
     }
 }

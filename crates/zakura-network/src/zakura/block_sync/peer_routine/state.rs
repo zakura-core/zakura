@@ -6,7 +6,10 @@ use zakura_chain::block;
 use zakura_rt::time::Instant;
 
 use super::{
-    super::state::RateMeter,
+    super::{
+        peer_registry::{hard_outbound_capacity, SlotDiagnostics},
+        state::RateMeter,
+    },
     fill::{FillLimits, FillStop},
     BlockSyncStatus, DownloadWindow, ZakuraBlockSyncConfig,
 };
@@ -58,7 +61,7 @@ pub(super) struct PeerState {
     /// Rate meter for status application, with one extra range change per window.
     pub(super) inbound_status_meter: RateMeter,
     /// Allows one immediate range change without permitting an unbounded bypass.
-    pub(super) status_range_bypass_available: bool,
+    status_range_bypass_available: bool,
     /// Clamped limits last published to the registry. Request issuance uses the
     /// latest limits immediately; only publication waits for the meter.
     pub(super) published_limits: (u32, u32, u32),
@@ -71,13 +74,13 @@ pub(super) struct PeerState {
     pub(super) pending_status: Option<BlockSyncStatus>,
     /// Last `reset_epoch` that this routine processed.
     /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
-    pub(super) last_reset_epoch: u64,
+    last_reset_epoch: u64,
     /// Work-queue revocation count when this routine last checked its requests
     /// for lost ownership.
-    pub(super) checked_revocations: u64,
+    checked_revocations: u64,
     /// Start of the current interval in which this peer's outbound queue stayed full.
     /// The liveness check uses the interval to distinguish congestion from a peer that stopped reading.
-    pub(super) outbound_full_since: Option<Instant>,
+    outbound_full_since: Option<Instant>,
     /// Whether this peer has sent a `Status` yet (gates want-work; mirrored into
     /// the registry for the reactor's candidate reads).
     pub(super) received_status: bool,
@@ -88,7 +91,7 @@ pub(super) struct PeerState {
     /// This peer's clamped advertised serving caps, learned from its `Status`.
     /// Authoritative for the routine's own want-work decision (mirrored into the
     /// registry for the reactor's candidate reads).
-    pub(super) max_blocks_per_response: u32,
+    max_blocks_per_response: u32,
     pub(super) max_response_bytes: u32,
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
@@ -181,6 +184,49 @@ impl PeerState {
             floor_cwnd_bytes: window.cwnd_byte_headroom_at(floor_bonus, now),
             above_floor_cwnd_bytes: window.cwnd_byte_headroom_at(0, now),
         })
+    }
+
+    /// Record whether the last capacity attempt found the requester pool empty,
+    /// so the routine also waits for a pool entry.
+    pub(super) fn note_request_pool(&mut self, waiting: bool) {
+        self.request_pool_waiting = waiting;
+    }
+
+    /// Record what a slot publication shows at `now`, and return it. A requester
+    /// that refuses new requests publishes no free slots, so no other routine
+    /// defers the floor to it.
+    pub(super) fn publish_slots(
+        &mut self,
+        requester_stopped: bool,
+        now: Instant,
+    ) -> SlotDiagnostics {
+        let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
+        let available_slots = if requester_stopped {
+            0
+        } else {
+            self.window.available_slots_at(now)
+        };
+        self.published_requester_stopped = requester_stopped;
+        self.published_free_slots = available_slots > 0;
+        SlotDiagnostics {
+            hard_capacity,
+            effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
+            available_slots,
+            outstanding_requests: self.window.outstanding.len(),
+            // Filter the published RTprop by now so a peer that stopped completing
+            // requests stops advertising a stale-low RTprop to the cross-peer
+            // floor-preference comparison.
+            bbr_rtprop_ms: self.window.bbr_rtprop_ms(now),
+        }
+    }
+
+    /// Refill low-water mark in blocks, computed from a single peer's caps.
+    pub(super) fn refill_low_water_blocks(&self, config: &ZakuraBlockSyncConfig) -> usize {
+        let max_blocks_per_response =
+            usize::try_from(config.advertised_max_blocks_per_response()).unwrap_or(usize::MAX);
+        hard_outbound_capacity(self.window.max_inflight_requests)
+            .saturating_mul(max_blocks_per_response)
+            .max(max_blocks_per_response)
     }
 
     /// Allocate the next request identity. A later failure of the same attempt

@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use zakura_chain::block;
 use zakura_rt::{sync::CancellationToken, time::Instant};
 
@@ -19,7 +20,8 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{
-        request::BlockSizeEstimate, test_work_scope, trace::request_owner, BlockSyncStatus,
+        events::RoutineToReactor, request::BlockSizeEstimate, test_work_scope,
+        trace::request_owner, BlockSyncStatus,
     },
     regulation::ReservationPool,
     testkit::{TraceCapture, TraceValue},
@@ -35,13 +37,14 @@ struct Fixture {
     outbound: FramedRecv,
     pool: ReservationPool,
     connection: CancellationToken,
+    events: mpsc::Receiver<RoutineToReactor>,
     heights: Vec<u32>,
 }
 
 fn fixture(max_blocks: u32, heights: &[u32]) -> Fixture {
     let pool = ReservationPool::new(2).unwrap();
     let connection = CancellationToken::new();
-    let (mut routine, outbound, _events) = status_test_routine_with(pool.clone(), &connection);
+    let (mut routine, outbound, events) = status_test_routine_with(pool.clone(), &connection);
     routine.handle_status(BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(10),
@@ -63,6 +66,7 @@ fn fixture(max_blocks: u32, heights: &[u32]) -> Fixture {
         outbound,
         pool,
         connection,
+        events,
         heights: heights.to_vec(),
     }
 }
@@ -261,19 +265,26 @@ fn publish_after(
     let routine = &mut fixture.routine;
     let now = Instant::now();
     let limits = routine.state.fill_limits(&routine.config, now).unwrap();
-    let capacity = routine.acquire_request_capacity(&sender).unwrap();
+    let capacity = routine.io.acquire_request_capacity(&sender).unwrap();
     let request_id = routine.state.allocate_request_id().unwrap();
     let TakenWork {
         download_floor,
         request,
     } = routine.select_work(&limits, request_id, now).unwrap();
-    let unpublished = routine.fund(request, download_floor).unwrap();
+    let unpublished = routine.io.fund(request, download_floor).unwrap();
     assert!(routine.io.budget.reserved() > 0, "funding took its charge");
     let request = block_range_request(&unpublished).unwrap();
+    let max_response_bytes = routine.state.max_response_bytes;
     let writer = routine
-        .authorize_response(&request, capacity.entry, capacity.exchange)
+        .io
+        .authorize_response(
+            &request,
+            max_response_bytes,
+            capacity.entry,
+            capacity.exchange,
+        )
         .unwrap();
-    let frame = routine.encode_request(&request).unwrap();
+    let frame = routine.io.encode_request(&request).unwrap();
     interfere(routine, &mut fixture.outbound, &fixture.connection);
     routine.publish_request(
         unpublished,
@@ -286,10 +297,12 @@ fn publish_after(
     )
 }
 
-/// A closed budget stops the pass before it acquires anything.
+/// A closed budget stops the pass before it acquires anything. The pass reports
+/// its own stop, and it asks for no more work.
 #[tokio::test]
 async fn closed_accounting_stops_before_any_acquisition() {
     let mut fixture = fixture(1, &[1]);
+    while fixture.events.try_recv().is_ok() {}
     fixture
         .routine
         .io
@@ -302,7 +315,43 @@ async fn closed_accounting_stops_before_any_acquisition() {
 
     assert_eq!(report.stop, FillStop::AccountingClosed);
     assert_eq!(fixture.next_request_id(), before);
+    let traced = &fixture.routine.io.fill_stop_trace_at;
+    assert!(traced.contains_key("accounting_closed"));
+    assert!(!traced.contains_key("budget"));
+    assert!(
+        fixture.events.try_recv().is_err(),
+        "closed accounting cannot request more work"
+    );
+    assert_eq!(fixture.routine.io.budget.available(), 0);
     fixture.assert_settled(0);
+}
+
+/// A funding audit that finds drift closes the budget under a live request. The
+/// next pass reports the accounting stop, sends nothing, and asks for no more
+/// work. The live request keeps its work.
+#[tokio::test]
+async fn funding_drift_stops_the_fill_pass() {
+    let mut fixture = fixture(1, &[1]);
+    assert_eq!(fixture.routine.try_fill().sent, 1);
+    fixture.outbound.try_recv().unwrap();
+    while fixture.events.try_recv().is_ok() {}
+    let retained = fixture.routine.io.work.retain_funding_for_test(1);
+    assert!(!fixture.routine.io.work.audit_funding());
+
+    let report = fixture.routine.try_fill();
+
+    assert_eq!(report.stop, FillStop::AccountingClosed);
+    let traced = &fixture.routine.io.fill_stop_trace_at;
+    assert!(traced.contains_key("accounting_closed"));
+    assert!(!traced.contains_key("budget"));
+    assert!(fixture.outbound.try_recv().is_err(), "nothing was sent");
+    assert!(
+        fixture.events.try_recv().is_err(),
+        "closed accounting cannot request more work"
+    );
+    assert_eq!(fixture.routine.io.budget.available(), 0);
+    assert_eq!(fixture.routine.io.work.in_flight_len(), 1);
+    drop(retained);
 }
 
 /// Funding refuses a take that a reset retired after selection. The reset
@@ -317,7 +366,7 @@ async fn a_reset_after_selection_refuses_funding() {
     let taken = routine.select_work(&limits, request_id, now).unwrap();
     routine.io.work.reset_above(block::Height(0));
 
-    let refusal = routine.fund(taken.request, taken.download_floor);
+    let refusal = routine.io.fund(taken.request, taken.download_floor);
 
     assert_eq!(refusal.unwrap_err(), FillStop::StaleWork);
     assert_eq!(routine.io.budget.reserved(), 0);
@@ -334,19 +383,26 @@ async fn refused_authorization_rolls_back_funding() {
     let routine = &mut fixture.routine;
     let now = Instant::now();
     let limits = routine.state.fill_limits(&routine.config, now).unwrap();
-    let held = routine.acquire_request_capacity(&sender).unwrap();
+    let held = routine.io.acquire_request_capacity(&sender).unwrap();
     let request_id = routine.state.allocate_request_id().unwrap();
     let taken = routine.select_work(&limits, request_id, now).unwrap();
-    let unpublished = routine.fund(taken.request, taken.download_floor).unwrap();
+    let unpublished = routine
+        .io
+        .fund(taken.request, taken.download_floor)
+        .unwrap();
     let request = block_range_request(&unpublished).unwrap();
     // An exchange that still owns this range refuses the overlapping reservation.
+    let max_response_bytes = routine.state.max_response_bytes;
     let earlier = routine
-        .authorize_response(&request, held.entry, held.exchange)
+        .io
+        .authorize_response(&request, max_response_bytes, held.entry, held.exchange)
         .unwrap();
     let entry = routine.io.requester.pool.try_entry().unwrap();
     let exchange = routine.io.requester.open().unwrap();
 
-    let refusal = routine.authorize_response(&request, entry, exchange);
+    let refusal = routine
+        .io
+        .authorize_response(&request, max_response_bytes, entry, exchange);
 
     assert_eq!(refusal.err(), Some(FillStop::Internal));
     assert!(routine.io.cancel.is_cancelled());

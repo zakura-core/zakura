@@ -20,19 +20,24 @@ const STARTED: u8 = 2;
 const WRITTEN: u8 = 3;
 const EXPIRED: u8 = 4;
 
+/// Report one request step, in test and simulator builds.
+macro_rules! report {
+    ($reporter:expr, $step:expr) => {
+        #[cfg(any(test, zakura_sim))]
+        $reporter.report($step);
+    };
+}
+
 #[cfg(test)]
 mod tests;
 
 /// Observes whether transport skipped an attempt without retaining its work or
 /// byte reservation. The routine can keep this after the writer drops its claim.
 ///
-/// In test and simulator builds it also carries its request's reporter, so
-/// every expiry reports its step, whichever owner expires the request.
+/// It carries its request's reporter, so every expiry reports its step, whichever
+/// owner expires the request.
 #[derive(Clone, Debug)]
-pub(in crate::zakura::block_sync) struct RequestWriteStatus(
-    Arc<AtomicU8>,
-    #[cfg(any(test, zakura_sim))] Option<Arc<RequestReporter>>,
-);
+pub(in crate::zakura::block_sync) struct RequestWriteStatus(Arc<AtomicU8>, RequestReporter);
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn was_skipped(&self) -> bool {
@@ -69,36 +74,63 @@ impl RequestWriteStatus {
             .0
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        #[cfg(any(test, zakura_sim))]
-        if let (true, Some(reporter)) = (expired, &self.1) {
-            reporter.report(RequestStep::Expired);
+        if expired {
+            report!(self.1, RequestStep::Expired);
         }
         expired
     }
 }
 
-/// Reports one request's steps to the queue's observer.
+/// Reports one request's steps to the queue's observer. Outside test and simulator
+/// builds it is empty, and `report!` compiles to nothing.
+#[derive(Clone, Debug, Default)]
+pub(in crate::zakura::block_sync) struct RequestReporter(
+    #[cfg(any(test, zakura_sim))] Option<Arc<RequestReport>>,
+);
+
+/// What a [`RequestReporter`] reports with each step.
 #[cfg(any(test, zakura_sim))]
 #[derive(Debug)]
-pub(in crate::zakura::block_sync) struct RequestReporter {
+pub(in crate::zakura::block_sync) struct RequestReport {
     observer: crate::zakura::block_sync::block_sync_observe::ObserverSlot,
     owner: BodyWorkOwner,
     heights: Vec<block::Height>,
     estimated_bytes: u64,
 }
 
-#[cfg(any(test, zakura_sim))]
 impl RequestReporter {
+    fn new(
+        work: &WorkQueue,
+        owner: BodyWorkOwner,
+        items: &[(block::Height, WorkItem)],
+        estimated_bytes: u64,
+    ) -> Self {
+        #[cfg(not(any(test, zakura_sim)))]
+        let _ = (work, owner, items, estimated_bytes);
+        Self(
+            #[cfg(any(test, zakura_sim))]
+            Some(Arc::new(RequestReport {
+                observer: work.observer.clone(),
+                owner,
+                heights: items.iter().map(|(height, _)| *height).collect(),
+                estimated_bytes,
+            })),
+        )
+    }
+
+    #[cfg(any(test, zakura_sim))]
     fn report(&self, step: RequestStep) {
-        observe!(
-            self.observer,
-            BlockEvent::Request {
-                owner: self.owner,
-                heights: self.heights.clone(),
-                estimated_bytes: self.estimated_bytes,
-                step,
-            }
-        );
+        if let Some(report) = &self.0 {
+            observe!(
+                report.observer,
+                BlockEvent::Request {
+                    owner: report.owner,
+                    heights: report.heights.clone(),
+                    estimated_bytes: report.estimated_bytes,
+                    step,
+                }
+            );
+        }
     }
 }
 
@@ -135,9 +167,7 @@ pub(crate) struct RequestWrite {
     work: Arc<WorkQueue>,
     cancel: CancellationToken,
     state: Arc<AtomicU8>,
-    /// Reports this request's steps, in test and simulator builds.
-    #[cfg(any(test, zakura_sim))]
-    reporter: Arc<RequestReporter>,
+    reporter: RequestReporter,
 }
 
 /// Owns an exact provisional take until admission or rollback.
@@ -145,8 +175,7 @@ pub(crate) struct RequestWrite {
 pub(in crate::zakura::block_sync) struct TakenRequest {
     work: Arc<WorkQueue>,
     items: Vec<(block::Height, WorkItem)>,
-    #[cfg(any(test, zakura_sim))]
-    reporter: Option<RequestReporter>,
+    reporter: RequestReporter,
 }
 
 /// Why a provisional take could not acquire funding.
@@ -166,8 +195,7 @@ impl TakenRequest {
         Self {
             work,
             items,
-            #[cfg(any(test, zakura_sim))]
-            reporter: None,
+            reporter: RequestReporter::default(),
         }
     }
 
@@ -190,7 +218,7 @@ impl TakenRequest {
     /// Admit the retained take against its queue's budget. Derive the charge and
     /// floor exception from its actual items and the supplied download-floor view.
     pub(in crate::zakura::block_sync) fn admit(
-        self,
+        mut self,
         download_floor: block::Height,
         cancel: CancellationToken,
     ) -> Result<UnpublishedRequest, AdmitRefusal> {
@@ -229,23 +257,10 @@ impl TakenRequest {
                 None => return Err(self.funding_refusal()),
             }
         };
-        #[cfg(any(test, zakura_sim))]
-        let mut self_owned = self;
-        #[cfg(not(any(test, zakura_sim)))]
-        let self_owned = self;
-        #[cfg(any(test, zakura_sim))]
-        {
-            let reporter = RequestReporter {
-                observer: self_owned.work.observer.clone(),
-                owner,
-                heights: self_owned.items.iter().map(|(height, _)| *height).collect(),
-                estimated_bytes: bytes,
-            };
-            reporter.report(RequestStep::Funded);
-            self_owned.reporter = Some(reporter);
-        }
+        self.reporter = RequestReporter::new(&self.work, owner, &self.items, bytes);
+        report!(self.reporter, RequestStep::Funded);
         Ok(UnpublishedRequest {
-            taken: self_owned,
+            taken: self,
             owner,
             priority,
             funding,
@@ -264,10 +279,10 @@ impl TakenRequest {
 
 impl Drop for TakenRequest {
     fn drop(&mut self) {
-        #[cfg(any(test, zakura_sim))]
-        if let Some(reporter) = &self.reporter {
-            reporter.report(RequestStep::Dropped(RequestWritePhase::Unpublished));
-        }
+        report!(
+            self.reporter,
+            RequestStep::Dropped(RequestWritePhase::Unpublished)
+        );
         if !self.items.is_empty() {
             self.work.return_unpublished(&self.items);
         }
@@ -303,13 +318,6 @@ impl UnpublishedRequest {
 
     /// Publish outstanding state and enqueue under the work lock. The local
     /// claim survives the callback so a closed channel cannot drop it under the lock.
-    #[cfg_attr(
-        any(test, zakura_sim),
-        allow(
-            clippy::unwrap_in_result,
-            reason = "missing capture is an infrastructure failure, not a publication refusal"
-        )
-    )]
     pub(in crate::zakura::block_sync) fn publish(
         self,
         publish: impl FnOnce(&Arc<RequestWrite>),
@@ -322,13 +330,7 @@ impl UnpublishedRequest {
             ..
         } = self;
         let claim = Arc::new(RequestWrite {
-            #[cfg(any(test, zakura_sim))]
-            reporter: Arc::new(
-                taken
-                    .reporter
-                    .take()
-                    .expect("admission creates the request reporter"),
-            ),
+            reporter: std::mem::take(&mut taken.reporter),
             owner,
             items: std::mem::take(&mut taken.items),
             work: taken.work.clone(),
@@ -363,8 +365,7 @@ impl UnpublishedRequest {
                 },
             );
             claim.state.store(QUEUED, Ordering::Release);
-            #[cfg(any(test, zakura_sim))]
-            claim.observe(RequestStep::Published);
+            report!(claim.reporter, RequestStep::Published);
             // The queue transition is complete. Release its lock before unwinding
             // a callback so claim cleanup can settle the published reservation.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish(&claim)));
@@ -379,17 +380,7 @@ impl UnpublishedRequest {
 
 impl RequestWrite {
     pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
-        RequestWriteStatus(
-            self.state.clone(),
-            #[cfg(any(test, zakura_sim))]
-            Some(self.reporter.clone()),
-        )
-    }
-
-    /// Reports `step` to the queue's observer, if one is installed.
-    #[cfg(any(test, zakura_sim))]
-    fn observe(&self, step: RequestStep) {
-        self.reporter.report(step);
+        RequestWriteStatus(self.state.clone(), self.reporter.clone())
     }
 
     pub(super) fn owner(&self) -> BodyWorkOwner {
@@ -403,8 +394,7 @@ impl RequestWrite {
     /// A reserved queue slot lost its receiver during publication. Settle the
     /// ledger now even if that closed channel retains a copy of this claim.
     pub(in crate::zakura::block_sync) fn delivery_failed(&self) {
-        #[cfg(any(test, zakura_sim))]
-        self.observe(RequestStep::DeliveryFailed);
+        report!(self.reporter, RequestStep::DeliveryFailed);
         self.cancel.cancel();
         self.expire_unwritten();
         self.work
@@ -429,8 +419,7 @@ impl RequestWrite {
     }
 
     pub(super) fn reset(&self) {
-        #[cfg(any(test, zakura_sim))]
-        self.observe(RequestStep::Reset);
+        report!(self.reporter, RequestStep::Reset);
         self.expire_unwritten();
         if self.state.load(Ordering::Acquire) == STARTED {
             // The prefix already belongs to this ordered stream. Cancelling the
@@ -454,17 +443,15 @@ impl FrameWriteClaim for RequestWrite {
             .state
             .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        #[cfg(any(test, zakura_sim))]
         if started {
-            self.observe(RequestStep::Started);
+            report!(self.reporter, RequestStep::Started);
         }
         started
     }
 
     fn written(&self) {
         self.state.store(WRITTEN, Ordering::Release);
-        #[cfg(any(test, zakura_sim))]
-        self.observe(RequestStep::Written);
+        report!(self.reporter, RequestStep::Written);
         self.work.lock().request_writes.remove(&self.owner);
     }
 }
@@ -492,7 +479,6 @@ impl Drop for RequestWrite {
                 self.work.lock().request_writes.remove(&self.owner);
             }
         }
-        #[cfg(any(test, zakura_sim))]
-        self.observe(RequestStep::Dropped(self.status().phase()));
+        report!(self.reporter, RequestStep::Dropped(self.status().phase()));
     }
 }

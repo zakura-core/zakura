@@ -15,25 +15,16 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
+use super::model::{expected_retry_run, fund_through_queue};
 use super::*;
 use crate::zakura::{
     block_sync::{
         config::{BS_BLOCKS_PER_RESPONSE, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
         request::BlockSizeEstimate,
-        test_work_scope,
         work_queue::WorkQueue,
     },
     transport::ByteBudget,
 };
-
-fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {
-    let start = allowed.iter().position(|allowed| *allowed)?;
-    let len = allowed[start..]
-        .iter()
-        .take_while(|allowed| **allowed)
-        .count();
-    Some(start..start + len)
-}
 
 #[test]
 fn retry_filter_retains_each_small_allowed_run() {
@@ -42,7 +33,17 @@ fn retry_filter_retains_each_small_allowed_run() {
             let allowed: Vec<_> = (0..len)
                 .map(|index| mask & (1usize << index) != 0)
                 .collect();
-            let expected = reference_first_allowed_run(&allowed);
+            let facts: Vec<_> = allowed
+                .iter()
+                .map(|allowed| {
+                    if *allowed {
+                        RetryFact::Allowed
+                    } else {
+                        RetryFact::ProtocolBlocked
+                    }
+                })
+                .collect();
+            let expected = expected_retry_run(&facts);
             let items: Vec<_> = (0..len).collect();
             let mut calls = vec![0usize; len];
 
@@ -51,17 +52,12 @@ fn retry_filter_retains_each_small_allowed_run() {
                 allowed[*item]
             });
 
-            assert_eq!(actual, expected, "len={len}, mask={mask:#08b}");
+            assert_eq!(actual, expected.keep, "len={len}, mask={mask:#08b}");
 
-            let visited_len = match &expected {
-                Some(range) if range.end < len => range.end + 1,
-                Some(range) => range.end,
-                None => len,
-            };
             for (index, calls) in calls.into_iter().enumerate() {
                 assert_eq!(
                     calls,
-                    usize::from(index < visited_len),
+                    usize::from(index < expected.visited),
                     "len={len}, mask={mask:#08b}, index={index}"
                 );
             }
@@ -276,29 +272,30 @@ fn admit_kept(
     // The queue owns only heights above genesis, and raw scenario heights can be
     // zero. Shifting the floor and the run together keeps their priority.
     let shifted = |height: block::Height| block::Height(height.0 + 1);
-    queue.extend(
-        test_work_scope(),
-        kept.iter().map(|(height, estimate)| {
+    let wanted: Vec<_> = kept
+        .iter()
+        .map(|(height, estimate)| {
             (
                 shifted(*height),
-                block::Hash([7; 32]),
                 BlockSizeEstimate::Confirmed(u32::try_from(*estimate).unwrap()),
             )
-        }),
-    );
-    let (low, high) = (shifted(kept.first()?.0), shifted(kept.last()?.0));
-    let request_id = std::num::NonZeroU64::MIN;
-    let take = queue.take_request(low, high, kept.len(), u64::MAX, 1, request_id);
-    let cancel = zakura_rt::sync::CancellationToken::new();
-    let funded = take.admit(shifted(download_floor), cancel).ok()?;
+        })
+        .collect();
+    let (_, funding) = fund_through_queue(
+        &queue,
+        shifted(download_floor),
+        &[],
+        &wanted,
+        0..wanted.len(),
+    )?;
     Some(Funded {
-        priority: funded.priority(),
-        reserved_bytes: funded.bytes(),
+        priority: funding.priority,
+        reserved_bytes: funding.reserved_bytes,
         overdrafts: false,
     })
 }
 
-/// Fund a retained run the way `PeerRoutine::fund` does.
+/// Fund a retained run the way `PeerIO::fund` does.
 fn fund_retained(download_floor: block::Height, kept: &[(block::Height, u64)]) -> Funded {
     let funded = admit_kept(download_floor, kept, u64::MAX / 2)
         .expect("a run with an ample budget always funds");
@@ -465,37 +462,26 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
 
     // The retry filter keeps the first allowed contiguous run and reads each
     // visited item once, stopping after that run.
-    let fact = |raw: &u32| {
-        scenario
-            .facts
-            .get(raw)
-            .copied()
-            .unwrap_or(RetryFact::Allowed)
-    };
-    let first = items
+    let facts: Vec<_> = items
         .iter()
-        .position(|(raw, _)| fact(raw) == RetryFact::Allowed);
-    let expected_keep = first.map(|first| {
-        let len = items[first..]
-            .iter()
-            .take_while(|(raw, _)| fact(raw) == RetryFact::Allowed)
-            .count();
-        first..first + len
-    });
-    let visited = match &expected_keep {
-        Some(keep) => (keep.end + 1).min(items.len()),
-        None => items.len(),
-    };
-    let expected_visits: Vec<_> = items[..visited].iter().map(|(raw, _)| *raw).collect();
+        .map(|(raw, _)| {
+            scenario
+                .facts
+                .get(raw)
+                .copied()
+                .unwrap_or(RetryFact::Allowed)
+        })
+        .collect();
+    let expected = expected_retry_run(&facts);
+    let expected_keep = expected.keep;
+    let expected_visits: Vec<_> = items[..expected.visited]
+        .iter()
+        .map(|(raw, _)| *raw)
+        .collect();
     let retry = attempt.retry.as_ref().expect("a selected take is filtered");
     assert_eq!(retry.keep, expected_keep);
     assert_eq!(attempt.visits, expected_visits);
-    assert_eq!(
-        retry.timed_rejection,
-        expected_visits
-            .iter()
-            .any(|raw| fact(raw) == RetryFact::Avoided)
-    );
+    assert_eq!(retry.timed_rejection, expected.timed_rejection);
 
     // Funding follows the retained run's first height, never the lane or the probe.
     match (&expected_keep, attempt.funding) {

@@ -397,10 +397,7 @@ fn a_clean_run_holds_no_task_panic() {
 fn every_harness_names_its_statuses() {
     for entry in HARNESSES {
         let properties = (entry.properties)();
-        if zakura_sim::harness::block_work::is_machine(entry.name)
-            || zakura_sim::harness::header_work::is_machine(entry.name)
-            || zakura_sim::harness::discovery_machine::is_machine(entry.name)
-        {
+        if entry.machine {
             assert_eq!(properties.len(), 1);
             assert_eq!(properties[0].id, entry.name);
             assert_eq!(entry.status(NO_TASK_PANIC), None);

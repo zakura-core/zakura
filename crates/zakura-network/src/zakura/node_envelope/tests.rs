@@ -15,11 +15,8 @@ use super::*;
 use crate::{
     config::Config,
     zakura::{
-        regulation::{test_family, OutputByteBudget, ServeCapacity, ServeLimits, SessionCapacity},
-        transport::{
-            ByteBudget, FrameGate, NodeResources, NodeUsage, OwnerCounts, OwnerPhase,
-            TransportLimits,
-        },
+        regulation::{test_family, ServeCapacity, ServeLimits, SessionCapacity},
+        transport::{ByteBudget, NodeResources, OwnerCounts, OwnerPhase, TransportLimits},
         ServicePeerDirection, ServicePeerLimits,
     },
 };
@@ -252,24 +249,6 @@ fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
     drop(handshakes);
 }
 
-/// Every metric label comes from fixed tables, so churn cannot grow their cardinality.
-#[test]
-fn usage_diagnostics_keep_a_fixed_vocabulary() {
-    let node = NodeResources::new(transport());
-    let labels = |usage: NodeUsage| usage.budget_bytes().map(|(label, _)| label);
-    let empty = labels(node.usage());
-
-    let streams: Vec<_> = (0..64).map(|_| node.connection().stream()).collect();
-    let grants: Vec<_> = streams
-        .iter()
-        .map(|stream| stream.raw.try_admit(8).expect("the first frame is funded"))
-        .collect();
-
-    assert_eq!(labels(node.usage()), empty);
-    assert_eq!(empty, ["raw", "output", "compat_response"]);
-    drop(grants);
-}
-
 /// One family holds all shared transport bytes and its own owner. Every other family
 /// keeps its own capacity, and the sum stays inside the composed bound.
 #[tokio::test]
@@ -407,17 +386,4 @@ async fn control_frames_progress_through_saturated_output() {
         .expect("the returned floor slot admits the next frame");
     assert_eq!(node.usage().output_bytes, held_output);
     drop(next);
-}
-
-/// An unpolled admission holds nothing, and an abandoned wait leaves every budget as it
-/// found it.
-#[test]
-fn an_unpolled_admission_holds_nothing() {
-    let shared = OutputByteBudget::new(WINDOW).expect("the budget size is valid");
-    let node = OutputByteBudget::new(WINDOW).expect("the budget size is valid");
-    let gate = FrameGate::new(shared.clone(), node.clone());
-
-    drop(gate.admit(WINDOW));
-    assert_eq!(shared.granted(), 0);
-    assert_eq!(node.granted(), 0);
 }

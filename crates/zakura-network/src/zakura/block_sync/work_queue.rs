@@ -34,7 +34,7 @@ use zakura_rt::{
     },
 };
 
-use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
+use super::request::BlockSizeEstimate;
 use crate::zakura::transport::{
     BudgetClosure, BudgetClosureNotification, ByteBudget, ByteRelease, ByteReservation,
     ReservationError,
@@ -48,63 +48,9 @@ pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
 pub(super) use request_write::{AdmitRefusal, RequestWrite, RequestWriteStatus, TakenRequest};
 use state::{WorkQueueState, WorkWake};
-
-/// Lower clamp on a body-size estimate.
-pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
-
-/// Per-height download metadata held in the [`WorkQueue`].
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct WorkItem {
-    /// Exact durable coordinates that authorized this body download.
-    pub(super) scope: zakura_header_chain::BodyWorkAuthority,
-    /// Exact attempt, retained from provisional take through response receipt.
-    pub(super) owner: Option<zakura_header_chain::BodyWorkOwner>,
-    /// Taken by an attempt that has not yet published its reservation and frame.
-    provisional: bool,
-    /// Expected hash of the block at this height (drives the response match).
-    pub(super) hash: block::Hash,
-    /// The block's size estimate. Used for request budget reservation and the receive-path size-hint mismatch metric.
-    pub(super) estimated_bytes: u64,
-    /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
-    observed_bytes: u64,
-    /// Refreshed hint for a future retry while an issued reservation stays fixed.
-    retry_estimated_bytes: Option<u64>,
-    /// A pressure refusal waits for verified progress before it can be retried.
-    retry_after_tip: Option<block::Height>,
-    /// Request reservation; received bodies use `Released`.
-    pub(super) budget: BlockBudgetLedger,
-    /// Another attempt's body ended this owner's reservation. The owner's request
-    /// still claims the height, so dropping or moving the item is a revocation.
-    answered_elsewhere: bool,
-}
-
-/// Where a queued item sits in its download lifecycle.
 #[cfg(any(test, zakura_sim))]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum WorkItemPlace {
-    /// Waiting for a request.
-    Pending,
-    /// Taken by a request that has not yet published its reservation here.
-    Provisional,
-    /// Taken by a published request.
-    InFlight,
-}
-
-/// One queued item's owner and byte quantities.
-#[cfg(any(test, zakura_sim))]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct WorkItemOwnership {
-    /// The item's height.
-    pub height: block::Height,
-    /// The request that took the item, if one did.
-    pub owner: Option<zakura_header_chain::BodyWorkOwner>,
-    /// Where the item sits.
-    pub place: WorkItemPlace,
-    /// The size estimate a request for this item reserves.
-    pub estimated_bytes: u64,
-    /// The estimate bytes this item currently charges to the queue's tally.
-    pub reserved_bytes: u64,
-}
+pub use state::{WorkItemOwnership, WorkItemPlace};
+pub(super) use state::{WorkItem, WorkReturnOutcome};
 
 /// A request reservation that a received body ended.
 #[derive(Debug)]
@@ -113,37 +59,6 @@ pub(super) struct EndedReservation {
     pub(super) charge: u64,
     /// Owns the charge and the unsent heights of a queued request that receipt retired.
     pub(super) funding: ByteReservation,
-}
-
-/// Diagnostics for an attempted `in_flight -> pending` retry transition.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct WorkReturnOutcome {
-    /// This owner's frame was skipped before writing, atomically with settlement.
-    pub(super) request_was_unwritten: bool,
-    /// Reserved bytes released while returning or discarding items.
-    pub(super) released_bytes: u64,
-    /// Reserved items successfully moved back to `pending`.
-    pub(super) returned_count: u64,
-    /// Owned heights discarded because they are already committed.
-    pub(super) committed_count: u64,
-    /// Requested heights that were already back in `pending`.
-    pub(super) already_pending_count: u64,
-    /// Received items still present in `in_flight` with a `Released` ledger.
-    pub(super) released_count: u64,
-    /// Requested heights absent from both `pending` and `in_flight`.
-    pub(super) missing_count: u64,
-    /// Lowest height considered by the cleanup.
-    pub(super) min_height: Option<block::Height>,
-    /// Highest height considered by the cleanup.
-    pub(super) max_height: Option<block::Height>,
-}
-
-impl WorkReturnOutcome {
-    /// Whether the cleanup took unreceived work away from its owner: it returned
-    /// a reserved height or discarded a committed one.
-    pub(super) fn revoked_work(&self) -> bool {
-        self.returned_count > 0 || self.committed_count > 0
-    }
 }
 
 /// The queue lock's contents: the logical owner plus the runtime registrations

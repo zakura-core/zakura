@@ -4637,7 +4637,7 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
 
 #[test]
 fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
-    use super::work_queue::DEFAULT_BS_SIZE_FLOOR_BYTES;
+    use super::work_queue::state::DEFAULT_BS_SIZE_FLOOR_BYTES;
 
     // Default estimator: Unknown -> worst case; tiny hints clamp up to the floor;
     // huge hints clamp down to MAX_BLOCK_BYTES; ordinary hints pass through.

@@ -17,10 +17,7 @@ use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, BodyWorkOwner};
 
-use super::{
-    super::{request::BlockSizeEstimate, state::BlockBudgetLedger},
-    WorkItem, WorkReturnOutcome, DEFAULT_BS_SIZE_FLOOR_BYTES,
-};
+use super::super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
@@ -32,6 +29,94 @@ pub use tests::{
     WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary, WorkOwnershipStep,
     WorkOwnershipView,
 };
+
+/// Lower clamp on a body-size estimate.
+pub(in crate::zakura::block_sync) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
+
+/// Per-height download metadata held in the [`WorkQueue`](super::WorkQueue).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct WorkItem {
+    /// Exact durable coordinates that authorized this body download.
+    pub(in crate::zakura::block_sync) scope: zakura_header_chain::BodyWorkAuthority,
+    /// Exact attempt, retained from provisional take through response receipt.
+    pub(in crate::zakura::block_sync) owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Taken by an attempt that has not yet published its reservation and frame.
+    provisional: bool,
+    /// Expected hash of the block at this height (drives the response match).
+    pub(in crate::zakura::block_sync) hash: block::Hash,
+    /// The block's size estimate. Used for request budget reservation and the receive-path size-hint mismatch metric.
+    pub(in crate::zakura::block_sync) estimated_bytes: u64,
+    /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
+    observed_bytes: u64,
+    /// Refreshed hint for a future retry while an issued reservation stays fixed.
+    retry_estimated_bytes: Option<u64>,
+    /// A pressure refusal waits for verified progress before it can be retried.
+    retry_after_tip: Option<block::Height>,
+    /// Request reservation; received bodies use `Released`.
+    pub(in crate::zakura::block_sync) budget: BlockBudgetLedger,
+    /// Another attempt's body ended this owner's reservation. The owner's request
+    /// still claims the height, so dropping or moving the item is a revocation.
+    answered_elsewhere: bool,
+}
+
+/// Where a queued item sits in its download lifecycle.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WorkItemPlace {
+    /// Waiting for a request.
+    Pending,
+    /// Taken by a request that has not yet published its reservation here.
+    Provisional,
+    /// Taken by a published request.
+    InFlight,
+}
+
+/// One queued item's owner and byte quantities.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemOwnership {
+    /// The item's height.
+    pub height: block::Height,
+    /// The request that took the item, if one did.
+    pub owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Where the item sits.
+    pub place: WorkItemPlace,
+    /// The size estimate a request for this item reserves.
+    pub estimated_bytes: u64,
+    /// The estimate bytes this item currently charges to the queue's tally.
+    pub reserved_bytes: u64,
+}
+
+/// Diagnostics for an attempted `in_flight -> pending` retry transition.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct WorkReturnOutcome {
+    /// This owner's frame was skipped before writing, atomically with settlement.
+    pub(in crate::zakura::block_sync) request_was_unwritten: bool,
+    /// Reserved bytes released while returning or discarding items.
+    pub(in crate::zakura::block_sync) released_bytes: u64,
+    /// Reserved items successfully moved back to `pending`.
+    pub(in crate::zakura::block_sync) returned_count: u64,
+    /// Owned heights discarded because they are already committed.
+    pub(in crate::zakura::block_sync) committed_count: u64,
+    /// Requested heights that were already back in `pending`.
+    pub(in crate::zakura::block_sync) already_pending_count: u64,
+    /// Received items still present in `in_flight` with a `Released` ledger.
+    pub(in crate::zakura::block_sync) released_count: u64,
+    /// Requested heights absent from both `pending` and `in_flight`.
+    pub(in crate::zakura::block_sync) missing_count: u64,
+    /// Lowest height considered by the cleanup.
+    pub(in crate::zakura::block_sync) min_height: Option<block::Height>,
+    /// Highest height considered by the cleanup.
+    pub(in crate::zakura::block_sync) max_height: Option<block::Height>,
+}
+
+impl WorkReturnOutcome {
+    /// Whether the cleanup took unreceived work away from its owner: it returned
+    /// a reserved height or discarded a committed one.
+    pub(in crate::zakura::block_sync) fn revoked_work(&self) -> bool {
+        self.returned_count > 0 || self.committed_count > 0
+    }
+}
 
 /// Wakeups that a logical work transition requires.
 #[must_use]
@@ -131,22 +216,22 @@ pub(in crate::zakura::block_sync) struct WorkQueueState {
 impl WorkQueueState {
     /// Read each item's ownership and charge from the maps, not the tallies.
     #[cfg(any(test, zakura_sim))]
-    pub(super) fn ownership(&self) -> Vec<super::WorkItemOwnership> {
+    pub(super) fn ownership(&self) -> Vec<WorkItemOwnership> {
         let pending = self
             .pending
             .iter()
-            .map(|(height, item)| (height, item, super::WorkItemPlace::Pending));
+            .map(|(height, item)| (height, item, WorkItemPlace::Pending));
         let in_flight = self.in_flight.iter().map(|(height, item)| {
             let place = if item.provisional {
-                super::WorkItemPlace::Provisional
+                WorkItemPlace::Provisional
             } else {
-                super::WorkItemPlace::InFlight
+                WorkItemPlace::InFlight
             };
             (height, item, place)
         });
         pending
             .chain(in_flight)
-            .map(|(height, item, place)| super::WorkItemOwnership {
+            .map(|(height, item, place)| WorkItemOwnership {
                 height: *height,
                 owner: item.owner,
                 place,

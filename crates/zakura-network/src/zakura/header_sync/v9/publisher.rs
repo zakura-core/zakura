@@ -348,16 +348,15 @@ struct EncodedPage {
     frame: Frame,
 }
 
-/// What a page job produced.
+/// What a page job found instead of a page.
 #[derive(Debug)]
-enum JobResult {
-    Page(EncodedPage),
+enum Refusal {
     /// Storage refused a lease for capacity. The signal reports its release.
     CapacityBusy(ServingCapacitySignal),
     Settled(Output),
 }
 
-impl From<Output> for JobResult {
+impl From<Output> for Refusal {
     fn from(output: Output) -> Self {
         Self::Settled(output)
     }
@@ -485,8 +484,7 @@ enum Progress<'a> {
     /// The encoded page and its transport slot, boxed because the slot's send
     /// handle dwarfs the other variants.
     Page(Box<(EncodedPage, PushSend<'a>)>),
-    CapacityBusy(ServingCapacitySignal),
-    Other(Output),
+    Refused(Refusal),
     Closed,
 }
 
@@ -641,14 +639,14 @@ fn settle(
             }
             ControlFlow::Continue(())
         }
-        Progress::CapacityBusy(signal) => {
+        Progress::Refused(Refusal::CapacityBusy(signal)) => {
             metrics::counter!("sync.header.v9.publisher.stall", "reason" => "capacity")
                 .increment(1);
             let latest = selected.borrow().clone();
             lock(shared).capacity_busy(key, signal, latest.as_ref());
             ControlFlow::Continue(())
         }
-        Progress::Other(output) => {
+        Progress::Refused(Refusal::Settled(output)) => {
             match &output {
                 Output::Retry(reason) => {
                     metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => *reason)
@@ -721,20 +719,22 @@ fn start_page<'a, const HEADER_BYTES: usize>(
                 }
             }
         });
-        let (result, permit): (JobResult, Admission) = match running.await {
+        let (result, permit) = match running.await {
             Ok(Some(done)) => done,
             // The publisher task re-raises the job's panic.
-            Ok(None) => return Progress::Other(Output::Stall(Stall::Local, "job_panicked")),
+            Ok(None) => {
+                let panicked = Output::Stall(Stall::Local, "job_panicked");
+                return Progress::Refused(panicked.into());
+            }
             // The runtime is shutting down.
             Err(_) => return Progress::Closed,
         };
         let (encoded, permit) = match (result, permit) {
-            (JobResult::Page(encoded), Admission::Page(permit)) => (encoded, permit),
-            (JobResult::Page(_), Admission::Check { .. }) => {
+            (Ok(encoded), Admission::Page(permit)) => (encoded, permit),
+            (Ok(_), Admission::Check { .. }) => {
                 unreachable!("a check runs `check_following`, which reads no page")
             }
-            (JobResult::CapacityBusy(signal), _) => return Progress::CapacityBusy(signal),
-            (JobResult::Settled(output), _) => return Progress::Other(output),
+            (Err(refusal), _) => return Progress::Refused(refusal),
         };
         let Ok(slot) = permit.reserve_send(send).await else {
             return Progress::Closed;
@@ -742,7 +742,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         if following
             && !still_selected(&*check_port, &push, id, &selected, seen, &encoded.page).await
         {
-            return Progress::Other(Output::Retry("left_selected_chain"));
+            return Progress::Refused(Output::Retry("left_selected_chain").into());
         }
         Progress::Page(Box::new((encoded, slot)))
     })
@@ -791,20 +791,20 @@ async fn run_job<const HEADER_BYTES: usize>(
     port: &dyn Port,
     owner: LeaseOwner,
     job: &Job,
-) -> JobResult {
+) -> Result<EncodedPage, Refusal> {
     if job.count == 0 {
-        return check_following(port, job).await.into();
+        return Err(check_following(port, job).await.into());
     }
     if job.probe {
         match port.selected_chain_contains(job.initial_target).await {
             Ok(SelectedChainMembership::Selected(_)) => {}
             Ok(SelectedChainMembership::NotSelected) => {
-                return Output::End(HeadersOutcomeCode::TargetNotSelected).into()
+                return Err(Output::End(HeadersOutcomeCode::TargetNotSelected).into())
             }
             Ok(SelectedChainMembership::NotRetained) => {
-                return Output::End(HeadersOutcomeCode::TargetNotRetained).into()
+                return Err(Output::End(HeadersOutcomeCode::TargetNotRetained).into())
             }
-            Err(error) => return port_failure(job.id, "probe", &error).into(),
+            Err(error) => return Err(port_failure(job.id, "probe", &error).into()),
         }
     }
     // Keep leasing toward the pinned tip while it is selected, so the lease
@@ -813,7 +813,7 @@ async fn run_job<const HEADER_BYTES: usize>(
         Some(pin) => match port.selected_chain_contains(pin.hash).await {
             Ok(SelectedChainMembership::Selected(found)) if found == pin => pin.hash,
             Ok(_) => job.lease_target,
-            Err(error) => return port_failure(job.id, "pin", &error).into(),
+            Err(error) => return Err(port_failure(job.id, "pin", &error).into()),
         },
         None => job.lease_target,
     };
@@ -822,38 +822,38 @@ async fn run_job<const HEADER_BYTES: usize>(
         let reply = acquire(port, owner, job.selected.as_ref(), lease_target, locators).await;
         let path = match reply {
             Ok(AcquirePathReply::Acquired(path)) => *path,
-            Ok(AcquirePathReply::CapacityBusy(signal)) => return JobResult::CapacityBusy(signal),
+            Ok(AcquirePathReply::CapacityBusy(signal)) => return Err(Refusal::CapacityBusy(signal)),
             // The selected chain no longer extends the last header sent.
             Ok(AcquirePathReply::NoLocatorIntersection) if job.following => {
-                return Output::End(HeadersOutcomeCode::SubscriptionSuperseded).into()
+                return Err(Output::End(HeadersOutcomeCode::SubscriptionSuperseded).into())
             }
             Ok(AcquirePathReply::NoLocatorIntersection) => {
-                return Output::End(HeadersOutcomeCode::NoLocatorIntersection).into()
+                return Err(Output::End(HeadersOutcomeCode::NoLocatorIntersection).into())
             }
             // A stale selected tip: the next selected-chain change retries.
             Ok(AcquirePathReply::TargetNotRetained) if job.following => {
-                return Output::Stall(Stall::Local, "selected_tip").into()
+                return Err(Output::Stall(Stall::Local, "selected_tip").into())
             }
             Ok(AcquirePathReply::TargetNotRetained) => {
-                return Output::End(HeadersOutcomeCode::TargetNotRetained).into()
+                return Err(Output::End(HeadersOutcomeCode::TargetNotRetained).into())
             }
             Ok(AcquirePathReply::HistoryPruned) => {
-                return Output::End(HeadersOutcomeCode::HistoryPruned).into()
+                return Err(Output::End(HeadersOutcomeCode::HistoryPruned).into())
             }
-            Ok(AcquirePathReply::Busy) => return Output::Stall(Stall::Local, "acquire").into(),
-            Err(error) => return port_failure(job.id, "acquire", &error).into(),
+            Ok(AcquirePathReply::Busy) => return Err(Output::Stall(Stall::Local, "acquire").into()),
+            Err(error) => return Err(port_failure(job.id, "acquire", &error).into()),
         };
         if job.parent.is_none() && path.common_ancestor == path.target {
             let target = path.target;
             release(port, job.id, path).await;
-            return Output::ReachedAtOpen(target).into();
+            return Err(Output::ReachedAtOpen(target).into());
         }
         if job
             .parent
             .is_some_and(|parent| parent != path.common_ancestor)
         {
             release(port, job.id, path).await;
-            return Output::Stall(Stall::Local, "lease_parent").into();
+            return Err(Output::Stall(Stall::Local, "lease_parent").into());
         }
         let read = ReadPath {
             after_hash: path.common_ancestor.hash,
@@ -867,11 +867,11 @@ async fn run_job<const HEADER_BYTES: usize>(
             Ok(ReadPathReply::Unavailable) => release(port, job.id, path).await,
             Err(error) => {
                 release(port, job.id, path).await;
-                return port_failure(job.id, "read", &error).into();
+                return Err(port_failure(job.id, "read", &error).into());
             }
         }
     }
-    Output::Stall(Stall::Local, "lease_lost").into()
+    Err(Output::Stall(Stall::Local, "lease_lost").into())
 }
 
 /// Log a failed port `operation` for subscription `id`, and wait for the
@@ -959,7 +959,10 @@ fn scope(selected: Option<&EngineSnapshot>, target: block::Hash) -> HeaderWorkAu
 /// ends with `HistoryPruned`: a pruned node never gains records below its
 /// index height, so waiting would stall the subscriber forever. A following
 /// subscription waits instead, because `HistoryPruned` is past its window.
-fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPage) -> JobResult {
+fn page_output<const HEADER_BYTES: usize>(
+    job: &Job,
+    page: RetainedHeaderPathPage,
+) -> Result<EncodedPage, Refusal> {
     let count = page.headers.len();
     // Widening u32 to usize is lossless on supported targets.
     if count == 0
@@ -971,7 +974,7 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
             .parent
             .is_some_and(|parent| parent != page.common_ancestor)
     {
-        return Output::Stall(Stall::Local, "page_shape").into();
+        return Err(Output::Stall(Stall::Local, "page_shape").into());
     }
     let mut entries = Vec::with_capacity(count);
     for (((header, deliveries), finalized_tree_aux), finalized_body_size) in page
@@ -1006,11 +1009,11 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
         } else {
             Output::End(HeadersOutcomeCode::HistoryPruned)
         };
-        return output.into();
+        return Err(output.into());
     };
     let sent = u32::try_from(entries.len()).expect("a page holds at most MAX_HS_RANGE headers");
     let Some(height) = page.common_ancestor.height.0.checked_add(sent) else {
-        return Output::Stall(Stall::Local, "page_shape").into();
+        return Err(Output::Stall(Stall::Local, "page_shape").into());
     };
     let last = Frontier::new(block::Height(height), last.header.hash());
     let reaches_target = !job.following && last.hash == job.initial_target;
@@ -1025,7 +1028,7 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
     }));
     match frame {
         Ok(frame) if frame.payload.len() <= page_bytes(job.count, job.schema, HEADER_BYTES) => {
-            JobResult::Page(EncodedPage {
+            Ok(EncodedPage {
                 page: Page {
                     parent: page.common_ancestor,
                     last,
@@ -1037,6 +1040,6 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
                 frame,
             })
         }
-        _ => Output::Stall(Stall::Local, "encode").into(),
+        _ => Err(Output::Stall(Stall::Local, "encode").into()),
     }
 }

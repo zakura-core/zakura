@@ -746,7 +746,7 @@ where
                 // The target spacing at the tip scales the lookahead limit.
                 let multiplier =
                     tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
-                let (lookahead_drop_height, _, _) =
+                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) =
                     lookahead_heights(tip_height, lookahead_limit, multiplier);
 
                 // Get the finalized tip height, assuming we're using the non-finalized state.
@@ -840,6 +840,51 @@ where
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }
 
+                if block_height > lookahead_pause_height {
+                    // This log can be very verbose, usually hundreds of blocks are dropped.
+                    // So we only log at info level for the first above-height block.
+                    if !past_lookahead_limit_receiver.cloned_watch_data() {
+                        info!(
+                            ?hash,
+                            ?block_height,
+                            ?tip_height,
+                            ?lookahead_pause_height,
+                            ?lookahead_reset_height,
+                            lookahead_limit = ?lookahead_limit,
+                            "synced block height too far ahead of the tip: \
+                             waiting for downloaded blocks to commit to the state",
+                        );
+
+                        // Set the watched value to true, since we're over the limit.
+                        //
+                        // It is ok to block here, because we're going to pause new downloads anyway.
+                        // But if Zebra is shutting down, ignore the send error.
+                        let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(true);
+                    } else {
+                        debug!(
+                            ?hash,
+                            ?block_height,
+                            ?tip_height,
+                            ?lookahead_pause_height,
+                            ?lookahead_reset_height,
+                            lookahead_limit = ?lookahead_limit,
+                            "synced block height too far ahead of the tip: \
+                             waiting for downloaded blocks to commit to the state",
+                        );
+                    }
+
+                    metrics::counter!("sync.max.height.limit.paused.count").increment(1);
+                } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
+                    // Reset the watched value to false, since we're well under the limit.
+                    // We need to block here, because if we don't the syncer can hang.
+
+                    // But if Zebra is shutting down, ignore the send error.
+                    let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(false);
+                    metrics::counter!("sync.max.height.limit.reset.count").increment(1);
+
+                    metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
+                }
+
                 // A body that fails before its parent commits can't be attributed yet, so wait for
                 // the parent once and verify the same body again. The task keeps its lookahead slot
                 // while it waits, and stays cancellable.
@@ -867,60 +912,6 @@ where
                         "verifying",
                         Some(block_height),
                     );
-
-                    // Readiness can wait across the activation boundary. Recheck before
-                    // either flow-control writes or verifier submission, with no await between them.
-                    let tip_height = latest_chain_tip.best_tip_height();
-                    if !has_sufficient_work(&chain_network, block_height, tip_height, block.header.difficulty_threshold) {
-                        return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
-                    }
-                    let multiplier = tip_height.map_or(1, |tip| lookahead_limit_multiplier(&chain_network, tip));
-                    let (_, lookahead_pause_height, lookahead_reset_height) = lookahead_heights(tip_height, lookahead_limit, multiplier);
-
-                    if block_height > lookahead_pause_height {
-                        // This log can be very verbose, usually hundreds of blocks are dropped.
-                        // So we only log at info level for the first above-height block.
-                        if !past_lookahead_limit_receiver.cloned_watch_data() {
-                            info!(
-                                ?hash,
-                                ?block_height,
-                                ?tip_height,
-                                ?lookahead_pause_height,
-                                ?lookahead_reset_height,
-                                lookahead_limit = ?lookahead_limit,
-                                "synced block height too far ahead of the tip: \
-                                 waiting for downloaded blocks to commit to the state",
-                            );
-
-                            // Set the watched value to true, since we're over the limit.
-                            //
-                            // It is ok to block here, because we're going to pause new downloads anyway.
-                            // But if Zebra is shutting down, ignore the send error.
-                            let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(true);
-                        } else {
-                            debug!(
-                                ?hash,
-                                ?block_height,
-                                ?tip_height,
-                                ?lookahead_pause_height,
-                                ?lookahead_reset_height,
-                                lookahead_limit = ?lookahead_limit,
-                                "synced block height too far ahead of the tip: \
-                                 waiting for downloaded blocks to commit to the state",
-                            );
-                        }
-
-                        metrics::counter!("sync.max.height.limit.paused.count").increment(1);
-                    } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
-                        // Reset the watched value to false, since we're well under the limit.
-                        // We need to block here, because if we don't the syncer can hang.
-
-                        // But if Zebra is shutting down, ignore the send error.
-                        let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(false);
-                        metrics::counter!("sync.max.height.limit.reset.count").increment(1);
-
-                        metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
-                    }
 
                     // Verify the block.
                     verify_start = std::time::Instant::now();

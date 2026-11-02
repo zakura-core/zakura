@@ -4202,58 +4202,6 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
     verifier.expect_no_requests().await;
 }
 
-/// A readiness wait must not preserve an expired exemption or change throttling.
-#[tokio::test]
-async fn historical_work_exemption_is_rechecked_after_verifier_readiness() {
-    use crate::components::download_work::test_support::GatedBlockVerifier;
-    let historical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let hash = historical.hash();
-    for initially_paused in [false, true] {
-        let mut peers = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
-        let verifier = GatedBlockVerifier::new();
-        let (tip, sender) = MockChainTip::new();
-        sender.send_best_tip_height(Height(0));
-        sender.send_best_tip_hash(block::Hash([0xAA; 32]));
-        let (pause_sender, pause_receiver) = tokio::sync::watch::channel(initially_paused);
-        let mut downloads = Downloads::new(
-            peers.clone(),
-            verifier.clone(),
-            tip,
-            pause_sender,
-            sync::MIN_CONCURRENCY_LIMIT,
-            Network::Mainnet,
-            Height(0),
-            LegacySyncTrace::new(None, false),
-        );
-        downloads.download_and_verify(hash).await.unwrap();
-        peers
-            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-            .await
-            .respond(zn::Response::Blocks(vec![Available((
-                historical.clone(),
-                None,
-            ))]));
-        tokio::time::timeout(Duration::from_secs(5), verifier.polled.notified())
-            .await
-            .unwrap();
-        sender.send_best_tip_height(crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT);
-        verifier.release();
-        let error = tokio::time::timeout(Duration::from_secs(5), downloads.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            BlockDownloadVerifyError::BelowMinimumWork { .. }
-        ));
-        assert!(!verifier.called.load(Ordering::SeqCst));
-        assert_eq!(*pause_receiver.borrow(), initially_paused);
-    }
-}
-
 /// Weak-work blocks must fail admission without verification, scoring, or a restart.
 #[tokio::test]
 async fn mainnet_work_floor_rejects_downloads_before_verification() {
@@ -4304,6 +4252,9 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
                 peer_set.clone(),
                 verifier.clone(),
                 chain_tip,
+                ParentWait(Arc::new(|parent| {
+                    panic!("rejected block must not wait for parent {parent}")
+                })),
                 pause_sender,
                 sync::MIN_CONCURRENCY_LIMIT,
                 Network::Mainnet,

@@ -902,7 +902,7 @@ where
         let spawner = self.clone();
         let network = self.network.clone();
         let chain_network = self.chain_network.clone();
-        let mut verifier = self.verifier.clone();
+        let verifier = self.verifier.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
@@ -1124,11 +1124,10 @@ where
 
                 if parent_is_missing {
                     let header = block.header.clone();
-                    let pow_network = chain_network.clone();
                     let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
                         zakura_consensus::proof_of_work_is_valid(
                             &header,
-                            &pow_network,
+                            &chain_network,
                             &block_height,
                             &hash,
                         )
@@ -1161,25 +1160,8 @@ where
                 None => None,
             };
 
-            let verifier = verifier
-                .ready()
-                .await
-                .map_err(|error| (error, advertiser_addr))?;
-            // Both source ordering and verifier readiness can outlive the historical
-            // exemption. No async wait may separate this check from submission.
-            if !has_sufficient_work(
-                &chain_network,
-                block_height,
-                latest_chain_tip.best_tip_height(),
-                block.header.difficulty_threshold,
-            ) {
-                return Err((
-                    "gossiped block target is easier than the Mainnet admission floor".into(),
-                    advertiser_addr,
-                ));
-            }
             verifier
-                .call(zakura_consensus::Request::Commit(block))
+                .oneshot(zakura_consensus::Request::Commit(block))
                 .await
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))
@@ -1916,83 +1898,6 @@ mod tests {
                 "{error}"
             );
             assert_eq!(addr, Some(advertiser_addr));
-            assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
-        }
-    }
-
-    /// Async source and readiness waits must not preserve an expired exemption.
-    #[tokio::test]
-    async fn gossip_rechecks_historical_work_after_source_and_readiness_waits() {
-        use crate::components::download_work::test_support::GatedBlockVerifier;
-        use std::sync::atomic::Ordering;
-
-        let historical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
-        let historical_hash = historical.hash();
-        let advertiser_addr = "127.0.0.1:8233".parse().unwrap();
-        for wait_on_source in [false, true] {
-            let (mut tip_sender, tip) = chain_tip_at(block::Height(0), hash(0xAA));
-            let mut downloads = downloads_returning(historical.clone(), advertiser_addr, tip);
-            let verifier = GatedBlockVerifier::new();
-            downloads.spawner.verifier = BoxCloneService::new(verifier.clone());
-            let replied = Arc::new(tokio::sync::Notify::new());
-            let reply_signal = replied.clone();
-            let candidate = historical.clone();
-            downloads.spawner.network = BoxCloneService::new(service_fn(move |_| {
-                let replied = reply_signal.clone();
-                let candidate = candidate.clone();
-                async move {
-                    replied.notify_one();
-                    Ok::<_, BoxError>(zn::Response::Blocks(vec![Available((
-                        candidate,
-                        Some(advertiser_addr),
-                    ))]))
-                }
-            }));
-            let gate = Arc::new(Mutex::new(()));
-            let held = if wait_on_source {
-                verifier.release();
-                downloads.spawner.admission().source_locks.insert(
-                    AdvertiserSource::from(zn::PeerSource::LegacySocket(advertiser_addr)),
-                    gate.clone(),
-                );
-                Some(gate.lock_owned().await)
-            } else {
-                None
-            };
-            assert_eq!(
-                downloads.download_and_verify(
-                    historical_hash,
-                    Some(zn::PeerSource::LegacySocket(advertiser_addr))
-                ),
-                DownloadAction::AddedToQueue
-            );
-            if wait_on_source {
-                // On this current-thread runtime the immediate network/state responses
-                // run through admission to the held source lock before this task resumes.
-                tokio::time::timeout(Duration::from_secs(5), replied.notified())
-                    .await
-                    .unwrap();
-            } else {
-                tokio::time::timeout(Duration::from_secs(5), verifier.polled.notified())
-                    .await
-                    .unwrap();
-            }
-            set_tip(
-                &mut tip_sender,
-                crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT,
-                hash(0xBB),
-            );
-            drop(held);
-            verifier.release();
-            let (error, addr) = tokio::time::timeout(Duration::from_secs(5), downloads.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap_err();
-            assert!(error.to_string().contains("Mainnet admission floor"));
-            assert!(!verifier.called.load(Ordering::SeqCst));
             assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
         }
     }

@@ -67,64 +67,6 @@ pub(super) fn target_meets_work_floor(network: &Network, target: CompactDifficul
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::{
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-        task::{Context, Poll},
-    };
-    use zakura_chain::block;
-
-    /// Holds verifier readiness until a test releases it.
-    #[derive(Clone)]
-    pub(crate) struct GatedBlockVerifier {
-        ready: Arc<AtomicBool>,
-        pub(crate) polled: Arc<tokio::sync::Notify>,
-        waker: Arc<futures::task::AtomicWaker>,
-        pub(crate) called: Arc<AtomicBool>,
-    }
-
-    impl GatedBlockVerifier {
-        pub(crate) fn new() -> Self {
-            Self {
-                ready: Arc::new(AtomicBool::new(false)),
-                polled: Arc::new(tokio::sync::Notify::new()),
-                waker: Arc::new(futures::task::AtomicWaker::new()),
-                called: Arc::new(AtomicBool::new(false)),
-            }
-        }
-
-        pub(crate) fn release(&self) {
-            self.ready.store(true, Ordering::SeqCst);
-            self.waker.wake();
-        }
-    }
-
-    impl tower::Service<zakura_consensus::Request> for GatedBlockVerifier {
-        type Response = block::Hash;
-        type Error = crate::BoxError;
-        type Future = futures::future::Ready<Result<block::Hash, crate::BoxError>>;
-
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.waker.register(cx.waker());
-            self.polled.notify_one();
-            if self.ready.load(Ordering::SeqCst) {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
-        }
-
-        fn call(&mut self, request: zakura_consensus::Request) -> Self::Future {
-            self.called.store(true, Ordering::SeqCst);
-            futures::future::ready(Ok(request.block().hash()))
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use zakura_chain::work::difficulty::ParameterDifficulty as _;

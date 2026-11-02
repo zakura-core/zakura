@@ -494,7 +494,7 @@ impl FrameGuard {
 enum FrameOwner {
     /// No other owner funds this frame. The grant is absent on a queue without
     /// an output gate.
-    Output(Option<FrameGrant>),
+    Output { _grant: Option<FrameGrant> },
     /// Another owner's capacity funds this frame until its write ends.
     Guard(FrameGuard),
     /// This request's owner claims it before its first byte.
@@ -526,7 +526,7 @@ impl QueuedFrame {
     fn plain(frame: Frame, output: Option<FrameGrant>, queue_slot: SlotPermit) -> Self {
         Self {
             frame,
-            owner: FrameOwner::Output(output),
+            owner: FrameOwner::Output { _grant: output },
             queue_slot: Some(queue_slot),
         }
     }
@@ -543,7 +543,7 @@ impl QueuedFrame {
     pub(crate) fn into_parts(self) -> (Frame, Option<FrameGuard>) {
         let guard = match self.owner {
             FrameOwner::Guard(guard) => Some(guard),
-            FrameOwner::Output(_) | FrameOwner::Claim(_) => None,
+            FrameOwner::Output { .. } | FrameOwner::Claim(_) => None,
         };
         (self.frame, guard)
     }
@@ -582,7 +582,7 @@ impl QueuedFrame {
         let encoded = encode(frame)?;
         let claim = match &owner {
             FrameOwner::Claim(claim) => Some(claim),
-            FrameOwner::Output(_) | FrameOwner::Guard(_) => None,
+            FrameOwner::Output { .. } | FrameOwner::Guard(_) => None,
         };
         if claim.is_some_and(|claim| !claim.try_start()) {
             return Ok(());

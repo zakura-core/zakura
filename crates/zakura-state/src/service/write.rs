@@ -3041,40 +3041,35 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
-                    let result = (|| {
-                        // Acquire the fallback before committing any operator change.
-                        let finalized_tip = super::finalized_chain_tip(&finalized_state.db)?;
-                        let result = if let Some(writer) = header_chain.as_ref() {
-                            let mut staged = non_finalized_state.clone();
-                            staged.invalidate_block(hash).and_then(|result| {
-                                commit_operator_change(
-                                    writer,
-                                    non_finalized_state,
-                                    staged,
-                                    hash,
-                                    true,
-                                )
-                                .map(|_| result)
-                                .map_err(|error| {
-                                    InvalidateError::HeaderChain {
-                                        error: error.to_string(),
-                                    }
-                                })
-                            })
-                        } else {
-                            non_finalized_state.invalidate_block(hash)
-                        };
-                        if result.is_ok() {
-                            update_channels_after_operator_change(
-                                non_finalized_state,
-                                finalized_tip,
-                                chain_tip_sender,
-                                non_finalized_state_sender,
-                                backup_dir_path.as_deref(),
-                            );
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
                         }
-                        result
-                    })();
+                    };
+                    let result = if let Some(writer) = header_chain.as_ref() {
+                        let mut staged = non_finalized_state.clone();
+                        staged.invalidate_block(hash).and_then(|result| {
+                            commit_operator_change(writer, non_finalized_state, staged, hash, true)
+                                .map(|_| result)
+                                .map_err(|error| InvalidateError::HeaderChain {
+                                    error: error.to_string(),
+                                })
+                        })
+                    } else {
+                        non_finalized_state.invalidate_block(hash)
+                    };
+                    if result.is_ok() {
+                        update_channels_after_operator_change(
+                            non_finalized_state,
+                            finalized_tip,
+                            chain_tip_sender,
+                            non_finalized_state_sender,
+                            backup_dir_path.as_deref(),
+                        );
+                    }
                     let _ = rsp_tx.send(result);
                     None
                 }
@@ -3134,52 +3129,55 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
-                    let result = (|| {
-                        // Acquire the fallback before committing any operator change.
-                        let finalized_tip = super::finalized_chain_tip(&finalized_state.db)?;
-                        let result = if let Some(writer) = header_chain.as_ref() {
-                            let mut staged = non_finalized_state.clone();
-                            staged
-                                .reconsider_block(hash, &finalized_state.db)
-                                .and_then(|result| {
-                                    commit_operator_change(
-                                        writer,
-                                        non_finalized_state,
-                                        staged,
-                                        hash,
-                                        false,
-                                    )
-                                    .map(|_| result)
-                                    .map_err(|error| {
-                                        ReconsiderError::HeaderChain {
-                                            error: error.to_string(),
-                                        }
-                                    })
-                                })
-                        } else {
-                            non_finalized_state.reconsider_block(hash, &finalized_state.db)
-                        };
-                        if result.is_ok() {
-                            let evicted = non_finalized_state_sender
-                                .borrow()
-                                .evicted_blocks(non_finalized_state);
-                            update_channels_after_operator_change(
-                                non_finalized_state,
-                                finalized_tip,
-                                chain_tip_sender,
-                                non_finalized_state_sender,
-                                backup_dir_path.as_deref(),
-                            );
-                            if !evicted.is_empty() {
-                                let _ = non_finalized_write_update_sender
-                                    .send(NonFinalizedWriteUpdate::Evicted(evicted));
-                            }
-                            // Reconsideration restores blocks without committing them,
-                            // so wake readers waiting for one of those blocks.
-                            block_commit_sender.send_modify(|_| {});
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
                         }
-                        result
-                    })();
+                    };
+                    let result = if let Some(writer) = header_chain.as_ref() {
+                        let mut staged = non_finalized_state.clone();
+                        staged
+                            .reconsider_block(hash, &finalized_state.db)
+                            .and_then(|result| {
+                                commit_operator_change(
+                                    writer,
+                                    non_finalized_state,
+                                    staged,
+                                    hash,
+                                    false,
+                                )
+                                .map(|_| result)
+                                .map_err(|error| {
+                                    ReconsiderError::HeaderChain {
+                                        error: error.to_string(),
+                                    }
+                                })
+                            })
+                    } else {
+                        non_finalized_state.reconsider_block(hash, &finalized_state.db)
+                    };
+                    if result.is_ok() {
+                        let evicted = non_finalized_state_sender
+                            .borrow()
+                            .evicted_blocks(non_finalized_state);
+                        update_channels_after_operator_change(
+                            non_finalized_state,
+                            finalized_tip,
+                            chain_tip_sender,
+                            non_finalized_state_sender,
+                            backup_dir_path.as_deref(),
+                        );
+                        if !evicted.is_empty() {
+                            let _ = non_finalized_write_update_sender
+                                .send(NonFinalizedWriteUpdate::Evicted(evicted));
+                        }
+                        // Reconsideration restores blocks without committing them,
+                        // so wake readers waiting for one of those blocks.
+                        block_commit_sender.send_modify(|_| {});
+                    }
                     let _ = rsp_tx.send(result);
                     None
                 }

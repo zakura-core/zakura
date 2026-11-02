@@ -3638,6 +3638,7 @@ impl Service<ReadRequest> for ReadStateService {
                 //
                 // TODO: Convert `CommitSemanticallyVerifiedError` to a new `ValidateProposalError`?
                 latest_non_finalized_state.disable_metrics();
+                latest_non_finalized_state.record_proposal_spends();
 
                 write::validate_and_commit_non_finalized(
                     &state.db,

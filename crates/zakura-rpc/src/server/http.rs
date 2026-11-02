@@ -37,7 +37,7 @@ pub type HttpResponse<B = HttpBody> = hyper::Response<B>;
 pub(super) const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
 
 /// The maximum number of requests a server handles at the same time.
-const MAX_CONCURRENT_REQUESTS: usize = 100;
+pub(super) const MAX_CONCURRENT_REQUESTS: usize = 100;
 
 /// The content type of JSON responses.
 const JSON: &str = "application/json; charset=utf-8";
@@ -49,7 +49,6 @@ const TEXT: &str = "text/plain";
 #[derive(Clone)]
 pub struct JsonRpcHttpService<S> {
     rpc_service: S,
-    request_permits: Arc<Semaphore>,
     max_batch_entries: usize,
     max_response_body_size: usize,
 }
@@ -58,12 +57,10 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
     /// Returns a service that answers requests with `rpc_service`.
     ///
     /// Batches can have up to `max_batch_entries` entries, and batch responses can be up to
-    /// `max_response_body_size` bytes long. Clones of this service share a limit on the number
-    /// of requests handled at the same time.
+    /// `max_response_body_size` bytes long.
     pub fn new(rpc_service: S, max_batch_entries: usize, max_response_body_size: usize) -> Self {
         Self {
             rpc_service,
-            request_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             max_batch_entries,
             max_response_body_size,
         }
@@ -85,15 +82,58 @@ where
     }
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let this = self.clone();
+        Box::pin(async move { Ok(this.answer(request).await) })
+    }
+}
+
+/// A service that answers requests with `429 Too Many Requests` while its inner service is
+/// handling `max_requests` requests.
+///
+/// Put it outside every layer that reads request bodies, so excess requests are rejected
+/// before their bodies are received. Clones share the limit.
+#[derive(Clone)]
+pub struct RequestLimit<S> {
+    inner: S,
+    request_permits: Arc<Semaphore>,
+}
+
+impl<S> RequestLimit<S> {
+    /// Returns a service that handles up to `max_requests` requests at the same time with
+    /// `inner`.
+    pub fn new(inner: S, max_requests: usize) -> Self {
+        Self {
+            inner,
+            request_permits: Arc::new(Semaphore::new(max_requests)),
+        }
+    }
+}
+
+impl<S, Request> Service<Request> for RequestLimit<S>
+where
+    S: Service<Request, Response = HttpResponse, Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    Request: Send + 'static,
+{
+    type Response = HttpResponse;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        // Each call drives a clone of the inner service to readiness.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
         let Ok(permit) = self.request_permits.clone().try_acquire_owned() else {
             return Box::pin(async { Ok(too_many_requests()) });
         };
 
-        let this = self.clone();
+        let inner = self.inner.clone();
         Box::pin(async move {
-            let response = this.answer(request).await;
+            let response = tower::ServiceExt::oneshot(inner, request).await;
             drop(permit);
-            Ok(response)
+            response
         })
     }
 }

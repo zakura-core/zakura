@@ -122,6 +122,8 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 serde_json = { workspace = true, features = ["preserve_order"] }
 bytes = { workspace = true }
 http-body = { workspace = true }
+# Test the plain listener with an HTTP/2 client.
+hyper = { workspace = true, features = ["client", "http2"] }
 insta = { workspace = true, features = ["json", "ron"] }
 anyhow = { workspace = true }
 # Test RPC listeners with an HTTP/1.1 client.

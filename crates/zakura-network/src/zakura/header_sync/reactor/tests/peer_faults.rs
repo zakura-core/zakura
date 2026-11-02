@@ -51,7 +51,6 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;
     active.entries.clear();
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     reactor.deliver_page(
         peer.clone(),
@@ -346,7 +345,6 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     active.phase = HeaderTargetPhase::Receiving;
     active.entries.clear();
     let returned_ancestor = active.common_ancestor.expect("the fixture has an ancestor");
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     let response = Headers {
         subscription_id: owner.request_id().get(),

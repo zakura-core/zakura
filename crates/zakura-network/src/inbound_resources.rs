@@ -10,14 +10,10 @@
 //! | --- | --- |
 //! | [`InboundBudget::try_charge`] | Unsolicited work drops, as it does when a queue is full. |
 //! | [`InboundBudget::charge_committed`] | Never refuses. A response the node asked for cannot wait or drop without timing out a conformant peer. |
-//! | [`TcpHandshakeOwner`] | Sized for every connection slot, so a refusal means a dialer exceeded its own limit. |
 
 use std::sync::Arc;
 
-use zakura_rt::sync::{
-    atomic::{AtomicU64, Ordering},
-    OwnedSemaphorePermit, Semaphore,
-};
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 /// Decoded `block` and `tx` bytes that unsolicited TCP work may retain across this node.
 ///
@@ -127,38 +123,6 @@ impl Drop for InboundCharge {
     }
 }
 
-/// Aggregate owner of TCP handshakes that have not finished.
-///
-/// Each handshake holds one slot from its first byte until it ends or times out. A
-/// slot bounds the handshake's codec buffer by the pre-handshake body limit, its
-/// decoded `version` by the user-agent limit, and its phase metadata by one task.
-/// The inbound and outbound connection counters reserve a connection before its
-/// handshake starts, so a slot per connection cannot refuse a conformant peer.
-#[derive(Clone, Debug)]
-pub(crate) struct TcpHandshakeOwner {
-    slots: Arc<Semaphore>,
-}
-
-impl TcpHandshakeOwner {
-    /// Create an owner with one slot per connection, and at least one slot.
-    pub(crate) fn new(connection_limit: usize) -> Self {
-        Self {
-            slots: Arc::new(Semaphore::new(connection_limit.max(1))),
-        }
-    }
-
-    /// Take a slot now, or nothing.
-    pub(crate) fn try_admit(&self) -> Option<OwnedSemaphorePermit> {
-        self.slots.clone().try_acquire_owned().ok()
-    }
-
-    /// Slots no handshake holds.
-    #[cfg(test)]
-    pub(crate) fn available(&self) -> usize {
-        self.slots.available_permits()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,21 +155,5 @@ mod tests {
         drop(committed);
         assert_eq!(budget.used(), 0);
         assert!(budget.try_charge(1).is_some());
-    }
-
-    /// L.handshake: the owner counts every unfinished handshake across its clones,
-    /// and a zero connection limit still leaves one slot for isolated use.
-    #[test]
-    fn the_handshake_owner_bounds_handshakes_in_aggregate() {
-        let owner = TcpHandshakeOwner::new(2);
-        let clone = owner.clone();
-        let first = owner.try_admit().expect("one of two slots");
-        let _second = clone.try_admit().expect("two of two slots");
-        assert!(owner.try_admit().is_none());
-        assert_eq!(clone.available(), 0);
-        drop(first);
-        assert_eq!(owner.available(), 1);
-
-        assert_eq!(TcpHandshakeOwner::new(0).available(), 1);
     }
 }

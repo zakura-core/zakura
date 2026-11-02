@@ -39,7 +39,7 @@ use zakura_node_services::task::erased;
 
 use crate::{
     constants,
-    inbound_resources::{InboundBudget, TcpHandshakeOwner, TCP_INBOUND_RETAINED_BYTES},
+    inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
         CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
@@ -96,9 +96,6 @@ where
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
 
-    /// Bounds this node's unfinished handshakes.
-    handshake_owner: TcpHandshakeOwner,
-
     /// Funds decoded TCP payloads across this node's connections.
     inbound_budget: InboundBudget,
 
@@ -151,7 +148,6 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
-            handshake_owner: self.handshake_owner.clone(),
             inbound_budget: self.inbound_budget.clone(),
             bans: self.bans.clone(),
             parent_span: self.parent_span.clone(),
@@ -669,7 +665,6 @@ where
         let relay = self.relay.unwrap_or(false);
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
-        let handshake_owner = TcpHandshakeOwner::new(config.peerset_total_connection_limit());
 
         Ok(Handshake {
             config,
@@ -684,7 +679,6 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
-            handshake_owner,
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
             bans: self.bans.unwrap_or_default(),
             parent_span: Span::current(),
@@ -1547,14 +1541,6 @@ where
     }
 
     fn call(&mut self, req: HandshakeRequest<PeerTransport>) -> Self::Future {
-        // The connection counters reserve a connection before its handshake starts,
-        // so a refusal here means a dialer exceeded its own limit.
-        let Some(handshake_slot) = self.handshake_owner.try_admit() else {
-            metrics::counter!("zcash.net.handshake.refused").increment(1);
-            let refused: BoxError = "TCP handshake owner is at capacity".into();
-            return future::ready(Err(refused)).boxed();
-        };
-
         let HandshakeRequest {
             data_stream,
             connected_addr,
@@ -1617,9 +1603,6 @@ where
                 Codec::builder().for_network(&config.network).finish(),
             );
             let mut connection_tracker = connection_tracker;
-            // This drops before a failed handshake's tracker. A counter that sees the
-            // connection close therefore also finds this slot free.
-            let _handshake_slot = handshake_slot;
 
             let connection_info = match negotiate_version(
                 &mut peer_conn,

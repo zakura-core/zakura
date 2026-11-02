@@ -1098,12 +1098,7 @@ pub struct WorkOwnershipReplaySummary {
     pub settled: u64,
 }
 
-/// Replay decoder-v1 quadruples against the existing ownership ledger.
-/// Read at most 512 bytes. The ledger does not inspect production accounting helpers.
-pub fn replay_work_ownership_bytes(data: &[u8]) -> WorkOwnershipReplaySummary {
-    run(decode(data), |_, _| {})
-}
-
+/// Decode at most 512 bytes of decoder-v1 quadruples.
 fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
     data[..data.len().min(512)].chunks(4).map(|chunk| {
         let a = chunk[0];
@@ -1205,7 +1200,7 @@ proptest! {
 
     #[test]
     fn work_bytes_match_the_same_ledger(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_work_ownership_bytes(&bytes);
+        run(decode(&bytes), |_, _| {});
     }
 }
 
@@ -1221,7 +1216,7 @@ const WITNESS: &[u8] = &[
     reason = "witnesses print applicability counters"
 )]
 fn work_witness_exercises_reset_stale_return_and_settlement() {
-    let summary = replay_work_ownership_bytes(WITNESS);
+    let summary = run(decode(WITNESS), |_, _| {});
     assert_eq!(
         summary,
         WorkOwnershipReplaySummary {
@@ -1234,7 +1229,7 @@ fn work_witness_exercises_reset_stale_return_and_settlement() {
         }
     );
     assert_eq!(
-        replay_work_ownership_bytes(&[]),
+        run(decode(&[]), |_, _| {}),
         WorkOwnershipReplaySummary::default()
     );
     println!("tier=Machine target=block_work_ownership decoder=1 {summary:?}");
@@ -1261,7 +1256,7 @@ fn work_witness_rejects_lost_owner() {
 #[test]
 fn semantic_history_keeps_inputs_and_independent_states() {
     let history = trace_work_ownership_bytes(WITNESS);
-    assert_eq!(history.summary, Some(replay_work_ownership_bytes(WITNESS)));
+    assert_eq!(history.summary, Some(run(decode(WITNESS), |_, _| {})));
     assert_eq!(history.steps.len(), 10);
     for (step, input) in history.steps.iter().zip(WITNESS.chunks(4)) {
         assert_eq!(step.input, input);

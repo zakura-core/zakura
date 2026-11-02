@@ -1311,8 +1311,8 @@ async fn mempool_request_with_missing_input_is_rejected() {
     }
 }
 
-/// Only a lookup timeout reports a missing input. A state refusal keeps its own error,
-/// so a mempool caller cannot mistake lost capacity for missing data.
+/// Only a lookup timeout reports a missing input. A state refusal reports the state as
+/// unavailable, so a mempool caller cannot mistake lost capacity for missing data.
 #[tokio::test]
 async fn mempool_lookup_refusal_stays_distinct_from_a_missing_input() {
     let net = Network::Mainnet;
@@ -1339,7 +1339,7 @@ async fn mempool_lookup_refusal_stays_distinct_from_a_missing_input() {
             assert_eq!(error, TransactionError::TransparentInputNotFound);
         } else {
             assert!(
-                matches!(error, TransactionError::InternalDowncastError(_)),
+                matches!(error, TransactionError::StateUnavailable(_)),
                 "{error}"
             );
         }

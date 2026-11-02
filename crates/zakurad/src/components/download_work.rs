@@ -7,12 +7,6 @@
 
 use zakura_chain::{block::Height, parameters::Network, work::difficulty::CompactDifficulty};
 
-/// Last Mainnet checkpoint when the admission floor was introduced.
-///
-/// Historical downloads are exempt only until the committed tip reaches this
-/// boundary. A peer's claimed height cannot disable the floor after that point.
-pub(super) const MAINNET_WORK_FLOOR_HEIGHT: Height = Height(3_535_411);
-
 /// Target of Mainnet block 3,538,452, observed on November 1, 2026 UTC.
 ///
 /// Block hash:
@@ -27,18 +21,17 @@ const MAINNET_TARGET_MULTIPLIER: u32 = 10;
 /// Whether a downloaded header's claimed target meets the admission work floor.
 ///
 /// This does not verify the header hash or Equihash solution, or replace the
-/// parent-dependent difficulty check. Historical Mainnet downloads remain exempt
-/// while the committed tip is below the boundary or absent. This preserves
-/// historical sync without trusting a peer's old height claim near the tip.
+/// parent-dependent difficulty check. All Mainnet downloads remain exempt while
+/// the committed tip is below the network's last checkpoint or absent. Only our
+/// own chain progress determines this exemption, never a peer's claimed height.
+/// Other networks retain their existing validation rules.
 pub(super) fn has_sufficient_work(
     network: &Network,
-    height: Height,
     committed_tip_height: Option<Height>,
     target: CompactDifficulty,
 ) -> bool {
     if !matches!(network, Network::Mainnet)
-        || (height <= MAINNET_WORK_FLOOR_HEIGHT
-            && committed_tip_height.is_none_or(|tip| tip < MAINNET_WORK_FLOOR_HEIGHT))
+        || committed_tip_height.is_none_or(|tip| tip < network.checkpoint_list().max_height())
     {
         return true;
     }
@@ -61,68 +54,40 @@ mod tests {
     use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
     #[test]
-    fn mainnet_work_floor_covers_the_default_semantic_path() {
-        assert!(MAINNET_WORK_FLOOR_HEIGHT <= Network::Mainnet.checkpoint_list().max_height());
-    }
-
-    #[test]
-    fn mainnet_work_floor_uses_the_committed_tip_despite_an_old_height_claim() {
-        let easiest_target = Network::Mainnet.target_difficulty_limit().to_compact();
-        for height in [Height(0), MAINNET_WORK_FLOOR_HEIGHT] {
-            for tip in [
-                MAINNET_WORK_FLOOR_HEIGHT,
-                MAINNET_WORK_FLOOR_HEIGHT.next().unwrap(),
-            ] {
-                assert!(!has_sufficient_work(
-                    &Network::Mainnet,
-                    height,
-                    Some(tip),
-                    easiest_target,
-                ));
-            }
+    fn mainnet_work_floor_activates_at_the_last_checkpoint() {
+        let network = Network::Mainnet;
+        let checkpoint = network.checkpoint_list().max_height();
+        let easiest_target = network.target_difficulty_limit().to_compact();
+        for tip in [None, Some(checkpoint.previous().unwrap())] {
+            assert!(has_sufficient_work(&network, tip, easiest_target));
+        }
+        for tip in [checkpoint, checkpoint.next().unwrap()] {
+            assert!(!has_sufficient_work(&network, Some(tip), easiest_target));
             assert!(has_sufficient_work(
-                &Network::Mainnet,
-                height,
-                Some(MAINNET_WORK_FLOOR_HEIGHT.previous().unwrap()),
-                easiest_target,
+                &network,
+                Some(tip),
+                MAINNET_REFERENCE_TARGET,
             ));
         }
     }
 
     #[test]
-    fn mainnet_work_floor_preserves_earlier_blocks_and_other_networks() {
-        let easiest_target = Network::Mainnet.target_difficulty_limit().to_compact();
-        for height in [Height(0), MAINNET_WORK_FLOOR_HEIGHT] {
-            assert!(has_sufficient_work(
-                &Network::Mainnet,
-                height,
-                None,
-                easiest_target
-            ));
-        }
-        let height = MAINNET_WORK_FLOOR_HEIGHT.next().unwrap();
-        assert!(!has_sufficient_work(
-            &Network::Mainnet,
-            height,
-            None,
-            easiest_target
-        ));
+    fn mainnet_work_floor_preserves_other_networks() {
         for network in [
             Network::new_default_testnet(),
             Network::new_regtest(Default::default()),
         ] {
-            assert!(has_sufficient_work(
-                &network,
-                height,
-                Some(height),
-                easiest_target
-            ));
+            let checkpoint = network.checkpoint_list().max_height();
+            let easiest_target = network.target_difficulty_limit().to_compact();
+            for tip in [None, Some(checkpoint), Some(checkpoint.next().unwrap())] {
+                assert!(has_sufficient_work(&network, tip, easiest_target));
+            }
         }
     }
 
     #[test]
     fn mainnet_work_floor_compares_expanded_targets_at_the_boundary() {
-        let height = MAINNET_WORK_FLOOR_HEIGHT.next().unwrap();
+        let tip = Some(Network::Mainnet.checkpoint_list().max_height());
         let max_target =
             MAINNET_REFERENCE_TARGET.to_expanded().unwrap() * MAINNET_TARGET_MULTIPLIER;
         let easiest_allowed_encoding = max_target.to_compact();
@@ -132,26 +97,22 @@ mod tests {
 
         assert!(has_sufficient_work(
             &Network::Mainnet,
-            height,
-            None,
+            tip,
             MAINNET_REFERENCE_TARGET
         ));
         assert!(has_sufficient_work(
             &Network::Mainnet,
-            height,
-            None,
+            tip,
             easiest_allowed_encoding
         ));
         assert!(!has_sufficient_work(
             &Network::Mainnet,
-            height,
-            None,
+            tip,
             easier_encoding
         ));
         assert!(!has_sufficient_work(
             &Network::Mainnet,
-            height,
-            None,
+            tip,
             CompactDifficulty::from_le_bytes([0; 4]),
         ));
     }

@@ -1090,7 +1090,6 @@ where
 
             if !has_sufficient_work(
                 &chain_network,
-                block_height,
                 tip_height,
                 block.header.difficulty_threshold,
             ) {
@@ -1851,9 +1850,9 @@ mod tests {
     async fn mainnet_work_floor_rejects_gossip_before_parent_recovery() {
         use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
-        let tip_height = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
-        // An unrelated parent skips tip-child authentication. Claiming the last
-        // exempt height must not bypass the floor once our committed tip reaches it.
+        let tip_height = Network::Mainnet.checkpoint_list().max_height();
+        // An unrelated parent skips tip-child authentication. Neither an old nor a
+        // new claimed height can bypass the floor once our tip reaches the checkpoint.
         for height in [
             tip_height.previous().unwrap(),
             tip_height,

@@ -4208,7 +4208,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
     use zakura_chain::work::difficulty::ParameterDifficulty as _;
 
     let _init_guard = zakura_test::init();
-    let tip_height = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+    let tip_height = Network::Mainnet.checkpoint_list().max_height();
     let (_, pause_height, _) = lookahead_heights(
         Some(tip_height),
         sync::MIN_CONCURRENCY_LIMIT,

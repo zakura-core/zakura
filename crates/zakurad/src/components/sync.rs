@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use eyre::{eyre, Report};
@@ -1568,6 +1568,7 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        self.downloads.start_round();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1652,7 +1653,8 @@ where
         // Progress means a block finished verification, a background hash
         // extension finished, or more full-block downloads were queued. If none
         // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
-        let mut last_progress = Instant::now();
+        // Measured on the runtime's clock, like the timeouts it is compared with.
+        let mut last_progress = tokio::time::Instant::now();
 
         'sync_round: loop {
             if header_runtime_status
@@ -1698,7 +1700,7 @@ where
                 result?;
                 // Only a verified block is progress: a dropped or rejected one is not.
                 if verified {
-                    last_progress = Instant::now();
+                    last_progress = tokio::time::Instant::now();
                 }
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
@@ -1798,7 +1800,7 @@ where
                         result?;
                         // Only a verified block is progress: a dropped or rejected one is not.
                         if verified {
-                            last_progress = Instant::now();
+                            last_progress = tokio::time::Instant::now();
                         }
                         self.update_metrics();
                     }
@@ -1917,7 +1919,7 @@ where
                         result?;
                         // Only a verified block is progress: a dropped or rejected one is not.
                         if verified {
-                            last_progress = Instant::now();
+                            last_progress = tokio::time::Instant::now();
                         }
                         self.update_metrics();
                     }
@@ -1940,7 +1942,7 @@ where
                         self.recent_syncs.push_extend_tips_length(discovered);
                         reserve.extend(download_set);
                         extend = None;
-                        last_progress = Instant::now();
+                        last_progress = tokio::time::Instant::now();
                     }
                 }
 
@@ -3233,8 +3235,8 @@ where
             }
             BlockDownloadVerifyError::ParentUnknown { .. } => {
                 // The download task found no way for this block's parent to arrive. A real block
-                // is found again by the next tip refresh or round, so drop it without a restart,
-                // a retry or a score.
+                // is found again by a later tip refresh or sync round, so drop it without a
+                // restart, a retry or a score.
                 debug!(
                     error = ?e,
                     %peer,

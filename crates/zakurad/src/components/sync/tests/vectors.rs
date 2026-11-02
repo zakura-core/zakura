@@ -2459,6 +2459,150 @@ async fn parent_unknown_is_dropped_without_a_restart_retry_or_score() {
     }
 }
 
+/// Only a verified block (or a finished tip extension) holds off the round's stall restart.
+///
+/// Block 1,687,107 is the last checkpoint. Its first verification fails a minute in with a
+/// missing input, which sync retries, and its retry never finishes, so the round can only
+/// refresh tips while it waits. (The retry also keeps its own verifier timeout from firing before
+/// the stall check.) The peer offers one more block alongside it:
+///
+/// - Block 1,687,108 is a child of the checkpoint block, which never passes the parent check, so
+///   it is dropped once the checkpoint block fails. A drop is not progress, so the round restarts
+///   [`sync::BLOCK_VERIFY_TIMEOUT`] after it started.
+/// - Block 1,687,113 has a parent the state can build on, and verifies 30 s in. That resets the
+///   stall timer, so the round restarts only a full timeout after that.
+#[tokio::test(start_paused = true)]
+async fn only_verified_blocks_hold_off_a_stalled_round() {
+    let _init_guard = zakura_test::init();
+    let verify_delay = Duration::from_secs(30);
+    let retry_delay = Duration::from_secs(60);
+
+    for verifies in [false, true] {
+        let (
+            mut chain_sync,
+            _sync_status,
+            block_verifier_router,
+            peer_set,
+            state_service,
+            mock_chain_tip_sender,
+        ) = setup_chain_sync_with_options(Height(1_687_107), STALLED_SERVICE_REQUEST_DELAY);
+        mock_chain_tip_sender.send_best_tip_height(Height(1_687_106));
+        mock_chain_tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+
+        let checkpoint: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let offered: Arc<Block> = if verifies {
+            zakura_test::vectors::BLOCK_MAINNET_1687113_BYTES.zcash_deserialize_into()
+        } else {
+            zakura_test::vectors::BLOCK_MAINNET_1687108_BYTES.zcash_deserialize_into()
+        }
+        .unwrap();
+        let checkpoint_hash = checkpoint.hash();
+        let offered_hash = offered.hash();
+        let locator = block::Hash([0xAA; 32]);
+        let blocks: HashMap<block::Hash, Arc<Block>> = [&checkpoint, &offered]
+            .into_iter()
+            .map(|block| (block.hash(), block.clone()))
+            .collect();
+
+        // The peer offers both blocks once, and an unrelated trailing hash that sync discards.
+        // Later tip requests find nothing new.
+        let mut tips = Some(vec![checkpoint_hash, offered_hash, block::Hash([0xBB; 32])]);
+        let peers = tokio::spawn(async move {
+            let mut peer_set = peer_set;
+            loop {
+                let request = peer_set.expect_request_that(|_| true).await;
+                let response = match request.request() {
+                    zn::Request::FindBlocks { known_blocks, .. } if *known_blocks == [locator] => {
+                        zn::Response::BlockHashes(tips.take().unwrap_or_default())
+                    }
+                    zn::Request::FindBlocks { .. } => zn::Response::BlockHashes(Vec::new()),
+                    zn::Request::BlocksByHash(hashes) => zn::Response::Blocks(
+                        hashes
+                            .iter()
+                            .map(|hash| Available((blocks[hash].clone(), None)))
+                            .collect(),
+                    ),
+                    other => panic!("unexpected peer request: {other:?}"),
+                };
+                request.respond(response);
+            }
+        });
+
+        // The state can build on every parent except the unverified checkpoint block.
+        let state = tokio::spawn(async move {
+            let mut state_service = state_service;
+            loop {
+                let request = state_service.expect_request_that(|_| true).await;
+                let response = match request.request() {
+                    zs::Request::BlockLocator => zs::Response::BlockLocator(vec![locator]),
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckParentInputs { parent, .. } if *parent == checkpoint_hash => {
+                        zs::Response::ParentInputs(zs::ParentInputs::ParentUnavailable)
+                    }
+                    zs::Request::CheckParentInputs { .. } => {
+                        zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                    }
+                    other => panic!("unexpected state request: {other:?}"),
+                };
+                request.respond(response);
+            }
+        });
+
+        let verifier = tokio::spawn(async move {
+            let mut block_verifier_router = block_verifier_router;
+            let mut checkpoint_attempts = 0;
+            let mut unanswered = Vec::new();
+            loop {
+                let request = block_verifier_router.expect_request_that(|_| true).await;
+                let hash = request.request().block().hash();
+                if hash == offered_hash {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(verify_delay).await;
+                        request.respond(offered_hash);
+                    });
+                } else if hash == checkpoint_hash && checkpoint_attempts == 0 {
+                    checkpoint_attempts += 1;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(retry_delay).await;
+                        request.respond(Err(crate::BoxError::from(RouterError::Block {
+                            source: Box::new(VerifyBlockError::Transaction(
+                                TransactionError::TransparentInputNotFound,
+                            )),
+                        })));
+                    });
+                } else {
+                    unanswered.push(request);
+                }
+            }
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = chain_sync.try_to_sync(None).await;
+        let elapsed = start.elapsed();
+        peers.abort();
+        state.abort();
+        verifier.abort();
+
+        let error = result.expect_err("a round that verifies nothing more stalls");
+        assert!(
+            error.to_string().contains("stalled"),
+            "verifies: {verifies}, {error:#}"
+        );
+        // The stall is noticed at the next tip-refresh tick after the timeout.
+        let stall_from = if verifies {
+            verify_delay + sync::BLOCK_VERIFY_TIMEOUT
+        } else {
+            sync::BLOCK_VERIFY_TIMEOUT
+        };
+        assert!(
+            elapsed >= stall_from && elapsed < stall_from + Duration::from_secs(20),
+            "verifies: {verifies}, stalled after {elapsed:?}, expected from {stall_from:?}"
+        );
+    }
+}
+
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
     BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {
@@ -4839,11 +4983,18 @@ async fn child_of_a_parent_that_is_never_retried_is_dropped_after_the_wait() {
     assert!(asked_parents(&asked).is_empty());
 }
 
-/// Cancelling the round forgets every pending block, so a later child of a block whose
-/// download failed asks the state instead of waiting for a retry that will never come.
+/// A new round, whether after a restart or a normal end, forgets every pending block, so a later
+/// child of a block whose download failed asks the state instead of waiting for a retry that
+/// will never come.
 #[tokio::test]
-async fn cancel_all_forgets_pending_parents() {
+async fn a_new_round_forgets_pending_parents() {
     let _init_guard = zakura_test::init();
+    for restart in [true, false] {
+        a_new_round_forgets_pending_parents_after(restart).await;
+    }
+}
+
+async fn a_new_round_forgets_pending_parents_after(restart: bool) {
     let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
         downloading_parent_setup(true, Height(0));
 
@@ -4866,7 +5017,11 @@ async fn cancel_all_forgets_pending_parents() {
         other => panic!("unexpected result: {other:?}"),
     }
 
-    downloads.cancel_all();
+    if restart {
+        downloads.cancel_all();
+    } else {
+        downloads.start_round();
+    }
 
     downloads
         .download_and_verify(block2.hash())

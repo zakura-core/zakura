@@ -1161,6 +1161,13 @@ where
             .send(false);
     }
 
+    /// Forgets the blocks requested in earlier rounds, so a block whose last download failed
+    /// doesn't keep its children waiting in the next round. Called when a round starts, with
+    /// nothing in flight.
+    pub fn start_round(&mut self) {
+        self.parent_gate.clear();
+    }
+
     /// Returns true if `hash` has an in-flight download and verify task.
     pub(super) fn contains(&self, hash: &block::Hash) -> bool {
         self.cancel_handles.contains_key(hash)

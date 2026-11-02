@@ -1,86 +1,26 @@
-//! Machine tests for [`RedialState`]: worked scenarios and a proptest against
-//! an independent model.
-//!
-//! The model restates the documented rules. It never calls the code it
-//! checks.
-
-use std::time::Duration;
-
-#[cfg(test)]
-use proptest::prelude::*;
+//! The independent model of [`RedialState`](super::state::RedialState), shared by
+//! its proptest and its cargo-fuzz target. The model restates the documented rules
+//! and never calls the code it checks.
 
 use super::state::{RedialNext, RedialStart, RedialState};
 use super::{DialResult, RedialPolicy};
 use crate::zakura::ZAKURA_ALPN_MISMATCH_BACKOFF;
+use std::time::Duration;
 
-const HEALTHY: Duration = Duration::from_secs(60);
-
-// Worked scenario: local limits retry at the initial backoff and leave the
-// remote-failure budget and the backoff growth untouched.
-#[test]
-fn repeated_local_limits_keep_the_remote_failure_budget() {
-    let initial = Duration::from_secs(1);
-    let mut state = RedialState::new(RedialPolicy::maintain_bounded(
-        initial,
-        Duration::from_secs(30),
-        2,
-    ));
-
-    for _ in 0..10 {
-        assert_eq!(state.start(false), RedialStart::Dial);
-        assert_eq!(
-            state.record(DialResult::LocalLimit),
-            RedialNext::RetryAfter(initial)
-        );
-    }
-    // The first counted failure still waits the initial backoff.
-    assert_eq!(
-        state.record(DialResult::Failed),
-        RedialNext::RetryAfter(initial)
-    );
-    assert_eq!(
-        state.record(DialResult::LocalLimit),
-        RedialNext::RetryAfter(initial)
-    );
-    // The second counted failure exhausts the budget of two.
-    assert_eq!(state.record(DialResult::Failed), RedialNext::Stop);
-}
-
-// A healthy connection keeps its outcome while its deregistration lags, and
-// a lasting registration upgrades a failed dial.
-#[test]
-fn lagging_registration_only_upgrades_an_attempt() {
-    let brief = Duration::from_millis(1);
-    assert_eq!(
-        DialResult::Healthy.with_lagging_registration(brief),
-        DialResult::Healthy
-    );
-    assert_eq!(
-        DialResult::Failed.with_lagging_registration(brief),
-        DialResult::Failed
-    );
-    assert_eq!(
-        DialResult::Failed.with_lagging_registration(HEALTHY),
-        DialResult::Healthy
-    );
-    assert_eq!(
-        DialResult::AlpnMismatch.with_lagging_registration(HEALTHY - brief),
-        DialResult::AlpnMismatch
-    );
-}
+pub(super) const HEALTHY: Duration = Duration::from_secs(60);
 
 #[derive(Copy, Clone, Debug)]
-enum ModelMode {
+pub(super) enum ModelMode {
     ConnectOnce { attempts: usize, settle: Duration },
     Maintain,
     MaintainBounded { attempts: usize },
 }
 
 #[derive(Copy, Clone, Debug)]
-struct ModelPolicy {
-    mode: ModelMode,
-    initial: Duration,
-    max: Duration,
+pub(super) struct ModelPolicy {
+    pub(super) mode: ModelMode,
+    pub(super) initial: Duration,
+    pub(super) max: Duration,
 }
 
 impl ModelPolicy {
@@ -114,25 +54,8 @@ impl ModelPolicy {
     }
 }
 
-#[cfg(test)]
-fn model_policy() -> impl Strategy<Value = ModelPolicy> {
-    let mode = prop_oneof![
-        (1usize..5, 1u64..120).prop_map(|(attempts, settle)| ModelMode::ConnectOnce {
-            attempts,
-            settle: Duration::from_secs(settle),
-        }),
-        Just(ModelMode::Maintain),
-        (1usize..5).prop_map(|attempts| ModelMode::MaintainBounded { attempts }),
-    ];
-    (mode, 1u64..30, 1u64..120).prop_map(|(mode, initial, max)| ModelPolicy {
-        mode,
-        initial: Duration::from_secs(initial),
-        max: Duration::from_secs(max),
-    })
-}
-
 #[derive(Clone, Debug)]
-enum RedialOp {
+pub(super) enum RedialOp {
     /// Start an attempt. A registered peer's registration lasts `lasted`
     /// seconds, or changes while a connect-once loop waits when `lasted` is
     /// `None`.
@@ -146,22 +69,6 @@ enum RedialOp {
         result: DialResult,
         lagging: Option<u64>,
     },
-}
-
-#[cfg(test)]
-fn redial_op() -> impl Strategy<Value = RedialOp> {
-    let result = prop_oneof![
-        Just(DialResult::Healthy),
-        Just(DialResult::Failed),
-        Just(DialResult::AlpnMismatch),
-        Just(DialResult::LocalLimit),
-    ];
-    let lasted = prop::option::of(0u64..120);
-    prop_oneof![
-        (any::<bool>(), lasted.clone())
-            .prop_map(|(registered, lasted)| RedialOp::Start { registered, lasted }),
-        (result, lasted).prop_map(|(result, lagging)| RedialOp::Dial { result, lagging }),
-    ]
 }
 
 /// The documented redial rules.
@@ -283,7 +190,7 @@ pub fn replay_redial_bytes(data: &[u8]) -> RedialReplaySummary {
     run(policy, ops, |_, _| {})
 }
 
-fn run(
+pub(super) fn run(
     policy: ModelPolicy,
     ops: impl IntoIterator<Item = RedialOp>,
     mut after_attempt: impl FnMut(&mut RedialState, DialResult),
@@ -372,86 +279,4 @@ fn run(
         }
     }
     summary
-}
-
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    #[test]
-    fn redial_state_matches_independent_model(
-        policy in model_policy(),
-        ops in prop::collection::vec(redial_op(), 1..64),
-    ) {
-        run(policy, ops, |_, _| {});
-    }
-
-    #[test]
-    fn redial_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_redial_bytes(&bytes);
-    }
-}
-
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "CI retains these applicability counters"
-)]
-fn redial_witness_exercises_limits_resets_and_lagging_registration() {
-    let summary = replay_redial_bytes(&[1, 0, 29, 3, 0, 0, 7, 0, 0, 3, 0, 0, 3, 1, 60, 5, 0, 0]);
-    assert_eq!(
-        summary,
-        RedialReplaySummary {
-            scored: 5,
-            local_limits: 1,
-            resets: 1,
-            lagging_upgrades: 1,
-            stops: 0
-        }
-    );
-    assert_eq!(replay_redial_bytes(&[0, 0, 29, 3, 0, 0]).stops, 1);
-    assert_eq!(replay_redial_bytes(&[0, 0, 29, 2, 0, 0]).resets, 1);
-    assert_eq!(replay_redial_bytes(&[]), RedialReplaySummary::default());
-    println!("tier=Machine target=discovery_redial decoder=1 {summary:?}");
-}
-
-#[cfg(test)]
-fn failure_sequence() -> impl Iterator<Item = RedialOp> {
-    [
-        DialResult::Failed,
-        DialResult::LocalLimit,
-        DialResult::Failed,
-    ]
-    .into_iter()
-    .map(|result| RedialOp::Dial {
-        result,
-        lagging: None,
-    })
-}
-
-#[cfg(test)]
-fn maintained_policy() -> ModelPolicy {
-    ModelPolicy {
-        mode: ModelMode::Maintain,
-        initial: Duration::from_secs(1),
-        max: Duration::from_secs(30),
-    }
-}
-
-#[test]
-#[should_panic(expected = "discovery/redial-policy")]
-fn redial_witness_rejects_resetting_after_failure() {
-    run(maintained_policy(), failure_sequence(), |state, _| {
-        state.registration_changed()
-    });
-}
-
-#[test]
-#[should_panic(expected = "discovery/redial-policy")]
-fn redial_witness_rejects_charging_local_limits() {
-    run(maintained_policy(), failure_sequence(), |state, result| {
-        if result == DialResult::LocalLimit {
-            let _ = state.record(DialResult::Failed);
-        }
-    });
 }

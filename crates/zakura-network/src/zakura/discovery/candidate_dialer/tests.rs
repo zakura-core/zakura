@@ -4,42 +4,20 @@
 //! The model restates the documented rules. It never calls the code it
 //! checks.
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::net::{IpAddr, SocketAddr};
 
-#[cfg(test)]
 use proptest::prelude::*;
-use zakura_quic::{NodeId, NodeSecretKey};
-use zakura_rt::collections::{HashMap, HashSet};
-use zakura_rt::time::Instant;
+use zakura_quic::NodeId;
 
-#[cfg(test)]
+use super::model::*;
 use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration};
-use super::state::{CandidateAddress, CandidateDialerState, DialAttemptKey};
-use super::DiscoveryDialResult;
-#[cfg(test)]
+use super::state::{CandidateAddress, CandidateDialerState};
+use super::*;
 use crate::zakura::canonical_ip;
-use crate::zakura::discovery::ZakuraDiscoveryDialCandidate;
 
-#[cfg(test)]
 const DIAL_BACKOFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3_600));
 
-fn node_id(byte: u8) -> NodeId {
-    NodeSecretKey::from_bytes(&[byte; 32]).public()
-}
-
-fn candidate(node_id: NodeId, direct_addrs: Vec<SocketAddr>) -> ZakuraDiscoveryDialCandidate {
-    ZakuraDiscoveryDialCandidate {
-        node_id,
-        direct_addrs,
-        is_static: false,
-    }
-}
-
 /// Records an attempt to `node` that reserves `ips`, then completes it.
-#[cfg(test)]
 fn settle(
     state: &mut CandidateDialerState,
     node: NodeId,
@@ -56,7 +34,6 @@ fn settle(
 
 // Worked scenario: an attempt's settlement releases the IPs it reserved, not
 // the ones its node advertises now.
-#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn panicked_attempt_releases_its_original_reservations() {
     let a = node_id(1);
@@ -106,7 +83,6 @@ async fn panicked_attempt_releases_its_original_reservations() {
 
 // Worked scenario: a duplicate completion of a settled attempt changes
 // nothing, even when a newer attempt to the same node is in flight.
-#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn duplicate_completion_leaves_the_next_attempt_in_flight() {
     let node = node_id(1);
@@ -146,7 +122,6 @@ async fn duplicate_completion_leaves_the_next_attempt_in_flight() {
 
 // A local limit pauses the next round for one tick without backing off the
 // candidate's IPs.
-#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn local_limit_pauses_without_backing_off() {
     let node = node_id(1);
@@ -169,7 +144,6 @@ async fn local_limit_pauses_without_backing_off() {
     assert!(state.begin_round(now + Duration::from_secs(1)));
 }
 
-#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
     let failing_node = node_id(1);
@@ -243,7 +217,6 @@ async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
 // V12 F-305587: an ALPN mismatch from one stale address used to put every
 // address of the record into the ten-minute floor. The floor now lives on
 // the node in the discovery book, and each address gets the ordinary backoff.
-#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
     let node = node_id(1);
@@ -271,7 +244,6 @@ async fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
 
 // V12 F-58: a record can pair one live endpoint with decoy addresses. A
 // success through the live endpoint must not reset the decoys' backoff.
-#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn success_clears_backoff_only_for_the_admitted_ip() {
     let node = node_id(1);
@@ -326,70 +298,6 @@ async fn success_clears_backoff_only_for_the_admitted_ip() {
     assert!(state.is_backed_off(node, decoy, now));
 }
 
-// The model's universe: a few nodes, canonical IPs, and address variants
-// whose canonical IP the table states directly.
-const MODEL_NODES: usize = 3;
-const MODEL_IPS: [Ipv4Addr; 3] = [
-    Ipv4Addr::new(93, 184, 216, 34),
-    Ipv4Addr::new(198, 51, 100, 7),
-    Ipv4Addr::new(203, 0, 113, 9),
-];
-/// `(canonical IP index, mapped into IPv6, port)` for each address variant.
-const MODEL_ADDRESSES: [(usize, bool, u16); 7] = [
-    (0, false, 8233),
-    (0, false, 8234),
-    (0, true, 8235),
-    (1, false, 8233),
-    (1, true, 8233),
-    (2, false, 8233),
-    (2, true, 8236),
-];
-/// The supervisor's simulated per-IP cap.
-const MODEL_PER_IP_CAP: usize = 2;
-const MODEL_BACKOFF_BASE_MS: u64 = 2_000;
-const MODEL_BACKOFF_MAX_MS: u64 = 20_000;
-/// One dial interval: the local-limit pause.
-const MODEL_PAUSE_MS: u64 = 1_000;
-
-fn model_nodes() -> Vec<NodeId> {
-    (10..).take(MODEL_NODES).map(node_id).collect()
-}
-
-fn model_ip(index: usize) -> IpAddr {
-    IpAddr::V4(MODEL_IPS[index])
-}
-
-fn model_address(index: usize) -> SocketAddr {
-    let (ip, mapped, port) = MODEL_ADDRESSES[index];
-    let ip = if mapped {
-        IpAddr::V6(MODEL_IPS[ip].to_ipv6_mapped())
-    } else {
-        IpAddr::V4(MODEL_IPS[ip])
-    };
-    SocketAddr::new(ip, port)
-}
-
-#[derive(Clone, Debug)]
-enum DialerOp {
-    Advance(u64),
-    Round,
-    Dial {
-        node: usize,
-        addresses: Vec<usize>,
-        refused: [bool; MODEL_IPS.len()],
-    },
-    Complete {
-        pick: usize,
-        result: DiscoveryDialResult,
-        admitted: Option<usize>,
-    },
-    Duplicate {
-        pick: usize,
-        result: DiscoveryDialResult,
-    },
-}
-
-#[cfg(test)]
 fn dial_result() -> impl Strategy<Value = DiscoveryDialResult> {
     prop_oneof![
         Just(DiscoveryDialResult::Registered),
@@ -401,7 +309,6 @@ fn dial_result() -> impl Strategy<Value = DiscoveryDialResult> {
     ]
 }
 
-#[cfg(test)]
 fn dialer_op() -> impl Strategy<Value = DialerOp> {
     prop_oneof![
         2 => (0u64..25_000).prop_map(DialerOp::Advance),
@@ -431,335 +338,6 @@ fn dialer_op() -> impl Strategy<Value = DialerOp> {
     ]
 }
 
-#[derive(Debug)]
-struct ModelAttempt {
-    key: DialAttemptKey,
-    node: usize,
-    ips: Vec<usize>,
-}
-
-/// The documented candidate-dialer rules, restated over table indexes.
-#[derive(Debug, Default)]
-struct DialerModel {
-    now_ms: u64,
-    paused_until_ms: Option<u64>,
-    in_flight: Vec<ModelAttempt>,
-    settled: Vec<DialAttemptKey>,
-    /// `(node, ip)` → `(failure count, retry deadline)`.
-    backoff: HashMap<(usize, usize), (u32, u64)>,
-}
-
-impl DialerModel {
-    fn reserved(&self, ip: usize) -> usize {
-        self.in_flight
-            .iter()
-            .map(|attempt| {
-                attempt
-                    .ips
-                    .iter()
-                    .filter(|&&reserved| reserved == ip)
-                    .count()
-            })
-            .sum()
-    }
-
-    fn backed_off(&self, node: usize, ip: usize) -> bool {
-        self.backoff
-            .get(&(node, ip))
-            .is_some_and(|&(_, retry_at)| self.now_ms < retry_at)
-    }
-
-    fn round(&mut self) -> bool {
-        let now = self.now_ms;
-        self.backoff
-            .retain(|_, &mut (_, retry_at)| now.saturating_sub(retry_at) <= MODEL_BACKOFF_MAX_MS);
-        if self.paused_until_ms.is_some_and(|until| now < until) {
-            return false;
-        }
-        self.paused_until_ms = None;
-        true
-    }
-
-    /// The first address variant of each canonical IP, unless that IP is in
-    /// backoff for `node`.
-    fn candidate_addresses(&self, node: usize, addresses: &[usize]) -> Vec<(usize, usize)> {
-        let mut seen = HashSet::new();
-        addresses
-            .iter()
-            .filter_map(|&address| {
-                let ip = MODEL_ADDRESSES[address].0;
-                (seen.insert(ip) && !self.backed_off(node, ip)).then_some((address, ip))
-            })
-            .collect()
-    }
-
-    fn complete(&mut self, index: usize, result: DiscoveryDialResult, admitted: Option<usize>) {
-        let attempt = self.in_flight.remove(index);
-        self.settled.push(attempt.key);
-        match result {
-            DiscoveryDialResult::LocalResourceLimit => {
-                self.paused_until_ms = Some(self.now_ms + MODEL_PAUSE_MS);
-            }
-            DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
-                for ip in attempt.ips {
-                    let count = self
-                        .backoff
-                        .get(&(attempt.node, ip))
-                        .map_or(1, |&(count, _)| count + 1);
-                    let wait =
-                        (MODEL_BACKOFF_BASE_MS << (count - 1).min(10)).min(MODEL_BACKOFF_MAX_MS);
-                    self.backoff
-                        .insert((attempt.node, ip), (count, self.now_ms + wait));
-                }
-            }
-            DiscoveryDialResult::Registered
-            | DiscoveryDialResult::ConnectedElsewhere
-            | DiscoveryDialResult::ShortLivedRegistered => {
-                if let Some(admitted) = admitted {
-                    self.backoff
-                        .remove(&(attempt.node, MODEL_ADDRESSES[admitted].0));
-                }
-            }
-        }
-    }
-}
-
-fn check_dialer(state: &CandidateDialerState, model: &DialerModel, nodes: &[NodeId], now: Instant) {
-    let mut in_flight = state.in_flight_node_ids();
-    let unique: HashSet<_> = in_flight.iter().copied().collect();
-    assert_eq!(
-        unique.len(),
-        in_flight.len(),
-        "{PROPERTY}: one attempt per node"
-    );
-    let mut expected: Vec<_> = model
-        .in_flight
-        .iter()
-        .map(|attempt| nodes[attempt.node])
-        .collect();
-    in_flight.sort();
-    expected.sort();
-    assert_eq!(in_flight, expected, "{PROPERTY}");
-
-    for ip in 0..MODEL_IPS.len() {
-        let reserved = state.in_flight_dials_to(model_ip(ip));
-        assert_eq!(
-            reserved,
-            model.reserved(ip),
-            "{PROPERTY}: reservations of IP {}",
-            ip
-        );
-        assert!(reserved <= MODEL_PER_IP_CAP, "{PROPERTY}");
-        for (node, &node_id) in nodes.iter().enumerate() {
-            assert_eq!(
-                state.is_backed_off(node_id, model_ip(ip), now),
-                model.backed_off(node, ip),
-                "{PROPERTY}: backoff of node {} for IP {}",
-                node,
-                ip
-            );
-        }
-    }
-}
-
-const PROPERTY: &str = "discovery/dial-attempts";
-
-/// Applicable transitions in a decoder-v1 candidate dial history.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct CandidateDialReplaySummary {
-    /// Attempts accepted with at least one IP reservation.
-    pub attempts: usize,
-    /// Explicit completions of live attempts.
-    pub completions: usize,
-    /// Duplicate completions rejected by identity.
-    pub duplicates: usize,
-    /// Local resource limits that pause dialing.
-    pub local_limits: usize,
-    /// Failed attempts that establish backoff.
-    pub failures: usize,
-    /// Round decisions checked at logical time.
-    pub rounds: usize,
-}
-
-/// Replay decoder-v1 triples against the existing candidate dialer model.
-/// Read at most 512 bytes. Logical time advances only through decoded events.
-pub fn replay_candidate_dial_bytes(data: &[u8]) -> CandidateDialReplaySummary {
-    run(decode(data), |_, _, _| {})
-}
-
-fn decode(data: &[u8]) -> impl Iterator<Item = DialerOp> + '_ {
-    data[..data.len().min(512)].chunks(3).map(|chunk| {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let result = match c % 6 {
-            0 => DiscoveryDialResult::Registered,
-            1 => DiscoveryDialResult::ConnectedElsewhere,
-            2 => DiscoveryDialResult::ShortLivedRegistered,
-            3 => DiscoveryDialResult::Failed,
-            4 => DiscoveryDialResult::AlpnMismatch,
-            _ => DiscoveryDialResult::LocalResourceLimit,
-        };
-        match a % 5 {
-            0 => DialerOp::Advance(u64::from(b) * 100),
-            1 => DialerOp::Round,
-            2 => DialerOp::Dial {
-                node: usize::from(a / 5) % MODEL_NODES,
-                addresses: (0..MODEL_ADDRESSES.len())
-                    .filter(|bit| b & (1 << bit) != 0)
-                    .collect(),
-                refused: [c & 1 != 0, c & 2 != 0, c & 4 != 0],
-            },
-            3 => DialerOp::Complete {
-                pick: usize::from(b),
-                result,
-                admitted: (c & 8 != 0).then_some(usize::from(c / 16) % MODEL_ADDRESSES.len()),
-            },
-            _ => DialerOp::Duplicate {
-                pick: usize::from(b),
-                result,
-            },
-        }
-    })
-}
-
-fn run(
-    ops: impl IntoIterator<Item = DialerOp>,
-    mut after_step: impl FnMut(&mut CandidateDialerState, &DialerModel, Instant),
-) -> CandidateDialReplaySummary {
-    let nodes = model_nodes();
-    let start = Instant::now();
-    let mut state = CandidateDialerState::new((
-        Duration::from_millis(MODEL_BACKOFF_BASE_MS),
-        Duration::from_millis(MODEL_BACKOFF_MAX_MS),
-    ));
-    let mut model = DialerModel::default();
-
-    let mut summary = CandidateDialReplaySummary::default();
-    for op in ops {
-        let now = start + Duration::from_millis(model.now_ms);
-        match op {
-            DialerOp::Advance(ms) => model.now_ms += ms,
-            DialerOp::Round => {
-                summary.rounds += 1;
-                assert_eq!(state.begin_round(now), model.round(), "{PROPERTY}");
-            }
-            DialerOp::Dial {
-                node,
-                addresses,
-                refused,
-            } => {
-                let dialed = candidate(
-                    nodes[node],
-                    addresses
-                        .iter()
-                        .map(|&address| model_address(address))
-                        .collect(),
-                );
-                let expected = model.candidate_addresses(node, &addresses);
-                let planned = state.candidate_addresses(&dialed, now);
-                assert_eq!(
-                    &planned,
-                    &expected
-                        .iter()
-                        .map(|&(address, ip)| CandidateAddress {
-                            addr: model_address(address),
-                            ip: model_ip(ip),
-                        })
-                        .collect::<Vec<_>>(),
-                    "{PROPERTY}"
-                );
-
-                // The simulated supervisor refuses an IP the run marks
-                // refused or one at its cap, counting this dialer's
-                // in-flight attempts as the real check does.
-                let accepted: Vec<_> = expected
-                    .iter()
-                    .map(|&(_, ip)| ip)
-                    .filter(|&ip| !refused[ip] && model.reserved(ip) < MODEL_PER_IP_CAP)
-                    .collect();
-                let recorded = state.record_attempt(
-                    nodes[node],
-                    accepted.iter().map(|&ip| model_ip(ip)).collect(),
-                );
-                let busy = model.in_flight.iter().any(|attempt| attempt.node == node);
-                match recorded {
-                    Some(key) => {
-                        summary.attempts += 1;
-                        assert!(!accepted.is_empty() && !busy, "{PROPERTY}");
-                        assert_eq!(key.node_id, nodes[node], "{PROPERTY}");
-                        assert!(
-                            !model.settled.contains(&key),
-                            "{PROPERTY}: keys are never reused"
-                        );
-                        model.in_flight.push(ModelAttempt {
-                            key,
-                            node,
-                            ips: accepted,
-                        });
-                    }
-                    None => assert!(accepted.is_empty() || busy, "{PROPERTY}"),
-                }
-            }
-            DialerOp::Complete {
-                pick,
-                result,
-                admitted,
-            } => {
-                if model.in_flight.is_empty() {
-                    continue;
-                }
-                let index = pick % model.in_flight.len();
-                let key = model.in_flight[index].key;
-                assert!(
-                    state.complete(
-                        key,
-                        result,
-                        admitted.map(model_address).map(|addr| addr.ip()),
-                        now
-                    ),
-                    "{PROPERTY}"
-                );
-                model.complete(index, result, admitted);
-                summary.completions += 1;
-                summary.local_limits +=
-                    usize::from(result == DiscoveryDialResult::LocalResourceLimit);
-                summary.failures += usize::from(matches!(
-                    result,
-                    DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch
-                ));
-            }
-            DialerOp::Duplicate { pick, result } => {
-                if model.settled.is_empty() {
-                    continue;
-                }
-                summary.duplicates += 1;
-                let key = model.settled[pick % model.settled.len()];
-                assert!(!state.complete(key, result, None, now), "{PROPERTY}");
-            }
-        }
-        let now = start + Duration::from_millis(model.now_ms);
-        after_step(&mut state, &model, now);
-        check_dialer(&state, &model, &nodes, now);
-    }
-
-    // Settling every remaining attempt releases every reservation.
-    let now = start + Duration::from_millis(model.now_ms);
-    while let Some(attempt) = model.in_flight.first() {
-        assert!(
-            state.complete(attempt.key, DiscoveryDialResult::Failed, None, now),
-            "{PROPERTY}"
-        );
-        model.complete(0, DiscoveryDialResult::Failed, None);
-    }
-    check_dialer(&state, &model, &nodes, now);
-    for ip in 0..MODEL_IPS.len() {
-        assert_eq!(state.in_flight_dials_to(model_ip(ip)), 0, "{PROPERTY}");
-    }
-    summary
-}
-
-#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
@@ -773,7 +351,6 @@ proptest! {
     }
 }
 
-#[cfg(test)]
 const WITNESS: &[u8] = &[
     2, 7, 0, 3, 0, 3, 4, 0, 3, 0, 30, 0, 1, 0, 0, 2, 7, 0, 3, 0, 5, 1, 0, 0, 0, 10, 0, 1, 0, 0,
 ];
@@ -859,4 +436,370 @@ fn registrations_credit_only_the_attempt_that_authenticated() {
             "{observation:?} authenticated={authenticated}"
         );
     }
+}
+
+fn peer_id(byte: u8) -> ZakuraPeerId {
+    ZakuraPeerId::new(vec![byte; 32]).expect("32-byte test peer id is valid")
+}
+
+fn node_id(byte: u8) -> NodeId {
+    zakura_quic::NodeSecretKey::from_bytes(&[byte; 32]).public()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_unpolled_worker_settles_only_its_attempt() {
+    let ip = IpAddr::from([93, 184, 216, 34]);
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let first = state.record_attempt(node_id(3), vec![ip]).unwrap();
+    let second = state.record_attempt(node_id(4), vec![ip]).unwrap();
+    let retained = std::sync::Arc::new(());
+    let observed = std::sync::Arc::downgrade(&retained);
+    let worker = DiscoveryDialWorker::spawn(first, async move {
+        let _retained = retained;
+        std::future::pending().await
+    });
+    worker.task.abort();
+    assert!(
+        observed.upgrade().is_some(),
+        "abort requests cancellation before task destruction"
+    );
+    assert_eq!(state.in_flight_dials_to(ip), 2);
+    let (attempt, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap();
+    assert!(
+        observed.upgrade().is_none(),
+        "joining observes destruction of the task payload"
+    );
+    assert_eq!(attempt, first);
+    assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+    assert_eq!(outcome.phase, DialPhase::WorkerCancelled);
+    assert!(state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()));
+    assert_eq!(state.in_flight_dials_to(ip), 1);
+    assert_eq!(state.in_flight_node_ids(), vec![second.node_id]);
+    let replacement = state.record_attempt(first.node_id, vec![ip]).unwrap();
+    assert!(!state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()));
+    assert_eq!(state.in_flight_dials_to(ip), 2);
+    assert!(state.complete(
+        replacement,
+        DiscoveryDialResult::ConnectedElsewhere,
+        None,
+        Instant::now()
+    ));
+    assert_eq!(state.in_flight_node_ids(), vec![second.node_id]);
+}
+
+#[tokio::test]
+async fn shutdown_joins_started_and_unpolled_workers_before_discarding_reservations() {
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9212)
+        .spawn()
+        .await
+        .unwrap();
+    let mut io = CandidateDialerIO {
+        endpoint: node.endpoint(),
+        discovery: node.discovery(),
+        limits: node.limits().clone(),
+        sought_services: Vec::new(),
+        trace: node.endpoint().trace(),
+        workers: FuturesUnordered::new(),
+    };
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let ip = IpAddr::from([93, 184, 216, 34]);
+    let mut probes = Vec::new();
+    for index in 0..2 {
+        let attempt = state.record_attempt(node_id(index + 3), vec![ip]).unwrap();
+        let retained = std::sync::Arc::new(());
+        probes.push(std::sync::Arc::downgrade(&retained));
+        let (started_tx, started_rx) = oneshot::channel();
+        io.workers
+            .push(DiscoveryDialWorker::spawn(attempt, async move {
+                let _retained = retained;
+                let _ = started_tx.send(());
+                std::future::pending().await
+            }));
+        if index == 0 {
+            zakura_rt::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    assert_eq!(state.in_flight_dials_to(ip), 2);
+    zakura_rt::time::timeout(Duration::from_secs(5), io.shutdown(&mut state))
+        .await
+        .unwrap();
+    assert!(io.workers.is_empty());
+    assert!(state.in_flight_node_ids().is_empty());
+    assert_eq!(state.in_flight_dials_to(ip), 0);
+    assert!(probes.iter().all(|probe| probe.upgrade().is_none()));
+    drop(io);
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
+    zakura_rt::time::timeout(Duration::from_secs(15), async {
+        let limits = ZakuraLocalLimits {
+            max_connections: 2,
+            max_pending_handshakes: 1,
+            ..ZakuraLocalLimits::from_config(&crate::Config::default())
+        };
+        let node = crate::zakura::testkit::ZakuraTestNode::builder(9213)
+            .limits(limits.clone())
+            .quic_config(zakura_quic::QuicConfig {
+                handshake_timeout_secs: Some(30),
+                ..Default::default()
+            })
+            .spawn()
+            .await
+            .unwrap();
+        let endpoint = node.endpoint();
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let target = node_id(6);
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        for _ in 0..2 {
+            let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            assert!(endpoint.has_discovery_admission_capacity());
+            let attempt = state.record_attempt(target, vec![ip]).unwrap();
+            let worker = DiscoveryDialWorker::spawn(
+                attempt,
+                run_discovery_dial_once(
+                    endpoint.clone(),
+                    NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
+                    limits.clone(),
+                    attempt,
+                ),
+            );
+            let mut packet = [0; 2048];
+            silent.recv_from(&mut packet).await.unwrap();
+            assert!(
+                !endpoint.has_discovery_admission_capacity(),
+                "the real transport holds the sole discovery slot"
+            );
+            worker.task.abort();
+            let (completed, outcome) = worker.await;
+            assert_eq!(completed, attempt);
+            assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+            assert!(state.complete(
+                completed,
+                outcome.result,
+                outcome.admitted_ip,
+                Instant::now()
+            ));
+            zakura_rt::time::timeout(Duration::from_secs(2), async {
+                while !endpoint.has_discovery_admission_capacity() {
+                    zakura_rt::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("worker cancellation releases transport capacity before the handshake timeout");
+            assert_eq!(state.in_flight_dials_to(ip), 0);
+        }
+        node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn panicked_worker_returns_metadata_needed_to_release_reservations() {
+    let ip = IpAddr::from([93, 184, 216, 34]);
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let attempt = state.record_attempt(node_id(3), vec![ip]).unwrap();
+    let worker = DiscoveryDialWorker::spawn(attempt, async { panic!("test worker panic") });
+    let (completed, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap();
+    assert_eq!(completed, attempt);
+    assert_eq!(outcome.result, DiscoveryDialResult::Failed);
+    assert!(state.complete(
+        completed,
+        outcome.result,
+        outcome.admitted_ip,
+        Instant::now()
+    ));
+    assert!(state.in_flight_node_ids().is_empty());
+    assert_eq!(state.in_flight_dials_to(ip), 0);
+}
+
+const DIAL_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
+
+/// One attempt's watch of a dial that runs `dial`, with the registration
+/// watch's sender and the sender that reports the authenticated IP.
+fn dial_watch(
+    byte: u8,
+    registered: Vec<ZakuraPeerId>,
+    dial: impl Future<Output = Result<(), ZakuraHandlerError>> + Send + 'static,
+) -> (
+    DialWatch,
+    watch::Sender<Vec<ZakuraPeerId>>,
+    oneshot::Sender<IpAddr>,
+) {
+    let (registered_tx, registered_rx) = watch::channel(registered);
+    let (admitted_tx, admitted_ip_rx) = oneshot::channel();
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let watch = DialWatch {
+        attempt: state
+            .record_attempt(node_id(byte), vec![DIAL_IP])
+            .expect("a fresh dialer records the attempt"),
+        peer_id: peer_id(byte),
+        registered: registered_rx,
+        dial: AbortOnDropHandle::new(zakura_rt::task::spawn(dial)),
+        admitted_ip_rx,
+        admitted_ip: None,
+        registration: PeerRegistration::Absent,
+        trace: ZakuraTrace::default(),
+    };
+    (watch, registered_tx, admitted_tx)
+}
+
+#[tokio::test(start_paused = true)]
+async fn registration_drop_before_healthy_threshold_is_short_lived() {
+    let peer = peer_id(7);
+    let (watch, registered_tx, admitted_tx) = dial_watch(7, vec![peer], std::future::pending());
+    admitted_tx.send(DIAL_IP).unwrap();
+
+    let settled = tokio::spawn(watch.run());
+    tokio::task::yield_now().await;
+    assert!(!settled.is_finished(), "the registration is live");
+
+    registered_tx.send_replace(Vec::new());
+    let outcome = settled.await.unwrap();
+    assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
+    assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+}
+
+#[tokio::test(start_paused = true)]
+async fn dial_completion_with_live_registration_is_connected_elsewhere() {
+    let (watch, _registered_tx, _admitted_tx) =
+        dial_watch(9, vec![peer_id(9)], std::future::ready(Ok(())));
+    assert_eq!(
+        watch.run().await.result,
+        DiscoveryDialResult::ConnectedElsewhere
+    );
+}
+
+/// A dial that served its connection before the watch showed the peer ran
+/// a real, short connection, not a failed dial.
+#[tokio::test(start_paused = true)]
+async fn a_served_dial_with_a_delayed_registration_is_short_lived() {
+    let (watch, _registered_tx, admitted_tx) =
+        dial_watch(10, Vec::new(), std::future::ready(Ok(())));
+    admitted_tx.send(DIAL_IP).unwrap();
+    let outcome = watch.run().await;
+    assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
+    assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+}
+
+/// Another connection's registration ending says nothing about this
+/// attempt, which goes on to report its own dial's failure.
+#[tokio::test(start_paused = true)]
+async fn another_connections_registration_ending_keeps_the_attempt_waiting() {
+    let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+    let (watch, registered_tx, _admitted_tx) = dial_watch(11, vec![peer_id(11)], async move {
+        let _ = fail_rx.await;
+        Err(ZakuraHandlerError::ResourceLimit(
+            "the test dial hit a limit",
+        ))
+    });
+    let settled = tokio::spawn(watch.run());
+    tokio::task::yield_now().await;
+
+    registered_tx.send_replace(Vec::new());
+    tokio::task::yield_now().await;
+    assert!(!settled.is_finished(), "the attempt's own dial still runs");
+
+    fail_tx.send(()).unwrap();
+    let outcome = settled.await.unwrap();
+    assert_eq!(outcome.result, DiscoveryDialResult::LocalResourceLimit);
+    assert_eq!(outcome.admitted_ip, None);
+}
+
+/// A registration that lasts on another connection does not credit this
+/// attempt, and the attempt's own handshake ends with it.
+#[tokio::test(start_paused = true)]
+async fn another_connections_healthy_registration_ends_the_unfinished_dial() {
+    let retained = std::sync::Arc::new(());
+    let observed = std::sync::Arc::downgrade(&retained);
+    let (watch, _registered_tx, _admitted_tx) = dial_watch(12, vec![peer_id(12)], async move {
+        let _retained = retained;
+        std::future::pending().await
+    });
+    let outcome = watch.run().await;
+    assert_eq!(outcome.result, DiscoveryDialResult::ConnectedElsewhere);
+    assert_eq!(outcome.admitted_ip, None);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(observed.upgrade().is_none(), "the dial was aborted");
+}
+
+/// This attempt's healthy connection keeps serving past its attempt.
+#[tokio::test(start_paused = true)]
+async fn an_authenticated_healthy_registration_hands_the_dial_to_its_connection() {
+    let retained = std::sync::Arc::new(());
+    let observed = std::sync::Arc::downgrade(&retained);
+    let (watch, _registered_tx, admitted_tx) = dial_watch(13, vec![peer_id(13)], async move {
+        let _retained = retained;
+        std::future::pending().await
+    });
+    admitted_tx.send(DIAL_IP).unwrap();
+    let outcome = watch.run().await;
+    assert_eq!(outcome.result, DiscoveryDialResult::Registered);
+    assert_eq!(outcome.admitted_ip, Some(DIAL_IP));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(observed.upgrade().is_some(), "the dial keeps serving");
+}
+
+/// A cancelled worker reports its identity and its end.
+// V12 F-71: the reservation counts one dial per IP, and the endpoint
+// starts one handshake per address. A record that lists several ports on
+// one IP must get one address per IP, so attempts equal reservations.
+#[tokio::test]
+async fn dial_keeps_the_first_address_of_each_ip() {
+    use std::net::SocketAddr;
+
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9211)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let shared: IpAddr = IpAddr::from([93, 184, 216, 34]);
+    let other: IpAddr = IpAddr::from([198, 51, 100, 7]);
+    let mapped_shared: IpAddr = "::ffff:93.184.216.34"
+        .parse()
+        .expect("mapped test address parses");
+    let candidate = ZakuraDiscoveryDialCandidate {
+        node_id: node_id(5),
+        direct_addrs: vec![
+            SocketAddr::new(shared, 8233),
+            SocketAddr::new(shared, 8234),
+            SocketAddr::new(other, 8233),
+            SocketAddr::new(mapped_shared, 8235),
+            SocketAddr::new(other, 8234),
+        ],
+        is_static: false,
+    };
+
+    let (node_addr, reserved_ips) = discovery_node_addr_with_reserved_ip_capacity(
+        &node.endpoint(),
+        &CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600))),
+        &candidate,
+        Instant::now(),
+    )
+    .await
+    .expect("both IPs have capacity");
+
+    assert_eq!(
+        node_addr.direct,
+        vec![SocketAddr::new(shared, 8233), SocketAddr::new(other, 8233)]
+    );
+    assert_eq!(reserved_ips, vec![shared, other]);
+    node.shutdown().await;
 }

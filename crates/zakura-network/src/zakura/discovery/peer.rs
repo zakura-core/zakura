@@ -12,11 +12,13 @@
 //! to its deadline, for this session's unwritten answers and for the peer's
 //! delivered answers and `Hello`, which can be waiting for a verification slot.
 
-mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
+mod model;
+mod state;
+#[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use tests::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
+pub use model::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 
 use std::{sync::Arc, time::Duration};
 

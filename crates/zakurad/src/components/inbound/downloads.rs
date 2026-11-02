@@ -31,7 +31,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    download_work::WorkAdmission,
+    download_work::{WorkAdmission, ADMISSION_TIMEOUT},
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -1049,6 +1049,19 @@ where
                 ))?;
             }
 
+            // Reserve this source's FIFO position before asynchronous work admission can
+            // reorder completions. Poll once to enqueue the lock request, but let admission
+            // and parent recovery proceed without waiting for an earlier verifier. Recovery
+            // tasks have no source lock, so they can unblock the child holding it.
+            let source_lock = async move {
+                match source_lock {
+                    Some(source_lock) => Some(source_lock.lock_owned().await),
+                    None => None,
+                }
+            };
+            tokio::pin!(source_lock);
+            let source_guard = source_lock.as_mut().now_or_never();
+
             let admitted_height = WorkAdmission::new(state.clone())
                 .check(chain_network.clone(), block.clone())
                 .await
@@ -1099,8 +1112,12 @@ where
             if kind == DownloadKind::Advertised && admitted_height.is_none() {
                 let parent = block.header.previous_block_hash;
                 if matches!(
-                    state.oneshot(zs::Request::KnownBlock(parent)).await,
-                    Ok(zs::Response::KnownBlock(None))
+                    tokio::time::timeout(
+                        ADMISSION_TIMEOUT,
+                        state.oneshot(zs::Request::KnownBlock(parent))
+                    )
+                    .await,
+                    Ok(Ok(zs::Response::KnownBlock(None)))
                 ) {
                     let recovery = spawner.recover_parent(parent, download_source);
                     debug!(
@@ -1117,9 +1134,9 @@ where
                 }
             }
 
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
+            let _source_guard = match source_guard {
+                Some(guard) => guard,
+                None => source_lock.await,
             };
 
             verifier
@@ -1453,17 +1470,30 @@ mod tests {
 
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
+        let second_admitted = Arc::new(tokio::sync::Notify::new());
         let mut downloads = Downloads::new(
             MAX_INBOUND_CONCURRENCY,
             false,
             network,
             verifier,
-            BoxCloneService::new(service_fn(|request| async move {
-                match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                    zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
-                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
-                    request => Err(format!("unexpected state request: {request:?}").into()),
+            BoxCloneService::new(service_fn(move |request| {
+                let second_admitted = second_admitted.clone();
+                async move {
+                    match request {
+                        zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                        zs::Request::CheckHeaderAdmission(header) => {
+                            if header.hash() == hash_one {
+                                second_admitted.notified().await;
+                            } else {
+                                second_admitted.notify_one();
+                            }
+                            Ok(zs::Response::HeaderAdmission(None))
+                        }
+                        zs::Request::KnownBlock(_) => {
+                            Ok(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)))
+                        }
+                        request => Err(format!("unexpected state request: {request:?}").into()),
+                    }
                 }
             })),
             latest_chain_tip,
@@ -1574,7 +1604,9 @@ mod tests {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
-                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                    zs::Request::KnownBlock(_) => {
+                        Ok(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)))
+                    }
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1651,7 +1683,9 @@ mod tests {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
-                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                    zs::Request::KnownBlock(_) => {
+                        Ok(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)))
+                    }
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1756,7 +1790,9 @@ mod tests {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
-                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                    zs::Request::KnownBlock(_) => {
+                        Ok(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)))
+                    }
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -2022,5 +2058,39 @@ mod tests {
             Some(1),
             "releasing one hash leaves the others alone"
         );
+    }
+    /// An optional recovery lookup must not prevent the ordinary verifier from running.
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_recovery_lookup_defers_to_full_verification() {
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let (_sender, tip) = chain_tip_at(block::Height(0), block.header.previous_block_hash);
+        let advertiser = "127.0.0.1:8233".parse().unwrap();
+        let mut downloads = downloads_returning(block, advertiser, tip);
+        downloads.spawner.state = BoxCloneService::new(service_fn(|request| async move {
+            match request {
+                zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                zs::Request::CheckHeaderAdmission(_) => Ok(zs::Response::HeaderAdmission(None)),
+                zs::Request::KnownBlock(_) => future::pending().await,
+                request => panic!("unexpected state request: {request:?}"),
+            }
+        }));
+        downloads.spawner.verifier =
+            BoxCloneService::new(service_fn(move |_| async move { Ok(hash) }));
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::LegacySocket(advertiser))),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            tokio::time::timeout(ADMISSION_TIMEOUT * 3, downloads.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            hash
+        );
+        assert!(downloads.spawner.admission().parent_recoveries.is_empty());
     }
 }

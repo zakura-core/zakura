@@ -12,8 +12,8 @@ use zakura_state as zs;
 
 use crate::BoxError;
 
-/// Bounds state readiness and the parent-context read together.
-const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds readiness and each optional parent-context read together.
+pub(super) const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Checks downloaded headers without waiting for their parents to commit.
 #[derive(Clone)]

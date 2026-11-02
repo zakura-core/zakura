@@ -240,4 +240,63 @@ mod tests {
             Response::HeaderAdmission(Some(block::Height(1)))
         ));
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn header_admission_reads_a_non_best_committed_branch() {
+        use crate::{
+            arbitrary::Prepare, service::StateService, tests::FakeChainHelper,
+            CheckpointVerifiedBlock, Config, Request, Response,
+        };
+        use tower::ServiceExt;
+        let _guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let (mut state, _, _, _) =
+            StateService::new(Config::ephemeral(), &network, block::Height::MAX, 0)
+                .await
+                .unwrap();
+        for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=1) {
+            let block: Arc<block::Block> = bytes.zcash_deserialize_into().unwrap();
+            state
+                .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let mut parent: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        // The non-finalized state fixture requires V4 coinbases even at these early heights.
+        parent.transactions = vec![Arc::new(crate::tests::setup::transaction_v4_from_coinbase(
+            &parent.transactions[0],
+        ))];
+        let siblings = Arc::new(parent).make_fake_siblings(2);
+        for sibling in &siblings {
+            state
+                .queue_and_commit_to_non_finalized_state(sibling.clone().prepare(), None)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let best_hash = state
+            .read_service
+            .latest_non_finalized_state()
+            .best_tip()
+            .unwrap()
+            .1;
+        let side_parent = siblings
+            .iter()
+            .find(|parent| parent.hash() != best_hash)
+            .unwrap();
+        let child: block::Block = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let mut header = *child.header;
+        header.previous_block_hash = side_parent.hash();
+        assert!(matches!(
+            (&mut state)
+                .oneshot(Request::CheckHeaderAdmission(Arc::new(header)))
+                .await
+                .unwrap(),
+            Response::HeaderAdmission(Some(block::Height(3)))
+        ));
+    }
 }

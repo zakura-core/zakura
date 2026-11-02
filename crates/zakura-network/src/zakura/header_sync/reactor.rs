@@ -17,8 +17,9 @@ use super::{
     scheduler::{
         completed_targets::CompletedHeaderTargets,
         peer_work::{
-            HeaderTargetPhase, HeaderWorkEnd, PeerWorkPriority, PeerWorkQueue, QueueWorkResult,
-            RetainedHeaders, StorageCall, WorkIncarnation, MAX_HEADER_CHUNK_RESERVATION_V1,
+            decide_offer, HeaderTargetPhase, HeaderWorkEnd, OfferDecision, OfferFacts,
+            OfferedPeerWork, PeerWorkPriority, PeerWorkQueue, QueueWorkResult, RetainedHeaders,
+            SpentOffer, StorageCall, WorkIncarnation, MAX_HEADER_CHUNK_RESERVATION_V1,
         },
         repair::{RepairPolicyState, RepairRequirement, RepairRequirementSlot},
         status::StatusPublisher,
@@ -1033,64 +1034,82 @@ impl HeaderSyncReactor {
             return;
         };
         let target_tip_hash = status.selected_tip_hash;
-        let scope = zakura_header_chain::HeaderWorkAuthority::for_target(local, target_tip_hash);
         let target = AdvertisedHeaderTarget {
-            scope,
+            scope: zakura_header_chain::HeaderWorkAuthority::for_target(local, target_tip_hash),
             session_id,
             status,
         };
         let work_order = target.claimed_work_order(local);
-        let covered = self.state.completed_targets.contains(
-            local.header_generation,
-            zakura_header_chain::BranchId::new(local.frontiers.finalized.hash, target_tip_hash),
-        );
-        // A status too small for one header can never start a request.
-        let eligible = target.is_discovery_eligible(local)
-            && self.negotiated_response_limits(&target.status).1 != 0;
-        let pruned =
-            self.state
-                .pruned_pause_holds(&peer, local.frontiers.header_best, Instant::now());
-        if pruned || !eligible || covered {
-            // No round can follow, so an idle subscription kept for the next
-            // round only holds the session's connection hostage.
-            if self.peer_work_queue.active(&peer).is_none() {
-                self.close_subscription(&peer);
-            }
-        }
-        if pruned {
-            // The same attempt would end `HistoryPruned` again, so another
-            // peer's status takes the target.
-            self.peer_work_queue.remove_unstarted(&peer);
-            self.state.spend_status(&peer);
-            metrics::counter!("sync.header.target.pruned_pause").increment(1);
-            return;
-        }
-        if !eligible || covered {
-            self.peer_work_queue.remove_unstarted(&peer);
-            self.state.spend_status(&peer);
-            if covered {
-                metrics::counter!("sync.header.target.covered").increment(1);
-            }
-            return;
-        }
-        if let Some(active) = self.peer_work_queue.active(&peer) {
-            // Exact selected-range repair does not use the advertised ordinary offer. A status
-            // for another target stays unspent, so it starts once this work ends.
-            if matches!(active.purpose, HeaderTargetPurpose::Normal)
-                && active.target.status.selected_tip_hash == target_tip_hash
-            {
+        let decision = decide_offer(OfferFacts {
+            pruned_pause: self.state.pruned_pause_holds(
+                &peer,
+                local.frontiers.header_best,
+                Instant::now(),
+            ),
+            covered: self.state.completed_targets.contains(
+                local.header_generation,
+                zakura_header_chain::BranchId::new(local.frontiers.finalized.hash, target_tip_hash),
+            ),
+            eligible: target.is_discovery_eligible(local)
+                && self.negotiated_response_limits(&target.status).1 != 0,
+            work: self
+                .peer_work_queue
+                .active(&peer)
+                .map_or(OfferedPeerWork::Idle, |active| {
+                    if matches!(active.purpose, HeaderTargetPurpose::Normal)
+                        && active.target.status.selected_tip_hash == target_tip_hash
+                    {
+                        OfferedPeerWork::SameOrdinaryTarget
+                    } else {
+                        OfferedPeerWork::Other
+                    }
+                }),
+            held_back: self.ordinary_discovery_paused()
+                || self.ordinary_headroom(&peer, &target.status) == 0,
+            subscription_ready: self.subscription_ready(&peer, target_tip_hash),
+        });
+        match decision {
+            OfferDecision::Spend {
+                cause,
+                close_subscription,
+            } => {
+                if close_subscription {
+                    self.close_subscription(&peer);
+                }
+                self.peer_work_queue.remove_unstarted(&peer);
                 self.state.spend_status(&peer);
+                match cause {
+                    SpentOffer::PrunedPause => {
+                        metrics::counter!("sync.header.target.pruned_pause").increment(1);
+                    }
+                    SpentOffer::Covered => {
+                        metrics::counter!("sync.header.target.covered").increment(1);
+                    }
+                    SpentOffer::Ineligible => {}
+                }
             }
-            metrics::counter!("sync.header.target.already_active").increment(1);
-            return;
+            OfferDecision::AlreadyActive { spend } => {
+                if spend {
+                    self.state.spend_status(&peer);
+                }
+                metrics::counter!("sync.header.target.already_active").increment(1);
+            }
+            OfferDecision::HeldBack => self.peer_work_queue.remove_unstarted(&peer),
+            OfferDecision::AwaitSubscription => self.close_subscription(&peer),
+            OfferDecision::Stage => self.stage_offer(peer, target, work_order),
         }
-        if self.ordinary_discovery_paused() || self.ordinary_headroom(&peer, &target.status) == 0 {
-            self.peer_work_queue.remove_unstarted(&peer);
-            return;
-        }
-        if !self.subscription_ready(&peer, target_tip_hash) {
-            return;
-        }
+    }
+
+    /// Stage `target` for `peer`, and request its locator when the queue takes it.
+    fn stage_offer(
+        &mut self,
+        peer: ZakuraPeerId,
+        target: AdvertisedHeaderTarget,
+        work_order: Option<std::cmp::Ordering>,
+    ) {
+        let session_id = target.session_id;
+        let target_tip_hash = target.status.selected_tip_hash;
+        let scope = target.scope;
         let previous_claim = self
             .peer_work_queue
             .awaiting_target(&peer)
@@ -1211,24 +1230,14 @@ impl HeaderSyncReactor {
 
     /// Whether `peer`'s session can start work toward `target`: it holds no
     /// subscription, or one that a `Grant` can continue toward `target`.
-    ///
-    /// Any other live subscription is closed, and the peer's status waits for
-    /// its terminal outcome, because the next `Open` must follow it.
-    fn subscription_ready(&mut self, peer: &ZakuraPeerId, target: block::Hash) -> bool {
-        let Some(handles) = self.sessions.get(peer) else {
-            return false;
-        };
-        let subscriber = handles.session.subscriber();
-        if subscriber.live().is_none()
-            || subscriber
-                .resumable()
-                .is_some_and(|(_, resumable, _, _)| resumable == target)
-        {
-            return true;
-        }
-        drop(subscriber);
-        self.close_subscription(peer);
-        false
+    fn subscription_ready(&self, peer: &ZakuraPeerId, target: block::Hash) -> bool {
+        self.sessions.get(peer).is_some_and(|handles| {
+            let subscriber = handles.session.subscriber();
+            subscriber.live().is_none()
+                || subscriber
+                    .resumable()
+                    .is_some_and(|(_, resumable, _, _)| resumable == target)
+        })
     }
 
     /// Return an unstarted ordinary offer to the scheduler when a local blocker defers it.

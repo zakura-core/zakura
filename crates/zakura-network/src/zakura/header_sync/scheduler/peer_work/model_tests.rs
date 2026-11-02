@@ -15,9 +15,10 @@ use zakura_header_chain::{
 };
 
 use super::{
-    ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase, HeaderTargetPurpose,
-    PeerWorkPriority, PeerWorkQueue, QueueWorkResult, RetainedHeaders, StorageCall,
-    StorageCallKind, WorkIncarnation, MAX_HEADER_CHUNK_RESERVATION_V1,
+    decide_offer, ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase,
+    HeaderTargetPurpose, OfferDecision, OfferFacts, OfferedPeerWork, PeerWorkPriority,
+    PeerWorkQueue, QueueWorkResult, RetainedHeaders, SpentOffer, StorageCall, StorageCallKind,
+    WorkIncarnation, MAX_HEADER_CHUNK_RESERVATION_V1,
 };
 use crate::zakura::{
     header_sync::{wire::AuxSchema, HeaderSyncRequestId, Status},
@@ -56,6 +57,35 @@ enum Op {
     Retire { peer: usize },
     /// A committed snapshot at header generation `generation` retires what it obsoletes.
     Commit { generation: u8 },
+    /// `peer` offers `tip`, with the blockers that `blockers` names.
+    Offer {
+        peer: usize,
+        tip: u8,
+        priority: u8,
+        blockers: OfferBlockers,
+    },
+}
+
+/// The facts of one offer that the queue does not decide.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct OfferBlockers {
+    pruned_pause: bool,
+    covered: bool,
+    eligible: bool,
+    held_back: bool,
+    subscription_ready: bool,
+}
+
+impl OfferBlockers {
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            pruned_pause: bits & 1 != 0,
+            covered: bits & 2 != 0,
+            eligible: bits & 4 == 0,
+            held_back: bits & 8 != 0,
+            subscription_ready: bits & 16 == 0,
+        }
+    }
 }
 
 /// One peer's work in the model.
@@ -130,6 +160,10 @@ struct HeaderWorkReplaySummary {
     evictions: usize,
     /// Headers that stayed charged to a call after their round retired.
     retained_after_retirement: usize,
+    /// Offers that the decision staged.
+    offers_staged: usize,
+    /// Offers that the decision spent.
+    offers_spent: usize,
 }
 
 struct Harness {
@@ -322,6 +356,41 @@ impl Harness {
         QueueWorkResult::NeedsLocator
     }
 
+    /// End `peer`'s unstarted work in the model.
+    fn model_remove_unstarted(&mut self, peer: usize) {
+        if matches!(self.work.get(&peer), Some(ModelWork::Awaiting { .. })) {
+            self.work.remove(&peer);
+            self.release(peer);
+            self.revision += 1;
+        }
+    }
+
+    /// The decision the documented offer rules give `peer`'s offer of `tip`.
+    /// The first rule that applies wins.
+    fn model_offer(&self, peer: usize, tip: u8, blockers: OfferBlockers) -> OfferDecision {
+        let started = match self.work.get(&peer) {
+            Some(ModelWork::Active { tip: active, .. }) => Some(*active == tip),
+            _ => None,
+        };
+        let spent = [
+            (blockers.pruned_pause, SpentOffer::PrunedPause),
+            (blockers.covered, SpentOffer::Covered),
+            (!blockers.eligible, SpentOffer::Ineligible),
+        ]
+        .into_iter()
+        .find_map(|(applies, cause)| applies.then_some(cause));
+        match (spent, started) {
+            (Some(cause), started) => OfferDecision::Spend {
+                cause,
+                close_subscription: started.is_none(),
+            },
+            (None, Some(same_target)) => OfferDecision::AlreadyActive { spend: same_target },
+            (None, None) if blockers.held_back => OfferDecision::HeldBack,
+            (None, None) if !blockers.subscription_ready => OfferDecision::AwaitSubscription,
+            (None, None) => OfferDecision::Stage,
+        }
+    }
+
     /// Take the hold that `hold` selects, if any call is live.
     fn take_hold(&mut self, hold: usize) -> Option<Hold> {
         if self.holds.is_empty() {
@@ -369,11 +438,7 @@ impl Harness {
                     .iter()
                     .any(|(owner, work)| *owner != peer && work.tip() == tip);
                 let expected = if owned_elsewhere {
-                    if matches!(self.work.get(&peer), Some(ModelWork::Awaiting { .. })) {
-                        self.work.remove(&peer);
-                        self.release(peer);
-                        self.revision += 1;
-                    }
+                    self.model_remove_unstarted(peer);
                     QueueWorkResult::TargetAlreadyAssigned
                 } else {
                     self.model_stage(peer, tip, priority, 0)
@@ -588,6 +653,53 @@ impl Harness {
                     self.revision += 1;
                 }
             }
+            Op::Offer {
+                peer,
+                tip,
+                priority,
+                blockers,
+            } => {
+                let work =
+                    self.queue
+                        .active(&peer_id(peer))
+                        .map_or(OfferedPeerWork::Idle, |active| {
+                            if active.target.status.selected_tip_hash == hash(tip) {
+                                OfferedPeerWork::SameOrdinaryTarget
+                            } else {
+                                OfferedPeerWork::Other
+                            }
+                        });
+                let decision = decide_offer(OfferFacts {
+                    pruned_pause: blockers.pruned_pause,
+                    covered: blockers.covered,
+                    eligible: blockers.eligible,
+                    work,
+                    held_back: blockers.held_back,
+                    subscription_ready: blockers.subscription_ready,
+                });
+                assert_eq!(
+                    decision,
+                    self.model_offer(peer, tip, blockers),
+                    "{PROPERTY}: offer"
+                );
+                match decision {
+                    OfferDecision::Spend { .. } | OfferDecision::HeldBack => {
+                        self.summary.offers_spent +=
+                            usize::from(matches!(decision, OfferDecision::Spend { .. }));
+                        self.queue.remove_unstarted(&peer_id(peer));
+                        self.model_remove_unstarted(peer);
+                    }
+                    OfferDecision::AlreadyActive { .. } | OfferDecision::AwaitSubscription => {}
+                    OfferDecision::Stage => {
+                        self.summary.offers_staged += 1;
+                        return self.apply(Op::StageDistinct {
+                            peer,
+                            tip,
+                            priority,
+                        });
+                    }
+                }
+            }
         }
         self.check();
     }
@@ -733,7 +845,7 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
         let d = chunk.get(3).copied().unwrap_or(0);
         let peer = usize::from(b) % PEERS;
         let tip = c % TIPS;
-        match a % 10 {
+        match a % 11 {
             0 => Op::Stage {
                 peer,
                 tip,
@@ -760,7 +872,13 @@ fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
                 apply: d & 1 == 0,
             },
             8 => Op::Retire { peer },
-            _ => Op::Commit { generation: b % 2 },
+            9 => Op::Commit { generation: b % 2 },
+            _ => Op::Offer {
+                peer,
+                tip,
+                priority: d >> 5,
+                blockers: OfferBlockers::from_bits(d),
+            },
         }
     })
 }
@@ -811,14 +929,20 @@ mod tests {
                 .prop_map(|(peer, tip, priority)| Op::StageDistinct { peer, tip, priority }),
             4 => (peer.clone(), 0..300_u32).prop_map(|(peer, count)| Op::Reserve { peer, count }),
             1 => peer.clone().prop_map(|peer| Op::Cancel { peer }),
-            4 => (peer.clone(), tip).prop_map(|(peer, tip)| Op::Start { peer, tip }),
+            4 => (peer.clone(), tip.clone()).prop_map(|(peer, tip)| Op::Start { peer, tip }),
             4 => (peer.clone(), 0..300_usize)
                 .prop_map(|(peer, returned)| Op::Page { peer, returned }),
             3 => peer.clone().prop_map(|peer| Op::Prepare { peer }),
             4 => (any::<usize>(), any::<bool>())
                 .prop_map(|(hold, apply)| Op::Complete { hold, apply }),
-            2 => peer.prop_map(|peer| Op::Retire { peer }),
+            2 => peer.clone().prop_map(|peer| Op::Retire { peer }),
             1 => (0..2_u8).prop_map(|generation| Op::Commit { generation }),
+            4 => (peer, tip, any::<u8>()).prop_map(|(peer, tip, bits)| Op::Offer {
+                peer,
+                tip,
+                priority: bits >> 5,
+                blockers: OfferBlockers::from_bits(bits),
+            }),
         ]
     }
 
@@ -970,6 +1094,56 @@ mod tests {
         assert_eq!(harness.summary.evictions, 1);
         assert_eq!(harness.queue.chunk_budget_usage(), (20, 0));
         assert_eq!(harness.queue.reserved_header_count(&peer_id(3)), 0);
+    }
+
+    /// A blocker keeps a held-back offer from staging, and the same offer stages
+    /// once nothing holds it.
+    #[test]
+    fn an_offer_stages_only_when_nothing_blocks_it() {
+        let clear = OfferBlockers::from_bits(0);
+        let harness = run([
+            Op::Offer {
+                peer: 0,
+                tip: 1,
+                priority: 1,
+                blockers: OfferBlockers {
+                    held_back: true,
+                    ..clear
+                },
+            },
+            Op::Offer {
+                peer: 1,
+                tip: 1,
+                priority: 1,
+                blockers: OfferBlockers {
+                    subscription_ready: false,
+                    ..clear
+                },
+            },
+        ]);
+        assert_eq!(harness.queue.len(), 0);
+
+        let mut harness = run([Op::Offer {
+            peer: 0,
+            tip: 1,
+            priority: 1,
+            blockers: clear,
+        }]);
+        assert_eq!(harness.summary.offers_staged, 1);
+        assert_eq!(harness.queue.len(), 1);
+
+        // A pruned pause ends the unstarted work that the first offer staged.
+        harness.apply(Op::Offer {
+            peer: 0,
+            tip: 1,
+            priority: 1,
+            blockers: OfferBlockers {
+                pruned_pause: true,
+                ..clear
+            },
+        });
+        assert_eq!(harness.summary.offers_spent, 1);
+        assert_eq!(harness.queue.len(), 0);
     }
 
     /// A fixed decoder-v1 history reaches every kind of decision, so the

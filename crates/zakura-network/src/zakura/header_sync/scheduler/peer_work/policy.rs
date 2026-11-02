@@ -322,6 +322,106 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
     AtCapacity,
 }
 
+/// What one peer's started work means for a new offer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum OfferedPeerWork {
+    /// The peer has no started work.
+    Idle,
+    /// The peer's ordinary work already pursues the offered target.
+    SameOrdinaryTarget,
+    /// The peer's started work pursues something else.
+    Other,
+}
+
+/// The facts that decide one peer's offer of a target at one instant.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) struct OfferFacts {
+    /// A `HistoryPruned` pause holds for this peer at the selected header tip.
+    pub(in crate::zakura::header_sync) pruned_pause: bool,
+    /// The target's generation and branch already finished.
+    pub(in crate::zakura::header_sync) covered: bool,
+    /// The status names another target and can carry at least one header.
+    pub(in crate::zakura::header_sync) eligible: bool,
+    /// The peer's started work.
+    pub(in crate::zakura::header_sync) work: OfferedPeerWork,
+    /// A resource stall or missing headroom holds ordinary work back.
+    pub(in crate::zakura::header_sync) held_back: bool,
+    /// The session holds no subscription, or one that a `Grant` can continue
+    /// toward the target.
+    pub(in crate::zakura::header_sync) subscription_ready: bool,
+}
+
+/// Why an offer that cannot yield work is spent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum SpentOffer {
+    /// The same attempt would end `HistoryPruned` again, so another peer's
+    /// status takes the target.
+    PrunedPause,
+    /// The target already finished.
+    Covered,
+    /// The status cannot start a request.
+    Ineligible,
+}
+
+/// What one peer's offer of a target does.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum OfferDecision {
+    /// Spend the offer and end the peer's unstarted work.
+    Spend {
+        /// Why no round can follow.
+        cause: SpentOffer,
+        /// Whether to close an idle subscription kept for the next round, which
+        /// would only hold the session's connection hostage.
+        close_subscription: bool,
+    },
+    /// Started work continues. Exact selected-range repair does not use the
+    /// advertised ordinary offer. A status for another target stays unspent, so
+    /// it starts once this work ends.
+    AlreadyActive {
+        /// Whether the offer names the target this work already pursues.
+        spend: bool,
+    },
+    /// End the peer's unstarted work and keep the offer until the blocker clears.
+    HeldBack,
+    /// Close the live subscription and keep the offer, because the next `Open`
+    /// must follow its terminal outcome.
+    AwaitSubscription,
+    /// Stage the target.
+    Stage,
+}
+
+/// Decide one peer's offer. The checks run in priority order.
+pub(in crate::zakura::header_sync) fn decide_offer(facts: OfferFacts) -> OfferDecision {
+    let spent = if facts.pruned_pause {
+        Some(SpentOffer::PrunedPause)
+    } else if facts.covered {
+        Some(SpentOffer::Covered)
+    } else if !facts.eligible {
+        Some(SpentOffer::Ineligible)
+    } else {
+        None
+    };
+    if let Some(cause) = spent {
+        return OfferDecision::Spend {
+            cause,
+            close_subscription: facts.work == OfferedPeerWork::Idle,
+        };
+    }
+    if facts.work != OfferedPeerWork::Idle {
+        return OfferDecision::AlreadyActive {
+            spend: facts.work == OfferedPeerWork::SameOrdinaryTarget,
+        };
+    }
+    if facts.held_back {
+        return OfferDecision::HeldBack;
+    }
+    if !facts.subscription_ready {
+        return OfferDecision::AwaitSubscription;
+    }
+    OfferDecision::Stage
+}
+
 /// Counts claimed against the aggregate header budget.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct HeaderChunkUsage {

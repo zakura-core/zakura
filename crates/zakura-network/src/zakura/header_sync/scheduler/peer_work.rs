@@ -17,15 +17,16 @@ use zakura_rt::{
 
 mod policy;
 
+pub(in crate::zakura::header_sync) use policy::{
+    decide_offer, OfferDecision, OfferFacts, OfferedPeerWork, PeerWorkPriority, QueueWorkResult,
+    SpentOffer, StorageCall, WorkCall, HEADER_CHUNK_BUDGET_CAPACITY_V1,
+    MAX_HEADER_CHUNK_RESERVATION_V1,
+};
 pub use policy::{
     ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase, HeaderTargetPurpose,
     HeaderWorkEnd, StorageCallKind, WorkIncarnation,
 };
 use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
-pub(in crate::zakura::header_sync) use policy::{
-    PeerWorkPriority, QueueWorkResult, StorageCall, WorkCall, HEADER_CHUNK_BUDGET_CAPACITY_V1,
-    MAX_HEADER_CHUNK_RESERVATION_V1,
-};
 
 #[cfg(any(test, zakura_sim))]
 use super::super::observe::{ObserverSlot, ReactorEvent};

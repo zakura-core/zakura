@@ -7,9 +7,9 @@ use zakura_rt::sync::CancellationToken;
 
 use super::super::{
     request::BlockSizeEstimate,
-    work_queue::{AdmitRefusal, WorkQueue},
+    work_queue::{AdmitRefusal, UnpublishedRequest, WorkQueue},
 };
-use crate::zakura::transport::{ByteBudget, ByteReservation, FrameWriteClaim};
+use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
 
 /// The endpoint of a benchmark request's lifetime.
 #[derive(Clone, Copy, Debug)]
@@ -31,20 +31,7 @@ pub enum WorkRequestEnd {
 /// This workload allocates queue metadata but no block payloads. It does not
 /// measure decoding, QUIC, storage or asynchronous peer scheduling.
 pub fn bench_work_request(count: u32, bytes: u32, end: WorkRequestEnd) {
-    let (work, budget) = pending_work(count, bytes, u64::from(count) * u64::from(bytes));
-    let total = u64::from(count) * u64::from(bytes);
-    let taken = work.take_request(
-        block::Height(1),
-        block::Height(count),
-        usize::try_from(count).expect("request count fits usize"),
-        total,
-        1,
-        NonZeroU64::new(1).expect("request ID is nonzero"),
-    );
-    let admitted = taken
-        .admit(block::Height(0), CancellationToken::new())
-        .expect("the empty budget admits the whole request");
-    assert_eq!(budget.reserved(), total);
+    let (work, budget, admitted) = admitted_request(count, bytes);
     let owner = admitted.owner();
     if matches!(end, WorkRequestEnd::Unpublished) {
         drop(admitted);
@@ -91,6 +78,25 @@ pub fn bench_work_request(count: u32, bytes: u32, end: WorkRequestEnd) {
     std::hint::black_box(&work);
 }
 
+/// Queue `count` bodies and admit them as one request against an empty budget.
+fn admitted_request(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget, UnpublishedRequest) {
+    let total = u64::from(count) * u64::from(bytes);
+    let (work, budget) = pending_work(count, bytes, total);
+    let taken = work.take_request(
+        block::Height(1),
+        block::Height(count),
+        usize::try_from(count).expect("request count fits usize"),
+        total,
+        1,
+        NonZeroU64::new(1).expect("request ID is nonzero"),
+    );
+    let admitted = taken
+        .admit(block::Height(0), CancellationToken::new())
+        .expect("the empty budget admits the whole request");
+    assert_eq!(budget.reserved(), total);
+    (work, budget, admitted)
+}
+
 fn pending_work(count: u32, bytes: u32, limit: u64) -> (Arc<WorkQueue>, ByteBudget) {
     assert!(count > 0 && bytes >= 1024);
     let budget = ByteBudget::new(limit);
@@ -129,19 +135,7 @@ pub struct BenchReceiptBatch {
 impl BenchReceiptBatch {
     /// Admit, publish and complete the writer before measuring receipts.
     pub fn new(count: u32, bytes: u32) -> Self {
-        let (work, budget) = pending_work(count, bytes, u64::from(count) * u64::from(bytes));
-        let total = u64::from(count) * u64::from(bytes);
-        let taken = work.take_request(
-            block::Height(1),
-            block::Height(count),
-            usize::try_from(count).expect("request count fits usize"),
-            total,
-            1,
-            NonZeroU64::new(1).expect("request ID is nonzero"),
-        );
-        let admitted = taken
-            .admit(block::Height(0), CancellationToken::new())
-            .expect("the empty budget admits the whole request");
+        let (work, budget, admitted) = admitted_request(count, bytes);
         let owner = admitted.owner();
         let claim = admitted.publish(|_| {}).expect("the request is current");
         assert!(claim.try_start());
@@ -170,48 +164,6 @@ impl BenchReceiptBatch {
                 .expect("the request owns the height");
             assert_eq!(ended.charge, u64::from(self.bytes));
             drop(ended);
-        }
-        assert_eq!(self.budget.reserved(), 0);
-    }
-}
-
-/// Funded receipts prepared without queue metadata or locking.
-pub struct BenchBudgetReceipts {
-    budget: ByteBudget,
-    funding: ByteReservation,
-    count: u32,
-    bytes: u32,
-}
-
-impl BenchBudgetReceipts {
-    /// Acquire the same aggregate funding that a published queue owns.
-    pub fn new(count: u32, bytes: u32) -> Self {
-        assert!(count > 0 && bytes > 0);
-        let total = u64::from(count) * u64::from(bytes);
-        let budget = ByteBudget::new(total);
-        let funding = budget
-            .reserve_owned(total)
-            .expect("the budget starts empty");
-        Self {
-            budget,
-            funding,
-            count,
-            bytes,
-        }
-    }
-
-    /// Transfer and release each receipt without entering a queue transition.
-    pub fn release_all(&mut self) {
-        assert_eq!(
-            self.budget.reserved(),
-            u64::from(self.count) * u64::from(self.bytes)
-        );
-        for _ in 0..self.count {
-            let receipt = self
-                .funding
-                .split(u64::from(self.bytes))
-                .expect("each receipt is funded");
-            drop(receipt);
         }
         assert_eq!(self.budget.reserved(), 0);
     }

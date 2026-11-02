@@ -381,8 +381,8 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
 /// work queue, an action sender, and the
-/// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
-/// `Misbehavior` on the same action channel the reactor uses.
+/// committed throughput meter. Emits `SubmitBlock` / `Misbehavior` on the same action
+/// channel the reactor uses. It settles request bytes only through the work queue.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
     retained_body_limit: u64,
@@ -847,7 +847,6 @@ impl SequencerTask {
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
         self.work.reset_above(tip);
-
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
@@ -874,7 +873,6 @@ impl SequencerTask {
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         if advance.changed {
             self.work.advance_floor(frontiers.verified_block_tip);
-
             self.release_contiguous_blocks().await;
         }
     }
@@ -1138,7 +1136,6 @@ impl SequencerTask {
                 let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
                 self.work.reset_above(self.sequencer.floor());
-
                 let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result identifies a bad body from a peer.
                 // Attribute it to the delivering peer.
@@ -1823,16 +1820,7 @@ mod tests {
                 ),
             )],
         );
-        let taken = task.work.take_for_request(
-            height,
-            height,
-            1,
-            estimate,
-            u64::from(height.0),
-            std::num::NonZeroU64::new(1).unwrap(),
-        );
-        let owner = taken[0].1.owner.unwrap();
-        task.work.mark_reserved_for_owner(owner, [height]);
+        let owner = task.work.publish_fixture(height.0..=height.0);
         drop(
             task.work
                 .begin_receipt_for_owner(owner, height)
@@ -1882,7 +1870,7 @@ mod tests {
             block::Height(0)
         ));
         task.work.advance_floor(block::Height(1));
-        let retry = task.work.take_for_request(
+        let retry = task.work.take_request(
             block::Height(500),
             block::Height(500),
             1,
@@ -1890,7 +1878,7 @@ mod tests {
             99,
             std::num::NonZeroU64::new(2).unwrap(),
         );
-        assert_eq!(retry[0].1.estimated_bytes, bytes);
+        assert_eq!(retry.items()[0].1.estimated_bytes, bytes);
         assert!(!task.work.defer_received_for_owner(
             owner,
             block::Height(500),

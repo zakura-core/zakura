@@ -302,26 +302,6 @@ async fn accounting_closure_has_a_distinct_fill_stop() {
 async fn receipt_keeps_funding_until_the_production_send_completes() {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct ReceiverWake {
-        budget: ByteBudget,
-        resident: Arc<AtomicU64>,
-        charge_at_send: AtomicU64,
-        resident_at_send: AtomicU64,
-        cancel: CancellationToken,
-    }
-
-    impl futures::task::ArcWake for ReceiverWake {
-        fn wake_by_ref(waker: &Arc<Self>) {
-            waker
-                .charge_at_send
-                .store(waker.budget.reserved(), Ordering::SeqCst);
-            waker
-                .resident_at_send
-                .store(waker.resident.load(Ordering::Relaxed), Ordering::SeqCst);
-            waker.cancel.cancel();
-        }
-    }
-
     for matched in [true, false] {
         let Probe {
             budget,
@@ -345,14 +325,21 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
         let unrelated = budget.reserve_owned(17).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
         routine.sequencer_input = sender;
-        let wake = Arc::new(ReceiverWake {
-            budget: budget.clone(),
-            resident: routine.sequencer_input_bytes.clone(),
-            charge_at_send: AtomicU64::new(0),
-            resident_at_send: AtomicU64::new(0),
-            cancel: routine.cancel.clone(),
+        let resident = routine.sequencer_input_bytes.clone();
+        let charge_at_send = Arc::new(AtomicU64::new(0));
+        let resident_at_send = Arc::new(AtomicU64::new(0));
+        let waker = crate::zakura::transport::callback_waker({
+            let budget = budget.clone();
+            let resident = resident.clone();
+            let charge_at_send = charge_at_send.clone();
+            let resident_at_send = resident_at_send.clone();
+            let cancel = routine.cancel.clone();
+            move || {
+                charge_at_send.store(budget.reserved(), Ordering::SeqCst);
+                resident_at_send.store(resident.load(Ordering::Relaxed), Ordering::SeqCst);
+                cancel.cancel();
+            }
         });
-        let waker = futures::task::waker(wake.clone());
         let mut context = std::task::Context::from_waker(&waker);
         assert!(receiver.poll_recv(&mut context).is_pending());
 
@@ -360,12 +347,12 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
 
         assert!(routine.cancel.is_cancelled(), "the send woke the receiver");
         assert_eq!(
-            wake.charge_at_send.load(Ordering::SeqCst),
+            charge_at_send.load(Ordering::SeqCst),
             charge + 17,
             "the request charge survives until the send completes"
         );
         assert!(
-            wake.resident_at_send.load(Ordering::SeqCst) > 0,
+            resident_at_send.load(Ordering::SeqCst) > 0,
             "the body is charged before the receiver can run"
         );
         assert_eq!(routine.work.reserved_bytes(), 0);
@@ -375,7 +362,7 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
                 .try_recv()
                 .expect("cancellation cannot interrupt the admitted send"),
         );
-        assert_eq!(wake.resident.load(Ordering::Relaxed), 0);
+        assert_eq!(resident.load(Ordering::Relaxed), 0);
         drop(unrelated);
         assert_eq!(routine.budget.reserved(), 0);
     }

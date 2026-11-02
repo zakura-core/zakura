@@ -17,9 +17,10 @@ use super::{
     scheduler::{
         completed_targets::CompletedHeaderTargets,
         peer_work::{
-            decide_offer, HeaderTargetPhase, HeaderWorkEnd, OfferDecision, OfferFacts,
-            OfferedPeerWork, PeerWorkPriority, PeerWorkQueue, QueueWorkResult, RetainedHeaders,
-            SpentOffer, StorageCall, WorkIncarnation, MAX_HEADER_CHUNK_RESERVATION_V1,
+            decide_offer, page_next, repair_page, HeaderTargetPhase, HeaderWorkEnd, OfferDecision,
+            OfferFacts, OfferedPeerWork, PageFacts, PageNext, PeerWorkPriority, PeerWorkQueue,
+            QueueWorkResult, RepairPage, RetainedHeaders, SpentOffer, StorageCall, WorkIncarnation,
+            MAX_HEADER_CHUNK_RESERVATION_V1,
         },
         repair::{RepairPolicyState, RepairRequirement, RepairRequirementSlot},
         status::StatusPublisher,
@@ -1340,23 +1341,19 @@ impl HeaderSyncReactor {
         response: Headers,
         admitted: Admitted,
     ) {
-        let Some(active) = self.peer_work_queue.active(&peer) else {
+        let Some(active) = self
+            .peer_work_queue
+            .active(&peer)
+            .filter(|active| active.awaits_page(admitted.id, session_id))
+        else {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         };
-        if active.request_id.get() != admitted.id
-            || active.owner.session_id() != session_id
-            || active.phase != HeaderTargetPhase::Receiving
-        {
-            metrics::counter!("sync.header.target.late_response.total").increment(1);
-            return;
-        }
-        let response_scope = active.owner.header_authority();
         self.emit_header_response(
             hs_trace::HEADER_RESPONSE_RECEIVED,
             &peer,
             session_id,
-            response_scope,
+            active.owner.header_authority(),
             response.subscription_id,
             response.initial_target_tip_hash,
             response.common_ancestor_height,
@@ -1365,249 +1362,188 @@ impl HeaderSyncReactor {
             admitted.reaches_target,
             response.tree_aux_schema,
         );
+        if !self.repair_page_accepted(&peer, session_id, &response, admitted.reaches_target) {
+            return;
+        }
         let returned_ancestor = zakura_header_chain::Frontier::new(
             response.common_ancestor_height,
             response.common_ancestor_hash,
         );
-        let repair_episode = self.peer_work_queue.repair_episode(active.owner);
-        if let HeaderTargetPurpose::SelectedAuxiliaryRepair {
-            selected_target, ..
-        } = &active.purpose
+        let page_matches = self.peer_work_queue.active(&peer).is_some_and(|active| {
+            active.matches_response_page(response.initial_target_tip_hash, returned_ancestor)
+        });
+        if !page_matches
+            || !self.peer_work_queue.stage_page(
+                &peer,
+                returned_ancestor,
+                response.entries,
+                admitted.cursor,
+            )
         {
-            let episode = repair_episode.expect("an active repair binds its evidence episode");
-            let repair_owner = active
-                .owner
-                .body_owner()
-                .expect("an auxiliary repair has body authority");
-            let context = self.state.vct_repair.get(repair_owner).and_then(|task| {
-                let RepairPolicyState::Assigned { context } = &task.state else {
-                    return None;
-                };
-                Some(context)
-            });
-            let returned_range: Option<Vec<_>> = response
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let offset = u32::try_from(index).ok()?.checked_add(1)?;
-                    let height = returned_ancestor.height.0.checked_add(offset)?;
-                    Some(zakura_header_chain::Frontier::new(
-                        block::Height(height),
-                        entry.header.hash(),
-                    ))
-                })
-                .collect();
-            let exact_shape = response.initial_target_tip_hash == selected_target.hash
-                && active.sent_locator.entries() == [returned_ancestor]
-                && admitted.reaches_target
-                && response.tree_aux_schema == AuxSchema::V1
-                && response
-                    .entries
-                    .iter()
-                    .all(|entry| entry.tree_aux.is_some())
-                && returned_range.as_ref().is_some_and(|range| {
-                    context.is_some_and(|context| {
-                        context.episode == episode
-                            && context.request_target() == *selected_target
-                            && context.matches_selected_range(range)
-                    })
-                });
-            if !exact_shape {
-                self.retry_vct_repair(
-                    repair_owner,
-                    VctRepairRetry::supplier(
-                        active.source,
-                        HeaderRequestTerminal::MalformedResponse,
-                    ),
-                );
-                sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
-                return;
-            }
-            let inputs: Vec<_> = response
-                .entries
-                .iter()
-                .map(|entry| {
-                    entry
-                        .tree_aux
-                        .expect("a repair response has schema-1 auxiliary input")
-                })
-                .collect();
-            let excluded = self.state.vct_repair.get(repair_owner).is_some_and(|task| {
-                let RepairPolicyState::Assigned { context } = &task.state else {
-                    return false;
-                };
-                context.episode == episode && !context.admits_new_input(active.source, &inputs)
-            });
-            if excluded {
-                metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
-                self.retry_vct_repair(repair_owner, VctRepairRetry::excluded_input(active.source));
-                return;
-            }
-        }
-        if !active.matches_response_page(response.initial_target_tip_hash, returned_ancestor) {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
-            return;
-        }
-        if !self
-            .peer_work_queue
-            .consume_response_capacity(&peer, response.entries.len())
-        {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+            self.reject_page(peer, session_id);
             return;
         }
         self.reset_unproductive_requests(&peer, session_id);
         self.state
             .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
 
-        let complete = admitted.reaches_target;
         let active = self
             .peer_work_queue
-            .active_mut(&peer)
-            .expect("the matching active request was just cloned");
-        active.common_ancestor.get_or_insert(returned_ancestor);
-        active.entries.extend(response.entries);
-        active.cursor = Some(admitted.cursor);
-        let staged_entry_count = active.entries.len();
-        let target_tip_height = active.target.status.selected_tip_height;
-        let Some(staged_tip) = active.staged_tip() else {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
-            return;
-        };
-        let checkpoint_prefix_ready = self
-            .committed_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| Self::should_prepare_checkpoint_prefix(snapshot, active));
-        let _ = active;
-        debug_assert_eq!(
-            self.peer_work_queue.owned_header_count(&peer),
-            staged_entry_count,
-            "every staged header retains exactly one owned budget unit",
-        );
-        if complete {
-            // Stop the pages that would follow the target. Pages already in
-            // flight are dropped.
+            .active(&peer)
+            .expect("the page was just staged on this work");
+        let facts = self.page_facts(&peer, active, admitted.reaches_target);
+        let next = page_next(active, facts);
+        if next.closes_subscription() {
             self.close_subscription(&peer);
-        } else if self.peer_work_queue.reserved_header_count(&peer) != 0 {
-            // The rest of this round's credit is still on its way.
-            return;
         }
-        // A peer can advertise an arbitrarily distant target.
-        // The reactor bounds response staging by admitting a validated prefix at capacity.
-        // The reactor limits continuations to remaining capacity.
-        // A local checkpoint-sized minimum also allows a selected extension to unblock
-        // body validation without letting short peer pages force tiny prefix commits.
-        let durable_prefix_full = self.committed_snapshot.as_ref().is_some_and(|snapshot| {
-            Self::request_header_prefix_remaining(
-                snapshot,
-                self.peer_work_queue.claimed_header_count(),
-                target_tip_height,
-            ) == 0
-        });
-        let bounded_prefix = !complete
-            && (self.peer_work_queue.budget_is_full()
-                || durable_prefix_full
-                || checkpoint_prefix_ready);
-        if !complete && checkpoint_prefix_ready {
-            metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
-        }
-        let active = self
-            .peer_work_queue
-            .active_mut(&peer)
-            .expect("the matching active request remains staged");
-
-        if complete || bounded_prefix {
-            if complete && staged_tip.hash != active.target.status.selected_tip_hash {
-                self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-                sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
-                return;
+        match next {
+            PageNext::WaitCredit => {}
+            PageNext::Malformed { .. } => self.reject_page(peer, session_id),
+            PageNext::Prepare { bounded_prefix } => {
+                if bounded_prefix && facts.checkpoint_prefix_ready {
+                    metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
+                }
+                self.prepare_staged_work(&peer, bounded_prefix);
             }
-            let common_ancestor = active
-                .common_ancestor
-                .expect("a response page fixed its exact ancestor");
-            let completion = match active.purpose {
-                HeaderTargetPurpose::Normal if bounded_prefix => {
-                    let owner = active
-                        .owner
-                        .header_owner()
-                        .expect("a normal target has header authority");
-                    active.owner = zakura_header_chain::HeaderWorkAuthority {
-                        branch: zakura_header_chain::BranchId {
-                            target_tip_hash: staged_tip.hash,
-                            ..owner.authority.branch
-                        },
-                        ..owner.authority
-                    }
-                    .bind(owner.session_id, owner.request_id)
-                    .into();
-                    zakura_header_chain::TargetCompletion::TargetPrefix { common_ancestor }
-                }
-                HeaderTargetPurpose::Normal => {
-                    zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor }
-                }
-                HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                    selected_target, ..
-                } => zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
-                    common_ancestor,
-                    selected_target,
-                    episode: repair_episode.expect("an active repair binds its evidence episode"),
-                },
-            };
-            let repair = matches!(
+            PageNext::Continue { staged_tip } => self.continue_round(&peer, staged_tip),
+        }
+    }
+
+    /// Judge a page for `peer`'s selected-range repair, and retry the repair
+    /// when it fails. Ordinary work has nothing to judge here.
+    #[cfg_attr(not(any(test, zakura_sim)), allow(unused_variables))]
+    fn repair_page_accepted(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        response: &Headers,
+        reaches_target: bool,
+    ) -> bool {
+        let Some(active) = self.peer_work_queue.active(peer).filter(|active| {
+            matches!(
                 active.purpose,
                 HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
             )
-            .then(|| {
-                (
-                    active
-                        .owner
-                        .body_owner()
-                        .expect("an auxiliary repair has body authority"),
-                    active.source,
-                )
-            });
-            active.phase = HeaderTargetPhase::Preparing;
-            let action = HeaderPortOperation::PrepareHeaderTarget {
-                purpose: active.purpose.clone(),
-                peer: peer.clone(),
-                source: active.source,
-                owner: active.owner,
-                common_ancestor,
-                target: staged_tip,
-                completion,
-                entries: std::mem::take(&mut active.entries),
-            };
-            let _ = active;
-            self.peer_work_queue.publish_phase_metrics();
-            if let Some((owner, source)) = repair {
-                let Some(task) = self.state.vct_repair.get(owner) else {
-                    self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
-                    return;
-                };
-                if !matches!(task.state, RepairPolicyState::Assigned { .. }) {
-                    self.retry_vct_repair(
-                        owner,
-                        VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
-                    );
-                    return;
-                }
+        }) else {
+            return true;
+        };
+        let source = active.source;
+        let owner = active
+            .owner
+            .body_owner()
+            .expect("an auxiliary repair has body authority");
+        let episode = self
+            .peer_work_queue
+            .repair_episode(active.owner)
+            .expect("an active repair binds its evidence episode");
+        let context = self
+            .state
+            .vct_repair
+            .get(owner)
+            .and_then(RepairRequirement::assigned_context);
+        match repair_page(active, episode, context, response, reaches_target) {
+            RepairPage::Accepted => true,
+            RepairPage::Malformed => {
+                self.retry_vct_repair(
+                    owner,
+                    VctRepairRetry::supplier(source, HeaderRequestTerminal::MalformedResponse),
+                );
+                sim_arg!(self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::MalformedMessage); session_id);
+                false
             }
-            if self.dispatch_action(action).is_refused() {
-                if let Some((owner, source)) = repair {
-                    self.retry_vct_repair(
-                        owner,
-                        VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
-                    );
-                } else {
-                    self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
-                }
+            RepairPage::ExcludedInput => {
+                metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
+                self.retry_vct_repair(owner, VctRepairRetry::excluded_input(source));
+                false
             }
-            return;
         }
+    }
 
+    /// Retire `peer`'s work over a page its session sent, and record the violation.
+    #[cfg_attr(not(any(test, zakura_sim)), allow(unused_variables))]
+    fn reject_page(&mut self, peer: ZakuraPeerId, session_id: u64) {
+        self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
+        sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+    }
+
+    /// Read the facts that decide what follows the page just staged on `active`.
+    fn page_facts(
+        &self,
+        peer: &ZakuraPeerId,
+        active: &ActiveHeaderRequest,
+        reaches_target: bool,
+    ) -> PageFacts {
+        let snapshot = self.committed_snapshot.as_ref();
+        PageFacts {
+            reaches_target,
+            reserved: self.peer_work_queue.reserved_header_count(peer),
+            budget_full: self.peer_work_queue.budget_is_full(),
+            durable_prefix_full: snapshot.is_some_and(|snapshot| {
+                Self::request_header_prefix_remaining(
+                    snapshot,
+                    self.peer_work_queue.claimed_header_count(),
+                    active.target.status.selected_tip_height,
+                ) == 0
+            }),
+            checkpoint_prefix_ready: snapshot
+                .is_some_and(|snapshot| Self::should_prepare_checkpoint_prefix(snapshot, active)),
+        }
+    }
+
+    /// Dispatch the prepare that validates `peer`'s staged headers.
+    fn prepare_staged_work(&mut self, peer: &ZakuraPeerId, bounded_prefix: bool) {
+        let action = self
+            .peer_work_queue
+            .begin_prepare(peer, bounded_prefix)
+            .expect("the decided work is receiving and holds staged headers");
+        let active = self
+            .peer_work_queue
+            .active(peer)
+            .expect("the prepare's round stays active");
+        let repair = matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        )
+        .then(|| {
+            (
+                active
+                    .owner
+                    .body_owner()
+                    .expect("an auxiliary repair has body authority"),
+                active.source,
+            )
+        });
+        if let Some((owner, source)) = repair {
+            let Some(task) = self.state.vct_repair.get(owner) else {
+                self.retire_peer_work(peer, HeaderRequestTerminal::RepairObsolete);
+                return;
+            };
+            if !matches!(task.state, RepairPolicyState::Assigned { .. }) {
+                self.retry_vct_repair(
+                    owner,
+                    VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
+                );
+                return;
+            }
+        }
+        if self.dispatch_action(action).is_refused() {
+            if let Some((owner, source)) = repair {
+                self.retry_vct_repair(
+                    owner,
+                    VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                );
+            } else {
+                self.retire_peer_work(peer, HeaderRequestTerminal::LocalError);
+            }
+        }
+    }
+
+    /// Grant `peer`'s round more credit toward its target from `staged_tip`.
+    fn continue_round(&mut self, peer: &ZakuraPeerId, staged_tip: zakura_header_chain::Frontier) {
+        let active = self
+            .peer_work_queue
+            .active(peer)
+            .expect("the decided work is active");
         let locator = active.continuation_locator(staged_tip);
         let negotiated_header_count = active.max_header_count;
         let tree_aux_schema = active.tree_aux_schema;
@@ -1615,7 +1551,6 @@ impl HeaderSyncReactor {
         let request_id = active.request_id;
         let target_tip_height = active.target.status.selected_tip_height;
         let request_scope = active.owner.header_authority();
-        let _ = active;
         let max_header_count = self
             .peer_work_queue
             .reservable_header_count(negotiated_header_count)
@@ -1630,31 +1565,27 @@ impl HeaderSyncReactor {
             max_header_count > 0,
             "a full owned or durable prefix returned before continuation"
         );
-        if max_header_count == 0
-            || !self
-                .peer_work_queue
-                .reserve_request(&peer, max_header_count)
-        {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::StagingRefused);
+        if max_header_count == 0 || !self.peer_work_queue.reserve_request(peer, max_header_count) {
+            self.retire_peer_work(peer, HeaderRequestTerminal::StagingRefused);
             return;
         }
         let Some(session) = self
             .sessions
-            .get(&peer)
+            .get(peer)
             .map(|handles| handles.session.clone())
         else {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::Disconnected);
+            self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
             return;
         };
         // Every staged header and the new reservation make up the window, so
         // the grant adds exactly the new reservation.
-        let staging = u32::try_from(self.peer_work_queue.owned_header_count(&peer))
+        let staging = u32::try_from(self.peer_work_queue.owned_header_count(peer))
             .expect("the header budget capacity fits u32")
             .saturating_add(max_header_count);
         match session.try_grant(staging) {
             Ok(true) => {
                 self.emit_header_request(
-                    &peer,
+                    peer,
                     session.session_id(),
                     request_scope,
                     request_id,
@@ -1665,13 +1596,13 @@ impl HeaderSyncReactor {
                 );
             }
             Ok(false) => {
-                self.peer_work_queue.cancel_request_reservation(&peer);
-                self.retire_peer_work(&peer, HeaderRequestTerminal::StagingRefused);
+                self.peer_work_queue.cancel_request_reservation(peer);
+                self.retire_peer_work(peer, HeaderRequestTerminal::StagingRefused);
             }
             Err(error) => {
-                self.peer_work_queue.cancel_request_reservation(&peer);
-                self.emit_queue_send_failed(&peer, &session, "SubscribeHeaders", &error, None);
-                self.retire_peer_work(&peer, HeaderRequestTerminal::SendError);
+                self.peer_work_queue.cancel_request_reservation(peer);
+                self.emit_queue_send_failed(peer, &session, "SubscribeHeaders", &error, None);
+                self.retire_peer_work(peer, HeaderRequestTerminal::SendError);
             }
         }
     }
@@ -2040,11 +1971,10 @@ impl HeaderSyncReactor {
                     Instant::now(),
                     self.startup.request_timeout,
                 );
-                self.peer_work_queue
-                    .active_mut(&peer)
-                    .expect("the exact preparing request passed the completion gate")
-                    .phase = HeaderTargetPhase::Applying;
-                self.peer_work_queue.publish_phase_metrics();
+                assert!(
+                    self.peer_work_queue.begin_apply(&peer),
+                    "the exact preparing request passed the completion gate"
+                );
                 let dispatch = self.dispatch_holding(
                     HeaderPortOperation::ApplyHeaderTarget {
                         purpose: purpose.clone(),

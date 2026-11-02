@@ -13,12 +13,13 @@ use std::cmp::Ordering;
 
 use zakura_header_chain::{
     AuxiliaryRequirementEpisode, EngineSnapshot, Frontier, HeaderLocator, HeaderSyncWorkOwner,
-    HeaderWorkAuthority, SourceId, MAX_STAGED_TARGETS_V1,
+    HeaderWorkAuthority, SourceId, TargetCompletion, VctRepairContext, MAX_STAGED_TARGETS_V1,
 };
 use zakura_rt::collections::HashMap;
 
 use super::super::super::{
-    v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
+    events::HeaderPortOperation, v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Headers,
+    Status, ZakuraPeerId, MAX_HS_RANGE,
 };
 
 /// Exact aggregate header count owned across receiving, preparation, and application.
@@ -248,6 +249,13 @@ impl ActiveHeaderRequest {
             && expected_ancestor == Some(returned_ancestor)
     }
 
+    /// Whether this work still receives the pages of subscription `id` on `session_id`.
+    pub(in crate::zakura::header_sync) fn awaits_page(&self, id: u64, session_id: u64) -> bool {
+        self.request_id.get() == id
+            && self.owner.session_id() == session_id
+            && self.phase == HeaderTargetPhase::Receiving
+    }
+
     /// Whether one explicit outcome exactly matches the active request.
     pub fn accepts_outcome(
         &self,
@@ -420,6 +428,175 @@ pub(in crate::zakura::header_sync) fn decide_offer(facts: OfferFacts) -> OfferDe
         return OfferDecision::AwaitSubscription;
     }
     OfferDecision::Stage
+}
+
+/// The facts that decide what follows one staged page.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) struct PageFacts {
+    /// Whether the page ends at the initial target.
+    pub(in crate::zakura::header_sync) reaches_target: bool,
+    /// Headers that this round's credit may still deliver.
+    pub(in crate::zakura::header_sync) reserved: usize,
+    /// Whether the aggregate header budget is full.
+    pub(in crate::zakura::header_sync) budget_full: bool,
+    /// Whether the durable prefix has no room for the round's next grant.
+    pub(in crate::zakura::header_sync) durable_prefix_full: bool,
+    /// Whether the staged headers form a whole refill batch for the selected tip.
+    pub(in crate::zakura::header_sync) checkpoint_prefix_ready: bool,
+}
+
+/// What follows one staged page.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum PageNext {
+    /// The rest of this round's credit is still on its way.
+    WaitCredit,
+    /// Validate the staged headers.
+    Prepare {
+        /// Whether they form a prefix of the target, because capacity bounds the round.
+        bounded_prefix: bool,
+    },
+    /// Grant more credit toward the target from `staged_tip`.
+    Continue {
+        /// The last staged header.
+        staged_tip: Frontier,
+    },
+    /// The peer's pages cannot form the target.
+    Malformed {
+        /// Whether the page claimed to reach the target with staged headers.
+        reached_target: bool,
+    },
+}
+
+impl PageNext {
+    /// Whether the page reached its target, so the pages that would follow it
+    /// must stop. Pages already in flight are dropped.
+    pub(in crate::zakura::header_sync) fn closes_subscription(self) -> bool {
+        matches!(
+            self,
+            Self::Prepare {
+                bounded_prefix: false
+            } | Self::Malformed {
+                reached_target: true
+            }
+        )
+    }
+}
+
+/// Decide what follows the page just staged on `active`.
+///
+/// A peer can advertise an arbitrarily distant target. Admitting a validated
+/// prefix at capacity bounds response staging, and a checkpoint-sized minimum
+/// lets a selected extension unblock body validation without letting short peer
+/// pages force tiny prefix commits.
+pub(in crate::zakura::header_sync) fn page_next(
+    active: &ActiveHeaderRequest,
+    facts: PageFacts,
+) -> PageNext {
+    let Some(staged_tip) = active.staged_tip() else {
+        return PageNext::Malformed {
+            reached_target: false,
+        };
+    };
+    if facts.reaches_target {
+        return if staged_tip.hash == active.target.status.selected_tip_hash {
+            PageNext::Prepare {
+                bounded_prefix: false,
+            }
+        } else {
+            PageNext::Malformed {
+                reached_target: true,
+            }
+        };
+    }
+    if facts.reserved != 0 {
+        return PageNext::WaitCredit;
+    }
+    if facts.budget_full || facts.durable_prefix_full || facts.checkpoint_prefix_ready {
+        return PageNext::Prepare {
+            bounded_prefix: true,
+        };
+    }
+    PageNext::Continue { staged_tip }
+}
+
+/// What one selected-range repair page means for its repair.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) enum RepairPage {
+    /// The page has the exact shape of the selected range and carries new input.
+    Accepted,
+    /// The page does not have the exact shape of the selected range.
+    Malformed,
+    /// The supplier returned auxiliary input that this episode already excludes.
+    ExcludedInput,
+}
+
+/// Judge `response` against `active`'s repair, whose evidence episode is `episode`.
+///
+/// `context` is the repair's assigned context, if it is still assigned.
+pub(in crate::zakura::header_sync) fn repair_page(
+    active: &ActiveHeaderRequest,
+    episode: AuxiliaryRequirementEpisode,
+    context: Option<&VctRepairContext>,
+    response: &Headers,
+    reaches_target: bool,
+) -> RepairPage {
+    let HeaderTargetPurpose::SelectedAuxiliaryRepair {
+        selected_target, ..
+    } = &active.purpose
+    else {
+        return RepairPage::Accepted;
+    };
+    let ancestor = Frontier::new(
+        response.common_ancestor_height,
+        response.common_ancestor_hash,
+    );
+    let returned_range: Option<Vec<_>> = response
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let offset = u32::try_from(index).ok()?.checked_add(1)?;
+            let height = ancestor.height.0.checked_add(offset)?;
+            Some(Frontier::new(
+                zakura_chain::block::Height(height),
+                entry.header.hash(),
+            ))
+        })
+        .collect();
+    let context = context.filter(|context| {
+        context.episode == episode
+            && context.request_target() == *selected_target
+            && returned_range
+                .as_ref()
+                .is_some_and(|range| context.matches_selected_range(range))
+    });
+    let exact_shape = response.initial_target_tip_hash == selected_target.hash
+        && active.sent_locator.entries() == [ancestor]
+        && reaches_target
+        && response.tree_aux_schema == AuxSchema::V1
+        && response
+            .entries
+            .iter()
+            .all(|entry| entry.tree_aux.is_some());
+    let (true, Some(context)) = (exact_shape, context) else {
+        return RepairPage::Malformed;
+    };
+    let inputs: Vec<_> = response
+        .entries
+        .iter()
+        .map(|entry| {
+            entry
+                .tree_aux
+                .expect("a repair response has schema-1 auxiliary input")
+        })
+        .collect();
+    if context.admits_new_input(active.source, &inputs) {
+        RepairPage::Accepted
+    } else {
+        RepairPage::ExcludedInput
+    }
 }
 
 /// Counts claimed against the aggregate header budget.
@@ -864,11 +1041,116 @@ impl WorkPolicy {
         }
     }
 
+    /// Whether `peer`'s started work still receives pages.
+    pub(super) fn is_receiving(&self, peer: &ZakuraPeerId) -> bool {
+        self.active(peer)
+            .is_some_and(|request| request.phase == HeaderTargetPhase::Receiving)
+    }
+
+    /// Mutable access for tests and models that seed a request's fields directly.
+    #[cfg(any(test, feature = "header-fuzz"))]
     pub(super) fn active_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
+        self.request_mut(peer)
+    }
+
+    fn request_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
         match self.work_by_peer.get_mut(peer) {
             Some(PeerWorkState::Active { request, .. }) => Some(request),
             _ => None,
         }
+    }
+
+    /// Stage one admitted page on `peer`'s receiving work.
+    ///
+    /// The first page fixes the exact `ancestor`. The page's `cursor` replaces
+    /// the last one.
+    pub(super) fn stage_page(
+        &mut self,
+        peer: &ZakuraPeerId,
+        ancestor: Frontier,
+        entries: Vec<HeaderEntry>,
+        cursor: Cursor,
+    ) -> bool {
+        let Some(request) = self
+            .request_mut(peer)
+            .filter(|request| request.phase == HeaderTargetPhase::Receiving)
+        else {
+            return false;
+        };
+        request.common_ancestor.get_or_insert(ancestor);
+        request.entries.extend(entries);
+        request.cursor = Some(cursor);
+        true
+    }
+
+    /// Move `peer`'s staged headers into preparation, and return the storage
+    /// operation that validates them.
+    ///
+    /// A `bounded_prefix` round narrows an ordinary owner to its staged tip,
+    /// since state admits only that prefix. Return `None` unless `peer`'s work
+    /// is receiving and holds staged headers.
+    pub(super) fn begin_prepare(
+        &mut self,
+        peer: &ZakuraPeerId,
+        bounded_prefix: bool,
+    ) -> Option<HeaderPortOperation> {
+        let active = self.active(peer)?;
+        let episode = self.repair_episode(active.owner);
+        let request = self
+            .request_mut(peer)
+            .filter(|request| request.phase == HeaderTargetPhase::Receiving)?;
+        let target = request.staged_tip()?;
+        let common_ancestor = request.common_ancestor?;
+        let completion = match request.purpose {
+            HeaderTargetPurpose::Normal if bounded_prefix => {
+                let owner = request
+                    .owner
+                    .header_owner()
+                    .expect("a normal target has header authority");
+                request.owner = HeaderWorkAuthority {
+                    branch: zakura_header_chain::BranchId {
+                        target_tip_hash: target.hash,
+                        ..owner.authority.branch
+                    },
+                    ..owner.authority
+                }
+                .bind(owner.session_id, owner.request_id)
+                .into();
+                TargetCompletion::TargetPrefix { common_ancestor }
+            }
+            HeaderTargetPurpose::Normal => TargetCompletion::TargetComplete { common_ancestor },
+            HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                selected_target, ..
+            } => TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor,
+                selected_target,
+                episode: episode.expect("an active repair binds its evidence episode"),
+            },
+        };
+        request.phase = HeaderTargetPhase::Preparing;
+        Some(HeaderPortOperation::PrepareHeaderTarget {
+            purpose: request.purpose.clone(),
+            peer: peer.clone(),
+            source: request.source,
+            owner: request.owner,
+            common_ancestor,
+            target,
+            completion,
+            entries: std::mem::take(&mut request.entries),
+        })
+    }
+
+    /// Move `peer`'s prepared work to its one state call, and return whether
+    /// the work was preparing.
+    pub(super) fn begin_apply(&mut self, peer: &ZakuraPeerId) -> bool {
+        let Some(request) = self
+            .request_mut(peer)
+            .filter(|request| request.phase == HeaderTargetPhase::Preparing)
+        else {
+            return false;
+        };
+        request.phase = HeaderTargetPhase::Applying;
+        true
     }
 
     /// Record that `work`'s round on `peer` waits for its call. Another round's

@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use zakura_header_chain::{EngineSnapshot, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
+use zakura_header_chain::{
+    EngineSnapshot, Frontier, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
+};
 use zakura_rt::{
     collections::HashMap,
     sync::{
@@ -18,9 +20,9 @@ use zakura_rt::{
 mod policy;
 
 pub(in crate::zakura::header_sync) use policy::{
-    decide_offer, OfferDecision, OfferFacts, OfferedPeerWork, PeerWorkPriority, QueueWorkResult,
-    SpentOffer, StorageCall, WorkCall, HEADER_CHUNK_BUDGET_CAPACITY_V1,
-    MAX_HEADER_CHUNK_RESERVATION_V1,
+    decide_offer, page_next, repair_page, OfferDecision, OfferFacts, OfferedPeerWork, PageFacts,
+    PageNext, PeerWorkPriority, QueueWorkResult, RepairPage, SpentOffer, StorageCall, WorkCall,
+    HEADER_CHUNK_BUDGET_CAPACITY_V1, MAX_HEADER_CHUNK_RESERVATION_V1,
 };
 pub use policy::{
     ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase, HeaderTargetPurpose,
@@ -30,7 +32,7 @@ use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
 
 #[cfg(any(test, zakura_sim))]
 use super::super::observe::{ObserverSlot, ReactorEvent};
-use super::super::ZakuraPeerId;
+use super::super::{events::HeaderPortOperation, v9::Cursor, HeaderEntry, ZakuraPeerId};
 
 #[derive(Debug)]
 struct HeaderChunkBudgetInner {
@@ -512,11 +514,56 @@ impl PeerWorkQueue {
         self.policy.active(peer)
     }
 
+    /// Mutable access for tests and models that seed a request's fields directly.
+    #[cfg(any(test, feature = "header-fuzz"))]
     pub(in crate::zakura::header_sync) fn active_mut(
         &mut self,
         peer: &ZakuraPeerId,
     ) -> Option<&mut ActiveHeaderRequest> {
         self.policy.active_mut(peer)
+    }
+
+    /// Charge one admitted page to `peer`'s reservation and stage its entries.
+    ///
+    /// Return false, changing nothing, when `peer`'s work is not receiving or
+    /// the page does not fit the reservation.
+    pub(in crate::zakura::header_sync) fn stage_page(
+        &mut self,
+        peer: &ZakuraPeerId,
+        ancestor: Frontier,
+        entries: Vec<HeaderEntry>,
+        cursor: Cursor,
+    ) -> bool {
+        if !self.policy.is_receiving(peer) || !self.consume_response_capacity(peer, entries.len()) {
+            return false;
+        }
+        self.policy.stage_page(peer, ancestor, entries, cursor);
+        debug_assert_eq!(
+            self.owned_header_count(peer),
+            self.policy
+                .active(peer)
+                .map_or(0, |request| request.entries.len()),
+            "every staged header retains exactly one owned budget unit",
+        );
+        true
+    }
+
+    /// Move `peer`'s staged headers into preparation. See [`WorkPolicy::begin_prepare`].
+    pub(in crate::zakura::header_sync) fn begin_prepare(
+        &mut self,
+        peer: &ZakuraPeerId,
+        bounded_prefix: bool,
+    ) -> Option<HeaderPortOperation> {
+        let operation = self.policy.begin_prepare(peer, bounded_prefix);
+        self.publish_phase_metrics();
+        operation
+    }
+
+    /// Move `peer`'s prepared work to its state call, and return whether it was preparing.
+    pub(in crate::zakura::header_sync) fn begin_apply(&mut self, peer: &ZakuraPeerId) -> bool {
+        let began = self.policy.begin_apply(peer);
+        self.publish_phase_metrics();
+        began
     }
 
     /// Bound one request by its fair share and currently unowned capacity.

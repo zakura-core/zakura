@@ -196,10 +196,6 @@ pub(super) struct Terminal {
     /// The ended subscription's slot, which holds this outcome's reserved
     /// output.
     pub(super) slot: SlotId,
-    /// The job in progress for this subscription, which state abandoned.
-    /// Drop its page when this outcome is written; a running job keeps its
-    /// permit until storage answers.
-    pub(super) abandons: Option<JobKey>,
 }
 
 /// Why the publisher task stops.
@@ -376,16 +372,12 @@ impl PublisherState {
                     "the publisher queued {outcome:?} outside its window"
                 );
                 let slot = self.publications.end(&id)?;
-                let abandons = self
-                    .in_progress
-                    .take_if(|job| job.subscription == id)
-                    .map(|job| job.key);
+                self.in_progress.take_if(|job| job.subscription == id);
                 self.terminals.push_back(Terminal {
                     id,
                     target: subscription.fixed.target,
                     outcome,
                     slot,
-                    abandons,
                 });
                 Some((id, outcome))
             })
@@ -582,6 +574,12 @@ impl PublisherState {
             return Some(job);
         }
         None
+    }
+
+    /// Whether job `key` is the job in progress. After [`Self::end_due`], a job
+    /// that is not has been abandoned, and its page is never sent.
+    pub(super) fn is_current(&self, key: JobKey) -> bool {
+        self.in_progress.as_ref().is_some_and(|job| job.key == key)
     }
 
     /// Take the job in progress if it is `key`.

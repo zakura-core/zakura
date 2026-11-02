@@ -258,7 +258,6 @@ impl PublisherOwner {
             frame,
             permit,
             slot: terminal.slot,
-            abandons: terminal.abandons,
         }
     }
 
@@ -340,8 +339,6 @@ struct OwnedTerminal {
     permit: TerminalPermit,
     /// The identity to report the write under.
     slot: SlotId,
-    /// See [`state::Terminal::abandons`].
-    abandons: Option<JobKey>,
 }
 
 /// An encoded page: the frame for the output path, and its facts for state.
@@ -506,24 +503,30 @@ async fn publish<const HEADER_BYTES: usize>(
     // The page in progress, under the key state recorded for its job.
     let mut work: Option<(JobKey, Work<'_>)> = None;
     loop {
-        for outcome in lock(&task.shared).end_due() {
+        let (outcomes, abandoned) = {
+            let mut shared = lock(&task.shared);
+            let outcomes = shared.end_due();
+            let abandoned = work
+                .as_ref()
+                .is_some_and(|(key, _)| !shared.state.is_current(*key));
+            (outcomes, abandoned)
+        };
+        for outcome in outcomes {
             metrics::counter!(
                 "sync.header.v9.publisher.outcome",
                 "outcome" => outcome_label(outcome),
             )
             .increment(1);
         }
+        // The subscription sends no more pages, so drop its page in progress. A
+        // running job keeps its permit until state answers.
+        if abandoned {
+            work = None;
+        }
         loop {
             let Some(terminal) = lock(&task.shared).next_terminal::<HEADER_BYTES>() else {
                 break;
             };
-            // The subscription sends no more pages, so drop its page in
-            // progress. A running job keeps its permit until state answers.
-            if terminal.abandons.is_some()
-                && work.as_ref().map(|(working, _)| *working) == terminal.abandons
-            {
-                work = None;
-            }
             let written = write_terminal(
                 &task.shared,
                 &selected,
@@ -591,8 +594,7 @@ async fn publish<const HEADER_BYTES: usize>(
 /// A full queue must not keep a cancelled session's task alive, hide a page
 /// job's panic, or stop another subscription's page. That page settles at
 /// once: its job gives its execution slots back, and a page that holds the
-/// queue slot this terminal waits for is queued instead of kept. A page whose
-/// subscription ended in the same batch fails its commit and is dropped.
+/// queue slot this terminal waits for is queued instead of kept.
 async fn write_terminal<'a>(
     shared: &Mutex<PublisherOwner>,
     selected: &watch::Receiver<Option<EngineSnapshot>>,

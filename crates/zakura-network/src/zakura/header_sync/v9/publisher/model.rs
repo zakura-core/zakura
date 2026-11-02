@@ -197,7 +197,6 @@ impl ModelSub {
 struct ModelTerminal {
     id: u64,
     outcome: HeadersOutcomeCode,
-    abandons: Option<JobKey>,
 }
 
 /// An ended subscription's remains.
@@ -435,6 +434,12 @@ impl Machine {
             self.expected_view(),
             "{PROPERTY}: the owner's view"
         );
+        if let Some(record) = &self.model.in_progress {
+            assert!(
+                self.owner.state.is_current(record.job.key),
+                "{PROPERTY}: the job in progress keeps its exact key"
+            );
+        }
         if self.model.exit.is_some() {
             return;
         }
@@ -980,11 +985,13 @@ impl Machine {
                 "{PROPERTY}: {outcome:?} is legal for {sub:?}"
             );
             let abandoned = model.in_progress.take_if(|record| record.job.id == id);
-            model.queued.push_back(ModelTerminal {
-                id,
-                outcome,
-                abandons: abandoned.as_ref().map(|record| record.job.key),
-            });
+            if let Some(record) = &abandoned {
+                assert!(
+                    !self.owner.state.is_current(record.job.key),
+                    "{PROPERTY}: ending a subscription abandons its job"
+                );
+            }
+            model.queued.push_back(ModelTerminal { id, outcome });
             self.stale.extend(abandoned);
             model.tombstones.push_back(ModelTombstone {
                 id,
@@ -1013,13 +1020,13 @@ impl Machine {
             else {
                 panic!("a terminal frame is an outcome");
             };
-            (outcome.subscription_id, outcome.outcome, terminal.abandons)
+            (outcome.subscription_id, outcome.outcome)
         });
         assert_eq!(
             found,
             expected
                 .as_ref()
-                .map(|terminal| (terminal.id, terminal.outcome, terminal.abandons)),
+                .map(|terminal| (terminal.id, terminal.outcome)),
             "{PROPERTY}: the next terminal outcome, one at a time and in order"
         );
         if terminal.is_some() {

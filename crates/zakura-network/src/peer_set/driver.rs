@@ -10,10 +10,11 @@ use futures::{
     FutureExt,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::sync::{CancellationToken, PollSender};
+use tokio_util::sync::PollSender;
 use tower::{discover::Discover, util::BoxCloneSyncService, Service};
 use tracing::debug;
 use zakura_chain::chain_tip::ChainTip;
+use zakura_rt::sync::CancellationToken;
 
 use super::PeerSet;
 use crate::{

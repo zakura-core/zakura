@@ -8,25 +8,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zakura_chain::{
-    block::{self, genesis::regtest_genesis_block},
-    work::difficulty::U256,
-};
-use zakura_header_chain::{
-    AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, HeaderLocator,
-    HeaderWorkOwner, StateVersion, SuffixWork, VerifiedGeneration, MAX_STAGED_TARGETS_V1,
-};
+use zakura_chain::block::{self, genesis::regtest_genesis_block};
+use zakura_header_chain::{Frontier, HeaderLocator, HeaderWorkOwner, MAX_STAGED_TARGETS_V1};
 
 use super::{
-    decide_offer, page_next, ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase,
-    HeaderTargetPurpose, OfferDecision, OfferFacts, OfferedPeerWork, PageFacts, PageNext,
-    PeerWorkPriority, PeerWorkQueue, QueueWorkResult, RetainedHeaders, SpentOffer, StorageCall,
-    StorageCallKind, MAX_HEADER_CHUNK_RESERVATION_V1,
+    decide_offer,
+    fixtures::{self, hash, snapshot},
+    page_next, ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPhase, HeaderTargetPurpose,
+    OfferDecision, OfferFacts, OfferedPeerWork, PageFacts, PageNext, PeerWorkPriority,
+    PeerWorkQueue, QueueWorkResult, RetainedHeaders, SpentOffer, StorageCall, StorageCallKind,
+    MAX_HEADER_CHUNK_RESERVATION_V1,
 };
 use crate::zakura::{
     header_sync::{
         events::HeaderPortOperation, v9::Cursor, wire::AuxSchema, HeaderEntry, HeaderSyncRequestId,
-        Status,
     },
     ZakuraPeerId,
 };
@@ -202,12 +197,7 @@ struct Harness {
 }
 
 fn peer_id(peer: usize) -> ZakuraPeerId {
-    let byte = u8::try_from(peer).expect("the test uses few peers") + 1;
-    ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length")
-}
-
-fn hash(byte: u8) -> block::Hash {
-    block::Hash([byte; 32])
+    fixtures::peer(u8::try_from(peer).expect("the test uses few peers") + 1)
 }
 
 thread_local! {
@@ -238,7 +228,7 @@ fn tip_hash(tip: u8) -> block::Hash {
 
 /// The ancestor that the first page of every round names.
 fn ancestor() -> Frontier {
-    Frontier::new(block::Height(10), hash(0xF0))
+    Frontier::new(block::Height(10), hash(10))
 }
 
 /// The admitted page of `returned` headers.
@@ -260,25 +250,6 @@ fn priority_of(priority: u8) -> PeerWorkPriority {
     }
 }
 
-fn snapshot(generation: u8) -> zakura_header_chain::EngineSnapshot {
-    let finalized = Frontier::new(block::Height(10), hash(0xF0));
-    let tip = Frontier::new(block::Height(100), hash(0xF1));
-    zakura_header_chain::EngineSnapshot {
-        mode: EngineMode::Integrated,
-        state_version: StateVersion::new(1),
-        header_generation: HeaderGeneration::new(u64::from(generation)),
-        verified_generation: VerifiedGeneration::new(1),
-        frontiers: FrontierSet {
-            finalized,
-            header_best: tip,
-            verified_best: finalized,
-        },
-        header_best_score: ChainScore::new(SuffixWork::new(U256::from(100_u32)), tip.hash),
-        oldest_retained_height: finalized.height,
-        alarms: AlarmSet::default(),
-    }
-}
-
 fn target(tip: u8, generation: u8) -> AdvertisedHeaderTarget {
     AdvertisedHeaderTarget {
         scope: zakura_header_chain::HeaderWorkAuthority::for_target(
@@ -286,18 +257,7 @@ fn target(tip: u8, generation: u8) -> AdvertisedHeaderTarget {
             tip_hash(tip),
         ),
         session_id: 1,
-        status: Status {
-            work_anchor_height: block::Height(10),
-            work_anchor_hash: hash(0xF0),
-            selected_tip_height: block::Height(u32::from(tip) + 11),
-            selected_tip_hash: tip_hash(tip),
-            suffix_cumulative_work: U256::from(1_u32),
-            oldest_retained_height: block::Height(10),
-            max_headers_per_response: 1_000,
-            max_subscriptions: 1,
-            max_message_bytes: 2_000_000,
-            tree_aux_schema_mask: 0,
-        },
+        status: fixtures::status(u32::from(tip) + 11, tip_hash(tip), 1),
     }
 }
 

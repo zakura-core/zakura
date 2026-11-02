@@ -709,6 +709,8 @@ impl PeerWorkQueue {
 }
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod model_tests;
 
 #[cfg(test)]
@@ -717,37 +719,18 @@ mod tests {
 
     use zakura_header_chain::HeaderWorkAuthority;
 
-    use super::*;
+    use super::{
+        fixtures::{self, hash, peer},
+        *,
+    };
     use crate::zakura::header_sync::{
-        wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, MAX_HS_RANGE,
+        wire::AuxSchema, HeaderEntry, HeaderSyncRequestId, MAX_HS_RANGE,
     };
     use zakura_chain::{block, block::genesis::regtest_genesis_block, work::difficulty::U256};
-    use zakura_header_chain::{
-        AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, HeaderLocator,
-        StateVersion, SuffixWork, VerifiedGeneration, MAX_STAGED_TARGETS_V1,
-    };
-
-    fn hash(byte: u8) -> block::Hash {
-        block::Hash([byte; 32])
-    }
+    use zakura_header_chain::{Frontier, HeaderLocator, MAX_STAGED_TARGETS_V1};
 
     fn snapshot() -> EngineSnapshot {
-        let finalized = Frontier::new(block::Height(10), hash(10));
-        let tip = Frontier::new(block::Height(100), hash(100));
-        EngineSnapshot {
-            mode: EngineMode::Integrated,
-            state_version: StateVersion::new(1),
-            header_generation: HeaderGeneration::new(1),
-            verified_generation: VerifiedGeneration::new(1),
-            frontiers: FrontierSet {
-                finalized,
-                header_best: tip,
-                verified_best: finalized,
-            },
-            header_best_score: ChainScore::new(SuffixWork::new(U256::from(100_u32)), tip.hash),
-            oldest_retained_height: finalized.height,
-            alarms: AlarmSet::default(),
-        }
+        fixtures::snapshot(1)
     }
 
     fn advertisement(marker: u8) -> AdvertisedHeaderTarget {
@@ -755,23 +738,8 @@ mod tests {
         AdvertisedHeaderTarget {
             scope: HeaderWorkAuthority::for_target(&local, hash(marker)),
             session_id: 7,
-            status: Status {
-                work_anchor_height: block::Height(10),
-                work_anchor_hash: hash(10),
-                selected_tip_height: block::Height(u32::from(marker)),
-                selected_tip_hash: hash(marker),
-                suffix_cumulative_work: U256::from(u32::from(marker)),
-                oldest_retained_height: block::Height(10),
-                max_headers_per_response: 1_000,
-                max_subscriptions: 1,
-                max_message_bytes: 2_000_000,
-                tree_aux_schema_mask: 1,
-            },
+            status: fixtures::status(u32::from(marker), hash(marker), u32::from(marker)),
         }
-    }
-
-    fn peer(marker: u8) -> ZakuraPeerId {
-        ZakuraPeerId::new(vec![marker; 32]).expect("the test peer ID has the required length")
     }
 
     fn active_request(
@@ -782,31 +750,26 @@ mod tests {
     ) -> ActiveHeaderRequest {
         let request_id =
             HeaderSyncRequestId::new(u64::from(marker)).expect("the marker is nonzero");
-        {
-            let mut request = ActiveHeaderRequest::new(
-                HeaderTargetPurpose::Normal,
-                peer(marker),
-                SourceId::from_digest([marker; 32]),
-                HeaderLocator::for_continuation(local.frontiers.finalized),
-                zakura_header_chain::HeaderWorkOwner {
-                    authority: HeaderWorkAuthority::for_target(
-                        local,
-                        target.status.selected_tip_hash,
-                    ),
-                    session_id: target.session_id,
-                    request_id: std::num::NonZeroU64::new(request_id.get())
-                        .expect("header-sync request IDs are nonzero"),
-                }
-                .into(),
-                target,
-                request_id,
-                1_000,
-                AuxSchema::None,
-            );
-            request.common_ancestor = Some(local.frontiers.finalized);
-            request.entries = entries;
-            request
-        }
+        let mut request = ActiveHeaderRequest::new(
+            HeaderTargetPurpose::Normal,
+            peer(marker),
+            SourceId::from_digest([marker; 32]),
+            HeaderLocator::for_continuation(local.frontiers.finalized),
+            zakura_header_chain::HeaderWorkOwner {
+                authority: HeaderWorkAuthority::for_target(local, target.status.selected_tip_hash),
+                session_id: target.session_id,
+                request_id: std::num::NonZeroU64::new(request_id.get())
+                    .expect("header-sync request IDs are nonzero"),
+            }
+            .into(),
+            target,
+            request_id,
+            1_000,
+            AuxSchema::None,
+        );
+        request.common_ancestor = Some(local.frontiers.finalized);
+        request.entries = entries;
+        request
     }
 
     #[test]

@@ -117,45 +117,28 @@ fn check(target: Target, cx: &mut CheckCtx<'_, Handle>) -> Verdict {
         cx.missing_evidence("machine transition has no captured view");
         return Verdict::NotApplicable;
     };
-    let (failure, difference) = match (target, &view) {
-        (Target::Book, MachineStep::DiscoveryBook(step)) => (
-            &step.failure,
-            (step.actual != step.expected)
-                .then(|| (format!("{:?}", step.expected), format!("{:?}", step.actual))),
-        ),
-        (Target::State, MachineStep::DiscoveryState(step)) => (
-            &step.failure,
-            (step.actual != step.expected)
-                .then(|| (format!("{:?}", step.expected), format!("{:?}", step.actual))),
-        ),
+    let failure = match (target, &view) {
+        (Target::Book, MachineStep::DiscoveryBook(step)) => &step.failure,
+        (Target::State, MachineStep::DiscoveryState(step)) => &step.failure,
         _ => {
             cx.missing_evidence("machine transition has the wrong evidence kind");
             return Verdict::NotApplicable;
         }
     };
-    if let Some(failure) = failure {
-        if !failure.property_failure {
-            cx.missing_evidence(format!("machine driver panicked: {}", failure.message));
-            return Verdict::NotApplicable;
-        }
-        return Verdict::Violated(Violation {
-            property: target.name().into(),
-            step: cx.step,
-            witness: (1..=cx.step).collect(),
-            expected: "independent model agrees with the transition and retained state".into(),
-            actual: failure.message.clone(),
-        });
+    let Some(failure) = failure else {
+        return Verdict::Holds;
+    };
+    if !failure.property_failure {
+        cx.missing_evidence(format!("machine driver panicked: {}", failure.message));
+        return Verdict::NotApplicable;
     }
-    if let Some((expected, actual)) = difference {
-        return Verdict::Violated(Violation {
-            property: target.name().into(),
-            step: cx.step,
-            witness: (1..=cx.step).collect(),
-            expected,
-            actual,
-        });
-    }
-    Verdict::Holds
+    Verdict::Violated(Violation {
+        property: target.name().into(),
+        step: cx.step,
+        witness: (1..=cx.step).collect(),
+        expected: "independent model agrees with the transition and retained state".into(),
+        actual: failure.message.clone(),
+    })
 }
 
 fn registered(target: Target) -> Vec<PropertyRef> {

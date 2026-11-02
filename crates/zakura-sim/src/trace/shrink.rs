@@ -313,7 +313,7 @@ pub fn shrink_with(
     let mut shrinker = Shrinker {
         harness,
         scenario: trace.meta.scenario.clone(),
-        machine_failure: machine_failure(&trace.steps, trace.end.as_ref()),
+        machine_failure: machine_failure(&trace.steps),
         property: property.clone(),
         budget,
         started,
@@ -348,10 +348,7 @@ pub fn shrink_with(
         &property,
         &out.join(REDUCED_DIR),
     ) {
-        Ok(reduced)
-            if machine_failure(&reduced.steps, reduced.end.as_ref())
-                == shrinker.machine_failure =>
-        {
+        Ok(reduced) if machine_failure(&reduced.steps) == shrinker.machine_failure => {
             (Some(reduced.id.clone()), Some(Counts::of(&reduced)), None)
         }
         Ok(_) => (
@@ -395,35 +392,17 @@ fn machine_input(name: &str, scenario: &Value) -> Option<Vec<u8>> {
         .map(|scenario| scenario.input)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MachineFailureKey {
-    Driver(zakura_network::zakura::DriverFailure),
-    State { expected: String, actual: String },
-}
+type MachineFailureKey = zakura_network::zakura::DriverFailure;
 
 fn machine_failure<'a>(
     steps: impl IntoIterator<Item = &'a StepRecord>,
-    end: Option<&EndRecord>,
 ) -> Option<MachineFailureKey> {
-    let mut machine = false;
-    for step in steps.into_iter().filter_map(|step| step.machine.as_deref()) {
-        let failure = match step {
-            crate::record::machine::MachineStep::DiscoveryBook(book) => &book.failure,
-            crate::record::machine::MachineStep::DiscoveryState(state) => &state.failure,
-        };
-        machine = true;
-        if let Some(failure) = failure {
-            return Some(MachineFailureKey::Driver(failure.clone()));
-        }
-    }
-    // The adapter can detect a state mismatch even when the driver did not panic.
-    if !machine {
-        return None;
-    }
-    end.and_then(|end| end.violation.as_ref())
-        .map(|violation| MachineFailureKey::State {
-            expected: violation.expected.clone(),
-            actual: violation.actual.clone(),
+    steps
+        .into_iter()
+        .filter_map(|step| step.machine.as_deref())
+        .find_map(|step| match step {
+            crate::record::machine::MachineStep::DiscoveryBook(book) => book.failure.clone(),
+            crate::record::machine::MachineStep::DiscoveryState(state) => state.failure.clone(),
         })
 }
 
@@ -886,11 +865,7 @@ impl Shrinker<'_> {
                     Record::Step(step) => Some(step),
                     _ => None,
                 });
-                let end = sink.records.iter().find_map(|record| match record {
-                    Record::End(end) => Some(end),
-                    _ => None,
-                });
-                let failure = machine_failure(steps, end);
+                let failure = machine_failure(steps);
                 if failure != expected_failure {
                     return Err(WitnessError::ChangedFailure);
                 }

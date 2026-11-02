@@ -16,6 +16,7 @@ use std::{
 use proptest::prelude::*;
 use rand_10::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -282,8 +283,6 @@ struct BookModel {
     entries: HashMap<NodeId, ModelEntry>,
     /// The record changes the current operation made.
     changes: Vec<BookChange>,
-    /// What the current operation's import should return.
-    last_result: Option<Expected>,
 }
 
 impl BookModel {
@@ -315,19 +314,6 @@ impl BookModel {
     }
 
     fn import(
-        &mut self,
-        node_id: NodeId,
-        sequence: u64,
-        expires: u64,
-        source: Option<NodeId>,
-        now: u64,
-    ) -> Expected {
-        let expected = self.predict_import(node_id, sequence, expires, source, now);
-        self.last_result = Some(expected);
-        expected
-    }
-
-    fn predict_import(
         &mut self,
         node_id: NodeId,
         sequence: u64,
@@ -537,6 +523,8 @@ struct BookDriver {
     changes: Vec<BookChange>,
     /// The current import's result, if the operation imported a record.
     result: Option<Expected>,
+    /// What the model predicts for the current import.
+    expected_result: Option<Expected>,
     /// The current sample's signed records, as they would go on the wire.
     sample: Vec<Vec<u8>>,
 }
@@ -568,6 +556,7 @@ impl BookDriver {
             now: START,
             changes: Vec::new(),
             result: None,
+            expected_result: None,
             sample: Vec::new(),
         }
     }
@@ -576,6 +565,7 @@ impl BookDriver {
         self.changes.clear();
         self.model.changes.clear();
         self.result = None;
+        self.expected_result = None;
         self.sample.clear();
         let now = self.now;
         match op {
@@ -607,10 +597,9 @@ impl BookDriver {
                     ),
                     Err(error) => Err(error.into()),
                 };
-                let expected = self.model.import(node_id, sequence, expires, source, now);
-                let actual = import_result(result);
-                self.result = Some(actual);
-                assert_eq!(actual, expected, "{BOOK_PROPERTY}");
+                self.expected_result =
+                    Some(self.model.import(node_id, sequence, expires, source, now));
+                self.result = Some(import_result(result));
             }
             BookOp::DialSuccess(author) => {
                 let node_id = self.authors[author].public();
@@ -672,43 +661,21 @@ impl BookDriver {
 
     fn check(&mut self, after_step: &mut impl FnMut(&mut ZakuraDiscoveryBook, u64)) {
         after_step(&mut self.book, self.now);
-        assert_eq!(
-            self.book.discovered_len(),
-            self.model.entries.len(),
-            "{BOOK_PROPERTY}"
-        );
+        assert_view_matches(BOOK_PROPERTY, &self.actual_view(), &self.expected_view());
         assert!(
             self.model.entries.len() <= BOOK_MAX_RECORDS,
             "{BOOK_PROPERTY}"
         );
-        assert_eq!(self.changes, self.model.changes, "{BOOK_PROPERTY}");
         assert!(
             self.book.sample_snapshot_len() <= BOOK_MAX_RECORDS.max(SAMPLE_WINDOW),
             "{BOOK_PROPERTY}: the sample snapshot exceeds the book"
         );
-        for signer in &self.authors {
-            let node_id = signer.public();
-            assert_eq!(
-                observed_entry(&self.book, node_id),
-                self.model.entries.get(&node_id).cloned(),
-                "{BOOK_PROPERTY}"
-            );
-        }
         for index in 0..RELAYS {
             assert!(
                 self.model.relayed_by(relay(index)) <= BOOK_MAX_PER_RELAY,
                 "{BOOK_PROPERTY}"
             );
         }
-        assert_eq!(
-            self.book
-                .relayed_counts()
-                .into_iter()
-                .map(|(relay, count)| (hex::encode(relay.as_bytes()), count))
-                .collect::<Vec<_>>(),
-            self.model.relayed_counts(),
-            "{BOOK_PROPERTY}"
-        );
     }
 
     fn actual_view(&self) -> BookView {
@@ -723,6 +690,7 @@ impl BookDriver {
         entries.sort_unstable_by(|left, right| left.node.cmp(&right.node));
         BookView {
             now: self.now,
+            discovered: self.book.discovered_len(),
             entries,
             relayed: self
                 .book
@@ -745,15 +713,11 @@ impl BookDriver {
         entries.sort_unstable_by(|left, right| left.node.cmp(&right.node));
         BookView {
             now: self.now,
+            discovered: self.model.entries.len(),
             entries,
             relayed: self.model.relayed_counts(),
             changes: self.model.changes.iter().map(BookFact::from).collect(),
-            result: self.result.map(|_| {
-                format!(
-                    "{:?}",
-                    self.model.last_result.expect("each import sets its result")
-                )
-            }),
+            result: self.expected_result.map(|result| format!("{result:?}")),
         }
     }
 }
@@ -885,6 +849,8 @@ impl From<&BookChange> for BookFact {
 pub struct BookView {
     /// The explicit fixture time, in Unix seconds.
     pub now: u64,
+    /// Discovered records in the book.
+    pub discovered: usize,
     /// Stored entries in node id order.
     pub entries: Vec<BookEntryFact>,
     /// Each relay's attributed entries, in node id order.
@@ -923,6 +889,28 @@ pub struct DriverFailure {
     pub property_failure: bool,
     /// The panic payload, without the panic hook's source location.
     pub message: String,
+}
+
+/// Fails `property` unless the owner's view matches the model's.
+///
+/// The panic names only the first differing field. The step record keeps both
+/// views, so a shrink can delete an unrelated operation and keep the same failure.
+fn assert_view_matches<V: Eq + Serialize>(property: &str, actual: &V, expected: &V) {
+    if actual == expected {
+        return;
+    }
+    let values = (serde_json::to_value(actual), serde_json::to_value(expected));
+    let field = match &values {
+        (Ok(Value::Object(actual)), Ok(expected)) => actual
+            .iter()
+            .find(|(name, value)| expected.get(name.as_str()) != Some(*value))
+            .map(|(name, _)| name.as_str()),
+        _ => None,
+    };
+    panic!(
+        "{property}: {} differs from the model",
+        field.unwrap_or("the view")
+    );
 }
 
 fn driver_failure(payload: &(dyn Any + Send), property: &str) -> DriverFailure {
@@ -1322,17 +1310,12 @@ impl StateDriver {
                         ImportOutcome::Added
                     };
                     self.expected_result = Some(format!("installed:{expected:?}"));
-                    assert_eq!(result.ok(), Some(expected), "{STATE_PROPERTY}");
                     // An install first drops what disconnected peers no longer back.
                     self.model.sync(now);
                     self.model.peers[peer].in_book = true;
                     self.model.peers[peer].hinted = true;
                 } else {
                     self.expected_result = Some("superseded".to_owned());
-                    assert!(
-                        matches!(result, Err(SessionRecordError::Superseded)),
-                        "{STATE_PROPERTY}"
-                    );
                 }
             }
             StateOp::ReceiveServices {
@@ -1413,6 +1396,7 @@ impl StateDriver {
             ),
             "{STATE_PROPERTY}"
         );
+        assert_view_matches(STATE_PROPERTY, &self.actual_view(), &self.expected_view());
     }
 
     fn actual_view(&self) -> SessionView {

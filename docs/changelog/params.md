@@ -33,8 +33,6 @@ Keep entries **newest-first**. Each row records:
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
 | `TCP_INBOUND_RETAINED_BYTES` | `crates/zakura-network/src/inbound_resources.rs` | unbounded → 128 MiB | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound decoded unsolicited TCP transactions across connections. Solicited responses are charged but never refuse; unmeasured choice |
-| `MAX_DISCARDED_COMMANDS_PER_DECODE_TURN` | `crates/zakura-network/src/protocol/external/codec.rs` | unbounded → `64` | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound ignored Bloom work per decode turn; a longer burst resumes at the next socket read |
-| `MAX_DISCARDED_BYTES_PER_DECODE_TURN` | `crates/zakura-network/src/protocol/external/codec.rs` | unbounded → 1 MiB | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound ignored Bloom checksum work per decode turn; BIP 37's largest message is 36,000 bytes |
 | `LEGACY_INBOUND_RETAINED_BYTES` | `crates/zakura-network/src/zakura/legacy_gossip.rs` | unbounded → 128 MiB | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound decoded inbound gossip and requests; unmeasured choice |
 | `LEGACY_CLIENT_INVENTORY_SLOTS` | `crates/zakura-network/src/zakura/legacy_gossip.rs` | unbounded → `256` | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound client inventory work across retries and fallback; unmeasured choice |
 | `LEGACY_CLIENT_CONTROL_SLOTS` | `crates/zakura-network/src/zakura/legacy_gossip.rs` | unbounded → `32` | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Keep control requests in their own partition; unmeasured choice |

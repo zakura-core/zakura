@@ -206,7 +206,7 @@ pub(in crate::zakura::header_sync) struct RetainedHeaders {
 
 impl RetainedHeaders {
     /// The peer whose work these headers belong to.
-    #[cfg(any(test, zakura_sim))]
+    #[cfg(test)]
     pub(in crate::zakura::header_sync) fn peer(&self) -> &ZakuraPeerId {
         &self.peer
     }

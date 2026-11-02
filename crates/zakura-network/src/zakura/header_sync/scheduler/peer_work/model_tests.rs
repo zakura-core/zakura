@@ -1,10 +1,10 @@
 //! Interleaved work decisions against an independent model.
 //!
 //! Each step drives the real [`PeerWorkQueue`], with its real budget and leases,
-//! the way the reactor does, applies the same step to a model built from plain
-//! maps, and compares every observable fact. Steps for different peers and for
-//! calls that outlive their round interleave freely. The model never calls the
-//! queue or its policy.
+//! and the real [`decide_offer`] and [`page_next`] decisions. The step applies to
+//! a model built from plain maps, and the test compares every observable fact.
+//! Steps for different peers and for calls that outlive their round interleave
+//! freely. The model never calls the queue or its policy.
 
 use std::collections::{BTreeMap, BTreeSet};
 

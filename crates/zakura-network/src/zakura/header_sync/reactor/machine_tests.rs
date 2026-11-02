@@ -1,8 +1,10 @@
 //! Machine tests for [`ReactorState`].
 //!
-//! Each step drives `ReactorState` the way the reactor does, applies the same
-//! step to an independent model, and compares the two. The model never calls
-//! `ReactorState`. A virtual clock supplies every `now`.
+//! Each step drives `ReactorState` and the real [`repair_candidates`] choice,
+//! applies the same step to an independent model, and compares the two. The model
+//! never calls `ReactorState`. A virtual clock supplies every `now`. The saved
+//! `header/reactor-policy` input pins this decoder, so offer and page decisions
+//! run in the `peer_work` model instead.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -924,6 +926,7 @@ impl Harness {
 }
 
 /// Run `ops` from an empty state, checking the machine after every step.
+#[cfg(test)]
 fn run_with(
     ops: impl IntoIterator<Item = Op>,
     mut after_step: impl FnMut(&mut Harness),

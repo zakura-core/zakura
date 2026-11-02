@@ -723,6 +723,7 @@ fn check(state: &WorkQueueState, model: &Model) {
         unsettled += ledger.charged - ledger.settled;
     }
     assert_eq!(state.reserved_bytes(), unsettled, "{PROPERTY}");
+    assert_eq!(actual_view(state), expected_view(model), "{PROPERTY}: view");
 }
 
 fn pick<'a>(claims: &'a [Claim], index: &usize) -> Option<&'a Claim> {

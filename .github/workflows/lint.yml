@@ -27,6 +27,10 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      # Release signer keys are checked against their Yubico attestations.
+      - .github/release-signers
+      - ".github/release-attestations/**"
+      - ".github/yubico-ca/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -54,6 +58,10 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      # Release signer keys are checked against their Yubico attestations.
+      - .github/release-signers
+      - ".github/release-attestations/**"
+      - ".github/yubico-ca/**"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -251,6 +259,10 @@ jobs:
       - name: Read-only release review tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
+
+      - name: Release approval tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_approval.py'
 
       - name: Deployer tests
         if: ${{ !cancelled() }}

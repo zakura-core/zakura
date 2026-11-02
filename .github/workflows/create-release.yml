@@ -1,12 +1,17 @@
 # This workflow is the only supported path for creating v* release tags.
 # It dispatches an advisory Mainnet VCT handoff canary and builds/verifies every
 # release asset before a protected environment allows the release GitHub App to
-# publish a draft and create the immutable tag.
+# publish a draft and create the immutable tag. A release signer approves that
+# environment with scripts/approve-release.sh, whose security-key signature the
+# publish job verifies and attaches to the release (docs/release-approval.md).
 #
 # It dispatches from main, or from a hotfix/vX.Y.Z branch named for the exact
 # tag it releases (see docs/security-hotfix-release.md). The
 # source_first_release input is the emergency "Mode B" path described there.
 name: Create release
+# scripts/approve-release.sh reads the tag from the run title, since
+# workflow_dispatch inputs are not readable through the API.
+run-name: Create release ${{ inputs.release_tag }}
 
 on:
   workflow_dispatch:
@@ -337,12 +342,25 @@ jobs:
         )
       }}
     environment: release
-    # actions: write is for dispatching crates.io publishing below; the release
-    # itself is created with the GitHub App token, not GITHUB_TOKEN.
+    # actions: write is for reading the run's approvals and dispatching
+    # crates.io publishing below; the release itself is created with the
+    # GitHub App token, not GITHUB_TOKEN.
     permissions:
       contents: read
       actions: write
     steps:
+      # A separate path keeps the checkout from cleaning ./assets.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.target_sha }}
+          path: release-source
+          sparse-checkout: |
+            .github/scripts
+            .github/release-signers
+            .github/release-attestations
+            .github/yubico-ca
+
       - name: Download staged release assets
         if: ${{ !inputs.source_first_release }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
@@ -442,6 +460,34 @@ jobs:
                   raise SystemExit(f"Manifest checksum does not match {platform_id}.")
           PY
 
+      - name: Verify security-key release approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+          SOURCE_FIRST: ${{ inputs.source_first_release && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          sha256sums=none
+          if [ "$SOURCE_FIRST" != "true" ]; then
+            sha256sums="$(sha256sum ./assets/SHA256SUMS.txt | cut -d' ' -f1)"
+          fi
+          gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/approvals" > "$RUNNER_TEMP/approvals.json"
+          # -I keeps sibling files in .github/scripts from shadowing the modules
+          # the verifier imports.
+          python3 -I release-source/.github/scripts/release_approval.py verify-run \
+            --repository "$REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --commit "$TARGET_SHA" \
+            --sha256sums "$sha256sums" \
+            --signers release-source/.github/release-signers \
+            --attestations release-source/.github/release-attestations \
+            --yubico-ca release-source/.github/yubico-ca \
+            --approvals "$RUNNER_TEMP/approvals.json" \
+            --out-dir ./approval
+
       - name: Create release GitHub App token
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 #v3.3.0
@@ -460,7 +506,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_body="Release created by the protected Create release workflow."
+          release_body="Release created by the protected Create release workflow and approved with a maintainer security key. To verify it, see https://github.com/${REPOSITORY}/blob/main/docs/verify.md."
           if [ "$SOURCE_FIRST" = "true" ]; then
             release_body="Source-first release: binaries are being built and attached by the tag-push release-binaries run."
           fi
@@ -537,32 +583,43 @@ jobs:
             )"
           fi
 
+          asset_files=(./approval/release-approval.txt ./approval/release-approval.sig)
           if [ "$SOURCE_FIRST" = "true" ]; then
-            echo "Source-first release: publishing without assets; the tag-push run attaches them."
+            echo "Source-first release: publishing only the approval; the tag-push run attaches the binaries."
           else
-            mapfile -t asset_files < <(
+            mapfile -t -O 2 asset_files < <(
               find ./assets -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' | sort
             )
             asset_files+=("./assets/SHA256SUMS.txt")
-            for asset in "${asset_files[@]}"; do
-              name="$(basename "$asset")"
-              encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
-              echo "Uploading ${name}."
-              curl --fail --silent --show-error \
-                --request POST \
-                --header "Authorization: Bearer ${GH_TOKEN}" \
-                --header "Content-Type: application/octet-stream" \
-                --data-binary "@${asset}" \
-                --output /dev/null \
-                "https://uploads.github.com/repos/${REPOSITORY}/releases/${draft_id}/assets?name=${encoded_name}"
-            done
           fi
+          for asset in "${asset_files[@]}"; do
+            name="$(basename "$asset")"
+            encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
+            echo "Uploading ${name}."
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@${asset}" \
+              --output /dev/null \
+              "https://uploads.github.com/repos/${REPOSITORY}/releases/${draft_id}/assets?name=${encoded_name}"
+          done
 
+          # Name the approved tag and commit in the publishing request itself: a
+          # repository writer can edit the draft's target while assets upload,
+          # and publishing creates the tag from whatever the draft says.
           html_url="$(
             gh api --method PATCH "repos/${REPOSITORY}/releases/${draft_id}" \
+              --field tag_name="$RELEASE_TAG" \
+              --field target_commitish="$TARGET_SHA" \
               --field draft=false \
               --jq '.html_url'
           )"
+          tagged_sha="$(gh api "repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')"
+          if [ "$tagged_sha" != "$TARGET_SHA" ]; then
+            echo "::error title=Release tag mismatch::${RELEASE_TAG} points to ${tagged_sha}, not the approved ${TARGET_SHA}. Investigate before using this release." >&2
+            exit 1
+          fi
           echo "Published ${html_url}; tag ${RELEASE_TAG} now points to ${TARGET_SHA}."
 
       # Dispatched rather than called: crates.io matches its Trusted Publisher

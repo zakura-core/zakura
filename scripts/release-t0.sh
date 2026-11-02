@@ -19,7 +19,8 @@
 # operator clones accumulate stale rehearsal tags that shadow real ones.
 #
 # The script never approves the `release` environment (the human
-# stop-and-check point), never publishes crates, and never signs.
+# stop-and-check point, made with scripts/approve-release.sh and a release
+# signer's security key), never publishes crates, and never signs.
 #
 # Usage:
 #   scripts/release-t0.sh <subcommand> --tag vX.Y.Z [options]
@@ -425,6 +426,14 @@ preflight_expected_head() {
         || die "preflight: head" "git cat-file -e ${HEAD_SHA}" "object missing locally" \
             "the commit available to push" "fetch or build the release commit first"
     fi
+    # A hotfix dispatches the branch's own Create release workflow. One based on
+    # a release from before the security-key gate would publish on a button
+    # click, so it must carry the gate.
+    git -C "$repo_root" fetch -q origin "$HEAD_SHA" 2>/dev/null || true
+    git -C "$repo_root" cat-file -e "${HEAD_SHA}:.github/scripts/release_approval.py" 2>/dev/null \
+      || die "preflight: head" "release_approval.py at ${HEAD_SHA:0:9}" "missing" \
+          "the security-key release approval gate" \
+          "merge or cherry-pick the gate commit from main into hotfix/${TAG} (docs/release-approval.md)"
   fi
 }
 
@@ -640,7 +649,7 @@ step_watch() {
   run_url=$(gh run view "$DISPATCHED_RUN_ID" --repo "$REPO" --json url --jq '.url')
   if [ "$NO_WAIT" = 1 ]; then
     info "not waiting (--no-wait). Watch: ${run_url}"
-    info "when the run reaches the release environment: APPROVE it yourself —"
+    info "when the run reaches the release environment, approve it with scripts/approve-release.sh ${DISPATCHED_RUN_ID} —"
     info "deliberate stop-and-check: right commit (${MERGE_SHA:0:9})? right tag (${TAG})?"
     info "resume afterwards with: $0 publish --tag ${TAG} --mode ${MODE} --head-sha ${MERGE_SHA}$( [ "$HOTFIX" = 1 ] && printf ' --hotfix')"
     exit 0
@@ -659,7 +668,7 @@ step_watch() {
           if resolve_tag_commit "$TAG" >/dev/null; then
             die "$step" "run ${DISPATCHED_RUN_ID} conclusion" "$conclusion" "success" \
               "the run failed AFTER the tag was created; do not re-dispatch —" \
-              "repair assets with release-binaries.yml workflow_dispatch" \
+              "repair assets with release-binaries.yml workflow_dispatch --ref ${TAG}" \
               "(publish_assets_to_release), see docs/security-hotfix-release.md Mode B notes"
           fi
           die "$step" "run ${DISPATCHED_RUN_ID} conclusion" "$conclusion" "success" \
@@ -677,6 +686,8 @@ step_watch() {
             printf '\nAPPROVE NOW  %s\n' "$run_url"
             printf '  This is the deliberate stop-and-check, not a formality:\n'
             printf '  right commit (%s)? right tag (%s)?\n' "${MERGE_SHA:0:9}" "$TAG"
+            printf '  Approve with your security key: scripts/approve-release.sh %s\n' "$DISPATCHED_RUN_ID"
+            printf '  (the GitHub button alone fails the publish job before tagging).\n'
             printf '  The script keeps waiting and verifies after approval.\n\n'
             announced=1
             last_reminder=$SECONDS
@@ -740,7 +751,7 @@ step_verify_publish() {
     done
     [ -z "$missing" ] \
       || die "$step" "release assets" "missing:${missing}" "complete Mode A asset set" \
-          "repair with release-binaries.yml workflow_dispatch (publish_assets_to_release)"
+          "repair with release-binaries.yml workflow_dispatch --ref ${TAG} (publish_assets_to_release)"
   fi
   ok "tag ${TAG} at ${tag_commit:0:9}; release published; assets verified"
 
@@ -954,7 +965,7 @@ main() {
         printf '  1. gh pr merge %s --repo %s --squash --match-head-commit %s\n' "${PR_NUM:-<N>}" "$REPO" "$HEAD_SHA"
         printf '  2. gh workflow run create-release.yml --repo %s --ref main -f release_tag=%s -f expected_tag_delay_days=%s\n' "$REPO" "$TAG" "$EXPECTED_TAG_DELAY_DAYS"
       fi
-      printf '  3. watch to the release-environment gate; YOU approve\n'
+      printf '  3. watch to the release-environment gate; a release signer approves with scripts/approve-release.sh\n'
       printf '  4. verify tag + release + assets\n'
       ;;
     publish) cmd_publish ;;

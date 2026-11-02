@@ -79,7 +79,7 @@ async fn cancelled_owned_transaction_verification_keeps_queued_script_charge() {
         })
         .expect("the block contains a transparent V4 spend");
     let bytes = block.attributed_memory_size_bytes();
-    let pool = DecodedBlockPool::new(bytes);
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
     let transaction = owner.transaction(index).unwrap();
     let known_utxos: HashMap<_, _> = transaction

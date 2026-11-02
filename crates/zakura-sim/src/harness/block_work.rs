@@ -60,7 +60,7 @@ const FUNDING: Machine = Machine {
 const DECODED_RETENTION: Machine = Machine {
     name: "block/decoded-retention",
     identity: "block-decoded-retention",
-    claim: "At each completed owner operation and before pool destruction, independently read block/header/transaction allocations and exact pool charges agree with the model's handle graph. Transfers and closed generations preserve final-holder settlement. This target excludes asynchronous backend-worker coverage.",
+    claim: "At each completed owner operation and before pool destruction, independently read block/header/transaction allocations and exact pool charges agree with the model's handle graph. A closed generation preserves final-holder settlement. This target excludes asynchronous backend-worker coverage.",
     generator: 1,
     budget: 129,
     history: |input| {

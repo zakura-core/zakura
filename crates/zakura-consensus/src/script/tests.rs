@@ -67,7 +67,7 @@ async fn verifier_returns_error_for_out_of_range_input_index() {
 
 /// A cancelled caller cannot settle the decoded memory of its queued Rayon job.
 #[tokio::test]
-async fn cancelled_script_caller_keeps_transferred_block_charge_until_worker_finishes() {
+async fn cancelled_script_caller_keeps_block_charge_until_worker_finishes() {
     use std::task::{Context, Waker};
 
     use tower::Service;
@@ -86,9 +86,8 @@ async fn cancelled_script_caller_keeps_transferred_block_charge_until_worker_fin
         })
         .expect("the block contains a transparent spend");
     let bytes = block.attributed_memory_size_bytes();
-    let ingress = DecodedBlockPool::new(bytes);
-    let backend = DecodedBlockPool::new(bytes);
-    let owned = ingress.try_admit(block, Admission::WithinLimit).unwrap();
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+    let owned = pool.try_admit(block, Admission::WithinLimit).unwrap();
     let transaction = owned.transaction(index).unwrap();
     let previous_outputs = transaction
         .inputs()
@@ -121,16 +120,14 @@ async fn cancelled_script_caller_keeps_transferred_block_charge_until_worker_fin
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
-        owned.transfer_to(&backend, Admission::WithinLimit).unwrap();
         drop(owned);
         drop(future);
         assert!(
             actual.upgrade().is_some(),
             "the queued worker still retains the transaction"
         );
-        assert_eq!(ingress.reserved_bytes(), 0);
         assert_eq!(
-            backend.reserved_bytes(),
+            pool.reserved_bytes(),
             bytes,
             "queued script work must retain its decoded charge"
         );
@@ -138,10 +135,10 @@ async fn cancelled_script_caller_keeps_transferred_block_charge_until_worker_fin
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let available = backend.capacity().notified();
+            let available = pool.capacity().notified();
             tokio::pin!(available);
             available.as_mut().enable();
-            if backend.reserved_bytes() == 0 {
+            if pool.reserved_bytes() == 0 {
                 break;
             }
             available.await;

@@ -5547,7 +5547,7 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(queued, bytes);
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             assert_eq!(pool.reserved_bytes(), bytes);
             let block = sequenced
                 .body
@@ -5583,10 +5583,10 @@ mod tests {
                 "a full pool retains only the original frame bytes"
             );
             assert_eq!(queued, 0);
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             drop(refused);
             drop(retained);
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
         }
     }
@@ -5612,14 +5612,14 @@ mod tests {
                     .is_none()
             );
             assert!(pool.is_closed());
-            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_blocks(), 1);
             assert_eq!(
                 pool.reserved_bytes(),
                 bytes,
                 "closure preserves earlier holders"
             );
             drop(retained);
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
         }
     }

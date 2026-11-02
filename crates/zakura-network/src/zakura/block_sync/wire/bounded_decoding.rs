@@ -55,7 +55,10 @@ fn buffered_replay_keeps_the_same_transaction_allocation_bound() {
     assert!(!body.is_decoded());
     let replayed = body
         .decoded_block(
-            &zakura_node_services::block_memory::DecodedBlockPool::new(u64::MAX),
+            &zakura_node_services::block_memory::DecodedBlockPool::for_pipeline(
+                std::num::NonZeroU64::MAX,
+                u64::MAX,
+            ),
             zakura_node_services::block_memory::Admission::WithinLimit,
         )
         .unwrap();

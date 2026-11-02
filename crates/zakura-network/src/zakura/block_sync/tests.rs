@@ -5599,7 +5599,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     }
     assert_eq!(
         pool.reserved_blocks(),
-        Some(BACKEND_BLOCKS + submission_limit_u64),
+        BACKEND_BLOCKS + submission_limit_u64,
         "backend retention must leave room for the complete checkpoint range"
     );
     for (index, (_, block)) in initial_submissions.iter().enumerate() {
@@ -5709,7 +5709,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(
         pool.reserved_blocks(),
-        Some(BACKEND_BLOCKS + submission_limit_u64 + 1),
+        BACKEND_BLOCKS + submission_limit_u64 + 1,
         "completed submissions stay charged while driver and backend handles remain"
     );
     let held_bytes: u64 = backend
@@ -5721,9 +5721,9 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     assert_eq!(pool.reserved_bytes(), held_bytes);
     drop(initial_submissions);
     drop(block_402);
-    assert_eq!(pool.reserved_blocks(), Some(BACKEND_BLOCKS));
+    assert_eq!(pool.reserved_blocks(), BACKEND_BLOCKS);
     drop(backend);
-    assert_eq!(pool.reserved_blocks(), Some(0));
+    assert_eq!(pool.reserved_blocks(), 0);
     assert_eq!(pool.reserved_bytes(), 0);
 }
 

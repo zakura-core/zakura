@@ -423,7 +423,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
         .prepare(
             &mut policy,
             block::Height(1),
-            &DecodedBlockPool::new(u64::MAX),
+            &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
         )
         .unwrap()
         .unwrap();
@@ -546,7 +546,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
         task.submit_pending_blocks().await;
         assert!(task.decoded_capacity_blocked.is_some());
         assert!(actions_rx.try_recv().is_err());
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         assert!(
             task.payloads
                 .entries
@@ -593,7 +593,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
                 actions_rx.try_recv().is_err(),
                 "capacity release must not submit stale work"
             );
-            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_blocks(), 0);
             assert_eq!(pool.reserved_bytes(), 0);
             continue;
         }
@@ -608,15 +608,15 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
         };
         assert!(matches!(submitted, BlockHandle::Owned(_)));
         assert_eq!(submitted.hash(), block.hash());
-        assert_eq!(pool.reserved_blocks(), Some(1));
+        assert_eq!(pool.reserved_blocks(), 1);
         drop(running);
         assert_eq!(
             pool.reserved_blocks(),
-            Some(1),
+            1,
             "the driver still retains the allocation"
         );
         drop(submitted);
-        assert_eq!(pool.reserved_blocks(), Some(0));
+        assert_eq!(pool.reserved_blocks(), 0);
         assert_eq!(pool.reserved_bytes(), 0);
     }
 }

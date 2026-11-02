@@ -232,7 +232,7 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
         .unwrap();
     let bytes = child.attributed_memory_size_bytes();
     let hash = child.hash();
-    let pool = DecodedBlockPool::new(bytes);
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
     let probe = Probe::new(&child);
     drop(
@@ -348,7 +348,7 @@ async fn retired_state_snapshots_and_read_results_keep_decoded_ownership() {
         let bytes = child.attributed_memory_size_bytes();
         let hash = child.hash();
         let transaction_hash = child.transactions[0].hash();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
         let probe = Probe::new(&child);
         let child = SemanticallyVerifiedBlock::from(BlockHandle::from(child));

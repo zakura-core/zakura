@@ -520,11 +520,11 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
 
             for request in [
                 Request::Prepare {
-                    block: candidate.clone(),
+                    block: candidate.clone().into(),
                     source,
                 },
                 Request::CommitMined {
-                    block: candidate.clone(),
+                    block: candidate.clone().into(),
                     admission: zs::BlockAdmission::pending(),
                 },
             ] {
@@ -1013,7 +1013,7 @@ async fn cancelled_block_verification_keeps_downstream_payloads_charged() {
             Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
                 .expect("the genesis block deserializes");
         let bytes = block.attributed_memory_size_bytes();
-        let pool = DecodedBlockPool::new(bytes);
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
         let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
         let transaction_holder = Arc::new(Mutex::new(None));
         let state_holder = Arc::new(Mutex::new(None));
@@ -1105,7 +1105,7 @@ fn owned_block_view_preserves_consensus_checks_and_charge() -> Result<(), Report
     let hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
     let encoded = block.zcash_serialize_to_vec()?;
     let bytes = block.attributed_memory_size_bytes();
-    let pool = DecodedBlockPool::new(bytes);
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
     let view = BlockView::from(&owner);
     let coinbase = check::coinbase_is_first(&owner)?;

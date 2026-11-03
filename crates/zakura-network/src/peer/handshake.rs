@@ -39,6 +39,7 @@ use zakura_node_services::task::erased;
 
 use crate::{
     constants,
+    lifecycle_trace::{LifecycleTrace, RequestTrace},
     meta_addr::MetaAddrChange,
     peer::{
         CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
@@ -95,6 +96,8 @@ where
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
 
+    /// Creates each connection's lifecycle trace context.
+    lifecycle_trace: LifecycleTrace,
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
 
@@ -144,6 +147,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            lifecycle_trace: self.lifecycle_trace.clone(),
             bans: self.bans.clone(),
             parent_span: self.parent_span.clone(),
         }
@@ -501,6 +505,7 @@ where
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
     peer_registry: Option<PeerRegistry>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
+    lifecycle_trace: Option<LifecycleTrace>,
     latest_chain_tip: C,
     bans: Option<BannedIps>,
 }
@@ -587,6 +592,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
+            lifecycle_trace: self.lifecycle_trace,
             bans: self.bans,
         }
     }
@@ -614,6 +620,15 @@ where
     /// exempted and every connection behaves exactly as before.
     pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
         self.protected_peer_ips = Some(protected_peer_ips);
+        self
+    }
+
+    /// Provide the lifecycle trace that records each connection's messages and requests.
+    /// Optional.
+    ///
+    /// If this is unset, connections write no lifecycle trace rows.
+    pub(crate) fn with_lifecycle_trace(mut self, lifecycle_trace: LifecycleTrace) -> Self {
+        self.lifecycle_trace = Some(lifecycle_trace);
         self
     }
 
@@ -674,6 +689,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            lifecycle_trace: self.lifecycle_trace.unwrap_or_default(),
             bans: self.bans.unwrap_or_default(),
             parent_span: Span::current(),
         })
@@ -701,6 +717,7 @@ where
             zakura_handshake_connector: None,
             peer_registry: None,
             protected_peer_ips: None,
+            lifecycle_trace: None,
             latest_chain_tip: NoChainTip,
             bans: None,
         }
@@ -1571,6 +1588,7 @@ where
         let bans = self.bans.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
+        let lifecycle_trace = self.lifecycle_trace.clone();
 
         // Whether this peer is exempt from the inbound-overload connection drop.
         // Computed here (not in the future) so only the resulting `bool` is moved
@@ -1855,6 +1873,8 @@ where
                     )
                 });
 
+            let connection_trace =
+                lifecycle_trace.connection(connected_addr.is_inbound(), addr_label.as_str());
             let server = Connection::new(
                 inbound_service,
                 ConnectionRequests {
@@ -1869,6 +1889,7 @@ where
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
+                connection_trace.clone(),
             );
 
             let block_uploads = server.block_uploads.clone();
@@ -1906,6 +1927,7 @@ where
                 error_slot,
                 connection_task,
                 heartbeat_task,
+                connection_trace,
             };
 
             Ok(client)
@@ -2160,6 +2182,8 @@ async fn send_one_heartbeat(
         inv_collector: None,
         transient_addr: None,
         span: tracing::Span::current(),
+        // Heartbeats are not stamped: they bypass the peer set and are not counted as queued.
+        trace: RequestTrace::default(),
     }) {
         Ok(()) => {}
         Err(e) => {

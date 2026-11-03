@@ -26,6 +26,7 @@ use zakura_chain::{block, chain_tip::ChainTip};
 
 use crate::{
     constants::REQUEST_TIMEOUT,
+    lifecycle_trace::{AdvertTrace, ConnectionTrace, LifecycleTrace, SlotRelease},
     peer::{MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
@@ -218,6 +219,8 @@ pub(crate) struct BlockGossipPeer {
     pub(crate) version: Version,
     /// Configured sidecars may wait for a busy connection to write inventory.
     pub(crate) sidecar: bool,
+    /// Identifies this connection in lifecycle traces.
+    pub(crate) trace: ConnectionTrace,
 }
 
 impl BlockGossipPeer {
@@ -225,7 +228,7 @@ impl BlockGossipPeer {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
 
-    /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.
+    /// Advertises `hash` to this peer, then tracks the upload the peer requests.
     ///
     /// Writing the `inv` takes no upload slot. The peer takes one only once it requests the
     /// block, and keeps it through the block write and the drain allowance.
@@ -235,19 +238,27 @@ impl BlockGossipPeer {
     #[cfg(test)]
     pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
         matches!(
-            self.advertise_outcome(hash, slots).await,
+            self.advertise_outcome(hash, slots, AdvertTrace::default())
+                .await,
             AdvertOutcome::Sent
         )
     }
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
-    async fn advertise_outcome(self, hash: block::Hash, slots: BlockUploadSlots) -> AdvertOutcome {
+    pub(crate) async fn advertise_outcome(
+        self,
+        hash: block::Hash,
+        slots: BlockUploadSlots,
+        mut advert_trace: AdvertTrace,
+    ) -> AdvertOutcome {
+        advert_trace.started();
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
             if let Some(claim) = claim {
                 break (progress, claim);
             }
+            advert_trace.joined();
             // Early and committed announcements join an existing upload for this peer.
             let succeeded = loop {
                 match *progress.borrow_and_update() {
@@ -260,6 +271,7 @@ impl BlockGossipPeer {
                 }
             };
             if succeeded || retried || self.sender.is_closed() {
+                advert_trace.finished(succeeded);
                 return AdvertOutcome::from(succeeded);
             }
             // The joined upload can fail without reaching this peer, for example when early
@@ -279,6 +291,7 @@ impl BlockGossipPeer {
         // Dropping `written` makes the connection skip an advert that it has not started writing.
         let advertised = timeout(inventory_wait, async {
             self.sender.send(advert).await.ok()?;
+            advert_trace.inv_enqueued();
             written.await.ok()
         })
         .await;
@@ -288,43 +301,66 @@ impl BlockGossipPeer {
                 claim.0.send_replace(UploadState::Revoked);
                 return AdvertOutcome::Revoked;
             }
-            _ => return AdvertOutcome::Failed,
+            _ => {
+                advert_trace.slot_released(SlotRelease::InventoryNotWritten);
+                return AdvertOutcome::Failed;
+            }
         }
+        advert_trace.inv_written();
         // The connection usually marks the write first; senders without a connection rely on this.
         claim.0.send_if_modified(UploadState::start_waiting);
 
         let request_deadline = Instant::now() + BLOCK_REQUEST_WAIT;
         let mut upload = None;
+        let mut waiting_for_slot = false;
+        let mut release = SlotRelease::UploadFailed;
         let succeeded = loop {
             let state = *progress.borrow_and_update();
             let deadline = match state {
                 UploadState::Queued => unreachable!("written inventory leaves the queued state"),
                 UploadState::Waiting => request_deadline,
-                UploadState::Requested(started) => started + BLOCK_UPLOAD_WAIT,
+                UploadState::Requested(started) => {
+                    advert_trace.upload_requested(started);
+                    started + BLOCK_UPLOAD_WAIT
+                }
                 UploadState::Written(written) => {
+                    advert_trace.upload_written(written);
                     // A peer that requested while every slot was held keeps this broadcast's
                     // window entry until it gets one, so busy uploads pace every broadcast's
                     // further fan-out.
                     if upload.is_none() {
+                        if !waiting_for_slot {
+                            advert_trace.waiting_for_slot();
+                        }
                         upload = Some(slots.acquire().await);
+                        advert_trace.slot_acquired(slots.available_uploads());
                     }
                     sleep_until(written + BLOCK_WRITE_GRACE).await;
                     // A disconnect during the grace can discard the body in the send queue.
-                    break !matches!(*progress.borrow(), UploadState::Finished(false));
+                    let succeeded = !matches!(*progress.borrow(), UploadState::Finished(false));
+                    if succeeded {
+                        release = SlotRelease::WriteGrace;
+                    }
+                    break succeeded;
                 }
                 UploadState::Finished(succeeded) => break succeeded,
                 UploadState::Revoked => return AdvertOutcome::Revoked,
             };
             let requested = matches!(state, UploadState::Requested(_));
+            if requested && upload.is_none() && !waiting_for_slot {
+                advert_trace.waiting_for_slot();
+                waiting_for_slot = true;
+            }
             tokio::select! {
                 biased;
                 changed = progress.changed() => if changed.is_err() { break false; },
                 slot = slots.acquire(), if requested && upload.is_none() => {
                     upload = Some(slot);
+                    advert_trace.slot_acquired(slots.available_uploads());
                 }
                 _ = sleep_until(deadline) => {
-                    let reason = if matches!(state, UploadState::Waiting) { "no_request" } else { "upload_timeout" };
-                    metrics::counter!("peer.block_gossip.slot_timeout", "reason" => reason).increment(1);
+                    release = if matches!(state, UploadState::Waiting) { SlotRelease::NoRequest } else { SlotRelease::UploadTimeout };
+                    metrics::counter!("peer.block_gossip.slot_timeout", "reason" => release.label()).increment(1);
                     // A peer that already has the block never requests it, so the advert still
                     // succeeded. A requested upload that did not finish was not delivered.
                     break matches!(state, UploadState::Waiting);
@@ -332,6 +368,8 @@ impl BlockGossipPeer {
             }
         };
         drop(upload);
+        advert_trace.slot_released(release);
+        advert_trace.finished(succeeded);
         claim.0.send_replace(UploadState::Finished(succeeded));
         AdvertOutcome::from(succeeded)
     }
@@ -339,7 +377,10 @@ impl BlockGossipPeer {
 
 /// The upload slots that every legacy block broadcast shares.
 #[derive(Clone, Debug)]
-pub(crate) struct BlockUploadSlots(Arc<UploadSlotsState>);
+pub(crate) struct BlockUploadSlots {
+    state: Arc<UploadSlotsState>,
+    trace: LifecycleTrace,
+}
 
 #[derive(Debug)]
 struct UploadSlotsState {
@@ -350,21 +391,29 @@ struct UploadSlotsState {
 impl BlockUploadSlots {
     /// Returns slots that account for at most `upload_capacity` concurrent uploads.
     pub(crate) fn new(upload_capacity: usize) -> Self {
-        Self(Arc::new(UploadSlotsState {
-            uploads: Arc::new(Semaphore::new(upload_capacity)),
-            upload_capacity,
-        }))
+        Self {
+            state: Arc::new(UploadSlotsState {
+                uploads: Arc::new(Semaphore::new(upload_capacity)),
+                upload_capacity,
+            }),
+            trace: LifecycleTrace::noop(),
+        }
+    }
+
+    /// Records broadcasts with `trace`.
+    pub(crate) fn set_trace(&mut self, trace: LifecycleTrace) {
+        self.trace = trace;
     }
 
     /// Returns the number of upload slots not held by a requested upload.
     pub(crate) fn available_uploads(&self) -> usize {
-        self.0.uploads.available_permits()
+        self.state.uploads.available_permits()
     }
 
     /// Waits for an upload slot, which is returned when the slot is dropped.
     async fn acquire(&self) -> UploadSlot {
         let permit = self
-            .0
+            .state
             .uploads
             .clone()
             .acquire_owned()
@@ -380,7 +429,7 @@ impl BlockUploadSlots {
     fn record_uploads_in_use(&self) {
         metrics::gauge!("peer.block_gossip.uploads_in_use")
             // Upload counts are at most `BLOCK_UPLOAD_CONCURRENCY`, so they convert exactly.
-            .set((self.0.upload_capacity - self.available_uploads()) as f64);
+            .set((self.state.upload_capacity - self.available_uploads()) as f64);
     }
 }
 
@@ -398,7 +447,7 @@ impl Drop for UploadSlot {
 }
 
 #[derive(Clone, Copy)]
-enum AdvertOutcome {
+pub(crate) enum AdvertOutcome {
     Sent,
     Revoked,
     Failed,
@@ -430,17 +479,29 @@ pub(crate) fn broadcast_block(
     slots: BlockUploadSlots,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
     let peers = order_peers(peers, mined, &mut rand_10::rng());
+    let broadcast = slots.trace.block_broadcast(
+        hash,
+        mined,
+        peers.len(),
+        slots.state.upload_capacity,
+        slots.available_uploads(),
+    );
     async move {
         let mut sends = futures::stream::iter(peers)
-            .map(|peer| peer.advertise_outcome(hash, slots.clone()))
+            .enumerate()
+            .map(|(position, peer)| {
+                let advert = broadcast.advert(position, &peer.trace);
+                peer.advertise_outcome(hash, slots.clone(), advert)
+            })
             .buffer_unordered(BLOCK_ADVERT_WINDOW);
-        let mut succeeded = false;
+        let mut succeeded_peers = 0;
         let mut revoked = false;
         while let Some(outcome) = sends.next().await {
-            succeeded |= matches!(outcome, AdvertOutcome::Sent);
+            succeeded_peers += usize::from(matches!(outcome, AdvertOutcome::Sent));
             revoked |= matches!(outcome, AdvertOutcome::Revoked);
         }
-        if succeeded {
+        broadcast.finished(succeeded_peers);
+        if succeeded_peers > 0 {
             Ok(Response::Nil)
         } else if revoked {
             Err(Box::new(RevokedCandidates) as BoxError)
@@ -600,6 +661,7 @@ mod tests {
                 registry: None,
                 version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
                 sidecar: false,
+                trace: ConnectionTrace::untraced(),
             },
             receiver,
         )
@@ -1345,9 +1407,14 @@ mod tests {
             let (peer, mut receiver) = peer();
             let slots = BlockUploadSlots::new(1);
             let hash = block::Hash([62; 32]);
-            let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone()));
+            let first = tokio::spawn(peer.clone().advertise_outcome(
+                hash,
+                slots.clone(),
+                AdvertTrace::default(),
+            ));
             let advert = receiver.recv().await.unwrap();
-            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone()));
+            let second =
+                tokio::spawn(peer.advertise_outcome(hash, slots.clone(), AdvertTrace::default()));
             tokio::task::yield_now().await;
             advert
                 .result

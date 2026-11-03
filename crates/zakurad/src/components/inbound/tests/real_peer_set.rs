@@ -1072,6 +1072,7 @@ async fn setup(
         latest_chain_tip,
         network: network.clone(),
         misbehavior_sender,
+        block_verify_trace: crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     };
     let r = setup_tx.send(setup_data);
     // We can't expect or unwrap because the returned Result does not implement Debug

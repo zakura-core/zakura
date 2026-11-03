@@ -3619,6 +3619,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     );
 
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
@@ -3670,6 +3671,7 @@ async fn block_download_network_readiness_times_out() {
         Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     );
     let hash = block::Hash::from([0xCE; 32]);
 
@@ -3727,6 +3729,7 @@ fn setup_downloads_with_parent_wait(
         Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     )
 }
 
@@ -4273,6 +4276,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
                         Network::Mainnet,
                         max_checkpoint_height,
                         LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
+                        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
                     );
 
                     downloads.download_and_verify(hash).await.unwrap();

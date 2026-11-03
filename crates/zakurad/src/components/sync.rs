@@ -40,7 +40,9 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::{
-    components::sync::downloads::BlockDownloadVerifyError, config::ZakuradConfig, BoxError,
+    components::{block_verify_trace::BlockVerifyTrace, sync::downloads::BlockDownloadVerifyError},
+    config::ZakuradConfig,
+    BoxError,
 };
 
 mod downloads;
@@ -992,6 +994,9 @@ where
 
     /// Structured diagnostics for the legacy sync pipeline.
     trace: LegacySyncTrace,
+
+    /// Download, verification, and commit timing, shared with the inbound gossip downloader.
+    block_verify_trace: BlockVerifyTrace,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -1094,8 +1099,10 @@ where
         let (past_lookahead_limit_sender, past_lookahead_limit_receiver) = watch::channel(false);
         let past_lookahead_limit_receiver = zs::WatchReceiver::new(past_lookahead_limit_receiver);
         let expose_peer_addresses = config.network.expose_peer_addresses;
-        let trace =
-            LegacySyncTrace::new(config.network.zakura.spawn_tracer(), expose_peer_addresses);
+        // One writer serves the `legacy_sync` and `block_verify` tables.
+        let tracer = config.network.zakura.spawn_tracer();
+        let trace = LegacySyncTrace::new(tracer.clone(), expose_peer_addresses);
+        let block_verify_trace = BlockVerifyTrace::new(tracer);
 
         let parent_wait = state_parent_wait(state.clone());
 
@@ -1112,6 +1119,7 @@ where
             config.network.network.clone(),
             max_checkpoint_height,
             trace.clone(),
+            block_verify_trace.clone(),
         ));
 
         let new_syncer = Self {
@@ -1138,9 +1146,15 @@ where
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
+            block_verify_trace,
         };
 
         (new_syncer, sync_status)
+    }
+
+    /// Returns the block verification trace, so gossiped blocks share the syncer's writer.
+    pub fn block_verify_trace(&self) -> BlockVerifyTrace {
+        self.block_verify_trace.clone()
     }
 
     /// Runs the syncer to synchronize the chain and keep it synchronized.

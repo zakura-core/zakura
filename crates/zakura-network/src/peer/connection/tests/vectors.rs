@@ -190,6 +190,7 @@ async fn connection_run_loop_message_ok() {
         inv_collector: None,
         transient_addr: None,
         span: Span::current(),
+        trace: Default::default(),
     };
 
     client_tx
@@ -256,6 +257,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
             inv_collector: None,
             transient_addr: None,
             span: Span::current(),
+            trace: Default::default(),
         })
         .unwrap();
     assert_eq!(
@@ -274,6 +276,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
             inv_collector: None,
             transient_addr: None,
             span: Span::current(),
+            trace: Default::default(),
         })
         .unwrap();
     assert!(outbound.next().now_or_never().is_none());
@@ -315,6 +318,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
             inv_collector: None,
             transient_addr: None,
             span: Span::current(),
+            trace: Default::default(),
         })
         .unwrap();
     assert_eq!(
@@ -336,6 +340,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
             inv_collector: None,
             transient_addr: None,
             span: Span::current(),
+            trace: Default::default(),
         })
         .await
         .unwrap();
@@ -693,6 +698,7 @@ async fn connection_run_loop_send_timeout_nil_response() {
         inv_collector: None,
         transient_addr: None,
         span: Span::current(),
+        trace: Default::default(),
     };
 
     client_tx.try_send(request).expect("channel is valid");
@@ -767,6 +773,7 @@ async fn connection_run_loop_send_timeout_expect_response() {
         inv_collector: None,
         transient_addr: None,
         span: Span::current(),
+        trace: Default::default(),
     };
 
     client_tx.try_send(request).expect("channel is valid");
@@ -841,6 +848,7 @@ async fn connection_run_loop_receive_timeout() {
         inv_collector: None,
         transient_addr: None,
         span: Span::current(),
+        trace: Default::default(),
     };
 
     client_tx.try_send(request).expect("channel is valid");
@@ -1238,6 +1246,7 @@ async fn connection_ping_pong_round_trip() {
             inv_collector: None,
             transient_addr: None,
             span: Span::none(),
+            trace: Default::default(),
         })
         .await
         .expect("send to connection should succeed");
@@ -1333,6 +1342,7 @@ async fn block_gossip_slot_tracks_connection_write() {
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         sidecar: false,
+        trace: crate::lifecycle_trace::ConnectionTrace::untraced(),
     };
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -1391,6 +1401,7 @@ async fn truncated_block_request_releases_gossip_slot() {
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         sidecar: false,
+        trace: crate::lifecycle_trace::ConnectionTrace::untraced(),
     };
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let decoy = block::Hash([1; 32]);
@@ -1472,6 +1483,7 @@ async fn block_advert_while_awaiting_response() {
                 inv_collector: None,
                 transient_addr: None,
                 span: Span::current(),
+                trace: Default::default(),
             })
             .unwrap();
         assert!(matches!(
@@ -1545,6 +1557,7 @@ async fn block_advert_as_ordinary_request_is_an_error() {
                 inv_collector: None,
                 transient_addr: None,
                 span: Span::current(),
+                trace: Default::default(),
             })
             .unwrap();
         let error = request_rx
@@ -1642,6 +1655,7 @@ async fn send_find_blocks(
             inv_collector: None,
             transient_addr: None,
             span: Span::current(),
+            trace: Default::default(),
         })
         .unwrap();
     assert!(matches!(
@@ -1879,6 +1893,7 @@ async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
                     inv_collector: None,
                     transient_addr: None,
                     span: Span::current(),
+                    trace: Default::default(),
                 })
                 .unwrap();
             assert!(matches!(
@@ -2010,6 +2025,7 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
                 inv_collector: None,
                 transient_addr: None,
                 span: Span::current(),
+                trace: Default::default(),
             })
             .unwrap();
         assert!(matches!(
@@ -2031,4 +2047,120 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     })
     .await
     .expect("the revoked advert is answered before the request timeout");
+}
+
+/// A traced connection records the dequeue, write, and response of a client request, and the
+/// matching wire messages.
+#[tokio::test]
+async fn traced_connection_records_request_and_message_rows() {
+    use crate::lifecycle_trace::tests::{capture, drain, rows};
+    use zakura_jsonl_trace::{tables, JsonlTraceTables};
+
+    let _init_guard = zakura_test::init();
+    let (trace, mut trace_rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "traced");
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) =
+        super::new_traced_test_connection::<PanicAssertion>(true, conn.clone());
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let request = Request::Peers;
+    conn.dispatched(7, &request, "p2c", 1);
+    let stamp = conn.stamp_dispatched(&request);
+    let (tx, response) = oneshot::channel();
+    conn.enqueued(&stamp);
+    client_tx
+        .try_send(ClientRequest {
+            request,
+            tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+            trace: stamp,
+        })
+        .expect("internal request channel is valid");
+
+    assert_eq!(outbound.next().await, Some(Message::GetAddr));
+    peer_tx
+        .send(Ok(Message::Addr(Vec::new())))
+        .await
+        .expect("peer inbound channel is valid");
+    assert_eq!(
+        response
+            .await
+            .expect("connection responds")
+            .expect("peers request succeeds"),
+        Response::Peers(Vec::new())
+    );
+    connection_task.abort();
+
+    let written = drain(&mut trace_rx);
+    let requests = rows(&written, tables::P2P_REQUEST);
+    let events: Vec<_> = requests.iter().map(|row| row["event"].as_str()).collect();
+    assert_eq!(
+        events,
+        ["dispatch", "enqueue", "dequeue", "write", "finish"]
+    );
+    assert!(requests.iter().all(|row| row["request_id"] == "7"));
+    assert_eq!(requests[3]["result"], "ok");
+    assert_eq!(requests[4]["result"], "ok");
+
+    let messages = rows(&written, tables::P2P);
+    let events: Vec<_> = messages
+        .iter()
+        .map(|row| (row["event"].as_str(), row["msg"].as_str()))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("send_start", "getaddr"),
+            ("send_done", "getaddr"),
+            ("recv", "addr")
+        ]
+    );
+    assert!(messages
+        .iter()
+        .all(|row| row["conn"] == conn.id().to_string() && row["direction"] == "outbound"));
+}
+
+#[tokio::test]
+async fn traced_disconnect_finishes_active_request() {
+    use crate::lifecycle_trace::tests::{capture, drain, rows};
+    use zakura_jsonl_trace::{tables, JsonlTraceTables};
+
+    let (trace, mut trace_rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "disconnect");
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) =
+        super::new_traced_test_connection::<PanicAssertion>(true, conn.clone());
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let request = Request::Peers;
+    let stamp = conn.stamp(Some(7), &request);
+    let (tx, response) = oneshot::channel();
+    conn.enqueued(&stamp);
+    client_tx
+        .try_send(ClientRequest {
+            request,
+            tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+            trace: stamp,
+        })
+        .unwrap();
+    assert_eq!(outbound.next().await, Some(Message::GetAddr));
+    drop(peer_tx);
+    assert!(response.await.unwrap().is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(5), connection_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let written = rows(&drain(&mut trace_rx), tables::P2P_REQUEST);
+    let finishes: Vec<_> = written
+        .iter()
+        .filter(|row| row["event"] == "finish")
+        .collect();
+    assert_eq!(finishes.len(), 1);
+    assert_eq!(finishes[0]["request_id"], "7");
+    assert_eq!(finishes[0]["result"], "error");
 }

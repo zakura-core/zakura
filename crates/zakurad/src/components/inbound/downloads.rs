@@ -31,6 +31,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
+    block_verify_trace::{BlockSource, BlockVerification, BlockVerifyTrace, ParentAtArrival},
     download_work::has_sufficient_work,
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
@@ -423,6 +424,9 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// The network whose target spacing scales the gossip lookahead window.
     chain_network: Network,
 
+    /// Download, verification, and commit timing for each gossiped block.
+    verify_trace: BlockVerifyTrace,
+
     admission: Arc<std::sync::Mutex<Admission>>,
 
     /// Hands handles of tasks spawned by other tasks to the stream, which collects their
@@ -439,6 +443,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             state: self.state.clone(),
             latest_chain_tip: self.latest_chain_tip.clone(),
             chain_network: self.chain_network.clone(),
+            verify_trace: self.verify_trace.clone(),
             admission: self.admission.clone(),
             spawned_sender: self.spawned_sender.clone(),
         }
@@ -569,6 +574,7 @@ where
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,
@@ -577,6 +583,7 @@ where
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
         chain_network: Network,
+        verify_trace: BlockVerifyTrace,
     ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
@@ -593,6 +600,7 @@ where
                 state,
                 latest_chain_tip,
                 chain_network,
+                verify_trace,
                 admission: Arc::default(),
                 spawned_sender,
             },
@@ -906,6 +914,7 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let verify_trace = self.verify_trace.clone();
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -934,6 +943,7 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
+            let download_start = std::time::Instant::now();
             let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
                 network.oneshot(request).await.map_err(|e| (e, None))?
             {
@@ -982,6 +992,7 @@ where
                 ));
             }
             metrics::counter!("gossip.downloaded.block.count").increment(1);
+            let download = download_start.elapsed();
 
             // # Security & Performance
             //
@@ -1150,15 +1161,35 @@ where
                     .increment(1);
                 }
             }
+            let parent_hash = block.header.previous_block_hash;
+            let parent = ParentAtArrival::classify(block_height, parent_hash, best_tip);
 
             let _source_guard = match source_lock {
                 Some(source_lock) => Some(source_lock.lock_owned().await),
                 None => None,
             };
 
-            verifier
+            let verify_start = std::time::Instant::now();
+            let verification = verifier
                 .oneshot(zakura_consensus::Request::Commit(block))
-                .await
+                .await;
+            verify_trace.record(BlockVerification {
+                source: BlockSource::Gossip,
+                hash,
+                height: block_height,
+                parent_hash,
+                parent,
+                tip_height,
+                download,
+                wait: verify_start.saturating_duration_since(download_start + download),
+                verify: verify_start.elapsed(),
+                error: verification
+                    .as_ref()
+                    .err()
+                    .map(|error| error as &dyn std::fmt::Display),
+            });
+
+            verification
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))
         }
@@ -1277,6 +1308,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         )
     }
 
@@ -1398,6 +1430,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         for index in 0..MIN_CONCURRENCY_LIMIT {
@@ -1500,6 +1533,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         assert_eq!(
@@ -1610,6 +1644,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         assert_eq!(
@@ -1685,6 +1720,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         assert_eq!(
@@ -1788,6 +1824,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         )
     }
 

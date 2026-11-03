@@ -127,6 +127,7 @@ use zakura_chain::{block, chain_tip::ChainTip, parameters::Network};
 use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
+    lifecycle_trace::LifecycleTrace,
     peer::{
         block_gossip::{BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
         LoadTrackedClient, MinimumPeerVersion,
@@ -250,6 +251,9 @@ where
 
     /// Structured attribution for legacy peer discovery and block requests.
     legacy_peer_trace: LegacyPeerTrace,
+
+    /// Block broadcast scheduling trace.
+    lifecycle_trace: LifecycleTrace,
 
     // Peer Tracking: Busy Peers
     //
@@ -383,6 +387,7 @@ where
             block_gossip_slots: BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.spawn_tracer()),
+            lifecycle_trace: LifecycleTrace::noop(),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),
@@ -441,6 +446,13 @@ where
                 Poll::Ready(Err("all peer set background tasks have exited".into()))
             }
         }
+    }
+
+    /// Records block broadcast scheduling with `lifecycle_trace`.
+    pub(crate) fn with_lifecycle_trace(mut self, lifecycle_trace: LifecycleTrace) -> Self {
+        self.block_gossip_slots.set_trace(lifecycle_trace.clone());
+        self.lifecycle_trace = lifecycle_trace;
+        self
     }
 
     /// Receive background tasks, if they've been sent on the channel, but not consumed yet.
@@ -1091,9 +1103,17 @@ where
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
+            let request_id = self.legacy_peer_trace.next_request_id();
+            // The selected peer was removed from the ready list above.
+            svc.connection_trace().dispatched(
+                request_id,
+                &req,
+                "p2c",
+                self.ready_services.len() + 1,
+            );
             let find_blocks_trace = match &req {
                 Request::FindBlocks { known_blocks, stop } => Some((
-                    self.legacy_peer_trace.next_request_id(),
+                    request_id,
                     self.legacy_peer_trace_context(p2c_key, &svc),
                     known_blocks.first().copied(),
                     *stop,
@@ -1193,9 +1213,16 @@ where
                 "routing to a peer which advertised inventory"
             );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
+            let request_id = self.legacy_peer_trace.next_request_id();
+            svc.connection_trace().dispatched(
+                request_id,
+                &req,
+                "advertised",
+                advertising_peer_list.len(),
+            );
             let trace_context = match hash {
                 InventoryHash::Block(hash) => Some((
-                    self.legacy_peer_trace.next_request_id(),
+                    request_id,
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),
@@ -1262,9 +1289,12 @@ where
                 "routing to a peer that might have inventory"
             );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
+            let request_id = self.legacy_peer_trace.next_request_id();
+            svc.connection_trace()
+                .dispatched(request_id, &req, "maybe", maybe_peer_list.len());
             let trace_context = match hash {
                 InventoryHash::Block(hash) => Some((
-                    self.legacy_peer_trace.next_request_id(),
+                    request_id,
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),

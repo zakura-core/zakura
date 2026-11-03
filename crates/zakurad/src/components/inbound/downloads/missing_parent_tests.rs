@@ -242,6 +242,7 @@ impl Harness {
             state,
             latest_chain_tip,
             chain_network,
+            crate::components::block_verify_trace::BlockVerifyTrace::noop(),
         );
 
         Self {

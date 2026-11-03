@@ -202,7 +202,7 @@ impl
 pub enum Request {
     /// Verify the supplied transaction as part of a block.
     Block {
-        /// The transaction hash.
+        /// The mined ID of `transaction`, which the caller must compute from it.
         transaction_hash: transaction::Hash,
         /// The transaction itself.
         transaction: Arc<Transaction>,
@@ -312,17 +312,35 @@ impl Request {
 
     /// The unmined transaction ID for the transaction in this request.
     ///
-    /// The shielded verification cache keys its entries on this ID, so it must always be derived
-    /// from the transaction carried here. A witnessed ID's authorizing-data digest is what commits
-    /// the key to the proofs and signatures; keying on a mined ID instead would let a transaction
-    /// be answered from the cached verification of a differently-signed twin. Both arms below
-    /// recompute the ID, and the `Request::Block::transaction_hash` field the caller supplies is
-    /// deliberately not used.
+    /// The shielded verification cache keys its entries on this ID, so it must commit to the
+    /// transaction carried here, including its proofs and signatures. Keying on a mined ID alone
+    /// would let a transaction be answered from the cached verification of a differently-signed
+    /// twin.
+    ///
+    /// A block request reuses the mined ID its caller supplies, which the block verifier computes
+    /// from this same transaction just before building the request, and recomputes the
+    /// authorizing-data digest here. A pre-v5 mined ID already commits to the whole
+    /// transaction, signatures included. A mempool request recomputes the whole ID.
     pub fn tx_id(&self) -> UnminedTxId {
         match self {
-            // TODO: get the precalculated ID from the block verifier. It must be a full unmined
-            // ID recomputed from the transaction, for the reason given above.
-            Request::Block { transaction, .. } => transaction.unmined_id(),
+            Request::Block {
+                transaction,
+                transaction_hash,
+                ..
+            } => {
+                debug_assert_eq!(
+                    transaction.hash(),
+                    *transaction_hash,
+                    "block transaction requests carry the mined ID of their own transaction"
+                );
+                match transaction.auth_digest() {
+                    None => UnminedTxId::Legacy(*transaction_hash),
+                    Some(auth_digest) => UnminedTxId::Witnessed(transaction::WtxId {
+                        id: *transaction_hash,
+                        auth_digest,
+                    }),
+                }
+            }
             Request::Mempool { transaction, .. } => transaction.id(),
         }
     }

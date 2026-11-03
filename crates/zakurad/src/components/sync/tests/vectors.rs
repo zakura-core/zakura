@@ -2362,6 +2362,63 @@ async fn unavailable_parent_drops_block_without_restart() {
     peers.expect_no_requests().await;
 }
 
+/// A block whose verifier can't find its parent stays pending in the downloader, because the
+/// syncer usually requests it again. When the syncer drops it instead, because the parent can't
+/// arrive, the block stops being pending, so blocks waiting on it as a parent get their answer at
+/// once instead of after the parent wait.
+#[tokio::test]
+async fn dropped_block_with_an_unavailable_parent_stops_being_pending(
+) -> Result<(), crate::BoxError> {
+    let _init_guard = zakura_test::init();
+    let (mut chain_sync, _, mut verifier, mut peers, mut state, _) = setup_chain_sync();
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let hash = block1.hash();
+    let genesis = block1.header.previous_block_hash;
+
+    chain_sync.downloads.download_and_verify(hash).await?;
+    peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            block1.clone(),
+            None,
+        ))]));
+    answer_parent_extendable(&mut state, genesis).await;
+    verifier
+        .expect_request_that(|req| req.block().hash() == hash)
+        .await
+        .respond(Err(crate::BoxError::from(RouterError::Block {
+            source: Box::new(VerifyBlockError::ParentUnavailable { parent: genesis }),
+        })));
+    let error = chain_sync
+        .downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking")
+        .expect_err("the verifier can't find the parent");
+    assert!(error.is_requested_again(), "{error:?}");
+    assert!(chain_sync.downloads.is_parent_pending(&hash));
+
+    let (response, _) = tokio::join!(
+        chain_sync.handle_block_response_with_missing_retry(Err(error)),
+        answer_parent_unavailable(&mut state, genesis, None),
+    );
+    response.expect("an unavailable parent does not restart sync");
+
+    assert!(
+        !chain_sync.downloads.is_parent_pending(&hash),
+        "a dropped block is no longer waited on as a parent"
+    );
+    assert_eq!(
+        chain_sync.downloads.in_flight(),
+        0,
+        "the block is not retried"
+    );
+    peers.expect_no_requests().await;
+    Ok(())
+}
+
 /// A block whose parent is in flight, awaiting a registry retry, or committed after the
 /// verifier's state read keeps the bounded UTXO timeout retry.
 #[tokio::test]
@@ -2654,6 +2711,124 @@ async fn only_verified_blocks_hold_off_a_stalled_round() {
             "verifies: {verifies}, stalled after {elapsed:?}, expected from {stall_from:?}"
         );
     }
+}
+
+/// Responses that aren't progress don't keep a round alive past its stall deadline.
+///
+/// Block 1,687,107 is the last checkpoint. Its first verification fails a minute in with a
+/// missing input, and its retry never finishes, so nothing verifies. About 400 s in, a peer offers
+/// a block that every peer is missing. Sync retries it every few seconds, and each retry ends
+/// without progress. The round still restarts as stalled [`sync::BLOCK_VERIFY_TIMEOUT`] after it
+/// started, before the retries run out of budget.
+#[tokio::test(start_paused = true)]
+async fn non_progress_responses_do_not_hold_off_a_stalled_round() {
+    let _init_guard = zakura_test::init();
+    let retry_delay = Duration::from_secs(60);
+    let missing_offered_after = Duration::from_secs(400);
+
+    let (
+        mut chain_sync,
+        _sync_status,
+        block_verifier_router,
+        peer_set,
+        state_service,
+        mock_chain_tip_sender,
+    ) = setup_chain_sync_with_options(Height(1_687_107), STALLED_SERVICE_REQUEST_DELAY);
+    mock_chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    mock_chain_tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+
+    let checkpoint: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let checkpoint_hash = checkpoint.hash();
+    let missing = block::Hash([0xCC; 32]);
+    let locator = block::Hash([0xAA; 32]);
+    let start = tokio::time::Instant::now();
+
+    // The peer offers the checkpoint block first, and the missing block once 400 s have passed.
+    // Each list ends with an unrelated trailing hash that sync discards.
+    let mut first_tips = Some(vec![checkpoint_hash, block::Hash([0xBB; 32])]);
+    let mut late_tips = Some(vec![missing, block::Hash([0xDD; 32])]);
+    let peers = tokio::spawn(async move {
+        let mut peer_set = peer_set;
+        loop {
+            let request = peer_set.expect_request_that(|_| true).await;
+            match request.request() {
+                zn::Request::FindBlocks { known_blocks, .. } if *known_blocks == [locator] => {
+                    let tips = first_tips.take().or_else(|| {
+                        (start.elapsed() >= missing_offered_after)
+                            .then(|| late_tips.take())
+                            .flatten()
+                    });
+                    request.respond(zn::Response::BlockHashes(tips.unwrap_or_default()));
+                }
+                zn::Request::FindBlocks { .. } => {
+                    request.respond(zn::Response::BlockHashes(Vec::new()))
+                }
+                zn::Request::BlocksByHash(hashes) if hashes.contains(&missing) => {
+                    request.respond(Err(not_found_registry_error(missing)))
+                }
+                zn::Request::BlocksByHash(_) => {
+                    request.respond(zn::Response::Blocks(vec![Available((
+                        checkpoint.clone(),
+                        None,
+                    ))]))
+                }
+                other => panic!("unexpected peer request: {other:?}"),
+            }
+        }
+    });
+
+    let state = tokio::spawn(async move {
+        let mut state_service = state_service;
+        loop {
+            let request = state_service.expect_request_that(|_| true).await;
+            let response = match request.request() {
+                zs::Request::BlockLocator => zs::Response::BlockLocator(vec![locator]),
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::CheckParentInputs { .. } => {
+                    zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                }
+                other => panic!("unexpected state request: {other:?}"),
+            };
+            request.respond(response);
+        }
+    });
+
+    let verifier = tokio::spawn(async move {
+        let mut block_verifier_router = block_verifier_router;
+        let mut first_attempt = true;
+        let mut unanswered = Vec::new();
+        loop {
+            let request = block_verifier_router.expect_request_that(|_| true).await;
+            if std::mem::take(&mut first_attempt) {
+                tokio::spawn(async move {
+                    tokio::time::sleep(retry_delay).await;
+                    request.respond(Err(crate::BoxError::from(RouterError::Block {
+                        source: Box::new(VerifyBlockError::Transaction(
+                            TransactionError::TransparentInputNotFound,
+                        )),
+                    })));
+                });
+            } else {
+                unanswered.push(request);
+            }
+        }
+    });
+
+    let result = chain_sync.try_to_sync(None).await;
+    let elapsed = start.elapsed();
+    peers.abort();
+    state.abort();
+    verifier.abort();
+
+    let error = result.expect_err("a round that verifies nothing stalls");
+    assert!(error.to_string().contains("stalled"), "{error:#}");
+    assert!(
+        elapsed >= sync::BLOCK_VERIFY_TIMEOUT
+            && elapsed < sync::BLOCK_VERIFY_TIMEOUT + Duration::from_secs(20),
+        "stalled after {elapsed:?}"
+    );
 }
 
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
@@ -4945,16 +5120,42 @@ async fn child_waits_for_its_downloading_parent_to_pass() {
 
 /// A block whose downloading parent fails its own check is dropped before the verifier, as soon
 /// as the parent is rejected: a requested hash proves nothing about where the block connects.
+///
+/// Blocks 2 and 3 are used because block 1's parent, genesis, is the last checkpoint here, and a
+/// child of the last checkpoint is never dropped.
 #[tokio::test]
 async fn child_of_a_parent_that_fails_its_check_is_dropped() {
     let _init_guard = zakura_test::init();
-    let (block1, block2, mut peer_set, mut verifier, mut downloads, asked) =
-        downloading_parent_setup(false, Height(0));
+    let block2: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let block3: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let asked = AskedParents::default();
+    let recorded = asked.clone();
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, _chain_tip_sender) = MockChainTip::new();
+    let mut downloads = setup_downloads_with_parent_checks(
+        peer_set.clone(),
+        verifier.clone(),
+        chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
+        ParentExtendable(Arc::new(move |parent| {
+            recorded.lock().expect("test lock").push(parent);
+            async { false }.boxed()
+        })),
+        Height(0),
+    );
 
     let parent_download =
-        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block1, &block2).await;
+        request_parent_then_serve_child(&mut downloads, &mut peer_set, &block2, &block3).await;
     parent_download.respond(zn::Response::Blocks(vec![Available((
-        block1.clone(),
+        block2.clone(),
         None,
     ))]));
 
@@ -4971,12 +5172,55 @@ async fn child_of_a_parent_that_fails_its_check_is_dropped() {
             other => panic!("unexpected result: {other:?}"),
         }
     }
-    assert_eq!(dropped, [block1.hash(), block2.hash()].into());
+    assert_eq!(dropped, [block2.hash(), block3.hash()].into());
     verifier.expect_no_requests().await;
     assert_eq!(
         asked_parents(&asked),
-        vec![block1.header.previous_block_hash, block1.hash()],
+        vec![block2.header.previous_block_hash, block2.hash()],
         "the child asks the state once, after its parent was rejected"
+    );
+}
+
+/// The child of the last checkpoint block is never dropped for its parent, even when the state
+/// doesn't have the checkpoint block yet: the checkpoint verifier can report the block as a
+/// duplicate before the state writes it. The checkpoint block's hash comes from the checkpoint
+/// list, so no peer can forge it.
+#[tokio::test]
+async fn child_of_the_last_checkpoint_is_never_dropped() {
+    let _init_guard = zakura_test::init();
+    // Genesis is the last checkpoint, and the state says it can't build on it.
+    let (block1, _block2, mut peer_set, mut verifier, mut downloads, asked) =
+        downloading_parent_setup(false, Height(0));
+
+    downloads
+        .download_and_verify(block1.hash())
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(block1.hash()).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            block1.clone(),
+            None,
+        ))]));
+
+    verifier
+        .expect_request_that(|req| req.block().hash() == block1.hash())
+        .await
+        .respond_with(|req| req.block().hash());
+    assert_eq!(
+        downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking")
+            .expect("the child of the last checkpoint verifies"),
+        (Height(1), block1.hash())
+    );
+    assert_eq!(
+        asked_parents(&asked),
+        vec![block1.header.previous_block_hash]
     );
 }
 

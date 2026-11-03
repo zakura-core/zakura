@@ -510,6 +510,10 @@ where
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
 
+    /// The hash the checkpoint list records at [`Self::max_checkpoint_height`], if it records
+    /// one there. A block whose parent has this hash is never dropped for its parent.
+    last_checkpoint_hash: Option<block::Hash>,
+
     // Shared syncer state
     //
     /// Sender that is set to `true` when the downloader is past the lookahead limit.
@@ -592,10 +596,11 @@ where
                     this.cancel_handles.remove(&hash);
                     // A block the syncer requests again (a failed download, a verification
                     // without a verdict, or a forged body) stays pending: the syncer either
-                    // starts its retry or restarts the round, which clears the gate, so its
-                    // children keep waiting until then. A retried block must pass its parent
-                    // check again before its children may rely on it. A retry only starts after
-                    // this result is polled, so this never changes a newer task's entry.
+                    // starts its retry, restarts the round (which clears the gate), or drops the
+                    // block and calls `forget`, so its children keep waiting until then. A
+                    // retried block must pass its parent check again before its children may rely
+                    // on it. A retry only starts after this result is polled, so this never
+                    // changes a newer task's entry.
                     if e.is_requested_again() {
                         this.parent_gate.unpass(hash);
                     } else {
@@ -663,6 +668,7 @@ where
             parent_wait,
             parent_extendable,
             lookahead_limit,
+            last_checkpoint_hash: chain_network.checkpoint_list().hash(max_checkpoint_height),
             chain_network,
             max_checkpoint_height,
             past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
@@ -796,6 +802,7 @@ where
         let lookahead_limit = self.lookahead_limit;
         let chain_network = self.chain_network.clone();
         let max_checkpoint_height = self.max_checkpoint_height;
+        let last_checkpoint_hash = self.last_checkpoint_hash;
 
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
@@ -1001,7 +1008,8 @@ where
                 // Blocks at or below the last checkpoint skip this: the checkpoint verifier only
                 // accepts the checkpointed chain. They also never count as passed, so a fake
                 // checkpoint height can't vouch for a child; their children wait until the state
-                // has them.
+                // has them. A child of the last checkpoint block itself, named by the hash in the
+                // checkpoint list, is never dropped.
                 if block_height > max_checkpoint_height {
                     // Reject a header without real proof of work before anything else, with the
                     // verifier's own error, so a dropped block always cost its sender real work.
@@ -1032,7 +1040,7 @@ where
                     }
 
                     let parent = block.header.previous_block_hash;
-                    let parent_ready = tokio::select! {
+                    let parent_checked = tokio::select! {
                         biased;
                         // Prefer the cancel handle if both are ready.
                         _ = &mut cancel_rx => {
@@ -1041,6 +1049,12 @@ where
                         }
                         ready = parent_gate.parent_ready(parent, &parent_extendable) => ready,
                     };
+                    // The last checkpoint block's hash is fixed by the checkpoint list, so a peer
+                    // can't forge it, and the checkpoint verifier only accepts that block. Its
+                    // child is never dropped for it: the checkpoint verifier can answer that the
+                    // block is a duplicate before the state has written it, so the state may not
+                    // have it yet.
+                    let parent_ready = parent_checked || Some(parent) == last_checkpoint_hash;
 
                     if !parent_ready {
                         debug!(
@@ -1266,6 +1280,20 @@ where
             "a sync round starts with no block in flight"
         );
         self.parent_gate.clear();
+    }
+
+    /// Records that the syncer dropped `hash` without requesting it again, so blocks waiting on it
+    /// as a parent stop waiting. Used for a block the syncer was expected to request again (see
+    /// [`BlockDownloadVerifyError::is_requested_again`]) but dropped instead.
+    pub(super) fn forget(&mut self, hash: block::Hash) {
+        self.parent_gate.finish(hash);
+    }
+
+    /// Returns whether `hash` is still waited on as a parent: requested this round, and neither
+    /// verified, rejected nor dropped.
+    #[cfg(test)]
+    pub(super) fn is_parent_pending(&self, hash: &block::Hash) -> bool {
+        self.parent_gate.is_pending(hash)
     }
 
     /// Returns true if `hash` has an in-flight download and verify task.

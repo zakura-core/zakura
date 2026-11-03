@@ -163,7 +163,7 @@ impl ParentGate {
 
     /// Returns whether `hash` is still pending.
     #[cfg(test)]
-    fn is_pending(&self, hash: &block::Hash) -> bool {
+    pub(super) fn is_pending(&self, hash: &block::Hash) -> bool {
         self.lock().pending.contains(hash)
     }
 

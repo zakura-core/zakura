@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinError,
-    time::{sleep, sleep_until, timeout},
+    time::{sleep, sleep_until, timeout, timeout_at},
 };
 use tower::{
     builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, timeout::Timeout, Service,
@@ -154,6 +154,10 @@ const PARENT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Sync skips a block the state is still writing, because the state reports it as known, so its
 /// child must not be dropped for that parent.
+///
+/// A block queued in the state while it waits for its own parent doesn't count: blocks from gossip
+/// and RPC enter that queue without this check, so it can't show that the parent will ever arrive.
+/// A sync round that restarts while one of its blocks is queued finds that block again.
 async fn parent_can_be_built_on<ZS>(state: ZS, parent: block::Hash) -> Result<bool, BoxError>
 where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone,
@@ -185,7 +189,9 @@ where
 }
 
 /// Returns a [`ParentExtendable`] that asks `state` whether a block can be built on a parent,
-/// bounded by [`PARENT_CHECK_TIMEOUT`]. A failed or timed-out request counts as extendable.
+/// bounded by [`PARENT_CHECK_TIMEOUT`]. A failed or timed-out request counts as extendable, and so
+/// does an inconclusive answer: the state can't tell a usable parent from one whose context changed
+/// during the read. The full verifier still rejects a block whose parent turns out unusable.
 fn state_parent_extendable<ZS>(state: ZS) -> ParentExtendable
 where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
@@ -1655,12 +1661,10 @@ where
         // syncer cannot build up an unbounded backlog of undispatched hashes.
         let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
 
-        // The last time this sync round made observable progress.
-        //
-        // Progress means a block finished verification, a background hash
-        // extension finished, or more full-block downloads were queued. If none
-        // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
-        // Measured on the runtime's clock, like the timeouts it is compared with.
+        // The last time this sync round made progress: a block verified, or a background hash
+        // extension finished. If neither happens for `BLOCK_VERIFY_TIMEOUT`, the round restarts,
+        // however many blocks are dropped or rejected meanwhile. Measured on the runtime's clock,
+        // like the timeouts it is compared with.
         let mut last_progress = tokio::time::Instant::now();
 
         'sync_round: loop {
@@ -1683,6 +1687,9 @@ where
                 }
                 break;
             }
+
+            // Checked on every pass, so responses that aren't progress can't keep the round alive.
+            self.ensure_round_progress(last_progress, reserve.len())?;
 
             // Opportunistically handle any block tasks that are already finished, without blocking.
             while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
@@ -1815,11 +1822,7 @@ where
                     // out. Loop around and re-check rather than relying on that.
                     Ok(None) => {}
                     Err(_) => {
-                        if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
-                            return Err(eyre!(
-                                "sync round stalled: no block completed or tips extended within timeout"
-                            ));
-                        }
+                        self.ensure_round_progress(last_progress, reserve.len())?;
 
                         info!(
                             in_flight = self.downloads.in_flight(),
@@ -1874,7 +1877,8 @@ where
             // Copy the earliest backoff deadline out so the timer future doesn't borrow `self`
             // across the `select!` while other arms borrow `self.downloads`.
             let registry_retry_at = self.registry_miss_retry.values().min().copied();
-            let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
+            // The wait ends at the round's stall deadline, not a fresh timeout per wait.
+            let step = timeout_at(last_progress + BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
 
@@ -1959,18 +1963,29 @@ where
 
             match step {
                 Ok(result) => result?,
-                Err(_elapsed) => {
-                    if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
-                        self.trace_sync_snapshot("round_stalled", reserve.len());
-                        return Err(eyre!(
-                            "sync round stalled: no block completed or tips extended within timeout"
-                        ));
-                    }
-                }
+                Err(_elapsed) => self.ensure_round_progress(last_progress, reserve.len())?,
             }
         }
 
         Ok(())
+    }
+
+    /// Returns an error that restarts the round if it has made no progress (a verified block or a
+    /// finished tip extension) since `last_progress` for [`BLOCK_VERIFY_TIMEOUT`]. `reserve` is the
+    /// number of undispatched hashes, for the diagnostic snapshot.
+    fn ensure_round_progress(
+        &self,
+        last_progress: tokio::time::Instant,
+        reserve: usize,
+    ) -> Result<(), Report> {
+        if last_progress.elapsed() < BLOCK_VERIFY_TIMEOUT {
+            return Ok(());
+        }
+
+        self.trace_sync_snapshot("round_stalled", reserve);
+        Err(eyre!(
+            "sync round stalled: no block verified or tips extended within timeout"
+        ))
     }
 
     async fn first_unknown_in_find_blocks_response(
@@ -2777,6 +2792,8 @@ where
                     "block parent is neither committed nor in flight, dropping block"
                 );
                 self.verify_timeout_retry_counts.remove(&hash);
+                // The downloader kept this block pending for the retry that now won't happen.
+                self.downloads.forget(hash);
                 return Ok(());
             }
         }

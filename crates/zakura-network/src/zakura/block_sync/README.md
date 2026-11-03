@@ -126,12 +126,6 @@ for the commit-window exemption, the resident-memory gate, and request sizing â€
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
 sizing.
 
-The one deliberate exception is `admission::admit_received_body`, the retention-only
-gate for a body that is already downloaded (the unmatched-fallthrough path). A received
-body consumes no request budget, so it applies the same commit-window exemption and
-resident gate but never consults `budget_available` â€” a wire budget saturated by
-outstanding requests must not force an already-paid-for body to be dropped and
-re-downloaded.
 
 ### The commit window
 

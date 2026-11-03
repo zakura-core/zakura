@@ -112,7 +112,7 @@ max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
-peer_memory_budget_bytes = 8589934592
+peer_memory_budget_bytes = 18991808512
 stream_open_rate_per_second = 32
 
 [network.zakura.quic]

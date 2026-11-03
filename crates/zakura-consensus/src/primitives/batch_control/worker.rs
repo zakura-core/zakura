@@ -13,7 +13,7 @@ use futures::{
 use pin_project::pin_project;
 use tokio::{
     sync::mpsc,
-    time::{sleep, Sleep},
+    time::{sleep_until, Instant, Sleep},
 };
 use tokio_util::sync::PollSemaphore;
 use tower::{Service, ServiceExt};
@@ -55,11 +55,12 @@ where
 
     /// The timer for the pending batch, if it has any items.
     ///
-    /// The timer is started when the first entry of a new batch is
-    /// submitted, so that the batch latency of all entries is at most
-    /// self.max_latency. However, we don't keep the timer running unless
-    /// there is a pending request to prevent wakeups on idle services.
+    /// It fires at the earlier of `batch_deadline` and `max_idle` after the most recent item.
+    /// No timer runs for an empty batch, to prevent wakeups on idle services.
     pending_batch_timer: Option<Pin<Box<Sleep>>>,
+
+    /// When the pending batch must flush: `max_latency` after its first item.
+    batch_deadline: Instant,
 
     /// The batches that the worker is concurrently executing.
     concurrent_batches: FuturesUnordered<BoxFuture<'static, Result<T::Response, T::Error>>>,
@@ -87,6 +88,9 @@ where
     /// The maximum delay before processing a batch with items that have a total weight
     /// that is less than `max_items_weight_in_batch`.
     max_latency: std::time::Duration,
+
+    /// The maximum time a pending batch waits after its most recent item before it flushes.
+    max_idle: std::time::Duration,
 }
 
 /// Get the error out
@@ -110,6 +114,7 @@ where
         max_items_weight_in_batch: usize,
         max_concurrent_batches: usize,
         max_latency: std::time::Duration,
+        max_idle: std::time::Duration,
         close: PollSemaphore,
     ) -> (ErrorHandle, Worker<T, Request>) {
         let error_handle = ErrorHandle {
@@ -121,6 +126,7 @@ where
             service,
             pending_items_weight: 0,
             pending_batch_timer: None,
+            batch_deadline: Instant::now(),
             concurrent_batches: FuturesUnordered::new(),
             failed: None,
             error_handle: error_handle.clone(),
@@ -128,6 +134,7 @@ where
             max_items_weight_in_batch,
             max_concurrent_batches,
             max_latency,
+            max_idle,
         };
 
         (error_handle, worker)
@@ -204,6 +211,12 @@ where
         }
     }
 
+    /// Returns when the pending batch should flush if no item arrives after `now`.
+    fn next_flush_deadline(&self, now: Instant) -> Instant {
+        now.checked_add(self.max_idle)
+            .map_or(self.batch_deadline, |idle| idle.min(self.batch_deadline))
+    }
+
     /// Is the current number of concurrent batches above the configured limit?
     fn can_spawn_new_batches(&self) -> bool {
         self.concurrent_batches.len() < self.max_concurrent_batches
@@ -216,7 +229,7 @@ where
         loop {
             // Wait on either a new message or the batch timer.
             //
-            // If both are ready, end the batch now, because the timer has elapsed.
+            // Queued items are taken before an idle flush, but never past the batch deadline.
             // If the timer elapses, any pending messages are preserved:
             // https://docs.rs/tokio/latest/tokio/sync/mpsc/struct.UnboundedReceiver.html#cancel-safety
             tokio::select! {
@@ -238,7 +251,14 @@ where
                     }
                 },
 
-                Some(()) = OptionFuture::from(self.pending_batch_timer.as_mut()), if self.pending_batch_timer.as_ref().is_some() => {
+                Some(()) = OptionFuture::from(self.pending_batch_timer.as_mut()),
+                    if self.pending_batch_timer.is_some()
+                        && (self.rx.is_empty() || Instant::now() >= self.batch_deadline) => {
+                    // Items can arrive after the guard was checked, while this select waited.
+                    if Instant::now() < self.batch_deadline && !self.rx.is_empty() {
+                        continue;
+                    }
+
                     tracing::trace!(
                         pending_items_weight = self.pending_items_weight,
                         batch_deadline = ?self.pending_batch_timer.as_ref().map(|sleep| sleep.deadline()),
@@ -291,7 +311,13 @@ where
                             );
 
                             // The first message in a new batch.
-                            self.pending_batch_timer = Some(Box::pin(sleep(self.max_latency)));
+                            let now = Instant::now();
+                            // An overflowing latency falls back to Tokio's far-future deadline.
+                            self.batch_deadline = now
+                                .checked_add(self.max_latency)
+                                .unwrap_or_else(|| tokio::time::sleep(self.max_latency).deadline());
+                            self.pending_batch_timer =
+                                Some(Box::pin(sleep_until(self.next_flush_deadline(now))));
                         } else {
                             tracing::trace!(
                                 pending_items_weight = self.pending_items_weight,
@@ -299,6 +325,10 @@ where
                                 running_batches = self.concurrent_batches.len(),
                                 "waiting for full batch or batch timer",
                             );
+                            let deadline = self.next_flush_deadline(Instant::now());
+                            if let Some(timer) = self.pending_batch_timer.as_mut() {
+                                timer.as_mut().reset(deadline);
+                            }
                         }
                     }
                     Some(Message::Flush { span, .. }) => {

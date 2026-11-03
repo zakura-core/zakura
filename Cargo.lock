@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "11.0.0"
+version = "11.1.0"
 dependencies = [
  "bech32",
  "bitflags",

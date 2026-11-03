@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "11.1.0"
+version = "11.1.1"
 dependencies = [
  "bech32",
  "bitflags",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "13.0.0"
+version = "13.0.1"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3402,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.1"
+version = "5.0.2"
 dependencies = [
  "hex",
  "ripemd",
@@ -3506,7 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "13.0.0"
+version = "13.0.1"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.9"
+version = "2.2.10"
 dependencies = [
  "clap",
  "eyre",

@@ -72,6 +72,13 @@ pub struct Chain {
     /// preferences, whenever it inserts the chain into the `chain_set`. Growing or forking the
     /// chain keeps the stored hash, which stops matching the tip, so a stale value never applies.
     precious: Option<(block::Hash, NonZeroU64)>,
+
+    /// Whether this chain skips its partial transparent address index.
+    ///
+    /// Set when the finalized state doesn't build transparent address indexes, because address
+    /// queries then fail before reading this chain, so its partial index would never be read.
+    /// Forks and clones keep the setting.
+    skips_transparent_address_index: bool,
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.
@@ -310,6 +317,7 @@ impl Chain {
             network: network.clone(),
             inner,
             precious: None,
+            skips_transparent_address_index: false,
         };
 
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
@@ -319,6 +327,27 @@ impl Chain {
         chain.add_history_tree(finalized_tip_height, history_tree);
 
         chain
+    }
+
+    /// Returns this chain with its partial transparent address index skipped if `skip` is true.
+    ///
+    /// Call this before pushing any blocks: a chain must index all of its blocks or none of them.
+    pub(crate) fn skipping_transparent_address_index(mut self, skip: bool) -> Self {
+        assert!(
+            self.blocks.is_empty(),
+            "the transparent address index setting must not change after blocks are pushed",
+        );
+        self.skips_transparent_address_index = skip;
+        self
+    }
+
+    /// Returns the address `output` pays, if this chain indexes it.
+    fn indexed_address(&self, output: &transparent::Output) -> Option<transparent::Address> {
+        if self.skips_transparent_address_index {
+            None
+        } else {
+            output.address(&self.network)
+        }
     }
 
     /// Is the internal state of `self` the same as `other`?
@@ -2127,7 +2156,7 @@ impl
             );
 
             // Update the address index with this UTXO
-            if let Some(receiving_address) = created_utxo.utxo.output.address(&self.network) {
+            if let Some(receiving_address) = self.indexed_address(&created_utxo.utxo.output) {
                 self.partial_transparent_transfers
                     .get_or_insert_mut(receiving_address)
                     .update_chain_tip_with(&(&outpoint, created_utxo))?;
@@ -2163,7 +2192,7 @@ impl
             );
 
             // Revert the address index for this UTXO
-            if let Some(receiving_address) = created_utxo.utxo.output.address(&self.network) {
+            if let Some(receiving_address) = self.indexed_address(&created_utxo.utxo.output) {
                 let address_transfers = self
                     .partial_transparent_transfers
                     .get_mut(&receiving_address)
@@ -2235,7 +2264,7 @@ impl
             };
 
             // Index the spent output for the address
-            if let Some(spending_address) = spent_output.utxo.output.address(&self.network) {
+            if let Some(spending_address) = self.indexed_address(&spent_output.utxo.output) {
                 self.partial_transparent_transfers
                     .get_or_insert_mut(spending_address)
                     .update_chain_tip_with(&(spending_input, spending_tx_hash, spent_output))?;
@@ -2280,7 +2309,7 @@ impl
             };
 
             // Revert the spent output for the address
-            if let Some(receiving_address) = spent_output.utxo.output.address(&self.network) {
+            if let Some(receiving_address) = self.indexed_address(&spent_output.utxo.output) {
                 let address_transfers = self
                     .partial_transparent_transfers
                     .get_mut(&receiving_address)

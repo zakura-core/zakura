@@ -9,6 +9,11 @@
 //! uploads still slow each broadcast's fan-out, but they cannot delay another block's first
 //! `inv`s.
 //!
+//! The slots pace fan-out. They do not gate the body write: the connection answers a `getdata`
+//! at once, and the advert task can take its slot after the write completes. So the window, not
+//! the slots, bounds one broadcast's concurrent body writes, and overlapping broadcasts and
+//! sidecars add to that.
+//!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
 //! that never becomes the tip.
@@ -62,7 +67,9 @@ pub(crate) enum BlockAdvertError {
     Connection(#[from] SharedPeerError),
 }
 
-/// Maximum concurrent block uploads requested through legacy block broadcasts, across broadcasts.
+/// Upload slots shared by every legacy block broadcast.
+///
+/// A slot paces fan-out after a peer requests the block. It does not delay the body write.
 pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
 
 /// Chooses how many peers one block broadcast advertises to at once, from the block's size.

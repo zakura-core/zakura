@@ -326,30 +326,26 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     );
 }
 
-/// The peer memory budget funds each live connection's handshake window. The
-/// negotiated kinds' shares sit on top of it, outside the budget.
+/// The peer memory budget funds every admitted connection's whole window at the
+/// default shares, its send window, every handshake, and the socket queue. The
+/// transport envelope's QUIC term is the budget's charge without the socket.
 #[test]
-fn the_peer_memory_budget_funds_the_handshake_windows() {
-    let quic = QuicConfig::default();
-    let shares = ReactorShares::from_quic(&quic);
-    let connections = crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS;
-    let limits = TransportLimits {
-        max_open_streams: 1024,
-        control_receive_bytes: shares.control_receive_bytes,
-        connection_shares: ReactorBudget {
-            receive: 5 * shares.other.receive,
-            output: 5 * shares.other.output,
-        },
-        compat_exchange_bytes: COMPAT_EXCHANGE_BUDGET.receive,
-        send_window: quic.send_window_bytes,
-        max_connections: connections,
-        max_pending_handshakes: crate::zakura::DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-    };
-    let envelope = ResourceEnvelope::new(limits);
-    // Widening usize to u128 is lossless on supported targets.
-    let shared = connections as u128 * u128::from(limits.connection_shares.receive);
+fn the_peer_memory_budget_funds_the_whole_windows() {
+    let config = crate::Config::default();
+    let limits = crate::zakura::ZakuraLocalLimits::from_config(&config);
+    let shares = limits.reactor_shares();
+    let envelope = ResourceEnvelope::new(
+        limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
+    );
+    let quic = config
+        .zakura
+        .quic_memory_bytes(&config.network, limits.max_connections);
+    assert_eq!(
+        envelope.transport_credit_bytes + u128::from(zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES),
+        quic
+    );
     let budget = u128::from(crate::zakura::DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
-    assert!(envelope.transport_credit_bytes - shared <= budget);
+    assert!(quic <= budget, "{quic} of {budget}");
 }
 
 #[derive(Debug, Clone)]

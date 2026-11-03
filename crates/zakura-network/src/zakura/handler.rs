@@ -52,8 +52,8 @@ use zakura_rt::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::peer_memory::{
-    budget_admitted_connections, budgeted_max_connections, PeerMemoryBudgetError,
-    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes,
+    ConnectionMemory, PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
@@ -95,9 +95,10 @@ use crate::{
     },
 };
 
-/// Default total Zakura connections when P2P v2 is enabled: as many as the
-/// default peer memory budget admits (see `peer_memory`).
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
+/// Default total Zakura connections when P2P v2 is enabled: 92, the count
+/// the previous 8 GiB budget admitted at the default windows. The default peer
+/// memory budget funds this many at every reactor's share (see `peer_memory`).
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 92;
 /// Default per-IP Zakura connection cap.
 pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 /// Default simultaneous Zakura control handshakes.
@@ -324,16 +325,18 @@ pub struct ZakuraConfig {
     /// Bytes of QUIC flow-control credit and queued datagrams that native
     /// connections together may make this node hold.
     ///
-    /// Each live QUIC connection can hold its `[network.zakura.quic]` receive
-    /// and send windows, 64 MiB at the defaults, whether or not the node
-    /// reads. Each bound socket can also queue 256 MiB of datagrams, however
-    /// many connections it serves (zakura-quic CTRL-26 lists what this leaves
-    /// out). The node reserves one socket queue per bound socket and funds the
-    /// rest divided by the per-connection cost, 124 live connections on the
-    /// one socket `listen_addr` binds. `max_pending_handshakes` of those are
-    /// headroom for handshakes, so the node admits 92, and a larger
-    /// `max_connections` is lowered at startup. A closed connection releases
-    /// its stream buffers and costs nothing more until it drains.
+    /// An admitted QUIC connection can hold its receive window, which is the
+    /// `[network.zakura.quic]` receive window plus every reactor's receive
+    /// share, and its send window: 141,937,353 bytes at the Mainnet defaults.
+    /// A connection in its handshake holds only the two QUIC windows, 64 MiB.
+    /// Each bound socket can also queue 256 MiB of datagrams, however many
+    /// connections it serves (zakura-quic CTRL-26 lists what this leaves out).
+    /// The node reserves one socket queue per bound socket and
+    /// `max_pending_handshakes` handshakes, and funds the rest divided by the
+    /// admitted connection's cost: 96 connections on the one socket
+    /// `listen_addr` binds. A larger `max_connections` is lowered at startup.
+    /// A closed connection releases its stream buffers and costs nothing more
+    /// until it drains.
     /// Startup fails when the budget admits fewer than 16 connections, or
     /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
     /// peers), or fewer than `max_connections` when that is smaller.
@@ -415,36 +418,99 @@ impl ZakuraConfig {
         }
     }
 
-    /// Return the connection cap after the peer memory budget (see
-    /// [`budgeted_max_connections`]), or an error naming the keys when the
-    /// budget admits too few connections.
+    /// Each reactor's receive and output share on one connection on
+    /// `network`, keyed by its stream kind.
+    ///
+    /// The handshake share is the `[network.zakura.quic]` receive window. The
+    /// kinds are legacy gossip (2), legacy requests (3), discovery (4), header
+    /// sync (5) and block sync (6). The compatibility exchanges and TCP ingress
+    /// have their own envelope terms, so they are not kinds. Other kinds keep
+    /// [`ReactorShares::from_quic`]'s share.
+    pub fn reactor_shares(&self, network: &Network) -> ReactorShares {
+        // A cwnd cap so large that its share overflows can't be funded, so the
+        // peer memory budget refuses it.
+        let block_sync = super::block_sync_reactor_budget(
+            self.block_sync.bbr_max_cwnd_bytes,
+            self.block_sync.floor_bypass_slots,
+        )
+        .unwrap_or(ReactorBudget {
+            receive: u64::MAX,
+            output: u64::MAX,
+        });
+        ReactorShares {
+            kinds: vec![
+                (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
+                (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
+                (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
+                (HEADER_SYNC_STREAM_KIND, super::header_sync::v9::budget(network)),
+                (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
+            ],
+            ..ReactorShares::from_quic(&self.quic)
+        }
+    }
+
+    /// What one connection on `network` costs the peer memory budget, when it
+    /// negotiates every reactor in [`Self::reactor_shares`].
+    pub fn connection_memory(&self, network: &Network) -> ConnectionMemory {
+        let shares = self.reactor_shares(network);
+        let kinds = shares
+            .kinds
+            .iter()
+            .fold(0_u64, |sum, (_, share)| sum.saturating_add(share.receive));
+        ConnectionMemory::new(
+            shares.control_receive_bytes,
+            kinds,
+            self.quic.send_window_bytes,
+        )
+    }
+
+    /// The QUIC memory the node can hold on `network` with `max_connections`
+    /// admitted: every admitted connection, the handshake headroom, and the
+    /// bound sockets' queues. The peer memory budget is its ceiling.
+    pub fn quic_memory_bytes(&self, network: &Network, max_connections: usize) -> u128 {
+        budgeted_quic_bytes(
+            self.bound_socket_count(),
+            self.connection_memory(network),
+            max_connections,
+            self.max_pending_handshakes.max(1),
+        )
+    }
+
+    /// Return the connection cap on `network` after the peer memory budget
+    /// (see [`budgeted_max_connections`]), or an error naming the keys when
+    /// the budget admits too few connections.
     ///
     /// The floor counts distinct bootstrap identities, as discovery does.
     /// Without the node key it can't tell whether one of them is this node, so
     /// it counts one fewer: it never refuses a config that
     /// [`Self::budgeted_max_connections_for_node`] accepts.
-    pub fn budgeted_max_connections(&self) -> Result<usize, PeerMemoryBudgetError> {
-        self.budgeted_max_connections_excluding(None)
+    pub fn budgeted_max_connections(
+        &self,
+        network: &Network,
+    ) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(network, None)
     }
 
     /// Like [`Self::budgeted_max_connections`], but leaves `local_node_id` out
     /// of the bootstrap count, exactly as discovery does.
     pub fn budgeted_max_connections_for_node(
         &self,
+        network: &Network,
         local_node_id: NodeId,
     ) -> Result<usize, PeerMemoryBudgetError> {
-        self.budgeted_max_connections_excluding(Some(local_node_id))
+        self.budgeted_max_connections_excluding(network, Some(local_node_id))
     }
 
     fn budgeted_max_connections_excluding(
         &self,
+        network: &Network,
         local_node_id: Option<NodeId>,
     ) -> Result<usize, PeerMemoryBudgetError> {
         budgeted_max_connections(
             self.max_connections,
             self.peer_memory_budget_bytes,
             self.bound_socket_count(),
-            self.quic.connection_memory_bytes(),
+            self.connection_memory(network),
             match local_node_id {
                 Some(local_node_id) => {
                     remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
@@ -543,7 +609,7 @@ impl ZakuraLocalLimits {
                 .min(budget_admitted_connections(
                     config.zakura.peer_memory_budget_bytes,
                     config.zakura.bound_socket_count(),
-                    config.zakura.quic.connection_memory_bytes(),
+                    config.zakura.connection_memory(&config.network),
                     config.zakura.max_pending_handshakes.max(1),
                 )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
@@ -559,6 +625,7 @@ impl ZakuraLocalLimits {
             max_inbound_queue_depth: handshake.max_inbound_queue_depth,
             reactor_shares: None,
         }
+        .with_reactor_shares(config.zakura.reactor_shares(&config.network))
     }
 
     /// These limits with `shares`, and the QUIC windows that carry them: the
@@ -4476,16 +4543,16 @@ async fn spawn_zakura_endpoint_inner(
     let local_node_id = secret_key.public();
     let budgeted_max_connections = config
         .zakura
-        .budgeted_max_connections_for_node(local_node_id)?;
+        .budgeted_max_connections_for_node(&config.network, local_node_id)?;
     if budgeted_max_connections < config.zakura.max_connections {
         warn!(
             max_connections = config.zakura.max_connections,
             budgeted_max_connections,
             peer_memory_budget_bytes = config.zakura.peer_memory_budget_bytes,
-            connection_memory_bytes = config.zakura.quic.connection_memory_bytes(),
+            connection_memory = ?config.zakura.connection_memory(&config.network),
             "lowering [network.zakura] max_connections to what peer_memory_budget_bytes \
-             admits at the configured QUIC windows; raise the budget or lower \
-             max_connections to silence this"
+             admits at the configured QUIC windows and reactor shares; raise the budget or \
+             lower max_connections to silence this"
         );
     }
     let limits = ZakuraLocalLimits::from_config(config);
@@ -9589,9 +9656,22 @@ mod tests {
     #[tokio::test]
     async fn paused_ordered_reads_preserve_writes_and_sibling_credit() -> Result<(), BoxError> {
         const ALPN: &[u8] = b"/zakura/testkit/paused-reader/0";
-        const FRAME_COUNT: usize = 24;
+        const FRAME_BYTES: usize = 1024 * 1024;
         let local = ZakuraLocalLimits::from_config(&Config::default());
+        // The 1 MiB frames fill the stream receive window, plus a margin the
+        // sender cannot write.
+        let window_frames = local.quic.stream_receive_window_bytes as usize / FRAME_BYTES;
+        let frame_count = window_frames + 8;
+        // After negotiation the connection window holds y_ctl beside the
+        // largest stream window, so a paused stream leaves sibling credit.
         let server = LocalEndpointFactory::with_limits(&local)
+            .quic_config(QuicConfig {
+                receive_window_bytes: local
+                    .quic
+                    .receive_window_bytes
+                    .saturating_add(local.quic.stream_receive_window_bytes),
+                ..local.quic.clone()
+            })
             .endpoint(52)
             .await?;
         let (conn_tx, _conn_rx) = mpsc::channel(1);
@@ -9616,7 +9696,7 @@ mod tests {
         let frame = Frame {
             message_type: 3,
             flags: 0,
-            payload: vec![0; 1024 * 1024],
+            payload: vec![0; FRAME_BYTES],
         };
         let limits = test_connection_limits();
         let stream = Stream {
@@ -9672,14 +9752,14 @@ mod tests {
         let mut sending = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             sender.write_all(&encoded[1..]).await.unwrap();
             progress_tx.send_replace(1);
-            for sent in 2..=FRAME_COUNT {
+            for sent in 2..=frame_count {
                 sender.write_all(&encoded).await.unwrap();
                 progress_tx.send_replace(sent);
             }
             sender
         }));
         timeout(Duration::from_secs(10), async {
-            while *progress_rx.borrow_and_update() < 16 {
+            while *progress_rx.borrow_and_update() < window_frames {
                 progress_rx.changed().await.unwrap();
             }
         })
@@ -9732,14 +9812,14 @@ mod tests {
         assert_eq!(&bytes, b"sibling");
 
         timeout(Duration::from_secs(10), async {
-            for _ in 0..FRAME_COUNT {
+            for _ in 0..frame_count {
                 assert_eq!(inbound_rx.recv().await.unwrap().frame, frame);
             }
         })
         .await
         .expect("resuming application reads drains all frames in order");
         let mut sender = timeout(Duration::from_secs(2), &mut sending).await??;
-        assert_eq!(*progress_rx.borrow(), FRAME_COUNT);
+        assert_eq!(*progress_rx.borrow(), frame_count);
         // Cancellation must also work while the reader waits on a full channel.
         let empty = Frame {
             message_type: 2,

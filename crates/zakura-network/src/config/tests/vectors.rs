@@ -19,7 +19,7 @@ use crate::{
     },
     zakura::{
         ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
@@ -862,25 +862,28 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     .unwrap();
     assert_eq!(config.zakura.max_connections, 256);
     assert_eq!(
-        config.zakura.budgeted_max_connections(),
-        Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+        config.zakura.budgeted_max_connections(&config.network),
+        Ok(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS)
     );
     assert_eq!(
         ZakuraLocalLimits::from_config(&config).max_connections,
-        DEFAULT_ZAKURA_MAX_CONNECTIONS
+        DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
     );
 
     let config: Config = toml::from_str(
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 19595788288
+        peer_memory_budget_bytes = 38751881472
         "#,
     )
     .unwrap();
-    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
-    // admitted and 32 of headroom.
-    assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
+    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
+    // connections of 141,937,353 bytes.
+    assert_eq!(
+        config.zakura.budgeted_max_connections(&config.network),
+        Ok(256)
+    );
 
     // The transport holds the admitted connections and the headroom, half of
     // it kept for dials (zakura-quic ADM-12), and two closing connections per
@@ -904,8 +907,8 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         (124, 16, 248)
     );
 
-    // A 1 GiB receive window leaves the default budget room for 7 QUIC
-    // connections, less than its headroom alone.
+    // With a 1 GiB receive window, the handshake headroom alone exceeds the
+    // default budget.
     let error = toml::from_str::<Config>(
         r#"
         p2p_stack = "dual"

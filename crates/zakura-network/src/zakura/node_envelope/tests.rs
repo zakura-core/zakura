@@ -110,6 +110,7 @@ fn the_default_node_config_composes() {
     let limits = ZakuraLocalLimits::from_config(&config);
     let envelope = NodeEnvelope::for_node(&config, &limits, 16).expect("the default config fits");
 
+    assert_eq!(limits.max_connections, crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
     assert_eq!(envelope.owners, limits.owner_bound());
     assert_eq!(
         envelope.decoded_blocks,
@@ -124,13 +125,62 @@ fn the_default_node_config_composes() {
     // answers.
     assert!(envelope.serve_output_bytes >= 2 * 512 * (64 << 20));
     assert!(envelope.serve_output_bytes < 2 * 512 * (64 << 20) + (1 << 30));
-    // The transport bound depends on the host's memory, so only its parts are fixed.
+    // The QUIC term is the derived one, within the peer memory budget.
+    assert_eq!(
+        envelope.quic_bytes,
+        config
+            .zakura
+            .quic_memory_bytes(&config.network, limits.max_connections)
+    );
+    assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
     assert_eq!(
         envelope.retained_bytes_bound(),
         envelope.transport_bytes
-            + u128::from(config.zakura.peer_memory_budget_bytes)
+            + envelope.quic_bytes
             + u128::from(config.tcp_ingress_bound_bytes())
     );
+}
+
+/// The default node's envelope, term by term: 92 connections at every reactor's
+/// share on Mainnet.
+#[test]
+fn the_default_envelope_sums_the_reactor_shares() {
+    const MIB: u64 = 1 << 20;
+    let config = Config::default();
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let shares = limits.reactor_shares();
+    let share = |kind| shares.share(kind);
+    assert_eq!(share(2), crate::zakura::LEGACY_GOSSIP_BUDGET);
+    assert_eq!(share(3), crate::zakura::LEGACY_REQUESTS_BUDGET);
+    assert_eq!(share(4), crate::zakura::DISCOVERY_BUDGET);
+    assert_eq!(share(5), crate::zakura::HEADER_SYNC_BUDGET);
+    assert_eq!(share(6), crate::zakura::BLOCK_SYNC_REACTOR_BUDGET);
+    assert_eq!(shares.control_receive_bytes, 32 * MIB);
+    // The connection window and the stream window that carry the shares.
+    assert_eq!(
+        shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
+        32 * MIB + 74_828_489
+    );
+    assert_eq!(
+        u64::from(limits.quic.stream_receive_window_bytes),
+        crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive
+    );
+    assert_eq!(u64::from(limits.quic.receive_window_bytes), 32 * MIB);
+
+    let envelope = NodeEnvelope::for_node(&config, &limits, 16).expect("the default config fits");
+    let transport = ResourceEnvelope::new(
+        limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
+    );
+    // Per connection: 74,828,489 B of receive shares and 180,303,803 B of output shares.
+    assert_eq!(transport.connection_raw_bytes, 74_828_489);
+    assert_eq!(transport.connection_output_bytes, 180_303_803);
+    assert_eq!(transport.compat_response_bytes, 92 * 20 * MIB);
+    assert_eq!(
+        envelope.transport_bytes,
+        92 * u128::from(74_828_489_u64 + 180_303_803 + 20 * MIB)
+    );
+    // 92 × 141,937,353 + 32 × 64 MiB + 256 MiB.
+    assert_eq!(envelope.quic_bytes, 15_474_155_580);
 }
 
 #[test]

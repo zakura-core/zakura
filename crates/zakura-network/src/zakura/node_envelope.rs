@@ -7,9 +7,15 @@
 //! clamps connections and handshakes, handshake constants fund frames and streams, and
 //! `budgeted_max_connections_for_node` refuses a budget below one connection.
 //!
-//! The byte bounds add up without double counting. A frame's bytes belong to QUIC's
-//! buffers until a reader takes them, and to a raw grant afterwards. The peer memory
-//! budget funds the former and the transport envelope funds the latter. TCP decoders
+//! Every byte bound derives from the reactors' shares (`ReactorShares`): each admitted
+//! connection holds the handshake window, every reactor's receive share and the send
+//! window in QUIC, and each kind's raw and output gates hold that kind's shares of
+//! frames. Handshakes hold the handshake and send windows, and each bound socket its
+//! datagram queue. The peer memory budget is the ceiling on the QUIC part.
+//!
+//! A held raw frame's bytes sit both in its connection's receive window and in its
+//! kind's raw gate, so the retained bound counts them twice. The second count funds a
+//! payload buffer that the reader allocates before its bytes arrive. TCP decoders
 //! hold their incomplete messages under a connection limit of their own. Decoded
 //! blocks stay a separate allowance: a count across every holder, and a byte limit
 //! only on what the block pipeline still holds.
@@ -45,6 +51,18 @@ pub(crate) enum NodeEnvelopeError {
     /// The block-sync limits cannot size the decoded block pool.
     #[error("the decoded block allowance is invalid: {0}")]
     DecodedAllowance(&'static str),
+    /// The connections' QUIC windows and the sockets' queues exceed the peer
+    /// memory budget.
+    #[error(
+        "the Zakura QUIC envelope of {quic_bytes} bytes exceeds \
+         [network.zakura] peer_memory_budget_bytes ({budget_bytes} bytes)"
+    )]
+    PeerMemoryBudget {
+        /// The connections' QUIC windows and the sockets' queues.
+        quic_bytes: u128,
+        /// The configured budget.
+        budget_bytes: u64,
+    },
 }
 
 /// The bounds of every owner family on one node.
@@ -56,8 +74,9 @@ pub(crate) struct NodeEnvelope {
     pub(crate) request_executions: usize,
     /// The most frame bytes that transport owners retain.
     pub(crate) transport_bytes: u128,
-    /// The most bytes in QUIC's buffers and the sockets' queues.
-    pub(crate) quic_bytes: u64,
+    /// The most bytes in QUIC's buffers and the sockets' queues: every admitted
+    /// connection's windows, the handshakes' windows, and the socket queues.
+    pub(crate) quic_bytes: u128,
     /// The most bytes that TCP decoders hold for incomplete messages.
     pub(crate) tcp_ingress_bytes: u64,
     /// The most blocks that the decoded pool admits within its limit.
@@ -73,7 +92,7 @@ impl NodeEnvelope {
     /// Check these limits and compose their bounds.
     pub(crate) fn new(
         transport: TransportLimits,
-        quic_bytes: u64,
+        quic_bytes: u128,
         tcp_ingress_bytes: u64,
         decoded_blocks: NonZeroU64,
         decoded_pipeline_bytes: u64,
@@ -96,18 +115,29 @@ impl NodeEnvelope {
         })
     }
 
-    /// The envelope of a node with this configuration.
+    /// The envelope of a node with this configuration, or an error if the peer
+    /// memory budget can't fund its connections.
     pub(crate) fn for_node(
         config: &Config,
         limits: &ZakuraLocalLimits,
         decoded_backend_blocks: u64,
     ) -> Result<Self, NodeEnvelopeError> {
         let block_sync = &config.zakura.block_sync;
+        let quic_bytes = config
+            .zakura
+            .quic_memory_bytes(&config.network, limits.max_connections);
+        let budget_bytes = config.zakura.peer_memory_budget_bytes;
+        if quic_bytes > u128::from(budget_bytes) {
+            return Err(NodeEnvelopeError::PeerMemoryBudget {
+                quic_bytes,
+                budget_bytes,
+            });
+        }
         Self::new(
             limits.transport_limits_for_kinds(
                 limits.reactor_shares().kinds.iter().map(|(kind, _)| *kind),
             ),
-            config.zakura.peer_memory_budget_bytes,
+            quic_bytes,
             config.tcp_ingress_bound_bytes(),
             block_sync
                 .decoded_block_allowance(decoded_backend_blocks)
@@ -119,7 +149,7 @@ impl NodeEnvelope {
 
     /// The most bytes that this envelope's byte owners retain together.
     pub(crate) fn retained_bytes_bound(&self) -> u128 {
-        self.transport_bytes + u128::from(self.quic_bytes) + u128::from(self.tcp_ingress_bytes)
+        self.transport_bytes + self.quic_bytes + u128::from(self.tcp_ingress_bytes)
     }
 }
 

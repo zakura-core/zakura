@@ -1480,7 +1480,7 @@ impl<'de> Deserialize<'de> for Config {
             // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
             // lowers a larger cap after tracing starts so its warning is logged.
             zakura
-                .budgeted_max_connections()
+                .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
         }
 

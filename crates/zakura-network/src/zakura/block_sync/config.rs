@@ -719,7 +719,7 @@ pub fn clamp_advertised_response_bytes(bytes: u32) -> u32 {
 #[cfg(test)]
 mod owner_cap_tests {
     use super::*;
-    use crate::zakura::DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
+    use crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS;
 
     #[test]
     fn the_default_cwnd_cap_carries_one_gigabit_at_250_milliseconds() {
@@ -748,11 +748,11 @@ mod owner_cap_tests {
     fn derived_inflight_bytes_count_block_sync_connections() {
         let config = ZakuraBlockSyncConfig::default();
         assert_eq!(
-            config.block_sync_connections(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS),
+            config.block_sync_connections(DEFAULT_ZAKURA_MAX_CONNECTIONS),
             92
         );
         assert_eq!(
-            config.derived_max_inflight_block_bytes(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS),
+            config.derived_max_inflight_block_bytes(DEFAULT_ZAKURA_MAX_CONNECTIONS),
             92 * DEFAULT_BS_BBR_MAX_CWND_BYTES
         );
         // The peer limits bind when the node admits more connections.

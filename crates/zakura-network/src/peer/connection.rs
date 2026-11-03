@@ -631,6 +631,9 @@ where
     /// Reports requested blocks and completed framed writes to gossip schedulers.
     pub(super) block_uploads: super::block_gossip::BlockUploads,
 
+    /// Tells the client and peer set whether this connection is free to write a new request.
+    pub(super) request_slot: super::client::RequestSlot,
+
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
     ///
@@ -709,6 +712,7 @@ where
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
+            request_slot: Default::default(),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
@@ -755,6 +759,11 @@ where
         // TODO: turn this comment into a module-level comment, after splitting the module.
         loop {
             self.update_state_metrics(None);
+
+            // Every state change returns here before the next await, so the slot is current
+            // whenever this task is waiting.
+            self.request_slot
+                .set_busy(!matches!(self.state, State::AwaitingRequest));
 
             match self.state {
                 State::AwaitingRequest => {
@@ -833,6 +842,8 @@ where
                             break;
                         }
                         Either::Right(Some(req)) => {
+                            // The request may wait for the peer writer before the state changes.
+                            self.request_slot.set_busy(true);
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -883,11 +894,13 @@ where
                         _ = tx.cancellation() => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
+                            self.record_unanswered_block_request();
                             self.state = State::AwaitingRequest;
                             continue;
                         }
                         _ = timer_ref => {
                             trace!(parent: &span, "client request timed out");
+                            self.record_unanswered_block_request();
                             let e = PeerError::ConnectionReceiveTimeout;
 
                             // Replace the state with a temporary value,
@@ -1504,6 +1517,31 @@ where
     /// # Panics
     ///
     /// If the state is not `AwaitingResponse` with a `Finished` handler.
+    /// Records a block request that ends after spending at least half of its timeout unanswered.
+    ///
+    /// Block routing stops preferring this connection until the peer delivers a requested block.
+    fn record_unanswered_block_request(&self) {
+        let State::AwaitingResponse {
+            handler: Handler::BlocksByHash { .. },
+            ..
+        } = self.state
+        else {
+            return;
+        };
+
+        // Block downloaders apply their own timeout, so they usually cancel just before the
+        // connection's timer fires. An early cancellation says nothing about the peer.
+        let spent_half_of_timeout = self.request_timer.as_ref().is_some_and(|timer| {
+            timer
+                .deadline()
+                .saturating_duration_since(tokio::time::Instant::now())
+                <= constants::REQUEST_TIMEOUT / 2
+        });
+        if spent_half_of_timeout {
+            self.request_slot.set_block_request_unanswered(true);
+        }
+    }
+
     fn deliver_finished_response(&mut self) {
         // Replace the state with a temporary value,
         // so we can take ownership of the response sender.
@@ -1530,6 +1568,10 @@ where
                 .increment(1);
             } else {
                 debug!(error = ?response, "error in peer response to Zakura request");
+            }
+
+            if matches!(response, Ok(Response::Blocks(_))) {
+                self.request_slot.set_block_request_unanswered(false);
             }
 
             let _ = tx.send(response.map_err(Into::into));
@@ -1926,6 +1968,7 @@ where
 
         // Close channels first, so other tasks can start shutting down.
         self.client_rx.close();
+        self.request_slot.set_busy(true);
 
         // Update the shared error slot
         //

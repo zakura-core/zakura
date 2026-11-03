@@ -2873,7 +2873,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[1].hash(),
                 vec![coinbase(1)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[1]),
             ),
             (
                 blocks[1].hash(),
@@ -2916,7 +2916,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[5].hash(),
                 vec![coinbase(1), coinbase(3), coinbase(5)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[1, 3, 5]),
             ),
             (
                 blocks[5].hash(),
@@ -2927,7 +2927,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[4].hash(),
                 vec![coinbase(3)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[3]),
             ),
             (
                 blocks[4].hash(),
@@ -2942,6 +2942,11 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             ),
             (
                 blocks[4].hash(),
+                vec![coinbase(1), coinbase(3), coinbase(5), missing],
+                ParentInputs::Missing(coinbase(5)),
+            ),
+            (
+                blocks[4].hash(),
                 vec![coinbase(5), missing],
                 ParentInputs::Missing(coinbase(5)),
             ),
@@ -2949,7 +2954,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[1].hash(),
                 vec![coinbase(1)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[1]),
             ),
             (
                 blocks[1].hash(),
@@ -2964,6 +2969,29 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
         ],
     )
     .await;
+}
+
+/// Returns the [`ParentInputs::Unspent`] result for the coinbase output of each block in `heights`.
+fn unspent_coinbases(blocks: &[Arc<Block>], heights: &[usize]) -> ParentInputs {
+    ParentInputs::Unspent(Arc::new(
+        heights
+            .iter()
+            .map(|&height| {
+                let coinbase = &blocks[height].transactions[0];
+                (
+                    transparent::OutPoint {
+                        hash: coinbase.hash(),
+                        index: 0,
+                    },
+                    transparent::Utxo::new(
+                        coinbase.outputs()[0].clone(),
+                        Height(u32::try_from(height).expect("test heights are small")),
+                        true,
+                    ),
+                )
+            })
+            .collect(),
+    ))
 }
 
 async fn check_parent_inputs(
@@ -2985,7 +3013,7 @@ async fn check_parent_inputs(
                 .expect("the input read succeeds");
             assert_eq!(
                 response,
-                Response::ParentInputs(expected),
+                Response::ParentInputs(expected.clone()),
                 "parent {parent:?}"
             );
         }
@@ -3054,8 +3082,31 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
     // Sanity: the aligned view proves coinbase(2) present at block 5.
     assert_eq!(
         read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
-        ParentInputs::Inconclusive
+        unspent_coinbases(&blocks, &[2])
     );
+
+    // Repeated inputs against a real chain must still report the first missing input in order.
+    // The parallel paths are covered with distinct inputs in `read::block::tests`.
+    for len in [8, 128] {
+        let mut outpoints: Vec<_> = [1, 2, 3]
+            .into_iter()
+            .cycle()
+            .take(len)
+            .map(coinbase)
+            .collect();
+        assert_eq!(
+            read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[3].hash(), &outpoints),
+            unspent_coinbases(&blocks, &[1, 2, 3]),
+            "{len} inputs"
+        );
+        outpoints[len / 2] = coinbase(5);
+        outpoints[len - 1] = coinbase(4);
+        assert_eq!(
+            read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[3].hash(), &outpoints),
+            ParentInputs::Missing(coinbase(5)),
+            "{len} inputs"
+        );
+    }
 
     // Gap: drop block 2 from the chain, so neither the chain nor the database has it.
     let mut gapped = (**nfs_a.best_chain().expect("best chain")).clone();
@@ -3106,12 +3157,12 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         (
             blocks[5].hash(),
             vec![coinbase(1), coinbase(2), coinbase(5)],
-            ParentInputs::Inconclusive,
+            unspent_coinbases(&blocks, &[1, 2, 5]),
         ),
         (
             blocks[4].hash(),
             vec![coinbase(2), coinbase(4)],
-            ParentInputs::Inconclusive,
+            unspent_coinbases(&blocks, &[2, 4]),
         ),
         (
             blocks[4].hash(),
@@ -3131,7 +3182,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         (
             blocks[2].hash(),
             vec![coinbase(2)],
-            ParentInputs::Inconclusive,
+            unspent_coinbases(&blocks, &[2]),
         ),
         (
             blocks[1].hash(),

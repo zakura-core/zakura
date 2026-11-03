@@ -3322,13 +3322,14 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "13.0.1"
+version = "13.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64",
  "bytes",
  "chrono",
+ "csv",
  "derive-new",
  "eyre",
  "futures",
@@ -3365,6 +3366,7 @@ dependencies = [
  "zakura-bls12-381",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-jsonl-trace",
  "zakura-jubjub",
  "zakura-network",
  "zakura-node-services",

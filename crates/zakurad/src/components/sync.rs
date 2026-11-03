@@ -1094,10 +1094,8 @@ where
         let (past_lookahead_limit_sender, past_lookahead_limit_receiver) = watch::channel(false);
         let past_lookahead_limit_receiver = zs::WatchReceiver::new(past_lookahead_limit_receiver);
         let expose_peer_addresses = config.network.expose_peer_addresses;
-        let trace = LegacySyncTrace::new(
-            config.network.zakura.trace_dir.clone(),
-            expose_peer_addresses,
-        );
+        let trace =
+            LegacySyncTrace::new(config.network.zakura.spawn_tracer(), expose_peer_addresses);
 
         let parent_wait = state_parent_wait(state.clone());
 

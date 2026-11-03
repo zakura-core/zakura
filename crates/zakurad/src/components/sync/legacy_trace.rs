@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fmt::Display,
-    path::PathBuf,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -11,32 +10,7 @@ use zakura_chain::block::{self, Height};
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
 use zakura_network::PeerSocketAddr;
 
-const TABLE: JsonlTraceTable = JsonlTraceTable::csv(
-    "legacy_sync",
-    "legacy_sync.csv",
-    &[
-        "event",
-        "state_tip",
-        "reason",
-        "error",
-        "checkpoint_height",
-        "reserve",
-        "prospective_tips",
-        "discovered",
-        "hash",
-        "height",
-        "result",
-        "phase",
-        "elapsed_ms",
-        "phase_elapsed_ms",
-        "previous_phase",
-        "in_flight",
-        "registry_retries",
-        "tasks",
-        "download_elapsed_ms",
-        "peer",
-    ],
-);
+const TABLE: JsonlTraceTable = zakura_jsonl_trace::tables::LEGACY_SYNC;
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyTaskState {
@@ -69,10 +43,7 @@ pub(super) struct LegacySyncTrace {
 }
 
 impl LegacySyncTrace {
-    pub(super) fn new(trace_dir: Option<PathBuf>, expose_peer_addresses: bool) -> Self {
-        let tracer = trace_dir
-            .map(JsonlTracer::spawn)
-            .unwrap_or_else(JsonlTracer::noop);
+    pub(super) fn new(tracer: JsonlTracer, expose_peer_addresses: bool) -> Self {
         Self {
             emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
             expose_peer_addresses,
@@ -425,11 +396,11 @@ mod tests {
         let addr: PeerSocketAddr = "192.0.2.1:8233".parse().expect("valid test address");
 
         assert_eq!(
-            LegacySyncTrace::new(None, false).peer_label(addr),
+            LegacySyncTrace::new(JsonlTracer::noop(), false).peer_label(addr),
             "v4redacted:8233"
         );
         assert_eq!(
-            LegacySyncTrace::new(None, true).peer_label(addr),
+            LegacySyncTrace::new(JsonlTracer::noop(), true).peer_label(addr),
             "192.0.2.1:8233"
         );
     }

@@ -382,7 +382,7 @@ where
             block_gossip_peers_changed: false,
             block_gossip_slots: BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
-            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
+            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.spawn_tracer()),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),

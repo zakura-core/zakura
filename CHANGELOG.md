@@ -42,11 +42,11 @@ independently.
 - Committing a block no longer copies the earlier transparent outputs of each address
   it pays, which makes accepting blocks faster for mining and busy addresses
   ([#1946](https://github.com/zakura-core/zakura/pull/1946)).
-
-<!-- release-readiness: allow-patch; reason: The new [network] advert-window settings are optional with defaults, so existing configs keep working. All other Changed entries are backwards-compatible performance improvements with no RPC or consensus rule change. -->
 - Pruned nodes that skip the transparent address indexes no longer maintain them for
   recent, non-finalized blocks either, which makes accepting blocks cheaper on those nodes
   ([#1947](https://github.com/zakura-core/zakura/pull/1947)).
+
+<!-- release-readiness: allow-patch; reason: The new [network] advert-window settings are optional with defaults, so existing configs keep working. All other Changed entries are backwards-compatible performance improvements with no RPC or consensus rule change. -->
 
 ### Fixed
 

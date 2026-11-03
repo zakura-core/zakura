@@ -3,11 +3,9 @@
 //! Block ingress reserves parser transients separately from retained admission.
 //! Block and derived transaction handles share one allocation and charge.
 //! A charge never changes pool, so its last holder settles the pool that admitted it.
-//! Disk reads reserve count admission before materialization. Standalone
-//! results keep their own slot through their final holder. A count bounds bytes
-//! only for payloads with a fixed maximum size, such as headers and serialized
-//! blocks. [`ReadMemoryBudget`] bounds what a count cannot: parser transients and
-//! the decoded bytes of variable-size results, under two separate limits.
+//! Disk reads reserve retained bytes in one [`ReadMemoryBudget`] before
+//! materialization, then settle to the measured result. Every result keeps its
+//! charge through its final holder.
 //!
 //! # Capacity and progress contract
 //!
@@ -17,15 +15,15 @@
 //! | Actor | Contract |
 //! | --- | --- |
 //! | Waiting caller | Waits for a worker slot before it holds any lock or memory charge. Dropping the wait releases the request. |
-//! | Reader | Acquires its result slot, parses under a [`ParseScope`], then funds the retained charge before it releases the parser charge. A refusal at any step releases every earlier step. |
+//! | Reader | Reserves an upper bound on its result's bytes, parses inside its worker slot, then settles the reservation to the measured result. A refusal at any step releases every earlier step. |
 //! | Snapshot | Holds its retained handles for one read job. The job's end releases them, so a snapshot cannot hold capacity for an idle peer. |
 //! | Fork | A block handle keeps its charge after its chain leaves the non-finalized state. Its last holder settles the charge. |
 //! | Writer | Takes no ordinary result capacity. Chain-tip publication uses a fixed partition, so readers cannot stall a commit. |
 //! | Rayon work | Holds no shared lock across a wait for its pool. A detached verifier job owns its payload handle until the job drops it. |
 //!
-//! A reservation always succeeds when its gauge has no other holder, even above the
+//! A reservation always succeeds when its budget has no other holder, even above the
 //! limit. Refusal therefore proves that another holder exists and that its release
-//! allows a retry. This bounds each gauge by its limit plus one legal payload.
+//! allows a retry. This bounds the budget by its limit plus one legal payload.
 //!
 //! Disk retention has no representation here. Store policies own durable limits,
 //! and a memory lease says nothing about what a commit wrote.
@@ -44,21 +42,16 @@
 //! retention can never refuse the work that would let downstream stores release
 //! their blocks.
 
-use std::{
-    fmt, io,
-    num::{NonZeroU16, NonZeroU64},
-    ops::Deref,
-    sync::Arc,
-};
+use std::{fmt, io, num::NonZeroU64, ops::Deref, sync::Arc};
 
 use zakura_chain::{
-    block::{self, Block, BlockView, Header},
+    block::{Block, BlockRef, Header},
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
 use zakura_rt::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Notify, OwnedSemaphorePermit, Semaphore,
+    Notify,
 };
 
 #[cfg(any(test, zakura_sim, feature = "test-support"))]
@@ -125,6 +118,28 @@ impl From<ReadMemoryExhausted> for AdmissionFailure {
     }
 }
 
+/// A decoded block and its attributed size, measured once when the block is
+/// wrapped. Only [`MeasuredBlock::new`] builds one, so the size always
+/// matches the block.
+#[derive(Debug)]
+pub struct MeasuredBlock {
+    block: Block,
+    bytes: u64,
+}
+
+impl MeasuredBlock {
+    /// Measure `block`'s attributed size.
+    pub fn new(block: Block) -> Self {
+        let bytes = block.attributed_memory_size_bytes();
+        Self { block, bytes }
+    }
+
+    /// The attributed size measured when the block was wrapped.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 /// A refused parsed block remains with its caller's transient decode scope.
 #[derive(Debug)]
 pub struct RejectedBlock {
@@ -150,36 +165,28 @@ impl DecodedBlockPool {
     /// Only count-limited pools support this operation. The count includes active
     /// decoders and returned blocks. Decoded bytes are measured after materialization.
     /// Use this only where a fixed count is the memory bound, such as a small partition.
-    /// [`Self::try_decode_bounded`] also enforces parser and decoded-byte limits.
     pub fn try_decode(
         &self,
         decode: impl FnOnce() -> Option<Block>,
     ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
-        self.decode_admitted(|| Ok(decode()), |_| Ok(None))
+        self.decode_admitted(None, decode)
     }
 
-    /// Decode like [`Self::try_decode`], and also charge `memory`.
-    ///
-    /// The steps run in this order: reserve the count, parse under `decode`'s scope,
-    /// measure the block, fund its retained bytes, and release the parser charge.
-    /// The retained charge follows the block to its final holder. Refusal and
-    /// unwinding release every earlier step.
-    pub fn try_decode_bounded(
+    /// Decode like [`Self::try_decode`] under a byte reservation the caller took before
+    /// reading. The reservation settles to the block's measured bytes and follows the
+    /// block to its final holder. Refusal and unwinding release every earlier step.
+    pub fn try_decode_reserved(
         &self,
-        memory: &ReadMemoryBudget,
-        decode: impl FnOnce(&mut ParseScope) -> Result<Option<Block>, ReadMemoryExhausted>,
+        reservation: ReadReservation,
+        decode: impl FnOnce() -> Option<Block>,
     ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
-        let mut parsing = memory.parse_scope();
-        self.decode_admitted(
-            || Ok(decode(&mut parsing)?),
-            |bytes| Ok(Some(memory.retain(bytes)?)),
-        )
+        self.decode_admitted(Some(reservation), decode)
     }
 
     fn decode_admitted(
         &self,
-        decode: impl FnOnce() -> Result<Option<Block>, AdmissionFailure>,
-        retain: impl FnOnce(u64) -> Result<Option<ByteLease>, AdmissionFailure>,
+        reservation: Option<ReadReservation>,
+        decode: impl FnOnce() -> Option<Block>,
     ) -> Result<Option<OwnedBlock>, AdmissionFailure> {
         // A pipeline pool charges measured bytes at admission, and a decode reserves
         // before it can measure them.
@@ -187,7 +194,7 @@ impl DecodedBlockPool {
             return Err(AdmissionFailure::DecodeRequiresCountLimit);
         }
         let mut charge = self.reserve(0, Admission::WithinLimit)?;
-        let Some(mut block) = decode()? else {
+        let Some(mut block) = decode() else {
             return Ok(None);
         };
         if Arc::get_mut(&mut block.header).is_none()
@@ -199,7 +206,9 @@ impl DecodedBlockPool {
             return Err(AdmissionFailure::AliasedPayload);
         }
         let bytes = block.attributed_memory_size_bytes();
-        let retained = retain(bytes)?;
+        let retained = reservation
+            .map(|reservation| reservation.0.settle(bytes))
+            .transpose()?;
         if self
             .0
             .counted_bytes
@@ -247,10 +256,19 @@ impl DecodedBlockPool {
     /// Existing strong or weak header/transaction aliases prevent adoption.
     pub fn try_admit(
         &self,
-        mut block: Block,
+        block: Block,
         admission: Admission,
     ) -> Result<OwnedBlock, RejectedBlock> {
-        let bytes = block.attributed_memory_size_bytes();
+        self.try_admit_measured(MeasuredBlock::new(block), admission)
+    }
+
+    /// [`Self::try_admit`] for a block whose caller already measured it.
+    pub fn try_admit_measured(
+        &self,
+        block: MeasuredBlock,
+        admission: Admission,
+    ) -> Result<OwnedBlock, RejectedBlock> {
+        let MeasuredBlock { mut block, bytes } = block;
         if Arc::get_mut(&mut block.header).is_none()
             || block
                 .transactions
@@ -527,18 +545,20 @@ struct RetainedBlock {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use zakura_chain::{block::BlockView, transaction::Transaction};
+/// use zakura_chain::transaction::Transaction;
 /// use zakura_node_services::block_memory::OwnedBlock;
 /// fn escape(owner: &OwnedBlock) -> Arc<Transaction> {
-///     BlockView::from(owner).transactions().next().unwrap().clone()
+///     owner.transactions().next().unwrap().clone()
 /// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct OwnedBlock(Arc<RetainedBlock>);
 
-impl<'a> From<&'a OwnedBlock> for BlockView<'a> {
-    fn from(block: &'a OwnedBlock) -> Self {
-        (&block.0.block).into()
+impl Deref for OwnedBlock {
+    type Target = BlockRef;
+
+    fn deref(&self) -> &BlockRef {
+        &self.0.block
     }
 }
 
@@ -605,13 +625,10 @@ impl BlockHandle {
     }
 
     /// Borrow payloads without exposing raw shared handles.
-    pub fn view(&self) -> BlockView<'_> {
-        self.block().into()
-    }
-
-    /// Borrow the block header.
-    pub fn header(&self) -> &Header {
-        self.view().header()
+    /// Callers use it to reach `BlockRef::transactions`, which [`Self::transactions`]
+    /// shadows, and `BlockRef::header` where an extension trait's `header` shadows it.
+    pub fn view(&self) -> &BlockRef {
+        self.block()
     }
 
     /// Retain the header with its existing ownership.
@@ -639,26 +656,13 @@ impl BlockHandle {
                 .expect("the index comes from this immutable block")
         })
     }
-
-    /// Return the height reported by the coinbase transaction.
-    pub fn coinbase_height(&self) -> Option<block::Height> {
-        self.block().coinbase_height()
-    }
-
-    /// Compute the block hash.
-    pub fn hash(&self) -> block::Hash {
-        self.block().hash()
-    }
-
-    /// Compute the authorizing-data commitment root.
-    pub fn auth_data_root(&self) -> block::merkle::AuthDataRoot {
-        self.block().auth_data_root()
-    }
 }
 
-impl<'a> From<&'a BlockHandle> for BlockView<'a> {
-    fn from(block: &'a BlockHandle) -> Self {
-        block.view()
+impl Deref for BlockHandle {
+    type Target = BlockRef;
+
+    fn deref(&self) -> &BlockRef {
+        self.block()
     }
 }
 
@@ -788,13 +792,12 @@ payload_handle!(TransactionHandle, Transaction);
 
 #[derive(Debug)]
 struct RetainedPayload<T> {
-    // Destroy the actual payload before releasing its admission.
+    // Destroy the actual payload before releasing its charge.
     payload: T,
-    _retained: Option<ByteLease>,
-    _permit: OwnedSemaphorePermit,
+    _retained: ByteLease,
 }
 
-/// A standalone payload whose final holder releases its read admission.
+/// A standalone payload whose final holder releases its retained read bytes.
 /// The owner exposes borrowed data, never a raw shared handle.
 #[derive(Debug)]
 pub struct OwnedPayload<T>(Arc<RetainedPayload<T>>);
@@ -814,99 +817,6 @@ pub type OwnedHeader = OwnedPayload<Header>;
 /// One block's serialized bytes copied from disk.
 pub type OwnedRawBlock = OwnedPayload<Vec<u8>>;
 
-/// Shared count admission for one kind of standalone read result.
-#[derive(Clone, Debug)]
-pub struct DecodedPayloadPool(Arc<Semaphore>);
-
-/// Why a standalone payload cannot acquire read admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PayloadAdmissionFailure {
-    /// Other readers or retained results hold every slot.
-    Capacity,
-    /// This pool generation has permanently closed admission.
-    Closed,
-}
-
-impl fmt::Display for PayloadAdmissionFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Capacity => "decoded payload capacity exhausted",
-            Self::Closed => "decoded payload pool closed",
-        })
-    }
-}
-
-impl std::error::Error for PayloadAdmissionFailure {}
-
-impl From<ReadMemoryExhausted> for PayloadAdmissionFailure {
-    fn from(_: ReadMemoryExhausted) -> Self {
-        Self::Capacity
-    }
-}
-
-impl DecodedPayloadPool {
-    /// Create one count allowance shared by this pool's clones.
-    pub fn new(limit: NonZeroU16) -> Self {
-        Self(Arc::new(Semaphore::new(usize::from(limit.get()))))
-    }
-
-    /// Read the actual semaphore capacity without waiting for a lock or worker.
-    pub fn available_slots(&self) -> usize {
-        self.0.available_permits()
-    }
-
-    /// Acquire a count slot before lookup or decoding. Missing data and unwinding
-    /// release the slot. Use this only for payloads with a fixed maximum size, where
-    /// the count bounds their bytes. [`Self::try_decode_bounded`] covers other payloads.
-    pub fn try_decode<T>(
-        &self,
-        decode: impl FnOnce() -> Option<T>,
-    ) -> Result<Option<OwnedPayload<T>>, PayloadAdmissionFailure> {
-        let permit = self.acquire()?;
-        Ok(decode().map(|payload| {
-            OwnedPayload(Arc::new(RetainedPayload {
-                payload,
-                _retained: None,
-                _permit: permit,
-            }))
-        }))
-    }
-
-    /// Decode like [`Self::try_decode`], and also charge `memory`.
-    ///
-    /// The steps run in this order: acquire the slot, parse under `decode`'s scope,
-    /// measure the payload, fund its retained bytes, and release the parser charge.
-    /// Refusal and unwinding release every earlier step.
-    pub fn try_decode_bounded<T: DecodedSize>(
-        &self,
-        memory: &ReadMemoryBudget,
-        decode: impl FnOnce(&mut ParseScope) -> Result<Option<T>, ReadMemoryExhausted>,
-    ) -> Result<Option<OwnedPayload<T>>, PayloadAdmissionFailure> {
-        let permit = self.acquire()?;
-        let mut parsing = memory.parse_scope();
-        let Some(payload) = decode(&mut parsing)? else {
-            return Ok(None);
-        };
-        let retained = memory.retain(payload.decoded_size_bytes())?;
-        drop(parsing);
-        Ok(Some(OwnedPayload(Arc::new(RetainedPayload {
-            payload,
-            _retained: Some(retained),
-            _permit: permit,
-        }))))
-    }
-
-    fn acquire(&self) -> Result<OwnedSemaphorePermit, PayloadAdmissionFailure> {
-        self.0
-            .clone()
-            .try_acquire_owned()
-            .map_err(|error| match error {
-                tokio::sync::TryAcquireError::NoPermits => PayloadAdmissionFailure::Capacity,
-                tokio::sync::TryAcquireError::Closed => PayloadAdmissionFailure::Closed,
-            })
-    }
-}
-
 /// Reports the memory a decoded read result retains, including its inline size.
 pub trait DecodedSize {
     /// Attributed bytes retained by this payload.
@@ -919,13 +829,20 @@ impl DecodedSize for Transaction {
     }
 }
 
+impl DecodedSize for Header {
+    fn decoded_size_bytes(&self) -> u64 {
+        // A header has no heap-backed fields, so its inline size is its whole allocation.
+        u64::try_from(std::mem::size_of::<Header>()).unwrap_or(u64::MAX)
+    }
+}
+
 impl DecodedSize for Vec<u8> {
     fn decoded_size_bytes(&self) -> u64 {
         u64::try_from(self.capacity()).unwrap_or(u64::MAX)
     }
 }
 
-/// A read refused because other holders use the rest of a memory limit.
+/// A read refused because other holders use the rest of the retained read limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadMemoryExhausted;
 
@@ -937,6 +854,18 @@ impl fmt::Display for ReadMemoryExhausted {
 
 impl std::error::Error for ReadMemoryExhausted {}
 
+/// Returns true when `error` or one of its sources refused a read for lack of
+/// capacity. A refusal says nothing about the requested data, so callers retry.
+pub fn is_read_capacity_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        error.is::<ReadMemoryExhausted>()
+            || matches!(
+                error.downcast_ref::<AdmissionFailure>(),
+                Some(AdmissionFailure::Capacity)
+            )
+    })
+}
+
 #[derive(Debug)]
 struct ByteGauge {
     limit: u64,
@@ -944,13 +873,6 @@ struct ByteGauge {
 }
 
 impl ByteGauge {
-    fn new(limit: NonZeroU64) -> Arc<Self> {
-        Arc::new(Self {
-            limit: limit.get(),
-            used: AtomicU64::new(0),
-        })
-    }
-
     /// Add `bytes` for a holder that already owns `held`. The gauge refuses growth
     /// past its limit only while another holder exists, so a lone reader finishes.
     fn try_add(&self, held: u64, bytes: u64) -> Result<(), ReadMemoryExhausted> {
@@ -970,10 +892,6 @@ impl ByteGauge {
                 Some(used.saturating_sub(bytes))
             });
     }
-
-    fn used(&self) -> u64 {
-        self.used.load(Ordering::Acquire)
-    }
 }
 
 /// Bytes charged to one gauge until this lease drops.
@@ -984,12 +902,15 @@ struct ByteLease {
 }
 
 impl ByteLease {
-    fn try_new(gauge: &Arc<ByteGauge>, bytes: u64) -> Result<Self, ReadMemoryExhausted> {
-        gauge.try_add(0, bytes)?;
-        Ok(Self {
-            gauge: gauge.clone(),
-            bytes,
-        })
+    /// Change the charge to `bytes`. A refused increase drops the lease and its charge.
+    fn settle(mut self, bytes: u64) -> Result<Self, ReadMemoryExhausted> {
+        if let Some(growth) = bytes.checked_sub(self.bytes) {
+            self.gauge.try_add(self.bytes, growth)?;
+        } else {
+            self.gauge.release(self.bytes - bytes);
+        }
+        self.bytes = bytes;
+        Ok(self)
     }
 }
 
@@ -999,76 +920,56 @@ impl Drop for ByteLease {
     }
 }
 
-/// Separate memory limits for parser transients and retained read results.
+/// One limit on the bytes that read results retain until their final holders drop.
 ///
-/// A parser charge covers raw rows, partial results, and output buffers during one
-/// read. A retained charge covers one measured result until its final holder drops.
-/// A result funds its retained charge before it releases its parser charge, so it
-/// never leaves both gauges during the handoff. Clones share both gauges.
+/// A read reserves an upper bound before it materializes a result, then settles the
+/// reservation to the result's measured bytes. Transient parser memory is not charged
+/// here: each read worker parses one result at a time, so the worker count bounds it.
+/// Clones share the limit.
 #[derive(Clone, Debug)]
-pub struct ReadMemoryBudget {
-    parser: Arc<ByteGauge>,
-    retained: Arc<ByteGauge>,
-}
+pub struct ReadMemoryBudget(Arc<ByteGauge>);
 
 impl ReadMemoryBudget {
-    /// Create one budget. Callers check that the limits fund a legal payload.
-    pub fn new(parser_limit: NonZeroU64, retained_limit: NonZeroU64) -> Self {
-        Self {
-            parser: ByteGauge::new(parser_limit),
-            retained: ByteGauge::new(retained_limit),
-        }
-    }
-
-    /// Bytes currently charged to active parsers.
-    pub fn parser_bytes(&self) -> u64 {
-        self.parser.used()
-    }
-
-    /// Bytes currently charged to retained results.
-    pub fn retained_bytes(&self) -> u64 {
-        self.retained.used()
-    }
-
-    fn parse_scope(&self) -> ParseScope {
-        ParseScope(Some(ByteLease {
-            gauge: self.parser.clone(),
-            bytes: 0,
+    /// Create one budget. Callers check that the limit funds a legal payload.
+    pub fn new(limit: NonZeroU64) -> Self {
+        Self(Arc::new(ByteGauge {
+            limit: limit.get(),
+            used: AtomicU64::new(0),
         }))
     }
 
-    fn retain(&self, bytes: u64) -> Result<ByteLease, ReadMemoryExhausted> {
-        ByteLease::try_new(&self.retained, bytes)
+    /// Bytes currently charged to reservations and retained results.
+    pub fn retained_bytes(&self) -> u64 {
+        self.0.used.load(Ordering::Acquire)
+    }
+
+    /// Reserve `bytes` before a read materializes its result. Refusal proves that
+    /// another holder exists, so its release allows a retry.
+    pub fn try_reserve(&self, bytes: u64) -> Result<ReadReservation, ReadMemoryExhausted> {
+        self.0.try_add(0, bytes)?;
+        Ok(ReadReservation(ByteLease {
+            gauge: self.0.clone(),
+            bytes,
+        }))
     }
 }
 
-/// Parser memory charged by one read. Dropping the scope releases its whole charge.
+/// Bytes reserved before a read materializes its result. Dropping it releases them.
 #[derive(Debug)]
-pub struct ParseScope(Option<ByteLease>);
+pub struct ReadReservation(ByteLease);
 
-impl ParseScope {
-    /// Create a scope for a read whose owner proves its parser bound statically,
-    /// such as a fixed worker partition multiplied by one block's size.
-    pub fn statically_bounded() -> Self {
-        Self(None)
-    }
-
-    /// Charge memory before or after allocating it, then keep it through this read.
-    pub fn try_charge(&mut self, bytes: u64) -> Result<(), ReadMemoryExhausted> {
-        if let Some(lease) = &mut self.0 {
-            lease.gauge.try_add(lease.bytes, bytes)?;
-            lease.bytes = lease.bytes.saturating_add(bytes);
-        }
-        Ok(())
-    }
-
-    /// Return memory this read already freed.
-    pub fn release(&mut self, bytes: u64) {
-        if let Some(lease) = &mut self.0 {
-            let bytes = bytes.min(lease.bytes);
-            lease.gauge.release(bytes);
-            lease.bytes -= bytes;
-        }
+impl ReadReservation {
+    /// Settle to `payload`'s measured bytes, then keep them through its final holder.
+    /// Growth past the reservation refuses while another holder exists.
+    pub fn retain<T: DecodedSize>(
+        self,
+        payload: T,
+    ) -> Result<OwnedPayload<T>, ReadMemoryExhausted> {
+        let retained = self.0.settle(payload.decoded_size_bytes())?;
+        Ok(OwnedPayload(Arc::new(RetainedPayload {
+            payload,
+            _retained: retained,
+        })))
     }
 }
 
@@ -1109,33 +1010,39 @@ mod tests {
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap()
     }
 
-    fn memory(parser: u64, retained: u64) -> ReadMemoryBudget {
-        ReadMemoryBudget::new(
-            NonZeroU64::new(parser).unwrap(),
-            NonZeroU64::new(retained).unwrap(),
-        )
+    fn memory(limit: u64) -> ReadMemoryBudget {
+        ReadMemoryBudget::new(NonZeroU64::new(limit).unwrap())
     }
 
-    fn ten_blocks() -> DecodedBlockPool {
-        DecodedBlockPool::for_block_count(NonZeroU64::new(10).unwrap())
+    fn read_pool() -> DecodedBlockPool {
+        DecodedBlockPool::for_block_count(NonZeroU64::MAX)
+    }
+
+    fn transaction() -> Transaction {
+        (*block().transactions[0]).clone()
     }
 
     #[test]
-    fn parser_charge_moves_to_a_separate_retained_charge_at_the_handoff() {
+    fn a_reservation_settles_to_the_measured_block_and_follows_its_final_holder() {
         let bytes = block().attributed_memory_size_bytes();
-        let budget = memory(4096, 2 * bytes);
+        let budget = memory(4 * bytes);
         let observed = budget.clone();
-        let owner = ten_blocks()
-            .try_decode_bounded(&budget, |scope| {
-                scope.try_charge(4096)?;
-                assert_eq!(observed.parser_bytes(), 4096);
-                assert_eq!(observed.retained_bytes(), 0);
-                Ok(Some(block()))
+        let owner = read_pool()
+            .try_decode_reserved(budget.try_reserve(3 * bytes).unwrap(), || {
+                assert_eq!(
+                    observed.retained_bytes(),
+                    3 * bytes,
+                    "reserved before decode"
+                );
+                Some(block())
             })
             .unwrap()
             .unwrap();
-        assert_eq!(budget.parser_bytes(), 0, "the result left its parser");
-        assert_eq!(budget.retained_bytes(), bytes);
+        assert_eq!(
+            budget.retained_bytes(),
+            bytes,
+            "settled to the measured block"
+        );
 
         let transaction = owner.transaction(0).unwrap();
         drop(owner);
@@ -1145,141 +1052,102 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_parser_limit_refuses_without_touching_retained_capacity() {
-        let budget = memory(100, u64::MAX);
-        let pool = ten_blocks();
-        let mut outer = budget.parse_scope();
-        outer.try_charge(100).unwrap();
-        let error = pool
-            .try_decode_bounded(&budget, |scope| {
-                scope.try_charge(1)?;
-                unreachable!("the parser limit refuses this read")
-            })
-            .unwrap_err();
-        assert_eq!(error, AdmissionFailure::Capacity);
-        assert_eq!(budget.parser_bytes(), 100, "only the other reader remains");
-        assert_eq!(budget.retained_bytes(), 0);
-        assert_eq!(pool.reserved_blocks(), 0, "the count rolled back");
-    }
-
-    #[test]
-    fn exhausted_retained_limit_rolls_back_count_and_parser_charges() {
+    fn exhausted_retained_limit_refuses_before_decode_and_rolls_back() {
         let bytes = block().attributed_memory_size_bytes();
-        let budget = memory(u64::MAX, bytes);
-        let pool = ten_blocks();
+        let budget = memory(bytes);
+        let pool = read_pool();
         let first = pool
-            .try_decode_bounded(&budget, |_| Ok(Some(block())))
+            .try_decode_reserved(budget.try_reserve(bytes).unwrap(), || Some(block()))
             .unwrap()
             .unwrap();
+        assert_eq!(budget.try_reserve(1).unwrap_err(), ReadMemoryExhausted);
+
+        // A reservation below the measured size refuses its growth while another holder exists.
+        let small = budget.try_reserve(0).unwrap();
         let error = pool
-            .try_decode_bounded(&budget, |scope| {
-                scope.try_charge(7)?;
-                Ok(Some(block()))
-            })
+            .try_decode_reserved(small, || Some(block()))
             .unwrap_err();
         assert_eq!(error, AdmissionFailure::Capacity);
-        assert_eq!(budget.parser_bytes(), 0);
         assert_eq!(budget.retained_bytes(), bytes);
         assert_eq!(pool.reserved_blocks(), 1);
         assert_eq!(pool.reserved_bytes(), bytes);
 
         drop(first);
+        assert_eq!(budget.retained_bytes(), 0);
         assert!(pool
-            .try_decode_bounded(&budget, |_| Ok(Some(block())))
+            .try_decode_reserved(budget.try_reserve(bytes).unwrap(), || Some(block()))
             .unwrap()
             .is_some());
     }
 
     #[test]
-    fn unwinding_parser_releases_every_reservation() {
-        let budget = memory(1 << 20, 1 << 20);
-        let pool = ten_blocks();
+    fn missing_or_unwinding_reads_release_every_reservation() {
+        let budget = memory(1 << 20);
+        let pool = read_pool();
+        let missing = pool
+            .try_decode_reserved(budget.try_reserve(1024).unwrap(), || None)
+            .unwrap();
+        assert!(missing.is_none());
+        assert_eq!(budget.retained_bytes(), 0);
+
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = pool.try_decode_bounded(&budget, |scope| {
-                scope.try_charge(1024)?;
+            let _ = pool.try_decode_reserved(budget.try_reserve(1024).unwrap(), || {
                 panic!("interrupted disk parser")
             });
         }));
         assert!(panic.is_err());
-        assert_eq!(budget.parser_bytes(), 0);
         assert_eq!(budget.retained_bytes(), 0);
         assert_eq!(pool.reserved_blocks(), 0);
     }
 
     #[test]
-    fn lone_reader_progresses_past_each_limit_but_a_second_holder_is_refused() {
+    fn lone_reader_progresses_past_the_limit_but_a_second_holder_is_refused() {
         let bytes = block().attributed_memory_size_bytes();
-        let budget = memory(1, 1);
-        let pool = ten_blocks();
+        let budget = memory(1);
+        let pool = read_pool();
         let oversized = pool
-            .try_decode_bounded(&budget, |scope| {
-                scope.try_charge(1024)?;
-                scope.try_charge(1024)?;
-                Ok(Some(block()))
-            })
+            .try_decode_reserved(budget.try_reserve(2 * bytes).unwrap(), || Some(block()))
             .unwrap()
             .unwrap();
         assert_eq!(budget.retained_bytes(), bytes);
-        assert_eq!(
-            pool.try_decode_bounded(&budget, |_| Ok(Some(block())))
-                .unwrap_err(),
-            AdmissionFailure::Capacity,
-        );
+        assert_eq!(budget.try_reserve(1).unwrap_err(), ReadMemoryExhausted);
         drop(oversized);
         assert_eq!(budget.retained_bytes(), 0);
     }
 
     #[test]
-    fn parser_release_returns_freed_rows_and_ignores_excess() {
-        let budget = memory(100, 100);
-        let mut scope = budget.parse_scope();
-        scope.try_charge(80).unwrap();
-        scope.release(30);
-        assert_eq!(budget.parser_bytes(), 50);
-        scope.try_charge(50).unwrap();
-        scope.release(1000);
-        assert_eq!(budget.parser_bytes(), 0);
-        drop(scope);
-        assert_eq!(budget.parser_bytes(), 0);
-    }
-
-    #[test]
-    fn static_scope_charges_no_gauge() {
-        let mut scope = ParseScope::statically_bounded();
-        scope.try_charge(u64::MAX).unwrap();
-        scope.release(u64::MAX);
+    fn only_capacity_refusals_are_read_capacity_refusals() {
+        let refusal =
+            |error: Box<dyn std::error::Error + Send + Sync>| is_read_capacity_refusal(&*error);
+        assert!(refusal(ReadMemoryExhausted.into()));
+        assert!(refusal(AdmissionFailure::Capacity.into()));
+        assert!(!refusal(AdmissionFailure::Closed.into()));
+        assert!(!refusal(io::Error::other("disk").into()));
     }
 
     #[test]
     fn standalone_payload_retains_measured_bytes_through_its_final_clone() {
-        let budget = memory(1 << 20, 64);
-        let pool = DecodedPayloadPool::new(NonZeroU16::new(4).unwrap());
-        let payload = pool
-            .try_decode_bounded(&budget, |scope| {
-                scope.try_charge(48)?;
-                assert_eq!(budget.parser_bytes(), 48);
-                Ok(Some(Vec::<u8>::with_capacity(48)))
-            })
+        let budget = memory(64);
+        let payload = budget
+            .try_reserve(64)
             .unwrap()
+            .retain(Vec::<u8>::with_capacity(48))
             .unwrap();
         let measured = payload.decoded_size_bytes();
-        assert_eq!(budget.parser_bytes(), 0);
         assert_eq!(budget.retained_bytes(), measured);
         let clone = payload.clone();
         drop(payload);
         assert_eq!(budget.retained_bytes(), measured);
 
-        let second = budget.retain(1).unwrap();
-        let refused = pool.try_decode_bounded(&budget, |_| Ok(Some(vec![0u8; 64])));
-        assert_eq!(refused.unwrap_err(), PayloadAdmissionFailure::Capacity);
+        let refused = budget.try_reserve(0).unwrap().retain(vec![0u8; 64]);
+        assert_eq!(refused.unwrap_err(), ReadMemoryExhausted);
         assert_eq!(
-            pool.available_slots(),
-            3,
-            "the refused read gave back its slot"
+            budget.retained_bytes(),
+            measured,
+            "the refused read left no charge"
         );
-        drop((clone, second));
+        drop(clone);
         assert_eq!(budget.retained_bytes(), 0);
-        assert_eq!(pool.available_slots(), 4);
     }
 
     #[test]
@@ -1340,74 +1208,52 @@ mod tests {
     }
 
     #[test]
-    fn standalone_transaction_admission_precedes_decode_and_outlives_clones() {
-        let pool = DecodedPayloadPool::new(NonZeroU16::MIN);
-        let transaction = pool
-            .try_decode(|| {
-                assert_eq!(pool.available_slots(), 0, "admission precedes decode");
-                Some((*block().transactions[0]).clone())
-            })
-            .unwrap()
-            .unwrap();
+    fn standalone_transaction_reservation_precedes_decode_and_outlives_clones() {
+        let budget = memory(1);
+        let reservation = budget.try_reserve(1 << 20).unwrap();
+        let refused = budget.try_reserve(1);
+        assert_eq!(
+            refused.unwrap_err(),
+            ReadMemoryExhausted,
+            "a reservation holds its bytes before the decode"
+        );
+        let transaction = reservation.retain(transaction()).unwrap();
         let probe = model::PayloadProbe::new(&transaction);
+        let bytes = transaction.decoded_size_bytes();
         let clone = transaction.clone();
         drop(transaction);
         assert_eq!(probe.holders(), 1);
         assert!(probe.serialized_bytes().unwrap() > 0);
         assert_eq!(
-            pool.available_slots(),
-            0,
-            "live standalone allocation retains its permit"
+            budget.retained_bytes(),
+            bytes,
+            "a live standalone allocation retains its charge"
         );
-        let error = pool
-            .try_decode::<Transaction>(|| panic!("refused decode ran"))
-            .unwrap_err();
-        assert_eq!(error, PayloadAdmissionFailure::Capacity);
+        assert_eq!(budget.try_reserve(1).unwrap_err(), ReadMemoryExhausted);
         drop(clone);
         assert_eq!(probe.holders(), 0);
         assert_eq!(probe.serialized_bytes(), None);
-        assert_eq!(pool.available_slots(), 1);
+        assert_eq!(budget.retained_bytes(), 0);
     }
 
     #[test]
-    fn header_slots_bound_retained_header_bytes() {
-        // A header has no heap-backed fields, so a slot bounds its whole allocation.
-        assert!(std::mem::size_of::<RetainedPayload<Header>>() <= 2048);
-    }
-
-    #[test]
-    fn standalone_transaction_missing_panic_and_closed_pool_settle_admission() {
-        let pool = DecodedPayloadPool::new(NonZeroU16::MIN);
-        assert!(pool.try_decode::<Transaction>(|| None).unwrap().is_none());
-        assert_eq!(pool.available_slots(), 1);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = pool.try_decode::<Transaction>(|| panic!("interrupted decode"));
-        }));
-        assert!(panic.is_err());
-        assert_eq!(pool.available_slots(), 1);
-        pool.0.close();
-        assert_eq!(
-            pool.try_decode::<Transaction>(|| panic!("closed decode ran"))
-                .unwrap_err(),
-            PayloadAdmissionFailure::Closed
-        );
-    }
-
-    #[test]
-    fn equal_transactions_settle_only_their_original_pool() {
-        let first = DecodedPayloadPool::new(NonZeroU16::MIN);
-        let second = DecodedPayloadPool::new(NonZeroU16::MIN);
-        let decode = || Some((*block().transactions[0]).clone());
-        let a = first.try_decode(decode).unwrap().unwrap();
-        let b = second.try_decode(decode).unwrap().unwrap();
+    fn equal_transactions_settle_only_their_original_budget() {
+        let first = memory(u64::MAX);
+        let second = memory(u64::MAX);
+        let a = first.try_reserve(0).unwrap().retain(transaction()).unwrap();
+        let b = second
+            .try_reserve(0)
+            .unwrap()
+            .retain(transaction())
+            .unwrap();
         assert_eq!(a.hash(), b.hash());
         let probe = model::PayloadProbe::new(&b);
         drop(a);
-        assert_eq!(first.available_slots(), 1);
-        assert_eq!(second.available_slots(), 0);
+        assert_eq!(first.retained_bytes(), 0);
+        assert!(second.retained_bytes() > 0);
         assert_eq!(probe.holders(), 1);
         drop(b);
-        assert_eq!(second.available_slots(), 1);
+        assert_eq!(second.retained_bytes(), 0);
         assert_eq!(probe.holders(), 0);
     }
 

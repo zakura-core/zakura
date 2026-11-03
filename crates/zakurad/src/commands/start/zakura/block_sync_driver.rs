@@ -650,7 +650,7 @@ fn abandon_block_apply(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
-    block: block::BlockView<'_>,
+    block: &block::BlockRef,
     trace: &ZakuraTrace,
 ) -> BlockApplyResult {
     let Some((height, expected_hash, result, event)) =
@@ -672,7 +672,7 @@ pub(crate) fn abandoned_block_apply_finished_event(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
-    block: block::BlockView<'_>,
+    block: &block::BlockRef,
 ) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
     let height = block.coinbase_height()?;
     let hash = block.hash();
@@ -1348,7 +1348,7 @@ where
 }
 
 pub(crate) fn block_apply_class(
-    block: block::BlockView<'_>,
+    block: &block::BlockRef,
     max_checkpoint_height: block::Height,
 ) -> BlockApplyClass {
     if block

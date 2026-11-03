@@ -1,6 +1,13 @@
 //! Blocks and block-related structures (heights, headers, etc.)
 
-use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    ops::{Deref, Neg},
+    sync::Arc,
+};
+
+use ref_cast::RefCast;
 
 use halo2::pasta::pallas;
 
@@ -66,166 +73,22 @@ pub struct Block {
 }
 
 /// Read-only block access that does not expose shared header or transaction handles.
-/// Runtime owners can lend this view without letting a caller clone their raw Arcs.
-#[derive(Clone, Copy, Debug)]
-pub struct BlockView<'a>(&'a Block);
+/// Runtime owners can lend this reference without letting a caller clone their raw Arcs.
+#[derive(Debug, RefCast)]
+#[repr(transparent)]
+pub struct BlockRef(Block);
 
-impl<'a> From<&'a Block> for BlockView<'a> {
-    fn from(block: &'a Block) -> Self {
-        Self(block)
+/// A block's read-only methods live on [`BlockRef`], so owners that hold a block can
+/// lend them through their own `Deref` impls.
+impl Deref for Block {
+    type Target = BlockRef;
+
+    fn deref(&self) -> &BlockRef {
+        BlockRef::ref_cast(self)
     }
 }
 
-impl<'a> From<&'a Arc<Block>> for BlockView<'a> {
-    fn from(block: &'a Arc<Block>) -> Self {
-        Self(block)
-    }
-}
-
-impl<'a> BlockView<'a> {
-    /// Measure the borrowed decoded payload without exposing shared handles.
-    pub fn attributed_memory_size_bytes(self) -> u64 {
-        self.0.attributed_memory_size_bytes()
-    }
-
-    /// Borrow sprout nullifiers in transaction order.
-    pub fn sprout_nullifiers(self) -> impl Iterator<Item = &'a sprout::Nullifier> {
-        self.0.sprout_nullifiers()
-    }
-
-    /// Borrow sapling nullifiers in transaction order.
-    pub fn sapling_nullifiers(self) -> impl Iterator<Item = &'a sapling::Nullifier> {
-        self.0.sapling_nullifiers()
-    }
-
-    /// Borrow orchard nullifiers in transaction order.
-    pub fn orchard_nullifiers(self) -> impl Iterator<Item = &'a orchard::Nullifier> {
-        self.0.orchard_nullifiers()
-    }
-
-    /// Borrow ironwood nullifiers in transaction order.
-    pub fn ironwood_nullifiers(self) -> impl Iterator<Item = &'a ironwood::Nullifier> {
-        self.0.ironwood_nullifiers()
-    }
-
-    /// Borrow sprout note commitments in transaction order.
-    pub fn sprout_note_commitments(self) -> impl Iterator<Item = &'a sprout::NoteCommitment> {
-        self.0.sprout_note_commitments()
-    }
-
-    /// Borrow sapling note commitments in transaction order.
-    pub fn sapling_note_commitments(
-        self,
-    ) -> impl Iterator<Item = &'a sapling_crypto::note::ExtractedNoteCommitment> {
-        self.0.sapling_note_commitments()
-    }
-
-    /// Borrow orchard note commitments in transaction order.
-    pub fn orchard_note_commitments(self) -> impl Iterator<Item = &'a pallas::Base> {
-        self.0.orchard_note_commitments()
-    }
-
-    /// Borrow ironwood note commitments in transaction order.
-    pub fn ironwood_note_commitments(self) -> impl Iterator<Item = &'a pallas::Base> {
-        self.0.ironwood_note_commitments()
-    }
-
-    /// Return the block hash.
-    pub fn hash(self) -> Hash {
-        self.0.hash()
-    }
-
-    /// Return the block auth data root.
-    pub fn auth_data_root(self) -> AuthDataRoot {
-        self.0.auth_data_root()
-    }
-
-    /// Return the block sapling transactions count.
-    pub fn sapling_transactions_count(self) -> u64 {
-        self.0.sapling_transactions_count()
-    }
-
-    /// Return the block orchard transactions count.
-    pub fn orchard_transactions_count(self) -> u64 {
-        self.0.orchard_transactions_count()
-    }
-
-    /// Return the block ironwood transactions count.
-    pub fn ironwood_transactions_count(self) -> u64 {
-        self.0.ironwood_transactions_count()
-    }
-
-    /// Interpret the header commitment for the network and coinbase height.
-    pub fn commitment(self, network: &Network) -> Result<Commitment, CommitmentError> {
-        self.0.commitment(network)
-    }
-
-    /// Compute the chain value-pool change from borrowed spent outputs.
-    pub fn chain_value_pool_change(
-        self,
-        network: &Network,
-        utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
-        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
-    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.0
-            .chain_value_pool_change(network, utxos, deferred_pool_balance_change)
-    }
-
-    /// Compute the chain value-pool change from borrowed spent outputs.
-    pub fn chain_value_pool_change_from_ordered_utxos(
-        self,
-        network: &Network,
-        utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
-    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.0.chain_value_pool_change_from_ordered_utxos(
-            network,
-            utxos,
-            deferred_pool_balance_change,
-        )
-    }
-
-    /// Borrow the header without lending its shared handle.
-    pub fn header(self) -> &'a Header {
-        &self.0.header
-    }
-
-    /// Borrow transactions in block order without lending their shared handles.
-    pub fn transactions(
-        self,
-    ) -> impl ExactSizeIterator<Item = &'a Transaction> + DoubleEndedIterator {
-        self.0.transactions.iter().map(Arc::as_ref)
-    }
-
-    /// Number of allocated slots in the transaction vector.
-    pub fn transaction_capacity(self) -> usize {
-        self.0.transactions.capacity()
-    }
-
-    /// Borrow transactions for indexed parallel computation without cloning handles.
-    pub fn parallel_transactions(
-        self,
-    ) -> impl rayon::iter::IndexedParallelIterator<Item = &'a Transaction> {
-        use rayon::prelude::*;
-        self.0.transactions.par_iter().map(Arc::as_ref)
-    }
-
-    /// Return the height reported by the coinbase transaction.
-    pub fn coinbase_height(self) -> Option<Height> {
-        self.0.coinbase_height()
-    }
-
-    /// Check transaction upgrade fields against the network and coinbase height.
-    pub fn check_transaction_network_upgrade_consistency(
-        self,
-        network: &Network,
-    ) -> Result<(), error::BlockError> {
-        self.0
-            .check_transaction_network_upgrade_consistency(network)
-    }
-}
-
-impl crate::serialization::ZcashSerialize for BlockView<'_> {
+impl crate::serialization::ZcashSerialize for BlockRef {
     fn zcash_serialize<W: std::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -248,7 +111,32 @@ impl fmt::Display for Block {
     }
 }
 
-impl Block {
+impl BlockRef {
+    /// Borrow the header without lending its shared handle.
+    pub fn header(&self) -> &Header {
+        &self.0.header
+    }
+
+    /// Borrow transactions in block order without lending their shared handles.
+    pub fn transactions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Transaction> + DoubleEndedIterator {
+        self.0.transactions.iter().map(Arc::as_ref)
+    }
+
+    /// Number of allocated slots in the transaction vector.
+    pub fn transaction_capacity(&self) -> usize {
+        self.0.transactions.capacity()
+    }
+
+    /// Borrow transactions for indexed parallel computation without cloning handles.
+    pub fn parallel_transactions(
+        &self,
+    ) -> impl rayon::iter::IndexedParallelIterator<Item = &Transaction> {
+        use rayon::prelude::*;
+        self.0.transactions.par_iter().map(Arc::as_ref)
+    }
+
     /// Returns a deterministic attributed size for this decoded block's
     /// Rust-visible object-graph payload.
     ///
@@ -262,16 +150,17 @@ impl Block {
     /// control blocks, temporary allocations, external library/runtime
     /// overhead, and allocations made by downstream verifiers.
     pub fn attributed_memory_size_bytes(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .map(|transaction| {
                 inline_size_bytes::<Transaction>()
                     .saturating_add(transaction.attributed_memory_size_bytes())
             })
             .fold(
-                inline_size_bytes::<Self>()
+                inline_size_bytes::<Block>()
                     .saturating_add(inline_size_bytes::<Header>())
-                    .saturating_add(vec_capacity_bytes(&self.transactions)),
+                    .saturating_add(vec_capacity_bytes(&self.0.transactions)),
                 u64::saturating_add,
             )
     }
@@ -282,7 +171,8 @@ impl Block {
     ///
     /// Verified blocks have a valid height.
     pub fn coinbase_height(&self) -> Option<Height> {
-        self.transactions
+        self.0
+            .transactions
             .first()
             .and_then(|tx| tx.inputs().first())
             .and_then(|input| match input {
@@ -293,7 +183,7 @@ impl Block {
 
     /// Compute the hash of this block.
     pub fn hash(&self) -> Hash {
-        Hash::from(self)
+        Hash::from(&self.0)
     }
 
     /// Get the parsed block [`Commitment`] for this block.
@@ -308,7 +198,9 @@ impl Block {
             None => Err(CommitmentError::MissingBlockHeight {
                 block_hash: self.hash(),
             }),
-            Some(height) => Commitment::from_bytes(*self.header.commitment_bytes, network, height),
+            Some(height) => {
+                Commitment::from_bytes(*self.0.header.commitment_bytes, network, height)
+            }
         }
     }
 
@@ -332,6 +224,7 @@ impl Block {
             NetworkUpgrade::current(network, self.coinbase_height().expect("a valid height"));
 
         if self
+            .0
             .transactions
             .iter()
             .filter_map(|trans| trans.as_ref().network_upgrade())
@@ -345,35 +238,40 @@ impl Block {
 
     /// Access the [`sprout::Nullifier`]s from all transactions in this block.
     pub fn sprout_nullifiers(&self) -> impl Iterator<Item = &sprout::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sprout_nullifiers())
     }
 
     /// Access the [`sapling::Nullifier`]s from all transactions in this block.
     pub fn sapling_nullifiers(&self) -> impl Iterator<Item = &sapling::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sapling_nullifiers())
     }
 
     /// Access the [`orchard::Nullifier`]s from all transactions in this block.
     pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.orchard_nullifiers())
     }
 
     /// Access the [`ironwood::Nullifier`]s from all transactions in this block.
     pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = &ironwood::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.ironwood_nullifiers())
     }
 
     /// Access the [`sprout::NoteCommitment`]s from all transactions in this block.
     pub fn sprout_note_commitments(&self) -> impl Iterator<Item = &sprout::NoteCommitment> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sprout_note_commitments())
     }
@@ -383,21 +281,24 @@ impl Block {
     pub fn sapling_note_commitments(
         &self,
     ) -> impl Iterator<Item = &sapling_crypto::note::ExtractedNoteCommitment> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sapling_note_commitments())
     }
 
     /// Access the [orchard note commitments](pallas::Base) from all transactions in this block.
     pub fn orchard_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.orchard_note_commitments())
     }
 
     /// Access the Ironwood note commitments from all transactions in this block.
     pub fn ironwood_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.ironwood_note_commitments())
     }
@@ -406,7 +307,8 @@ impl Block {
     /// i.e. transactions "where either of vSpendsSapling or vOutputsSapling is non-empty"
     /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn sapling_transactions_count(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .filter(|tx| tx.has_sapling_shielded_data())
             .count()
@@ -418,7 +320,8 @@ impl Block {
     /// i.e. transactions "where vActionsOrchard is non-empty."
     /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn orchard_transactions_count(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .filter(|tx| tx.has_orchard_shielded_data())
             .count()
@@ -430,7 +333,8 @@ impl Block {
     /// i.e. transactions containing Ironwood shielded data.
     /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn ironwood_transactions_count(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .filter(|tx| tx.has_ironwood_shielded_data())
             .count()
@@ -508,6 +412,7 @@ impl Block {
         // would silently drop transactions whose value balance returns `Err`. Use `try_fold`
         // to propagate the first error instead.
         let tx_pool_sum = self
+            .0
             .transactions
             .iter()
             .try_fold(ValueBalance::<NegativeAllowed>::zero(), |acc, tx| {
@@ -593,7 +498,8 @@ impl Block {
 
         // Compute each transaction's auth digest in parallel, and collect into a
         // Vec with the same ordering.
-        self.transactions
+        self.0
+            .transactions
             .par_iter()
             .map(|tx| auth_digest_or_placeholder(tx))
             .collect::<Vec<_>>()

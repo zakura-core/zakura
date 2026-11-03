@@ -1374,11 +1374,11 @@ async fn block_gossip_slot_tracks_connection_write() {
     connection_task.abort();
 }
 
-/// A `headers` response keeps its state read slots until the wire send finishes.
+/// A `headers` response keeps its state read charge until the wire send finishes.
 #[tokio::test(start_paused = true)]
 async fn tcp_headers_response_holds_read_admission_through_the_send() {
     use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
-    use zakura_node_services::block_memory::{DecodedPayloadPool, HeaderHandle};
+    use zakura_node_services::block_memory::{HeaderHandle, ReadMemoryBudget};
 
     let _init_guard = zakura_test::init();
     let (mut peer_tx, peer_rx) = mpsc::channel(1);
@@ -1388,11 +1388,14 @@ async fn tcp_headers_response_holds_read_admission_through_the_send() {
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    let pool = DecodedPayloadPool::new(std::num::NonZeroU16::MIN);
+    let pool = ReadMemoryBudget::new(std::num::NonZeroU64::MAX);
     let header = pool
-        .try_decode(|| Some(*block.header))
+        .try_reserve(
+            zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*block.header),
+        )
         .unwrap()
-        .expect("the decoder returned a header");
+        .retain(*block.header)
+        .unwrap();
 
     let known_blocks = vec![block.hash()];
     peer_tx
@@ -1411,9 +1414,8 @@ async fn tcp_headers_response_holds_read_admission_through_the_send() {
         .respond(Response::BlockHeaders(vec![HeaderHandle::from(header)]));
 
     tokio::task::yield_now().await;
-    assert_eq!(
-        pool.available_slots(),
-        0,
+    assert!(
+        pool.retained_bytes() > 0,
         "the zero-capacity sink cannot flush until the test reads it"
     );
     let Message::Headers(sent) = outbound.next().await.unwrap() else {
@@ -1422,12 +1424,12 @@ async fn tcp_headers_response_holds_read_admission_through_the_send() {
     assert_eq!(sent[0].header, block.header);
     // The connection task finishes its flush and drops the handles on a later turn.
     for _ in 0..16 {
-        if pool.available_slots() == 1 {
+        if pool.retained_bytes() == 0 {
             break;
         }
         tokio::task::yield_now().await;
     }
-    assert_eq!(pool.available_slots(), 1);
+    assert_eq!(pool.retained_bytes(), 0);
     connection_task.abort();
 }
 
@@ -1654,18 +1656,21 @@ async fn unsolicited_tcp_transactions_respect_the_budget() {
 /// keeps its own slot and is copied. A shared header has no slot and is not copied.
 #[tokio::test]
 async fn tcp_header_copies_charge_only_their_new_allocations() {
-    use zakura_node_services::block_memory::{DecodedPayloadPool, HeaderHandle};
+    use zakura_node_services::block_memory::{HeaderHandle, ReadMemoryBudget};
 
     within_resource_bound(async {
         let mut tcp = budgeted_connection();
 
         let [first, second] = mainnet_blocks();
         let shared_header = second.header.clone();
-        let pool = DecodedPayloadPool::new(std::num::NonZeroU16::MIN);
+        let pool = ReadMemoryBudget::new(std::num::NonZeroU64::MAX);
         let read_header = pool
-            .try_decode(|| Some(*first.header))
+            .try_reserve(
+                zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*first.header),
+            )
             .unwrap()
-            .expect("the decoder returned a header");
+            .retain(*first.header)
+            .unwrap();
         let headers = vec![
             HeaderHandle::from(read_header),
             HeaderHandle::from(shared_header.clone()),
@@ -1697,7 +1702,10 @@ async fn tcp_header_copies_charge_only_their_new_allocations() {
             .respond(Response::BlockHeaders(headers));
 
         budget_reaches(&tcp.budget, copied_bytes).await;
-        assert_eq!(pool.available_slots(), 0, "the handle keeps its read slot");
+        assert!(
+            pool.retained_bytes() > 0,
+            "the handle keeps its read charge"
+        );
 
         let Some(Message::Headers(sent)) = tcp.outbound.next().await else {
             panic!("a headers response becomes a headers message")
@@ -1705,7 +1713,7 @@ async fn tcp_header_copies_charge_only_their_new_allocations() {
         assert_eq!(sent.len(), 2);
         drop(sent);
         budget_reaches(&tcp.budget, 0).await;
-        while pool.available_slots() != 1 {
+        while pool.retained_bytes() != 0 {
             tokio::task::yield_now().await;
         }
         tcp.task.abort();

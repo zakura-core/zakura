@@ -4432,29 +4432,62 @@ fn scaled_lookahead_stays_below_the_drop_height() {
 }
 
 #[test]
-fn backend_verification_total_fits_the_default_limits_and_rejects_excess() {
-    use crate::components::sync::{BackendExecutionError, Config, MAX_BACKEND_BLOCK_VERIFICATIONS};
+fn backend_verification_total_sums_effective_limits_and_rejects_excess() {
+    use crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY;
+    use crate::components::sync::{
+        lookahead_limit_multiplier, BackendExecutionError, Config,
+        DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT, MAX_BACKEND_BLOCK_VERIFICATIONS,
+        MIN_CHECKPOINT_CONCURRENCY_LIMIT, MIN_CONCURRENCY_LIMIT,
+        VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
+    };
 
-    let default = Config::default();
-    let total = default.backend_verification_total().unwrap();
-    assert!(total > default.full_verify_concurrency_limit);
-    assert!(total <= MAX_BACKEND_BLOCK_VERIFICATIONS);
-
-    let excess = Config {
-        full_verify_concurrency_limit: MAX_BACKEND_BLOCK_VERIFICATIONS,
+    // Limits below their minimums count at the minimum the syncer raises them to.
+    let low = Config {
+        checkpoint_verify_concurrency_limit: 0,
+        full_verify_concurrency_limit: 0,
+        zakura_block_apply_concurrency_limit: 0,
         ..Config::default()
     };
-    assert!(matches!(
-        excess.backend_verification_total(),
-        Err(BackendExecutionError::AboveAllowance { .. })
-    ));
+    for network in Network::iter() {
+        let multiplier = network
+            .activation_list()
+            .into_keys()
+            .map(|height| lookahead_limit_multiplier(&network, height))
+            .max()
+            .unwrap();
+        assert_eq!(
+            low.backend_verification_total(&network).unwrap(),
+            MIN_CHECKPOINT_CONCURRENCY_LIMIT
+                * multiplier
+                * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
+                + MIN_CONCURRENCY_LIMIT * multiplier
+                + 2 * MIN_CHECKPOINT_CONCURRENCY_LIMIT
+                + MAX_INBOUND_CONCURRENCY,
+            "{network}"
+        );
 
-    let overflow = Config {
-        checkpoint_verify_concurrency_limit: usize::MAX,
-        ..Config::default()
-    };
-    assert_eq!(
-        overflow.backend_verification_total(),
-        Err(BackendExecutionError::Overflow)
-    );
+        let default = Config::default();
+        let total = default.backend_verification_total(&network).unwrap();
+        assert!(total > default.full_verify_concurrency_limit * multiplier);
+        assert!(total > DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT);
+        assert!(total <= MAX_BACKEND_BLOCK_VERIFICATIONS);
+
+        let excess = Config {
+            full_verify_concurrency_limit: MAX_BACKEND_BLOCK_VERIFICATIONS,
+            ..Config::default()
+        };
+        assert!(matches!(
+            excess.backend_verification_total(&network),
+            Err(BackendExecutionError::AboveAllowance { .. })
+        ));
+
+        let overflow = Config {
+            checkpoint_verify_concurrency_limit: usize::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            overflow.backend_verification_total(&network),
+            Err(BackendExecutionError::Overflow)
+        );
+    }
 }

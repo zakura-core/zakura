@@ -1,11 +1,11 @@
 --- a/crates/zakura-node-services/src/block_memory.rs
 +++ b/crates/zakura-node-services/src/block_memory.rs
-@@ -186,10 +186,10 @@
+@@ -171,10 +171,10 @@ impl DecodedBlockPool {
          if self.0.pipeline_limit.is_some() {
              return Err(AdmissionFailure::DecodeRequiresCountLimit);
          }
 -        let mut charge = self.reserve(0, Admission::WithinLimit)?;
-         let Some(mut block) = decode()? else {
+         let Some(mut block) = decode() else {
              return Ok(None);
          };
 +        let mut charge = self.reserve(0, Admission::WithinLimit)?;

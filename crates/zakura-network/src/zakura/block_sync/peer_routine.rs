@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use zakura_node_services::block_memory::{
-    Admission, AdmissionFailure, DecodedBlockPool, OwnedBlock,
+    Admission, AdmissionFailure, DecodedBlockPool, MeasuredBlock, OwnedBlock,
 };
 
 use zakura_rt::{
@@ -3896,10 +3896,7 @@ mod tests {
                 matches!(block, BlockHandle::Owned(_)),
                 "the real frame decoder must retain an admitted owner"
             );
-            assert_eq!(
-                block.view().attributed_memory_size_bytes(),
-                pool.reserved_bytes()
-            );
+            assert_eq!(block.attributed_memory_size_bytes(), pool.reserved_bytes());
             let retained = block.transaction(0).unwrap();
             let hash = retained.hash();
             drop(block);
@@ -3983,7 +3980,7 @@ mod tests {
                 .body
                 .decoded_block(&pool, Admission::PipelineExempt)
                 .unwrap();
-            assert_eq!(block.view().attributed_memory_size_bytes(), bytes);
+            assert_eq!(block.attributed_memory_size_bytes(), bytes);
             assert_eq!(pool.pipeline_bytes(), bytes);
         }
     }

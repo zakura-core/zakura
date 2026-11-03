@@ -108,6 +108,7 @@ impl ContextuallyVerifiedBlock {
         } = block.into();
 
         Self {
+            header: Arc::new(*block.header()),
             block,
             hash,
             height,

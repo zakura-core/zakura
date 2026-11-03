@@ -415,7 +415,9 @@ fn timed_out_receipt_pairs_with_either_drop() {
         deadline_ms: None,
     }]);
     let (mut caller_dropped, mut reply_dropped) = (0, 0);
-    for input in inputs(64, 256) {
+    // The transport's scheduling choices come before the choices at the shared
+    // instant, so a plan needs room for both.
+    for input in inputs(64, 1_024) {
         let (report, _) = storage_run(&scenario, input);
         for (storage_seq, event) in events(&report) {
             let ReactorFact::CallEnded { end, op, .. } = event else {

@@ -243,6 +243,16 @@ impl Stream {
     /// Response rows add nothing themselves: their request row counts them.
     /// The bound excludes frame headers, as [`PayloadLen`] does.
     ///
+    /// A cadence term counts what a conformant sender queues across a
+    /// connection-wide outage of up to [`Cadence::MAX_OUTAGE`]. A longer read
+    /// pause on one stream lets the sender keep queuing that row's messages
+    /// past the term. QUIC's stream and connection receive windows bound those
+    /// bytes, and the peer memory budget charges those windows (CTRL-26), so
+    /// the node's memory bound holds. The excess spends connection credit
+    /// that sibling rows would otherwise use.
+    ///
+    /// [`Cadence::MAX_OUTAGE`]: super::Cadence::MAX_OUTAGE
+    ///
     /// The result is an error, never a default, when the table does not bound
     /// a count: a request this node sends whose responses need not end the
     /// exchange, or a subscription this node publishes without an update

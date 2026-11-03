@@ -495,6 +495,7 @@ impl WorkQueueState {
     /// The taken items keep their owner and publication state. "Contiguous-ascending"
     /// stops at the first gap, so the returned chunk maps to a single
     /// `BlockRangeRequest`. `high` is **NOT** clamped to the floor.
+    #[cfg(test)]
     pub(in crate::zakura::block_sync) fn take_in_range(
         &mut self,
         low: block::Height,
@@ -733,8 +734,26 @@ impl WorkQueueState {
         Some(released)
     }
 
+    /// End the reservation of the published request that holds `height`,
+    /// recording that another attempt's body answered it. Returns that owner
+    /// and the bytes that left the ledger, or `None` when no published request
+    /// reserves `height`. Pending work has no owner, so it returns `None`.
+    pub(in crate::zakura::block_sync) fn end_competing_reservation_at_receipt(
+        &mut self,
+        height: block::Height,
+    ) -> Option<(BodyWorkOwner, u64)> {
+        let owner = self
+            .in_flight
+            .get(&height)
+            .filter(|item| !item.provisional)?
+            .owner?;
+        self.end_reservation_at_receipt(owner, height, true)
+            .map(|charge| (owner, charge))
+    }
+
     /// End any reservation `owner` holds on a received height. Returns the bytes
     /// that left the ledger, or `None` when `owner` does not hold the in-flight height.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn claim_received(
         &mut self,
         owner: BodyWorkOwner,
@@ -1199,6 +1218,7 @@ impl WorkQueueState {
         self.in_flight.contains_key(&height)
     }
 
+    #[cfg(test)]
     pub(in crate::zakura::block_sync) fn reserved_in_flight_charge(
         &self,
         height: block::Height,

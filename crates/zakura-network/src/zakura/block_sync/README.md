@@ -126,7 +126,6 @@ for the commit-window exemption, the resident-memory gate, and request sizing â€
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
 sizing.
 
-
 ### The commit window
 
 Heights in `(verified_tip, verified_tip + 401]` are the **commit window**

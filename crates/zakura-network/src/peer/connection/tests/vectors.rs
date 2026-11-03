@@ -1485,7 +1485,7 @@ async fn request_slot_tracks_responses_and_notfound() {
         .expect("connection is open");
     inbound
         .expect_request_that(
-            |request| matches!(request, Request::AdvertiseBlock(hash, _) if *hash == block.hash()),
+            |request| matches!(request, Request::AdvertiseBlock(advert, _) if advert.hash == block.hash()),
         )
         .await
         .respond(Response::Nil);

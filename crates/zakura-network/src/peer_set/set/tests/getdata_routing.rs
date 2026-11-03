@@ -158,7 +158,7 @@ async fn block_getdata_waits_behind_tx_response_on_only_advertiser() {
     source
         .inbound_service
         .expect_request_that(
-            |request| matches!(request, Request::AdvertiseBlock(hash, _) if *hash == BLOCK_HASH),
+            |request| matches!(request, Request::AdvertiseBlock(advert, _) if advert.hash == BLOCK_HASH),
         )
         .await
         .respond(Response::Nil);

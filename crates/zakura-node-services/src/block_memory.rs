@@ -228,9 +228,7 @@ impl DecodedBlockPool {
         if self
             .0
             .counted_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-            })
+            .checked_update(|used| used.checked_add(bytes))
             .is_err()
         {
             self.close();
@@ -871,7 +869,7 @@ impl ByteGauge {
     /// past its limit only while another holder exists, so a lone reader finishes.
     fn try_add(&self, held: u64, bytes: u64) -> Result<(), ReadMemoryExhausted> {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .checked_update(|used| {
                 let next = used.checked_add(bytes)?;
                 (next <= self.limit || used == held).then_some(next)
             })
@@ -882,9 +880,7 @@ impl ByteGauge {
     fn release(&self, bytes: u64) {
         let _ = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+            .checked_update(|used| Some(used.saturating_sub(bytes)));
     }
 }
 

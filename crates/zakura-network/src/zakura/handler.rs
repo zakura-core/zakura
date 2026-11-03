@@ -52,8 +52,8 @@ use zakura_rt::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::peer_memory::{
-    budget_admitted_connections, budgeted_max_connections, PeerMemoryBudgetError,
-    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    budget_admitted_connections, budgeted_max_connections, native_connection_memory_bytes,
+    PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
@@ -95,9 +95,10 @@ use crate::{
     },
 };
 
-/// Default total Zakura connections when P2P v2 is enabled: as many as the
-/// default peer memory budget admits (see `peer_memory`).
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
+/// Default total Zakura connections when P2P v2 is enabled: 92, the count
+/// the previous 8 GiB budget admitted at the default windows. The default peer
+/// memory budget funds this many (see `peer_memory`).
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 92;
 /// Default per-IP Zakura connection cap.
 pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 /// Default simultaneous Zakura control handshakes.
@@ -325,12 +326,14 @@ pub struct ZakuraConfig {
     /// connections together may make this node hold.
     ///
     /// Each live QUIC connection can hold its `[network.zakura.quic]` receive
-    /// and send windows, 64 MiB at the defaults, whether or not the node
-    /// reads. Each bound socket can also queue 256 MiB of datagrams, however
-    /// many connections it serves (zakura-quic CTRL-26 lists what this leaves
-    /// out). The node reserves one socket queue per bound socket and funds the
-    /// rest divided by the per-connection cost, 124 live connections on the
-    /// one socket `listen_addr` binds. `max_pending_handshakes` of those are
+    /// and send windows, plus a `stream_receive_window_bytes` share for each
+    /// of the five native stream kinds it may negotiate, 144 MiB at the
+    /// defaults, whether or not the node reads. Each bound socket can also
+    /// queue 256 MiB of datagrams, however many connections it serves
+    /// (zakura-quic CTRL-26 lists what this leaves out). The node reserves one
+    /// socket queue per bound socket and funds the rest divided by the
+    /// per-connection cost, 124 live connections on the one socket
+    /// `listen_addr` binds. `max_pending_handshakes` of those are
     /// headroom for handshakes, so the node admits 92, and a larger
     /// `max_connections` is lowered at startup. A closed connection releases
     /// its stream buffers and costs nothing more until it drains.
@@ -444,7 +447,7 @@ impl ZakuraConfig {
             self.max_connections,
             self.peer_memory_budget_bytes,
             self.bound_socket_count(),
-            self.quic.connection_memory_bytes(),
+            self.connection_memory_bytes(),
             match local_node_id {
                 Some(local_node_id) => {
                     remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
@@ -453,6 +456,17 @@ impl ZakuraConfig {
                 None => remote_bootstrap_peer_count(&self.bootstrap_peers, None).saturating_sub(1),
             },
             self.max_pending_handshakes.max(1),
+        )
+    }
+
+    /// What one live native connection can make this node hold at this
+    /// config's windows: the handshake window, a stream window of receive
+    /// share for each native stream kind it may negotiate, and the send window.
+    pub fn connection_memory_bytes(&self) -> u64 {
+        native_connection_memory_bytes(
+            self.quic.receive_window_bytes,
+            self.quic.stream_receive_window_bytes,
+            self.quic.send_window_bytes,
         )
     }
 
@@ -543,7 +557,7 @@ impl ZakuraLocalLimits {
                 .min(budget_admitted_connections(
                     config.zakura.peer_memory_budget_bytes,
                     config.zakura.bound_socket_count(),
-                    config.zakura.quic.connection_memory_bytes(),
+                    config.zakura.connection_memory_bytes(),
                     config.zakura.max_pending_handshakes.max(1),
                 )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
@@ -4437,7 +4451,7 @@ async fn spawn_zakura_endpoint_inner(
             max_connections = config.zakura.max_connections,
             budgeted_max_connections,
             peer_memory_budget_bytes = config.zakura.peer_memory_budget_bytes,
-            connection_memory_bytes = config.zakura.quic.connection_memory_bytes(),
+            connection_memory_bytes = config.zakura.connection_memory_bytes(),
             "lowering [network.zakura] max_connections to what peer_memory_budget_bytes \
              admits at the configured QUIC windows; raise the budget or lower \
              max_connections to silence this"

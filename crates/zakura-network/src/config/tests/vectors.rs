@@ -874,11 +874,11 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 19595788288
+        peer_memory_budget_bytes = 43754979328
         "#,
     )
     .unwrap();
-    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
+    // One 256 MiB socket queue and 288 live connections of 144 MiB: 256
     // admitted and 32 of headroom.
     assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
 

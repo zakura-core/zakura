@@ -243,8 +243,9 @@ impl NodeResources {
     ///
     /// # Panics
     ///
-    /// If a kind's output share can't hold its largest frame. A queued frame
-    /// above its gate would take the whole gate, so the share must fit one.
+    /// If a kind's receive or output share can't hold its largest frame. A
+    /// frame above its gate takes the whole gate, so it would be charged less
+    /// than it holds.
     pub(crate) fn new(
         shares: ReactorShares,
         streams: impl IntoIterator<Item = Stream>,
@@ -262,7 +263,12 @@ impl NodeResources {
             }
         }
         for (kind, _, largest) in &kinds {
-            let output = shares.share(*kind).output;
+            let ReactorBudget { receive, output } = shares.share(*kind);
+            assert!(
+                receive >= *largest,
+                "stream kind {kind}'s receive share of {receive} bytes must hold its \
+                 largest frame of {largest} bytes"
+            );
             assert!(
                 output >= *largest,
                 "stream kind {kind}'s output share of {output} bytes must hold its \

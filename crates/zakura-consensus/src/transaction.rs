@@ -513,6 +513,7 @@ where
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
+            check::version_has_a_verifier(&tx)?;
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
             check::has_enough_ironwood_flags(&tx)?;
@@ -681,8 +682,7 @@ where
 
             let async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
-                    tracing::debug!(?tx, "got transaction with wrong version");
-                    return Err(TransactionError::WrongVersion);
+                    unreachable!("the version quick check rejects v1 to v3 transactions before any lookup")
                 }
                 Transaction::V4 {
                     joinsplit_data,

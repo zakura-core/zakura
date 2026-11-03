@@ -2,6 +2,58 @@
 
 use super::*;
 
+#[tokio::test]
+async fn pre_v4_mempool_transaction_is_rejected_without_state_requests() {
+    let _init_guard = zakura_test::init();
+    let mut joinsplit_data = test_transactions(&Network::Mainnet)
+        .find_map(|(_, tx)| match tx.as_ref() {
+            Transaction::V2 { joinsplit_data, .. } => joinsplit_data.clone(),
+            _ => None,
+        })
+        .expect("mainnet vectors include a v2 transaction with a JoinSplit");
+    joinsplit_data.rest.clear();
+    joinsplit_data.first.vpub_old = 0.try_into().unwrap();
+    joinsplit_data.first.vpub_new = 10_000.try_into().unwrap();
+    joinsplit_data.first.anchor = [0x42; 32].into();
+    let transaction = Transaction::V2 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        joinsplit_data: Some(joinsplit_data),
+    };
+    // The JoinSplit supplies inputs, outputs, and a sufficient declared fee;
+    // only its unsupported version should decide rejection before state access.
+    check::has_inputs_and_outputs(&transaction).unwrap();
+    let transaction: zakura_chain::transaction::UnminedTx = transaction.into();
+    let fee = 10_000.try_into().unwrap();
+    zip317::mempool_checks(
+        zip317::unpaid_actions(&transaction, fee),
+        fee,
+        transaction.size(),
+    )
+    .unwrap();
+
+    let mut state: MockService<zakura_state::Request, zakura_state::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
+    let verification = verifier.oneshot(Request::Mempool {
+        transaction,
+        height: NetworkUpgrade::Canopy
+            .activation_height(&Network::Mainnet)
+            .expect("Canopy has a mainnet activation height"),
+    });
+    tokio::pin!(verification);
+    let result = futures::poll!(&mut verification);
+    state.expect_no_requests().await;
+    assert!(
+        matches!(
+            result,
+            std::task::Poll::Ready(Err(TransactionError::WrongVersion))
+        ),
+        "unsupported versions must fail immediately with the structural version error"
+    );
+}
+
 /// Blocks must use their own chain context, without the best-tip mempool gate.
 pub(super) async fn check_block_skips_chain_gate(tx: &Transaction, height: Height) {
     // These shielded-only fixtures need no UTXO lookups. Reject every state

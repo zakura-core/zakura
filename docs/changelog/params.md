@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `state.read_result_byte_limit` ceiling | `crates/zakurad/src/config.rs` | `network.zakura.peer_memory_budget_bytes` → `DEFAULT_READ_RESULT_CEILING_BYTES` (8 GiB) | [#1882](https://github.com/zakura-core/zakura/pull/1882) | #1620 raised the peer budget to fund QUIC windows. The read limit keeps its chosen 8 GiB ceiling. |
 | `TCP_INBOUND_RETAINED_BYTES` | `crates/zakura-network/src/inbound_resources.rs` | unbounded → 128 MiB | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound decoded unsolicited TCP transactions across connections. Solicited responses are charged but never refuse; unmeasured choice |
 | `LEGACY_INBOUND_RETAINED_BYTES` | `crates/zakura-network/src/zakura/legacy_gossip.rs` | unbounded → 128 MiB | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound decoded inbound gossip and requests; unmeasured choice |
 | `LEGACY_CLIENT_INVENTORY_SLOTS` | `crates/zakura-network/src/zakura/legacy_gossip.rs` | unbounded → `256` | [#1882](https://github.com/zakura-core/zakura/pull/1882) | Bound client inventory work across retries and fallback; unmeasured choice |

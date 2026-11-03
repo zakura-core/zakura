@@ -1347,9 +1347,10 @@ async fn caches_getaddr_response() {
 }
 
 /// The state's read result limit serves the default inbound peers, each holding one
-/// legacy `getdata` block request, clamped to the peer memory budget.
+/// legacy `getdata` block request, clamped to its own 8 GiB ceiling.
 #[test]
 fn read_result_limit_derives_from_getdata_and_inbound_limits() {
+    const CEILING: u64 = 8 * 1024 * 1024 * 1024;
     assert_eq!(
         zakura_state::READ_RESULT_BLOCKS_PER_PEER,
         u64::try_from(super::super::GETDATA_MAX_BLOCK_COUNT).unwrap()
@@ -1359,22 +1360,19 @@ fn read_result_limit_derives_from_getdata_and_inbound_limits() {
         zakura_state::DEFAULT_READ_RESULT_PEERS,
         network.peerset_inbound_connection_limit()
     );
-    assert_eq!(
-        zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES,
-        network.zakura.peer_memory_budget_bytes
-    );
+    assert_eq!(zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES, CEILING);
 
-    // The default peer budget clamps the 115.2 GB derivation to 8 GiB.
+    // The ceiling clamps the 115.2 GB derivation to 8 GiB.
     let default = crate::config::ZakuradConfig::default();
     assert_eq!(
         default
             .mirrored_state_config()
             .read_result_byte_limit
             .map(std::num::NonZeroU64::get),
-        Some(network.zakura.peer_memory_budget_bytes)
+        Some(CEILING)
     );
 
-    // A small peer set keeps its derived limit below the budget.
+    // A small peer set keeps its derived limit below the ceiling.
     let config = crate::config::ZakuradConfig {
         network: zakura_network::Config {
             peerset_initial_target_size: 5,
@@ -1386,22 +1384,25 @@ fn read_result_limit_derives_from_getdata_and_inbound_limits() {
         config.network.peerset_inbound_connection_limit(),
         u64::MAX,
     );
-    assert!(derived.get() < network.zakura.peer_memory_budget_bytes);
+    assert!(derived.get() < CEILING);
     assert_eq!(
         config.mirrored_state_config().read_result_byte_limit,
         Some(derived)
     );
 
-    // A lower peer budget lowers the clamp.
-    let mut tight = crate::config::ZakuradConfig::default();
-    tight.network.zakura.peer_memory_budget_bytes = derived.get() / 2;
-    assert_eq!(
-        tight
-            .mirrored_state_config()
-            .read_result_byte_limit
-            .map(std::num::NonZeroU64::get),
-        Some(derived.get() / 2)
-    );
+    // The peer memory budget funds QUIC windows, not reads: raising or lowering it
+    // leaves the read limit where it was.
+    for budget in [1 << 30, 64 << 30] {
+        let mut changed = crate::config::ZakuradConfig::default();
+        changed.network.zakura.peer_memory_budget_bytes = budget;
+        assert_eq!(
+            changed
+                .mirrored_state_config()
+                .read_result_byte_limit
+                .map(std::num::NonZeroU64::get),
+            Some(CEILING)
+        );
+    }
 }
 
 /// A block read that the state refuses for lack of capacity becomes `notfound`, so the

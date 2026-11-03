@@ -4016,6 +4016,7 @@ dependencies = [
  "once_cell",
  "proptest",
  "proptest-derive",
+ "ragu",
  "rand 0.10.2",
  "rayon",
  "semver",

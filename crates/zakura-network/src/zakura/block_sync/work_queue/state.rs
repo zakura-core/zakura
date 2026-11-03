@@ -10,7 +10,9 @@
 //! Every height is in exactly one of `{below-floor (gone), pending, in_flight}`.
 //! A charge enters the ledger only at claim publication and leaves it exactly once,
 //! through the `released_bytes` of the transition that ended it. IO settles those
-//! bytes from the queue's pooled funding. Ledger arithmetic is checked: a failure keeps
+//! bytes from the queue's pooled funding. The ledger also keeps each session's in-flight
+//! charge, which admission compares with the [`OwnerReservationCap`]. Ledger arithmetic is
+//! checked: a failure keeps
 //! the last valid values and latches a [`LedgerFault`], which closes the budget.
 
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
@@ -18,7 +20,9 @@ use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, BodyWorkOwner};
 
-use super::super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
+use super::super::{
+    admission::RequestPriority, request::BlockSizeEstimate, state::BlockBudgetLedger,
+};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
@@ -169,6 +173,44 @@ impl ReservedTally {
     }
 }
 
+/// The work queue's cap on the reservations one session may publish.
+///
+/// Each field is the total a session's published reservations may reach once
+/// the admitted request publishes. A routine admits and publishes each request
+/// before it takes the next, so a session has at most that one admitted,
+/// unpublished request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct OwnerReservationCap {
+    /// The total an above-floor request may bring the session to.
+    pub(in crate::zakura::block_sync) above_floor: u64,
+    /// The total a floor request may bring the session to: the above-floor
+    /// total plus the floor bypass.
+    pub(in crate::zakura::block_sync) floor: u64,
+}
+
+impl OwnerReservationCap {
+    /// A cap that admits every request.
+    pub(in crate::zakura::block_sync) const UNLIMITED: Self = Self {
+        above_floor: u64::MAX,
+        floor: u64::MAX,
+    };
+
+    /// Whether a session that holds `held` bytes may admit a request of
+    /// `bytes` at `priority`.
+    pub(in crate::zakura::block_sync) fn admits(
+        self,
+        held: u64,
+        bytes: u64,
+        priority: RequestPriority,
+    ) -> bool {
+        let limit = match priority {
+            RequestPriority::Floor => self.floor,
+            RequestPriority::AboveFloor => self.above_floor,
+        };
+        held.checked_add(bytes).is_some_and(|total| total <= limit)
+    }
+}
+
 /// The first failed arithmetic in the logical ledger. The ledger keeps its last
 /// valid values, and IO closes the budget under the same lock.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -208,6 +250,10 @@ pub(in crate::zakura::block_sync) struct WorkQueueState {
     /// Nonzero reservations held by `in_flight` items, maintained at each
     /// `in_flight` ledger transition so admission never scans the map.
     in_flight_reserved: ReservedTally,
+    /// Nonzero reservations held by `in_flight` items, by their owner's
+    /// session, maintained with `in_flight_reserved`. A session without
+    /// reservations has no entry.
+    session_reserved: BTreeMap<u64, u64>,
     /// The first ledger arithmetic failure, if any. It never clears.
     ledger_fault: Option<LedgerFault>,
 }
@@ -249,6 +295,7 @@ impl WorkQueueState {
             floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
             reserved_bytes: 0,
             in_flight_reserved: ReservedTally::default(),
+            session_reserved: BTreeMap::new(),
             ledger_fault: None,
         }
     }
@@ -290,14 +337,24 @@ impl WorkQueueState {
         }
     }
 
-    fn charge_in_flight(&mut self, charge: u64) {
+    fn charge_in_flight(&mut self, owner: Option<BodyWorkOwner>, charge: u64) {
         match self.in_flight_reserved.checked_add(charge) {
             Some(tally) => self.in_flight_reserved = tally,
             None => self.note_fault("in-flight charge", self.in_flight_reserved.bytes, charge),
         }
+        let Some(owner) = owner.filter(|_| charge > 0) else {
+            return;
+        };
+        let held = self.session_reserved(owner.session_id);
+        match held.checked_add(charge) {
+            Some(total) => {
+                self.session_reserved.insert(owner.session_id, total);
+            }
+            None => self.note_fault("session charge", held, charge),
+        }
     }
 
-    fn settle_in_flight(&mut self, charge: u64) {
+    fn settle_in_flight(&mut self, owner: Option<BodyWorkOwner>, charge: u64) {
         match self.in_flight_reserved.checked_sub(charge) {
             Some(tally) => self.in_flight_reserved = tally,
             None => self.note_fault(
@@ -305,6 +362,19 @@ impl WorkQueueState {
                 self.in_flight_reserved.bytes,
                 charge,
             ),
+        }
+        let Some(owner) = owner.filter(|_| charge > 0) else {
+            return;
+        };
+        let held = self.session_reserved(owner.session_id);
+        match held.checked_sub(charge) {
+            Some(0) => {
+                self.session_reserved.remove(&owner.session_id);
+            }
+            Some(total) => {
+                self.session_reserved.insert(owner.session_id, total);
+            }
+            None => self.note_fault("session settlement", held, charge),
         }
     }
 
@@ -467,7 +537,7 @@ impl WorkQueueState {
         }
         for (height, item) in &taken {
             self.pending.remove(height);
-            self.charge_in_flight(item.budget.reserved_charge());
+            self.charge_in_flight(item.owner, item.budget.reserved_charge());
             self.in_flight.insert(*height, *item);
         }
         taken
@@ -551,7 +621,7 @@ impl WorkQueueState {
         }
         for (height, item) in &taken {
             self.pending.remove(height);
-            self.charge_in_flight(item.budget.reserved_charge());
+            self.charge_in_flight(item.owner, item.budget.reserved_charge());
             self.in_flight.insert(*height, *item);
         }
         taken
@@ -574,7 +644,7 @@ impl WorkQueueState {
                 continue;
             }
             if let Some(mut item) = self.in_flight.remove(height) {
-                self.settle_in_flight(item.budget.reserved_charge());
+                self.settle_in_flight(item.owner, item.budget.reserved_charge());
                 item.owner = None;
                 if let Some(estimate) = item.retry_estimated_bytes.take() {
                     item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -618,7 +688,8 @@ impl WorkQueueState {
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
             let charge = item.estimated_bytes;
-            self.charge_in_flight(charge);
+            let owner = item.owner;
+            self.charge_in_flight(owner, charge);
             transferred = self.add_to_total(transferred, charge);
         }
         self.charge_ledger(transferred);
@@ -658,7 +729,7 @@ impl WorkQueueState {
         item.answered_elsewhere = answered_elsewhere;
         let released = item.budget.release_reserved();
         self.settle_ledger(released);
-        self.settle_in_flight(released);
+        self.settle_in_flight(Some(owner), released);
         Some(released)
     }
 
@@ -674,7 +745,7 @@ impl WorkQueueState {
             return None;
         }
         let released = item.budget.release_reserved();
-        self.settle_in_flight(released);
+        self.settle_in_flight(Some(owner), released);
         self.settle_ledger(released);
         Some(released)
     }
@@ -737,7 +808,7 @@ impl WorkQueueState {
             }
             let charge = item.budget.release_reserved();
             released = self.add_to_total(released, charge);
-            self.settle_in_flight(charge);
+            self.settle_in_flight(Some(owner), charge);
         }
         self.settle_ledger(released);
         released
@@ -784,7 +855,7 @@ impl WorkQueueState {
                     .remove(&height)
                     .expect("owned item exists because it was just checked");
                 let charge = item.budget.release_reserved();
-                self.settle_in_flight(charge);
+                self.settle_in_flight(Some(owner), charge);
                 outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
                 outcome.committed_count = outcome.committed_count.saturating_add(1);
                 continue;
@@ -801,7 +872,7 @@ impl WorkQueueState {
                 .remove(&height)
                 .expect("reserved item exists because it was just checked");
             let charge = item.budget.release_reserved();
-            self.settle_in_flight(charge);
+            self.settle_in_flight(Some(owner), charge);
             outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
             item.owner = None;
             if let Some(estimate) = item.retry_estimated_bytes.take() {
@@ -858,7 +929,7 @@ impl WorkQueueState {
                 .expect("first_key_value returned Some");
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
-            self.settle_in_flight(charge);
+            self.settle_in_flight(item.owner, charge);
             released = self.add_to_total(released, charge);
         }
         self.settle_ledger(released);
@@ -902,7 +973,7 @@ impl WorkQueueState {
                 .expect("last_key_value returned Some");
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
-            self.settle_in_flight(charge);
+            self.settle_in_flight(item.owner, charge);
             released = self.add_to_total(released, charge);
         }
         self.settle_ledger(released);
@@ -977,6 +1048,12 @@ impl WorkQueueState {
             "the in-flight reservation tally matches a scan",
         );
         (above.bytes, above.items)
+    }
+
+    /// Reserved bytes that `session_id`'s in-flight items hold. O(log
+    /// sessions): the tally is maintained at each ledger transition.
+    pub(in crate::zakura::block_sync) fn session_reserved(&self, session_id: u64) -> u64 {
+        self.session_reserved.get(&session_id).copied().unwrap_or(0)
     }
 
     /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.

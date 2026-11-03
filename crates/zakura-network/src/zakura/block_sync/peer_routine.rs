@@ -3531,6 +3531,177 @@ mod tests {
         assert!(ends.bodies.try_recv().is_err());
     }
 
+    /// A received body's request charge stays on the byte budget until its
+    /// sequencer handoff ends. The budget releases the charge only after the
+    /// body enters the sequencer's input queue, and the handoff reports its end
+    /// after that release. A decoding or queued body therefore never sits
+    /// outside the bytes its request authorized.
+    #[tokio::test]
+    async fn a_body_keeps_its_reservation_until_the_sequencer_handoff_ends() {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        use super::super::block_sync_observe::{
+            BlockEvent, BlockSyncObserver, Holder, HolderChange, ObserverSlot,
+        };
+        use crate::zakura::transport::BudgetChangeKind;
+        use crate::zakura::ServicePeerDirection;
+
+        #[derive(Debug, Default)]
+        struct Log(Mutex<Vec<BlockEvent>>);
+        impl BlockSyncObserver for Log {
+            fn observe(&self, event: BlockEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let body_bytes = u32::try_from(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.len()).unwrap();
+        let log = Arc::new(Log::default());
+        let observer = ObserverSlot(Some(log.clone()));
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000).with_observer(observer.budget_observer());
+        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        work.set_estimate_floor_for_tests(1);
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                body.hash(),
+                BlockSizeEstimate::Advertised(body_bytes),
+            )],
+        );
+        let peer = ZakuraPeerId::new(vec![29; 32]).unwrap();
+        let registry = Arc::new(PeerRegistry::new());
+        let now = Instant::now();
+        let generation = registry
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
+            .generation();
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
+        let (in_send, in_recv) = framed_channel(4);
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let (reactor_input, _reactor_recv) = mpsc::channel(4);
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv,
+            requester,
+            serving,
+            config.clone(),
+            true,
+            generation,
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(now))),
+            sequencer_input,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_input,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+            super::super::test_decoded_pool(),
+        )
+        .with_observer(observer);
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            max_blocks_per_response: 1,
+            ..BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        assert_eq!(routine.window.outstanding.len(), 1);
+        timeout(Duration::from_secs(1), out_recv.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+            .await
+            .unwrap();
+        for message in [
+            BlockSyncMessage::Block(body.clone()),
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            },
+        ] {
+            in_send.send(message.encode_frame().unwrap()).await.unwrap();
+        }
+        let mut running = Box::pin(routine.run());
+        let sequenced = tokio::select! {
+            sequenced = sequencer_recv.recv() => sequenced,
+            _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
+        };
+        assert!(sequenced.is_some());
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), running).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+
+        let events = std::mem::take(&mut *log.0.lock().unwrap());
+        let position = |what: &str, found: &dyn Fn(&BlockEvent) -> bool| {
+            events
+                .iter()
+                .position(found)
+                .unwrap_or_else(|| panic!("no {what} event in {events:#?}"))
+        };
+        let started = position(
+            "handoff start",
+            &|event| matches!(event, BlockEvent::HandoffStarted { height, .. } if *height == block::Height(1)),
+        );
+        let BlockEvent::HandoffStarted { charge, .. } = events[started] else {
+            unreachable!("the position matched a handoff start");
+        };
+        assert!(charge > 0, "the request reserved its body's estimate");
+        let queued = position("queued", &|event| {
+            matches!(
+                event,
+                BlockEvent::Holder {
+                    body,
+                    holder: Holder::Queued { .. },
+                    change: HolderChange::Retained,
+                } if body.height == block::Height(1)
+            )
+        });
+        let released = position("charge release", &|event| {
+            matches!(
+                event,
+                BlockEvent::Budget(change)
+                    if change.kind == BudgetChangeKind::Released
+                        && change.before - change.after == charge
+            )
+        });
+        let ended = position("handoff end", &|event| {
+            matches!(
+                event,
+                BlockEvent::HandoffEnded { height, charge: ended, .. }
+                    if *height == block::Height(1) && *ended == charge
+            )
+        });
+        assert!(
+            started < queued && queued < released && released < ended,
+            "start {started}, queued {queued}, release {released}, end {ended}: {events:#?}"
+        );
+        // Nothing released the charge earlier, through another path.
+        assert!(events[..released].iter().all(|event| match event {
+            BlockEvent::Budget(change) => change.after >= charge,
+            _ => true,
+        }));
+    }
+
     #[tokio::test]
     async fn oversized_body_against_an_advertised_hint_is_still_sequenced() {
         use zakura_chain::serialization::ZcashDeserializeInto;

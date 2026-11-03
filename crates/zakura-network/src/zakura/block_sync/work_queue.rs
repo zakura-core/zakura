@@ -49,7 +49,7 @@ use request_write::RequestWriteRegistration;
 pub(super) use request_write::{
     AdmitRefusal, RequestWrite, RequestWriteStatus, TakenRequest, UnpublishedRequest,
 };
-pub(super) use state::{WorkItem, WorkReturnOutcome};
+pub(super) use state::{OwnerReservationCap, WorkItem, WorkReturnOutcome};
 #[cfg(any(test, zakura_sim))]
 pub use state::{WorkItemOwnership, WorkItemPlace};
 use state::{WorkQueueState, WorkWake};
@@ -125,6 +125,8 @@ impl Drop for WorkQueueGuard<'_> {
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     budget: ByteBudget,
+    /// Caps the reservations one session may publish. Admission checks it.
+    owner_cap: OwnerReservationCap,
     available: Notify,
     /// Counts events that take an unreceived height from its owner without that
     /// owner's routine retiring the request. Routines rescan their requests for
@@ -145,11 +147,18 @@ impl WorkQueue {
                 request_writes: HashMap::new(),
             }),
             budget,
+            owner_cap: OwnerReservationCap::UNLIMITED,
             available: Notify::new(),
             revocations: AtomicU64::new(0),
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         }
+    }
+
+    /// This queue, capping each session's published reservations at `cap`.
+    pub(super) fn with_owner_cap(mut self, cap: OwnerReservationCap) -> Self {
+        self.owner_cap = cap;
+        self
     }
 
     /// This queue, reporting to `observer`.

@@ -357,7 +357,9 @@ impl ZakuraProtocolHandler {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("ordered stream permit"))?;
-        let stream_resources = resources.stream();
+        let stream_resources = resources.stream(stream.kind, resources.owner()).ok_or(
+            ZakuraHandlerError::ResourceLimit("ordered stream kind gates"),
+        )?;
         let io = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
             .await
             .map_err(|_| ZakuraHandlerError::Timeout("open ordered service stream"))??;

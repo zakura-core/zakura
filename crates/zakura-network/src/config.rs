@@ -445,7 +445,7 @@ impl Config {
     pub fn tcp_ingress_bound_bytes(&self) -> u64 {
         // Widening usize to u64 is lossless on supported targets.
         (self.peerset_total_connection_limit() as u64)
-            .saturating_mul(crate::protocol::external::MAX_INCOMPLETE_MESSAGE_BYTES as u64)
+            .saturating_mul(crate::zakura::TCP_INGRESS_BUDGET.receive)
     }
 
     /// Returns the initial seed peer hostnames for the configured network.

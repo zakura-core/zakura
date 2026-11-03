@@ -187,6 +187,8 @@ pub(in crate::zakura::block_sync) enum AdmitRefusal {
     AccountingClosed,
     Cancelled,
     StaleClaim,
+    /// The session's published reservations would pass its owner cap.
+    OwnerCap,
     Capacity,
 }
 
@@ -242,6 +244,10 @@ impl TakenRequest {
             }
             if !inner.state.is_unpublished_claim(owner, &self.items) {
                 return Err(AdmitRefusal::StaleClaim);
+            }
+            let held = inner.state.session_reserved(owner.session_id);
+            if !self.work.owner_cap.admits(held, bytes, priority) {
+                return Err(AdmitRefusal::OwnerCap);
             }
             match self.work.budget.reserve_owned(bytes) {
                 Some(funding) => funding,

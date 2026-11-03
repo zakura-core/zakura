@@ -37,19 +37,19 @@ use crate::{
     constants::MAX_FIND_BLOCKS_RESPONSE_HASHES,
     inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge},
     protocol::{
-        external::{InventoryHash, MIN_INV_HASH_SIZE},
+        external::{InventoryHash, MAX_INCOMPLETE_MESSAGE_BYTES, MIN_INV_HASH_SIZE},
         internal::{InventoryResponse, PeerSource, Request, Response},
     },
     BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
 };
 
 use super::trace::BlockBodySource;
-use super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
+use super::transport::{COMPAT_RESPONSE_MAX_AGGREGATE_BYTES, DEFAULT_REACTOR_OUTPUT_BYTES};
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
-    RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
-    SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerHandle,
-    ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
+    ReactorBudget, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
+    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId,
+    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
@@ -196,6 +196,63 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
 pub(crate) fn legacy_gossip_streams() -> &'static [Stream] {
     &LEGACY_GOSSIP_SERVICE_STREAMS
 }
+
+/// The frame cap of the legacy gossip stream, kind [`ZAKURA_STREAM_GOSSIP`].
+// Widening u32 to u64 is lossless.
+const LEGACY_GOSSIP_FRAME_BYTES: u64 = LEGACY_GOSSIP_SERVICE_STREAMS[0].frame_cap as u64;
+/// The frame cap of the legacy request stream, kind
+/// [`ZAKURA_STREAM_LEGACY_REQUESTS`].
+// Widening u32 to u64 is lossless.
+const LEGACY_REQUEST_FRAME_BYTES: u64 = LEGACY_GOSSIP_SERVICE_STREAMS[1].frame_cap as u64;
+const _: () = assert!(LEGACY_GOSSIP_SERVICE_STREAMS[0].kind == ZAKURA_STREAM_GOSSIP);
+const _: () = assert!(LEGACY_GOSSIP_SERVICE_STREAMS[1].kind == ZAKURA_STREAM_LEGACY_REQUESTS);
+
+/// The legacy gossip stream's share of one connection, for kind
+/// [`ZAKURA_STREAM_GOSSIP`].
+///
+/// - Receive: two frames. The gossip receive loop decodes each frame and hands it
+///   to the inbound queue without waiting, dropping it when the queue is full. It
+///   holds one frame while the reader admits the next.
+/// - Output: [`DEFAULT_REACTOR_OUTPUT_BYTES`], today's share. Outbound gossip drops a
+///   frame that does not fit, so a smaller share would drop advertisements that the
+///   node queues today.
+pub const LEGACY_GOSSIP_BUDGET: ReactorBudget = ReactorBudget {
+    receive: 2 * LEGACY_GOSSIP_FRAME_BYTES,
+    output: DEFAULT_REACTOR_OUTPUT_BYTES,
+}
+.assert_frame_cap(LEGACY_GOSSIP_SERVICE_STREAMS[0].frame_cap);
+
+/// The legacy request stream's share of one connection, for kind
+/// [`ZAKURA_STREAM_LEGACY_REQUESTS`].
+///
+/// A connection's serving loop runs one outbound exchange at a time, so a
+/// conformant peer has one request and one response in flight on it.
+/// - Receive: one request frame, which this node holds while its service runs, plus
+///   the response payload of this node's one exchange, up to
+///   `COMPAT_RESPONSE_MAX_AGGREGATE_BYTES`. The exchange's frames and decode copies
+///   are funded separately by [`super::COMPAT_EXCHANGE_BUDGET`].
+/// - Output: [`DEFAULT_REACTOR_OUTPUT_BYTES`], today's share. A request reserves its
+///   whole response bound, up to the aggregate cap plus frame headers, before its
+///   service runs. This share keeps today's three maximal reservations, so a peer's
+///   retry after its own timeout does not wait on a service that is still running.
+pub const LEGACY_REQUESTS_BUDGET: ReactorBudget = ReactorBudget {
+    // Widening usize to u64 is lossless on supported targets.
+    receive: LEGACY_REQUEST_FRAME_BYTES + COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
+    output: DEFAULT_REACTOR_OUTPUT_BYTES,
+}
+.assert_frame_cap(LEGACY_GOSSIP_SERVICE_STREAMS[1].frame_cap);
+
+/// One legacy TCP connection's ingress: the decoder holds at most one incomplete
+/// message of `MAX_INCOMPLETE_MESSAGE_BYTES`, a header and a protocol-maximum body.
+///
+/// TCP is not a Zakura stream kind, so this budget never enters
+/// [`super::ReactorShares`]. [`crate::config::Config::tcp_ingress_bound_bytes`] multiplies
+/// it by the TCP connection limit. TCP output is outside this budget.
+pub const TCP_INGRESS_BUDGET: ReactorBudget = ReactorBudget {
+    // Widening usize to u64 is lossless on supported targets.
+    receive: MAX_INCOMPLETE_MESSAGE_BYTES as u64,
+    output: 0,
+};
 
 static FIRST_SEEN_BY_SUPERVISOR: OnceLock<std::sync::Mutex<HashMap<u64, FirstSeenCache>>> =
     OnceLock::new();
@@ -8094,5 +8151,66 @@ mod tests {
 
         node.shutdown().await;
         Ok(())
+    }
+
+    /// The compatibility budgets have their derived values at the default caps.
+    #[test]
+    fn compatibility_budgets_have_their_derived_values() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(
+            LEGACY_GOSSIP_BUDGET,
+            ReactorBudget {
+                receive: 2 * MIB,
+                output: 64 * MIB,
+            }
+        );
+        assert_eq!(
+            LEGACY_REQUESTS_BUDGET,
+            ReactorBudget {
+                receive: 17 * MIB,
+                output: 64 * MIB,
+            }
+        );
+        assert_eq!(
+            TCP_INGRESS_BUDGET,
+            ReactorBudget {
+                receive: 2 * MIB + 24,
+                output: 0,
+            }
+        );
+        assert_eq!(
+            crate::zakura::COMPAT_EXCHANGE_BUDGET,
+            ReactorBudget {
+                receive: 20 * MIB,
+                output: 0,
+            }
+        );
+    }
+
+    /// The legacy kinds' budgets fit their streams' frames, so a node that names
+    /// them as reactor shares starts, and a connection's window adds them.
+    #[test]
+    fn legacy_budgets_are_valid_reactor_shares() {
+        let shares = crate::zakura::ReactorShares {
+            control_receive_bytes: 1 << 20,
+            kinds: vec![
+                (ZAKURA_STREAM_GOSSIP, LEGACY_GOSSIP_BUDGET),
+                (ZAKURA_STREAM_LEGACY_REQUESTS, LEGACY_REQUESTS_BUDGET),
+            ],
+            other: ReactorBudget::ZERO,
+        };
+        let node = crate::zakura::transport::NodeResources::new(
+            shares,
+            legacy_gossip_streams().iter().copied(),
+            u32::MAX,
+        );
+        assert_eq!(
+            node.connection(ZAKURA_CAP_LEGACY_GOSSIP).receive_window(),
+            (1 << 20) + LEGACY_GOSSIP_BUDGET.receive + LEGACY_REQUESTS_BUDGET.receive
+        );
+        for stream in legacy_gossip_streams() {
+            assert!(LEGACY_GOSSIP_BUDGET.output >= u64::from(stream.frame_cap));
+            assert!(LEGACY_REQUESTS_BUDGET.output >= u64::from(stream.frame_cap));
+        }
     }
 }

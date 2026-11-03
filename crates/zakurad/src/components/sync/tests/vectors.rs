@@ -41,8 +41,9 @@ use crate::{
         sync::{
             self,
             downloads::{
-                lookahead_heights, BlockDownloadVerifyError, Downloads, ParentExtendable,
-                ParentWait, PARENT_ADMISSION_TIMEOUT, VERIFICATION_PIPELINE_DROP_LIMIT,
+                is_last_checkpoint_child, lookahead_heights, BlockDownloadVerifyError, Downloads,
+                ParentExtendable, ParentWait, PARENT_ADMISSION_TIMEOUT,
+                VERIFICATION_PIPELINE_DROP_LIMIT,
             },
             legacy_trace::LegacySyncTrace,
             SyncStatus,
@@ -5179,6 +5180,46 @@ async fn child_of_a_parent_that_fails_its_check_is_dropped() {
         vec![block2.header.previous_block_hash, block2.hash()],
         "the child asks the state once, after its parent was rejected"
     );
+}
+
+/// Only a block one above the last checkpoint that names the checkpoint list's hash there counts
+/// as the last checkpoint's child. A block naming that hash at any other height, a block naming
+/// another parent, and a last checkpoint height the list has no hash for don't count.
+#[test]
+fn only_the_block_one_above_the_last_checkpoint_is_its_child() {
+    let checkpoint = block::Hash([0xAA; 32]);
+    let last = Height(10);
+
+    assert!(is_last_checkpoint_child(
+        checkpoint,
+        Height(11),
+        Some(checkpoint),
+        last
+    ));
+    assert!(!is_last_checkpoint_child(
+        checkpoint,
+        Height(12),
+        Some(checkpoint),
+        last
+    ));
+    assert!(!is_last_checkpoint_child(
+        checkpoint,
+        Height(10),
+        Some(checkpoint),
+        last
+    ));
+    assert!(!is_last_checkpoint_child(
+        block::Hash([0xBB; 32]),
+        Height(11),
+        Some(checkpoint),
+        last
+    ));
+    assert!(!is_last_checkpoint_child(
+        checkpoint,
+        Height(11),
+        None,
+        last
+    ));
 }
 
 /// The child of the last checkpoint block is never dropped for its parent, even when the state

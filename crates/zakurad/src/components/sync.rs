@@ -1688,9 +1688,6 @@ where
                 break;
             }
 
-            // Checked on every pass, so responses that aren't progress can't keep the round alive.
-            self.ensure_round_progress(last_progress, reserve.len())?;
-
             // Opportunistically handle any block tasks that are already finished, without blocking.
             while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
@@ -1719,6 +1716,11 @@ where
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
+
+            // Checked on every pass, after the finished blocks above are counted, so responses
+            // that aren't progress can't keep the round alive, and a block that verified before
+            // the deadline still counts.
+            self.ensure_round_progress(last_progress, reserve.len())?;
 
             // Ask for more block hashes while we still have some left to download.
             //
@@ -1769,12 +1771,16 @@ where
                     "requesting more blocks",
                 );
 
-                let response = timeout(
-                    BLOCK_VERIFY_TIMEOUT,
+                // Requesting blocks waits for the network before each request, so it ends at the
+                // round's stall deadline too.
+                let Ok(response) = timeout_at(
+                    last_progress + BLOCK_VERIFY_TIMEOUT,
                     self.request_blocks(std::mem::take(&mut reserve)),
                 )
                 .await
-                .map_err(Report::from)?;
+                else {
+                    return Err(self.round_stalled(0));
+                };
                 reserve = Self::handle_hash_response(response, self.expose_peer_addresses)?;
                 continue;
             }
@@ -1982,10 +1988,14 @@ where
             return Ok(());
         }
 
+        Err(self.round_stalled(reserve))
+    }
+
+    /// Returns the error that restarts a round that reached its stall deadline, after recording a
+    /// diagnostic snapshot. `reserve` is the number of undispatched hashes.
+    fn round_stalled(&self, reserve: usize) -> Report {
         self.trace_sync_snapshot("round_stalled", reserve);
-        Err(eyre!(
-            "sync round stalled: no block verified or tips extended within timeout"
-        ))
+        eyre!("sync round stalled: no block verified or tips extended within timeout")
     }
 
     async fn first_unknown_in_find_blocks_response(

@@ -436,6 +436,20 @@ impl std::fmt::Debug for ParentExtendable {
     }
 }
 
+/// Whether a block at `height` with parent `parent` is the child of the last checkpoint block: one
+/// above `max_checkpoint_height`, naming the hash the checkpoint list records there
+/// (`last_checkpoint_hash`). Such a block is never dropped for its parent. The checkpoint list fixes
+/// that hash, so a peer can't forge it, and the checkpoint verifier only accepts that block. A block
+/// claiming any other height can't be its child.
+pub(super) fn is_last_checkpoint_child(
+    parent: block::Hash,
+    height: Height,
+    last_checkpoint_hash: Option<block::Hash>,
+    max_checkpoint_height: Height,
+) -> bool {
+    Some(parent) == last_checkpoint_hash && Some(height) == max_checkpoint_height.next().ok()
+}
+
 /// Whether a body disagrees with its transaction or authorizing data commitments, or its coinbase
 /// height disagrees with its expiry height.
 fn is_forged_body(error: &RouterError) -> bool {
@@ -511,7 +525,8 @@ where
     max_checkpoint_height: Height,
 
     /// The hash the checkpoint list records at [`Self::max_checkpoint_height`], if it records
-    /// one there. A block whose parent has this hash is never dropped for its parent.
+    /// one there. A block one above that height whose parent has this hash is never dropped for
+    /// its parent.
     last_checkpoint_hash: Option<block::Hash>,
 
     // Shared syncer state
@@ -1008,8 +1023,8 @@ where
                 // Blocks at or below the last checkpoint skip this: the checkpoint verifier only
                 // accepts the checkpointed chain. They also never count as passed, so a fake
                 // checkpoint height can't vouch for a child; their children wait until the state
-                // has them. A child of the last checkpoint block itself, named by the hash in the
-                // checkpoint list, is never dropped.
+                // has them. A block one above the last checkpoint whose parent is the hash the
+                // checkpoint list records there is never dropped.
                 if block_height > max_checkpoint_height {
                     // Reject a header without real proof of work before anything else, with the
                     // verifier's own error, so a dropped block always cost its sender real work.
@@ -1049,12 +1064,15 @@ where
                         }
                         ready = parent_gate.parent_ready(parent, &parent_extendable) => ready,
                     };
-                    // The last checkpoint block's hash is fixed by the checkpoint list, so a peer
-                    // can't forge it, and the checkpoint verifier only accepts that block. Its
-                    // child is never dropped for it: the checkpoint verifier can answer that the
-                    // block is a duplicate before the state has written it, so the state may not
-                    // have it yet.
-                    let parent_ready = parent_checked || Some(parent) == last_checkpoint_hash;
+                    // The checkpoint verifier can answer that the last checkpoint block is a
+                    // duplicate before the state has written it, so the state may not have it yet.
+                    let parent_ready = parent_checked
+                        || is_last_checkpoint_child(
+                            parent,
+                            block_height,
+                            last_checkpoint_hash,
+                            max_checkpoint_height,
+                        );
 
                     if !parent_ready {
                         debug!(

@@ -2,6 +2,144 @@
 
 use super::*;
 
+/// Two well-encoded proofs with distinct nullifiers and enough claimed value to
+/// pass fee policy. Changing their public inputs makes the proofs invalid, so a
+/// successful chain gate must still be followed by cryptographic verification.
+fn sprout_precheck_transaction() -> Transaction {
+    let mut joinsplit_data = test_transactions(&Network::Mainnet)
+        .find_map(|(_, tx)| match tx.as_ref() {
+            Transaction::V4 { joinsplit_data, .. } => joinsplit_data.clone(),
+            _ => None,
+        })
+        .expect("mainnet vectors include Groth16 JoinSplits");
+    joinsplit_data.first.vpub_old = 0.try_into().unwrap();
+    joinsplit_data.first.vpub_new = 100_000.try_into().unwrap();
+    joinsplit_data.first.nullifiers = [
+        sprout::Nullifier([1; 32].into()),
+        sprout::Nullifier([2; 32].into()),
+    ];
+    let mut second = joinsplit_data.first.clone();
+    second.vpub_new = 0.try_into().unwrap();
+    second.nullifiers = [
+        sprout::Nullifier([3; 32].into()),
+        sprout::Nullifier([4; 32].into()),
+    ];
+    joinsplit_data.rest = vec![second];
+    let tx = Transaction::V4 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        joinsplit_data: Some(joinsplit_data),
+        sapling_shielded_data: None,
+    };
+    check::has_inputs_and_outputs(&tx).unwrap();
+    let unmined = tx.clone().into();
+    let fee = 100_000.try_into().unwrap();
+    zip317::mempool_checks(zip317::unpaid_actions(&unmined, fee), fee, unmined.size()).unwrap();
+    tx
+}
+
+#[tokio::test]
+async fn malformed_sprout_proofs_are_rejected_before_chain_checks() {
+    let _init_guard = zakura_test::init();
+    for malformed_index in 0..2 {
+        let mut tx = sprout_precheck_transaction();
+        let Transaction::V4 {
+            joinsplit_data: Some(data),
+            ..
+        } = &mut tx
+        else {
+            unreachable!("the fixture is a v4 Sprout transaction")
+        };
+        // Both proofs must be decoded before the gate, including a malformed
+        // second proof after the first one has been successfully prepared.
+        let proof = if malformed_index == 0 {
+            &mut data.first.zkproof
+        } else {
+            &mut data.rest[0].zkproof
+        };
+        *proof = Groth16Proof([0; 192]);
+
+        let mut state: MockService<zakura_state::Request, zakura_state::Response, PanicAssertion> =
+            MockService::build().for_unit_tests();
+        let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
+        let verification = verifier.oneshot(Request::Mempool {
+            transaction: tx.into(),
+            height: NetworkUpgrade::Canopy
+                .activation_height(&Network::Mainnet)
+                .unwrap(),
+        });
+        tokio::pin!(verification);
+        let result = futures::poll!(&mut verification);
+        state.expect_no_requests().await;
+        assert!(
+            matches!(
+                result,
+                std::task::Poll::Ready(Err(TransactionError::MalformedGroth16(_)))
+            ),
+            "malformed proof at position {malformed_index} must fail before any chain request: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn well_encoded_sprout_proofs_require_chain_and_cryptographic_checks() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let tx = sprout_precheck_transaction();
+        let anchor_error = unknown_anchor_error(&tx).await;
+        assert!(matches!(
+            anchor_error,
+            ValidateContextError::UnknownSproutAnchor { .. }
+        ));
+
+        for accept_chain_context in [false, true] {
+            let mut state: MockService<
+                zakura_state::Request,
+                zakura_state::Response,
+                PanicAssertion,
+            > = MockService::build().for_unit_tests();
+            let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
+            let verification = verifier.oneshot(Request::Mempool {
+                transaction: tx.clone().into(),
+                height: NetworkUpgrade::Canopy
+                    .activation_height(&Network::Mainnet)
+                    .unwrap(),
+            });
+            tokio::pin!(verification);
+            assert!(futures::poll!(&mut verification).is_pending());
+            let response = state
+                .expect_request_that(|request| {
+                    matches!(
+                        request,
+                        zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                    )
+                })
+                .await
+                .unwrap();
+            if accept_chain_context {
+                response.respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+                let error = timeout(test_timeout(), verification)
+                    .await
+                    .expect("proof verification must finish")
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        TransactionError::Groth16(_) | TransactionError::Ed25519(_)
+                    ),
+                    "well-encoded but invalid proofs or signatures must still fail: {error:?}"
+                );
+            } else {
+                response.respond_error(anchor_error.clone());
+                assert_eq!(verification.await.unwrap_err(), anchor_error.clone().into());
+            }
+            state.expect_no_requests().await;
+        }
+    });
+}
+
 #[tokio::test]
 async fn pre_v4_mempool_transaction_is_rejected_without_state_requests() {
     let _init_guard = zakura_test::init();

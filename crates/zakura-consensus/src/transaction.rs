@@ -650,6 +650,7 @@ where
 
             let mempool_transaction = req.mempool_transaction();
             let mut miner_fee = None;
+            let mut prepared_sprout_proofs = None;
             if let Some(unmined_tx) = mempool_transaction.as_ref() {
                 // Apply ZIP-317 policy before expensive cryptographic verification.
                 // VerifiedUnminedTx::new() repeats this check to preserve its constructor
@@ -659,6 +660,13 @@ where
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
+
+                // Sprout anchor checks build interstitial trees. Reject malformed
+                // proof encodings before that work, without submitting any proofs.
+                if let Transaction::V4 { joinsplit_data, .. } = tx.as_ref() {
+                    prepared_sprout_proofs =
+                        Some(Self::prepare_sprout_proofs(joinsplit_data.as_deref())?);
+                }
 
                 // Reject unknown anchors and already-spent nullifiers before dispatching
                 // cryptographic work to the verifiers shared with block verification.
@@ -693,6 +701,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     joinsplit_data.as_deref(),
+                    prepared_sprout_proofs,
                     tx_id,
                 )?,
                 Transaction::V5 {
@@ -1027,7 +1036,8 @@ where
     /// - the `script_verifier` to use for verifying the transparent transfers
     /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the Sprout `joinsplit_data` shielded data in the transaction
-    /// - the `sapling_shielded_data` in the transaction
+    /// - `prepared_sprout_proofs`, prepared before the mempool chain gate, or `None`
+    ///   for block requests, which prepare their proofs here
     /// - the transaction's precomputed `tx_id`, used by the Sapling cache
     #[allow(clippy::unwrap_in_result)]
     fn verify_v4_transaction(
@@ -1036,6 +1046,7 @@ where
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
         joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
+        prepared_sprout_proofs: Option<Vec<primitives::groth16::Item>>,
         tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let tx = request.transaction();
@@ -1058,12 +1069,21 @@ where
             .sighasher()
             .sighash(HashType::ALL, None);
 
+        let sprout_proofs = match prepared_sprout_proofs {
+            Some(proofs) => proofs,
+            None => Self::prepare_sprout_proofs(joinsplit_data)?,
+        };
+
         Ok(Self::verify_transparent_inputs_and_outputs(
             request,
             script_verifier,
             cached_ffi_transaction,
         )?
-        .and(Self::verify_sprout_shielded_data(joinsplit_data, &sighash)?)
+        .and(Self::verify_sprout_shielded_data(
+            joinsplit_data,
+            sprout_proofs,
+            &sighash,
+        ))
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash, tx_id)))
     }
 
@@ -1344,15 +1364,33 @@ where
         }
     }
 
-    /// Verifies a transaction's Sprout shielded join split data.
+    /// Decodes every Sprout proof and prepares its public inputs without submitting
+    /// cryptographic work. Malformed encodings fail before mempool anchor-tree work.
+    fn prepare_sprout_proofs(
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
+    ) -> Result<Vec<primitives::groth16::Item>, TransactionError> {
+        let Some(joinsplit_data) = joinsplit_data else {
+            return Ok(Vec::new());
+        };
+
+        joinsplit_data
+            .joinsplits()
+            .map(|joinsplit| {
+                primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)
+            })
+            .collect()
+    }
+
+    /// Submits the prepared Sprout proofs and the transaction's JoinSplit signature.
     fn verify_sprout_shielded_data(
         joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
+        proofs: Vec<primitives::groth16::Item>,
         shielded_sighash: &SigHash,
-    ) -> Result<AsyncChecks, TransactionError> {
+    ) -> AsyncChecks {
         let mut checks = AsyncChecks::new();
 
         if let Some(joinsplit_data) = joinsplit_data {
-            for joinsplit in joinsplit_data.joinsplits() {
+            for proof in proofs {
                 // # Consensus
                 //
                 // > The proof π_ZKJoinSplit MUST be valid given a
@@ -1365,9 +1403,7 @@ where
                 // resulting future to our collection of async
                 // checks that (at a minimum) must pass for the
                 // transaction to verify.
-                checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
-                    primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)?,
-                ));
+                checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(proof));
             }
 
             // # Consensus
@@ -1407,7 +1443,7 @@ where
             checks.push(ed25519_verifier.oneshot(ed25519_item));
         }
 
-        Ok(checks)
+        checks
     }
 
     /// Verifies a transaction's Sapling shielded data.

@@ -176,7 +176,7 @@ fn state_timeout_does_not_dispatch_proofs() {
 ///
 /// Repeated valid fixtures model cold verification bursts, not unique network admissions.
 /// Actual proof submissions are reported because later requests can hit the bundle cache.
-#[cfg(all(feature = "internal-bench", target_os = "linux"))]
+#[cfg(feature = "internal-bench")]
 #[test]
 #[ignore = "requires an isolated host; run this test alone in release mode"]
 #[allow(clippy::print_stdout)]
@@ -184,6 +184,12 @@ fn rejected_anchor_verification_load() {
     use futures::{stream::FuturesUnordered, StreamExt};
     use std::time::Instant;
 
+    // Compile the harness on every platform so local checks cover its types,
+    // while keeping execution on Linux for /proc CPU accounting.
+    assert!(
+        cfg!(target_os = "linux"),
+        "benchmark CPU accounting requires Linux"
+    );
     let _init_guard = zakura_test::init();
     rayon::ThreadPoolBuilder::new()
         .num_threads(4)
@@ -222,7 +228,8 @@ fn rejected_anchor_verification_load() {
             });
             let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
             let mut verifier = Verifier::new(&Network::Mainnet, state, setup_rx);
-            setup_tx.send(CacheTestMempool::build().for_prop_tests()).ok().unwrap();
+            let mempool: CacheTestMempool = MockService::build().for_prop_tests();
+            setup_tx.send(mempool).ok().unwrap();
             let height = rejected.expiry_height().expect("the fixture has an expiry height");
 
             // Warm the circuit keys and runtime before measuring. Each trial then starts cold.
@@ -264,7 +271,7 @@ fn rejected_anchor_verification_load() {
 }
 
 /// Linux reports user and system CPU consumption in clock ticks, including worker threads.
-#[cfg(all(feature = "internal-bench", target_os = "linux"))]
+#[cfg(feature = "internal-bench")]
 fn process_cpu_ticks() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").expect("Linux exposes process CPU usage");
     let fields: Vec<_> = stat

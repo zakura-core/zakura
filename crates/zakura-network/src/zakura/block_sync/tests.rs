@@ -15,7 +15,7 @@ use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
         DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
-        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
@@ -1770,9 +1770,10 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(default.max_blocks_per_response, None);
     assert_eq!(default.advertised_max_blocks_per_response(), 1);
     assert_eq!(default.max_inflight_requests, 32000);
+    assert_eq!(default.max_inflight_block_bytes, None);
     assert_eq!(
-        default.max_inflight_block_bytes,
-        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES
+        default.inflight_block_bytes(),
+        default.derived_max_inflight_block_bytes(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
     );
     assert_eq!(
         default.max_reorder_lookahead_bytes,
@@ -1938,7 +1939,7 @@ fn ignored_max_blocks_per_response_warns_only_above_one() {
 #[test]
 fn config_validate_rejects_degenerate_values() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 0,
+        max_inflight_block_bytes: Some(0),
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -1953,13 +1954,13 @@ fn config_validate_rejects_degenerate_values() {
     // release their reservation at receipt, so the budget only has to exceed one
     // floor request (checked below the floor-request bound in `validate`).
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1),
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_ok());
 
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
         max_reorder_lookahead_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2000,6 +2001,36 @@ fn config_validate_rejects_degenerate_values() {
 }
 
 #[test]
+fn config_without_inflight_block_bytes_derives_them_and_round_trips() {
+    // A config without the key, like every default config written before the
+    // budget was derived, loads unset and writes the key back out unset.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_requests = 32000
+        "#,
+    )
+    .expect("a config without max_inflight_block_bytes loads");
+    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, None);
+    let written = toml::to_string(&config).expect("the config serializes");
+    assert!(!written.contains("max_inflight_block_bytes"));
+
+    // An old config that wrote the former 6 GiB default keeps it.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 6442450944
+        "#,
+    )
+    .expect("a config with the old default loads");
+    let block_sync = config.zakura.block_sync.clone().for_node_connections(4);
+    assert_eq!(block_sync.inflight_block_bytes(), 6 << 30);
+    let written = toml::to_string(&config).expect("the config serializes");
+    let reread: crate::Config = toml::from_str(&written).expect("the config reloads");
+    assert_eq!(reread.zakura.block_sync.max_inflight_block_bytes, Some(6 << 30));
+}
+
+#[test]
 fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
     // An older config with a small `max_inflight_block_bytes` (e.g. the stored
     // `v4.5.0-zakura-blocksync.toml` 256 MiB value) loads unchanged: the request
@@ -2015,7 +2046,7 @@ fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
     const {
         assert!(268435456u64 < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
     }
-    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, 268435456);
+    assert_eq!(config.zakura.block_sync.inflight_block_bytes(), 268435456);
 }
 
 #[test]
@@ -2037,7 +2068,7 @@ fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
         "test premise: the stored value is at or below one floor request"
     );
     assert_eq!(
-        config.zakura.block_sync.max_inflight_block_bytes,
+        config.zakura.block_sync.inflight_block_bytes(),
         request_floor + 1
     );
 }
@@ -2814,7 +2845,7 @@ fn admit_grant(
 #[test]
 fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 40_000_000,
+        max_inflight_block_bytes: Some(40_000_000),
         max_reorder_lookahead_bytes: 500,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2881,7 +2912,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
 #[test]
 fn admission_counts_inflight_to_sequencer_bytes() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2917,7 +2948,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
 #[test]
 fn total_resident_plateaus_under_commit_stall() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2953,7 +2984,7 @@ fn total_resident_plateaus_under_commit_stall() {
 #[test]
 fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3006,7 +3037,7 @@ fn outstanding_reservations_are_charged_at_wire_size() {
     // at their wire size. Charging them nothing makes in-flight volume invisible to the
     // byte gate until it is already resident.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3071,7 +3102,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
     // once the resident-memory look-ahead budget is full, while the commit window stays
     // fundable so a pinned checkpoint range can assemble and commit can drain.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         // Large enough that the byte (memory) cap, not the block cap, is what bites here.
         ..ZakuraBlockSyncConfig::default()
@@ -3153,7 +3184,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     // resident gate, sized only by the in-flight budget. The clamp is structural
     // (gate-independent), so it holds whether or not the gate is full.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3229,7 +3260,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
     };
 
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
         max_reorder_lookahead_bytes: 1,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -4240,7 +4271,7 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
@@ -4370,7 +4401,7 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, tip_rx) = genesis_tip_channel();
     let mut startup = genesis_startup(tip_rx, config.clone());
@@ -4484,7 +4515,7 @@ async fn check_cold_probe_deadline(expired: bool) {
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
     config.request_timeout = Duration::from_millis(300);
     config.floor_rescue_timeout = Duration::from_millis(120);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
@@ -7465,7 +7496,7 @@ proptest::proptest! {
         reserved_blocks in 0u64..20,
     ) {
         let config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: 64_000_000,
+            max_inflight_block_bytes: Some(64_000_000),
             max_reorder_lookahead_bytes: 1_000,
             ..ZakuraBlockSyncConfig::default()
         };
@@ -8278,7 +8309,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
-        accounting: ByteBudget::new(config.max_inflight_block_bytes).reader(),
+        accounting: ByteBudget::new(config.inflight_block_bytes()).reader(),
         events,
         lifecycle,
         needed_query_failures,
@@ -8663,7 +8694,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     let mut config = immediate_body_download_config();
     // One block's size hint of budget: size-based reservation now means one
     // advertised body fills the budget, throttling to one in-flight request.
-    config.max_inflight_block_bytes = u64::from(block1_size);
+    config.max_inflight_block_bytes = Some(u64::from(block1_size));
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(41);
@@ -8795,7 +8826,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 4;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 4);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(73);
@@ -8946,7 +8977,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     let mut config = immediate_body_download_config();
     // Budget holds exactly one worst-case share, so a hint-sized re-reservation
     // would have left no headroom for an underestimated body.
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
@@ -9179,7 +9210,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     let mut config = immediate_body_download_config();
     // One block's size hint of budget: size-based reservation now means one
     // advertised body fills the budget, throttling to one in-flight request.
-    config.max_inflight_block_bytes = u64::from(block1_size);
+    config.max_inflight_block_bytes = Some(u64::from(block1_size));
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = header_tip_startup(
@@ -9406,7 +9437,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(43);
@@ -9577,7 +9608,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_bytes = block_size(&block);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(42);
@@ -9869,7 +9900,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // of that body releases the whole reservation and the routine must issue the
     // next GetBlocks without any external nudge.
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
     config.request_timeout = Duration::from_secs(300);
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
@@ -10054,7 +10085,7 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
     let budget_blocks = 3u32;
     let heights = 12u32;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES),
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -10116,7 +10147,7 @@ async fn reactor_tiny_estimates_fit_one_worst_case_budget_block() {
     // requests, because each reserves its size hint (clamped to the 1 KiB floor),
     // not a worst-case share. All 4 advertised heights are requested at once.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES),
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -10465,7 +10496,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     config.peer_limits.inbound_queue_depth = 1;
     // Hold the whole flood in flight at once so nothing pauses on the byte
     // budget; the inbound flood, not the budget, is what this test exercises.
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     // A dropped body must not be quietly re-requested and healed before the
     // deadline — that would hide the very regression this test guards.
     config.request_timeout = Duration::from_secs(300);
@@ -10785,7 +10816,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     };
 
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
     config.peer_limits.inbound_queue_depth = 128;
@@ -11015,7 +11046,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 #[tokio::test]
 async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11146,7 +11177,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_submitted_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11272,7 +11303,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 async fn reactor_forward_reset_preserves_future_outstanding_body() {
     // Open the probe cap so heights 2 and 3 are both outstanding at the reset.
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11367,7 +11398,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11475,7 +11506,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
 #[tokio::test]
 async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_flight_apply() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11879,7 +11910,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 #[tokio::test]
 async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -12158,7 +12189,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
 #[tokio::test]
 async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -12529,7 +12560,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
 async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity() {
     let request_bytes: u32 = 10_000;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
 
@@ -13041,7 +13072,7 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     // Open the probe cap so all three heights are outstanding at the reanchor.
     let mut config = fill_loop_mechanics_config();
     config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+        Some(BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"));
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13541,7 +13572,7 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     // Open the probe cap so all three heights are outstanding when height 1 commits.
     let mut config = fill_loop_mechanics_config();
     config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+        Some(BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"));
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13636,7 +13667,7 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for all three bodies.
     config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+        Some(BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"));
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13744,7 +13775,7 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
 async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     let blocks = fake_sequential_blocks(4);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     config.max_submitted_block_applies = 2;
     config.request_timeout = Duration::from_secs(300);
 

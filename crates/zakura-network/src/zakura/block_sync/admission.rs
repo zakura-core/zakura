@@ -534,7 +534,7 @@ mod tests {
         };
 
         let config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: 1024 * 1024 * 1024,
+            max_inflight_block_bytes: Some(1024 * 1024 * 1024),
             ..ZakuraBlockSyncConfig::default()
         };
 
@@ -553,7 +553,7 @@ mod tests {
             decoded_resident_bytes: 0,
             reserved_above_floor_bytes: 0,
             reserved_above_floor_blocks: 0,
-            budget_available: config.max_inflight_block_bytes,
+            budget_available: config.inflight_block_bytes(),
         };
         // The range-completing block is inside the commit window, so it is exempt.
         assert!(

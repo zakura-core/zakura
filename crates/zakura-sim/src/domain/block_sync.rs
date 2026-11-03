@@ -142,7 +142,7 @@ impl Limits {
     /// fixture whose largest body is `largest_body` wire bytes.
     pub fn of(config: &ZakuraBlockSyncConfig, workers: u16, largest_body: u64) -> Limits {
         Limits {
-            budget: config.max_inflight_block_bytes,
+            budget: config.inflight_block_bytes(),
             lookahead: config.effective_max_reorder_lookahead_bytes(),
             queue: u64::try_from(config.submitted_apply_limit()).unwrap_or(u64::MAX),
             per_request: u64::from(config.advertised_max_blocks_per_response()),

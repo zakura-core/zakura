@@ -283,7 +283,7 @@ impl BlockSyncHandle {
         let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
         let (status_tx, status) = watch::channel(config.initial_status());
         let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
-        let accounting = ByteBudget::new(config.max_inflight_block_bytes);
+        let accounting = ByteBudget::new(config.inflight_block_bytes());
         let handle = BlockSyncHandle {
             accounting: accounting.reader(),
             events,
@@ -487,7 +487,7 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
-        let budget = ByteBudget::new(startup.config.max_inflight_block_bytes);
+        let budget = ByteBudget::new(startup.config.inflight_block_bytes());
         #[cfg(any(test, zakura_sim))]
         let budget = budget.with_observer(startup.observer.budget_observer());
         let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget)

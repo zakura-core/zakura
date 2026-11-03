@@ -1699,7 +1699,7 @@ mod tests {
                     .generation()
             });
             let work = self.work.unwrap_or_else(|| {
-                let budget = ByteBudget::new(self.config.max_inflight_block_bytes);
+                let budget = ByteBudget::new(self.config.inflight_block_bytes());
                 Arc::new(WorkQueue::new(block::Height(0), budget))
             });
             let (sequencer_input, bodies) = mpsc::channel(self.channels);

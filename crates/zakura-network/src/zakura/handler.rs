@@ -4672,7 +4672,11 @@ async fn spawn_zakura_endpoint_inner(
                     .zakura
                     .block_sync
                     .decoded_block_pool(driver_startup.decoded_backend_blocks)?,
-                config.zakura.block_sync.clone(),
+                config
+                    .zakura
+                    .block_sync
+                    .clone()
+                    .for_node_connections(limits.max_connections),
             )
             .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
@@ -4704,7 +4708,11 @@ async fn spawn_zakura_endpoint_inner(
         &supervisor,
         Some(header_sync.clone()),
         block_sync.clone(),
-        config.zakura.block_sync.clone(),
+        config
+            .zakura
+            .block_sync
+            .clone()
+            .for_node_connections(limits.max_connections),
         legacy_service,
         discovery_service,
         service_demand.clone(),

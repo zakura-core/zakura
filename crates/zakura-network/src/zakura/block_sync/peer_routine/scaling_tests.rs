@@ -38,7 +38,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     let config = ZakuraBlockSyncConfig {
         max_inflight_requests: window,
         initial_inflight_requests: window,
-        max_inflight_block_bytes: u64::MAX / 4,
+        max_inflight_block_bytes: Some(u64::MAX / 4),
         max_reorder_lookahead_bytes: u64::MAX / 4,
         request_timeout: Duration::from_secs(3600),
         initial_block_probe_requests: window,
@@ -47,7 +47,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     };
     let capacity = usize::try_from(window).unwrap() + 16;
     let (out_send, outbound) = crate::zakura::framed_channel(capacity);
-    let budget = ByteBudget::new(config.max_inflight_block_bytes);
+    let budget = ByteBudget::new(config.inflight_block_bytes());
     let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
     let (mut routine, ends) = super::tests::TestRoutine {
         config,

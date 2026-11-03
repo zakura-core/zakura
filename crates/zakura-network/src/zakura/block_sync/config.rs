@@ -31,8 +31,6 @@ pub const DEFAULT_BS_INITIAL_INFLIGHT: u32 = 64;
 pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 32_768;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
-/// Default global byte budget for outstanding block-request reservations.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
 /// Block-sync reserves a per-block size estimate at send time (this worst case
@@ -257,7 +255,13 @@ pub struct ZakuraBlockSyncConfig {
     /// Maximum estimated bytes reserved for outstanding block-body requests: a
     /// DoS/pacing bound on in-flight wire data, released at receipt. Received
     /// bodies are bounded by `max_reorder_lookahead_bytes` instead.
-    pub max_inflight_block_bytes: u64,
+    ///
+    /// Unset, the node derives it from the per-peer cwnd cap: `x × C`, with `x`
+    /// the connections that can carry block sync
+    /// ([`Self::derived_max_inflight_block_bytes`]). That is 92 × 32 MiB at the
+    /// defaults. A configured value replaces the derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_block_bytes: Option<u64>,
     /// Maximum estimated *resident* memory of look-ahead block bodies retained
     /// by the download pipeline. Serialized backlog and reservations are charged
     /// at wire size; decoded input/submission windows add
@@ -376,7 +380,7 @@ impl Default for ZakuraBlockSyncConfig {
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
-            max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+            max_inflight_block_bytes: None,
             max_reorder_lookahead_bytes: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
             floor_peer_avoid_cooldown: DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
             max_submitted_block_applies: MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
@@ -579,24 +583,47 @@ impl ZakuraBlockSyncConfig {
 
     /// The node in-flight byte budget derived from the per-peer cap:
     /// `x × C`, with `x` from [`Self::block_sync_connections`].
-    ///
-    /// `max_inflight_block_bytes` keeps its fixed default until node
-    /// composition passes the node's `max_connections` here.
     pub fn derived_max_inflight_block_bytes(&self, max_connections: usize) -> u64 {
         // Widening usize to u64 is lossless on every supported target.
         (self.block_sync_connections(max_connections) as u64)
             .saturating_mul(self.bbr_max_cwnd_bytes)
     }
 
+    /// The node in-flight byte budget: the configured `max_inflight_block_bytes`,
+    /// or [`Self::derived_max_inflight_block_bytes`] at the default connection
+    /// count until [`Self::for_node_connections`] sets it.
+    pub fn inflight_block_bytes(&self) -> u64 {
+        self.max_inflight_block_bytes.unwrap_or_else(|| {
+            self.derived_inflight_block_bytes(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
+        })
+    }
+
+    /// This config for a node that admits `max_connections`: an unset
+    /// in-flight byte budget becomes `x × C` for those connections. A
+    /// configured value stays.
+    pub fn for_node_connections(mut self, max_connections: usize) -> Self {
+        if self.max_inflight_block_bytes.is_none() {
+            self.max_inflight_block_bytes = Some(self.derived_inflight_block_bytes(max_connections));
+        }
+        self
+    }
+
+    /// `x × C`, raised to just above one floor request so that a node without
+    /// block-sync peers still validates.
+    fn derived_inflight_block_bytes(&self, max_connections: usize) -> u64 {
+        self.derived_max_inflight_block_bytes(max_connections)
+            .max(self.floor_request_byte_reservation().saturating_add(1))
+    }
+
     /// Validate production-safety bounds after deserialization.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.max_inflight_block_bytes == 0 {
+        if self.inflight_block_bytes() == 0 {
             return Err("max_inflight_block_bytes must be greater than zero");
         }
         if self.max_reorder_lookahead_bytes == 0 {
             return Err("max_reorder_lookahead_bytes must be greater than zero");
         }
-        if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
+        if self.inflight_block_bytes() <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
         }
         if self.request_timeout < Duration::from_millis(1) {
@@ -679,14 +706,17 @@ impl ZakuraBlockSyncConfig {
     /// raise the budget to the smallest valid value and warn.
     pub fn clamp_inflight_block_bytes_to_request_floor(&mut self) {
         let request_floor = self.floor_request_byte_reservation();
-        if self.max_inflight_block_bytes > 0 && self.max_inflight_block_bytes <= request_floor {
+        if let Some(configured) = self
+            .max_inflight_block_bytes
+            .filter(|&bytes| bytes > 0 && bytes <= request_floor)
+        {
             tracing::warn!(
-                configured_max_inflight_block_bytes = self.max_inflight_block_bytes,
+                configured_max_inflight_block_bytes = configured,
                 floor_request_byte_reservation = request_floor,
                 "zakura.block_sync.max_inflight_block_bytes cannot cover one floor \
                  request; clamping it up so the node can start",
             );
-            self.max_inflight_block_bytes = request_floor.saturating_add(1);
+            self.max_inflight_block_bytes = Some(request_floor.saturating_add(1));
         }
     }
 
@@ -754,6 +784,33 @@ mod owner_cap_tests {
         assert_eq!(
             config.derived_max_inflight_block_bytes(DEFAULT_ZAKURA_MAX_CONNECTIONS),
             92 * DEFAULT_BS_BBR_MAX_CWND_BYTES
+        );
+        // Unset, the node budget derives from the connections the node admits,
+        // 2,944 MiB at the defaults instead of the old fixed 6 GiB.
+        assert_eq!(config.max_inflight_block_bytes, None);
+        assert_eq!(config.inflight_block_bytes(), 3_087_007_744);
+        assert_eq!(
+            config.clone().for_node_connections(16).max_inflight_block_bytes,
+            Some(16 * DEFAULT_BS_BBR_MAX_CWND_BYTES)
+        );
+        // A configured budget stays.
+        let configured = ZakuraBlockSyncConfig {
+            max_inflight_block_bytes: Some(6 << 30),
+            ..config.clone()
+        };
+        assert_eq!(configured.for_node_connections(16).inflight_block_bytes(), 6 << 30);
+        // A node without block-sync peers still covers one floor request.
+        let no_peers = ZakuraBlockSyncConfig {
+            peer_limits: crate::zakura::ServicePeerLimits {
+                max_inbound_peers: 0,
+                max_outbound_peers: 0,
+                ..config.peer_limits
+            },
+            ..config.clone()
+        };
+        assert_eq!(
+            no_peers.clone().for_node_connections(92).inflight_block_bytes(),
+            no_peers.floor_request_byte_reservation() + 1
         );
         // The peer limits bind when the node admits more connections.
         assert_eq!(config.block_sync_connections(10_000), 512);

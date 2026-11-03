@@ -1968,7 +1968,7 @@ mod tests {
         };
 
         let block_sync_config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: u64::MAX,
+            max_inflight_block_bytes: Some(u64::MAX),
             request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: if one_session_slot {

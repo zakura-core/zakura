@@ -23,6 +23,153 @@ fn proof_calls(tx: &Transaction, upgrade: NetworkUpgrade) -> usize {
     }
 }
 
+/// Rejections and a pending lookup must not consume the fixture's cold proof verification.
+pub(super) async fn check_chain_gate(
+    verifier: &mut CacheTestVerifier,
+    state: &CacheTestState,
+    tx: &Transaction,
+    upgrade: NetworkUpgrade,
+) {
+    use zakura_state::DuplicateNullifierError;
+
+    let height = tx
+        .expiry_height()
+        .expect("the fixture has an expiry height");
+    let anchor_error = unknown_anchor_error(tx).await;
+    assert!(matches!(
+        anchor_error,
+        ValidateContextError::UnknownSaplingAnchor { .. }
+            | ValidateContextError::UnknownOrchardAnchor { .. }
+    ));
+    let duplicate_error = if tx.has_sapling_shielded_data() {
+        tx.sapling_nullifiers()
+            .next()
+            .unwrap()
+            .duplicate_nullifier_error(true)
+    } else {
+        tx.orchard_nullifiers()
+            .next()
+            .unwrap()
+            .duplicate_nullifier_error(true)
+    };
+    let expected_calls = proof_calls(tx, upgrade);
+    let errors: [(BoxError, TransactionError); 3] = [
+        (anchor_error.clone().into(), anchor_error.into()),
+        (duplicate_error.clone().into(), duplicate_error.into()),
+        (
+            "state lookup unavailable".into(),
+            TransactionError::from(BoxError::from("state lookup unavailable")),
+        ),
+    ];
+    for (error, expected) in errors {
+        let mut state = state.clone();
+        let request = Request::Mempool {
+            transaction: tx.clone().into(),
+            height,
+        };
+        let verification = verify(verifier, request);
+        tokio::pin!(verification);
+        assert!(futures::poll!(&mut verification).is_pending());
+        let response = state
+            .expect_request_that(|req| {
+                matches!(
+                    req,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            proof_calls(tx, upgrade),
+            expected_calls,
+            "pending chain checks must not dispatch proofs"
+        );
+        response.respond_error(error);
+        assert_eq!(verification.await.unwrap_err(), expected);
+        assert_eq!(
+            proof_calls(tx, upgrade),
+            expected_calls,
+            "rejected chain checks must not dispatch proofs"
+        );
+    }
+
+    // Only a successful lookup may release the expensive verification.
+    let mut state = state.clone();
+    let verification = verify(
+        verifier,
+        Request::Mempool {
+            transaction: tx.clone().into(),
+            height,
+        },
+    );
+    tokio::pin!(verification);
+    assert!(futures::poll!(&mut verification).is_pending());
+    let response = state
+        .expect_request_that(|req| {
+            matches!(
+                req,
+                zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(proof_calls(tx, upgrade), expected_calls);
+    response.respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    verification
+        .await
+        .expect("valid chain context permits the real transaction to verify");
+}
+
+#[test]
+fn state_timeout_does_not_dispatch_proofs() {
+    let _init_guard = zakura_test::init();
+    let mut tx = cacheable_mainnet_orchard_transaction();
+    // Give this test its own cold key without changing structural validity or fee policy.
+    let height = tx.expiry_height().unwrap();
+    *tx.expiry_height_mut() = (height + 1).unwrap();
+    let upgrade = NetworkUpgrade::current(&Network::Mainnet, height);
+    // The process-wide verifier's worker must belong to the persistent runtime,
+    // rather than the short-lived runtime whose clock this test advances.
+    let before = zakura_test::MULTI_THREADED_RUNTIME.block_on(async { proof_calls(&tx, upgrade) });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let error = runtime.block_on(async {
+        let (mut verifier, mut state) = cache_test_verifier();
+        let verification = verify(
+            &mut verifier,
+            Request::Mempool {
+                transaction: tx.clone().into(),
+                height,
+            },
+        );
+        tokio::pin!(verification);
+        assert!(futures::poll!(&mut verification).is_pending());
+        let _response = state
+            .expect_request_that(|req| {
+                matches!(
+                    req,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .unwrap();
+        tokio::time::advance(super::super::UTXO_LOOKUP_TIMEOUT + std::time::Duration::from_secs(1))
+            .await;
+        verification.await.unwrap_err()
+    });
+    assert!(
+        matches!(error, TransactionError::InternalDowncastError(message) if message.contains("Elapsed"))
+    );
+    assert_eq!(
+        zakura_test::MULTI_THREADED_RUNTIME.block_on(async { proof_calls(&tx, upgrade) }),
+        before,
+        "state timeouts must not dispatch proofs"
+    );
+}
+
 /// Run alone in a release test executable on Linux, with four Tokio and Rayon threads.
 ///
 /// Repeated valid fixtures model cold verification bursts, not unique network admissions.

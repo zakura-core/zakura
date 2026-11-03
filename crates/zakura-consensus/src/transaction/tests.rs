@@ -6919,17 +6919,8 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "this transaction's bundle must not have been verified before this test"
         );
 
-        // 1. The mempool verification is the only one that reaches the Halo2 verifier.
-        respond_to_nullifier_and_anchor_check(&state);
-        verify(
-            &mut verifier,
-            Request::Mempool {
-                transaction: tx.clone().into(),
-                height: expiry_height,
-            },
-        )
-        .await
-        .expect("a real mainnet Orchard transaction must verify at its expiry height");
+        // 1. Chain eligibility must succeed before the mempool can dispatch proof verification.
+        mempool_precheck::check_chain_gate(&mut verifier, &state, &tx, network_upgrade).await;
 
         assert_eq!(
             primitives::halo2::inner_calls_for(network_upgrade, &item),
@@ -6994,6 +6985,18 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
                 1,
                 "the {mutated_field} mutation must reach the inner Halo2 verifier"
             );
+
+            respond_to_nullifier_and_anchor_check(&state);
+            let error = verify(
+                &mut verifier,
+                Request::Mempool {
+                    transaction: mutated_tx.into(),
+                    height: expiry_height,
+                },
+            )
+            .await
+            .expect_err("passing chain checks must not accept invalid Orchard authorization");
+            assert_eq!(error, TransactionError::Halo2VerificationFailed);
         }
     });
 }
@@ -7223,17 +7226,8 @@ fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "this transaction's bundle must not have been verified before this test"
         );
 
-        // 1. The mempool verification is the only one that reaches the Sapling verifier.
-        respond_to_nullifier_and_anchor_check(&state);
-        verify(
-            &mut verifier,
-            Request::Mempool {
-                transaction: tx.clone().into(),
-                height: expiry_height,
-            },
-        )
-        .await
-        .expect("a real mainnet Sapling transaction must verify at its expiry height");
+        // 1. Chain eligibility must succeed before the mempool can dispatch proof verification.
+        mempool_precheck::check_chain_gate(&mut verifier, &state, &tx, network_upgrade).await;
 
         assert_eq!(
             primitives::sapling::inner_calls_for(&item),
@@ -7298,6 +7292,18 @@ fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
                 1,
                 "the {mutated_field} mutation must reach the inner Sapling verifier"
             );
+
+            respond_to_nullifier_and_anchor_check(&state);
+            let error = verify(
+                &mut verifier,
+                Request::Mempool {
+                    transaction: mutated_tx.into(),
+                    height: expiry_height,
+                },
+            )
+            .await
+            .expect_err("passing chain checks must not accept invalid Sapling authorization");
+            assert_eq!(error, TransactionError::SaplingVerificationFailed);
         }
     });
 }

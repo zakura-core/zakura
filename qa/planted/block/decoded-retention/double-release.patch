@@ -1,7 +1,11 @@
 --- a/crates/zakura-node-services/src/block_memory.rs
 +++ b/crates/zakura-node-services/src/block_memory.rs
-@@ -296,3 +296,3 @@
-             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
--                used.checked_sub(1)
-+                used.checked_sub(2)
-             })
+@@ -424,7 +424,7 @@
+             .pool
+             .0
+             .reserved
+-            .checked_update(|used| used.checked_sub(1))
++            .checked_update(|used| used.checked_sub(2))
+             .is_err()
+         {
+             self.pool.close();

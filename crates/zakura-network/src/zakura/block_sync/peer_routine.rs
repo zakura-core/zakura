@@ -1514,10 +1514,12 @@ impl PeerRoutine {
                         AdmitRefusal::Capacity => FillStop::Budget,
                         AdmitRefusal::Cancelled => FillStop::Cancelled,
                         AdmitRefusal::StaleClaim => FillStop::StaleWork,
+                        // The owner cap is the byte cwnd's hard ceiling.
+                        AdmitRefusal::OwnerCap => FillStop::CwndSaturated,
                         AdmitRefusal::Empty
                         | AdmitRefusal::MissingOwner
                         | AdmitRefusal::AmountOverflow => FillStop::Internal,
-                    }
+                    };
                 }
             };
             let reserved_bytes = unpublished.bytes();

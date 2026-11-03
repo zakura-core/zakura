@@ -209,6 +209,23 @@ impl CompatibleRequest {
         max_body_size: usize,
         response_format: ResponseFormat,
     ) -> Result<Body<'static>, PreparationError> {
+        let (params, body_size) = self.normalize_and_measure();
+        if body_size > max_body_size {
+            return Err(PreparationError::InnerBodyTooLarge(response_format));
+        }
+
+        let id = match self.id {
+            Some(serde_json::Value::String(id)) => Some(Id::Str(Cow::Owned(id))),
+            Some(serde_json::Value::Number(id)) => id.as_u64().map(Id::Number),
+            _ => None,
+        };
+        let method = Cow::Owned(self.method);
+        let params = params.map(Cow::Owned);
+        Ok(message(method, params, id))
+    }
+
+    /// Normalizes parameters and measures the request without creating a replacement envelope.
+    fn normalize_and_measure(&self) -> (Option<Box<RawValue>>, usize) {
         let params = self
             .params
             .as_ref()
@@ -241,18 +258,7 @@ impl CompatibleRequest {
                 .saturating_add(b",\"params\":".len())
                 .saturating_add(params.get().len());
         }
-        if size.0 > max_body_size {
-            return Err(PreparationError::InnerBodyTooLarge(response_format));
-        }
-
-        let id = match self.id {
-            Some(serde_json::Value::String(id)) => Some(Id::Str(Cow::Owned(id))),
-            Some(serde_json::Value::Number(id)) => id.as_u64().map(Id::Number),
-            _ => None,
-        };
-        let method = Cow::Owned(self.method);
-        let params = params.map(Cow::Owned);
-        Ok(message(method, params, id))
+        (params, size.0)
     }
 }
 

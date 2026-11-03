@@ -291,25 +291,6 @@ fn remaining_lookahead_wire_bytes(
         .saturating_sub(estimated_resident_pipeline_bytes(snapshot))
 }
 
-/// Retention-only admission for a body that is already downloaded.
-///
-/// A received body consumes no request budget (its wire reservation is
-/// released at receipt), so unlike [`admit`] this never consults
-/// `budget_available`: only the commit-window exemption and the resident
-/// look-ahead gate — the two rules that bound retention — apply.
-pub(super) fn admit_received_body(
-    config: &ZakuraBlockSyncConfig,
-    snapshot: &AdmissionSnapshot,
-    height: block::Height,
-    serialized_bytes: u64,
-) -> bool {
-    if height <= commit_window_high(snapshot) {
-        return true;
-    }
-    !lookahead_over_budget(config, snapshot)
-        && serialized_bytes <= remaining_lookahead_wire_bytes(config, snapshot)
-}
-
 /// Final, serialized-backlog cap checked by the single sequencer owner.
 /// Request estimates and queued copies are not retained backlog. Decoded input
 /// and submitted blocks have separate bounded windows. The verified checkpoint

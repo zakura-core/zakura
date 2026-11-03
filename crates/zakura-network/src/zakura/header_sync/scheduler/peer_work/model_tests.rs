@@ -596,10 +596,10 @@ impl Harness {
                         PageFacts {
                             reaches_target,
                             reserved: self.queue.reserved_header_count(&id),
-                            budget_full: self.queue.budget_is_full(),
-                            durable_prefix_full: false,
                             checkpoint_prefix_ready: false,
                         },
+                        || self.queue.budget_is_full(),
+                        || false,
                     );
                     assert_eq!(
                         next,

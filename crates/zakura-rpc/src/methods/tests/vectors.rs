@@ -3615,6 +3615,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
@@ -3782,6 +3783,19 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     queue.abort();
 }
 
+#[test]
+fn test_networks_ignore_tip_age() {
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(Height(1));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now() - chrono::Duration::days(30));
+
+    crate::methods::types::get_block_template::check_synced_to_tip(
+        &Network::new_default_testnet(),
+        tip,
+    )
+    .expect("test networks serve templates regardless of tip age");
+}
+
 async fn gbt_with(net: Network, addr: ZcashAddress) {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -3817,6 +3831,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     mock_tip_sender.send_best_tip_height(fake_tip_height);
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -3953,35 +3968,56 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         Amount::<NonNegative>::zero()
     );
 
-    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(200));
-    let get_block_template_sync_error = rpc
-        .get_block_template(None)
-        .await
-        .expect_err("needs an error when estimated distance to network chain tip is far");
+    // The gate compares the tip's block time with the local clock. Each case stays at least a
+    // minute away from the boundary, so time passing during the test can't change the result.
+    let request_template = |tip_age: Option<chrono::Duration>| {
+        mock_tip_sender.send_best_tip_block_time(tip_age.map(|age| chrono::Utc::now() - age));
+        async {
+            tokio::join!(
+                rpc.get_block_template(None),
+                make_mock_mempool_request_handler(vec![], fake_tip_hash),
+                make_mock_read_state_request_handler(),
+            )
+            .0
+        }
+    };
 
-    assert_eq!(
-        get_block_template_sync_error.code(),
-        ErrorCode::ServerError(-10).code()
-    );
+    request_template(Some(
+        chrono::Duration::hours(6) - chrono::Duration::minutes(1),
+    ))
+    .await
+    .expect("a tip just inside the tip-age window is accepted");
+
+    request_template(Some(-chrono::Duration::hours(1)))
+        .await
+        .expect("a tip with a block time ahead of the local clock is accepted");
 
     mock_sync_status.set_is_close_to_tip(false);
+    request_template(Some(chrono::Duration::zero()))
+        .await
+        .expect("a fresh tip is accepted regardless of other node state");
+    mock_sync_status.set_is_close_to_tip(true);
 
-    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(None);
     let get_block_template_sync_error = rpc
         .get_block_template(None)
         .await
-        .expect_err("needs an error when syncer is not close to tip");
+        .expect_err("needs an error when the tip has no block time");
 
-    assert_eq!(
-        get_block_template_sync_error.code(),
-        ErrorCode::ServerError(-10).code()
+    assert!(
+        get_block_template_sync_error
+            .message()
+            .contains("no chain tip available yet"),
+        "unexpected error: {get_block_template_sync_error:?}"
     );
 
-    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(200));
+    mock_tip_sender.send_best_tip_block_time(
+        chrono::Utc::now() - chrono::Duration::hours(6) - chrono::Duration::minutes(1),
+    );
     let get_block_template_sync_error = rpc
         .get_block_template(None)
         .await
-        .expect_err("needs an error when syncer is not close to tip or estimated distance to network chain tip is far");
+        .expect_err("needs an error when the tip is older than the tip-age window");
 
     assert_eq!(
         get_block_template_sync_error.code(),
@@ -4065,6 +4101,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     mock_sync_status.set_is_close_to_tip(true);
 
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let (get_block_template, ..) = tokio::join!(
         rpc.get_block_template(None),
@@ -5577,6 +5614,7 @@ async fn a_rejection_that_arrives_after_the_deadline_still_withdraws_the_templat
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let mempool = tower::service_fn(move |_| async move {
@@ -5699,6 +5737,7 @@ async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(first_parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
 
@@ -5803,6 +5842,7 @@ async fn a_timed_out_parent_is_not_speculated_on_again() {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let mempool = tower::service_fn(move |_| async move {

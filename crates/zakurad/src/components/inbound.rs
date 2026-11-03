@@ -20,7 +20,7 @@ use futures::{
     Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tower::{buffer::Buffer, timeout::Timeout, Service, ServiceExt};
+use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneSyncService, Service, ServiceExt};
 
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
@@ -100,8 +100,7 @@ pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
      requiring this block cannot continue syncing. Restore zcashd from a newer snapshot, or use \
      archive storage on Zakura side https://zakura.com/snapshots/ .";
 
-type BlockDownloadPeerSet =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type BlockDownloadPeerSet = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type Mempool = Buffer<
@@ -562,9 +561,13 @@ impl Service<zn::Request> for Inbound {
                             ));
                         }
 
-                        // The outcome, including a replacement refused by the queue bounds, is
-                        // logged by `retry_poisoned` itself.
-                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        // A failed parent recovery is left to the syncer. A re-request would
+                        // leave the recovery bounds, because it is an ordinary download.
+                        if !mismatch.parent_recovery {
+                            // The outcome, including a replacement refused by the queue bounds,
+                            // is logged by `retry_poisoned` itself.
+                            let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        }
                         continue;
                     }
 

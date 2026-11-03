@@ -4030,6 +4030,60 @@ fn sapling_v4_output_with_invalid_value_commitment_is_rejected_after_roundtrip()
     });
 }
 
+/// A coinbase transaction whose Sapling output has an invalid (off-curve) value
+/// commitment is rejected by the verifier with `SmallOrder`.
+///
+/// Converting a transaction through librustzcash no longer rejects an invalid
+/// Sapling `cv`, so `check::coinbase_outputs_are_decryptable`, which converts
+/// the coinbase, can no longer be relied on to reject one: a miner can encrypt
+/// the output under the invalid `cv` so that it decrypts. The early semantic
+/// point check still rejects the coinbase, which fails its block.
+#[test]
+fn sapling_coinbase_output_with_invalid_value_commitment_is_rejected() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .find(|(_, transaction)| {
+                transaction.is_coinbase()
+                    && matches!(transaction.as_ref(), Transaction::V4 { .. })
+                    && transaction.sapling_outputs().next().is_some()
+            })
+            .expect("a V4 coinbase transaction with Sapling outputs");
+
+        corrupt_first_sapling_output_value_commitment(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+        );
+
+        assert!(
+            !transaction.sapling_point_encodings_are_valid(),
+            "the deferred Sapling point check must reject the coinbase's invalid cv"
+        );
+
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let verifier = Verifier::new_for_tests(&network, state_service);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction_hash: transaction.hash(),
+                transaction,
+                known_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::SmallOrder),
+            "a coinbase Sapling output with an off-curve cv must be rejected with SmallOrder",
+        );
+    });
+}
+
 /// Transactions whose Sapling spend has an invalid (off-curve) value
 /// commitment are rejected by the verifier with `SmallOrder`.
 ///

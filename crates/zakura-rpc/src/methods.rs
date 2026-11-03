@@ -3401,7 +3401,6 @@ where
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
-        let sync_status = self.gbt.sync_status();
         let read_state = self.read_state.clone();
 
         if let Some(HexData(block_proposal_bytes)) = parameters
@@ -3413,11 +3412,10 @@ where
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
-                sync_status,
+                self.gbt.prepared_candidates(),
                 parameters
                     .as_ref()
-                    .and_then(|params| params.work_id.as_deref())
-                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
+                    .and_then(|params| params.work_id.as_deref()),
             )
             .await;
         }
@@ -3459,7 +3457,7 @@ where
                 //
                 // Optional TODO:
                 // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                check_synced_to_tip(&self.network, latest_chain_tip.clone())?;
                 // TODO: return an error if we have no peers, like `zcashd` does,
                 //       and add a developer config that mines regardless of how many peers we have.
                 // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
@@ -3805,23 +3803,26 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block) => block,
-            Err(error) => {
-                tracing::info!(
-                    ?error,
-                    "submit block failed: block bytes could not be deserialized into a structurally valid block"
-                );
+        let block = match self
+            .gbt
+            .prepared_candidates()
+            .decode_submitted(&block_bytes)
+        {
+            Some(block) => block,
+            None => match block_bytes.zcash_deserialize_into::<Block>() {
+                Ok(block) => Arc::new(block),
+                Err(error) => {
+                    tracing::info!(
+                        ?error,
+                        "submit block failed: block bytes could not be deserialized into a structurally valid block"
+                    );
 
-                return Ok(SubmitBlockErrorResponse::Rejected.into());
-            }
+                    return Ok(SubmitBlockErrorResponse::Rejected.into());
+                }
+            },
         };
-        self.run_mined_block_lifecycle(
-            Arc::new(block),
-            submitted_at,
-            MinedBlockSubmission::FullBlock,
-        )
-        .await
+        self.run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::FullBlock)
+            .await
     }
 
     async fn submit_solution(

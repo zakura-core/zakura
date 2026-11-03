@@ -496,6 +496,10 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
+            // This is the only check on Sapling `cv` encodings before proof
+            // verification: librustzcash keeps `cv` as bytes when it parses, so
+            // `to_librustzcash` no longer rejects an invalid one. Keep it here,
+            // ahead of every conversion and proof.
             check::sapling_point_encodings_are_valid(&tx)?;
 
             // A transaction whose own shielded counts exceed a per-block ZIP 218
@@ -1011,6 +1015,15 @@ where
         Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        if joinsplit_data.is_none() && sapling_bundle.is_none() {
+            // Only shielded data signs the transaction-wide sighash, so a transparent-only
+            // transaction never needs it; its inputs compute their own sighashes.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1125,6 +1138,15 @@ where
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1206,6 +1228,15 @@ where
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
         let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() && ironwood_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()

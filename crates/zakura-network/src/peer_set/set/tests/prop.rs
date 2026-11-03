@@ -378,10 +378,7 @@ fn sidecar_peer_always_receives_block_gossip() {
             sidecar_received,
             "configured sidecar receives the first wave"
         );
-        assert_eq!(
-            received,
-            crate::peer::block_gossip::BLOCK_GOSSIP_CONCURRENCY
-        );
+        assert_eq!(received, crate::peer::block_gossip::BLOCK_ADVERT_WINDOW);
         tokio::task::yield_now().await;
         // Inventory completion alone cannot start the remaining advertisements.
         for handle in &mut handles {

@@ -513,8 +513,9 @@ const MAX_BLOCKING_READ_WORKERS: u64 = 512;
 /// `zakura-network`'s default inbound limit, 100 initial target peers × 3.
 pub const DEFAULT_READ_RESULT_PEERS: usize = 300;
 
-/// The ceiling on the derived retained read limit when no peer memory budget is known:
-/// `zakura-network`'s default `peer_memory_budget_bytes`, 8 GiB.
+/// The ceiling on the derived retained read limit: 8 GiB, the 2026-11-02 choice. The
+/// honest derivation for 300 peers is about 115 GB, which would never bind. It stays
+/// fixed, so raising `zakura-network`'s peer memory budget does not raise it.
 pub const DEFAULT_READ_RESULT_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Blocks one peer request can hold as read results: `zakurad`'s legacy

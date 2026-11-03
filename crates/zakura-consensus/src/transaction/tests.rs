@@ -1189,9 +1189,14 @@ async fn mempool_request_with_missing_input_is_rejected() {
         let verifier = Verifier::new_for_tests(&net, state.clone());
 
         let (height, tx) = transactions_from_blocks(net.block_iter())
-            .find(|(_, tx)| !(tx.is_coinbase() || tx.inputs().is_empty()))
+            .find(|(_, tx)| {
+                tx.version() >= 4
+                    && !tx.is_coinbase()
+                    && !tx.inputs().is_empty()
+                    && !tx.lock_time_is_time()
+            })
             .expect(
-                "At least one non-coinbase transaction with transparent inputs in test vectors",
+                "test vectors include a supported non-coinbase transaction with transparent inputs and no time lock",
             );
 
         let input_outpoint = match tx.inputs()[0] {
@@ -1199,8 +1204,7 @@ async fn mempool_request_with_missing_input_is_rejected() {
             transparent::Input::Coinbase { .. } => panic!("requires a non-coinbase transaction"),
         };
 
-        // The first non-coinbase transaction with transparent inputs in our test vectors
-        // does not use a lock time, so we don't see Request::BestChainNextMedianTimePast here
+        // The fixture needs no median-time lookup, so the missing input is the first query.
 
         let state_req = state
             .expect_request(zakura_state::Request::UnspentBestChainUtxo(input_outpoint))

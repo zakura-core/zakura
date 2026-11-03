@@ -25,7 +25,9 @@ fn sprout_precheck_transaction() -> Transaction {
         sprout::Nullifier([4; 32].into()),
     ];
     joinsplit_data.rest = vec![second];
-    let tx = Transaction::V4 {
+    let signing_key = ed25519::SigningKey::new(rand_core::OsRng);
+    joinsplit_data.pub_key = ed25519::VerificationKey::from(&signing_key).into();
+    let mut tx = Transaction::V4 {
         inputs: Vec::new(),
         outputs: Vec::new(),
         lock_time: LockTime::unlocked(),
@@ -33,6 +35,21 @@ fn sprout_precheck_transaction() -> Transaction {
         joinsplit_data: Some(joinsplit_data),
         sapling_shielded_data: None,
     };
+    let sighash = tx
+        .sighash(
+            NetworkUpgrade::Canopy,
+            HashType::ALL,
+            Arc::new(Vec::new()),
+            None,
+        )
+        .expect("v4 transactions support Canopy signature hashes");
+    if let Transaction::V4 {
+        joinsplit_data: Some(data),
+        ..
+    } = &mut tx
+    {
+        data.sig = signing_key.sign(sighash.as_ref());
+    }
     check::has_inputs_and_outputs(&tx).unwrap();
     let unmined = tx.clone().into();
     let fee = 100_000.try_into().unwrap();
@@ -116,8 +133,7 @@ fn well_encoded_sprout_proofs_require_chain_and_cryptographic_checks() {
                         zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
                     )
                 })
-                .await
-                .unwrap();
+                .await;
             if accept_chain_context {
                 response.respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
                 let error = timeout(test_timeout(), verification)
@@ -125,14 +141,11 @@ fn well_encoded_sprout_proofs_require_chain_and_cryptographic_checks() {
                     .expect("proof verification must finish")
                     .unwrap_err();
                 assert!(
-                    matches!(
-                        error,
-                        TransactionError::Groth16(_) | TransactionError::Ed25519(_)
-                    ),
-                    "well-encoded but invalid proofs or signatures must still fail: {error:?}"
+                    matches!(error, TransactionError::Groth16(_)),
+                    "well-encoded but invalid proofs must still fail: {error:?}"
                 );
             } else {
-                response.respond_error(anchor_error.clone());
+                response.respond_error(anchor_error.clone().into());
                 assert_eq!(verification.await.unwrap_err(), anchor_error.clone().into());
             }
             state.expect_no_requests().await;

@@ -1799,12 +1799,13 @@ where
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
-        // Block gossip sizes its advert fan-out from this.
-        let size = block.zcash_serialized_size();
         let submission_guard = match self.gbt.reserve_mined_submission(block_hash) {
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
         };
+        // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
+        // runs only after the reservation rejects duplicate and over-capacity submissions.
+        let size = block.zcash_serialized_size();
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone(),

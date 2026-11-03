@@ -33,6 +33,7 @@ use crate::{
         block_gossip::{BlockAdvert, BlockAdvertError},
         connection::peer_tx::PeerTx,
         error::AlreadyErrored,
+        tcp_progress::UploadProgress,
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
@@ -720,6 +721,15 @@ where
             last_overload_time: None,
             trace,
         }
+    }
+
+    /// Records the delivery of every block body this connection sends with `progress`.
+    ///
+    /// The connection becomes the only owner of `progress` and its socket handle, which close
+    /// when the connection's message sender drops.
+    pub(crate) fn with_upload_progress(mut self, progress: Option<UploadProgress>) -> Self {
+        self.peer_tx.set_upload_progress(progress);
+        self
     }
 }
 

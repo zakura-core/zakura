@@ -10,7 +10,10 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
-use super::{super::Chain, TransparentTransfers};
+use super::{
+    super::{Chain, RevertPosition, UpdateWith},
+    TransparentTransfers,
+};
 
 #[test]
 fn cloned_chain_keeps_transparent_address_history_isolated() {
@@ -67,6 +70,60 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
     assert!(history(&candidate).tx_ids.contains(&added));
     assert!(!history(&original).tx_ids.contains(&added));
     assert!(history(&original).tx_ids.contains(&existing));
+}
+
+/// Records a coinbase output paid to the address at `height`.
+fn receive_coinbase(
+    transfers: &mut TransparentTransfers,
+    height: u32,
+) -> (transparent::OutPoint, transparent::OrderedUtxo) {
+    let outpoint = transparent::OutPoint {
+        hash: transaction::Hash([u8::try_from(height).expect("test heights fit in u8"); 32]),
+        index: 0,
+    };
+    let output = transparent::Output::new(
+        zakura_chain::amount::Amount::try_from(1_000).expect("the amount is in range"),
+        transparent::Script::new(&[0x51; 25]),
+    );
+    let utxo = transparent::OrderedUtxo::new(output, Height(height), 0);
+    transfers
+        .update_chain_tip_with(&(&outpoint, &utxo))
+        .expect("a new output is accepted");
+    (outpoint, utxo)
+}
+
+#[test]
+fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
+    let mut original = TransparentTransfers::default();
+    for height in 1..=3 {
+        receive_coinbase(&mut original, height);
+    }
+
+    // A snapshot taken before the next block keeps the earlier outputs without copying them.
+    let mut appended = original.clone();
+    let (outpoint, utxo) = receive_coinbase(&mut appended, 4);
+
+    for height in 1..=3 {
+        assert!(Arc::ptr_eq(
+            &original.created_utxos[&Height(height)],
+            &appended.created_utxos[&Height(height)],
+        ));
+    }
+    assert_eq!(original.created_utxos().count(), 3);
+    assert_eq!(appended.created_utxos().count(), 4);
+    assert_eq!(appended.received(), 4_000);
+
+    // Outputs are listed in chain order across heights.
+    let heights: Vec<_> = appended
+        .created_utxos()
+        .map(|(location, _)| location.height())
+        .collect();
+    assert_eq!(heights, [Height(1), Height(2), Height(3), Height(4)]);
+
+    // Reverting the block removes its whole height and leaves no empty group behind.
+    appended.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
+    assert_eq!(appended, original);
+    assert!(!appended.created_utxos.contains_key(&Height(4)));
 }
 
 #[test]

@@ -91,7 +91,6 @@ pub use events::{
 pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
-#[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
 #[cfg(any(test, zakura_sim))]
 pub use service::{block_sync_serving_limit, block_sync_streams};

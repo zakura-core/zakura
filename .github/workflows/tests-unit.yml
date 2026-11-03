@@ -496,11 +496,13 @@ jobs:
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build
+        # Use the simulator's optimized profile while retaining debug assertions
+        # and overflow checks. Unoptimized scenario runs exceed the job budget.
         run: |
-          cargo test --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic
-          cargo test --locked -p zakura-network --test sim_header_sync --test sim_block_sync
+          cargo test --locked --profile planted -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic
+          cargo test --locked --profile planted -p zakura-network --test sim_header_sync --test sim_block_sync
           # Rustdoc needs the flag too, or the crate has no doc tests to run.
-          RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc
+          RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked --profile planted -p zakura-sim --doc
         env:
           RUSTFLAGS: --cfg zakura_sim
 

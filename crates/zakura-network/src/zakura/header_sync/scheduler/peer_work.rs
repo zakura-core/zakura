@@ -1307,4 +1307,49 @@ mod tests {
             OfferDecision::Stage
         );
     }
+
+    /// A page that waits for credit or is ready for its checkpoint prefix never
+    /// reads the budget or the durable prefix, and a full budget skips the
+    /// durable prefix.
+    #[test]
+    fn a_page_reads_capacity_facts_only_when_earlier_checks_pass() {
+        let local = snapshot();
+        let active = active_request(
+            1,
+            advertisement(1),
+            &local,
+            vec![HeaderEntry {
+                header: regtest_genesis_block().header.clone(),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        );
+        let staged_tip = active.staged_tip().expect("one header is staged");
+        let facts = |reserved, checkpoint_prefix_ready| PageFacts {
+            reaches_target: false,
+            reserved,
+            checkpoint_prefix_ready,
+        };
+        let unread = || -> bool { panic!("an earlier check decides this page") };
+        assert_eq!(
+            page_next(&active, facts(1, false), unread, unread),
+            PageNext::WaitCredit
+        );
+        let bounded = PageNext::Prepare {
+            bounded_prefix: true,
+        };
+        assert_eq!(page_next(&active, facts(0, true), unread, unread), bounded);
+        assert_eq!(
+            page_next(&active, facts(0, false), || true, unread),
+            bounded
+        );
+        assert_eq!(
+            page_next(&active, facts(0, false), || false, || true),
+            bounded
+        );
+        assert_eq!(
+            page_next(&active, facts(0, false), || false, || false),
+            PageNext::Continue { staged_tip }
+        );
+    }
 }

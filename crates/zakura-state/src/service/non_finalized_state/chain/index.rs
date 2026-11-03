@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::RangeInclusive,
+    sync::Arc,
 };
 
 use zakura_chain::{
@@ -35,11 +36,10 @@ pub struct TransparentTransfers {
     /// The `getaddressutxos` RPC doesn't need these transaction IDs to be sorted in chain order,
     /// but it might in future. So Zebra does it anyway.
     ///
-    /// Optional TODOs:
-    /// - store `Utxo`s in the chain, and just store the created locations for this address
-    /// - if we add an OutputLocation to UTXO, remove this OutputLocation,
-    ///   and use the inner OutputLocation to sort Utxos in chain order
-    created_utxos: BTreeMap<OutputLocation, transparent::Output>,
+    /// Outputs are grouped by the height of the block that created them. Each group is shared
+    /// between chain snapshots, so committing a block copies one pointer per earlier height
+    /// rather than every earlier output. Groups are never empty.
+    created_utxos: BTreeMap<Height, Arc<CreatedOutputs>>,
 
     /// The partial list of UTXOs spent by a transparent address.
     ///
@@ -51,6 +51,9 @@ pub struct TransparentTransfers {
     ///   and stop storing spent UTXOs by address
     spent_utxos: BTreeSet<OutputLocation>,
 }
+
+/// The outputs one block created for an address, in chain order.
+type CreatedOutputs = BTreeMap<OutputLocation, transparent::Output>;
 
 // A created UTXO
 //
@@ -81,9 +84,12 @@ impl
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
 
-        let previous_entry = self
+        let height_outputs = self
             .created_utxos
-            .insert(output_location, created_utxo.utxo.output.clone());
+            .entry(transaction_location.height)
+            .or_default();
+        let previous_entry =
+            Arc::make_mut(height_outputs).insert(output_location, created_utxo.utxo.output.clone());
         assert_eq!(
             previous_entry, None,
             "unexpected created output: duplicate update or duplicate UTXO",
@@ -111,9 +117,22 @@ impl
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
 
-        let removed_entry = self.created_utxos.remove(&output_location);
+        let height_outputs = self
+            .created_utxos
+            .get_mut(&transaction_location.height)
+            .expect("created output height exists because the block was previously applied");
+        // Drop a group that only holds this output instead of copying it to empty it.
+        let output_was_removed =
+            if height_outputs.len() == 1 && height_outputs.contains_key(&output_location) {
+                self.created_utxos.remove(&transaction_location.height);
+                true
+            } else {
+                Arc::make_mut(height_outputs)
+                    .remove(&output_location)
+                    .is_some()
+            };
         assert!(
-            removed_entry.is_some(),
+            output_was_removed,
             "unexpected revert of created output: duplicate update or duplicate UTXO",
         );
 
@@ -230,8 +249,9 @@ impl TransparentTransfers {
 
     /// Returns the partial received balance for this address.
     pub fn received(&self) -> u64 {
-        let received_utxos = self.created_utxos.values();
-        received_utxos.map(|out| out.value()).map(u64::from).sum()
+        self.created_utxos()
+            .map(|(_, output)| u64::from(output.value()))
+            .sum()
     }
 
     /// Returns the [`transaction::Hash`]es of the transactions that sent or
@@ -276,8 +296,10 @@ impl TransparentTransfers {
     /// Some of these outputs might already be spent.
     /// [`TransparentTransfers::spent_utxos`] returns spent UTXOs.
     #[allow(dead_code)]
-    pub fn created_utxos(&self) -> &BTreeMap<OutputLocation, transparent::Output> {
-        &self.created_utxos
+    pub fn created_utxos(&self) -> impl Iterator<Item = (&OutputLocation, &transparent::Output)> {
+        self.created_utxos
+            .values()
+            .flat_map(|outputs| outputs.iter())
     }
 
     /// Returns the [`OutputLocation`]s of the spent transparent outputs sent to this address,

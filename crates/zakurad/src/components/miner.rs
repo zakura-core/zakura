@@ -775,9 +775,9 @@ mod tests {
         chain_tip_sender.send_best_tip_height(block::Height(1));
         chain_tip_sender.send_best_tip_hash(block.hash());
         chain_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        chain_tip_sender.send_best_tip_block_time(chrono::Utc::now() - chrono::Duration::hours(7));
 
-        let mut sync_status = MockSyncStatus::default();
-        sync_status.set_is_close_to_tip(false);
+        let sync_status = MockSyncStatus::default();
 
         let mempool = Buffer::new(
             MockService::build().for_unit_tests::<
@@ -866,6 +866,7 @@ mod tests {
         tip_sender.send_best_tip_height(height);
         tip_sender.send_best_tip_hash(parent);
         tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        tip_sender.send_best_tip_block_time(chrono::Utc::now());
         let mut sync = MockSyncStatus::default();
         sync.set_is_close_to_tip(true);
         let (mempool_calls, mut calls) = watch::channel(0);

@@ -169,12 +169,13 @@ impl<S> HttpRequestMiddleware<S> {
         version: JsonRpcVersion,
         response: HttpResponse<HttpBody>,
     ) -> Result<HttpResponse<HttpBody>, BoxError> {
-        let (parts, body) = response.into_parts();
-        let bytes = body.collect().await?.to_bytes();
         if matches!(version, JsonRpcVersion::TwoPointZero) {
             // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
-            return Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes)));
+            return Ok(response);
         }
+
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await?.to_bytes();
         let bytes =
             if let Ok(response) = serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref()) {
                 serde_json::to_vec(&response.into_version(version))
@@ -308,16 +309,25 @@ fn is_canonical_array(params: &RawValue) -> bool {
     let compact_len = 2
         + items.iter().map(|item| item.get().len()).sum::<usize>()
         + items.len().saturating_sub(1);
-    compact_len == params.get().len()
-        && items.iter().all(|item| {
-            let item = item.get();
-            // A JSON string can only contain a quote or control character as an escape, so
-            // one without a backslash re-encodes unchanged.
-            (item.starts_with('"') && !item.contains('\\'))
-                || serde_json::from_str::<serde_json::Value>(item)
-                    .and_then(|value| serde_json::to_string(&value))
-                    .is_ok_and(|encoded| encoded == item)
-        })
+    if compact_len != params.get().len() {
+        return false;
+    }
+
+    items.iter().all(|item| reencodes_unchanged(item))
+}
+
+/// Returns whether a JSON value re-encodes to the same bytes.
+fn reencodes_unchanged(value: &RawValue) -> bool {
+    let json = value.get();
+
+    // Strings without escapes serialize unchanged.
+    if json.starts_with('"') && !json.contains('\\') {
+        return true;
+    }
+
+    serde_json::from_str::<serde_json::Value>(json)
+        .and_then(|value| serde_json::to_string(&value))
+        .is_ok_and(|encoded| encoded == json)
 }
 
 /// A JSON-RPC 2.0 call with only the standard fields, borrowed from the request body.

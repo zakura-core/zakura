@@ -281,9 +281,9 @@ async fn a_full_kind_gate_leaves_other_kinds_flowing() -> Result<(), BoxError> {
     const HEADERS: Stream = test_stream(905, StreamMode::Persistent);
     const BLOCKS: Stream = test_stream(906, StreamMode::Persistent);
     let mut link = Link::connect().await?;
-    let connection = connection_gates(&[HEADERS, BLOCKS], 64, 1024);
+    let connection = connection_gates(&[HEADERS, BLOCKS], 1024, 1024);
     let headers = stream_of(&connection, HEADERS.kind);
-    let full = headers.raw.try_admit(64).unwrap();
+    let full = headers.raw.try_admit(1024).unwrap();
 
     let bytes = frame_bytes(1, 16);
     let mut header_context = tabled_context(None, 128);

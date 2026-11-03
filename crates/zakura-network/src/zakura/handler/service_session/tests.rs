@@ -610,12 +610,16 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
     };
     let shares = ReactorShares {
         control_receive_bytes: 256 * KIB,
-        kinds: vec![(SIBLING.kind, budget(192 * KIB))],
-        other: budget(128 * KIB),
+        // Each share holds one 2 MiB frame of these streams.
+        kinds: vec![(SIBLING.kind, budget(3 * 1024 * KIB))],
+        other: budget(2 * 1024 * KIB),
     };
     let local = ZakuraLocalLimits::from_config(&Config::default()).with_reactor_shares(shares);
     assert_eq!(u64::from(local.quic.receive_window_bytes), 256 * KIB);
-    assert_eq!(u64::from(local.quic.stream_receive_window_bytes), 192 * KIB);
+    assert_eq!(
+        u64::from(local.quic.stream_receive_window_bytes),
+        3 * 1024 * KIB
+    );
     let server = LocalEndpointFactory::with_limits(&local)
         .endpoint(93211)
         .await?;
@@ -692,7 +696,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
             .await
     }));
     timeout(TEST_TIMEOUT, async {
-        while remote.load().receive_window != (256 + 192) * KIB {
+        while remote.load().receive_window != (256 + 3 * 1024) * KIB {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

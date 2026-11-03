@@ -1464,6 +1464,11 @@ impl<'de> Deserialize<'de> for Config {
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
         if p2p_stack.resolve(&network).runs_zakura() {
+            zakura
+                .validate_stream_receive_window()
+                .map_err(de::Error::custom)?;
+        }
+        if p2p_stack.resolve(&network).runs_zakura() {
             // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
             // lowers a larger cap after tracing starts so its warning is logged.
             zakura

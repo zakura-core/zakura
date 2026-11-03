@@ -418,6 +418,28 @@ impl Default for ZakuraConfig {
 }
 
 impl ZakuraConfig {
+    /// Refuses a stream receive window that can't hold the largest native
+    /// frame, a block-sync frame of `MAX_BS_FRAME_BYTES`.
+    ///
+    /// Each native stream kind's receive share is the stream window
+    /// ([`ReactorShares::from_quic`]). A frame above its share would take the
+    /// whole share and be charged less than it holds, so the endpoint would
+    /// refuse to start.
+    pub fn validate_stream_receive_window(&self) -> Result<(), zakura_quic::ConfigError> {
+        let largest = super::block_sync::MAX_BS_FRAME_BYTES.min(super::LOCAL_MAX_MESSAGE_BYTES);
+        let window = self.quic.stream_receive_window_bytes;
+        if window < largest {
+            return Err(zakura_quic::ConfigError {
+                key: "stream_receive_window_bytes",
+                reason: format!(
+                    "{window} can't hold the largest native frame of {largest} bytes; \
+                     each native stream kind receives at most one stream window"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Return the effective per-IP admission cap, preserving a non-zero limit.
     pub fn max_connections_per_ip(&self) -> usize {
         if self.max_connections_per_ip == 0 {
@@ -7032,6 +7054,31 @@ mod tests {
         transaction::{self, UnminedTxId},
     };
     use zakura_test::vectors::{BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_141042_BYTES};
+
+    /// The stream window check compares against block sync's frame cap, so no
+    /// other native stream kind may carry a larger frame.
+    #[test]
+    fn block_sync_carries_the_largest_native_frame() {
+        use crate::zakura::header_sync::v9::{CommonMessage, RegtestMessage};
+
+        let streams: Vec<Stream> = super::super::legacy_gossip::legacy_gossip_streams()
+            .iter()
+            .chain(&CommonMessage::LAYOUT)
+            .chain(&RegtestMessage::LAYOUT)
+            .copied()
+            .collect();
+        for stream in &streams {
+            assert!(
+                stream.frame_cap <= MAX_BS_FRAME_BYTES,
+                "stream kind {} carries {} bytes, more than a block-sync frame",
+                stream.kind,
+                stream.frame_cap
+            );
+        }
+        // Discovery's frame is its largest peers payload and a frame header.
+        let discovery = super::super::discovery::wire::PEERS_MAX_BYTES + FRAME_HEADER_BYTES;
+        assert!(discovery <= MAX_BS_FRAME_BYTES as usize);
+    }
 
     /// Regression for the mainnet dual-stack body-sync stall on
     /// `temp-zakura-sync-test-7` during run `20260714T073939Z-cca353fd1287`.

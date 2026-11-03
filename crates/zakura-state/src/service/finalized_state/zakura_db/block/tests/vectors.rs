@@ -358,9 +358,10 @@ async fn find_block_headers_results_keep_their_read_admission() {
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let (mut state, mut read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
+    let (mut state, mut read, _, _) =
+        StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
     for bytes in [
         &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
         &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],

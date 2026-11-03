@@ -1,7 +1,7 @@
 //! State [`tower::Service`] response types.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
@@ -44,6 +44,21 @@ pub enum PreparedMinedRelayEligibility {
     /// The block proves expected work but does not extend the selected tip.
     CommitFirst,
     /// State cannot prove expected work from the available context.
+    Unavailable,
+}
+
+/// Whether a block's header commits to the authorizing data in its body.
+///
+/// From NU5, the block hash commits to authorizing data only through `hashBlockCommitments`
+/// (ZIP 244), so a body can match its header's transaction IDs and still carry different
+/// signatures, proofs, or scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthDataCommitment {
+    /// The header commits to the body's authorizing data. Before NU5, transaction IDs do.
+    Bound,
+    /// The body's authorizing data does not match the header's commitment.
+    Mismatch(block::CommitmentError),
+    /// The parent's history tree is not available, so the binding is unknown.
     Unavailable,
 }
 
@@ -138,6 +153,9 @@ pub enum Response {
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
+    /// Response to [`Request::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
+
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -153,14 +171,22 @@ pub enum Response {
 }
 
 /// The result of checking a candidate block's external inputs against its parent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentInputs {
+    /// Every input is unspent at the parent, with the output each one spends.
+    ///
+    /// The block verifier hands these outputs to its transaction checks, so they are read once
+    /// per block. The map holds each output once while the block verifies, in addition to the
+    /// copies the transaction checks make of the outputs they spend. Its locking scripts are
+    /// capped per check, see `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
+    Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),
     /// The parent is neither in a non-finalized chain nor the finalized tip,
     /// so no chain can accept the candidate now.
     ParentUnavailable,
-    /// Every input is unspent at the parent, or the parent context changed during the read.
+    /// The state could not decide, for example because the parent context changed during the read,
+    /// or every input was found but their outputs were too large to keep.
     Inconclusive,
 }
 
@@ -647,6 +673,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
+    /// Response to [`ReadRequest::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
+
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -768,6 +797,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
             ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
+            }
+            ReadResponse::AuthDataCommitment(commitment) => {
+                Ok(Response::AuthDataCommitment(commitment))
             }
 
             ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),

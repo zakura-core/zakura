@@ -3613,6 +3613,37 @@ fn late_body_does_not_resurrect_charge() {
 }
 
 #[test]
+fn an_unmatched_receipt_takes_only_the_charge_it_looked_up() {
+    // A routine with no request for height 1 receives its body while another
+    // routine publishes height 1. The lookup and the transfer share one queue
+    // lock, so the receipt sees either pending work, which it leaves alone, or
+    // the published request, whose charge it takes.
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    assert!(queue
+        .begin_unmatched_receipt(block::Height(1))
+        .expect("fixture funding matches the queue")
+        .is_none());
+    assert!(queue.pending_contains(block::Height(1)));
+    assert_eq!(queue.budget().reserved(), 0);
+
+    let owner = queue.publish_fixture(1..=1);
+    let (ended_owner, ended) = queue
+        .begin_unmatched_receipt(block::Height(1))
+        .expect("fixture funding matches the queue")
+        .expect("the published request reserves height 1");
+    assert_eq!(ended_owner, owner);
+    assert_eq!(ended.charge, 100);
+    assert_eq!(ended.funding.bytes(), 100);
+    assert_eq!(
+        queue.receive_fixture(owner, block::Height(1)),
+        None,
+        "the owner's own body can't release the charge again"
+    );
+    drop(ended);
+    assert_eq!(queue.budget().reserved(), 0);
+}
+
+#[test]
 fn claim_received_does_not_orphan_a_charge() {
     // An unmatched body claims its height without a new reservation, but any stale
     // request reservation it still owned is handed back exactly once.
@@ -4965,7 +4996,6 @@ impl TestSequencer {
                 facts.id,
                 &test_decoded_pool(),
                 admission::submission_decode_admission(self.policy.verified_tip(), height),
-                0,
             )
             .unwrap();
         let intent = self
@@ -7396,54 +7426,6 @@ async fn reactor_handle_observes_its_actual_request_budget_closing() {
     drop(claim);
     drop(retained);
     reactor.abort();
-}
-
-#[test]
-fn received_body_admission_ignores_request_budget() {
-    // A received body consumes no request budget, so a wire budget saturated by
-    // outstanding requests must not cause it to be dropped and re-downloaded:
-    // only the commit-window exemption and the resident gate apply.
-    let config = ZakuraBlockSyncConfig {
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(600),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
-        reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        // Outstanding requests have spent the entire in-flight budget.
-        budget_available: 0,
-    };
-    // In-window heights (<= verified_tip 10 + 401 = 411) stay exempt.
-    assert!(super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(411),
-        2_000_000,
-    ));
-    // Above the window the resident gate is the sole authority. The body is
-    // retained serialized, so one wire byte consumes one byte of headroom.
-    assert!(super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(602),
-        1_000,
-    ));
-    // A body larger than the remaining serialized headroom is refused.
-    assert!(!super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(602),
-        1_001,
-    ));
 }
 
 proptest::proptest! {

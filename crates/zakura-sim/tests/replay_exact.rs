@@ -1194,10 +1194,12 @@ fn work_machine_records_and_replays_without_transport() {
         .any(|step| matches!(step.machine.as_deref(), Some(zakura_sim::record::machine::MachineStep::Work(work)) if work.actual.reserved > 0)));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
-    assert!(matches!(
+    // The property applies from step 3, the first whose model holds a charged
+    // in-flight item, through step 10.
+    assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Held { applicable: 10 }
-    ));
+        PropertyOutcome::Held { applicable: 8 }
+    );
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "work_machine_replay_child"])
         .env("ZAKURA_WORK_MACHINE_CHILD", dir.path())

@@ -6,10 +6,10 @@ use zakura_rt::sync::CancellationToken;
 
 use super::{
     serving::{Server, Source},
-    wire::{Range, GET_BLOCKS},
+    wire::{Range, GET_BLOCKS, LARGEST_SERVED_RESPONSE},
 };
 use crate::zakura::{
-    block_sync::{ZakuraBlockSyncConfig, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
+    block_sync::ZakuraBlockSyncConfig,
     regulation::{
         sizing, CompletionId, Completions, OutputOrder, Serve, ServeCapacity, ServeLimits,
     },
@@ -37,13 +37,11 @@ const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
 const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_ENDINGS);
 
 /// The production GetBlocks serving limits. Execution is fixed by
-/// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
-/// the response configuration cannot inflate execution concurrency.
+/// [`NODE_EXECUTION`]; output sizing covers the largest response a server
+/// sends, one advertised block ([`LARGEST_SERVED_RESPONSE`]), so the response
+/// configuration cannot inflate execution concurrency.
 pub(crate) fn serving_limits() -> ServeLimits {
-    let largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
-        .expect("the protocol's largest range starts at height zero")
-        .response_cap(MAX_BS_RESPONSE_BYTES)
-        .output_bytes();
+    let largest = LARGEST_SERVED_RESPONSE.output_bytes();
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,

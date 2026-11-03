@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// Blocks must use their own chain context, without the best-tip mempool gate.
+pub(super) async fn check_block_skips_chain_gate(tx: &Transaction, height: Height) {
+    // These shielded-only fixtures need no UTXO lookups. Reject every state
+    // request, naming the mempool gate explicitly so a regression fails here.
+    let state = service_fn(|request| async move {
+        assert!(
+            !matches!(
+                request,
+                zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+            ),
+            "block verification must not query the best-tip mempool gate"
+        );
+        Err::<zakura_state::Response, BoxError>(
+            "unexpected state request for shielded-only block transaction".into(),
+        )
+    });
+    let verifier = Verifier::new_for_tests(&Network::Mainnet, state);
+    timeout(test_timeout(), verifier.oneshot(block_request(tx, height)))
+        .await
+        .expect("block verification must finish without a state response")
+        .expect("a valid block transaction must bypass the mempool chain gate");
+}
+
 /// Obtain the real unknown-anchor error without exposing constructors for state errors.
 async fn unknown_anchor_error(tx: &Transaction) -> ValidateContextError {
     let state = zakura_state::init_test(&Network::Mainnet).await;
@@ -188,6 +211,9 @@ fn rejected_anchor_verification_load() {
 
     // Compile the harness on every platform so local checks cover its types,
     // while keeping execution on Linux for /proc CPU accounting.
+    // This is intentionally a runtime guard: a const assertion would prevent
+    // the benchmark from compiling on other platforms.
+    #[allow(clippy::assertions_on_constants)]
     assert!(
         cfg!(target_os = "linux"),
         "benchmark CPU accounting requires Linux"

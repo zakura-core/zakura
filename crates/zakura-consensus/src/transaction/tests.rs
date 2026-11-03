@@ -6928,9 +6928,7 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "the mempool verification must reach the inner Halo2 verifier"
         );
 
-        verify(&mut verifier, block_request(&tx, expiry_height))
-            .await
-            .expect("the same transaction must verify in a block");
+        mempool_precheck::check_block_skips_chain_gate(&tx, expiry_height).await;
 
         assert_eq!(
             primitives::halo2::inner_calls_for(network_upgrade, &item),
@@ -7235,9 +7233,7 @@ fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "the mempool verification must reach the inner Sapling verifier"
         );
 
-        verify(&mut verifier, block_request(&tx, expiry_height))
-            .await
-            .expect("the same transaction must verify in a block");
+        mempool_precheck::check_block_skips_chain_gate(&tx, expiry_height).await;
 
         assert_eq!(
             primitives::sapling::inner_calls_for(&item),

@@ -20,7 +20,7 @@ use crate::zakura::{
         wire::{DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES},
     },
     regulation::{sizing, WriterFence},
-    CloseCause,
+    CloseCause, FRAME_HEADER_BYTES,
 };
 
 /// The production window: 4,000 headers and 8 MiB.
@@ -80,6 +80,118 @@ async fn a_full_window_of_one_header_pages_fits_the_cursor_ring() {
     assert_eq!(last, [(block::Height(4_000), tip.height, true)]);
     assert_eq!(harness.publisher.unacknowledged(id), Some(1));
     harness.check_quiet().await;
+}
+
+/// The production serving limits keep the toolkit's defaults, 64 MiB of
+/// output per peer among them, and [`v9::serving_limits`] changes only the
+/// per-peer output.
+#[test]
+fn serving_limits_keep_the_production_default() {
+    let production = ServeLimits {
+        node_execution: NODE_EXECUTION,
+        peer_execution: PEER_EXECUTION,
+        peer_output_responses: 16_384,
+        node_output_responses: 305_176,
+        peer_output_bytes: 64 * 1024 * 1024,
+        node_output_bytes: 1_250_000_000,
+    };
+    assert_eq!(v9::SERVE_LIMITS, production);
+    let output = v9::CommonMessage::BUDGET.output;
+    assert_eq!(
+        v9::serving_limits(output),
+        ServeLimits {
+            peer_output_bytes: output,
+            ..production
+        }
+    );
+}
+
+/// The derived output share holds a full window with the writer stalled. A
+/// byte window of the largest Mainnet pages and a header window of the
+/// smallest each queue without waiting for output, and they hold at most the
+/// share.
+#[test]
+fn the_derived_output_share_holds_a_full_window() {
+    let output = v9::CommonMessage::BUDGET.output;
+    let largest = v9::largest_page(COMMON_HEADER_BYTES);
+    let smallest = smallest_page(COMMON_HEADER_BYTES, AuxSchema::None);
+    // Widening u32 to usize is lossless on supported targets.
+    let window = WINDOW.bytes as usize;
+    let mut bytes_bind = vec![largest; window / largest];
+    while bytes_bind.iter().sum::<usize>() + smallest <= window {
+        bytes_bind.push(smallest);
+    }
+    let headers_bind = vec![smallest; WINDOW.objects as usize];
+    for pages in [bytes_bind, headers_bind] {
+        let capacity = ServeCapacity::new(
+            "header-sync",
+            &SUBSCRIBE_HEADERS,
+            v9::serving_limits(output),
+        )
+        .expect("the derived limits are positive");
+        let push = capacity.push(&peer(7));
+        // Room for every page and the control slot, and nobody reads.
+        let (send, _recv) = framed_channel(pages.len() + 1);
+        let mut queued = 0;
+        for &len in &pages {
+            let permit = push
+                .acquire(len)
+                .now_or_never()
+                .expect("a page within the window never waits for output");
+            let slot = permit
+                .reserve_send(&send)
+                .now_or_never()
+                .expect("the queue has room")
+                .expect("the queue is open");
+            slot.send(Frame {
+                message_type: v9::message_type::HEADERS,
+                flags: 0,
+                payload: vec![0; len],
+            });
+            // Widening usize to u64 is lossless on supported targets.
+            queued += (len + FRAME_HEADER_BYTES) as u64;
+        }
+        assert_eq!(capacity.peer_held(&peer(7)).1, queued);
+        assert!(queued <= output, "{queued} of {output}");
+    }
+}
+
+/// A publisher writing at full credit never waits on output. Under the
+/// derived output share, with a writer that never drains, the publisher
+/// commits a full window of one-header pages, the most frames one window
+/// allows.
+#[tokio::test(start_paused = true)]
+async fn a_publisher_at_full_credit_never_waits_on_output() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let tip = *port
+        .grow(WINDOW.objects + 1)
+        .last()
+        .expect("the chain grew");
+    let output = v9::RegtestMessage::BUDGET.output;
+    let capacity = ServeCapacity::new(
+        "header_sync_v9",
+        &SUBSCRIBE_HEADERS,
+        v9::serving_limits(output),
+    )
+    .expect("the derived limits are positive");
+    let one_header = PageLimits {
+        max_headers: 1,
+        ..production_pages()
+    };
+    // Room for every page and the control slot, and nobody reads.
+    let queue = WINDOW.objects as usize + 1;
+    let (publisher, _recv, _cancel, _task) =
+        session_advertising(&port, &capacity, &peer(7), 1, queue, one_header);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(tip.hash, vec![port.genesis], WINDOW, AuxSchema::None);
+    assert_eq!(publisher.apply(&open).await, Ok(Applied::Live));
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(publisher.unacknowledged(open.subscription_id), Some(4_000));
+    // Widening usize to u64 is lossless on supported targets.
+    let page = (smallest_page(HB, AuxSchema::None) + FRAME_HEADER_BYTES) as u64;
+    let held = capacity.peer_held(&peer(7)).1;
+    assert_eq!(held, 4_000 * page);
+    assert!(held <= output, "{held} of {output}");
 }
 
 /// A subscriber that never acknowledges sends the most `Open` and `Grant`

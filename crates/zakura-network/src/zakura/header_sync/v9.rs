@@ -38,14 +38,38 @@ const NODE_EXECUTION: usize = 8;
 /// time.
 const PEER_EXECUTION: usize = 2;
 
-/// The production serving limits for published pages: [`NODE_EXECUTION`] and
-/// [`PEER_EXECUTION`] page reads, and output sized for the largest page.
-pub(crate) const SERVE_LIMITS: ServeLimits = ServeLimits {
-    node_execution: NODE_EXECUTION,
-    peer_execution: PEER_EXECUTION,
-    // The largest page is about 2 MiB, so widening it to u64 is lossless.
-    ..sizing::serve_limits(largest_page(COMMON_HEADER_BYTES) as u64, sizing::TARGET_RTT)
-};
+/// The toolkit's serving defaults for responses of the largest page.
+// The largest page is about 2 MiB, so widening it to u64 is lossless.
+const DEFAULT_LIMITS: ServeLimits =
+    sizing::serve_limits(largest_page(COMMON_HEADER_BYTES) as u64, sizing::TARGET_RTT);
+
+// A full window of one-header pages fits the per-peer response slots, so only
+// output bytes can make a publisher at full credit wait.
+const _: () = assert!(
+    // Widening u32 to usize is lossless on every supported target.
+    DEFAULT_LIMITS.peer_output_responses >= MAX_HS_PUSH_CREDIT_HEADERS as usize,
+    "a full window of pages fits the per-peer response slots"
+);
+
+/// Serving limits for published pages: [`NODE_EXECUTION`] and
+/// [`PEER_EXECUTION`] page reads, `peer_output_bytes` of unsent pages per
+/// peer, and the toolkit's defaults for the rest.
+///
+/// [`Message::BUDGET`]'s output share is the derived value of
+/// `peer_output_bytes`.
+pub(crate) const fn serving_limits(peer_output_bytes: u64) -> ServeLimits {
+    ServeLimits {
+        node_execution: NODE_EXECUTION,
+        peer_execution: PEER_EXECUTION,
+        peer_output_bytes,
+        ..DEFAULT_LIMITS
+    }
+}
+
+/// The production serving limits for published pages. They keep the
+/// toolkit's per-peer output default, 64 MiB, until the node composition
+/// sizes output from [`Message::BUDGET`].
+pub(crate) const SERVE_LIMITS: ServeLimits = serving_limits(DEFAULT_LIMITS.peer_output_bytes);
 
 /// The production serving capacity for published pages, under
 /// [`SERVE_LIMITS`].

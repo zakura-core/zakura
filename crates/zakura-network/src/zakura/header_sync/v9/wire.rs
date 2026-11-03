@@ -281,9 +281,34 @@ const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget 
     };
     ReactorBudget {
         receive,
-        output: super::SERVE_LIMITS.peer_output_bytes,
+        output: serve_output_bytes(header_bytes),
     }
     .assert_frame_cap(FRAME_CAP)
+}
+
+/// Encoded bytes of the pages that the publisher may hold unwritten for one
+/// subscriber that sends conformant updates.
+///
+/// A page job sizes its page within the unspent credit, and committing the
+/// page spends that credit. A page stays unwritten until the transport writes
+/// it, and only a written page can be acknowledged. So the queued pages and
+/// the page in progress stay within one subscription's window. The window
+/// holds at most `credit.objects` pages, and the largest page covers their
+/// frame headers. Terminal outcomes and `Status` take no serve output.
+const fn serve_output_bytes(header_bytes: usize) -> u64 {
+    let MessageRole::Subscription {
+        max_live, credit, ..
+    } = SUBSCRIBE_HEADERS.role
+    else {
+        panic!("SUBSCRIBE_HEADERS is a subscription row");
+    };
+    // Widening u32 and usize to u64 is lossless on every supported target.
+    let largest = largest_page(header_bytes) as u64;
+    assert!(
+        credit.objects as u64 * FRAME_HEADER_BYTES as u64 <= largest,
+        "the largest page covers a window's frame headers"
+    );
+    max_live as u64 * (credit.bytes as u64 + largest)
 }
 
 /// Payload bytes of the `SubscribeHeaders` updates that a conformant
@@ -524,8 +549,10 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     ///   released. The row declares no cadence, so `update_bytes` counts
     ///   them from the credit window.
     ///
-    /// The output share is the per-peer serve output that the publisher's
-    /// serving limits set today.
+    /// The output share is one subscription's byte credit plus one largest
+    /// page, which `serve_output_bytes` derives. The production serving
+    /// limits keep a larger per-peer default until the node composition
+    /// sizes them from this share.
     pub const BUDGET: ReactorBudget = layout_budget(&Self::LAYOUT, HEADER_BYTES);
 
     /// Check the rules that the payload items cannot express.

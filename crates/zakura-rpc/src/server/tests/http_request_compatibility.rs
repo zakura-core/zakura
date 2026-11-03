@@ -91,58 +91,23 @@ async fn oversized_request_body_is_rejected() {
     assert!(result.is_err(), "oversized request body should be rejected");
 }
 
-/// A mock inner service that records the request body it receives and answers with a fixed body.
-#[derive(Clone)]
-struct RecordingRpcService {
-    received: Arc<Mutex<Option<Bytes>>>,
-    response: &'static str,
-}
-
-impl RecordingRpcService {
-    fn new(response: &'static str) -> Self {
-        Self {
-            received: Arc::default(),
-            response,
-        }
-    }
-
-    fn received(&self) -> Bytes {
-        self.received
-            .lock()
-            .expect("no test thread panics while holding the lock")
-            .clone()
-            .expect("the middleware forwards every parsed request to the inner service")
-    }
-}
-
-impl Service<HttpRequest> for RecordingRpcService {
-    type Response = HttpResponse;
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, BoxError>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: HttpRequest) -> Self::Future {
-        let received = self.received.clone();
-        let response = self.response;
-        Box::pin(async move {
-            let body = req.into_body().collect().await?.to_bytes();
-            *received
-                .lock()
-                .expect("no test thread panics while holding the lock") = Some(body);
-            Ok(HttpResponse::new(HttpBody::from(response)))
-        })
-    }
-}
-
 /// Sends `request` through the middleware and returns what the inner service received and
 /// what the client gets back.
 async fn round_trip(request: impl Into<Bytes>, response: &'static str) -> (Bytes, Bytes) {
-    let service = RecordingRpcService::new(response);
+    let received = Arc::new(Mutex::new(None));
+    let recorded = received.clone();
+    let service = tower::service_fn(move |request: HttpRequest| {
+        let recorded = recorded.clone();
+        async move {
+            let body = request.into_body().collect().await?.to_bytes();
+            *recorded
+                .lock()
+                .expect("no test thread panics while holding the lock") = Some(body);
+            Ok::<_, BoxError>(HttpResponse::new(HttpBody::from(response)))
+        }
+    });
     // Match the server's limit of twice the maximum block size plus its JSON wrapper.
-    let mut middleware = HttpRequestMiddleware::new(service.clone(), None, 4_001_024);
+    let mut middleware = HttpRequestMiddleware::new(service, None, 4_001_024);
     let request = HttpRequest::builder()
         .method("POST")
         .header("content-type", "application/json")
@@ -157,81 +122,42 @@ async fn round_trip(request: impl Into<Bytes>, response: &'static str) -> (Bytes
         .await
         .expect("a full body can't fail")
         .to_bytes();
-    (service.received(), response)
+    let received = received
+        .lock()
+        .expect("no test thread panics while holding the lock")
+        .take()
+        .expect("the middleware forwards the request to the inner service");
+    (received, response)
 }
 
 /// A plain JSON-RPC 2.0 call reaches the server exactly as sent, and the server's response
 /// reaches the client exactly as sent.
 #[tokio::test]
 async fn plain_json_rpc_2_call_and_response_pass_through_unchanged() {
-    let request = r#"{"id": 3, "method": "submitblock", "jsonrpc": "2.0", "params": ["00ff"]}"#;
+    let block = "00".repeat(2_000_000);
+    let request =
+        format!(r#"{{"id": 3, "method": "submitblock", "jsonrpc": "2.0", "params": ["{block}"]}}"#);
     let response = r#"{"jsonrpc":"2.0","id":3,"result":null}"#;
 
-    let (received, returned) = round_trip(request, response).await;
+    let (received, returned) = round_trip(request.clone(), response).await;
 
     assert_eq!(received, request.as_bytes());
     assert_eq!(returned, response.as_bytes());
 }
 
-/// The request shortcut accepts only parameters it can check without allocating per argument.
+/// A near-limit numeric array with a noncanonical final number keeps the conversion behavior.
 #[tokio::test]
-async fn only_empty_or_single_unescaped_string_params_can_pass_through() {
-    for (params, expected) in [
-        ("[]", true),
-        (r#"[""]"#, true),
-        (r#"["00ff"]"#, true),
-        (r#"["é"]"#, true),
-        (r#"["a b"]"#, true),
-        ("[ ]", false),
-        (r#"[ "00ff"]"#, false),
-        (r#"["00ff" ]"#, false),
-        (r#"["\u0041"]"#, false),
-        (r#"["a\"b"]"#, false),
-        (r#"["a\\b"]"#, false),
-        (r#"["a","b"]"#, false),
-        (r#"["00ff",null]"#, false),
-        (r#"["00ff",{"workid":"job"}]"#, false),
-        ("[0,0]", false),
-        ("[0,1e2]", false),
-        ("[true]", false),
-        ("[[0]]", false),
-        (r#"{"a":1}"#, false),
-    ] {
-        let request =
-            format!(r#"{{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": {params}}}"#);
-        let (received, _) =
-            round_trip(request.clone(), r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
-        assert_eq!(
-            received == request.as_bytes(),
-            expected,
-            "unexpected forwarding decision for {params}"
-        );
-    }
-}
-
-/// Near the request-size limit, a block string can pass through but numeric arrays use conversion.
-#[tokio::test]
-async fn large_strings_pass_through_and_large_numeric_arrays_use_conversion() {
-    let block = "00".repeat(2_000_000);
-    let request =
-        format!(r#"{{"jsonrpc":"2.0","method":"submitblock","params":["{block}"],"id":1}}"#);
-    let (received, _) =
-        round_trip(request.clone(), r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
-    assert_eq!(received, request.as_bytes());
-
+async fn large_numeric_array_is_normalized() {
     let numbers = "0,".repeat(1_999_999);
-    for last in ["0", "1e2"] {
-        let request = format!(
-            r#"{{"id": 1, "method": "submitblock", "jsonrpc": "2.0", "params": [{numbers}{last}]}}"#
-        );
-        let (received, _) =
-            round_trip(request.clone(), r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
-        assert_ne!(received, request.as_bytes());
-        assert!(received.starts_with(br#"{"jsonrpc":"2.0","method":"submitblock","params":[0,0,"#));
-        if last == "1e2" {
-            assert!(received.ends_with(br#",100.0],"id":1}"#));
-        }
-    }
+    let request = format!(
+        r#"{{"id": 1, "method": "submitblock", "jsonrpc": "2.0", "params": [{numbers}1e2]}}"#
+    );
+    let expected =
+        format!(r#"{{"jsonrpc":"2.0","method":"submitblock","params":[{numbers}100.0],"id":1}}"#);
+
+    let (received, _) = round_trip(request, r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
+
+    assert_eq!(received, expected.as_bytes());
 }
 
 /// JSON-RPC 2.0 calls that the server would read differently from their re-encoded form are

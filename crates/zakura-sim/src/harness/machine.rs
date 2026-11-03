@@ -6,7 +6,10 @@
 //! explorer. [`machine_entry!`](crate::machine_entry) makes a [`Machine`] a
 //! [`HarnessEntry`](super::HarnessEntry).
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use serde_json::Value;
 use zakura_scheduler::{CleanupReport, SimInstant, Status as SchedulerStatus};
@@ -14,7 +17,7 @@ use zakura_scheduler::{CleanupReport, SimInstant, Status as SchedulerStatus};
 use super::HarnessError;
 use crate::{
     action::{Action, Enabled, SourceId},
-    check::{Checker, Phase, StepCtx, Violation},
+    check::{Checker, Phase, PropertyReport, StepCtx, Violation},
     end::{HarnessFailure, IdleStatus, Outcome, RunEnd},
     explore::ExploreRun,
     plan::Decider,
@@ -55,6 +58,8 @@ pub struct Machine {
     pub history: fn(&[u8]) -> Vec<(usize, MachineStep)>,
     /// Whether a run's steps reached the resource-bearing transition that a
     /// witness expecting [`Expect`] needs. [`Expect::Applicable`] never asks.
+    /// The property applies from the first step whose prefix reaches it under
+    /// [`Expect::Holds`], so a run that never reaches it is not applicable.
     pub reached: fn(&[MachineStep], Expect) -> bool,
 }
 
@@ -85,17 +90,28 @@ macro_rules! machine_entry {
     };
 }
 
-struct Handle(RefCell<Option<(u64, MachineStep)>>);
+/// The current step, and whether the run's steps so far reached the machine's
+/// resource-bearing transition.
+struct Handle {
+    step: RefCell<Option<(u64, MachineStep)>>,
+    reached: Cell<bool>,
+}
+
+/// A step and whether the run reached [`Machine::reached`] by it.
+type StepView = (MachineStep, bool);
 
 impl HasView for Handle {
-    type View = Option<MachineStep>;
+    type View = Option<StepView>;
 
     fn view(&self) -> Self::View {
-        self.0.borrow().as_ref().map(|(_, step)| step.clone())
+        self.step
+            .borrow()
+            .as_ref()
+            .map(|(_, step)| (step.clone(), self.reached.get()))
     }
 
     fn captured(&self) -> Capture {
-        self.0
+        self.step
             .borrow()
             .as_ref()
             .map_or(Capture::Missing, |(step, _)| Capture::AfterStep(*step))
@@ -115,13 +131,21 @@ fn properties(machine: &Machine) -> Vec<Property<Handle>> {
     }]
 }
 
+/// A step that fails is a violation, even before the run reaches the
+/// resource-bearing transition. A step that passes counts as an applicable
+/// evaluation only once the run has reached it, so idle-only runs are not
+/// coverage.
 fn check(cx: &mut CheckCtx<'_, Handle>) -> Verdict {
-    let Some(step) = cx.view() else {
+    let Some((step, reached)) = cx.view() else {
         cx.missing_evidence("machine transition has no captured view");
         return Verdict::NotApplicable;
     };
     let Some(failure) = step.failure() else {
-        return Verdict::Holds;
+        return if reached {
+            Verdict::Holds
+        } else {
+            Verdict::NotApplicable
+        };
     };
     if !failure.property_failure {
         cx.missing_evidence(format!("machine driver panicked: {}", failure.message));
@@ -213,7 +237,12 @@ fn run_checked(
 ) -> Result<RunReport, HarnessError> {
     let scenario = scenario(value)?;
     let history = (machine.history)(&scenario.input);
-    let handle = Rc::new(Handle(RefCell::new(None)));
+    let handle = Rc::new(Handle {
+        step: RefCell::new(None),
+        reached: Cell::new(false),
+    });
+    // The steps so far, kept only until the run reaches the transition.
+    let mut prefix = Vec::new();
     let mut checker = RegistryChecker::new(
         Registry::new(properties(machine)).expect("unique static property"),
         Rc::clone(&handle),
@@ -247,7 +276,13 @@ fn run_checked(
                 break;
             }
         };
-        *handle.0.borrow_mut() = Some((number, work.clone()));
+        if !handle.reached.get() {
+            prefix.push(work.clone());
+            handle
+                .reached
+                .set((machine.reached)(&prefix, Expect::Holds));
+        }
+        *handle.step.borrow_mut() = Some((number, work.clone()));
         end.steps = number;
         picks.push(Pick {
             step: number,
@@ -317,6 +352,18 @@ fn run_checked(
     let mut properties = checker.at_end(&end, &log);
     if let Some(extra) = extra {
         properties.extend(extra.at_end(&end, &log));
+    }
+    // As in `Sim::run`: a harness failure leaves no property held, since the
+    // run's evidence may be incomplete. The report and the end record both
+    // take these.
+    if end.outcome == Outcome::Harness {
+        properties = properties
+            .into_iter()
+            .map(|report| PropertyReport {
+                outcome: report.outcome.after_harness_failure(),
+                ..report
+            })
+            .collect();
     }
     let report = RunReport {
         end,

@@ -654,6 +654,22 @@ impl ContextuallyVerifiedBlock {
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
+        Self::with_block_and_shared_spent_utxos(
+            network,
+            semantically_verified,
+            Arc::new(spent_outputs),
+        )
+    }
+
+    /// Like [`Self::with_block_and_spent_utxos`], but retains an already shared spent-output
+    /// map so proposal validation and the solved block can use the same allocation.
+    ///
+    /// The same input requirements and panic conditions apply.
+    pub(crate) fn with_block_and_shared_spent_utxos(
+        network: &Network,
+        semantically_verified: SemanticallyVerifiedBlock,
+        spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
             hash,
@@ -676,7 +692,7 @@ impl ContextuallyVerifiedBlock {
             hash,
             height,
             new_outputs: Arc::new(new_outputs),
-            spent_outputs: Arc::new(spent_outputs),
+            spent_outputs,
             transaction_hashes,
             chain_value_pool_change,
             receipt_order,
@@ -1344,7 +1360,8 @@ pub enum Request {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
-    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
+    /// their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {
@@ -1485,6 +1502,12 @@ pub enum Request {
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
+    /// Checks whether the block's header commits to the authorizing data in its body,
+    /// using the history tree of the block's parent.
+    ///
+    /// Returns [`Response::AuthDataCommitment`].
+    CheckAuthDataCommitment(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`Response::BestChainNextMedianTimePast`] when successful.
@@ -1581,6 +1604,7 @@ impl Request {
             Request::CheckPreparedMinedRelayEligibility(_) => {
                 "check_prepared_mined_relay_eligibility"
             }
+            Request::CheckAuthDataCommitment(_) => "check_auth_data_commitment",
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
@@ -1737,7 +1761,8 @@ pub enum ReadRequest {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
-    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
+    /// their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {
@@ -2066,6 +2091,12 @@ pub enum ReadRequest {
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
+    /// Checks whether the block's header commits to the authorizing data in its body,
+    /// using the history tree of the block's parent.
+    ///
+    /// Returns [`ReadResponse::AuthDataCommitment`].
+    CheckAuthDataCommitment(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`ReadResponse::BestChainNextMedianTimePast`] when successful.
@@ -2194,6 +2225,7 @@ impl ReadRequest {
             ReadRequest::CheckPreparedMinedRelayEligibility(_) => {
                 "check_prepared_mined_relay_eligibility"
             }
+            ReadRequest::CheckAuthDataCommitment(_) => "check_auth_data_commitment",
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]
@@ -2257,6 +2289,9 @@ impl TryFrom<Request> for ReadRequest {
             }
             Request::CheckPreparedMinedRelayEligibility(block) => {
                 Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
+            }
+            Request::CheckAuthDataCommitment(block) => {
+                Ok(ReadRequest::CheckAuthDataCommitment(block))
             }
 
             Request::ApplyHeaderChainInsert { .. }

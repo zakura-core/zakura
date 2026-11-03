@@ -747,6 +747,28 @@ fn zakura_nat_traversal_fails_and_names_the_transport_spec() {
     assert!(!config.zakura.nat_traversal);
 }
 
+/// Each native stream kind receives one stream window, so a window below a
+/// block-sync frame fails config validation instead of the endpoint's startup.
+#[test]
+fn zakura_stream_window_below_the_largest_native_frame_fails_for_v2_stacks() {
+    let _init_guard = zakura_test::init();
+    let largest = crate::zakura::MAX_BS_FRAME_BYTES;
+    let config = |stack: &str, window: u32| {
+        format!("p2p_stack = \"{stack}\"\n[zakura.quic]\nstream_receive_window_bytes = {window}\n")
+    };
+
+    let error = toml::from_str::<Config>(&config("dual", largest - 1))
+        .expect_err("a stream window below a block-sync frame must fail at startup")
+        .to_string();
+    assert!(error.contains("stream_receive_window_bytes"), "{error}");
+    assert!(error.contains(&largest.to_string()), "{error}");
+
+    toml::from_str::<Config>(&config("dual", largest))
+        .expect("a stream window that holds a block-sync frame is valid");
+    toml::from_str::<Config>(&config("legacy", 64 * 1024))
+        .expect("a legacy-only node creates no QUIC endpoint, so its stream window is unused");
+}
+
 #[test]
 fn zakura_quic_out_of_range_value_fails_and_names_the_key() {
     let _init_guard = zakura_test::init();

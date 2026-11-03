@@ -198,6 +198,21 @@ impl SyncCoordinator {
             .map(|_| ())
     }
 
+    /// Transfers block-apply ownership to native Zakura if startup began in the
+    /// legacy genesis bootstrap, and returns whether this call made the transfer.
+    ///
+    /// Startup begins native when the header runtime is already ready, so a
+    /// restarted node can reach the end of the genesis fetch with nothing to hand off.
+    pub(crate) fn finish_legacy_bootstrap_if_pending(
+        &self,
+    ) -> Result<bool, LifecycleTransitionError> {
+        if matches!(self.apply_phase(), ApplyPhase::LegacyBootstrap { .. }) {
+            self.finish_legacy_bootstrap().map(|()| true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Wait until bootstrap completes or fallback owns/drains the apply pipeline.
     pub(crate) async fn wait_for_zakura_ownership(&self) {
         loop {

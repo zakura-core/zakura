@@ -1266,7 +1266,7 @@ where
         self.trace
             .checkpoint_handoff(Some(handoff_state_tip), Height(0));
         block_sync_handoff
-            .finish_legacy_bootstrap()
+            .finish_legacy_bootstrap_if_pending()
             .map_err(|error| eyre!("genesis apply handoff failed: {error}"))?;
         info!(
             "Zakura block sync replacement completed genesis bootstrap; \

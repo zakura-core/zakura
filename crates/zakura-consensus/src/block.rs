@@ -34,6 +34,7 @@ use zakura_state as zs;
 
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
+mod body_digest;
 pub mod check;
 mod prepared;
 mod receipt;
@@ -435,7 +436,12 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(block.view()));
+        // Solved blocks are identified twice below, for receipt order and for prepared
+        // candidates, so hash their transactions once for both.
+        let body = (!request.is_proposal()).then(|| body_digest::BodyDigest::of(block.view()));
+        let receipt = body
+            .as_ref()
+            .map(|body| self.receipt_orders.register(block.view(), body));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -533,11 +539,14 @@ where
                         _ => unreachable!("wrong response to Request::KnownBlock"),
                     }
 
+                    let body = body
+                        .as_ref()
+                        .expect("a mined commit is not a proposal, so its body was hashed");
                     if let Some(committed) = try_prepared_fast_path(
                         &prepared_candidates,
                         &mut state_service,
                         &network,
-                        block.clone(),
+                        (block.clone(), body),
                         hash,
                         (height, receipt_order),
                         admission,
@@ -885,7 +894,7 @@ async fn try_prepared_fast_path<S>(
     prepared_candidates: &prepared::PreparedCandidateCache,
     state_service: &mut S,
     network: &Network,
-    block: BlockHandle,
+    (block, body): (BlockHandle, &body_digest::BodyDigest),
     hash: block::Hash,
     (height, receipt_order): (block::Height, Option<u64>),
     admission: &zs::BlockAdmission,
@@ -898,7 +907,7 @@ where
     let Some(prepared::CacheHit {
         source,
         prepared: cached_prepared_block,
-    }) = prepared_candidates.lookup(&block, network)
+    }) = prepared_candidates.lookup(&block, body, network)
     else {
         metrics::histogram!("mining.solved_header_check.duration_seconds")
             .record(solved_header_start.elapsed().as_secs_f64());

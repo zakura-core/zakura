@@ -325,8 +325,7 @@ impl ResponseFormat {
                 wire.error = wire.error.or(Some(RawValue::NULL));
             }
             // The old unknown-version response conversion omitted explicit null fields.
-            Self::Unknown => (),
-            Self::TwoPointZero => unreachable!("modern responses return before conversion"),
+            Self::Unknown | Self::TwoPointZero => (),
         }
         response.json = serde_json::value::to_raw_value(&wire)
             .expect("borrowed response fields serialize as valid JSON");

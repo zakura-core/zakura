@@ -182,6 +182,10 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
                 );
             }
             Err(PreparationError::InnerBodyTooLarge(format)) => {
+                tracing::warn!(
+                    limit = MAX_REQUEST_BODY_SIZE,
+                    "RPC request exceeds the inner body limit after compatibility preparation"
+                );
                 return json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format.format_response(MethodResponse::error(

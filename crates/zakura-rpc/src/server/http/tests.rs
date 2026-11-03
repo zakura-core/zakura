@@ -106,6 +106,21 @@ async fn malformed_and_failed_body_reads_release_the_permit() {
         MAX_CONCURRENT_REQUESTS
     );
 
+    let mut request = collected(r#"{"method":"getinfo","params":[],"id":1}"#);
+    request
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, "11000000".parse().unwrap());
+    let response = service.call(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        r#"{"id":null,"result":null,"error":{"code":-32007,"message":"Request is too big","data":"Exceeded max limit of 10485760"}}"#
+    );
+    assert_eq!(
+        service.request_permits.available_permits(),
+        MAX_CONCURRENT_REQUESTS
+    );
+
     let body = StreamBody::new(futures::stream::iter([Err::<
         http_body::Frame<Bytes>,
         BoxError,

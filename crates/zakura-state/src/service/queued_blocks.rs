@@ -277,7 +277,7 @@ impl QueuedBlocks {
         for outpoint in old.0.new_outputs.keys() {
             self.known_utxos.remove(outpoint);
         }
-        for (outpoint, ordered_utxo) in &replacement.0.new_outputs {
+        for (outpoint, ordered_utxo) in replacement.0.new_outputs.iter() {
             self.known_utxos
                 .insert(*outpoint, ordered_utxo.utxo.clone());
         }

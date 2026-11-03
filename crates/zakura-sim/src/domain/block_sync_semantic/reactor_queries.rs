@@ -11,8 +11,9 @@
 //!   only an accepted query, once, under its exact identity. An accepted query
 //!   becomes the pending query and advances the next ID. A refusal keeps both. A
 //!   full channel arms a retry. A closed channel ends dispatch and arms nothing.
-//!   A stale reply or failure keeps the pending query. A reset, an authority
-//!   change and a tip reset retire it.
+//!   A reply or failure that names the pending query's ID and authority
+//!   retires it, and any other keeps it, whatever its label. A reset, an
+//!   authority change and a tip reset retire it.
 //! - **Facts.** Each `BlockSyncFact::Reactor` transition and its state, and each
 //!   `QueryNeededBlocks` that block storage took. The check compares one
 //!   transition with the state the previous transition reported.
@@ -35,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::Finding;
 use crate::{
     observe::{BlockSyncReactorState, BodyScope, StorageRequest},
-    record::machine::{BodyAuthority, ReactorAction, ReactorQuery, ReactorRefusal, ReactorReply},
+    record::machine::{BodyAuthority, ReactorAction, ReactorQuery, ReactorRefusal},
 };
 
 /// A query as block storage took it, in the same terms as a [`ReactorQuery`].
@@ -61,8 +62,8 @@ impl StorageQuery {
 /// the reactor last reported.
 #[derive(Debug)]
 pub struct ReactorQueries {
-    /// The pending query's ID in the last reported state.
-    reported_pending: Option<u64>,
+    /// The pending query's ID and authority in the last reported state.
+    reported_pending: Option<(u64, BodyAuthority)>,
     /// The next query's ID in the last reported state.
     reported_next: Option<u64>,
     /// Each accepted query, by ID.
@@ -150,11 +151,20 @@ impl ReactorQueries {
                 }
             }
             Fact::QueryReply {
-                outcome: ReactorReply::Stale,
-                ..
+                query_id, scope, ..
             }
-            | Fact::QueryFailed { matched: false, .. } => {
-                self.judge_query_state_kept(step, transition, state);
+            | Fact::QueryFailed {
+                query_id, scope, ..
+            } => {
+                // The label is the reactor's claim, so the check judges the
+                // reply by the identity of the query it names.
+                let names_pending =
+                    self.reported_pending.as_ref() == Some(&(*query_id, scope.clone()));
+                if names_pending {
+                    self.judge_query_retired(step, transition, state);
+                } else {
+                    self.judge_query_state_kept(step, transition, state);
+                }
             }
             Fact::AuthorityChanged { .. }
             | Fact::TipReset { .. }
@@ -167,13 +177,9 @@ impl ReactorQueries {
                     );
                 }
             }
-            Fact::QueryReply { .. }
-            | Fact::QueryFailed { .. }
-            | Fact::QueryGateChanged
-            | Fact::RetryElapsed
-            | Fact::View { .. } => {}
+            Fact::QueryGateChanged | Fact::RetryElapsed | Fact::View { .. } => {}
         }
-        self.reported_pending = pending_id(state);
+        self.reported_pending = pending_key(state);
         self.reported_next = state.next_query_id;
     }
 
@@ -184,11 +190,32 @@ impl ReactorQueries {
         transition: &ReactorAction,
         state: &BlockSyncReactorState,
     ) {
-        let required = (self.reported_pending, self.reported_next);
+        let required = (
+            self.reported_pending.as_ref().map(|(id, _)| *id),
+            self.reported_next,
+        );
         if (pending_id(state), state.next_query_id) != required {
             self.finding(
                 step,
                 format!("{transition:?} keeps (pending, next ID) at {required:?}"),
+                format!("the reactor reported {state:?}"),
+            );
+        }
+    }
+
+    /// Judges a reply or failure that names the pending query: it must retire
+    /// the query and keep the next ID.
+    fn judge_query_retired(
+        &mut self,
+        step: u64,
+        transition: &ReactorAction,
+        state: &BlockSyncReactorState,
+    ) {
+        let required = (None, self.reported_next);
+        if (pending_id(state), state.next_query_id) != required {
+            self.finding(
+                step,
+                format!("{transition:?} names the pending query, so it retires it"),
                 format!("the reactor reported {state:?}"),
             );
         }
@@ -284,6 +311,14 @@ fn pending_id(state: &BlockSyncReactorState) -> Option<u64> {
     state.pending.as_ref().map(|query| query.query_id)
 }
 
+/// The pending query's ID and authority in `state`.
+fn pending_key(state: &BlockSyncReactorState) -> Option<(u64, BodyAuthority)> {
+    state
+        .pending
+        .as_ref()
+        .map(|query| (query.query_id, query.scope.clone()))
+}
+
 /// Checker tests: each crafts `BlockSyncFact::Reactor` and storage facts and
 /// folds them through [`SemanticModel`](super::SemanticModel). They show what
 /// the checker judges. They don't show that a simulated run produces these
@@ -294,6 +329,7 @@ mod checker_tests {
     use crate::{
         domain::block_sync_semantic::SemanticModel,
         observe::{BlockSyncFact, StorageBranch, StorageFact, WorkScope},
+        record::machine::ReactorReply,
         storage::BLOCK_SERVICE,
         Observation, ObservationLog,
     };
@@ -570,6 +606,49 @@ mod checker_tests {
             let mut history = accepted_first();
             history.reactor(stale.clone(), state(None, 2));
             assert_eq!(history.findings().len(), 1, "{stale:?}");
+        }
+    }
+
+    /// A late reply for a replaced query keeps the replacement, whatever
+    /// its label says.
+    #[test]
+    fn checker_finds_a_mislabeled_late_reply_that_clears_the_replacement() {
+        let mut history = accepted_first();
+        history.reactor(Fact::QueryAccepted { query: query(2) }, state(Some(2), 3));
+        history.reactor(
+            Fact::QueryReply {
+                query_id: 1,
+                scope: authority(1),
+                outcome: ReactorReply::Accepted,
+            },
+            state(None, 3),
+        );
+        assert_eq!(history.findings().len(), 1);
+    }
+
+    /// A reply or failure that names the pending query retires it, whatever
+    /// its label says.
+    #[test]
+    fn checker_finds_a_matching_reply_that_keeps_the_pending_query() {
+        for matching in [
+            Fact::QueryReply {
+                query_id: 1,
+                scope: authority(1),
+                outcome: ReactorReply::Stale,
+            },
+            Fact::QueryFailed {
+                query_id: 1,
+                scope: authority(1),
+                matched: false,
+            },
+        ] {
+            let mut history = accepted_first();
+            history.reactor(matching.clone(), state(None, 2));
+            assert_eq!(history.findings(), [], "{matching:?}");
+
+            let mut history = accepted_first();
+            history.reactor(matching.clone(), state(Some(1), 2));
+            assert_eq!(history.findings().len(), 1, "{matching:?}");
         }
     }
 

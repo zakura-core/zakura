@@ -111,7 +111,7 @@ fn authorized_state(tip: u32, header_tip: u32) -> ReactorState {
 fn work(first_unclaimed: Option<u32>, backlog: usize, low_water: usize) -> WorkFacts {
     WorkFacts {
         first_unclaimed: first_unclaimed.map(block::Height),
-        backlog,
+        backlog: Some(backlog),
         low_water,
     }
 }
@@ -373,6 +373,34 @@ fn view_with_unchanged_reaction_epoch_only_refreshes_mirrors() {
 /// A forced refill that the full channel refuses must not lose its force: a
 /// stale outstanding snapshot above the low-water target would otherwise hold
 /// the retry until an external wake.
+/// An idle refill reads nothing past its first unclaimed height, and a forced
+/// one, or one that owes a forced retry, skips the backlog.
+#[test]
+fn work_reads_stop_when_idle_and_skip_the_backlog_when_forced() {
+    let now = Instant::now();
+    let mut state = authorized_state(0, 100);
+    for first_unclaimed in [None, Some(block::Height(101))] {
+        assert_eq!(state.work_reads(true, first_unclaimed), WorkReads::Idle);
+    }
+    let first = Some(block::Height(1));
+    assert_eq!(
+        state.work_reads(false, first),
+        WorkReads::Facts { backlog: true }
+    );
+    assert_eq!(
+        state.work_reads(true, first),
+        WorkReads::Facts { backlog: false }
+    );
+
+    let refused = refill(&mut state, true, work(Some(1), 50, 10), false, now);
+    assert!(matches!(refused, Refill::Refused(_)));
+    assert_eq!(
+        state.work_reads(false, first),
+        WorkReads::Facts { backlog: false },
+        "the owed forced retry skips the low-water gate"
+    );
+}
+
 #[test]
 fn refused_forced_refill_retries_past_low_water() {
     let now = Instant::now();

@@ -365,7 +365,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     sapling_shielded_data: None,
-                    orchard_shielded_data: Some(orchard_shielded_data),
+                    orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
                     ironwood_shielded_data: Some(ironwood_shielded_data),
                 })
             };

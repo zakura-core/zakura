@@ -106,6 +106,9 @@ pub(crate) struct Publications<K, C> {
     slots: SlotBudget,
     slot_count: usize,
     over_limit: u64,
+    /// Reports this table's transitions, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<crate::zakura::RegulationTap<K>>,
 }
 
 impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
@@ -120,6 +123,29 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
                 .expect("the validator requires max_live >= 1, and twice it fits a semaphore"),
             slot_count: slots,
             over_limit: 0,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
+        }
+    }
+
+    /// This table, reporting its transitions through `tap` if there is one.
+    /// Attach it before sharing the table, since locking a shared table is a
+    /// scheduling point in a simulated run.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
+        self.tap = tap;
+        self
+    }
+
+    /// Report `transition` if a tap is attached. `transition` is built only
+    /// then.
+    #[cfg(any(test, zakura_sim))]
+    fn regulated(
+        &self,
+        transition: impl FnOnce(&crate::zakura::RegulationTap<K>) -> crate::zakura::Transition,
+    ) {
+        if let Some(tap) = &self.tap {
+            tap.stream().regulated(transition(tap));
         }
     }
 
@@ -172,6 +198,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         while self.tombstones.len() > keep {
             self.tombstones.pop_front();
         }
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::OpenApplied {
+            subscription: tap.id(&key),
+            objects: credit.objects,
+            bytes: credit.bytes,
+            seq: tap.stream().serving(),
+        });
         self.live.insert(
             key,
             Published {
@@ -216,6 +249,15 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
             .map_err(|_| fault(SubscriptionFault::AboveWindow))?;
         published.sequence = sequence;
         acknowledge(published, through);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::GrantApplied {
+                    subscription: tap.id(key),
+                    objects: added.objects,
+                    bytes: added.bytes,
+                });
+        }
         Ok(Applied::Live)
     }
 
@@ -241,6 +283,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         published.sequence = sequence;
         published.closing = true;
         acknowledge(published, through);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::CloseApplied {
+                    subscription: tap.id(key),
+                });
+        }
         Ok(Applied::Live)
     }
 
@@ -338,6 +387,10 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         while self.tombstones.len() > bound {
             self.tombstones.pop_front();
         }
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::PublicationEnded {
+            subscription: tap.id(key),
+        });
         Some(TerminalPermit {
             _slot: published.slot,
         })

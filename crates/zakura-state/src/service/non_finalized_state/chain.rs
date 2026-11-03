@@ -1618,7 +1618,10 @@ impl Chain {
     /// running note commitment tree updates in parallel with other updates.
     ///
     /// Used to implement `update_chain_tip_with::<ContextuallyVerifiedBlock>`.
-    #[instrument(skip(self, contextually_valid), fields(block = %contextually_valid.block))]
+    #[instrument(
+        skip(self, contextually_valid),
+        fields(height = ?contextually_valid.height, hash = %contextually_valid.hash)
+    )]
     #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with_block_parallel(
         &mut self,
@@ -1701,7 +1704,10 @@ impl Chain {
     /// except for the note commitment and history tree updates.
     ///
     /// Used to implement `update_chain_tip_with::<ContextuallyVerifiedBlock>`.
-    #[instrument(skip(self, contextually_valid), fields(block = %contextually_valid.block))]
+    #[instrument(
+        skip(self, contextually_valid),
+        fields(height = ?contextually_valid.height, hash = %contextually_valid.hash)
+    )]
     #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with_block_except_trees(
         &mut self,
@@ -1911,7 +1917,10 @@ pub(crate) trait UpdateWith<T> {
 }
 
 impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
-    #[instrument(skip(self, contextually_valid), fields(block = %contextually_valid.block))]
+    #[instrument(
+        skip(self, contextually_valid),
+        fields(height = ?contextually_valid.height, hash = %contextually_valid.hash)
+    )]
     #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with(
         &mut self,
@@ -1920,7 +1929,10 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
         self.update_chain_tip_with_block_parallel(contextually_valid)
     }
 
-    #[instrument(skip(self, contextually_valid), fields(block = %contextually_valid.block))]
+    #[instrument(
+        skip(self, contextually_valid),
+        fields(height = ?contextually_valid.height, hash = %contextually_valid.hash)
+    )]
     fn revert_chain_with(
         &mut self,
         contextually_valid: &ContextuallyVerifiedBlock,
@@ -2289,15 +2301,15 @@ impl
 
 impl
     UpdateWith<(
-        &Option<transaction::JoinSplitData<Groth16Proof>>,
+        &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
         &SpendingTransactionId,
     )> for Chain
 {
-    #[instrument(skip(self, joinsplit_data))]
+    #[instrument(level = "trace", skip(self, joinsplit_data))]
     fn update_chain_tip_with(
         &mut self,
         &(joinsplit_data, revealing_tx_id): &(
-            &Option<transaction::JoinSplitData<Groth16Proof>>,
+            &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2318,11 +2330,11 @@ impl
     /// Panics if any nullifier is missing from the chain when we try to remove it.
     ///
     /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
-    #[instrument(skip(self, joinsplit_data))]
+    #[instrument(level = "trace", skip(self, joinsplit_data))]
     fn revert_chain_with(
         &mut self,
         &(joinsplit_data, _revealing_tx_id): &(
-            &Option<transaction::JoinSplitData<Groth16Proof>>,
+            &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2342,17 +2354,17 @@ impl
 
 impl<AnchorV>
     UpdateWith<(
-        &Option<sapling::ShieldedData<AnchorV>>,
+        &Option<Box<sapling::ShieldedData<AnchorV>>>,
         &SpendingTransactionId,
     )> for Chain
 where
     AnchorV: sapling::AnchorVariant + Clone,
 {
-    #[instrument(skip(self, sapling_shielded_data))]
+    #[instrument(level = "trace", skip(self, sapling_shielded_data))]
     fn update_chain_tip_with(
         &mut self,
         &(sapling_shielded_data, revealing_tx_id): &(
-            &Option<sapling::ShieldedData<AnchorV>>,
+            &Option<Box<sapling::ShieldedData<AnchorV>>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2373,11 +2385,11 @@ where
     /// Panics if any nullifier is missing from the chain when we try to remove it.
     ///
     /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
-    #[instrument(skip(self, sapling_shielded_data))]
+    #[instrument(level = "trace", skip(self, sapling_shielded_data))]
     fn revert_chain_with(
         &mut self,
         &(sapling_shielded_data, _revealing_tx_id): &(
-            &Option<sapling::ShieldedData<AnchorV>>,
+            &Option<Box<sapling::ShieldedData<AnchorV>>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2395,12 +2407,12 @@ where
     }
 }
 
-impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Chain {
-    #[instrument(skip(self, orchard_shielded_data))]
+impl UpdateWith<(&Option<Box<orchard::ShieldedData>>, &SpendingTransactionId)> for Chain {
+    #[instrument(level = "trace", skip(self, orchard_shielded_data))]
     fn update_chain_tip_with(
         &mut self,
         &(orchard_shielded_data, revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            &Option<Box<orchard::ShieldedData>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2421,11 +2433,11 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
     /// Panics if any nullifier is missing from the chain when we try to remove it.
     ///
     /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
-    #[instrument(skip(self, orchard_shielded_data))]
+    #[instrument(level = "trace", skip(self, orchard_shielded_data))]
     fn revert_chain_with(
         &mut self,
         (orchard_shielded_data, _revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            &Option<Box<orchard::ShieldedData>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2444,7 +2456,7 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
 }
 
 impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for Chain {
-    #[instrument(skip(self, ironwood_shielded_data))]
+    #[instrument(level = "trace", skip(self, ironwood_shielded_data))]
     fn update_chain_tip_with(
         &mut self,
         &(ironwood_shielded_data, revealing_tx_id): &(
@@ -2469,7 +2481,7 @@ impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for C
     /// Panics if any nullifier is missing from the chain when we try to remove it.
     ///
     /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
-    #[instrument(skip(self, ironwood_shielded_data))]
+    #[instrument(level = "trace", skip(self, ironwood_shielded_data))]
     fn revert_chain_with(
         &mut self,
         &(ironwood_shielded_data, _revealing_tx_id): &(

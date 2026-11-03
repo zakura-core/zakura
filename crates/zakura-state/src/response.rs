@@ -46,6 +46,21 @@ pub enum PreparedMinedRelayEligibility {
     Unavailable,
 }
 
+/// Whether a block's header commits to the authorizing data in its body.
+///
+/// From NU5, the block hash commits to authorizing data only through `hashBlockCommitments`
+/// (ZIP 244), so a body can match its header's transaction IDs and still carry different
+/// signatures, proofs, or scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthDataCommitment {
+    /// The header commits to the body's authorizing data. Before NU5, transaction IDs do.
+    Bound,
+    /// The body's authorizing data does not match the header's commitment.
+    Mismatch(block::CommitmentError),
+    /// The parent's history tree is not available, so the binding is unknown.
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
@@ -136,6 +151,9 @@ pub enum Response {
 
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
+
+    /// Response to [`Request::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
 
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -641,6 +659,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
+    /// Response to [`ReadRequest::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
+
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -762,6 +783,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
             ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
+            }
+            ReadResponse::AuthDataCommitment(commitment) => {
+                Ok(Response::AuthDataCommitment(commitment))
             }
 
             ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),

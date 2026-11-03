@@ -48,7 +48,7 @@ use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
+use crate::{error::TransactionError, primitives, BoxError};
 
 use super::{check, Request, Verifier};
 
@@ -638,7 +638,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
     };
 
     assert_eq!(
-        check::shielded_proof_size_is_canonical(&make_v5(shielded_data.clone())),
+        check::shielded_proof_size_is_canonical(&make_v5(Box::new(shielded_data.clone()))),
         Ok(())
     );
     assert_eq!(
@@ -657,7 +657,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
 
     for noncanonical in [short, padded] {
         assert_eq!(
-            check::shielded_proof_size_is_canonical(&make_v5(noncanonical.clone())),
+            check::shielded_proof_size_is_canonical(&make_v5(Box::new(noncanonical.clone()))),
             Err(TransactionError::OrchardProofSize)
         );
         assert_eq!(
@@ -687,7 +687,7 @@ fn matching_orchard_and_ironwood_nullifiers_are_not_conflicts() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data.clone()),
+        orchard_shielded_data: Some(Box::new(shielded_data.clone())),
         ironwood_shielded_data: Some(shielded_data),
     };
 
@@ -796,7 +796,7 @@ fn v6_pool_flow_transaction(
         inputs: vec![],
         outputs: transparent_outputs,
         sapling_shielded_data: None,
-        orchard_shielded_data,
+        orchard_shielded_data: orchard_shielded_data.map(Box::new),
         ironwood_shielded_data,
     }
 }
@@ -883,7 +883,7 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
         inputs: vec![coinbase_input()],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS)),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS))),
         ironwood_shielded_data: None,
     };
     assert!(coinbase_with_orchard.is_coinbase());
@@ -1612,13 +1612,12 @@ async fn mempool_request_with_unmined_output_spends_is_accepted() {
         "spent_mempool_outpoints in tx verifier response should match input_outpoint"
     );
 
-    tokio::time::sleep(POLL_MEMPOOL_DELAY * 2).await;
-    // polled before AwaitOutput request and after a mempool transaction with transparent outputs
-    // is successfully verified
+    // Polled only for the AwaitOutput request. The mempool's downloader, not the verifier,
+    // wakes the mempool to add verified transactions.
     assert_eq!(
         mempool.poll_count(),
-        2,
-        "the mempool service should have been polled twice"
+        1,
+        "the mempool service should have been polled once"
     );
 }
 
@@ -1787,13 +1786,12 @@ async fn dont_skip_verification_of_block_transactions_in_mempool() {
         panic!("unexpected response variant from transaction verifier for Block request")
     };
 
-    tokio::time::sleep(POLL_MEMPOOL_DELAY * 2).await;
-    // polled before AwaitOutput request and after a mempool transaction with transparent outputs
-    // is successfully verified.
+    // Polled only for the AwaitOutput request. The mempool's downloader, not the verifier,
+    // wakes the mempool to add verified transactions.
     assert_eq!(
         mempool.poll_count(),
-        2,
-        "the mempool service should have been polled twice"
+        1,
+        "the mempool service should have been polled once"
     );
 }
 
@@ -2697,7 +2695,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
             outputs: vec![],
             lock_time: LockTime::Height(block::Height(0)),
             expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data: Some(Box::new(joinsplit_data)),
             sapling_shielded_data: None,
         };
 
@@ -2772,7 +2770,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
             outputs: vec![],
             lock_time: LockTime::Height(block::Height(0)),
             expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data: Some(Box::new(joinsplit_data)),
             sapling_shielded_data: None,
         };
 
@@ -4028,6 +4026,60 @@ fn sapling_v4_output_with_invalid_value_commitment_is_rejected_after_roundtrip()
             result,
             Err(TransactionError::SmallOrder),
             "a V4 Sapling output with an off-curve cv must be rejected with SmallOrder",
+        );
+    });
+}
+
+/// A coinbase transaction whose Sapling output has an invalid (off-curve) value
+/// commitment is rejected by the verifier with `SmallOrder`.
+///
+/// Converting a transaction through librustzcash no longer rejects an invalid
+/// Sapling `cv`, so `check::coinbase_outputs_are_decryptable`, which converts
+/// the coinbase, can no longer be relied on to reject one: a miner can encrypt
+/// the output under the invalid `cv` so that it decrypts. The early semantic
+/// point check still rejects the coinbase, which fails its block.
+#[test]
+fn sapling_coinbase_output_with_invalid_value_commitment_is_rejected() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .find(|(_, transaction)| {
+                transaction.is_coinbase()
+                    && matches!(transaction.as_ref(), Transaction::V4 { .. })
+                    && transaction.sapling_outputs().next().is_some()
+            })
+            .expect("a V4 coinbase transaction with Sapling outputs");
+
+        corrupt_first_sapling_output_value_commitment(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+        );
+
+        assert!(
+            !transaction.sapling_point_encodings_are_valid(),
+            "the deferred Sapling point check must reject the coinbase's invalid cv"
+        );
+
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let verifier = Verifier::new_for_tests(&network, state_service);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction_hash: transaction.hash(),
+                transaction,
+                known_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::SmallOrder),
+            "a coinbase Sapling output with an off-curve cv must be rejected with SmallOrder",
         );
     });
 }

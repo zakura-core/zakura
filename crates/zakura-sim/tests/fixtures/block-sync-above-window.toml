@@ -1,0 +1,15 @@
+# The committed fuzz input `block-sync-above-window.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# two bytes, `ff 04`, pick the above-window scenario: four mirrors serve
+# 420 bodies of unknown size but withhold height 3 and every height above
+# 403, so the node requests above-window heights that never arrive. The
+# plan is empty, so every pick is round-robin.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "e66b81be1c76b815b0d2ef0c9b60e702d09219cf7d689b1f1100c6a11d0599cd"
+scenario_sha256 = "e0b8db423c03639f12687fabea3aa14b3dec678635ac12ffb08f45af547265b9"
+source = "crates/zakura-sim/tests/block_resource_properties.rs"
+
+[[witness]]
+property = "block-sync/lookahead-overshoot-bound"
+expect = "holds"

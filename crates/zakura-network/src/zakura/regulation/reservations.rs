@@ -747,6 +747,9 @@ struct PrecheckSetup {
     choice: OnceLock<Option<Arc<dyn ResponsePrecheck>>>,
     gated: AtomicBool,
     ready: CancellationToken,
+    /// The stream's transport observer, shared by its reader and service.
+    #[cfg(any(test, zakura_sim))]
+    tap: OnceLock<Arc<crate::zakura::StreamTap>>,
 }
 
 impl PrecheckSlot {
@@ -778,6 +781,19 @@ impl PrecheckSlot {
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
         self.0.choice.get().and_then(|choice| choice.as_deref())
+    }
+
+    /// Report this stream's reads, writes and regulation through `tap`. Only
+    /// the first call attaches one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<crate::zakura::StreamTap>) {
+        let _ = self.0.tap.set(tap);
+    }
+
+    /// The stream's transport observer, if one is attached.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn tap(&self) -> Option<&Arc<crate::zakura::StreamTap>> {
+        self.0.tap.get()
     }
 }
 

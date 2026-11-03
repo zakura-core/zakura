@@ -1,0 +1,74 @@
+[limits]
+budget_usd = 25
+unit_bytes = 24000
+max_seconds = 3300
+
+[scope]
+# Literal file paths, or directory paths ending in / (including descendants).
+exclude_paths = [
+    # Automation, simulation, test infrastructure, and documentation.
+    ".github/",
+    "crates/zakura-sim/",
+    "crates/zakura-scheduler/",
+    "crates/zakura-storage/",
+    "crates/zakura-test/",
+    "crates/zakura-rt/src/sim/",
+    "crates/zakura-quic/src/sim/",
+    "crates/zakura-network/src/zakura/testkit/",
+    "qa/",
+    ".oss-scanner/",
+    "docs/",
+    "AGENTS.md",
+    "README.md",
+    "CHANGELOG.md",
+    "deploy/",
+
+    # Standalone test and benchmark modules; source remains readable as context.
+    "crates/xtask/tests/",
+    "crates/zakura-chain/benches/",
+    "crates/zakura-chain/src/block/tests/",
+    "crates/zakura-chain/src/orchard/tests/",
+    "crates/zakura-chain/src/sapling/tests.rs",
+    "crates/zakura-chain/src/sapling/tests/",
+    "crates/zakura-chain/src/transaction/tests/",
+    "crates/zakura-consensus/src/block/tests.rs",
+    "crates/zakura-consensus/src/primitives/halo2/tests.rs",
+    "crates/zakura-consensus/src/primitives/sapling/tests.rs",
+    "crates/zakura-consensus/src/router/tests.rs",
+    "crates/zakura-consensus/src/transaction/tests.rs",
+    "crates/zakura-header-chain/src/transition/recovery/tests/",
+    "crates/zakura-network/src/protocol/external/codec/tests/",
+    "crates/zakura-network/src/zakura/block_sync/regulated/session/tests.rs",
+    "crates/zakura-network/src/zakura/block_sync/regulated/session/tests/",
+    "crates/zakura-network/src/zakura/block_sync/sequencer_task/tests/",
+    "crates/zakura-network/src/zakura/block_sync/tests.rs",
+    "crates/zakura-network/src/zakura/block_sync/tests/",
+    "crates/zakura-network/src/zakura/block_sync/work_queue/request_write/tests.rs",
+    "crates/zakura-network/src/zakura/handler/service_session/tests.rs",
+    "crates/zakura-network/src/zakura/handler/tests/",
+    "crates/zakura-network/src/zakura/header_sync/reactor/tests/",
+    "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests.rs",
+    "crates/zakura-network/src/zakura/regulation/serve/tests.rs",
+    "crates/zakura-network/src/zakura/regulation/subscription/tests.rs",
+    "crates/zakura-network/src/zakura/transport/message_rule/tests.rs",
+    "crates/zakura-network/tests/",
+    "crates/zakura-quic/src/tests.rs",
+    "crates/zakura-quic/tests/",
+    "crates/zakura-rpc/src/methods/tests/",
+    "crates/zakura-rpc/src/server/tests/",
+    "crates/zakura-rt/tests/",
+    "crates/zakura-script/src/tests.rs",
+    "crates/zakura-state/src/service/check/tests/",
+    "crates/zakura-state/src/service/finalized_state/tests/",
+    "crates/zakura-state/src/service/write/tests/",
+    "crates/zakura-state/src/service/write/vct_authentication_sweep/tests.rs",
+    "crates/zakura-state/src/service/write/vct_authentication_sweep/tests/",
+    "crates/zakura-state/src/service/write/vct_write_retry/tests.rs",
+    "crates/zakura-state/tests/",
+    "crates/zakurad/src/components/mempool/storage/tests/",
+    "crates/zakurad/src/components/metrics/prometheus/tests.rs",
+    "crates/zakurad/tests/",
+]
+
+[profiles.default]
+prompts = ["prompts/reviewer.md", "prompts/focus.md"]

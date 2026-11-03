@@ -25,6 +25,7 @@ pub(crate) use client::{CancelHeartbeatTask, ClientRequest};
 
 pub use client::Client;
 pub use connection::Connection;
+pub(crate) use connection::ConnectionRequests;
 pub use connector::{Connector, OutboundConnectorRequest};
 pub use error::{ErrorSlot, HandshakeError, NotFoundClass, PeerError, SharedPeerError};
 pub use handshake::{ConnectedAddr, ConnectionInfo, Handshake, HandshakeRequest};

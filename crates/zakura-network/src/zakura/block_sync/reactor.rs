@@ -251,6 +251,8 @@ pub fn spawn_block_sync_reactor(
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
+    #[cfg(any(test, zakura_sim))]
+    let sequencer_task = sequencer_task.with_observer(startup.observer.clone());
     spawn_erased_named("block_sync_sequencer", sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
@@ -284,6 +286,16 @@ pub fn spawn_block_sync_reactor(
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
         trace: startup.trace.clone(),
+        #[cfg(any(test, zakura_sim))]
+        observer: startup.observer.clone(),
+    };
+    #[cfg(any(test, zakura_sim))]
+    let routine_wiring = {
+        let mut routine_wiring = routine_wiring;
+        Arc::get_mut(&mut routine_wiring.serving)
+            .expect("nothing shares serving before the handle exists")
+            .observer = startup.observer.clone();
+        routine_wiring
     };
 
     let handle = BlockSyncHandle {
@@ -462,6 +474,8 @@ impl BlockSyncReactor {
         self.refresh_throughput();
         self.trace_sync_state(true);
         loop {
+            #[cfg(any(test, zakura_sim))]
+            self.state.work_queue.observe_items();
             // Arm the floor watchdog to the earliest outstanding floor-claim
             // deadline (event-driven, like the per-peer routine's own-timeout
             // arm): force-cancel an expired floor request exactly when it expires
@@ -717,7 +731,8 @@ impl BlockSyncReactor {
                 hash,
                 outcome,
             } => {
-                let semantic_completion = self.body_completion_authority(source, &owner);
+                let (semantic_completion, committed_epoch) =
+                    self.body_completion_authority(source, &owner);
                 self.handle_block_apply_finished(
                     owner,
                     source,
@@ -726,6 +741,7 @@ impl BlockSyncReactor {
                     hash,
                     outcome,
                     semantic_completion,
+                    committed_epoch,
                 )
                 .await
             }
@@ -1569,6 +1585,7 @@ impl BlockSyncReactor {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     ) {
         // The whole commit-pipeline body (token validate, applying removal,
         // throughput record, rollback + misbehavior, drain + submit) runs on the
@@ -1601,6 +1618,7 @@ impl BlockSyncReactor {
                 eligible_sources: self.registry.eligible_sources(height),
                 persisted_availability,
                 semantic_completion,
+                committed_epoch,
             });
         self.trace_sequencer_control_send(
             "apply_finished",
@@ -1646,7 +1664,16 @@ impl BlockSyncReactor {
         if self.empty_state_header_quiet_until.is_some() {
             return true;
         }
-        if self.request_floor >= self.state.best_header_tip {
+        // A committed verified tip off the selected chain at or above its tip
+        // leaves no selected height above the floor, yet only the state's
+        // answer names the common ancestor block sync must reset to.
+        let diverged = self.committed_view.as_ref().is_some_and(|view| {
+            let frontiers = view.frontiers;
+            frontiers.verified_best.height > frontiers.header_best.height
+                || (frontiers.verified_best.height == frontiers.header_best.height
+                    && frontiers.verified_best.hash != frontiers.header_best.hash)
+        });
+        if self.request_floor >= self.state.best_header_tip && !diverged {
             self.clear_pending_needed_query();
             return true;
         }
@@ -1660,6 +1687,7 @@ impl BlockSyncReactor {
         let Some(from) = refresh
             .map(|(_, from, _)| from)
             .or_else(|| self.next_needed_block_query_start())
+            .or_else(|| diverged.then_some(self.state.best_header_tip))
         else {
             return true;
         };
@@ -1752,14 +1780,20 @@ impl BlockSyncReactor {
         }
     }
 
+    /// Judges a body completion against the latest committed view, and returns
+    /// that view's body-work epoch. The epoch can be ahead of the last one this
+    /// reactor forwarded to the sequencer.
     fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
         owner: &zakura_header_chain::BodyWorkOwner,
-    ) -> Option<(
-        zakura_header_chain::BodyWorkOwner,
-        zakura_header_chain::StateVersion,
-    )> {
+    ) -> (
+        Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
+        Option<zakura_header_chain::BodyWorkEpoch>,
+    ) {
         let current = self
             .startup
             .committed_views
@@ -1767,28 +1801,36 @@ impl BlockSyncReactor {
             .and_then(|snapshots| snapshots.borrow().clone());
         #[cfg(test)]
         if current.is_none() {
-            return (self.body_work_scope() == Some(owner.authority()))
-                .then_some((*owner, zakura_header_chain::StateVersion::default()));
+            let scope = self.body_work_scope();
+            return (
+                (scope == Some(owner.authority()))
+                    .then_some((*owner, zakura_header_chain::StateVersion::default())),
+                scope.map(|scope| scope.body_work_epoch),
+            );
         }
-        let current = current?;
+        let Some(current) = current else {
+            return (None, None);
+        };
         let mut pending = zakura_header_chain::PendingOwners::default();
         pending.insert(source, *owner);
-        match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
-            zakura_header_chain::BodyCompletionDecision::Current => {
-                Some((*owner, current.state_version))
-            }
-            zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
-                Some((owner, current.state_version))
-            }
-            zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
-                metrics::counter!(
-                    "sync.header_chain.stale_completion.total",
-                    "kind" => format!("body_{reason:?}")
-                )
-                .increment(1);
-                None
-            }
-        }
+        let semantic_completion =
+            match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
+                zakura_header_chain::BodyCompletionDecision::Current => {
+                    Some((*owner, current.state_version))
+                }
+                zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
+                    Some((owner, current.state_version))
+                }
+                zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
+                    metrics::counter!(
+                        "sync.header_chain.stale_completion.total",
+                        "kind" => format!("body_{reason:?}")
+                    )
+                    .increment(1);
+                    None
+                }
+            };
+        (semantic_completion, Some(current.body_work_epoch))
     }
 
     fn next_needed_block_query_start(&self) -> Option<block::Height> {

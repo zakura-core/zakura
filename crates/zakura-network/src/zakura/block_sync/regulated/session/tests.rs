@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::block_sync::block_sync_observe::SessionKey;
 use crate::zakura::{
     block_sync::regulated::serving::{Read, ReadResult},
     framed_channel,
@@ -123,6 +124,7 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
     let (send, mut output) = framed_channel(4);
     let mut session = serving.session(
         &ZakuraPeerId::new(vec![61; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -176,6 +178,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     let (send, old_output) = framed_channel(4);
     let mut old = serving.session(
         &peer,
+        SessionKey::default(),
         send,
         old_cancel.clone(),
         CancellationToken::new(),
@@ -201,6 +204,10 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     let (send, mut output) = framed_channel(4);
     let mut new = serving.session(
         &peer,
+        SessionKey {
+            conn_id: 0,
+            generation: 1,
+        },
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -243,6 +250,7 @@ fn ready_session(
     let (send, output) = framed_channel(queue);
     let session = serving.session(
         &ZakuraPeerId::new(vec![peer; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -477,6 +485,7 @@ async fn serving_enforces_the_budgeted_limit() {
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
         &ZakuraPeerId::new(vec![62; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -506,6 +515,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
         &ZakuraPeerId::new(vec![63; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),

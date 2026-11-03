@@ -30,7 +30,7 @@ use zakura_network::zakura::{
         CallEnd, HeaderSyncObserver, HeaderTargetPhase, PortCall, ReactorEvent, RequestRef,
         WaitCause,
     },
-    HeaderTargetPurpose, ZakuraPeerId,
+    HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
 use zakura_scheduler::SimInstant;
@@ -311,6 +311,14 @@ fn cause(cause: WaitCause) -> &'static str {
     }
 }
 
+/// `reason`'s name.
+fn misbehavior(reason: HeaderSyncMisbehavior) -> &'static str {
+    match reason {
+        HeaderSyncMisbehavior::MalformedMessage => "malformed-message",
+        HeaderSyncMisbehavior::InvalidHeader => "invalid-header",
+    }
+}
+
 /// `event` in plain fields, or an error for an event this build can't
 /// encode.
 fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
@@ -353,6 +361,17 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             session_id,
             target: hash(target_tip_hash),
             cause: cause(refused).to_owned(),
+        },
+        ReactorEvent::Misbehavior {
+            peer: violator,
+            reason,
+            origin,
+            current,
+        } => ReactorFact::Misbehavior {
+            peer: peer(&violator),
+            reason: misbehavior(reason).to_owned(),
+            origin,
+            current,
         },
         // The enum is non-exhaustive, and an event the log can't hold would
         // leave the evidence silently incomplete.

@@ -1137,9 +1137,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
@@ -1730,9 +1730,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3524060.0"
+version = "0.3528743.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71aa78c665cd888d2020f0d3fd976b80e58af0b3cb96c7e621171205b9556a7d"
+checksum = "4c02a2659f48c757ae8dad429a6fa01a115e1e74c755701fa225164b135d390d"
 
 [[package]]
 name = "zakura-bellman"
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.1"
+version = "11.1.0"
 dependencies = [
  "chrono",
  "derive-new",

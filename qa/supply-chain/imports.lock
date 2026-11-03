@@ -35,8 +35,8 @@ when = "2026-04-17"
 trusted-publisher = "github:bytecodealliance/wit-bindgen"
 
 [[publisher.zakura-assets]]
-version = "0.3535411.0"
-when = "2026-10-31"
+version = "0.3538611.0"
+when = "2026-11-03"
 trusted-publisher = "github:zakura-core/zakura"
 
 [[audits.bytecode-alliance.wildcard-audits.bumpalo]]

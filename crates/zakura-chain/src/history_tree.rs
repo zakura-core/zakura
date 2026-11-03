@@ -620,22 +620,17 @@ impl HistoryTree {
     /// The tree is updated in-place. It is created when pushing the Heartwood
     /// activation block.
     #[allow(clippy::unwrap_in_result)]
-    pub fn push<'a>(
+    pub fn push(
         &mut self,
         network: &Network,
-        block: impl Into<crate::block::BlockView<'a>>,
+        block: &crate::block::BlockRef,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
     ) -> Result<(), HistoryTreeError> {
         self.push_from_parts(
             network,
-            HistoryTreeBlockParts::from_block(
-                block.into(),
-                sapling_root,
-                orchard_root,
-                ironwood_root,
-            ),
+            HistoryTreeBlockParts::from_block(block, sapling_root, orchard_root, ironwood_root),
         )
     }
 

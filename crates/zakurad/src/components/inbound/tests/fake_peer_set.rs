@@ -1332,6 +1332,153 @@ async fn caches_getaddr_response() {
     }
 }
 
+/// The state's read result limit serves the default inbound peers, each holding one
+/// legacy `getdata` block request, clamped to the peer memory budget.
+#[test]
+fn read_result_limit_derives_from_getdata_and_inbound_limits() {
+    assert_eq!(
+        zakura_state::READ_RESULT_BLOCKS_PER_PEER,
+        u64::try_from(super::super::GETDATA_MAX_BLOCK_COUNT).unwrap()
+    );
+    let network = zakura_network::Config::default();
+    assert_eq!(
+        zakura_state::DEFAULT_READ_RESULT_PEERS,
+        network.peerset_inbound_connection_limit()
+    );
+    assert_eq!(
+        zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES,
+        network.zakura.peer_memory_budget_bytes
+    );
+
+    // The default peer budget clamps the 115.2 GB derivation to 8 GiB.
+    let default = crate::config::ZakuradConfig::default();
+    assert_eq!(
+        default
+            .mirrored_state_config()
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get),
+        Some(network.zakura.peer_memory_budget_bytes)
+    );
+
+    // A small peer set keeps its derived limit below the budget.
+    let config = crate::config::ZakuradConfig {
+        network: zakura_network::Config {
+            peerset_initial_target_size: 5,
+            ..network.clone()
+        },
+        ..Default::default()
+    };
+    let derived = StateConfig::read_result_byte_limit_for_peers(
+        config.network.peerset_inbound_connection_limit(),
+        u64::MAX,
+    );
+    assert!(derived.get() < network.zakura.peer_memory_budget_bytes);
+    assert_eq!(
+        config.mirrored_state_config().read_result_byte_limit,
+        Some(derived)
+    );
+
+    // A lower peer budget lowers the clamp.
+    let mut tight = crate::config::ZakuradConfig::default();
+    tight.network.zakura.peer_memory_budget_bytes = derived.get() / 2;
+    assert_eq!(
+        tight
+            .mirrored_state_config()
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get),
+        Some(derived.get() / 2)
+    );
+}
+
+/// A block read that the state refuses for lack of capacity becomes `notfound`, so the
+/// peer can retry sooner. Other state errors still fail the request.
+#[tokio::test]
+async fn refused_block_reads_send_notfound() {
+    let _init_guard = zakura_test::init();
+
+    let refused = zakura_chain::block::Hash([0x11; 32]);
+    let unknown = zakura_chain::block::Hash([0x22; 32]);
+    let broken = zakura_chain::block::Hash([0x33; 32]);
+
+    let (_state, _read_only_state, latest_chain_tip, _chain_tip_change) =
+        zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+    let state = Buffer::new(
+        BoxService::new(tower::service_fn(move |request| async move {
+            match request {
+                zakura_state::Request::AnyChainBlock(hash) if hash == refused.into() => Err(
+                    BoxError::from(zakura_node_services::block_memory::ReadMemoryExhausted),
+                ),
+                zakura_state::Request::AnyChainBlock(hash) if hash == broken.into() => {
+                    Err(BoxError::from("disk failure"))
+                }
+                zakura_state::Request::AnyChainBlock(_) => Ok(zakura_state::Response::Block(None)),
+                request => panic!("unexpected state request: {request:?}"),
+            }
+        })),
+        1,
+    );
+    let block_verifier = Buffer::new(
+        BoxService::new(tower::service_fn(
+            |_request: zakura_consensus::Request| async move {
+                Err::<zakura_chain::block::Hash, _>(zakura_consensus::RouterError::from(
+                    zakura_consensus::VerifyCheckpointError::Finished,
+                ))
+            },
+        )),
+        1,
+    );
+
+    let (setup_tx, setup_rx) = oneshot::channel();
+    let inbound = ServiceBuilder::new().buffer(1).service(BoxService::new(
+        ServiceBuilder::new().load_shed().service(Inbound::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            None,
+            Vec::new(),
+            setup_rx,
+        )),
+    ));
+    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let setup_data = InboundSetupData {
+        address_book: Arc::new(std::sync::Mutex::new(AddressBook::new(
+            SocketAddr::from_str("0.0.0.0:0").unwrap(),
+            &Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
+            Span::none(),
+        ))),
+        block_download_peer_set: Buffer::new(
+            BoxService::new(MockService::build().for_unit_tests()),
+            1,
+        ),
+        block_verifier,
+        mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+        state,
+        latest_chain_tip,
+        network: Mainnet,
+        misbehavior_sender,
+    };
+    assert!(setup_tx.send(setup_data).is_ok(), "inbound setup is sent");
+
+    let response = inbound
+        .clone()
+        .oneshot(Request::BlocksByHash(
+            [refused, unknown].into_iter().collect(),
+        ))
+        .await
+        .expect("a refused read still answers the request");
+    assert_eq!(
+        response,
+        Response::Blocks(vec![Missing(refused), Missing(unknown)])
+    );
+
+    inbound
+        .oneshot(Request::BlocksByHash([broken].into_iter().collect()))
+        .await
+        .expect_err("a state failure that is not a refusal fails the request");
+}
+
 /// Setup a fake Zebra network stack, with fake peer set.
 ///
 /// Adds some initial state blocks, and mempool transactions if `add_transactions` is true.

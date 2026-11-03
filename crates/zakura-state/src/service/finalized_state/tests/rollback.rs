@@ -537,11 +537,10 @@ pub(super) fn spend_tx(
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-pub(super) fn child_block<'a>(
-    parent: impl Into<zakura_chain::block::BlockView<'a>>,
+pub(super) fn child_block(
+    parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
 ) -> Arc<Block> {
-    let parent = parent.into();
     let header = block::Header {
         previous_block_hash: parent.hash(),
         ..*parent.header()
@@ -638,8 +637,8 @@ pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwo
     )
 }
 
-pub(super) fn child_block_with_history_commitment<'a>(
-    parent: impl Into<zakura_chain::block::BlockView<'a>>,
+pub(super) fn child_block_with_history_commitment(
+    parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
     previous_history_tree: &zakura_chain::history_tree::HistoryTree,
@@ -1015,7 +1014,7 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
             prop_assert!(
                 !synced[target_index + 1..]
                     .iter()
-                    .any(|block| block.block.view().sprout_note_commitments().next().is_some()),
+                    .any(|block| block.block.sprout_note_commitments().next().is_some()),
                 "V5 blocks in the removed range must not contain Sprout commitments"
             );
 

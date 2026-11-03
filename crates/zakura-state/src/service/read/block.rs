@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, PayloadAdmissionFailure, TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, ReadMemoryExhausted, TransactionHandle,
 };
 
 use chrono::{DateTime, Utc};
@@ -127,7 +127,7 @@ pub fn block_header_result<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Result<Option<HeaderHandle>, PayloadAdmissionFailure>
+) -> Result<Option<HeaderHandle>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {
@@ -146,7 +146,7 @@ fn transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure>
+) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {
@@ -172,7 +172,7 @@ pub fn mined_transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<MinedTx>, PayloadAdmissionFailure>
+) -> Result<Option<MinedTx>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {
@@ -195,7 +195,7 @@ pub fn any_transaction<'a>(
     chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<AnyTx>, PayloadAdmissionFailure> {
+) -> Result<Option<AnyTx>, ReadMemoryExhausted> {
     // # Correctness
     //
     // It is ok to do this lookup in multiple different calls. Finalized state updates

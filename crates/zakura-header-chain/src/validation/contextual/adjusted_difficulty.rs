@@ -71,15 +71,14 @@ impl AdjustedDifficulty {
     ///
     /// Miners supply block times.
     /// The `time` values might not follow reverse chronological order.
-    pub fn new_from_block<'a, C>(
-        candidate_block: impl Into<zakura_chain::block::BlockView<'a>>,
+    pub fn new_from_block<C>(
+        candidate_block: &zakura_chain::block::BlockRef,
         network: &Network,
         context: C,
     ) -> Result<AdjustedDifficulty, AdjustedDifficultyError>
     where
         C: IntoIterator<Item = (CompactDifficulty, DateTime<Utc>)>,
     {
-        let candidate_block = candidate_block.into();
         let candidate_block_height = candidate_block
             .coinbase_height()
             .ok_or(AdjustedDifficultyError::MissingCoinbaseHeight)?;

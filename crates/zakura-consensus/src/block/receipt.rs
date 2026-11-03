@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use zakura_chain::{block::BlockView, serialization::ZcashSerialize};
+use zakura_chain::{block::BlockRef, serialization::ZcashSerialize};
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 
@@ -46,8 +46,7 @@ pub(super) struct ReceiptGuard {
 
 impl ReceiptRegistry {
     /// Called synchronously by the verifier before returning its request future.
-    pub(super) fn register<'a>(&self, block: impl Into<BlockView<'a>>) -> ReceiptGuard {
-        let block = block.into();
+    pub(super) fn register(&self, block: &BlockRef) -> ReceiptGuard {
         // Hash the complete serialized body before locking. ZIP-244 permits
         // unequal authorizing data under the same header and transaction IDs.
         let mut digest = blake2b_simd::Params::new().hash_length(32).to_state();

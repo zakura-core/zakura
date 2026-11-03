@@ -34,10 +34,10 @@ use crate::{
 /// A funded serialized block for a mocked state response.
 #[cfg(feature = "indexer")]
 fn raw_block(bytes: Vec<u8>) -> zakura_node_services::block_memory::OwnedRawBlock {
-    zakura_node_services::block_memory::DecodedPayloadPool::new(std::num::NonZeroU16::MIN)
-        .try_decode(|| Some(bytes))
-        .expect("a new pool has capacity")
-        .expect("the mock supplies the payload")
+    zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
+        .try_reserve(0)
+        .and_then(|reservation| reservation.retain(bytes))
+        .expect("an unlimited budget has room")
 }
 
 #[tokio::test]

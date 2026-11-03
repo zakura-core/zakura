@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, PayloadAdmissionFailure,
+    AdmissionFailure, BlockHandle, HeaderHandle, ReadMemoryExhausted,
 };
 
 use chrono::{DateTime, Utc};
@@ -547,7 +547,7 @@ fn collect_chain_headers<C>(
     intersection: Option<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Result<Vec<HeaderHandle>, PayloadAdmissionFailure>
+) -> Result<Vec<HeaderHandle>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {
@@ -644,7 +644,7 @@ pub fn find_chain_headers<C>(
     known_blocks: Vec<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Result<Vec<HeaderHandle>, PayloadAdmissionFailure>
+) -> Result<Vec<HeaderHandle>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {

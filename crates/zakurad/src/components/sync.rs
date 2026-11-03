@@ -740,22 +740,51 @@ pub enum BackendExecutionError {
 
 impl Config {
     /// Check that the sync and gossip paths fit one verifier allowance, then return
-    /// the block verifications they can hold together.
+    /// the block verifications they can hold together on `network`.
     ///
     /// The verifier router is one backend. Legacy sync, native block sync, and gossip each
-    /// hold their own limit.
-    pub fn backend_verification_total(&self) -> Result<usize, BackendExecutionError> {
-        let legacy_checkpoint = self
+    /// hold their own limit. Each term is the effective limit at runtime: the configured
+    /// limit raised to its minimum, then scaled by the largest lookahead multiplier of any
+    /// network upgrade.
+    pub fn backend_verification_total(
+        &self,
+        network: &Network,
+    ) -> Result<usize, BackendExecutionError> {
+        let multiplier = network
+            .activation_list()
+            .into_keys()
+            .map(|height| lookahead_limit_multiplier(network, height))
+            .max()
+            .unwrap_or(1);
+        let checkpoint = self
             .checkpoint_verify_concurrency_limit
-            .checked_mul(VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
+            .max(MIN_CHECKPOINT_CONCURRENCY_LIMIT);
+        let legacy_checkpoint = checkpoint
+            .checked_mul(multiplier)
+            .and_then(|limit| limit.checked_mul(VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1))
             .ok_or(BackendExecutionError::Overflow)?;
+        let legacy_full = self
+            .full_verify_concurrency_limit
+            .max(MIN_CONCURRENCY_LIMIT)
+            .checked_mul(multiplier)
+            .ok_or(BackendExecutionError::Overflow)?;
+        // The native driver keeps room for two complete checkpoint ranges.
+        let native_applies = self
+            .zakura_block_apply_concurrency_limit
+            .max(MIN_CONCURRENCY_LIMIT)
+            .max(
+                2 * self.checkpoint_verify_concurrency_limit.clamp(
+                    MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+                    zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+                ),
+            );
         let total = [
             // Legacy sync's checkpoint verifications, including its pipeline scaling.
             legacy_checkpoint,
             // Legacy sync's full verifications.
-            self.full_verify_concurrency_limit,
+            legacy_full,
             // Native block sync's combined applies.
-            self.zakura_block_apply_concurrency_limit,
+            native_applies,
             // Gossiped block downloads that can reach verification.
             crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY,
         ]

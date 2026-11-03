@@ -19,7 +19,7 @@ use zakura_sim::{
         ReplayOptions, Trace, TraceReader,
     },
     witness::{Expect, WitnessError},
-    MemorySink, NullSink, PlanInput,
+    MemorySink, NullSink, PlanInput, PropertyOutcome, Record,
 };
 
 /// An operation with no effect.
@@ -166,6 +166,51 @@ fn a_driver_failure_is_not_a_detection() {
 }
 
 #[test]
+fn a_harness_failure_leaves_no_property_held() {
+    // CHARGE holds and reaches the trigger, then PANIC ends the run as a
+    // harness failure. As in `Sim::run`, the property is inconclusive.
+    let mut sink = MemorySink::default();
+    let scenario = (ENTRY.draw)(&input(&[CHARGE, PANIC]));
+    let error = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut sink).unwrap_err();
+    let HarnessError::Run { report, .. } = error else {
+        panic!("{error}");
+    };
+    let inconclusive = PropertyOutcome::Inconclusive {
+        reason: "harness-failed".to_owned(),
+    };
+    assert_eq!(report.properties.len(), 1);
+    assert_eq!(report.properties[0].outcome, inconclusive);
+    let Some(Record::End(end)) = sink.records.last() else {
+        panic!("the run ends with its end record");
+    };
+    assert_eq!(end.properties, report.properties);
+}
+
+#[test]
+fn a_run_applies_only_once_it_reaches_the_trigger() {
+    let outcome = |operations: &[[u8; 4]]| {
+        let scenario = (ENTRY.draw)(&input(operations));
+        let report = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut NullSink).unwrap();
+        report.properties[0].outcome.clone()
+    };
+    assert_eq!(outcome(&[IDLE, IDLE]), PropertyOutcome::NotApplicable);
+    assert_eq!(
+        outcome(&[IDLE, CHARGE, IDLE]),
+        PropertyOutcome::Held { applicable: 2 }
+    );
+    // A failure before the trigger still reads as a violation.
+    let scenario = (ENTRY.draw)(&input(&[IDLE, BREAK]));
+    let report = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut NullSink).unwrap();
+    assert!(
+        matches!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated { .. }
+        ),
+        "{report:?}"
+    );
+}
+
+#[test]
 fn a_short_input_keeps_its_length() {
     assert_eq!(ENTRY.scenario(&[1, 2]), json!({ "input": [1, 2] }));
     let long = vec![0; INPUT_BYTES + 1];
@@ -188,11 +233,14 @@ fn a_witness_needs_its_trigger_history() {
     };
     assert_eq!(witness(&[CHARGE], FIXTURE.name, Expect::Holds), Ok(()));
     assert_eq!(witness(&[BREAK], FIXTURE.name, Expect::Violated), Ok(()));
-    assert_eq!(witness(&[IDLE], FIXTURE.name, Expect::Applicable), Ok(()));
-    assert_eq!(
-        witness(&[IDLE], FIXTURE.name, Expect::Holds),
-        Err(WitnessError::LostTriggerHistory)
-    );
+    assert_eq!(witness(&[CHARGE], FIXTURE.name, Expect::Applicable), Ok(()));
+    // An idle-only run never applies, so no expectation passes on it.
+    for expect in [Expect::Applicable, Expect::Holds] {
+        assert_eq!(
+            witness(&[IDLE], FIXTURE.name, expect),
+            Err(WitnessError::Outcome(PropertyOutcome::NotApplicable))
+        );
+    }
     assert_eq!(
         witness(&[CHARGE], "no/such-property", Expect::Holds),
         Err(WitnessError::Unregistered)

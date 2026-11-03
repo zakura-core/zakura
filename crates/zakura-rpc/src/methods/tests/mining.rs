@@ -987,6 +987,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sender.send_best_tip_height(original.tip_height);
         sender.send_best_tip_hash(original.tip_hash);
         sender.send_estimated_distance_to_network_chain_tip(0);
+        sender.send_best_tip_block_time(chrono::Utc::now());
         let read_count = Arc::new(AtomicUsize::new(0));
         let reads = read_count.clone();
         let slow_read = Arc::new(AtomicBool::new(false));

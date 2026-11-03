@@ -15,11 +15,10 @@ use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
         DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
-        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
-        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
-        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
+        DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS, DEFAULT_BS_MAX_RESPONSE_BYTES,
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
+        MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
@@ -2027,7 +2026,10 @@ fn config_without_inflight_block_bytes_derives_them_and_round_trips() {
     assert_eq!(block_sync.inflight_block_bytes(), 6 << 30);
     let written = toml::to_string(&config).expect("the config serializes");
     let reread: crate::Config = toml::from_str(&written).expect("the config reloads");
-    assert_eq!(reread.zakura.block_sync.max_inflight_block_bytes, Some(6 << 30));
+    assert_eq!(
+        reread.zakura.block_sync.max_inflight_block_bytes,
+        Some(6 << 30)
+    );
 }
 
 #[test]
@@ -13071,8 +13073,9 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     let blocks = mainnet_blocks_1_to_3();
     // Open the probe cap so all three heights are outstanding at the reanchor.
     let mut config = fill_loop_mechanics_config();
-    config.max_inflight_block_bytes =
-        Some(BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"));
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13571,8 +13574,9 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     let blocks = mainnet_blocks_1_to_3();
     // Open the probe cap so all three heights are outstanding when height 1 commits.
     let mut config = fill_loop_mechanics_config();
-    config.max_inflight_block_bytes =
-        Some(BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"));
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13666,8 +13670,9 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for all three bodies.
-    config.max_inflight_block_bytes =
-        Some(BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"));
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(

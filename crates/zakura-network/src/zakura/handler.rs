@@ -52,8 +52,8 @@ use zakura_rt::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::peer_memory::{
-    budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes,
-    ConnectionMemory, PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
+    PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
@@ -446,7 +446,10 @@ impl ZakuraConfig {
                 (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
                 (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
                 (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
-                (HEADER_SYNC_STREAM_KIND, super::header_sync::v9::budget(network)),
+                (
+                    HEADER_SYNC_STREAM_KIND,
+                    super::header_sync::v9::budget(network),
+                ),
                 (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
             ],
             ..ReactorShares::from_quic(&self.quic)

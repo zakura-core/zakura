@@ -603,7 +603,8 @@ impl ZakuraBlockSyncConfig {
     /// configured value stays.
     pub fn for_node_connections(mut self, max_connections: usize) -> Self {
         if self.max_inflight_block_bytes.is_none() {
-            self.max_inflight_block_bytes = Some(self.derived_inflight_block_bytes(max_connections));
+            self.max_inflight_block_bytes =
+                Some(self.derived_inflight_block_bytes(max_connections));
         }
         self
     }
@@ -790,7 +791,10 @@ mod owner_cap_tests {
         assert_eq!(config.max_inflight_block_bytes, None);
         assert_eq!(config.inflight_block_bytes(), 3_087_007_744);
         assert_eq!(
-            config.clone().for_node_connections(16).max_inflight_block_bytes,
+            config
+                .clone()
+                .for_node_connections(16)
+                .max_inflight_block_bytes,
             Some(16 * DEFAULT_BS_BBR_MAX_CWND_BYTES)
         );
         // A configured budget stays.
@@ -798,7 +802,10 @@ mod owner_cap_tests {
             max_inflight_block_bytes: Some(6 << 30),
             ..config.clone()
         };
-        assert_eq!(configured.for_node_connections(16).inflight_block_bytes(), 6 << 30);
+        assert_eq!(
+            configured.for_node_connections(16).inflight_block_bytes(),
+            6 << 30
+        );
         // A node without block-sync peers still covers one floor request.
         let no_peers = ZakuraBlockSyncConfig {
             peer_limits: crate::zakura::ServicePeerLimits {
@@ -809,7 +816,10 @@ mod owner_cap_tests {
             ..config.clone()
         };
         assert_eq!(
-            no_peers.clone().for_node_connections(92).inflight_block_bytes(),
+            no_peers
+                .clone()
+                .for_node_connections(92)
+                .inflight_block_bytes(),
             no_peers.floor_request_byte_reservation() + 1
         );
         // The peer limits bind when the node admits more connections.

@@ -110,7 +110,10 @@ fn the_default_node_config_composes() {
     let limits = ZakuraLocalLimits::from_config(&config);
     let envelope = NodeEnvelope::for_node(&config, &limits, 16).expect("the default config fits");
 
-    assert_eq!(limits.max_connections, crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
+    assert_eq!(
+        limits.max_connections,
+        crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS
+    );
     assert_eq!(envelope.owners, limits.owner_bound());
     assert_eq!(
         envelope.decoded_blocks,

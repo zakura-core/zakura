@@ -296,9 +296,16 @@ mod tests {
         assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 96);
         // Every admitted connection at its full window, every handshake, and the
         // one socket the default `listen_addr` binds fit on every network.
-        for network in [mainnet(), Network::new_default_testnet(), Network::new_regtest(Default::default())] {
+        for network in [
+            mainnet(),
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
             let quic = config.quic_memory_bytes(&network, DEFAULT_ZAKURA_MAX_CONNECTIONS);
-            assert!(quic <= u128::from(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES), "{network:?}");
+            assert!(
+                quic <= u128::from(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES),
+                "{network:?}"
+            );
             assert_eq!(
                 config.budgeted_max_connections(&network),
                 Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS),
@@ -424,7 +431,13 @@ mod tests {
             31
         );
         // Without the node key, config load assumes one entry may be its own.
-        assert_eq!(config.budgeted_max_connections(&mainnet()).unwrap_err().required, 31);
+        assert_eq!(
+            config
+                .budgeted_max_connections(&mainnet())
+                .unwrap_err()
+                .required,
+            31
+        );
 
         // Extra addresses for one identity and unparsable entries don't count.
         let config = ZakuraConfig {
@@ -472,7 +485,9 @@ mod tests {
         config.zakura.peer_memory_budget_bytes = budget_for(18);
         assert_eq!(config.zakura.budgeted_max_connections(&mainnet()), Ok(18));
         assert_eq!(
-            config.zakura.budgeted_max_connections_for_node(&mainnet(), node_ids[0]),
+            config
+                .zakura
+                .budgeted_max_connections_for_node(&mainnet(), node_ids[0]),
             Ok(18)
         );
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);
@@ -532,6 +547,12 @@ mod tests {
             peer_memory_budget_bytes: budget_for(2) - 1,
             ..config
         };
-        assert_eq!(config.budgeted_max_connections(&mainnet()).unwrap_err().required, 2);
+        assert_eq!(
+            config
+                .budgeted_max_connections(&mainnet())
+                .unwrap_err()
+                .required,
+            2
+        );
     }
 }

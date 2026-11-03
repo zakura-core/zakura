@@ -513,6 +513,7 @@ where
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
+            check::version_has_a_verifier(&tx)?;
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
             check::has_enough_ironwood_flags(&tx)?;
@@ -658,6 +659,19 @@ where
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
+
+                // Reject unknown anchors and already-spent nullifiers before dispatching
+                // cryptographic work to the verifiers shared with block verification.
+                let response = state
+                    .clone()
+                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
+                        unmined_tx.clone(),
+                    ))
+                    .await?;
+                assert!(
+                    response == zs::Response::ValidBestChainTipNullifiersAndAnchors,
+                    "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
+                );
             }
 
             let nu = req.upgrade(&network);
@@ -666,10 +680,9 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            let async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
-                    tracing::debug!(?tx, "got transaction with wrong version");
-                    return Err(TransactionError::WrongVersion);
+                    unreachable!("the version quick check rejects v1 to v3 transactions before any lookup")
                 }
                 Transaction::V4 {
                     joinsplit_data,
@@ -701,24 +714,6 @@ where
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 )?,
             };
-
-            if let Some(unmined_tx) = mempool_transaction {
-                let check_anchors_and_revealed_nullifiers_query = state
-                    .clone()
-                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
-                        unmined_tx,
-                    ))
-                    .map(|res| {
-                        assert!(
-                            res? == zs::Response::ValidBestChainTipNullifiersAndAnchors,
-                            "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
-                        );
-                        Ok(())
-                    }
-                    );
-
-                async_checks.push(check_anchors_and_revealed_nullifiers_query);
-            }
 
             let block_batch_flush_key = req.block_verifier_batch_flush_key();
 

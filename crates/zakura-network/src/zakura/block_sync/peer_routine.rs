@@ -33,8 +33,8 @@ use zakura_rt::{
 use super::events::RoutineToReactor;
 use super::{
     admission::{
-        admit, admit_received_body, floor_rescue_high, request_deadline, AdmissionOutcome,
-        AdmissionSnapshot, RequestPriority,
+        admit, floor_rescue_high, request_deadline, AdmissionOutcome, AdmissionSnapshot,
+        RequestPriority,
     },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
@@ -2407,12 +2407,11 @@ impl PeerRoutine {
         self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), true);
     }
 
-    /// Accept a wanted unmatched body whose original requester is gone or whose
-    /// height is currently reserved by another peer. The resident `admit()` check
-    /// is the sole gate for queued heights — a received body consumes no request
-    /// budget; for reserved in-flight heights the arrival ends that request's
-    /// reservation (first-completion-wins).
-    #[allow(clippy::too_many_arguments)]
+    /// Accept a wanted unmatched body whose height another published request
+    /// reserves: the arrival ends that request's reservation
+    /// (first-completion-wins). Pending work has no owner, so a body for it is
+    /// left to the caller's ignore path. A received body consumes no request
+    /// budget.
     async fn accept_unmatched_queued_body(
         &mut self,
         height: block::Height,
@@ -2469,65 +2468,25 @@ impl PeerRoutine {
         body_permit: mpsc::OwnedPermit<SequencedBody>,
         raw_block_payload: Arc<[u8]>,
     ) -> bool {
-        let reserved_in_flight = self.work.reserved_in_flight_charge(height);
-        let is_pending = self.work.pending_contains(height);
-        if reserved_in_flight.is_none() && !is_pending {
-            return false;
-        }
-        self.trace
-            .record_block_body_received(hash, BlockBodySource::Zakura);
-        let Some(owner) = self.work.owner_for_height(height) else {
-            // Pending work has no active request owner.
-            // Accepting a body here would create an unowned completion.
-            // Leave it to the unsolicited or stale classification path.
-            return false;
-        };
-
-        // The reservation this arrival ended (an active competing request, or a
-        // stale charge on the claimed height); released after the forward below.
-        let (receipt_settlement, admitted_estimate_bytes) = if is_pending {
-            let sequencer_view = *self.sequencer_view.borrow();
-            let snapshot = self.admission_snapshot(&sequencer_view);
-            if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
-                tracing::debug!(
-                    peer = ?self.peer,
-                    ?height,
-                    serialized_bytes,
-                    "not buffering unmatched queued block-sync body at look-ahead cap"
-                );
+        // First-completion-wins for a timed-out height already re-issued to
+        // another peer: this arrival ends that request's reservation instead of
+        // discarding a valid body because another peer currently owns the
+        // request slot. The ended reservation is released after the forward
+        // below. Pending work has no request owner, and accepting its body would
+        // create an unowned completion, so the caller ignores it.
+        let (owner, settlement) = match self.work.begin_unmatched_receipt(height) {
+            Ok(Some(ended)) => ended,
+            Ok(None) => return false,
+            Err(_) => {
+                self.cancel.cancel();
                 return true;
             }
-
-            // Claim this height into `in_flight` so it leaves `pending`; if it is
-            // already `in_flight` the take is a no-op and the Sequencer drops the
-            // later duplicate. The received body charges no request budget, but any
-            // stale request reservation the height still owned is released below.
-            let _ = self.work.take_in_range(height, height, 1);
-            metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-            let funding = match self.work.claim_receipt_for_owner(owner, height) {
-                Ok(funding) => funding,
-                Err(_) => {
-                    self.cancel.cancel();
-                    return true;
-                }
-            };
-            (funding, None)
-        } else {
-            // First-completion-wins for a timed-out height already re-issued to
-            // another peer: this arrival ends that request's reservation instead of
-            // discarding a valid body because another peer currently owns the
-            // request slot.
-            let settlement = match self.work.begin_competing_receipt(owner, height) {
-                Ok(Some(settlement)) => settlement,
-                Ok(None) => return false,
-                Err(_) => {
-                    self.cancel.cancel();
-                    return true;
-                }
-            };
-            metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-            (settlement.funding, Some(settlement.charge))
         };
+        self.trace
+            .record_block_body_received(hash, BlockBodySource::Zakura);
+        metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+        let (receipt_settlement, admitted_estimate_bytes) =
+            (settlement.funding, Some(settlement.charge));
 
         let decoded_attributed_memory_size_bytes =
             record_decoded_memory_size(&block, body_wire_bytes);

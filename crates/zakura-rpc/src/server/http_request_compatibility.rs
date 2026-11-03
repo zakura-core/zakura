@@ -277,8 +277,8 @@ enum JsonRpcVersion {
 /// positional parameters, duplicate or reordered named parameters, leading whitespace, a `null`
 /// ID (which re-encoding drops) and unknown fields (which re-encoding drops). So this accepts
 /// only a body that starts with `{`, has no other fields, has a non-`null` ID or none, and has
-/// no parameters or positional parameters that re-encode to the same bytes. This avoids
-/// copying and re-encoding large parameters, such as a block's hex in `submitblock`.
+/// no parameters, an empty array, or one unescaped string argument. This avoids copying and
+/// re-encoding a block's hex in `submitblock` without inspecting each array element.
 fn can_forward_json_rpc_2_call_unchanged(body: &[u8]) -> bool {
     if body.first() != Some(&b'{') {
         return false;
@@ -297,37 +297,28 @@ fn can_forward_json_rpc_2_call_unchanged(body: &[u8]) -> bool {
         matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9'))
     });
 
-    id_is_absent_or_string_or_number && call.params.is_none_or(is_canonical_array)
+    id_is_absent_or_string_or_number && call.params.is_none_or(params_can_pass_through_unchanged)
 }
 
-/// Returns whether `params` is a JSON array that re-encodes to the same bytes.
-fn is_canonical_array(params: &RawValue) -> bool {
-    let Ok(items) = serde_json::from_str::<'_, Vec<&RawValue>>(params.get()) else {
-        return false;
-    };
-    // A compact array has exactly one byte between neighbouring items and around the ends.
-    let compact_len = 2
-        + items.iter().map(|item| item.get().len()).sum::<usize>()
-        + items.len().saturating_sub(1);
-    if compact_len != params.get().len() {
-        return false;
-    }
+/// Returns whether parameters are `[]` or one compact, unescaped string argument.
+///
+/// `RawValue` already contains valid JSON. Checking its delimiters and string contents avoids
+/// allocating per argument or parsing and serializing values before falling back to conversion.
+fn params_can_pass_through_unchanged(params: &RawValue) -> bool {
+    let json = params.get();
 
-    items.iter().all(|item| reencodes_unchanged(item))
-}
-
-/// Returns whether a JSON value re-encodes to the same bytes.
-fn reencodes_unchanged(value: &RawValue) -> bool {
-    let json = value.get();
-
-    // Strings without escapes serialize unchanged.
-    if json.starts_with('"') && !json.contains('\\') {
+    if json == "[]" {
         return true;
     }
 
-    serde_json::from_str::<serde_json::Value>(json)
-        .and_then(|value| serde_json::to_string(&value))
-        .is_ok_and(|encoded| encoded == json)
+    let Some(value) = json
+        .strip_prefix("[\"")
+        .and_then(|value| value.strip_suffix("\"]"))
+    else {
+        return false;
+    };
+
+    !value.bytes().any(|byte| matches!(byte, b'"' | b'\\'))
 }
 
 /// A JSON-RPC 2.0 call with only the standard fields, borrowed from the request body.

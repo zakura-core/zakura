@@ -139,13 +139,14 @@ impl Service<HttpRequest> for RecordingRpcService {
 
 /// Sends `request` through the middleware and returns what the inner service received and
 /// what the client gets back.
-async fn round_trip(request: &'static str, response: &'static str) -> (Bytes, Bytes) {
+async fn round_trip(request: impl Into<Bytes>, response: &'static str) -> (Bytes, Bytes) {
     let service = RecordingRpcService::new(response);
-    let mut middleware = HttpRequestMiddleware::new(service.clone(), None, 2_097_152);
+    // Match the server's limit of twice the maximum block size plus its JSON wrapper.
+    let mut middleware = HttpRequestMiddleware::new(service.clone(), None, 4_001_024);
     let request = HttpRequest::builder()
         .method("POST")
         .header("content-type", "application/json")
-        .body(HttpBody::from(request))
+        .body(HttpBody::from(request.into()))
         .expect("valid request");
     let response = middleware
         .call(request)
@@ -163,7 +164,7 @@ async fn round_trip(request: &'static str, response: &'static str) -> (Bytes, By
 /// reaches the client exactly as sent.
 #[tokio::test]
 async fn plain_json_rpc_2_call_and_response_pass_through_unchanged() {
-    let request = r#"{"id": 3, "method": "submitblock", "jsonrpc": "2.0", "params": ["00ff",1]}"#;
+    let request = r#"{"id": 3, "method": "submitblock", "jsonrpc": "2.0", "params": ["00ff"]}"#;
     let response = r#"{"jsonrpc":"2.0","id":3,"result":null}"#;
 
     let (received, returned) = round_trip(request, response).await;
@@ -172,12 +173,81 @@ async fn plain_json_rpc_2_call_and_response_pass_through_unchanged() {
     assert_eq!(returned, response.as_bytes());
 }
 
+/// The request shortcut accepts only parameters it can check without allocating per argument.
+#[tokio::test]
+async fn only_empty_or_single_unescaped_string_params_can_pass_through() {
+    for (params, expected) in [
+        ("[]", true),
+        (r#"[""]"#, true),
+        (r#"["00ff"]"#, true),
+        (r#"["é"]"#, true),
+        (r#"["a b"]"#, true),
+        ("[ ]", false),
+        (r#"[ "00ff"]"#, false),
+        (r#"["00ff" ]"#, false),
+        (r#"["\u0041"]"#, false),
+        (r#"["a\"b"]"#, false),
+        (r#"["a\\b"]"#, false),
+        (r#"["a","b"]"#, false),
+        (r#"["00ff",null]"#, false),
+        (r#"["00ff",{"workid":"job"}]"#, false),
+        ("[0,0]", false),
+        ("[0,1e2]", false),
+        ("[true]", false),
+        ("[[0]]", false),
+        (r#"{"a":1}"#, false),
+    ] {
+        let request =
+            format!(r#"{{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": {params}}}"#);
+        let (received, _) =
+            round_trip(request.clone(), r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
+        assert_eq!(
+            received == request.as_bytes(),
+            expected,
+            "unexpected forwarding decision for {params}"
+        );
+    }
+}
+
+/// Near the request-size limit, a block string can pass through but numeric arrays use conversion.
+#[tokio::test]
+async fn large_strings_pass_through_and_large_numeric_arrays_use_conversion() {
+    let block = "00".repeat(2_000_000);
+    let request =
+        format!(r#"{{"jsonrpc":"2.0","method":"submitblock","params":["{block}"],"id":1}}"#);
+    let (received, _) =
+        round_trip(request.clone(), r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
+    assert_eq!(received, request.as_bytes());
+
+    let numbers = "0,".repeat(1_999_999);
+    for last in ["0", "1e2"] {
+        let request = format!(
+            r#"{{"id": 1, "method": "submitblock", "jsonrpc": "2.0", "params": [{numbers}{last}]}}"#
+        );
+        let (received, _) =
+            round_trip(request.clone(), r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
+        assert_ne!(received, request.as_bytes());
+        assert!(received.starts_with(br#"{"jsonrpc":"2.0","method":"submitblock","params":[0,0,"#));
+        if last == "1e2" {
+            assert!(received.ends_with(br#",100.0],"id":1}"#));
+        }
+    }
+}
+
 /// JSON-RPC 2.0 calls that the server would read differently from their re-encoded form are
 /// still re-encoded before they reach it.
 #[tokio::test]
 async fn json_rpc_2_calls_the_server_reads_differently_are_still_re_encoded() {
     let response = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
     for (request, forwarded) in [
+        (
+            r#"{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": [0,0]}"#,
+            r#"{"jsonrpc":"2.0","method":"getinfo","params":[0,0],"id":1}"#,
+        ),
+        (
+            r#"{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": ["a","b"]}"#,
+            r#"{"jsonrpc":"2.0","method":"getinfo","params":["a","b"],"id":1}"#,
+        ),
         (
             r#"{"jsonrpc":"2.0","method":"getinfo","params":[ ],"id":1}"#,
             r#"{"jsonrpc":"2.0","method":"getinfo","params":[],"id":1}"#,

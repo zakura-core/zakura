@@ -725,14 +725,14 @@ const fn check_cadence(message_type: u16, cadence: Cadence) -> Result<(), Layout
 ///
 /// `const fn` cannot take closures, so the queries below share this
 /// cursor instead of a visitor.
-struct Rows<'a> {
+pub(super) struct Rows<'a> {
     layout: &'a [Stream],
     stream: usize,
     row: usize,
 }
 
 impl<'a> Rows<'a> {
-    const fn new(layout: &'a [Stream]) -> Self {
+    pub(super) const fn new(layout: &'a [Stream]) -> Self {
         Self {
             layout,
             stream: 0,
@@ -740,7 +740,7 @@ impl<'a> Rows<'a> {
         }
     }
 
-    const fn next(&mut self) -> Option<MessageRule> {
+    pub(super) const fn next(&mut self) -> Option<MessageRule> {
         while self.stream < self.layout.len() {
             if let Some(rows) = self.layout[self.stream].messages {
                 if self.row < rows.len() {

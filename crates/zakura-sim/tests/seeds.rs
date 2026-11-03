@@ -10,7 +10,9 @@ use std::{
 use serde::Serialize;
 use tempfile::TempDir;
 use zakura_sim::{
-    harness::{block_sync::BlockScenario, discovery, wire_plans::SavedPlan},
+    harness::{
+        block_sync::BlockScenario, discovery, header_sync::StorageScenario, wire_plans::SavedPlan,
+    },
     seed::{self, SeedError, SeedKind, SeedReport},
 };
 
@@ -77,6 +79,11 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "block-sync-capacity-frontier-first" | "block-sync-capacity-reply-first" => {
             value(BlockScenario::capacity_release())
         }
+        "header-storage-default" => value(StorageScenario::default()),
+        "header-storage-close-relink" => value(StorageScenario::close_relink()),
+        "header-storage-grow" => value(StorageScenario::grow()),
+        "header-storage-holds" => value(StorageScenario::holds()),
+        "header-storage-triggers" => value(StorageScenario::triggers()),
         _ => None,
     }
 }

@@ -11,6 +11,50 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-11-03
+
+### Changed
+
+- Experimental: legacy block broadcasts adjust their advert window from the
+  block's size. Blocks up to 100 KiB use 64 peers. Blocks at or above 1.5 MiB
+  use 32 peers. The window decreases linearly between these sizes. New
+  `[network]` settings `advert_window_min` (default 32), `advert_window_max`
+  (default 64), `advert_window_small_size_bytes` (default 100 KiB), and
+  `advert_window_full_size_bytes` (default 1.5 MiB) control these bounds
+  ([#1886](https://github.com/zakura-core/zakura/pull/1886)).
+- Verifying transparent-only transactions skips a signature hash that only shielded
+  data uses ([#1910](https://github.com/zakura-core/zakura/pull/1910)).
+- Verifying a block the node has not seen before starts its parallel script checks
+  sooner, because each transaction's setup no longer re-hashes the transaction or copies
+  the read-state service ([#1916](https://github.com/zakura-core/zakura/pull/1916)).
+- Block verification no longer computes ZIP-244 digests when preparing signature hashes for pre-v5 transactions
+  ([#1919](https://github.com/zakura-core/zakura/pull/1919)).
+- Block verification reads each transparent input from the parent's UTXO set once,
+  instead of looking it up again for each transaction. Blocks with hundreds of
+  transparent inputs verify about 10 to 20 percent faster
+  ([#1937](https://github.com/zakura-core/zakura/pull/1937)).
+- Halo2 verifying keys are built in the background at startup, so the first
+  Orchard or Ironwood block after a restart no longer waits about 75 ms for them
+  ([#1937](https://github.com/zakura-core/zakura/pull/1937)).
+- `zakura_state::ParentInputs` has a new `Unspent` variant and is no longer `Copy`,
+  and `zakura_consensus::transaction::Request::Block` has a new `parent_utxos` field
+  ([#1937](https://github.com/zakura-core/zakura/pull/1937)).
+- Committing a block no longer copies the earlier transparent outputs of each address
+  it pays, which makes accepting blocks faster for mining and busy addresses
+  ([#1946](https://github.com/zakura-core/zakura/pull/1946)).
+
+<!-- release-readiness: allow-patch; reason: The new [network] advert-window settings are optional with defaults, so existing configs keep working. All other Changed entries are backwards-compatible performance improvements with no RPC or consensus rule change. -->
+- Pruned nodes that skip the transparent address indexes no longer maintain them for
+  recent, non-finalized blocks either, which makes accepting blocks cheaper on those nodes
+  ([#1947](https://github.com/zakura-core/zakura/pull/1947)).
+
+### Fixed
+
+- Block downloads triggered by a block advertisement now prefer an advertising
+  peer whose legacy connection can send the request immediately, rather than a
+  peer whose connection is still awaiting an unrelated transaction response
+  ([#1876](https://github.com/zakura-core/zakura/pull/1876)).
+
 ## [1.8.0] - 2026-11-02
 
 ### Added

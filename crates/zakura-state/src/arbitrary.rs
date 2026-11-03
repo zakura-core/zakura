@@ -112,11 +112,11 @@ impl ContextuallyVerifiedBlock {
             block,
             hash,
             height,
-            new_outputs: Arc::new(new_outputs.clone()),
+            new_outputs: new_outputs.clone(),
             // Just re-use the outputs we created in this block, even though that's incorrect.
             //
             // TODO: fix the tests, and stop adding unrelated inputs and outputs.
-            spent_outputs: Arc::new(new_outputs),
+            spent_outputs: new_outputs,
             transaction_hashes,
             chain_value_pool_change: ValueBalance::zero(),
             receipt_order,

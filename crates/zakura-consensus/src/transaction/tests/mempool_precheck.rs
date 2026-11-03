@@ -124,13 +124,15 @@ pub(super) async fn check_chain_gate(
 fn state_timeout_does_not_dispatch_proofs() {
     let _init_guard = zakura_test::init();
     let mut tx = cacheable_mainnet_orchard_transaction();
-    // Give this test its own cold key without changing structural validity or fee policy.
+    // The cache test uses expiry + 1 as a corrupted twin. Use a different key
+    // so concurrent tests cannot change this request's submission counter.
     let height = tx.expiry_height().unwrap();
-    *tx.expiry_height_mut() = (height + 1).unwrap();
+    *tx.expiry_height_mut() = (height + 2).unwrap();
     let upgrade = NetworkUpgrade::current(&Network::Mainnet, height);
     // The process-wide verifier's worker must belong to the persistent runtime,
     // rather than the short-lived runtime whose clock this test advances.
     let before = zakura_test::MULTI_THREADED_RUNTIME.block_on(async { proof_calls(&tx, upgrade) });
+    assert_eq!(before, 0, "the timeout fixture must have its own cold key");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)

@@ -28,8 +28,8 @@ use crate::zakura::{
         BlockHash, Bool, BoundedReader, HeightLe, LeU16, LeU32, LeU64, List, Wire, WireError,
         WireMessage, U8,
     },
-    Cadence, Credit, MessageRole, MessageRule, PayloadLen, Stream, StreamQueueDepths,
-    FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
+    Cadence, Credit, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget, Stream,
+    StreamQueueDepths, FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// The header sync stream version this module encodes.
@@ -256,6 +256,69 @@ pub type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
 const _: () = Stream::validate_layout(&CommonMessage::LAYOUT);
 const _: () = Stream::validate_layout(&RegtestMessage::LAYOUT);
 
+/// The Mainnet and Testnet header sync share of one connection's memory.
+pub const HEADER_SYNC_BUDGET: ReactorBudget = CommonMessage::BUDGET;
+
+/// The header sync share of one connection's memory on `network`, chosen by
+/// its header size.
+pub fn budget(network: &zakura_chain::parameters::Network) -> ReactorBudget {
+    if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
+        RegtestMessage::BUDGET
+    } else {
+        CommonMessage::BUDGET
+    }
+}
+
+/// The budget of `layout`, the version 9 layout of a network whose headers
+/// take `header_bytes`. [`Message::BUDGET`] explains each term.
+const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget {
+    let subscriber = match Stream::receive_bound(layout, LocalRole::Requester) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("{}", error.rule()),
+    };
+    let Some(receive) = subscriber.checked_add(update_bytes(header_bytes)) else {
+        panic!("the header sync receive share fits u64");
+    };
+    ReactorBudget {
+        receive,
+        output: super::SERVE_LIMITS.peer_output_bytes,
+    }
+    .assert_frame_cap(FRAME_CAP)
+}
+
+/// Payload bytes of the `SubscribeHeaders` updates that a conformant
+/// subscriber may have sent and this node's publisher has not released.
+///
+/// The row declares no cadence, and none would be honest: a subscriber grants
+/// whenever acceptance frees credit, without a timer, so its updates follow
+/// validation, not a rate. So this counts updates instead.
+///
+/// Say the publisher has released every update through `u`. It sends pages
+/// only within the credit granted through `u`, and an update acknowledges
+/// only pages the subscriber received. Every update keeps its granted minus
+/// acknowledged credit within the row's credit. Each `Grant` adds a header, or at least one
+/// smallest page of bytes, which the codec checks. So at most
+/// `credit.objects + credit.bytes / smallest page` grants follow `u`. One
+/// `Close` may follow them. After the terminal outcome, the subscriber's next
+/// `Open` may follow too. That subscription's grants need its pages, which
+/// wait for its `Open`. Each live slot of the row repeats this.
+///
+/// A `Grant` or `Close` carries no locators, so its payload is the row's
+/// minimum. An `Open` may take the row's maximum.
+const fn update_bytes(header_bytes: usize) -> u64 {
+    let MessageRole::Subscription {
+        max_live, credit, ..
+    } = SUBSCRIBE_HEADERS.role
+    else {
+        panic!("SUBSCRIBE_HEADERS is a subscription row");
+    };
+    // Widening u32 and usize to u64 is lossless on every supported target.
+    let smallest = smallest_page(header_bytes, AuxSchema::None) as u64;
+    let grants = credit.objects as u64 + credit.bytes as u64 / smallest;
+    let following = (grants + 1) * SUBSCRIBE_HEADERS.payload.min() as u64;
+    max_live as u64 * (following + SUBSCRIBE_HEADERS.payload.max() as u64)
+}
+
 /// The version 9 rows of a network whose headers take `header_bytes`.
 pub const fn rows(header_bytes: usize) -> &'static [MessageRule] {
     if header_bytes == REGTEST_HEADER_BYTES {
@@ -448,6 +511,22 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
         }),
         ..Stream::PERSISTENT
     }];
+
+    /// This network's header sync share of one connection's memory.
+    ///
+    /// The service runs one publisher and one subscriber per session, so the
+    /// receive share counts both sides of [`Self::LAYOUT`]:
+    ///
+    /// - as subscriber, [`Stream::receive_bound`] for
+    ///   [`LocalRole::Requester`]: the peer's `Status` cadence, and one
+    ///   subscription's byte credit plus one more page or outcome;
+    /// - as publisher, the peer's updates that the publisher has not
+    ///   released. The row declares no cadence, so `update_bytes` counts
+    ///   them from the credit window.
+    ///
+    /// The output share is the per-peer serve output that the publisher's
+    /// serving limits set today.
+    pub const BUDGET: ReactorBudget = layout_budget(&Self::LAYOUT, HEADER_BYTES);
 
     /// Check the rules that the payload items cannot express.
     fn check(&self) -> Result<(), WireError> {

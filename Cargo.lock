@@ -3009,7 +3009,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.1"
+version = "5.0.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.1"
+version = "5.0.2"
 dependencies = [
  "hex",
  "ripemd",

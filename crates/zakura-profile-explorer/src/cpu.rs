@@ -761,9 +761,11 @@ pub(crate) fn recover(db: &Connection, path: &Path) -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("");
         let retained = db
-            .query_row("SELECT deleting FROM cpu WHERE id=?", [id], |r| {
-                r.get::<_, bool>(0)
-            })
+            .query_row(
+                "SELECT deleting FROM cpu WHERE deleting=0 AND id=?",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )
             .optional()?;
         if retained != Some(false) || entry.path().extension().is_none_or(|e| e != "zst") {
             fs::remove_file(entry.path())?;

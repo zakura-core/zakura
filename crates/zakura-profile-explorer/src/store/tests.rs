@@ -1691,3 +1691,61 @@ fn retained_cpu_summary_uses_covering_index() -> Result<()> {
     );
     Ok(())
 }
+
+/// Retained catalogues recover and evict oldest captures without scanning symbol metadata.
+#[test]
+fn retained_cpu_recovery_and_eviction_are_indexed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = Connection::open_in_memory()?;
+    let schema = include_str!("../schema.sql");
+    db.execute_batch(schema)?;
+    db.execute_batch("DROP INDEX cpu_recovery; DROP INDEX cpu_retention")?;
+    db.execute(
+        "INSERT INTO runs(id,metadata,utc_ms,seen_ms) VALUES(?, '{}', 0, 0)",
+        [RUN],
+    )?;
+    fs::create_dir_all(temp.path().join("cpu"))?;
+    for (id, start, deleting) in [("new", 20, false), ("old", 10, false), ("removed", 0, true)] {
+        db.execute("INSERT INTO cpu(id,run,start_us,end_us,samples,bytes,metadata,deleting) VALUES(?,?,?,30,1,4096,?,?)", params![id,RUN,start,"x".repeat(30_000),deleting])?;
+        fs::write(
+            temp.path().join("cpu").join(format!("{id}.zst")),
+            b"retained",
+        )?;
+    }
+    fs::write(temp.path().join("cpu/orphan.zst"), b"orphan")?;
+    db.execute_batch(schema)?;
+    for (query, index) in [
+        (
+            "SELECT deleting FROM cpu WHERE deleting=0 AND id='new'",
+            "COVERING INDEX cpu_recovery",
+        ),
+        ("DELETE FROM cpu WHERE deleting=1", "INDEX cpu_recovery"),
+        (
+            "SELECT id,bytes FROM cpu ORDER BY start_us LIMIT 4096",
+            "COVERING INDEX cpu_retention",
+        ),
+    ] {
+        let plan = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))?
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(plan.iter().any(|step| step.contains(index)), "{plan:?}");
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+    crate::cpu::recover(&db, temp.path())?;
+    assert!(temp.path().join("cpu/new.zst").exists());
+    assert!(temp.path().join("cpu/old.zst").exists());
+    assert!(!temp.path().join("cpu/removed.zst").exists());
+    assert!(!temp.path().join("cpu/orphan.zst").exists());
+    assert_eq!(crate::cpu::prune(&db, temp.path(), 4096)?, 4096);
+    assert!(!temp.path().join("cpu/old.zst").exists());
+    assert!(temp.path().join("cpu/new.zst").exists());
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM cpu", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}

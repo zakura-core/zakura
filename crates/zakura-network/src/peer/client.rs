@@ -5,7 +5,10 @@ use std::{
     future::Future,
     iter,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -40,6 +43,9 @@ pub mod tests;
 pub struct Client {
     /// Tracks block writes for paced legacy advertisements.
     pub(crate) block_uploads: super::block_gossip::BlockUploads,
+    /// Reports whether the connection can write a request as soon as it is sent.
+    pub(crate) request_slot: RequestSlot,
+
     /// Reads heartbeat RTT for this exact connection generation.
     pub(crate) peer_registry_updater: Option<crate::peer_registry::PeerRegistryUpdater>,
 
@@ -70,6 +76,47 @@ pub struct Client {
 
     /// A handle to the task responsible for sending periodic heartbeats.
     pub(crate) heartbeat_task: JoinHandle<Result<(), BoxError>>,
+}
+
+/// Whether a legacy connection is free to write its next client request.
+///
+/// A connection handles one client request at a time. While it awaits a response, it reads peer
+/// messages but does not take requests from its client channel. So space in that channel, which is
+/// what [`Client::poll_ready`](Service::poll_ready) reports, does not mean a newly sent request will
+/// be written now.
+///
+/// The [`Connection`](super::Connection) task owns the writes. Clients and the peer set only read it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestSlot {
+    /// True while the connection is handling a client request, or after either half shuts down.
+    busy: Arc<AtomicBool>,
+
+    /// True if the connection's last block request ended unanswered, until a peer delivers a
+    /// requested block on this connection.
+    block_request_unanswered: Arc<AtomicBool>,
+}
+
+impl RequestSlot {
+    /// Records whether the connection is handling a client request (or can no longer take one).
+    pub(crate) fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Release);
+    }
+
+    /// Returns true if the connection is waiting for its next client request.
+    pub(crate) fn is_free(&self) -> bool {
+        !self.busy.load(Ordering::Acquire)
+    }
+
+    /// Records whether the connection's last block request ended unanswered.
+    pub(crate) fn set_block_request_unanswered(&self, unanswered: bool) {
+        self.block_request_unanswered
+            .store(unanswered, Ordering::Release);
+    }
+
+    /// Returns true if the connection's last block request ended unanswered.
+    pub(crate) fn block_request_unanswered(&self) -> bool {
+        self.block_request_unanswered.load(Ordering::Acquire)
+    }
 }
 
 /// A signal sent by the [`Client`] half of a peer connection,
@@ -597,6 +644,7 @@ impl Client {
     fn shutdown(&mut self) {
         // Prevent any senders from sending more messages to this peer.
         self.server_tx.close_channel();
+        self.request_slot.set_busy(true);
 
         // Ask the heartbeat task to stop.
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
@@ -647,6 +695,10 @@ impl Service<Request> for Client {
         // when it's handling messages in the context of processing this
         // request.
         let span = tracing::Span::current();
+
+        // Taking the request makes this client ready again, possibly before the connection task
+        // marks itself busy. So an idle connection's slot must be busy before the request is sent.
+        self.request_slot.set_busy(true);
 
         match self.server_tx.try_send(ClientRequest {
             request,

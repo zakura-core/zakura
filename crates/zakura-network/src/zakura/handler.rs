@@ -416,10 +416,11 @@ impl ZakuraConfig {
     /// Refuses a stream receive window that can't hold the largest native
     /// frame, a block-sync frame of `MAX_BS_FRAME_BYTES`.
     ///
-    /// Each native stream kind's receive share is the stream window
-    /// ([`ReactorShares::from_quic`]). A frame above its share would take the
-    /// whole share and be charged less than it holds, so the endpoint would
-    /// refuse to start.
+    /// The five native reactors take their receive shares from their own
+    /// budgets ([`Self::reactor_shares`]). Any other stream kind receives one
+    /// stream window ([`ReactorShares::from_quic`]). A frame above its share
+    /// would take the whole share and be charged less than it holds, so the
+    /// endpoint would refuse to start.
     pub fn validate_stream_receive_window(&self) -> Result<(), zakura_quic::ConfigError> {
         let largest = super::block_sync::MAX_BS_FRAME_BYTES.min(super::LOCAL_MAX_MESSAGE_BYTES);
         let window = self.quic.stream_receive_window_bytes;

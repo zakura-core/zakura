@@ -1373,7 +1373,8 @@ fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
             .unwrap()
             .verified());
     }
-    assert!(matches!(
+    // An empty run never reaches the trigger, so the property never applies.
+    assert_eq!(
         (entry.witness)(
             &json!({"input": []}),
             PlanInput::Bytes(Vec::new()),
@@ -1381,8 +1382,10 @@ fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
             zakura_sim::witness::Expect::Holds,
             &mut zakura_sim::NullSink,
         ),
-        Err(zakura_sim::witness::WitnessError::LostTriggerHistory)
-    ));
+        Err(zakura_sim::witness::WitnessError::Outcome(
+            PropertyOutcome::NotApplicable
+        ))
+    );
 }
 
 #[test]
@@ -1763,8 +1766,11 @@ fn discovery_book_records_and_replays_signed_samples() {
     assert!(books().all(|book| book.actual == book.expected));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
-    assert!(
-        matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable == u32::try_from(trace.steps.len()).unwrap())
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Held {
+            applicable: u32::try_from(trace.steps.len()).unwrap()
+        }
     );
     replay_in_child(dir.path());
 

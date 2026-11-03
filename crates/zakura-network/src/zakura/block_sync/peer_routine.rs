@@ -32,7 +32,6 @@ use zakura_rt::{
 
 use super::events::RoutineToReactor;
 use super::{
-    admission::admit_received_body,
     peer_registry::PeerRegistry,
     pipe::block_sync_guard,
     reactor::tolerated_bytes,
@@ -1211,11 +1210,11 @@ impl PeerRoutine {
         // top of the next iteration.
     }
 
-    /// Accept a wanted unmatched body whose original requester is gone or whose
-    /// height is currently reserved by another peer. The resident `admit()` check
-    /// is the sole gate for queued heights — a received body consumes no request
-    /// budget; for reserved in-flight heights the arrival ends that request's
-    /// reservation (first-completion-wins).
+    /// Accept a wanted unmatched body whose height another published request
+    /// reserves: the arrival ends that request's reservation
+    /// (first-completion-wins). Pending work has no owner, so a body for it is
+    /// left to the caller's ignore path. A received body consumes no request
+    /// budget.
     fn accept_unmatched_queued_body(&mut self, body: ReceivedBody) -> bool {
         let (height, hash, serialized_bytes) = (body.height, body.hash, body.serialized_bytes);
         if self.io.work.hash_for_height(height) != Some(hash) {
@@ -1224,66 +1223,25 @@ impl PeerRoutine {
         if !self.state.serves(height) {
             return false;
         }
-        let reserved_in_flight = self.io.work.reserved_in_flight_charge(height);
-        let is_pending = self.io.work.pending_contains(height);
-        if reserved_in_flight.is_none() && !is_pending {
-            return false;
-        }
+        // First-completion-wins for a timed-out height already re-issued to
+        // another peer: this arrival ends that request's reservation instead of
+        // discarding a valid body because another peer currently owns the
+        // request slot. The ended reservation is released after the forward
+        // below. Pending work has no request owner, and accepting its body would
+        // create an unowned completion, so the caller ignores it.
+        let (owner, settlement) = match self.io.work.begin_unmatched_receipt(height) {
+            Ok(Some(ended)) => ended,
+            Ok(None) => return false,
+            Err(_) => {
+                self.io.cancel.cancel();
+                return true;
+            }
+        };
         self.io
             .trace
             .record_block_body_received(hash, BlockBodySource::Zakura);
-        let Some(owner) = self.io.work.owner_for_height(height) else {
-            // Pending work has no active request owner.
-            // Accepting a body here would create an unowned completion.
-            // Leave it to the unsolicited or stale classification path.
-            return false;
-        };
-
-        // The reservation this arrival ended (an active competing request, or a
-        // stale charge on the claimed height); released after the forward below.
-        let (funding, admitted_estimate_bytes) = if is_pending {
-            let sequencer_view = *self.io.sequencer_view.borrow();
-            let snapshot = self.io.admission_snapshot(&sequencer_view);
-            if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
-                tracing::debug!(
-                    peer = ?self.io.peer,
-                    ?height,
-                    serialized_bytes,
-                    "not buffering unmatched queued block-sync body at look-ahead cap"
-                );
-                return true;
-            }
-
-            // Claim this height into `in_flight` so it leaves `pending`; if it is
-            // already `in_flight` the take is a no-op and the Sequencer drops the
-            // later duplicate. The received body charges no request budget, but any
-            // stale request reservation the height still owned is released below.
-            let _ = self.io.work.take_in_range(height, height, 1);
-            metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-            let funding = match self.io.work.claim_receipt_for_owner(owner, height) {
-                Ok(funding) => funding,
-                Err(_) => {
-                    self.io.cancel.cancel();
-                    return true;
-                }
-            };
-            (funding, None)
-        } else {
-            // First-completion-wins for a timed-out height already re-issued to
-            // another peer: this arrival ends that request's reservation instead of
-            // discarding a valid body because another peer currently owns the
-            // request slot.
-            let settlement = match self.io.work.begin_competing_receipt(owner, height) {
-                Ok(Some(settlement)) => settlement,
-                Ok(None) => return false,
-                Err(_) => {
-                    self.io.cancel.cancel();
-                    return true;
-                }
-            };
-            metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-            (settlement.funding, Some(settlement.charge))
-        };
+        metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+        let (funding, admitted_estimate_bytes) = (settlement.funding, Some(settlement.charge));
 
         let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
         else {

@@ -81,6 +81,9 @@ impl InboundBudget {
 
     /// Charge `bytes` now, or nothing. A larger item clamps to the whole budget, so
     /// it can still enter an idle budget. An empty item always enters.
+    // Rust 1.99 deprecates std's `fetch_update` for `try_update`, which the
+    // 1.97 MSRV lacks. The simulator's atomic keeps its own `fetch_update`.
+    #[allow(deprecated)]
     pub(crate) fn try_charge(&self, bytes: u64) -> Option<InboundCharge> {
         let bytes = bytes.min(self.capacity);
         if bytes == 0 {

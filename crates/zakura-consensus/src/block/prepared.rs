@@ -4,7 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blake2b_simd::Params;
 use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{Block, Header},
@@ -14,7 +13,7 @@ use zakura_chain::{
 };
 use zakura_state::SemanticallyVerifiedBlock;
 
-use super::PreparedCandidateSource;
+use super::{body_digest::BodyDigest, PreparedCandidateSource};
 
 const SERVER_MAX_ENTRIES: usize = 24;
 const SERVER_MAX_BYTES: usize = 48 * 1024 * 1024;
@@ -30,25 +29,20 @@ const ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 pub(super) struct CandidateId([u8; 32]);
 
 impl CandidateId {
-    /// Blake2b-256 of `block` with the header fields a solution sets normalized to fixed values.
+    /// The identity of `block`, hashing its transactions.
     pub(super) fn of(block: &Block, network: &Network) -> Self {
-        let mut header: Header = *block.header;
+        Self::with_body(&block.header, &BodyDigest::of(block), network)
+    }
+
+    /// Blake2b-256 of `header`, with the fields a solution sets normalized to fixed values,
+    /// followed by the digest of the block's transactions.
+    pub(super) fn with_body(header: &Header, body: &BodyDigest, network: &Network) -> Self {
+        let mut header: Header = *header;
         header.time =
             DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is a valid UTC timestamp");
         header.nonce = [0; 32].into();
         header.solution = Solution::for_proposal_for_network(network);
-
-        let bytes = Block {
-            header: Arc::new(header),
-            transactions: block.transactions.clone(),
-        }
-        .zcash_serialize_to_vec()
-        .expect("serialization to memory cannot fail");
-
-        let hash = Params::new().hash_length(32).hash(&bytes);
-        let mut id = [0; 32];
-        id.copy_from_slice(hash.as_bytes());
-        Self(id)
+        Self(body.with_header(&header))
     }
 }
 
@@ -128,15 +122,20 @@ impl PreparedCandidateCache {
     }
 
     /// Returns the prepared verification for `block`'s content, if some source prepared it.
-    pub(super) fn lookup(&self, block: &Block, network: &Network) -> Option<CacheHit> {
-        // Deriving the candidate id costs a full block serialization, so skip it when the cache
-        // holds no entry that could match.
+    ///
+    /// `body` is the digest of `block`'s transactions.
+    pub(super) fn lookup(
+        &self,
+        block: &Block,
+        body: &BodyDigest,
+        network: &Network,
+    ) -> Option<CacheHit> {
         if self.lock().iter().all(|partition| partition.is_empty()) {
             metrics::counter!("mining.prepared_cache.misses").increment(1);
             return None;
         }
 
-        let id = CandidateId::of(block, network);
+        let id = CandidateId::with_body(&block.header, body, network);
         let mut cache = self.lock();
         cache.iter_mut().for_each(Partition::prune_expired);
         let hit = cache.iter().find_map(|partition| {
@@ -361,7 +360,9 @@ mod tests {
         header.solution = Solution::for_proposal_for_network(&network);
         header.time += chrono::Duration::seconds(1);
 
-        assert!(cache.lookup(&solved, &network).is_some());
+        assert!(cache
+            .lookup(&solved, &BodyDigest::of(&solved), &network)
+            .is_some());
     }
 
     #[test]
@@ -378,30 +379,58 @@ mod tests {
 
         let mut changed_parent = original.clone();
         Arc::make_mut(&mut changed_parent.header).previous_block_hash = Hash([1; 32]);
-        assert!(cache.lookup(&changed_parent, &network).is_none());
+        assert!(cache
+            .lookup(&changed_parent, &BodyDigest::of(&changed_parent), &network)
+            .is_none());
 
         let mut changed_header = original.clone();
         Arc::make_mut(&mut changed_header.header).version ^= 1;
-        assert!(cache.lookup(&changed_header, &network).is_none());
+        assert!(cache
+            .lookup(&changed_header, &BodyDigest::of(&changed_header), &network)
+            .is_none());
 
         let mut changed_commitment = original.clone();
         Arc::make_mut(&mut changed_commitment.header).commitment_bytes[0] ^= 1;
-        assert!(cache.lookup(&changed_commitment, &network).is_none());
+        assert!(cache
+            .lookup(
+                &changed_commitment,
+                &BodyDigest::of(&changed_commitment),
+                &network
+            )
+            .is_none());
 
         let mut changed_difficulty = original.clone();
         Arc::make_mut(&mut changed_difficulty.header).difficulty_threshold =
             INVALID_COMPACT_DIFFICULTY;
-        assert!(cache.lookup(&changed_difficulty, &network).is_none());
+        assert!(cache
+            .lookup(
+                &changed_difficulty,
+                &BodyDigest::of(&changed_difficulty),
+                &network
+            )
+            .is_none());
 
         let mut changed_merkle_root = original.clone();
         Arc::make_mut(&mut changed_merkle_root.header).merkle_root.0[0] ^= 1;
-        assert!(cache.lookup(&changed_merkle_root, &network).is_none());
+        assert!(cache
+            .lookup(
+                &changed_merkle_root,
+                &BodyDigest::of(&changed_merkle_root),
+                &network
+            )
+            .is_none());
 
         let mut changed_transactions = original;
         changed_transactions
             .transactions
             .push(changed_transactions.transactions[0].clone());
-        assert!(cache.lookup(&changed_transactions, &network).is_none());
+        assert!(cache
+            .lookup(
+                &changed_transactions,
+                &BodyDigest::of(&changed_transactions),
+                &network
+            )
+            .is_none());
     }
 
     /// Filling one partition past its entry bound must not evict the other partition's entries.
@@ -425,12 +454,18 @@ mod tests {
         }
 
         assert!(
-            cache.lookup(&candidates[0], &network).is_none(),
+            cache
+                .lookup(&candidates[0], &BodyDigest::of(&candidates[0]), &network)
+                .is_none(),
             "the oldest entry of a full partition is evicted",
         );
-        assert!(cache.lookup(&candidates[1], &network).is_some());
+        assert!(cache
+            .lookup(&candidates[1], &BodyDigest::of(&candidates[1]), &network)
+            .is_some());
         assert!(
-            cache.lookup(&retained, &network).is_some(),
+            cache
+                .lookup(&retained, &BodyDigest::of(&retained), &network)
+                .is_some(),
             "the other partition keeps its entry",
         );
 
@@ -500,7 +535,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .lookup(&candidate, &network)
+                .lookup(&candidate, &BodyDigest::of(&candidate), &network)
                 .expect("both partitions hold the content")
                 .source,
             PreparedCandidateSource::ServerTemplate

@@ -13,7 +13,7 @@ use zakura_chain::{
 };
 use zakura_state::SemanticallyVerifiedBlock;
 
-use super::{body_digest::BodyDigest, PreparedCandidateSource};
+use super::PreparedCandidateSource;
 
 const SERVER_MAX_ENTRIES: usize = 24;
 const SERVER_MAX_BYTES: usize = 48 * 1024 * 1024;
@@ -21,28 +21,22 @@ const PROPOSAL_MAX_ENTRIES: usize = 8;
 const PROPOSAL_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// Identifies a mining candidate by the block content a solution cannot change.
+/// A mining candidate's header with the fields a solution sets normalized to fixed values.
 ///
-/// Two candidates share an identity exactly when a miner can turn one into the other by solving
-/// it, so a cache hit means the stored semantic verification covers the looked-up block.
+/// A candidate matches a block when their keys are equal and their transactions are equal, which
+/// is exactly when a miner can turn one into the other by solving it. So a match means the stored
+/// semantic verification covers the looked-up block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct CandidateId([u8; 32]);
+struct CandidateKey(Header);
 
-impl CandidateId {
-    /// The identity of `block`, hashing its transactions.
-    pub(super) fn of(block: &Block, network: &Network) -> Self {
-        Self::with_body(&block.header, &BodyDigest::of(block), network)
-    }
-
-    /// Blake2b-256 of `header`, with the fields a solution sets normalized to fixed values,
-    /// followed by the digest of the block's transactions.
-    pub(super) fn with_body(header: &Header, body: &BodyDigest, network: &Network) -> Self {
+impl CandidateKey {
+    fn of(header: &Header, network: &Network) -> Self {
         let mut header: Header = *header;
         header.time =
             DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is a valid UTC timestamp");
         header.nonce = [0; 32].into();
         header.solution = Solution::for_proposal_for_network(network);
-        Self(body.with_header(&header))
+        Self(header)
     }
 }
 
@@ -66,7 +60,7 @@ pub(super) enum InsertOutcome {
 }
 
 struct Entry {
-    id: CandidateId,
+    key: CandidateKey,
     prepared: Arc<SemanticallyVerifiedBlock>,
     size: usize,
     expires_at: Instant,
@@ -122,24 +116,12 @@ impl PreparedCandidateCache {
     }
 
     /// Returns the prepared verification for `block`'s content, if some source prepared it.
-    ///
-    /// `body` is the digest of `block`'s transactions.
-    pub(super) fn lookup(
-        &self,
-        block: &Block,
-        body: &BodyDigest,
-        network: &Network,
-    ) -> Option<CacheHit> {
-        if self.lock().iter().all(|partition| partition.is_empty()) {
-            metrics::counter!("mining.prepared_cache.misses").increment(1);
-            return None;
-        }
-
-        let id = CandidateId::with_body(&block.header, body, network);
+    pub(super) fn lookup(&self, block: &Block, network: &Network) -> Option<CacheHit> {
+        let key = CandidateKey::of(&block.header, network);
         let mut cache = self.lock();
         cache.iter_mut().for_each(Partition::prune_expired);
         let hit = cache.iter().find_map(|partition| {
-            partition.get(id).map(|entry| CacheHit {
+            partition.get(&key, block).map(|entry| CacheHit {
                 source: partition.source,
                 prepared: Arc::clone(&entry.prepared),
             })
@@ -156,14 +138,11 @@ impl PreparedCandidateCache {
 
     /// Reuses and refreshes a server candidate with identical immutable content.
     pub(super) fn reuse_server_candidate(&self, block: &Block, network: &Network) -> bool {
-        if self.lock()[PreparedCandidateSource::ServerTemplate.index()].is_empty() {
-            return false;
-        }
-        let id = CandidateId::of(block, network);
+        let key = CandidateKey::of(&block.header, network);
         let mut cache = self.lock();
         let partition = &mut cache[PreparedCandidateSource::ServerTemplate.index()];
         partition.prune_expired();
-        let Some(index) = partition.entries.iter().position(|entry| entry.id == id) else {
+        let Some(index) = partition.position(&key, block) else {
             return false;
         };
         let mut entry = partition
@@ -176,13 +155,14 @@ impl PreparedCandidateCache {
         true
     }
 
-    /// Stores `prepared` under `id` in `source`'s partition.
+    /// Stores `prepared` in `source`'s partition.
     pub(super) fn insert(
         &self,
-        id: CandidateId,
         source: PreparedCandidateSource,
         prepared: SemanticallyVerifiedBlock,
+        network: &Network,
     ) -> InsertOutcome {
+        let key = CandidateKey::of(&prepared.block.header, network);
         let size = retained_size(&prepared);
         let mut cache = self.lock();
         let partition = &mut cache[source.index()];
@@ -191,7 +171,7 @@ impl PreparedCandidateCache {
         if size > partition.max_bytes {
             return InsertOutcome::Oversized;
         }
-        if partition.get(id).is_some() {
+        if partition.get(&key, &prepared.block).is_some() {
             return InsertOutcome::AlreadyPresent;
         }
 
@@ -204,7 +184,7 @@ impl PreparedCandidateCache {
             .increment(evicted);
         }
         partition.push(Entry {
-            id,
+            key,
             prepared: Arc::new(prepared),
             size,
             expires_at: Instant::now() + ENTRY_TTL,
@@ -225,12 +205,18 @@ impl Partition {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    /// The index of the entry for `block`, whose candidate key is `key`.
+    ///
+    /// Bodies are compared only for entries with an equal key, which a block shares with at
+    /// most the candidates it was solved from.
+    fn position(&self, key: &CandidateKey, block: &Block) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            entry.key == *key && entry.prepared.block.transactions == block.transactions
+        })
     }
 
-    fn get(&self, id: CandidateId) -> Option<&Entry> {
-        self.entries.iter().find(|entry| entry.id == id)
+    fn get(&self, key: &CandidateKey, block: &Block) -> Option<&Entry> {
+        self.position(key, block).map(|index| &self.entries[index])
     }
 
     fn prune_expired(&mut self) {
@@ -336,9 +322,9 @@ mod tests {
         network: &Network,
     ) -> InsertOutcome {
         cache.insert(
-            CandidateId::of(block, network),
             source,
             SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
+            network,
         )
     }
 
@@ -360,9 +346,7 @@ mod tests {
         header.solution = Solution::for_proposal_for_network(&network);
         header.time += chrono::Duration::seconds(1);
 
-        assert!(cache
-            .lookup(&solved, &BodyDigest::of(&solved), &network)
-            .is_some());
+        assert!(cache.lookup(&solved, &network).is_some());
     }
 
     #[test]
@@ -379,58 +363,30 @@ mod tests {
 
         let mut changed_parent = original.clone();
         Arc::make_mut(&mut changed_parent.header).previous_block_hash = Hash([1; 32]);
-        assert!(cache
-            .lookup(&changed_parent, &BodyDigest::of(&changed_parent), &network)
-            .is_none());
+        assert!(cache.lookup(&changed_parent, &network).is_none());
 
         let mut changed_header = original.clone();
         Arc::make_mut(&mut changed_header.header).version ^= 1;
-        assert!(cache
-            .lookup(&changed_header, &BodyDigest::of(&changed_header), &network)
-            .is_none());
+        assert!(cache.lookup(&changed_header, &network).is_none());
 
         let mut changed_commitment = original.clone();
         Arc::make_mut(&mut changed_commitment.header).commitment_bytes[0] ^= 1;
-        assert!(cache
-            .lookup(
-                &changed_commitment,
-                &BodyDigest::of(&changed_commitment),
-                &network
-            )
-            .is_none());
+        assert!(cache.lookup(&changed_commitment, &network).is_none());
 
         let mut changed_difficulty = original.clone();
         Arc::make_mut(&mut changed_difficulty.header).difficulty_threshold =
             INVALID_COMPACT_DIFFICULTY;
-        assert!(cache
-            .lookup(
-                &changed_difficulty,
-                &BodyDigest::of(&changed_difficulty),
-                &network
-            )
-            .is_none());
+        assert!(cache.lookup(&changed_difficulty, &network).is_none());
 
         let mut changed_merkle_root = original.clone();
         Arc::make_mut(&mut changed_merkle_root.header).merkle_root.0[0] ^= 1;
-        assert!(cache
-            .lookup(
-                &changed_merkle_root,
-                &BodyDigest::of(&changed_merkle_root),
-                &network
-            )
-            .is_none());
+        assert!(cache.lookup(&changed_merkle_root, &network).is_none());
 
         let mut changed_transactions = original;
         changed_transactions
             .transactions
             .push(changed_transactions.transactions[0].clone());
-        assert!(cache
-            .lookup(
-                &changed_transactions,
-                &BodyDigest::of(&changed_transactions),
-                &network
-            )
-            .is_none());
+        assert!(cache.lookup(&changed_transactions, &network).is_none());
     }
 
     /// Filling one partition past its entry bound must not evict the other partition's entries.
@@ -454,18 +410,12 @@ mod tests {
         }
 
         assert!(
-            cache
-                .lookup(&candidates[0], &BodyDigest::of(&candidates[0]), &network)
-                .is_none(),
+            cache.lookup(&candidates[0], &network).is_none(),
             "the oldest entry of a full partition is evicted",
         );
-        assert!(cache
-            .lookup(&candidates[1], &BodyDigest::of(&candidates[1]), &network)
-            .is_some());
+        assert!(cache.lookup(&candidates[1], &network).is_some());
         assert!(
-            cache
-                .lookup(&retained, &BodyDigest::of(&retained), &network)
-                .is_some(),
+            cache.lookup(&retained, &network).is_some(),
             "the other partition keeps its entry",
         );
 
@@ -535,7 +485,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .lookup(&candidate, &BodyDigest::of(&candidate), &network)
+                .lookup(&candidate, &network)
                 .expect("both partitions hold the content")
                 .source,
             PreparedCandidateSource::ServerTemplate

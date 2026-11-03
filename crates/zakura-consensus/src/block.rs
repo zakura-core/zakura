@@ -33,7 +33,6 @@ use zakura_state as zs;
 
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
-mod body_digest;
 pub mod check;
 mod prepared;
 mod receipt;
@@ -435,12 +434,7 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        // Solved blocks are identified twice below, for receipt order and for prepared
-        // candidates, so hash their transactions once for both.
-        let body = (!request.is_proposal()).then(|| body_digest::BodyDigest::of(&block));
-        let receipt = body
-            .as_ref()
-            .map(|body| self.receipt_orders.register(&block, body));
+        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -538,14 +532,11 @@ where
                         _ => unreachable!("wrong response to Request::KnownBlock"),
                     }
 
-                    let body = body
-                        .as_ref()
-                        .expect("a mined commit is not a proposal, so its body was hashed");
                     if let Some(committed) = try_prepared_fast_path(
                         &prepared_candidates,
                         &mut state_service,
                         &network,
-                        (block.clone(), body),
+                        block.clone(),
                         hash,
                         (height, receipt_order),
                         admission,
@@ -889,7 +880,7 @@ async fn try_prepared_fast_path<S>(
     prepared_candidates: &prepared::PreparedCandidateCache,
     state_service: &mut S,
     network: &Network,
-    (block, body): (Arc<block::Block>, &body_digest::BodyDigest),
+    block: Arc<block::Block>,
     hash: block::Hash,
     (height, receipt_order): (block::Height, Option<u64>),
     admission: &zs::BlockAdmission,
@@ -902,7 +893,7 @@ where
     let Some(prepared::CacheHit {
         source,
         prepared: cached_prepared_block,
-    }) = prepared_candidates.lookup(&block, body, network)
+    }) = prepared_candidates.lookup(&block, network)
     else {
         metrics::histogram!("mining.solved_header_check.duration_seconds")
             .record(solved_header_start.elapsed().as_secs_f64());
@@ -915,9 +906,9 @@ where
         tx::check::lock_time_has_passed(transaction, height, block.header.time)
             .map_err(VerifyBlockError::Transaction)?;
     }
-    // No Merkle root check: the hit's `CandidateId` covers the header's Merkle root and every
-    // transaction byte, and the cached candidate passed `merkle_root_validity` before it was
-    // cached, so the same root, transaction set and branch IDs are already checked.
+    // No Merkle root check: a hit has the cached candidate's Merkle root and equal transactions,
+    // and the cached candidate passed `merkle_root_validity` before it was cached, so the same
+    // root, transaction set and branch IDs are already checked.
     // Preparation check:
     // https://github.com/zakura-core/zakura/blob/107634e1793ff0c57ef8dd3a1969c29af9b5598c/crates/zakura-consensus/src/block.rs#L483
     metrics::histogram!("mining.solved_header_check.duration_seconds")
@@ -969,8 +960,7 @@ where
     };
 
     if let (Ok(_), Some(source), Some(cache_copy)) = (&response, prepared_source, cache_copy) {
-        let id = prepared::CandidateId::of(&cache_copy.block, network);
-        prepared_candidates.insert(id, source, cache_copy);
+        prepared_candidates.insert(source, cache_copy, network);
         metrics::histogram!("mining.preparation.duration_seconds")
             .record(preparation_start.elapsed().as_secs_f64());
     }

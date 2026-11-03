@@ -58,9 +58,9 @@ use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
-    ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources, OrderedStreamFailure,
-    OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout, StreamResources,
-    TransportLimits,
+    ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, NodeResources,
+    OrderedStreamFailure, OrderedStreamFailureCause, OwnerGuard, OwnerPhase, ReactorBudget,
+    ReactorShares, ResourceEnvelope, SessionLayout, StreamResources, TransportLimits,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -532,6 +532,9 @@ pub struct ZakuraLocalLimits {
     pub max_open_streams: u16,
     /// Maximum inbound queue depth per stream kind.
     pub max_inbound_queue_depth: u16,
+    /// Each stream kind's receive and output share on one connection. Unset,
+    /// [`ReactorShares::from_quic`] derives them from `quic`'s windows.
+    pub reactor_shares: Option<ReactorShares>,
 }
 
 impl ZakuraLocalLimits {
@@ -563,7 +566,27 @@ impl ZakuraLocalLimits {
             max_message_bytes: handshake.max_message_bytes,
             max_open_streams: handshake.max_open_streams,
             max_inbound_queue_depth: handshake.max_inbound_queue_depth,
+            reactor_shares: None,
         }
+    }
+
+    /// These limits with `shares`, and the QUIC windows that carry them: the
+    /// connection window starts at the handshake share, and the stream window
+    /// holds the largest receive share.
+    pub fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
+        self.quic.receive_window_bytes =
+            u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX);
+        self.quic.stream_receive_window_bytes =
+            u32::try_from(shares.stream_receive_window()).unwrap_or(u32::MAX);
+        self.reactor_shares = Some(shares);
+        self
+    }
+
+    /// Each stream kind's receive and output share on one connection.
+    pub fn reactor_shares(&self) -> ReactorShares {
+        self.reactor_shares
+            .clone()
+            .unwrap_or_else(|| ReactorShares::from_quic(&self.quic))
     }
 
     /// Clamp peer-negotiated limits to local hard ceilings.
@@ -608,15 +631,30 @@ impl ZakuraLocalLimits {
         }
     }
 
-    /// Returns the transport's byte and worker bounds under these limits.
-    pub(crate) fn resource_envelope(&self) -> ResourceEnvelope {
+    /// Returns the transport's byte bounds under these limits, for a node
+    /// that serves `registry`'s stream kinds.
+    pub(crate) fn resource_envelope(&self, registry: &ServiceRegistry) -> ResourceEnvelope {
+        let shares = self.reactor_shares();
+        let mut kinds: Vec<u16> = registry
+            .services()
+            .iter()
+            .flat_map(|service| service.streams().iter().map(|stream| stream.kind))
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        let connection_shares = kinds.iter().fold(ReactorBudget::ZERO, |sum, kind| {
+            let share = shares.share(*kind);
+            ReactorBudget {
+                receive: sum.receive.saturating_add(share.receive),
+                output: sum.output.saturating_add(share.output),
+            }
+        });
         ResourceEnvelope::new(TransportLimits {
-            receive_window: self.quic.receive_window_bytes,
+            control_receive_bytes: shares.control_receive_bytes,
+            connection_shares,
             send_window: self.quic.send_window_bytes,
             max_connections: self.max_connections,
             max_pending_handshakes: self.max_pending_handshakes,
-            max_open_streams: self.max_open_streams,
-            max_frame_bytes: self.max_frame_bytes,
         })
     }
 
@@ -1878,8 +1916,9 @@ impl Drop for RegisteredPeerCleanupGuard {
 struct IncomingStreamSetup {
     io: SetupIo,
     permit: OwnedSemaphorePermit,
-    /// Created with the permit, so this future's first suspend finds it owned.
-    resources: StreamResources,
+    /// Created with the permit, so this future's first suspend finds it
+    /// counted. The stream's gates follow once its prelude names its kind.
+    owner: OwnerGuard,
     stream_id: u64,
     stream: Stream,
     prelude: StreamPrelude,
@@ -2519,7 +2558,15 @@ impl ZakuraProtocolHandler {
         handshake_config.supported_capabilities = registry.supported_capabilities();
         let supported_capabilities =
             Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
-        let envelope = limits.resource_envelope();
+        let envelope = limits.resource_envelope(&registry);
+        let resources = NodeResources::new(
+            limits.reactor_shares(),
+            registry
+                .services()
+                .iter()
+                .flat_map(|service| service.streams().iter().copied()),
+            limits.max_frame_bytes,
+        );
         debug!(
             ?envelope,
             transport_memory_bytes = %envelope.transport_memory_bytes(),
@@ -2537,7 +2584,7 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
-            resources: NodeResources::new(envelope),
+            resources,
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
@@ -2902,7 +2949,13 @@ impl ZakuraProtocolHandler {
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
-        let connection_resources = self.resources.connection();
+        let connection_resources = self.resources.connection(accepted_capabilities);
+        // Set once, for the kinds this connection negotiated (zakura-quic
+        // API-9). The handshake window stays inside it for the control stream.
+        let _ = connection.set_limits(
+            zakura_quic::ConnLimits::default()
+                .with_receive_window(connection_resources.receive_window()),
+        );
         let mut workers = JoinSet::new();
         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();
         let mut pending_sessions = PendingSessions::default();
@@ -3523,7 +3576,7 @@ impl ZakuraProtocolHandler {
                 .trace_stream("rejected.semaphore", stream_id, None);
             return None;
         };
-        let resources = admission.resources.stream();
+        let owner = admission.resources.owner();
 
         // Charge the per-connection stream-open rate token immediately after
         // acquiring a concurrency permit, before parsing the prelude or running
@@ -3710,7 +3763,7 @@ impl ZakuraProtocolHandler {
             Some(IncomingStreamSetup {
                 io,
                 permit,
-                resources,
+                owner,
                 stream_id,
                 stream,
                 prelude,
@@ -3732,13 +3785,20 @@ impl ZakuraProtocolHandler {
         let IncomingStreamSetup {
             io,
             permit,
-            resources: stream_resources,
+            owner,
             stream_id,
             stream,
             prelude,
             session,
         } = incoming;
         let (mut send, mut recv) = io.take();
+        let Some(stream_resources) = admission.resources.stream(stream.kind, owner) else {
+            // Admission checked the kind's capability, and the connection gates
+            // every negotiated kind, so this is a local inconsistency.
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            return None;
+        };
         let resources = if let Some((layout, _)) = &session {
             match pending_sessions.reserve_or_share(layout, &self.registry, admission.direction) {
                 Ok(resources) => resources,
@@ -5419,8 +5479,10 @@ async fn request_stream_worker(
         }
     };
 
-    // The result is the worker's own retained memory. Fund it through the write,
-    // and stop at this owner when the output budgets are saturated.
+    // The result is the worker's own retained memory. Fund it through the write
+    // from its kind's output gate, and stop at this owner while the gate is
+    // full. A result above the gate takes the whole gate, so one stalled
+    // response strands at most its kind's output share.
     let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
         bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
     });
@@ -5545,7 +5607,8 @@ async fn read_frame(
 }
 
 /// Read one frame as [`read_frame`] does, with `gate` admitting its bytes after
-/// the header's checks and before the payload's allocation.
+/// the header's checks and before the payload's allocation. The grant holds
+/// the payload's QUIC credit until it drops.
 async fn read_admitted_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
@@ -5566,10 +5629,27 @@ async fn read_admitted_frame(
     .map(|(frame, grant)| AdmittedFrame { frame, grant })
 }
 
+/// What funds a frame's payload from its allocation on.
+trait PayloadAdmission {
+    /// Keep the QUIC credit of the `payload_len` bytes that `recv` reads next,
+    /// if this admission funds them.
+    fn hold_credit(&mut self, recv: &mut RecvStream, payload_len: usize);
+}
+
+impl PayloadAdmission for () {
+    fn hold_credit(&mut self, _recv: &mut RecvStream, _payload_len: usize) {}
+}
+
+impl PayloadAdmission for FrameGrant {
+    fn hold_credit(&mut self, recv: &mut RecvStream, payload_len: usize) {
+        FrameGrant::hold_credit(self, recv, payload_len);
+    }
+}
+
 /// The frame read itself. `admit` runs once the header passed its checks, and
-/// its result funds the allocation that follows. A stalled peer's in-progress
-/// read and a local wait for capacity have separate bounds: `read_timeout` covers
-/// only the peer's bytes.
+/// its result funds the allocation that follows and holds the payload's QUIC
+/// credit. A stalled peer's in-progress read and a local wait for capacity
+/// have separate bounds: `read_timeout` covers only the peer's bytes.
 async fn read_frame_under<G, Fut>(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
@@ -5579,6 +5659,7 @@ async fn read_frame_under<G, Fut>(
     admit: impl FnOnce(u64) -> Fut,
 ) -> Result<(Frame, G), ZakuraHandlerError>
 where
+    G: PayloadAdmission,
     Fut: future::Future<Output = G>,
 {
     let mut header = [0; FRAME_HEADER_BYTES];
@@ -5635,7 +5716,9 @@ where
             max_frame_bytes,
         });
     }
-    let admission = admit(frame_wire_bytes(payload_len)).await;
+    let mut admission = admit(frame_wire_bytes(payload_len)).await;
+    // Before the payload read, so the hold rides in that read's command.
+    admission.hold_credit(recv, payload_len);
     let mut payload = vec![0; payload_len];
     read_frame_payload(recv, &mut payload, read_timeout).await?;
     #[cfg(any(test, zakura_sim))]
@@ -11042,7 +11125,7 @@ mod tests {
             conn: ZakuraConnTrace::placeholder(),
             peer_id: &peer_id,
             stream_sem: &stream_sem,
-            resources: &ConnectionResources::unconstrained(),
+            resources: &ConnectionResources::unconstrained(&[]),
             open_limiter: &mut open_limiter,
             message_buckets: &mut message_buckets,
             workers: &mut workers,

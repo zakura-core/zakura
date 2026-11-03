@@ -958,13 +958,11 @@ mod tests {
         assert_eq!(budget.granted(), 0);
     }
 
-    /// Output capacity and queue capacity report the same way to a caller, and
-    /// the stream's floor slot keeps one frame moving at a saturated budget.
+    /// Output capacity and queue capacity report the same way to a caller.
     #[tokio::test]
-    async fn a_saturated_budget_reports_full_and_keeps_the_floor_frame() {
+    async fn a_saturated_budget_reports_full() {
         let (sender, mut receiver, budget) = gated_queue(8, frame_bytes());
         sender.try_send(frame(1)).unwrap();
-        sender.try_send(frame(2)).expect("the floor slot admits it");
         assert!(matches!(
             sender.try_send(frame(3)),
             Err(mpsc::error::TrySendError::Full(Frame {
@@ -982,7 +980,7 @@ mod tests {
     #[tokio::test]
     async fn a_send_waiting_for_output_ends_when_the_queue_closes() {
         let (sender, receiver, _budget) = gated_queue(8, frame_bytes());
-        let _held = (sender.try_send(frame(1)), sender.try_send(frame(2)));
+        let _held = sender.try_send(frame(1));
         let mut waiting = Box::pin(sender.send(frame(3)));
         assert!(futures::poll!(&mut waiting).is_pending());
         drop(receiver);

@@ -409,6 +409,46 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_local_frame_retires_only_its_session() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let mut fixture = Fixture::start().await?;
+    let (client, server) = fixture.sessions().await?;
+    let mut client_sibling = timeout(TEST_TIMEOUT, fixture.client_siblings.recv())
+        .await
+        .expect("the client admits the sibling service")
+        .ok_or("missing client sibling")?;
+    let mut server_sibling = timeout(TEST_TIMEOUT, fixture.server_siblings.recv())
+        .await
+        .expect("the server admits the sibling service")
+        .ok_or("missing server sibling")?;
+    let (mut sibling_recv, _send) = client_sibling.take_stream(SIBLING.kind).unwrap();
+    let (_recv, sibling_send) = server_sibling.take_stream(SIBLING.kind).unwrap();
+
+    // A payload as large as the whole frame cap leaves no room for the header.
+    let oversize = frame(2, 43, usize::try_from(DATA.frame_cap)?);
+    timeout(TEST_TIMEOUT, client.data_send.send(oversize)).await??;
+    timeout(TEST_TIMEOUT, client.cancel.cancelled()).await?;
+    timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
+    assert!(!client.connection_cancel.is_cancelled());
+    assert!(!server.connection_cancel.is_cancelled());
+    assert!(!client_sibling.service_cancel_token().is_cancelled());
+    assert!(!server_sibling.service_cancel_token().is_cancelled());
+    assert!(fixture.connection.close_reason().is_none());
+
+    let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
+    assert_eq!(replacement_client.conn_id, client.conn_id);
+    assert_ne!(replacement_client.id, client.id);
+    exchange(&mut replacement_client, &mut replacement_server).await?;
+    let ping = frame(1, 19, 64);
+    timeout(TEST_TIMEOUT, sibling_send.send(ping.clone())).await??;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+        Some(ping)
+    );
+    fixture.close().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_sibling_does_not_prevent_full_capacity_pair() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     // The pair needs both slots; the third negotiated role has no local demand.
@@ -1510,6 +1550,108 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
     assert_eq!(slots.available_permits(), 2);
     assert!(pending.deadline().is_none());
     assert!(workers.is_empty());
+    connection.close(0u32.into(), b"done");
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let (server, client, connection, remote) = raw_connection().await?;
+    let (sessions, _sessions_rx) = mpsc::channel(1);
+    let (siblings, _siblings_rx) = mpsc::channel(1);
+    let local = ZakuraLocalLimits::from_config(&Config::default());
+    let handler = ZakuraProtocolHandler::new_with_registry(
+        ZakuraSupervisorHandle::new(16),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        local.clone(),
+        Arc::new(ServiceRegistry::new(vec![
+            Arc::new(SessionService {
+                streams: &[DATA, REQUESTS],
+                capacity: None,
+                opening: SessionOpening::EitherSide,
+                fail_first_reservation: std::sync::atomic::AtomicBool::new(false),
+                sessions,
+            }),
+            Arc::new(SiblingService {
+                sessions: siblings,
+                retired: false,
+            }),
+        ])?),
+    );
+    let header = u32::try_from(FRAME_HEADER_BYTES)?;
+    for (cap, admitted) in [(0, false), (header, false), (header + 1, true)] {
+        let slots = Arc::new(Semaphore::new(1));
+        let context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
+        let close_cause = context.close_cause.clone();
+        let mut workers = JoinSet::new();
+        let mut open_limiter = TokenBucket::new(100);
+        let mut buckets = MessageRateBuckets::new();
+        let mut pending = PendingSessions::default();
+        let (exits, _exit_rx) = mpsc::unbounded_channel();
+        let mut admission = StreamAdmission {
+            is_initiator: false,
+            direction: ServicePeerDirection::Inbound,
+            conn: context.conn,
+            peer_id: &context.peer_id,
+            stream_sem: &slots,
+            open_limiter: &mut open_limiter,
+            message_buckets: &mut buckets,
+            workers: &mut workers,
+            limits: context.limits,
+            accepted_capabilities: SIBLING.capability,
+            connection_token: context.connection_token.clone(),
+            close_cause: context.close_cause,
+            freshness_tx: context.freshness_tx,
+        };
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: SIBLING.kind,
+            stream_version: SIBLING.version,
+            request_id: None,
+            max_frame_bytes: cap,
+        };
+        send.write_all(&prelude.encode()?).await?;
+        let (accepted_send, accepted_recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+        let session = timeout(
+            TEST_TIMEOUT,
+            handler.admit_bi_stream(
+                accepted_send,
+                accepted_recv,
+                &mut admission,
+                2,
+                exits,
+                &mut pending,
+            ),
+        )
+        .await?;
+        assert_eq!(session.is_some(), admitted, "cap {cap}");
+        assert_eq!(
+            context.connection_token.is_cancelled(),
+            !admitted,
+            "cap {cap}"
+        );
+        if !admitted {
+            assert_eq!(close_cause.get(), Some("undersized_frame_cap"), "cap {cap}");
+            let mut byte = [0; 1];
+            let read = timeout(TEST_TIMEOUT, recv.read_exact(&mut byte)).await?;
+            assert!(
+                matches!(
+                    read,
+                    Err(zakura_quic::ReadExactError::ReadError(zakura_quic::ReadError::Reset(code)))
+                        if code == VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE)
+                ),
+                "cap {cap}: {read:?}"
+            );
+        } else {
+            assert_eq!(close_cause.get(), None, "cap {cap}");
+        }
+        context.connection_token.cancel();
+    }
     connection.close(0u32.into(), b"done");
     timeout(TEST_TIMEOUT, client.shutdown()).await?;
     timeout(TEST_TIMEOUT, server.shutdown()).await?;

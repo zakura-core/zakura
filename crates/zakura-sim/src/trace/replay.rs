@@ -23,7 +23,7 @@ use crate::{
     harness::{self, HarnessEntry, HarnessError},
     plan::TraceScript,
     record::EndRecord,
-    Divergence, HarnessFailure, Observation, ObservationLog, PlanError, PlanInput,
+    Divergence, HarnessFailure, Observation, ObservationLog, PlanError, PlanInput, Record,
 };
 
 /// The full observation log `--observe` writes beside `trace.jsonl`.
@@ -162,11 +162,13 @@ impl std::error::Error for ReplayError {}
 /// `meta.build`, replay fails before any harness code runs, unless
 /// [`ReplayOptions::allow_build_mismatch`] is set.
 pub fn replay(trace: &Trace, options: ReplayOptions) -> Result<ReplayReport, ReplayError> {
-    replay_on(trace, options, || {
-        harness::find(&trace.meta.sim).map_err(|error| ReplayError::UnsupportedScenario {
-            what: error.to_string(),
-        })
-    })
+    replay_on(
+        trace,
+        options,
+        registered(trace),
+        &mut ObservationLog::default(),
+        None,
+    )
 }
 
 /// [`replay`] on `harness`, whatever `meta.sim` names, for harnesses outside
@@ -176,15 +178,82 @@ pub fn replay_with(
     harness: &HarnessEntry,
     options: ReplayOptions,
 ) -> Result<ReplayReport, ReplayError> {
-    replay_on(trace, options, || Ok(harness))
+    replay_on(
+        trace,
+        options,
+        || Ok(harness),
+        &mut ObservationLog::default(),
+        None,
+    )
+}
+
+/// What a replay's run emitted, kept whether or not the replay succeeded.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReplayRun {
+    /// Every record the run emitted, in order. Empty if the replay failed
+    /// before its run started, since every run emits `init`.
+    pub(crate) records: Vec<Record>,
+    /// The run's property reports with every violation.
+    pub(crate) properties: Vec<PropertyReport>,
+}
+
+/// [`replay_with`] with default options, and what its run emitted.
+pub(crate) fn replay_keeping(
+    trace: &Trace,
+    harness: &HarnessEntry,
+) -> (Result<ReplayReport, ReplayError>, ReplayRun) {
+    let mut kept = ReplayRun::default();
+    let replayed = replay_on(
+        trace,
+        ReplayOptions::default(),
+        || Ok(harness),
+        &mut ObservationLog::default(),
+        Some(&mut kept),
+    );
+    (replayed, kept)
+}
+
+/// [`replay`], then the trace as [`explain`](super::explain::explain)
+/// renders it with the replay's observations.
+pub fn replay_explained(
+    trace: &Trace,
+    options: ReplayOptions,
+) -> Result<(ReplayReport, String), ReplayError> {
+    let mut log = ObservationLog::default();
+    let report = replay_on(trace, options, registered(trace), &mut log, None)?;
+    Ok((report, super::explain::explain(trace, &log)))
+}
+
+/// [`replay_explained`] on `harness`, whatever `meta.sim` names.
+pub fn replay_explained_with(
+    trace: &Trace,
+    harness: &HarnessEntry,
+    options: ReplayOptions,
+) -> Result<(ReplayReport, String), ReplayError> {
+    let mut log = ObservationLog::default();
+    let report = replay_on(trace, options, || Ok(harness), &mut log, None)?;
+    Ok((report, super::explain::explain(trace, &log)))
+}
+
+/// The registered harness `trace`'s `meta.sim` names.
+fn registered(trace: &Trace) -> impl FnOnce() -> Result<&'static HarnessEntry, ReplayError> + '_ {
+    || {
+        harness::find(&trace.meta.sim).map_err(|error| ReplayError::UnsupportedScenario {
+            what: error.to_string(),
+        })
+    }
 }
 
 /// Checks the trace and build, then looks up the harness, checks `meta`
-/// against it, and runs the replay.
+/// against it, and runs the replay. The run's observations go to `log`,
+/// once the run ends. With `kept`, the run's records and property reports
+/// go there too.
 fn replay_on<'h>(
     trace: &Trace,
     options: ReplayOptions,
     harness: impl FnOnce() -> Result<&'h HarnessEntry, ReplayError>,
+    log: &mut ObservationLog,
+    kept: Option<&mut ReplayRun>,
 ) -> Result<ReplayReport, ReplayError> {
     let steps = trace.steps.last().map_or(0, |step| step.step);
     // A prefix that stops before `init` has nothing to replay.
@@ -219,16 +288,21 @@ fn replay_on<'h>(
         .transpose()
         .map_err(ReplayError::Io)?;
 
-    let mut sink = VerifySink::new(trace);
-    let (report, failure) =
+    let mut sink = VerifySink::new(trace, kept.is_some());
+    let (mut report, failure) =
         match (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink) {
             Ok(report) => (report, None),
             Err(HarnessError::Run { failure, report }) => (*report, Some(failure)),
             Err(error) => return Err(unsupported(error)),
         };
+    if let Some(kept) = kept {
+        kept.records = std::mem::take(&mut sink.kept);
+        kept.properties = report.properties.clone();
+    }
     if let Some(file) = observations {
         write_observations(file, &report.log, report.end.steps).map_err(ReplayError::Io)?;
     }
+    *log = std::mem::take(&mut report.log);
 
     let strict = !build_mismatch;
     match failure {

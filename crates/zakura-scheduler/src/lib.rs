@@ -242,13 +242,17 @@ impl Point {
 /// Where a ready task will resume: its `n`-th point of kind `op`.
 ///
 /// A task at the top of its coroutine is at `poll#n`, where `n` counts its
-/// polls. Displayed as `kind#n`, the form traces use.
+/// polls. Displayed as `kind#n`, the form traces use. The display leaves
+/// out `object` and `site`, so they never change a pick's identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct At {
     /// The operation the task stopped before.
     pub op: Op,
     /// How many points of this kind the task has reached, this one included.
     pub n: u32,
+    /// The object the operation touches, if the primitive reports one.
+    /// `None` at the top of the coroutine.
+    pub object: Option<ObjectId>,
     /// The point's source location. `None` at the top of the coroutine.
     pub site: Option<&'static Location<'static>>,
 }

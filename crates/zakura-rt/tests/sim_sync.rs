@@ -397,3 +397,167 @@ fn points_are_skipped_while_a_watch_lock_is_held() {
         "only the load after the locks"
     );
 }
+
+/// A hook that counts its runs in `count`.
+fn counting_hook(count: &Arc<counter::AtomicUsize>) -> impl FnOnce() + Send + 'static {
+    let count = Arc::clone(count);
+    move || {
+        count.fetch_add(1, counter::Ordering::Relaxed);
+    }
+}
+
+/// A hook runs once, whether its own token or an ancestor is cancelled, and
+/// cancelling again runs nothing.
+#[test]
+fn on_cancel_runs_once_on_direct_and_parent_cancellation() {
+    let (runs, report) = run(async {
+        let direct = Arc::new(counter::AtomicUsize::new(0));
+        let inherited = Arc::new(counter::AtomicUsize::new(0));
+        let grandchild_runs = Arc::new(counter::AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let child = token.child_token();
+        let grandchild = child.child_token();
+        token.on_cancel(counting_hook(&direct));
+        child.on_cancel(counting_hook(&inherited));
+        grandchild.on_cancel(counting_hook(&grandchild_runs));
+        let before = (
+            direct.load(counter::Ordering::Relaxed),
+            inherited.load(counter::Ordering::Relaxed),
+        );
+        token.cancel();
+        let after_first = (
+            direct.load(counter::Ordering::Relaxed),
+            inherited.load(counter::Ordering::Relaxed),
+            grandchild_runs.load(counter::Ordering::Relaxed),
+        );
+        token.cancel();
+        child.cancel();
+        let after_second = (
+            direct.load(counter::Ordering::Relaxed),
+            inherited.load(counter::Ordering::Relaxed),
+            grandchild_runs.load(counter::Ordering::Relaxed),
+        );
+        (before, after_first, after_second)
+    });
+    assert_eq!(runs.0, (0, 0), "nothing runs before the cancel");
+    assert_eq!(runs.1, (1, 1, 1), "the cancel reaches the children");
+    assert_eq!(runs.2, (1, 1, 1), "cancelling again runs nothing");
+    assert_eq!(
+        report.count(Op::Cancel),
+        3,
+        "only the three cancels are points"
+    );
+}
+
+/// A hook added to a cancelled token, or to a child made after its parent
+/// was cancelled, runs when it's added.
+#[test]
+fn on_cancel_on_a_cancelled_token_runs_now() {
+    let (runs, report) = run(async {
+        let token = CancellationToken::new();
+        token.cancel();
+        let child = token.child_token();
+        let own = Arc::new(counter::AtomicUsize::new(0));
+        let late_child = Arc::new(counter::AtomicUsize::new(0));
+        token.on_cancel(counting_hook(&own));
+        child.on_cancel(counting_hook(&late_child));
+        (
+            own.load(counter::Ordering::Relaxed),
+            late_child.load(counter::Ordering::Relaxed),
+        )
+    });
+    assert_eq!(runs, (1, 1), "each hook runs when it's added");
+    assert_eq!(report.count(Op::Cancel), 1);
+    assert_eq!(
+        report.count(Op::Cancelled),
+        0,
+        "adding a hook reads no point"
+    );
+}
+
+/// A drop guard's cancel runs the token's hooks and its children's, and a
+/// dropped child's hooks never run.
+#[test]
+fn on_cancel_runs_from_a_drop_guard() {
+    let (runs, _) = run(async {
+        let own = Arc::new(counter::AtomicUsize::new(0));
+        let kept = Arc::new(counter::AtomicUsize::new(0));
+        let dropped = Arc::new(counter::AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let child = token.child_token();
+        let gone = token.child_token();
+        token.on_cancel(counting_hook(&own));
+        child.on_cancel(counting_hook(&kept));
+        gone.on_cancel(counting_hook(&dropped));
+        drop(gone);
+        drop(token.clone().drop_guard());
+        (
+            own.load(counter::Ordering::Relaxed),
+            kept.load(counter::Ordering::Relaxed),
+            dropped.load(counter::Ordering::Relaxed),
+        )
+    });
+    assert_eq!(runs, (1, 1, 0));
+}
+
+/// A grandchild's hook runs when the root is cancelled after the child
+/// between them was dropped, as tokio still cancels the grandchild. The
+/// dropped child's own hook never runs.
+#[test]
+fn on_cancel_survives_a_dropped_intermediate_token() {
+    let (runs, _) = run(async {
+        let middle_runs = Arc::new(counter::AtomicUsize::new(0));
+        let leaf_runs = Arc::new(counter::AtomicUsize::new(0));
+        let root = CancellationToken::new();
+        let middle = root.child_token();
+        let leaf = middle.child_token();
+        middle.on_cancel(counting_hook(&middle_runs));
+        leaf.on_cancel(counting_hook(&leaf_runs));
+        drop(middle);
+        root.cancel();
+        (
+            middle_runs.load(counter::Ordering::Relaxed),
+            leaf_runs.load(counter::Ordering::Relaxed),
+            leaf.is_cancelled(),
+        )
+    });
+    assert_eq!(runs, (0, 1, true));
+}
+
+/// A hook runs when the parent cancels a child whose last token became a
+/// `cancelled_owned` future, and that future still resolves.
+#[test]
+fn on_cancel_survives_cancelled_owned() {
+    let (runs, _) = run(async {
+        let count = Arc::new(counter::AtomicUsize::new(0));
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        child.on_cancel(counting_hook(&count));
+        let wait = child.cancelled_owned();
+        root.cancel();
+        let ran = count.load(counter::Ordering::Relaxed);
+        wait.await;
+        ran
+    });
+    assert_eq!(runs, 1);
+}
+
+/// Adding and running hooks adds no point and no draw.
+#[test]
+fn on_cancel_adds_no_point() {
+    let cancel_with = |hooked: bool| {
+        run(async move {
+            let token = CancellationToken::new();
+            let child = token.child_token();
+            if hooked {
+                token.on_cancel(|| {});
+                child.on_cancel(|| {});
+            }
+            token.cancel();
+        })
+        .1
+    };
+    let (hooked, plain) = (cancel_with(true), cancel_with(false));
+    assert_eq!(hooked.points, plain.points);
+    assert_eq!(hooked.draws, plain.draws);
+}

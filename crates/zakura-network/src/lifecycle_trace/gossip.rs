@@ -1,27 +1,14 @@
-//! `block_gossip` rows: a block broadcast's path through the shared upload slots.
+//! `block_gossip` rows follow each broadcast and its peers through inventory and body delivery.
 //!
-//! One broadcast writes `broadcast_start`, then for each peer, in order:
-//!
-//! - `advert_start`: the per-peer task started. `wait_us` is the time since `broadcast_start`
-//!   spent waiting for a place among the concurrently polled tasks.
-//! - `advert_join`: the peer already had an upload of this block in progress, so this task waits
-//!   for that upload instead of taking a slot.
-//! - `slot_acquired`: the task took an upload slot. `wait_us` is the time spent waiting for one.
-//! - `inv_enqueued`: the connection channel accepted the inventory request. `wait_us` is the
-//!   time since `slot_acquired`.
-//! - `inv_written`: the connection wrote the inventory. `wait_us` is the time since
-//!   `inv_enqueued`, which covers requests queued ahead of it and the connection's current
-//!   request.
-//! - `slot_released`: the slot was returned. `release_reason` says why, `held_us` is the time
-//!   since `slot_acquired`, and `requested_us` and `written_us` are the peer's `getdata` and the
-//!   completed block write, relative to `slot_acquired`.
-//! - `advert_done`: the task finished. `elapsed_us` is the time since `advert_start`.
-//!
-//! and finally `broadcast_done`, with the number of peers whose advertisement succeeded.
-//!
-//! Slot wait (`slot_acquired.wait_us`) and connection queue wait (`inv_enqueued.wait_us` plus
-//! `inv_written.wait_us`) are reported separately, so a slow advertisement can be attributed to
-//! older broadcasts holding slots or to a busy connection.
+//! `broadcast_start` and `broadcast_done` bound the broadcast.
+//! Each peer records `advert_start`, inventory queueing (`inv_enqueued`), and the inventory
+//! write (`inv_written`). Inventory uses no upload slot.
+//! A peer that requests the block records its slot wait (`slot_acquired.wait_us`) separately
+//! from its inventory queue wait (`inv_written.wait_us`).
+//! `slot_released` reports the slot's held duration and release reason.
+//! Its `requested_us` and `written_us` fields measure from `advert_start`, so they retain
+//! request times that precede slot acquisition.
+//! `advert_done` records the result even when the peer never requested an upload slot.
 
 use std::sync::Arc;
 
@@ -300,7 +287,7 @@ impl AdvertTrace {
         };
 
         let now = Instant::now();
-        let wait_us = micros_between(advert.slot_acquired.unwrap_or(now), now);
+        let wait_us = micros_between(advert.started, now);
         advert.inv_enqueued = Some(now);
         advert.emit("inv_enqueued", |row| GossipRow {
             wait_us: Some(wait_us),
@@ -347,7 +334,7 @@ impl AdvertTrace {
 
         advert.slot_released = true;
         let held_us = saturating_micros(acquired.elapsed());
-        let relative = |at: Option<Instant>| at.map(|at| micros_between(acquired, at));
+        let relative = |at: Option<Instant>| at.map(|at| micros_between(advert.started, at));
         let (requested_us, written_us) = (
             relative(advert.upload_requested),
             relative(advert.upload_written),

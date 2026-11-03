@@ -24,6 +24,11 @@ pub enum Observation {
         task: String,
         /// The point, such as `lock#2`.
         at: String,
+        /// The runtime object the point touches, if the primitive reports
+        /// one, as `<creator>:object#<n>`: the creating task's name, or
+        /// `setup`, and the creator's `n`-th object.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        object: Option<String>,
         /// The point's source location, as `file:line`.
         #[serde(skip_serializing_if = "Option::is_none")]
         site: Option<String>,
@@ -92,6 +97,22 @@ pub enum Observation {
         /// What happened.
         event: ReactorFact,
     },
+    /// One event a block-sync node reported through its tap, in the order
+    /// block sync reported it.
+    BlockSync {
+        /// The tap's registration index among the run's block-sync taps, an
+        /// index space apart from storage's and header reactors'.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The last fact the node's block storage had published when the
+        /// event happened, 0 before any.
+        storage_seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// What happened.
+        event: BlockSyncFact,
+    },
     /// A peer sent a frame on a tabled stream. The peer's role models
     /// labelled it when it was sent.
     PeerFrame {
@@ -99,6 +120,12 @@ pub enum Observation {
         connection: u64,
         /// The stream.
         stream: StreamId,
+        /// The frame's QUIC stream, the same on both ends (M5-Q12), so a
+        /// reopened stream of one kind and version numbers its frames
+        /// apart. `None` on an in-memory link, which carries one stream of
+        /// each kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame's position among the peer's frames on this stream,
         /// from 0.
         seq: u64,
@@ -126,17 +153,38 @@ pub enum Observation {
         /// The payload's length in bytes, frame header excluded.
         payload: u64,
     },
+    /// The body a peer's block frame carried, which the relay reads off the
+    /// frame after its [`Observation::PeerFrame`]. A model input, like
+    /// [`Observation::ExchangeOwed`]. A frame whose body doesn't decode, or
+    /// has no coinbase height, has none.
+    PeerBody {
+        /// The connection.
+        connection: u64,
+        /// The frame, as its [`Observation::PeerFrame`] numbers it.
+        seq: u64,
+        /// The body's coinbase height.
+        height: u32,
+        /// The body's hash, in hex as storage writes it.
+        hash: String,
+    },
     /// A frame the node sent on a tabled stream reached a peer, whose role
-    /// models labelled it on arrival under the sender's rules: `OverMargin`
-    /// once the node's open requests exceed the highest limit the peer
-    /// advertised, and `OverLive` once the node's live subscriptions exceed
-    /// `max_live`, without the receiver's margin of twice those. A model
-    /// input, like [`Observation::CreditGranted`].
+    /// models labelled it under the sender's rules: `OverMargin` once the
+    /// node's open requests exceed the highest limit the peer advertised,
+    /// and `OverLive` once the node's live subscriptions exceed `max_live`,
+    /// without the receiver's margin of twice those. An in-memory link's
+    /// relay labels it on arrival. A wire link labels it against the peer
+    /// updates the node had applied when it started writing the frame
+    /// ([`crate::peer::adapter`]). A model input, like
+    /// [`Observation::CreditGranted`].
     NodeFrame {
         /// The connection.
         connection: u64,
         /// The stream.
         stream: StreamId,
+        /// The frame's QUIC stream, as for [`Observation::PeerFrame`].
+        /// `None` on an in-memory link.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame's position among the node's frames on this stream,
         /// from 0.
         seq: u64,
@@ -159,6 +207,10 @@ pub enum Observation {
         connection: u64,
         /// The stream.
         stream: StreamId,
+        /// The frame's QUIC stream, as its [`Observation::PeerFrame`] has
+        /// it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame, as its [`Observation::PeerFrame`] numbers it.
         seq: u64,
     },
@@ -269,6 +321,96 @@ pub enum Observation {
         payload: u64,
         /// True if the row ends the exchange.
         ends: bool,
+    },
+    /// A datagram on the simulated network was sent, or left it. Each
+    /// datagram logs `sent`, then at most one of the others.
+    Datagram {
+        /// Its place in `link`'s sends, from 0, as `deliver:<link>:<id>`
+        /// names it.
+        id: u64,
+        /// Its directed link, as `<src>-><dst>`.
+        link: String,
+        /// Its length in bytes.
+        len: u64,
+        /// What happened to it.
+        outcome: DatagramOutcome,
+        /// When it was sent, in nanoseconds since the run's start.
+        sent_at: u64,
+    },
+    /// One event a node's transport reported through its tap, in the order
+    /// the transport reported it.
+    Transport {
+        /// The tap's registration index among the run's transport taps, an
+        /// index space of its own.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// The connection's registration ID, or `None` for an event the
+        /// transport reports before registration assigns it.
+        connection: Option<u64>,
+        /// The remote address the connection was admitted from, which keys
+        /// it before registration.
+        remote: String,
+        /// What happened.
+        event: TransportFact,
+    },
+    /// The identity map placed a service session the node admitted: the
+    /// connection from its `registered` event, the peer that bound the
+    /// connection's remote address, and the stream from its `admitted`
+    /// event. Logged right after that event. It's read back from the
+    /// transport, never predicted from draw order.
+    Session {
+        /// The connection.
+        connection: u64,
+        /// The peer's name.
+        peer: String,
+        /// The session's QUIC stream ID, the same on both ends.
+        quic_stream: u64,
+        /// The stream kind.
+        kind: u16,
+        /// The stream version.
+        version: u16,
+        /// The node's session ID for it.
+        session_id: u64,
+    },
+    /// A scripted peer's write of one frame finished: `write_all` returned.
+    /// The frame's [`Observation::PeerFrame`] came first.
+    PeerWritten {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream, from the identity map.
+        quic_stream: u64,
+        /// The frame's position among the peer's writes on the stream, from
+        /// 0.
+        seq: u64,
+    },
+    /// A scripted peer closed its connection with `Conn::close`, so its
+    /// close is on its way and nothing it sends on the connection follows
+    /// it. It's recorded on the peer's header stream, so it waits for that
+    /// stream's identity rows as the peer's frames do.
+    PeerClosed {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream of the peer's header stream then.
+        quic_stream: u64,
+    },
+    /// A scripted peer read and decoded one frame the node wrote.
+    PeerReceived {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream, from the identity map.
+        quic_stream: u64,
+        /// The frame's position among the node's writes on the stream, from
+        /// 0, as the node's `frame-written` numbers it.
+        seq: u64,
+        /// The frame's message type.
+        message_type: u16,
+        /// The payload's length in bytes, frame header excluded.
+        payload: u64,
+        /// The credit an update adds, for an `Open` or `Grant`.
+        credit: Option<PeerCredit>,
     },
     /// An event from a test-only fake action source.
     Fake {
@@ -410,17 +552,120 @@ pub enum StorageFact {
         #[serde(skip_serializing_if = "Option::is_none")]
         lease: Option<StorageLease>,
     },
-    /// The service shut down, dropping these operations.
+    /// Block operation `id` arrived, at its first stage if it holds one.
+    BlockSubmitted {
+        /// The operation's ID.
+        id: u64,
+        /// What it asks for.
+        request: StorageRequest,
+        /// Its first stage, such as `queued`, or `None` for a misbehavior
+        /// report, which holds nothing.
+        stage: Option<String>,
+    },
+    /// The apply limits admitted queued submission `id`.
+    Admitted {
+        /// The operation.
+        id: u64,
+    },
+    /// The run completed block operation `id`.
+    BlockCompleted {
+        /// The operation.
+        id: u64,
+        /// The outcome, as in its action identity.
+        outcome: String,
+        /// What it returned.
+        result: StorageResult,
+        /// Whether its reply reached block sync.
+        delivered: bool,
+        /// The engine's state version after it.
+        state_version: u64,
+    },
+    /// The driver took a later query, so block sync's query `query_id`
+    /// gets no reply.
+    Coalesced {
+        /// Block sync's query ID.
+        query_id: u64,
+    },
+    /// The step that took an action left these deferred actions, oldest
+    /// first.
+    Deferred {
+        /// The deferred actions.
+        queue: Vec<StorageRequest>,
+    },
+    /// The engine installed a transition.
+    TransitionInstalled {
+        /// The state version after it.
+        state_version: u64,
+        /// The verified tip after it.
+        verified_best: StoragePoint,
+        /// The body-work epoch before it.
+        epoch_before: u64,
+        /// Whether it invalidated body work.
+        invalidates_body_work: bool,
+        /// The verified-chain change a commit sent: `grow`,
+        /// `checkpoint-finalized-grow` or `reset`.
+        cause: Option<String>,
+    },
+    /// Full state published a committed view.
+    ViewPublished {
+        /// Its state version.
+        state_version: u64,
+        /// Its body work epoch.
+        epoch: u64,
+        /// Its size hint revision.
+        hint_revision: u64,
+        /// Its verified tip.
+        verified_best: StoragePoint,
+        /// Its header tip.
+        header_best: StoragePoint,
+    },
+    /// Operation `id`'s reply reached block sync's handle.
+    ReplyDelivered {
+        /// The operation.
+        id: u64,
+    },
+    /// Block sync's handle was closed, so operation `id`'s reply was
+    /// dropped.
+    HandleClosed {
+        /// The operation.
+        id: u64,
+    },
+    /// A range read's caller took its reply.
+    ReadTaken {
+        /// The operation.
+        id: u64,
+    },
+    /// A range read's caller dropped its call after the reply was stored.
+    ReadDropped {
+        /// The operation.
+        id: u64,
+    },
+    /// A query's reply found block sync's handle closed, so the driver
+    /// returned, dropping these action operations and deferred actions.
+    DriverExited {
+        /// The operations dropped.
+        dropped: Vec<u64>,
+        /// The deferred actions dropped, oldest first. Only block storage
+        /// defers actions.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        deferred: Vec<StorageRequest>,
+    },
+    /// The service shut down, dropping these operations and deferred
+    /// actions.
     ShutDown {
         /// The operations dropped.
         dropped: Vec<u64>,
+        /// The deferred actions dropped, oldest first. Only block storage
+        /// defers actions.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        deferred: Vec<StorageRequest>,
     },
 }
 
 /// A work owner with every field of its typed form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkOwner {
-    /// `header` or `body-repair`.
+    /// `header`, `body-repair`, or `body` for block sync's body work.
     pub kind: String,
     /// The scope it works in.
     #[serde(flatten)]
@@ -435,6 +680,37 @@ pub struct WorkOwner {
     pub session_id: u64,
     /// Its request.
     pub request_id: u64,
+}
+
+/// A body retry episode's summary, `BodyUnavailableSummary` in plain
+/// fields. Times are milliseconds since the Unix epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BodyAvailability {
+    /// When the episode started.
+    pub started_at: i64,
+    /// Its failed delivery attempts.
+    pub attempts: u32,
+    /// Its known eligible suppliers.
+    pub suppliers: u32,
+    /// The digest of the eligible-supplier set.
+    pub supplier_set_digest: String,
+    /// Whether its alarm has fired.
+    pub alarmed: bool,
+    /// The earliest time of its next attempt or probe.
+    pub next_probe_at: i64,
+}
+
+/// A body work scope: a header scope, with the verified generation and
+/// body work epoch that scheduled the work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BodyScope {
+    /// The header scope.
+    #[serde(flatten)]
+    pub scope: WorkScope,
+    /// The verified generation.
+    pub verified_generation: u64,
+    /// The body work epoch.
+    pub body_work_epoch: u64,
 }
 
 /// A header work scope: a generation and the branch it pursues.
@@ -548,6 +824,79 @@ pub enum StorageRequest {
         /// The header asked about.
         hash: String,
     },
+    /// `QueryNeededBlocks`.
+    QueryNeededBlocks {
+        /// Block sync's query ID.
+        query_id: u64,
+        /// The first height.
+        from: u32,
+        /// The number of heights.
+        limit: u32,
+        /// The scope block sync saw.
+        scope: BodyScope,
+        /// The best header tip's height block sync saw.
+        best_header_tip: u32,
+    },
+    /// `SubmitBlock`.
+    SubmitBlock {
+        /// The body work owner.
+        owner: WorkOwner,
+        /// The supplier.
+        source: String,
+        /// Block sync's apply token.
+        token: u64,
+        /// The coinbase height, if the body has one.
+        height: Option<u32>,
+        /// The block.
+        hash: String,
+        /// Its parent.
+        parent: String,
+        /// Its apply class, `checkpoint` or `full`.
+        class: String,
+        /// The decoded size of the block storage took,
+        /// `Block::attributed_memory_size_bytes`.
+        decoded_bytes: u64,
+    },
+    /// One of the body evidence records.
+    RecordBody {
+        /// The record, such as `record_body_invalid`.
+        record: String,
+        /// The state version block sync last saw.
+        expected_version: u64,
+        /// The header it's about.
+        hash: String,
+        /// The record's evidence ID.
+        evidence: String,
+        /// The broken rule, for an invalid body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+        /// The supplier, for an invalid body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// The failure kind, for an unavailable body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<String>,
+        /// The retry episode's summary, for every record but an invalid
+        /// body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        availability: Option<BodyAvailability>,
+    },
+    /// `Misbehavior`.
+    Misbehavior {
+        /// The peer.
+        peer: String,
+        /// Why.
+        reason: String,
+    },
+    /// Serving's range read.
+    ReadRange {
+        /// The first height.
+        start_height: u32,
+        /// The most blocks.
+        count: u32,
+        /// The byte budget.
+        max_body_bytes: u32,
+    },
 }
 
 /// What an operation returned.
@@ -638,11 +987,85 @@ pub enum StorageResult {
     NotSelected,
     /// Not retained.
     NotRetained,
+    /// A queued submission went to the verifier.
+    Admitted,
+    /// A query's answer.
+    NeededBlocks {
+        /// The body anchor.
+        anchor: StoragePoint,
+        /// The missing bodies.
+        blocks: Vec<StoragePoint>,
+    },
+    /// A query's failure.
+    NeededBlocksFailed,
+    /// A submission's verdict.
+    Verdict {
+        /// The verdict, as in its action identity.
+        verdict: String,
+        /// The result block sync reads, such as `committed`.
+        reply: String,
+    },
+    /// A record's attempts, each `committed`, `no-change`, `stale`,
+    /// `resource-stalled` or `refused`.
+    Recorded {
+        /// The attempts, in order.
+        attempts: Vec<String>,
+    },
+    /// A record's state call failed.
+    RecordFailed,
+    /// A served range read.
+    Served {
+        /// The heights served.
+        heights: Vec<u32>,
+        /// Their bytes.
+        bytes: u64,
+    },
+    /// A failed range read.
+    ReadFailed,
 }
 
-/// A storage service's actual owner state.
+/// A storage service's actual owner state, in its service's shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct StorageState {
+#[serde(untagged)]
+pub enum StorageState {
+    /// Header storage's.
+    Header(HeaderStorageState),
+    /// Block storage's.
+    Block(BlockStorageState),
+}
+
+/// Block storage's actual owner state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockStorageState {
+    /// Every operation it holds.
+    pub operations: Vec<BlockOperation>,
+    /// The actions the driver deferred, oldest first.
+    pub deferred: Vec<StorageRequest>,
+}
+
+/// One operation block storage holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockOperation {
+    /// Its ID.
+    pub id: u64,
+    /// What it asked for.
+    pub request: StorageRequest,
+    /// Where it is: `pending`, `queued`, `admitted` or `replied`.
+    pub stage: String,
+    /// For a pending operation, whether a range read's caller waits on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_waiting: Option<bool>,
+    /// For an admitted submission, whether a later copy replaced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<bool>,
+    /// The hash of the submitted block its request holds, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained: Option<String>,
+}
+
+/// Header storage's actual owner state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HeaderStorageState {
     /// Every operation not yet taken or dropped.
     pub operations: Vec<StorageOperation>,
     /// The operations whose permit storage holds.
@@ -780,6 +1203,17 @@ pub enum ReactorFact {
         /// Which capacity refused it: `staging-full` or `locator-capacity`.
         cause: String,
     },
+    /// The reactor dispatched a peer's violation to storage.
+    Misbehavior {
+        /// The violating peer.
+        peer: String,
+        /// What it did: `malformed-message` or `invalid-header`.
+        reason: String,
+        /// The session whose message or work showed it, if known.
+        origin: Option<u64>,
+        /// The peer's current session then, if it had one.
+        current: Option<u64>,
+    },
 }
 
 /// What a dispatched port call asks storage for.
@@ -852,6 +1286,344 @@ pub enum ReactorPurpose {
         /// The repair-signal generation that owns the attempt.
         repair_generation: u64,
     },
+}
+
+/// A block-sync event in plain fields: peers and hashes in hex, owners as
+/// storage writes them, and names for every enum. A body allocation is the
+/// tap's number for it, since addresses differ between processes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum BlockSyncFact {
+    /// The service admitted a session and is about to spawn its routine.
+    SessionAdmitted {
+        /// The remote peer.
+        peer: String,
+        /// The transport connection.
+        connection: u64,
+        /// The service's ID for the session.
+        session_id: u64,
+        /// The routine generation the registry assigned.
+        generation: u64,
+        /// `inbound` or `outbound`.
+        direction: String,
+    },
+    /// A routine took frame `seq` from its stream and is about to judge it.
+    FrameJudged {
+        /// The sending peer.
+        peer: String,
+        /// The connection the frame arrived on.
+        connection: u64,
+        /// The routine's generation.
+        generation: u64,
+        /// The frame's position on the routine's stream, from 1.
+        seq: u64,
+        /// The frame header's message type.
+        message_type: u16,
+        /// The frame header's flags.
+        flags: u16,
+        /// The payload length in bytes.
+        payload_len: u64,
+    },
+    /// A request's write moved one step.
+    Request {
+        /// The request.
+        owner: WorkOwner,
+        /// Its heights, in order.
+        heights: Vec<u32>,
+        /// The size estimate it reserved for all of its heights.
+        estimated_bytes: u64,
+        /// The step, such as `published`, `expired` or `dropped-queued`.
+        step: String,
+    },
+    /// The shared byte budget's counter changed.
+    Budget {
+        /// `reserved`, `charged` for a floor overdraft, or `released`.
+        change: String,
+        /// The counter before the change.
+        before: u64,
+        /// The counter after it.
+        after: u64,
+        /// The budget's maximum, `M`.
+        limit: u64,
+    },
+    /// A routine handed a body to the sequencer, keeping its charge.
+    HandoffStarted {
+        /// The delivering peer.
+        peer: String,
+        /// The request the body answered.
+        owner: WorkOwner,
+        /// The body's height.
+        height: u32,
+        /// The budget bytes released when the handoff ends.
+        charge: u64,
+    },
+    /// The routine released the charge of the body it handed off.
+    HandoffEnded {
+        /// The delivering peer.
+        peer: String,
+        /// The request the body answered.
+        owner: WorkOwner,
+        /// The body's height.
+        height: u32,
+        /// The budget bytes released.
+        charge: u64,
+    },
+    /// A retained body entered or left one of its holders.
+    Holder {
+        /// The body.
+        body: BlockSyncBody,
+        /// The holder.
+        holder: BlockSyncHolder,
+        /// `retained` or `released`.
+        change: String,
+    },
+    /// A serving response took its execution lease, or released it.
+    ServingLease {
+        /// The requesting peer.
+        peer: String,
+        /// The serving session's connection.
+        connection: u64,
+        /// The serving session's routine generation.
+        generation: u64,
+        /// The range's first height.
+        start: u32,
+        /// The range's requested count.
+        count: u32,
+        /// `acquired` or `released`.
+        step: String,
+    },
+    /// Serving judged a request against the ranges it still served: those
+    /// whose endings it hadn't published by then.
+    ServingAdmission {
+        /// The requesting peer.
+        peer: String,
+        /// The request's first height.
+        start: u32,
+        /// The request's count.
+        count: u32,
+        /// The first and last heights of each range it still served.
+        live: Vec<(u32, u32)>,
+    },
+    /// Serving queued one response frame.
+    ServingFrame {
+        /// The requesting peer.
+        peer: String,
+        /// The serving session's connection.
+        connection: u64,
+        /// The serving session's routine generation.
+        generation: u64,
+        /// The range's first height.
+        start: u32,
+        /// The frame's message type.
+        message_type: u8,
+        /// The block bytes the frame carries, or 0 for an ending.
+        body_bytes: u64,
+    },
+    /// A routine's owner state after it handled an input.
+    Routine {
+        /// The routine's peer.
+        peer: String,
+        /// Its connection.
+        connection: u64,
+        /// Its generation.
+        generation: u64,
+        /// Its outstanding requests.
+        requests: Vec<BlockSyncRequest>,
+        /// The claims it published to the peer registry.
+        claims: Vec<BlockSyncClaim>,
+        /// The ranges its serving session records.
+        serving: Vec<BlockSyncRange>,
+        /// True for the routine's last snapshot, after it returned its work.
+        ended: bool,
+    },
+    /// The work queue's items.
+    WorkQueue {
+        /// Each item, in the queue's order.
+        items: Vec<BlockSyncWorkItem>,
+    },
+    /// The sequencer's retained bodies.
+    Sequencer {
+        /// Each reorder-buffer body.
+        reorder: Vec<BlockSyncRetained>,
+        /// Each `applying` body.
+        applying: Vec<BlockSyncRetained>,
+        /// Each submission the driver can still retain.
+        submissions: Vec<BlockSyncSubmission>,
+    },
+    /// The sequencer task is dropping and takes no more bodies.
+    SequencerClosed,
+}
+
+/// A body one or more sequencer holders retain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncBody {
+    /// The body's height.
+    pub height: u32,
+    /// The request the body answered.
+    pub owner: WorkOwner,
+    /// Wire bytes.
+    pub bytes: u64,
+}
+
+/// One holder of a retained body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum BlockSyncHolder {
+    /// The sequencer's input queue.
+    Queued {
+        /// The tap's number for the body's allocation.
+        allocation: u64,
+        /// The attributed size of the decoded block the queued body holds,
+        /// measured from the block itself. 0 for raw bytes.
+        decoded_attributed_memory_bytes: u64,
+    },
+    /// The reorder buffer.
+    Reorder {
+        /// The tap's number for the body's allocation.
+        allocation: u64,
+    },
+    /// `applying`.
+    Applying {
+        /// The tap's number for the body's allocation.
+        allocation: u64,
+    },
+    /// The verifier driver, through a submission attached to `applying`.
+    Submitted {
+        /// The submission's token.
+        token: u64,
+    },
+    /// The verifier driver, through a detached submission.
+    Detached {
+        /// The submission's token.
+        token: u64,
+    },
+}
+
+/// An outstanding request in a routine's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRequest {
+    /// The request.
+    pub owner: WorkOwner,
+    /// Its write phase, such as `queued` or `written`.
+    pub write: String,
+    /// Each requested height, in order.
+    pub heights: Vec<BlockSyncRequestedHeight>,
+}
+
+/// One height of an outstanding request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRequestedHeight {
+    /// The height.
+    pub height: u32,
+    /// The size estimate the request reserved for it.
+    pub estimated_bytes: u64,
+    /// Whether its body arrived.
+    pub received: bool,
+}
+
+/// One unreceived height a routine published to the peer registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncClaim {
+    /// The height.
+    pub height: u32,
+    /// The request that claims it.
+    pub owner: WorkOwner,
+    /// The size estimate the request reserved for it.
+    pub estimated_bytes: u64,
+}
+
+/// A range a routine's serving session records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRange {
+    /// The first height.
+    pub first: u32,
+    /// The last height.
+    pub last: u32,
+    /// Whether its completion is recorded.
+    pub completed: bool,
+}
+
+/// One work-queue item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncWorkItem {
+    /// The item's height.
+    pub height: u32,
+    /// The request that took it, if one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<WorkOwner>,
+    /// `pending`, `provisional` or `in-flight`.
+    pub place: String,
+    /// The size estimate a request for it reserves.
+    pub estimated_bytes: u64,
+    /// The estimate bytes it charges to the queue's tally.
+    pub reserved_bytes: u64,
+}
+
+/// A reorder-buffer or `applying` body in the sequencer's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRetained {
+    /// The body.
+    #[serde(flatten)]
+    pub body: BlockSyncBody,
+    /// The size estimate its request reserved at admission, if it had one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_estimate_bytes: Option<u64>,
+    /// The tap's number for its allocation.
+    pub allocation: u64,
+    /// The attributed size of the decoded block it holds, measured from the
+    /// block. 0 for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
+}
+
+/// A submission in the sequencer's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncSubmission {
+    /// The submitted body.
+    #[serde(flatten)]
+    pub body: BlockSyncBody,
+    /// Its token.
+    pub token: u64,
+    /// The attributed size of the decoded block the driver can retain. An
+    /// attached submission shares its block with its `applying` body.
+    pub decoded_attributed_memory_bytes: u64,
+    /// Whether it left `applying` while the driver can still retain it.
+    pub detached: bool,
+}
+
+/// The events that block-sync tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn block_sync_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::BlockSync { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
+/// The events and session rows that transport tap `instance` logged in
+/// `observations`, in order. A run holds one transport tap, so every
+/// session row is its own.
+pub(crate) fn transport_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| match obs {
+            Observation::Transport {
+                instance: index, ..
+            } => *index == instance,
+            Observation::Session { .. } => true,
+            _ => false,
+        })
+        .collect()
 }
 
 /// The events that reactor tap `instance` logged in `observations`, in
@@ -936,6 +1708,271 @@ impl std::fmt::Display for RowAt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.stream, self.row)
     }
+}
+
+/// What happened to a datagram, in [`Observation::Datagram`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatagramOutcome {
+    /// It went in flight.
+    Sent,
+    /// It reached its destination's receive queue.
+    Delivered,
+    /// The plan dropped it within its link's loss budget.
+    Lost,
+    /// Nothing was bound at its destination when it arrived.
+    Unbound,
+}
+
+/// A transport event in plain fields, in [`Observation::Transport`]. Each
+/// mirrors the transport observer's event of the same name. Frame sequence
+/// numbers count from 0 per QUIC stream: reads in the order their headers
+/// arrived, writes in the order they started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum TransportFact {
+    /// The control handshake succeeded.
+    Negotiated {
+        /// The capability mask the node sent: its hello's, or, as the
+        /// responder, the mask it intersected with the peer's hello.
+        local: u64,
+        /// The capability mask the peer sent: its hello's, or its ack's.
+        offered: u64,
+        /// The capability mask the connection uses.
+        negotiated: u64,
+    },
+    /// The connection was refused before registration.
+    HandshakeRefused {
+        /// The handshake error, or the refusal's trace label.
+        reason: String,
+    },
+    /// The node's dial to the remote address failed, as the wire node's
+    /// call to `ZakuraEndpoint::dial` returned. No connection was
+    /// registered for it, so the address alone keys it.
+    DialFailed {
+        /// The returned error, as it displays.
+        error: String,
+    },
+    /// The supervisor registered the connection as `connection`.
+    Registered,
+    /// A service session's stream started.
+    Admitted {
+        /// The stream's QUIC stream ID.
+        quic_stream: u64,
+        /// The stream kind.
+        kind: u16,
+        /// The stream version.
+        version: u16,
+        /// The service session's ID.
+        session_id: u64,
+        /// The connection's limits after negotiation and clamping.
+        limits: TransportLimits,
+        /// Frames the reader may queue for the service.
+        inbound_depth: u64,
+        /// Frames the service may queue for the writer.
+        outbound_depth: u64,
+    },
+    /// The reader has a frame's 8 header bytes, before any check of them.
+    HeaderRead {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+        /// The header's message type.
+        message_type: u16,
+        /// The header's flags.
+        flags: u16,
+        /// The header's declared payload length.
+        payload_len: u32,
+    },
+    /// The reader has the frame's whole payload.
+    FrameRead {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+    },
+    /// A regulation table changed state, inside the lock that applied it.
+    Regulated {
+        /// The service session's QUIC stream.
+        quic_stream: u64,
+        /// What changed.
+        transition: TransitionFact,
+    },
+    /// An unknown, unnegotiated or unselected stream was reset without
+    /// closing the connection.
+    StreamRefused {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The prelude's stream kind.
+        kind: u16,
+        /// The prelude's stream version.
+        version: u16,
+        /// Why, as the stream trace names it.
+        reason: String,
+    },
+    /// The writer is about to hand a frame's first bytes to the stream.
+    FrameWriteStarted {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's writes.
+        seq: u64,
+        /// The frame's message type.
+        message_type: u16,
+    },
+    /// The writer finished writing a frame.
+    FrameWritten {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's writes.
+        seq: u64,
+        /// The frame's message type.
+        message_type: u16,
+    },
+    /// The node decided to close the connection: its first recorded close
+    /// cause, or `None` for a cancellation with no cause recorded first.
+    CloseDecided {
+        /// The first recorded cause, such as `unexpected_stream`.
+        cause: Option<String>,
+    },
+    /// The connection's workers drained and its peer was unregistered.
+    TornDown,
+}
+
+/// The credit one subscription update adds, in
+/// [`Observation::PeerReceived`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PeerCredit {
+    /// Objects, such as headers.
+    pub objects: u32,
+    /// Payload bytes.
+    pub bytes: u32,
+}
+
+/// A connection's limits after negotiation, in [`TransportFact::Admitted`],
+/// with durations in milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TransportLimits {
+    /// Maximum encoded frame bytes.
+    pub max_frame_bytes: u32,
+    /// Maximum reassembled message bytes.
+    pub max_message_bytes: u32,
+    /// Maximum concurrent streams.
+    pub max_open_streams: u16,
+    /// Bounded inbound queue depth.
+    pub max_inbound_queue_depth: u16,
+    /// Application idle timeout.
+    pub idle_timeout_ms: u64,
+    /// Stream prelude read timeout.
+    pub prelude_timeout_ms: u64,
+    /// Control handshake timeout.
+    pub control_timeout_ms: u64,
+    /// Per-connection stream-open rate.
+    pub stream_open_rate_per_second: u32,
+    /// Per-stream-kind message rate.
+    pub message_rate_per_second: u32,
+}
+
+/// A regulation table's state change, in [`TransportFact::Regulated`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "transition", rename_all = "kebab-case")]
+pub enum TransitionFact {
+    /// The subscriber's precheck judged the response header `seq`.
+    HeaderChecked {
+        /// The frame's position among the stream's reads.
+        seq: u64,
+        /// The verdict.
+        outcome: HeaderCheckFact,
+    },
+    /// The service claimed a page the reader had reserved.
+    PageClaimed {
+        /// The page's position among the stream's reads, if it was tagged.
+        seq: Option<u64>,
+        /// Objects the page spent.
+        objects: u32,
+        /// Payload bytes the page spent.
+        bytes: u64,
+    },
+    /// A subscription the node opened ended with its terminal outcome.
+    EndClaimed {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// A subscription the peer opened on the node ended.
+    PublicationEnded {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// The publisher applied the peer's `Open` and its initial credit.
+    OpenApplied {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the `Open` granted.
+        objects: u32,
+        /// Bytes the `Open` granted.
+        bytes: u32,
+        /// The `Open` frame's position among the stream's reads, if it was
+        /// tagged.
+        seq: Option<u64>,
+    },
+    /// The publisher applied the peer's `Close` to a live subscription.
+    CloseApplied {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// The publisher applied the peer's `Grant` to a live subscription.
+    GrantApplied {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the grant added.
+        objects: u32,
+        /// Bytes the grant added.
+        bytes: u32,
+    },
+    /// The node recorded its own `Open` before writing it.
+    OpenIssued {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the `Open` grants.
+        objects: u32,
+        /// Bytes the `Open` grants.
+        bytes: u32,
+    },
+    /// The node removed its own `Open`, whose frame was dropped before its
+    /// first byte was written.
+    OpenRetracted {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// The node recorded its own `Grant` before writing it.
+    GrantIssued {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the grant adds.
+        objects: u32,
+        /// Bytes the grant adds.
+        bytes: u32,
+    },
+}
+
+/// The subscriber precheck's verdict, in [`TransitionFact::HeaderChecked`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum HeaderCheckFact {
+    /// A page, charged to the queue until the service claims it.
+    Reserved {
+        /// Objects charged.
+        objects: u64,
+        /// Payload bytes charged.
+        bytes: u64,
+    },
+    /// A terminal outcome for a live subscription, which takes no charge.
+    AdmittedTerminal,
+    /// Refused, closing the connection.
+    Refused {
+        /// The rejection's label, such as `unsolicited`.
+        reason: String,
+    },
 }
 
 /// How a task ended.

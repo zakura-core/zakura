@@ -1,6 +1,10 @@
 //! The registry and its checker.
 
-use std::{collections::BTreeSet, fmt, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    rc::Rc,
+};
 
 use zakura_scheduler::{Op, SimInstant};
 
@@ -152,7 +156,7 @@ pub enum RegistryError {
         /// The shared ID.
         id: PropertyId,
     },
-    /// An `Ops` bound names an object, which needs zakura#1643.
+    /// An `Ops` bound names an object, which needs object creation labels.
     OpsObject {
         /// The property.
         id: PropertyId,
@@ -171,7 +175,7 @@ impl fmt::Display for RegistryError {
             RegistryError::DuplicateId { id } => write!(f, "two properties are both {id}"),
             RegistryError::OpsObject { id } => write!(
                 f,
-                "{id} has an Ops bound that names an object, which waits for zakura#1643"
+                "{id} has an Ops bound that names an object, which waits for object creation labels"
             ),
             RegistryError::OpsPoll { id } => {
                 write!(f, "{id} has an Ops bound on polls, which nothing observes")
@@ -292,6 +296,10 @@ struct PropertyState {
     ever_held: bool,
     /// The first reason the run can't finish the check.
     inconclusive: Option<Inconclusive>,
+    /// Why the latest evaluation couldn't judge its fired trigger, if so.
+    unsettled: Option<Inconclusive>,
+    /// Each quantity's largest value, as the check measured it.
+    peaks: BTreeMap<String, u64>,
 }
 
 /// An open obligation.
@@ -442,6 +450,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 outcome: outcome(property, state),
                 holds_since: state.holds_since.map(|(step, _)| step),
                 excluded: state.excluded.clone(),
+                peaks: state.peaks.clone(),
                 violations: state.violations.clone(),
             })
             .collect()
@@ -540,6 +549,11 @@ fn step_property<S: HasView>(
         Verdict::Violated(v) => violations.push(v),
     }
     violations.extend(parts.recorded);
+    state.unsettled = parts.unsettled;
+    for (quantity, value) in parts.peaks {
+        let peak = state.peaks.entry(quantity.to_owned()).or_default();
+        *peak = (*peak).max(value);
+    }
     events.extend(parts.labelled.into_iter().map(|frame| CheckEvent::Label {
         property: property.id.clone(),
         frame,
@@ -698,6 +712,7 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> Propert
         state
             .inconclusive
             .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
+            .or(state.unsettled)
     };
     match reason {
         Some(reason) => PropertyOutcome::Inconclusive {

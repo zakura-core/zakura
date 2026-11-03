@@ -1,0 +1,15 @@
+# The committed fuzz input `block-sync-paused-handoffs.bin`: the harness
+# that runs it, the generator version it was built for, and its SHA-256. Its
+# two bytes pick the paused-handoffs scenario: four mirrors serve sixteen
+# bodies of unknown size against a byte budget of `1.5·B`, on 4 workers,
+# and each routine pauses in its handoff from height 5. The plan is empty,
+# so every pick is round-robin.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "5b9f13720f7a45875e7095b41e43a15ec699bb298bc7b811495911d683a1b1f0"
+scenario_sha256 = "8abd7a09c01523ab203ddbe8afc41b79dc6ecda28a47194f288ad4b4e524a682"
+source = "crates/zakura-sim/tests/block_resource_properties.rs"
+
+[[witness]]
+property = "block-sync/reserved-byte-bound"
+expect = "holds"

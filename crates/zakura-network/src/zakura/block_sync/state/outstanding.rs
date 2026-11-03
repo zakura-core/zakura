@@ -13,7 +13,7 @@ use super::OutstandingBlockRange;
 
 /// Identity of one outstanding request. Keys increase in issue order.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(in crate::zakura::block_sync) struct RequestKey(u64);
+pub struct RequestKey(u64);
 
 impl RequestKey {
     const MIN: Self = Self(0);
@@ -21,26 +21,30 @@ impl RequestKey {
 }
 
 /// One outstanding request, as [`OutstandingRequests::ownership`] reads it.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::zakura::block_sync) struct RequestOwnership {
-    pub(in crate::zakura::block_sync) key: RequestKey,
-    pub(in crate::zakura::block_sync) owner: zakura_header_chain::BodyWorkOwner,
-    pub(in crate::zakura::block_sync) write:
-        crate::zakura::block_sync::work_queue::RequestWritePhase,
-    pub(in crate::zakura::block_sync) heights: Vec<RequestedHeight>,
+pub struct RequestOwnership {
+    /// The request's key in its routine.
+    pub key: RequestKey,
+    /// The request.
+    pub owner: zakura_header_chain::BodyWorkOwner,
+    /// Where the request's frame write stands.
+    pub write: crate::zakura::block_sync::work_queue::RequestWritePhase,
+    /// Each requested height, in order.
+    pub heights: Vec<RequestedHeight>,
 }
 
 /// One height of an outstanding request.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(in crate::zakura::block_sync) struct RequestedHeight {
-    pub(in crate::zakura::block_sync) height: block::Height,
+pub struct RequestedHeight {
+    /// The height.
+    pub height: block::Height,
     /// The size estimate the request reserved for this height at admission.
     /// A received body's wire bytes minus this is the hint's error.
-    pub(in crate::zakura::block_sync) estimated_bytes: u64,
+    pub estimated_bytes: u64,
     /// The body arrived, so the height no longer holds its estimate.
-    pub(in crate::zakura::block_sync) received: bool,
+    pub received: bool,
 }
 
 /// Outstanding requests in issue order with secondary indexes.
@@ -82,7 +86,7 @@ impl OutstandingRequests {
     /// Every outstanding request with its owner, write phase, and each
     /// height's admission estimate, read from the request map rather than
     /// from `reserved_bytes`.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::block_sync) fn ownership(&self) -> Vec<RequestOwnership> {
         self.requests
             .iter()

@@ -117,17 +117,24 @@ pub(crate) struct RunState {
 }
 
 impl RunState {
-    /// Records that `task` reached its next point of kind `op`.
+    /// Records that `task` reached its next point of kind `op`, on `object`
+    /// if the primitive reports one.
     pub(crate) fn advance_point(
         &mut self,
         task: TaskId,
         op: Op,
+        object: Option<ObjectId>,
         site: Option<&'static std::panic::Location<'static>>,
     ) -> At {
         let meta = &mut self.tasks[task.index()];
         let n = meta.point_counts.entry(op).or_insert(0);
         *n = n.saturating_add(1);
-        meta.at = At { op, n: *n, site };
+        meta.at = At {
+            op,
+            n: *n,
+            object,
+            site,
+        };
         meta.at
     }
 
@@ -169,6 +176,7 @@ impl RunState {
             at: At {
                 op: Op::Poll,
                 n: 1,
+                object: None,
                 site: None,
             },
             blocking: false,
@@ -602,7 +610,7 @@ impl Scheduler {
             Ok(CoroutineResult::Yield(Yield::Pending)) => {
                 self.state(|s| {
                     s.mid_poll.remove(&task);
-                    s.advance_point(task, Op::Poll, None);
+                    s.advance_point(task, Op::Poll, None, None);
                     // A wake during the poll, or an abort, makes it ready again.
                     if s.woken.remove(&task) || s.cancel_requested.contains(&task) {
                         s.ready.insert(task);

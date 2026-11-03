@@ -184,7 +184,7 @@ fn new_traced_test_connection<A>(
 
     let connection = Connection::new(
         mock_inbound_service.clone(),
-        client_rx,
+        test_connection_channels(client_rx),
         shared_error_slot.clone(),
         peer_tx,
         ActiveConnectionCounter::new_counter().track_connection(),
@@ -201,6 +201,26 @@ fn new_traced_test_connection<A>(
         peer_rx,
         shared_error_slot,
     )
+}
+
+/// Returns the request channel and authorization for a test connection.
+///
+/// The block advert channel is closed, which disables it; tests that send adverts replace
+/// `block_advert_rx`.
+fn test_connection_channels(
+    client_rx: mpsc::Receiver<ClientRequest>,
+) -> super::ConnectionRequests<zakura_chain::chain_tip::NoChainTip> {
+    let (_block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    super::ConnectionRequests {
+        client_rx,
+        block_advert_rx,
+        minimum_peer_version: crate::peer::MinimumPeerVersion::new(
+            zakura_chain::chain_tip::NoChainTip,
+            &zakura_chain::parameters::Network::Mainnet,
+        ),
+        bans: crate::BannedIps::default(),
+    }
 }
 
 /// Creates a connection whose peer writer never finishes closing.
@@ -240,7 +260,7 @@ fn new_never_closing_test_connection<A>(
 
     let connection = Connection::new(
         mock_inbound_service,
-        client_rx,
+        test_connection_channels(client_rx),
         shared_error_slot.clone(),
         NeverClosingSink,
         connection_tracker,

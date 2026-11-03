@@ -13,9 +13,7 @@ use std::{
     sync::{LockResult, PoisonError, TryLockError, TryLockResult},
 };
 
-use crate::sim::{
-    executor, executor_for, point, preempt, run_id, ObjectId, Op, Point, RunId, TaskId,
-};
+use crate::sim::{executor, executor_for, preempt, run_id, ObjectId, Op, Point, RunId, TaskId};
 
 /// A std-style mutex that parks contended tasks on the scheduler.
 pub struct Mutex<T: ?Sized> {
@@ -252,7 +250,14 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
         if let Some((run, object)) = object {
             if let Some(executor) = executor_for(run) {
                 executor.unpark_all(object);
-                point(Op::Release, self.site);
+                preempt(
+                    executor,
+                    Point {
+                        op: Op::Release,
+                        object: Some(object),
+                        site: self.site,
+                    },
+                );
             }
         }
     }

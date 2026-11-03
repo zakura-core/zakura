@@ -15,7 +15,11 @@ use tokio::{
     task::JoinHandle,
 };
 use tower::{
-    buffer::Buffer, builder::ServiceBuilder, load_shed::LoadShed, util::BoxService, ServiceExt,
+    buffer::Buffer,
+    builder::ServiceBuilder,
+    load_shed::LoadShed,
+    util::{BoxCloneSyncService, BoxService},
+    ServiceExt,
 };
 use tracing::instrument::WithSubscriber;
 
@@ -916,10 +920,7 @@ async fn setup(
         >,
     >,
     // outbound peer set (only has the connected peer)
-    Buffer<
-        zakura_network::Request,
-        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
-    >,
+    BoxCloneSyncService<zakura_network::Request, zakura_network::Response, BoxError>,
     Buffer<
         mempool::Request,
         futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,

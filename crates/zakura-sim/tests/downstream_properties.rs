@@ -84,6 +84,7 @@ fn frame(
     Observation::PeerFrame {
         connection: 1,
         stream: id(stream),
+        quic_stream: None,
         seq,
         row: Some(row.to_owned()),
         rule_stream: id(stream),
@@ -99,6 +100,7 @@ fn judged(stream: Stream, seq: u64) -> Observation {
     Observation::FrameJudged {
         connection: 1,
         stream: id(stream),
+        quic_stream: None,
         seq,
     }
 }

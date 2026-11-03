@@ -195,7 +195,7 @@ impl BuildInfo {
     }
 
     /// True if the build's provenance is known and its tree was clean.
-    fn clean(&self) -> bool {
+    pub(crate) fn clean(&self) -> bool {
         !self.dirty
             && [&self.git, &self.source, &self.lockfile, &self.rustc]
                 .iter()

@@ -202,6 +202,20 @@ impl ServiceStream {
     }
 }
 
+/// Reads the first cause recorded for a connection's close, such as
+/// `service_protocol_reject`.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug)]
+pub struct CloseCauseReader(CloseCause);
+
+#[cfg(any(test, zakura_sim))]
+impl CloseCauseReader {
+    /// The first recorded cause, or `None` while no path recorded one.
+    pub fn get(&self) -> Option<&'static str> {
+        self.0.get()
+    }
+}
+
 /// Per-peer transport state handed to a service when a peer connects.
 #[derive(Debug)]
 pub struct Peer {
@@ -461,6 +475,22 @@ impl Peer {
     /// Return the shared first-cause connection close recorder.
     pub(crate) fn close_cause(&self) -> CloseCause {
         self.close_cause.clone()
+    }
+
+    /// Makes `reader` the reader of this peer's stream: a frame it refuses
+    /// records its close cause on this connection and closes it.
+    #[cfg(any(test, zakura_sim))]
+    pub fn read_through(&self, reader: &super::StreamReader) {
+        reader.bind(self.close_cause.clone(), self.cancel_token.clone());
+    }
+
+    /// Return a reader for the cause of this peer's connection close.
+    ///
+    /// A service takes the peer by value, so the simulator keeps this reader
+    /// from before [`Service::add_peer`] to see why the connection closed.
+    #[cfg(any(test, zakura_sim))]
+    pub fn close_cause_reader(&self) -> CloseCauseReader {
+        CloseCauseReader(self.close_cause.clone())
     }
 
     /// Split this peer into fields so the registry can fan streams out by owner.

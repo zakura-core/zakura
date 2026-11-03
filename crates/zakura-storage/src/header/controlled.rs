@@ -241,7 +241,7 @@ impl std::error::Error for CompleteError {}
 /// The module doc describes the lifecycle.
 #[derive(Debug)]
 pub struct ControlledPort {
-    engine: EnginePort,
+    engine: Arc<EnginePort>,
     /// The run's own bookkeeping, so a std lock: it adds no scheduling points
     /// production lacks, and the run locks it from outside any task. So it's
     /// never held across a scheduling point, or a task suspended there would
@@ -382,10 +382,21 @@ impl Ops {
 impl ControlledPort {
     /// A port over a new [`EnginePort`] that holds only `fixture`'s anchor.
     pub fn new(fixture: &HeaderFixture) -> Self {
+        Self::over(Arc::new(EnginePort::new(fixture)))
+    }
+
+    /// A port over `engine`, which a block service may share, as zakurad's
+    /// header and block sides share one state service.
+    pub fn over(engine: Arc<EnginePort>) -> Self {
         ControlledPort {
-            engine: EnginePort::new(fixture),
+            engine,
             ops: Mutex::default(),
         }
+    }
+
+    /// The shared engine port, for a block service over the same state.
+    pub fn shared_engine(&self) -> Arc<EnginePort> {
+        self.engine.clone()
     }
 
     /// The engine port underneath. Its own `Port` methods run at once, which

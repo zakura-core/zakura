@@ -21,7 +21,6 @@ use super::{ConnectionState, ConnectionTrace};
 use crate::{
     peer::tcp_progress::{TcpInfo, UploadOutcome, UploadReport},
     protocol::external::{InventoryHash, Message, Nonce},
-    PeerError,
 };
 
 /// The most block hashes one `p2p` row lists.
@@ -188,7 +187,7 @@ impl ConnectionTrace {
     pub(crate) fn p2p_send_done(
         &self,
         send: Option<SendTrace>,
-        result: &Result<(), PeerError>,
+        result: &Result<(), impl fmt::Display>,
         tcp: Option<&TcpInfo>,
     ) {
         let (Some(state), Some(send)) = (self.p2p(), send) else {

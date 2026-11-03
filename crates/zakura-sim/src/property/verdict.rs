@@ -98,9 +98,9 @@ pub enum LivenessBound {
         /// The operation counted. Not `Op::Poll`: a poll boundary logs
         /// `TaskWaiting`, never a point, so a registry rejects it.
         op: Op,
-        /// The runtime object's creation label. Matching on it waits for the
-        /// scheduler to keep `Point.object` in its observations
-        /// (zakura#1643), so a registry rejects `Some` today.
+        /// The runtime object's creation label. Observations name an object
+        /// only by its creator and ordinal, and only a `Mutex` reports one,
+        /// so a registry rejects `Some` today.
         object: Option<&'static str>,
         /// The most points allowed.
         max: u32,
@@ -121,6 +121,8 @@ pub enum Inconclusive {
     /// The run ended at a harness failure, so its evidence may be
     /// incomplete.
     HarnessFailed,
+    /// Every peer left, but the run ended before teardown settled.
+    TeardownOpen,
 }
 
 impl fmt::Display for Inconclusive {
@@ -131,6 +133,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::AssumptionLost => "assumption-lost",
             Inconclusive::ObligationOpen => "obligation-open",
             Inconclusive::HarnessFailed => "harness-failed",
+            Inconclusive::TeardownOpen => "teardown-open",
         })
     }
 }

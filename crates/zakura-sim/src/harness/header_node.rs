@@ -47,12 +47,13 @@ use self::{
     tap::ReactorTap,
 };
 use crate::{
-    storage::HeaderStorage, ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    storage::{HeaderStorage, HEADER_SERVICE},
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
 /// Frames each direction of a link buffers, enough for a page and control
 /// frames in flight.
-const LINK_DEPTH: usize = 8;
+pub(crate) const LINK_DEPTH: usize = 8;
 
 /// A chain an actor holds before its run: `main` headers on branch 0 from
 /// genesis, then `fork`, if any, from that tip.
@@ -206,12 +207,6 @@ pub struct Effects {
     pub failure: Rc<RefCell<Option<String>>>,
 }
 
-/// `t` plus `d`, saturating at the largest instant.
-fn after(t: SimInstant, d: Duration) -> SimInstant {
-    t.checked_add(d)
-        .unwrap_or(SimInstant::from_start(Duration::MAX))
-}
-
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
 /// pure. With a [`ReactorTap`], it logs the node's reactor events after its
@@ -300,10 +295,13 @@ impl ActionSource for PolicySource {
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
             Some(tap) => {
-                // The storage source appends only its own port's facts.
+                // The storage source appends only its own port's facts, but
+                // a run may hold other services' storage too.
                 tap.storage_facts(log.entries()[before..].iter().filter_map(
                     |entry| match &entry.obs {
-                        Observation::Storage { seq, fact, .. } => Some((*seq, fact)),
+                        Observation::Storage {
+                            service, seq, fact, ..
+                        } if service == HEADER_SERVICE => Some((*seq, fact)),
                         _ => None,
                     },
                 ));
@@ -317,7 +315,9 @@ impl ActionSource for PolicySource {
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
-                Observation::Storage { fact, .. } => predicates.record(fact),
+                Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
+                    predicates.record(fact)
+                }
                 Observation::Reactor { event, .. } => predicates.record_reactor(event),
                 _ => {}
             }
@@ -379,6 +379,22 @@ pub struct HeaderNode {
     /// The VCT repair state the reactor follows. `Idle` unless a scenario
     /// sets it.
     pub vct_repairs: watch::Sender<VctRootRepairStatus>,
+    /// What the reactor was started with.
+    pub startup: StartupFacts,
+}
+
+/// The settings a [`HeaderNode`]'s reactor was started with, read from the
+/// startup it was handed, so a test can check them against production's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupFacts {
+    /// The header-sync config.
+    pub config: ZakuraHeaderSyncConfig,
+    /// The reactor's request deadline.
+    pub request_timeout: Duration,
+    /// How often the reactor refreshes its `Status`.
+    pub status_refresh_interval: Duration,
+    /// The largest frame the reactor writes.
+    pub max_frame_bytes: u32,
 }
 
 impl HeaderNode {
@@ -417,6 +433,12 @@ impl HeaderNode {
         startup.vct_root_repairs = Some(repairs);
         startup.header_chain_port = port.clone();
         startup.observer.0 = observer;
+        let facts = StartupFacts {
+            config: startup.config.clone(),
+            request_timeout: startup.request_timeout,
+            status_refresh_interval: startup.status_refresh_interval,
+            max_frame_bytes: startup.max_frame_bytes,
+        };
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
         guard_dispatch(sim, actions, dispatch);
@@ -431,6 +453,7 @@ impl HeaderNode {
             handle,
             port,
             vct_repairs,
+            startup: facts,
         }
     }
 }
@@ -495,52 +518,51 @@ impl Topology {
     /// Extends the selected chain of the node named `peer` by `len` fixture
     /// headers from its tip, through its own port, as if it had mined them.
     /// It records the growth only once the mirror's published tip is the
-    /// new one. Anything else, such as a resource stall that leaves the
-    /// target unadmitted, is recorded as a failure instead. The node must
-    /// be a mirror, on an engine port, that isn't applying anything else.
+    /// new one. The mirror's own sync may move its tip while the growth
+    /// waits at a scheduling point, which leaves the growth stale. Then it
+    /// grows the new tip instead. Anything else, such as a resource stall
+    /// that leaves the target unadmitted while the tip stays put, is
+    /// recorded as a failure. The node must be a mirror, on an engine port.
     async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32) {
         let node = self
             .nodes
             .iter()
             .find(|node| node.name == peer)
             .unwrap_or_else(|| panic!("the scenario has a `{peer}`"));
-        let published = || {
-            node.port
-                .selected_chain()
-                .borrow()
-                .as_ref()
-                .map(|snapshot| snapshot.frontiers.header_best)
-        };
-        let snapshot = node
-            .port
-            .selected_chain()
-            .borrow()
-            .clone()
-            .expect("an engine port publishes its snapshot from the start");
-        let tip = snapshot.frontiers.header_best;
-        let headers = fixture.extend(tip, len, 0);
-        let target = Frontier::new(
-            block::Height(
-                tip.height
-                    .0
-                    .checked_add(len)
-                    .expect("fixture heights stay small"),
-            ),
-            headers.last().expect("a growth has headers").hash(),
-        );
-        let request = fixture.target_request(&snapshot, tip, &headers, 1);
-        let applied = match node.port.prepare_header_target(request).await {
-            Ok(prepared) => node.port.apply_header_target(prepared).await,
-            Err(error) => Err(error),
-        };
-        match (applied, published()) {
-            (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
-                self.effects.grown.borrow_mut().push(peer.to_owned());
-            }
-            (applied, now) => {
-                *self.effects.failure.borrow_mut() = Some(format!(
-                    "growing {peer} to {target:?} gave {applied:?}, with its tip at {now:?}"
-                ));
+        let published = || node.port.selected_chain().borrow().clone();
+        loop {
+            let snapshot =
+                published().expect("an engine port publishes its snapshot until shutdown");
+            let tip = snapshot.frontiers.header_best;
+            let headers = fixture.extend(tip, len, 0);
+            let target = Frontier::new(
+                block::Height(
+                    tip.height
+                        .0
+                        .checked_add(len)
+                        .expect("fixture heights stay small"),
+                ),
+                headers.last().expect("a growth has headers").hash(),
+            );
+            let request = fixture.target_request(&snapshot, tip, &headers, 1);
+            let applied = match node.port.prepare_header_target(request).await {
+                Ok(prepared) => node.port.apply_header_target(prepared).await,
+                Err(error) => Err(error),
+            };
+            let now = published().map(|snapshot| snapshot.frontiers.header_best);
+            match (applied, now) {
+                (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
+                    self.effects.grown.borrow_mut().push(peer.to_owned());
+                    return;
+                }
+                // The mirror moved its tip during the growth.
+                (_, Some(now)) if now != tip => continue,
+                (applied, now) => {
+                    *self.effects.failure.borrow_mut() = Some(format!(
+                        "growing {peer} to {target:?} gave {applied:?}, with its tip at {now:?}"
+                    ));
+                    return;
+                }
             }
         }
     }

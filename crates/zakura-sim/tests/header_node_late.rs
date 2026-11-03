@@ -636,6 +636,7 @@ fn kind_of(request: &StorageRequest) -> (OpKind, Option<u64>) {
         }
         StorageRequest::ApplyHeaderTarget { owner, .. } => (OpKind::Apply, Some(owner.session_id)),
         StorageRequest::SelectedChainContains { .. } => (OpKind::Membership, None),
+        request => panic!("a header node logs no block request: {request:?}"),
     }
 }
 

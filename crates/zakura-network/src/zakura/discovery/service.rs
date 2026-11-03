@@ -18,10 +18,11 @@ use zakura_rt::{
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
-    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, Peer, PeerStreamSession,
-    Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SessionDemand, SessionOpening,
-    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZakuraTrace,
-    DEFAULT_ZAKURA_MAX_CONNECTIONS, FRAME_HEADER_BYTES, ZAKURA_CAP_DISCOVERY,
+    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, LocalRole, Peer,
+    PeerStreamSession, Pipe, ReactorBudget, Service, ServiceAdmissionDecision,
+    ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
+    ZakuraConnId, ZakuraPeerId, ZakuraTrace, DEFAULT_ZAKURA_MAX_CONNECTIONS, FRAME_HEADER_BYTES,
+    ZAKURA_CAP_DISCOVERY,
 };
 use crate::BoxError;
 
@@ -32,7 +33,7 @@ use super::protocol::{
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use super::requester::{reservation_pool, ClaimedAnswer, Queries};
-use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity};
+use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity, OUTPUT_BYTES};
 use super::state::DiscoverySessionKey;
 use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, ViolationStage};
 use super::wire::{PEERS_MAX_BYTES, RULES};
@@ -49,6 +50,26 @@ const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
 }];
 
 const _: () = Stream::validate_layout(&DISCOVERY_SERVICE_STREAMS);
+
+/// Discovery's share of one connection's memory.
+///
+/// Each session both serves and asks, so the receive share is
+/// [`Stream::receive_bound`] of the discovery layout for [`LocalRole::Both`]:
+/// the peer's `Hello` cadence, one request of each row from the peer, and one
+/// answer to each of this node's requests. The output share is two of the
+/// largest answers on each request row, the per-peer serve output that the
+/// serving limits set.
+pub const DISCOVERY_BUDGET: ReactorBudget = {
+    let receive = match Stream::receive_bound(&DISCOVERY_SERVICE_STREAMS, LocalRole::Both) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("{}", error.rule()),
+    };
+    ReactorBudget {
+        receive,
+        output: OUTPUT_BYTES,
+    }
+    .assert_frame_cap(DISCOVERY_SERVICE_STREAMS[0].frame_cap)
+};
 
 /// Service-declared streams for native discovery.
 pub(crate) fn discovery_streams() -> &'static [Stream] {
@@ -905,6 +926,27 @@ mod tests {
     };
     use crate::zakura::{wire_codec::decode_frame, Frame};
     use zakura_chain::{block, parameters::Network};
+
+    /// The discovery budget holds each row's term exactly.
+    ///
+    /// Receive: 42 `Hello`s of 648 bytes (the bucket for a 15-second sender),
+    /// one `GetPeers` of 8,470 bytes and one `GetServices` of 1,090 bytes
+    /// from the peer, and one `Peers` of 20,738 bytes and one `Services` of
+    /// 2,394 bytes answering this node. Output: two of each largest answer,
+    /// frame headers included.
+    #[test]
+    fn the_discovery_budget_holds_each_row() {
+        let receive = 42 * 648 + 8_470 + 1_090 + 20_738 + 2_394;
+        let output = 2 * (20_738 + 8) + 2 * (2_394 + 8);
+        assert_eq!(
+            DISCOVERY_BUDGET,
+            ReactorBudget {
+                receive: 59_908,
+                output: 46_296,
+            }
+        );
+        assert_eq!((receive, output), (59_908, 46_296));
+    }
 
     #[test]
     fn connection_ownership_is_scoped_to_the_exact_connection() {

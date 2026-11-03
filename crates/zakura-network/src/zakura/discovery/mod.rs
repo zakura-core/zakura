@@ -46,7 +46,7 @@ pub use redial::{replay_redial_bytes, RedialReplaySummary};
 pub(crate) use runtime::{
     build_discovery_handle, default_advertised_services, effective_discovery_connection_headroom,
 };
-pub use service::{DiscoveryPeerSession, DiscoveryService};
+pub use service::{DiscoveryPeerSession, DiscoveryService, DISCOVERY_BUDGET};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use requester::{

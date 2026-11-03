@@ -11,7 +11,7 @@ independently.
 
 ## [Unreleased]
 
-## [1.8.0-rc0] - 2026-11-01
+## [1.8.0] - 2026-11-02
 
 ### Added
 
@@ -82,6 +82,47 @@ independently.
 - Release binaries and Docker images no longer force the `portable` feature.
   They still use portable Pasta arithmetic and run on any x86-64 CPU
   ([#1869](https://github.com/zakura-core/zakura/pull/1869)).
+- Enable BMI2/ADX Pasta assembly in default node and release builds, without
+  global CPU compiler flags or per-operation runtime CPU detection. Default
+  x86-64 binaries now require both CPU extensions and check compatibility at
+  startup, including in the standalone rollback utility. Build with
+  `--features portable` for older x86-64 CPUs
+  ([#1893](https://github.com/zakura-core/zakura/pull/1893)).
+- Committing a block no longer opens INFO tracing spans for each transaction, which made
+  large blocks slower to accept. At INFO, logs from inside block commits lose the
+  per-transaction span names, hashes and indexes; TRACE keeps them
+  ([#1894](https://github.com/zakura-core/zakura/pull/1894)).
+- Sapling value commitments are now held as bytes through librustzcash
+  conversion, following Common's sapling-crypto change; the set of accepted
+  `cv` encodings is unchanged, and an invalid one is still rejected by the
+  semantic verifier before any proof work
+  ([#1907](https://github.com/zakura-core/zakura/pull/1907)).
+- Reduced parent-input check latency for blocks with large batches of transparent inputs by overlapping reads ([#1908](https://github.com/zakura-core/zakura/pull/1908)).
+- Verifying a block the node has not seen before is faster for blocks with many
+  transactions: about a third faster for a 1.9 MB transparent block
+  ([#1909](https://github.com/zakura-core/zakura/pull/1909)).
+- `getblocktemplate` now reports `-10` (not synced) only when the local chain
+  tip's block time is more than 6 hours old. The threshold is now a fixed
+  duration rather than a block count, so it no longer shrinks when block
+  spacing changes ([#1911](https://github.com/zakura-core/zakura/pull/1911)).
+- Require a minimum claimed proof-of-work difficulty for recent Mainnet block
+  downloads as a defense-in-depth admission policy
+  ([#1915](https://github.com/zakura-core/zakura/pull/1915)).
+- Block verification no longer recomputes each transaction's ID when preparing its signature hashes
+  ([#1920](https://github.com/zakura-core/zakura/pull/1920)).
+- Network upgrade and consensus branch ID lookups no longer rebuild their maps on each call
+  ([#1921](https://github.com/zakura-core/zakura/pull/1921)).
+- Orchard proof batches are prepared on blocking threads instead of the async worker that admits them
+  ([#1924](https://github.com/zakura-core/zakura/pull/1924)).
+- Improved Sapling verification throughput and async responsiveness by preparing
+  batches on CPU workers
+  ([#1934](https://github.com/zakura-core/zakura/pull/1934)).
+- Updated Common cryptography libraries to `5.0.0-rc.4` for faster Groth16
+  proof and RedDSA signature batch verification
+  ([#1939](https://github.com/zakura-core/zakura/pull/1939)).
+- Updated Common cryptographic libraries to the final 5.0.0 release, including
+  faster Sapling bundle proof parsing and proof verification
+  ([#1941](https://github.com/zakura-core/zakura/pull/1941)).
 
 ### Fixed
 
@@ -135,6 +176,35 @@ independently.
   the same connection is now downloaded right away, instead of after the
   syncer's whole discovery round, which could take up to 6 seconds
   ([#1881](https://github.com/zakura-core/zakura/pull/1881)).
+- A gossiped block that arrives before its parent now immediately requests the
+  missing parent, or waits on the parent's existing download, instead of waiting
+  for another peer or the next sync round. The request goes to a peer that
+  advertised the parent, or otherwise to the peer that sent the block. The block
+  must have valid proof of work to start a request
+  ([#1873](https://github.com/zakura-core/zakura/pull/1873)).
+- A newly mined or received block is announced to peers right away, instead of
+  waiting up to several seconds for an earlier block's announcements to
+  finish ([#1874](https://github.com/zakura-core/zakura/pull/1874)).
+- Smoothed short-term variation in sync progress reporting
+  ([#1913](https://github.com/zakura-core/zakura/pull/1913)).
+- Keep legacy block announcement peers current while the node is idle, and retry
+  announcements against fresh peers when selected connections lose authorization
+  ([#1883](https://github.com/zakura-core/zakura/pull/1883)).
+- Block verification now reports a block commitment failure, rather than an
+  unrelated consensus rule, when an NU5 or later block's body doesn't match its
+  header ([#1914](https://github.com/zakura-core/zakura/pull/1914)).
+- Exempt historical Mainnet downloads from the work floor only while the committed
+  tip is below the fixed height 3,535,411 and the downloaded block claims a height
+  at or below it, independently of checkpoint-sync settings. Preserve historical
+  full-verification sync, prevent old height claims from bypassing the active floor,
+  and reject policy failures before changing sync throttling
+  ([#1928](https://github.com/zakura-core/zakura/pull/1928)).
+- Corrected Mainnet end of support for the November 3, 2026 release to target
+  December 5, 2026. The last supported height is 3,643,309; the next block
+  projects to December 5 at 00:00:20 UTC from current Mainnet progress, with
+  upgrade warnings starting three days earlier. Enforcement follows block
+  height, so the actual halt time is approximate
+  ([#1938](https://github.com/zakura-core/zakura/pull/1938)).
 
 ### Security
 

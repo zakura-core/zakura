@@ -626,12 +626,12 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
 
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     recent_syncs.push_extend_tips_length(
-        zakura_sync_status_length(Some(Height(100)), Some(Height(201)))
+        zakura_sync_status_length(Some(Height(100)), Some(Height(401)))
             .expect("known Zakura tips produce a sync status length"),
     );
     assert!(
         !sync_status.is_close_to_tip(),
-        "a Zakura body/header gap over 100 blocks should keep the existing close-to-tip gate disabled"
+        "a Zakura body/header gap over 300 blocks should keep the existing close-to-tip gate disabled"
     );
 }
 

@@ -31,7 +31,12 @@ use std::{
 
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    timeout::Timeout,
+    util::{BoxCloneService, BoxCloneSyncService},
+    Service, ServiceExt,
+};
 
 use zakura_chain::{
     block::{self, Height},
@@ -120,8 +125,7 @@ fn transaction_error_peer_log_label(
     }
 }
 
-type Outbound =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type Outbound = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;
@@ -135,7 +139,6 @@ type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, Re
 /// mempool and its crawler activate, and at which the mempool starts peer
 /// transaction cooldowns.
 ///
-/// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
 /// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
 /// the gap between the two thresholds keeps the mempool from flapping.
 const MAX_ESTIMATED_DISTANCE_TO_ENABLE: block::HeightDiff = 100;

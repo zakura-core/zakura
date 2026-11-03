@@ -127,6 +127,73 @@ fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
 }
 
 #[test]
+fn skipped_transparent_address_index_stays_empty_through_commit_and_revert() {
+    for skip in [false, true] {
+        let mut chain = Chain::new(
+            &Network::Mainnet,
+            Height(0),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            ValueBalance::<NonNegative>::zero(),
+        )
+        .skipping_transparent_address_index(skip);
+
+        // A pay-to-public-key-hash output, so it has an address to index.
+        let mut lock_script = vec![0x76, 0xa9, 0x14];
+        lock_script.extend([4; 20]);
+        lock_script.extend([0x88, 0xac]);
+        let output = transparent::Output::new(
+            zakura_chain::amount::Amount::try_from(1_000).expect("the amount is in range"),
+            transparent::Script::new(&lock_script),
+        );
+        assert!(output.address(&Network::Mainnet).is_some());
+
+        let creating_tx = transaction::Hash([5; 32]);
+        let outpoint = transparent::OutPoint {
+            hash: creating_tx,
+            index: 0,
+        };
+        let outputs = vec![output.clone()];
+        let created = HashMap::from([(
+            outpoint,
+            transparent::OrderedUtxo::new(output, Height(1), 1),
+        )]);
+
+        let spending_tx = transaction::Hash([6; 32]);
+        let inputs = vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: 0,
+        }];
+
+        chain
+            .update_chain_tip_with(&(&outputs, &creating_tx, &created))
+            .expect("a new output is accepted");
+        chain
+            .update_chain_tip_with(&(&inputs, &spending_tx, &created))
+            .expect("spending the new output is accepted");
+
+        // The chain's own UTXO set is maintained either way; only the address index is skipped.
+        assert!(chain.created_utxos.contains_key(&outpoint));
+        assert!(chain.spent_utxos.contains_key(&outpoint));
+        assert_eq!(
+            chain.partial_transparent_transfers.len(),
+            usize::from(!skip)
+        );
+
+        chain.revert_chain_with(&(&inputs, &spending_tx, &created), RevertPosition::Tip);
+        chain.revert_chain_with(&(&outputs, &creating_tx, &created), RevertPosition::Tip);
+
+        assert!(!chain.created_utxos.contains_key(&outpoint));
+        assert!(!chain.spent_utxos.contains_key(&outpoint));
+        assert_eq!(chain.partial_transparent_transfers.len(), 0);
+    }
+}
+
+#[test]
 #[ignore = "release-mode clone benchmark"]
 #[allow(clippy::print_stdout)]
 fn compare_address_index_clone() {

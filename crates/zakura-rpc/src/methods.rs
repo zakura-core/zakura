@@ -1803,6 +1803,9 @@ where
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
         };
+        // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
+        // runs only after the reservation rejects duplicate and over-capacity submissions.
+        let size = block.zcash_serialized_size();
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone(),
@@ -1838,6 +1841,7 @@ where
                             let event = MinedBlockEvent::Early {
                                 hash: block_hash,
                                 height,
+                                size,
                                 submitted_at,
                                 submission,
                                 pending: registration.signal(),
@@ -1866,6 +1870,7 @@ where
                     .send(MinedBlockEvent::Committed {
                         hash: block_hash,
                         height,
+                        size,
                     })
                     .is_err()
                 {

@@ -6,7 +6,12 @@ use std::{collections::HashSet, iter, net::SocketAddr, str::FromStr, sync::Arc, 
 
 use futures::FutureExt;
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    builder::ServiceBuilder,
+    util::{BoxCloneSyncService, BoxService},
+    Service, ServiceExt,
+};
 use tracing::{Instrument, Span};
 
 use zakura_chain::{
@@ -14,7 +19,7 @@ use zakura_chain::{
     block::{Block, Height},
     fmt::humantime_seconds,
     parameters::Network::{self, *},
-    serialization::{DateTime32, ZcashDeserializeInto},
+    serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{UnminedTx, UnminedTxId, VerifiedUnminedTx},
 };
 use zakura_consensus::{error::TransactionError, transaction, Config as ConsensusConfig};
@@ -60,6 +65,11 @@ async fn wait_for_gossip() {
     // Let background gossip tasks run, then wait out the transaction gossip delay.
     tokio::task::yield_now().await;
     tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
+}
+
+/// The committed-tip advertisement of `block`, with the size the state reads.
+fn advertised(block: &Block) -> zakura_network::AdvertisedBlock {
+    zakura_network::AdvertisedBlock::new(block.hash(), block.zcash_serialized_size())
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -715,7 +725,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     wait_for_gossip().await;
     let possible_requests = &mut [
         Request::AdvertiseTransactionIds(hs, None),
-        Request::AdvertiseBlock(block_two.hash(), None),
+        Request::AdvertiseBlock(advertised(&block_two), None),
     ]
     .to_vec();
 
@@ -774,7 +784,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 
     // Test the block is gossiped
     peer_set
-        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
+        .expect_request(Request::AdvertiseBlock(advertised(&block_three), None))
         .await
         .respond(Response::Nil);
 
@@ -883,7 +893,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 
         // Test the block is gossiped
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(advertised(&block), None))
             .await
             .respond(Response::Nil);
 
@@ -962,7 +972,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     let _request = inbound_service
         .clone()
         .oneshot(Request::AdvertiseBlock(
-            block_hash,
+            block_hash.into(),
             Some(zakura_network::PeerSource::LegacySocket(advertiser_addr)),
         ))
         .await?;
@@ -1064,7 +1074,10 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
 
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(child_hash, Some(source.clone())))
+        .oneshot(Request::AdvertiseBlock(
+            child_hash.into(),
+            Some(source.clone()),
+        ))
         .await?;
 
     peer_set
@@ -1138,7 +1151,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash, None))
+        .oneshot(Request::AdvertiseBlock(block_hash.into(), None))
         .await?;
 
     // Block is fetched, and committed to the state
@@ -1174,7 +1187,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash, None))
+        .oneshot(Request::AdvertiseBlock(block_hash.into(), None))
         .await?;
 
     // Block is fetched, but the downloader drops it because it is too high
@@ -1267,8 +1280,9 @@ async fn caches_getaddr_response() {
 
         let peer_set = MockService::build()
             .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
-            .for_unit_tests();
-        let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+            .for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>();
+        let buffered_peer_set =
+            BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
         let buffered_mempool_service =
             Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 10);
@@ -1448,10 +1462,10 @@ async fn refused_block_reads_send_notfound() {
             DEFAULT_MAX_CONNS_PER_IP,
             Span::none(),
         ))),
-        block_download_peer_set: Buffer::new(
-            BoxService::new(MockService::build().for_unit_tests()),
+        block_download_peer_set: BoxCloneSyncService::new(Buffer::new(
+            BoxService::new(MockService::build().for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>()),
             1,
-        ),
+        )),
         block_verifier,
         mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
         state,
@@ -1597,7 +1611,8 @@ async fn setup_with_misbehavior_receiver(
     let mut peer_set = MockService::build()
         .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
         .for_unit_tests();
-    let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+    let buffered_peer_set =
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
     let mock_tx_verifier = MockService::build().for_unit_tests();
     let buffered_tx_verifier = Buffer::new(BoxService::new(mock_tx_verifier.clone()), 10);
@@ -1660,7 +1675,7 @@ async fn setup_with_misbehavior_receiver(
         false,
         buffered_peer_set.clone(),
         state_service.clone(),
-        tower::util::BoxCloneService::new(read_only_state_service),
+        tower::util::BoxCloneService::new(read_only_state_service.clone()),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1678,6 +1693,7 @@ async fn setup_with_misbehavior_receiver(
             sync_status.clone(),
             chain_tip_change.clone(),
             peer_set.clone(),
+            read_only_state_service,
             Some(submitblock_channel.receiver()),
         )
         .in_current_span(),
@@ -1689,7 +1705,7 @@ async fn setup_with_misbehavior_receiver(
     // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
     for block in committed_blocks.iter().skip(1) {
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(advertised(block), None))
             .await
             .respond(Response::Nil);
     }

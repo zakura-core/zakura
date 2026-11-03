@@ -1880,6 +1880,7 @@ where
             );
 
             let block_uploads = server.block_uploads.clone();
+            let request_slot = server.request_slot.clone();
             let client_peer_registry_updater = peer_registry_updater.clone();
 
             let connection_task = tokio::spawn(
@@ -1905,6 +1906,7 @@ where
 
             let client = Client {
                 block_uploads,
+                request_slot,
                 peer_registry_updater: client_peer_registry_updater,
                 connection_info,
                 shutdown_tx: Some(shutdown_tx),

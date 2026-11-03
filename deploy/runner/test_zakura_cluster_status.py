@@ -473,6 +473,22 @@ zcash_net_in_bytes_total 12345
         )
         self.assertNotIn("peer_user_agents", probe)
 
+    def test_difficulty_target_is_bound_to_the_accepted_tip_header(self):
+        tip = "a" * 64
+        self.rpc_results["getblockchaininfo"] = {"blocks": 3_538_452, "bestblockhash": tip, "chain": "main"}
+        header = {"hash": tip, "height": 3_538_452, "bits": "1b6aac57"}
+        for mismatch in (None, "hash", "height"):
+            with self.subTest(mismatch=mismatch):
+                candidate = dict(header)
+                if mismatch:
+                    candidate[mismatch] = "b" * 64 if mismatch == "hash" else 3_538_453
+                self.rpc_results["getblockheader"] = candidate
+                probe = self.run_probe(rpc_url=f"http://{self.endpoint}/")
+                if mismatch:
+                    self.assertNotIn("difficulty_bits", probe)
+                else:
+                    self.assertEqual(probe["difficulty_bits"], "1b6aac57")
+
     def test_metrics_scrape_can_be_skipped(self):
         probe = self.run_probe(metrics_endpoint=self.endpoint, want_metrics="")
 
@@ -2032,6 +2048,38 @@ class BoundedServerTests(unittest.TestCase):
         self.assertEqual(status.Handler.timeout, status.REQUEST_TIMEOUT_SECONDS)
         self.assertIn("BoundedHTTPServer((args.host, args.port), Handler)",
                       SCRIPT_PATH.read_text())
+
+
+class DifficultyPolicyTests(unittest.TestCase):
+    def test_monitoring_floor_matches_the_node_admission_policy(self):
+        sys.path.insert(0, str(SCRIPT_PATH.parent))
+        from zakura_monitoring import difficulty
+
+        source = (SCRIPT_PATH.parents[2] / "crates/zakurad/src/components/download_work.rs").read_text()
+        reference = re.search(r"CompactDifficulty::from_le_bytes\((0x[0-9a-fA-F]+)_u32", source)
+        multiplier = re.search(r"const MAINNET_TARGET_MULTIPLIER: u32 = (\d+);", source)
+        height = re.search(r"const MAINNET_WORK_FLOOR_HEIGHT: Height = Height\(([0-9_]+)\);", source)
+        self.assertIsNotNone(reference)
+        self.assertIsNotNone(multiplier)
+        self.assertIsNotNone(height)
+        self.assertEqual(difficulty.REFERENCE_BITS, int(reference[1], 16))
+        self.assertEqual(difficulty.TARGET_MULTIPLIER, int(multiplier[1]))
+        self.assertEqual(difficulty.FLOOR_HEIGHT, int(height[1].replace("_", "")))
+
+    def test_fleet_payload_keeps_the_target_with_its_tip(self):
+        collected = collector(network="mainnet")
+        probe = {"active_state": "active", "height": 3_538_452, "block_hash": "a" * 64,
+                 "rpc_chain": "main", "difficulty_bits": "1b6aac57"}
+        row = collected.row_for(node(), probe, now=1000)
+        collected.rows = [row]
+        collected.last_poll = 1000
+        payload = collected.snapshot()
+        self.assertEqual(payload["rows"][0]["difficulty_bits"], "1b6aac57")
+        safe = status.monitoring_snapshot(payload, {"node-a"})
+        self.assertEqual(safe["rows"][0]["difficulty_bits"], "1b6aac57")
+        self.assertEqual(safe["rows"][0]["rpc_chain"], "main")
+        self.assertEqual(safe["rows"][0]["last_seen_at"], 1000)
+        self.assertEqual(safe["rows"][0]["block_hash"], "a" * 64)
 
 
 if __name__ == "__main__":

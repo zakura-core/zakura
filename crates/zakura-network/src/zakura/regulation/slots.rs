@@ -179,7 +179,7 @@ impl OutputByteBudget {
             .map(|permit| OutputGrant { permit })
     }
 
-    pub(super) fn downgrade(&self) -> WeakOutputByteBudget {
+    pub(crate) fn downgrade(&self) -> WeakOutputByteBudget {
         WeakOutputByteBudget {
             capacity: self.capacity,
             bytes: downgrade(&self.bytes),
@@ -205,13 +205,13 @@ impl OutputGrant {
 
 /// A registry handle to an output budget that does not keep it alive.
 #[derive(Debug)]
-pub(super) struct WeakOutputByteBudget {
+pub(crate) struct WeakOutputByteBudget {
     capacity: u64,
     bytes: Weak<Semaphore>,
 }
 
 impl WeakOutputByteBudget {
-    pub(super) fn upgrade(&self) -> Option<OutputByteBudget> {
+    pub(crate) fn upgrade(&self) -> Option<OutputByteBudget> {
         Some(OutputByteBudget {
             capacity: self.capacity,
             bytes: self.bytes.upgrade()?,

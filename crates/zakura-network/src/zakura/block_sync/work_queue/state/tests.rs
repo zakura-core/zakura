@@ -1359,3 +1359,6 @@ fn missing_publish_item_preserves_transferred_charge() {
     assert_eq!(state.reserved_bytes_scanned(), 100);
     assert_eq!(state.reserved_above(height(0)), (100, 1));
 }
+
+#[cfg(test)]
+mod owner_cap;

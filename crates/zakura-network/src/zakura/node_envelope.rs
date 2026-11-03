@@ -52,6 +52,8 @@ pub(crate) enum NodeEnvelopeError {
 pub(crate) struct NodeEnvelope {
     /// The most handshake and stream owners, across every generation.
     pub(crate) owners: OwnerBound,
+    /// Request-stream executions that open streams allow at once.
+    pub(crate) request_executions: usize,
     /// The most frame bytes that transport owners retain.
     pub(crate) transport_bytes: u128,
     /// The most bytes in QUIC's buffers and the sockets' queues.
@@ -84,6 +86,7 @@ impl NodeEnvelope {
                 transport.max_open_streams,
             )
             .ok_or(NodeEnvelopeError::OwnerOverflow)?,
+            request_executions: ResourceEnvelope::new(transport).request_executions,
             transport_bytes: ResourceEnvelope::new(transport).retained_frame_bytes(),
             quic_bytes,
             tcp_ingress_bytes,
@@ -101,7 +104,9 @@ impl NodeEnvelope {
     ) -> Result<Self, NodeEnvelopeError> {
         let block_sync = &config.zakura.block_sync;
         Self::new(
-            limits.transport_limits(),
+            limits.transport_limits_for_kinds(
+                limits.reactor_shares().kinds.iter().map(|(kind, _)| *kind),
+            ),
             config.zakura.peer_memory_budget_bytes,
             config.tcp_ingress_bound_bytes(),
             block_sync
@@ -125,6 +130,7 @@ fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
     [
         getblocks_serving_limits(&config.zakura.block_sync).node_output_bytes,
         header_sync::v9::serving_limits(
+            header_sync::v9::SERVE_PEER_OUTPUT_BYTES,
             headers.serving_sessions(),
             headers.node_serve_output_bytes,
         )

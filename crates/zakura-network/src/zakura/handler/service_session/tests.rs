@@ -40,6 +40,14 @@ const SIBLING: Stream = Stream {
     capability: 1 << 17,
     ..DATA
 };
+/// Every stream kind these tests open.
+const KINDS: [u16; 5] = [
+    DATA.kind,
+    REQUESTS.kind,
+    SIBLING.kind,
+    EVENTS.kind,
+    ONE_SHOT.kind,
+];
 const ALPN: &[u8] = b"/zakura/test/ordered-pair/1";
 const TEST_DATA_WRITE_TIMEOUT: Duration = Duration::from_secs(32);
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -588,6 +596,115 @@ async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Con
         .await?
         .ok_or("missing connection")?;
     Ok((server, client, connection, remote))
+}
+
+/// A connection holds the handshake share until it negotiates. Serving it
+/// then sets its receive window once, to the handshake share plus the shares
+/// of the kinds it negotiated, and to nothing for the rest.
+#[tokio::test]
+async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxError> {
+    const KIB: u64 = 1024;
+    let budget = |receive| ReactorBudget {
+        receive,
+        output: 4 << 20,
+    };
+    let shares = ReactorShares {
+        control_receive_bytes: 256 * KIB,
+        kinds: vec![(SIBLING.kind, budget(192 * KIB))],
+        other: budget(128 * KIB),
+    };
+    let local = ZakuraLocalLimits::from_config(&Config::default()).with_reactor_shares(shares);
+    assert_eq!(u64::from(local.quic.receive_window_bytes), 256 * KIB);
+    assert_eq!(u64::from(local.quic.stream_receive_window_bytes), 192 * KIB);
+    let server = LocalEndpointFactory::with_limits(&local)
+        .endpoint(93211)
+        .await?;
+    let client = LocalEndpointFactory::with_limits(&local)
+        .endpoint(93212)
+        .await?;
+    let (accepted, mut connections) = mpsc::channel(1);
+    server.serve(RawConnection(accepted))?;
+    let connection = timeout(
+        TEST_TIMEOUT,
+        client.connect(LocalEndpointFactory::node_addr(&server).await, &[ALPN]),
+    )
+    .await??;
+    let remote = timeout(TEST_TIMEOUT, connections.recv())
+        .await?
+        .ok_or("missing connection")?;
+    // The handshake is over, and nothing raised the window yet.
+    tokio::time::sleep(zakura_quic::LOAD_INTERVAL * 2).await;
+    assert_eq!(
+        remote.load().receive_window,
+        256 * KIB,
+        "the handshake share"
+    );
+
+    let (sessions, _sessions) = mpsc::channel(1);
+    let (siblings, _siblings) = mpsc::channel(1);
+    let registry = Arc::new(ServiceRegistry::new(vec![
+        Arc::new(SessionService {
+            streams: &[DATA, REQUESTS],
+            opening: SessionOpening::InitiatorOnly,
+            fail_first_reservation: std::sync::atomic::AtomicBool::new(false),
+            capacity: None,
+            sessions,
+        }),
+        Arc::new(SiblingService {
+            sessions: siblings,
+            retired: false,
+        }),
+    ])?);
+    let handler = ZakuraProtocolHandler::new_with_registry(
+        ZakuraSupervisorHandle::new(16),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        local.clone(),
+        registry,
+    );
+    let shutdown = handler.shutdown.clone();
+    let peer_id = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
+    let transcript_hash = native_connection_transcript_hash(
+        ServicePeerDirection::Inbound,
+        &server.local_id(),
+        &client.local_id(),
+    );
+    let remote_ip = Some(remote.admitted_ip());
+    let served = remote.clone();
+    let serving = AbortOnDropHandle::new(tokio::spawn(async move {
+        handler
+            .register_and_serve(
+                served,
+                peer_id,
+                remote_ip,
+                ConnectionServeContext {
+                    limits: local.clamp(&local.initial_limits()),
+                    // The sibling only: the session service's kinds stay out.
+                    accepted_capabilities: SIBLING.capability,
+                    role: "responder",
+                    direction: ServicePeerDirection::Inbound,
+                    transcript_hash,
+                    i_open_collision_winner: false,
+                    conn: ZakuraConnTrace::without_peer(1),
+                    control_handshake: None,
+                    registration_report: None,
+                },
+            )
+            .await
+    }));
+    timeout(TEST_TIMEOUT, async {
+        while remote.load().receive_window != (256 + 192) * KIB {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    shutdown.cancel();
+    let _ = timeout(TEST_TIMEOUT, serving).await?;
+    connection.close(0u32.into(), b"test complete");
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
+    Ok(())
 }
 
 /// Run the real post-handshake connection loop with a raw peer controlling setup bytes.
@@ -1382,7 +1499,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
     .expect("the request header is rejected without waiting for its absent payload");
     assert!(cancel.is_cancelled());
 
-    let resources = ConnectionResources::unconstrained();
+    let resources = ConnectionResources::unconstrained(&[]);
     let response = write_outbound_request_frame(
         &connection,
         &resources,
@@ -1438,7 +1555,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
 /// failed exchange returns it at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), BoxError> {
-    use crate::zakura::{transport::NodeResources, transport::ResourceEnvelope};
+    use crate::zakura::transport::NodeResources;
     let _guard = zakura_test::init();
     let (server, client, connection, remote) = raw_connection().await?;
     let stream = Stream {
@@ -1449,15 +1566,15 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
     };
     Stream::check_layout(&[stream])?;
     let limits = raw_worker_context(&client, Arc::new(Semaphore::new(1))).limits;
-    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
-        1 << 20,
-        1,
-    )));
-    let resources = node.connection();
+    let node = NodeResources::new(
+        ReactorShares::from_quic(&QuicConfig::default()),
+        [stream],
+        stream.frame_cap,
+    );
+    let resources = node.connection(stream.capability);
 
-    // A saturated partition holds the exchange back before its stream opens.
-    let capacity =
-        ResourceEnvelope::new(TransportLimits::with_windows(1 << 20, 1)).compat_response_bytes;
+    // A full exchange gate holds the exchange back before its stream opens.
+    let capacity = COMPAT_EXCHANGE_BUDGET.receive;
     let saturated = resources.admit_compat_response(capacity).await;
     let blocked = write_outbound_request_frame(
         &connection,
@@ -1477,7 +1594,7 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
         "an unfunded exchange opens no stream"
     );
     drop(saturated);
-    assert_eq!(resources.compat_responses().granted(), 0);
+    assert_eq!(resources.compat_exchanges().granted(), 0);
 
     let response = write_outbound_request_frame(
         &connection,
@@ -1501,7 +1618,7 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
         )
         .await?;
         assert!(
-            resources.compat_responses().granted() > 0,
+            resources.compat_exchanges().granted() > 0,
             "the requester funded the response before the responder saw the request"
         );
         let frame = Frame {
@@ -1523,11 +1640,11 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
     let (frames, grant) = frames.into_parts();
     assert_eq!(frames.len(), 1);
     assert!(
-        resources.compat_responses().granted() > 0,
+        resources.compat_exchanges().granted() > 0,
         "the grant funds the frames until the decoder finishes"
     );
     drop(grant);
-    assert_eq!(resources.compat_responses().granted(), 0);
+    assert_eq!(resources.compat_exchanges().granted(), 0);
     assert_eq!(node.owners().counts().total(), 0);
 
     connection.close(0u32.into(), b"done");
@@ -1573,7 +1690,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         conn: ZakuraConnTrace::without_peer(1),
         peer_id: &peer,
         stream_sem: &permits,
-        resources: &ConnectionResources::unconstrained(),
+        resources: &ConnectionResources::unconstrained(&KINDS),
         open_limiter: &mut open_limiter,
         message_buckets: &mut buckets,
         workers: &mut workers,
@@ -1684,7 +1801,7 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
         conn: context.conn,
         peer_id: &context.peer_id,
         stream_sem: &slots,
-        resources: &ConnectionResources::unconstrained(),
+        resources: &ConnectionResources::unconstrained(&KINDS),
         open_limiter: &mut open_limiter,
         message_buckets: &mut buckets,
         workers: &mut workers,
@@ -1767,7 +1884,7 @@ async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), 
             conn: context.conn,
             peer_id: &context.peer_id,
             stream_sem: &slots,
-            resources: &ConnectionResources::unconstrained(),
+            resources: &ConnectionResources::unconstrained(&KINDS),
             open_limiter: &mut open_limiter,
             message_buckets: &mut buckets,
             workers: &mut workers,

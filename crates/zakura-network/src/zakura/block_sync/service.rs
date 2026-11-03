@@ -8,10 +8,10 @@ use super::{
     wire::*, *,
 };
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
-    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
-    ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, BudgetError, FramedRecv, FramedSend, LocalRole,
+    OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service, ServicePeerSnapshot,
+    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamQueueDepths,
+    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
@@ -51,6 +51,68 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     }),
     ..Stream::PERSISTENT
 }];
+
+/// The bytes one block-sync connection may hold, for a requester whose byte
+/// cwnd stops at `max_cwnd_bytes` and whose floor rescue may take
+/// `floor_bypass_slots` extra blocks.
+///
+/// - `receive` is what the peer may send us. The table's [`LocalRole::Responder`]
+///   bound covers the peer's GetBlocks requests and status announcements. Our
+///   own requests' responses do not end their exchange, so the table cannot
+///   bound them. The requester's cap bounds them instead: `max_cwnd_bytes`
+///   plus `floor_bypass_slots + 1` frames of `MAX_BS_FRAME_BYTES`, one per
+///   floor-bypass block and one for the frame in decode.
+/// - `output` is what we may queue for the peer: the largest response we
+///   serve (`LARGEST_SERVED_RESPONSE`) plus the send
+///   share of the bandwidth-delay product. That share is `max_cwnd_bytes`,
+///   since the same 1 Gbps × 250 ms product sizes the cwnd cap.
+///
+/// The receive share always holds one frame, because it counts at least one
+/// `MAX_BS_FRAME_BYTES`.
+///
+/// # Errors
+///
+/// [`BudgetError::Overflow`] if a term overflows `u64`, or the table's error
+/// from [`Stream::receive_bound`].
+pub const fn block_sync_reactor_budget(
+    max_cwnd_bytes: u64,
+    floor_bypass_slots: u32,
+) -> Result<ReactorBudget, BudgetError> {
+    const OVERFLOW: BudgetError = BudgetError::Overflow {
+        // A u8 discriminator always fits in u16.
+        message_type: MSG_BS_BLOCK as u16,
+    };
+    let table = match Stream::receive_bound(&BLOCK_SYNC_SERVICE_STREAMS, LocalRole::Responder) {
+        Ok(table) => table,
+        Err(error) => return Err(error),
+    };
+    // Widening u32 to u64 is lossless.
+    let frames = floor_bypass_slots as u64 + 1;
+    let Some(frame_bytes) = frames.checked_mul(MAX_BS_FRAME_BYTES as u64) else {
+        return Err(OVERFLOW);
+    };
+    let Some(receive) = table.checked_add(max_cwnd_bytes) else {
+        return Err(OVERFLOW);
+    };
+    let Some(receive) = receive.checked_add(frame_bytes) else {
+        return Err(OVERFLOW);
+    };
+    let largest = super::regulated::wire::LARGEST_SERVED_RESPONSE.output_bytes();
+    let Some(output) = largest.checked_add(max_cwnd_bytes) else {
+        return Err(OVERFLOW);
+    };
+    Ok(ReactorBudget { receive, output })
+}
+
+/// [`block_sync_reactor_budget`] at the default cwnd cap
+/// (`DEFAULT_BS_BBR_MAX_CWND_BYTES`) and floor bypass
+/// (`DEFAULT_BS_FLOOR_BYPASS_SLOTS`): 43,287,718 receive bytes and
+/// 35,554,458 output bytes.
+pub const BLOCK_SYNC_REACTOR_BUDGET: ReactorBudget =
+    match block_sync_reactor_budget(DEFAULT_BS_BBR_MAX_CWND_BYTES, DEFAULT_BS_FLOOR_BYPASS_SLOTS) {
+        Ok(budget) => budget.assert_frame_cap(MAX_BS_FRAME_BYTES),
+        Err(error) => panic!("{}", error.rule()),
+    };
 
 /// The block-sync stream layout, for the simulator's generated table checks.
 #[cfg(any(test, zakura_sim))]
@@ -1746,5 +1808,55 @@ mod regulated_frame_tests {
         };
         assert_eq!(cadence.capacity, 22);
         assert_eq!(cadence.send_interval, Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod reactor_budget_tests {
+    use super::*;
+
+    /// The default budget, term by term: status cadence 22 × 53 B, the
+    /// protocol's 32,768 in-flight GetBlocks × 9 B, the 32 MiB cwnd cap and
+    /// three frames on receive; one 2 MB block response plus the cwnd cap on
+    /// output.
+    #[test]
+    fn the_default_block_sync_budget_counts_each_term() {
+        let table = 22 * 53 + 32_768 * 9;
+        let frame = 3 * 1024 * 1024 + 8;
+        assert_eq!(u64::from(MAX_BS_FRAME_BYTES), frame);
+        let response = 2_000_000 + 1 + 9 + 2 * 8;
+        assert_eq!(
+            BLOCK_SYNC_REACTOR_BUDGET,
+            ReactorBudget {
+                receive: table + 32 * 1024 * 1024 + 3 * frame,
+                output: response + 32 * 1024 * 1024,
+            }
+        );
+        assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.receive, 43_287_718);
+        assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.output, 35_554_458);
+        let config = ZakuraBlockSyncConfig::default();
+        assert_eq!(
+            block_sync_reactor_budget(config.bbr_max_cwnd_bytes, config.floor_bypass_slots),
+            Ok(BLOCK_SYNC_REACTOR_BUDGET)
+        );
+    }
+
+    /// Each extra floor-bypass slot adds one frame to receive, the cwnd cap adds
+    /// to both sides, and overflow is an error instead of a wrapped bound.
+    #[test]
+    fn the_block_sync_budget_follows_its_parameters() {
+        let zero = block_sync_reactor_budget(0, 0).unwrap();
+        assert!(zero.check_frame_cap(MAX_BS_FRAME_BYTES).is_ok());
+        let more = block_sync_reactor_budget(1000, 4).unwrap();
+        assert_eq!(
+            more.receive - zero.receive,
+            1000 + 4 * u64::from(MAX_BS_FRAME_BYTES)
+        );
+        assert_eq!(more.output - zero.output, 1000);
+        let overflow = BudgetError::Overflow {
+            message_type: u16::from(MSG_BS_BLOCK),
+        };
+        assert_eq!(block_sync_reactor_budget(u64::MAX, 0), Err(overflow));
+        assert_eq!(block_sync_reactor_budget(0, u32::MAX).map(|_| ()), Ok(()));
     }
 }

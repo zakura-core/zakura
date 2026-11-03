@@ -1,4 +1,4 @@
-//! Transport owners share one node without one stream's saturation stopping another.
+//! Transport owners share one node without one kind's saturation stopping another.
 //!
 //! These tests hold only [`NodeResources`] owners. Other families' owners share no state
 //! with it, so holding them here could not fail. No test holds several families' real
@@ -12,24 +12,58 @@ use zakura_rt::time::timeout;
 use super::*;
 use crate::{
     config::Config,
-    zakura::transport::{NodeResources, OwnerCounts, OwnerPhase, TransportLimits},
+    zakura::{
+        transport::{
+            ConnectionResources, NodeResources, OwnerCounts, OwnerPhase, StreamResources,
+            TransportLimits,
+        },
+        ReactorBudget, ReactorShares, Stream,
+    },
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOW: u64 = 64;
 const MAX_CONNECTIONS: usize = 2;
 const MAX_OPEN_STREAMS: u16 = 4;
-const MAX_FRAME_BYTES: u32 = 1024;
 const TCP_INGRESS_BYTES: u64 = 3 << 20;
+
+/// Three kinds on separate capability bits, each with a `WINDOW` share.
+const BLOCKS: Stream = test_stream(6);
+const HEADERS: Stream = test_stream(5);
+const DISCOVERY: Stream = test_stream(4);
+
+const fn test_stream(kind: u16) -> Stream {
+    Stream {
+        kind,
+        capability: 1 << kind,
+        frame_cap: WINDOW as u32,
+        ..Stream::PERSISTENT
+    }
+}
+
+fn shares() -> ReactorShares {
+    ReactorShares {
+        control_receive_bytes: WINDOW,
+        kinds: Vec::new(),
+        other: ReactorBudget {
+            receive: WINDOW,
+            output: WINDOW,
+        },
+    }
+}
 
 fn limits() -> TransportLimits {
     TransportLimits {
-        receive_window: WINDOW as u32,
+        max_open_streams: MAX_OPEN_STREAMS,
+        control_receive_bytes: WINDOW,
+        connection_shares: ReactorBudget {
+            receive: 3 * WINDOW,
+            output: 3 * WINDOW,
+        },
+        compat_exchange_bytes: 0,
         send_window: WINDOW,
         max_connections: MAX_CONNECTIONS,
         max_pending_handshakes: 1,
-        max_open_streams: MAX_OPEN_STREAMS,
-        max_frame_bytes: MAX_FRAME_BYTES,
     }
 }
 
@@ -54,6 +88,20 @@ fn bound() -> OwnerBound {
 
 fn retained_bound() -> u128 {
     transport().retained_frame_bytes()
+}
+
+fn node() -> NodeResources {
+    NodeResources::new(shares(), [BLOCKS, HEADERS, DISCOVERY], 1024)
+}
+
+fn connection(node: &NodeResources) -> ConnectionResources {
+    node.connection(BLOCKS.capability | HEADERS.capability | DISCOVERY.capability)
+}
+
+fn stream(connection: &ConnectionResources, kind: Stream) -> StreamResources {
+    connection
+        .stream(kind.kind, connection.owner())
+        .expect("the test connection negotiated every kind")
 }
 
 #[test]
@@ -121,22 +169,22 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
     assert_eq!(derived - configured, 2 * (512 * (64 << 20) - (1 << 30)));
 }
 
-/// A reconnect gets fresh connection budgets, but it finds the old generation's
-/// retiring owners and node-wide charges still counted.
+/// A reconnect gets fresh connection gates, but it finds the old generation's
+/// retiring owners and their held bytes still counted.
 #[test]
 fn retiring_generations_count_against_the_node_across_reconnects() {
-    let node = NodeResources::new(transport());
+    let node = node();
     let mut retiring = Vec::new();
     let mut charges = Vec::new();
     let mut held = 0;
 
     for generation in 1..=3_usize {
-        let connection = node.connection();
-        let stream = connection.stream();
+        let connection = connection(&node);
+        let stream = stream(&connection, BLOCKS);
         let charge = stream
             .raw
             .try_admit(WINDOW)
-            .expect("a new connection's budget funds its first frame");
+            .expect("a new connection's gate funds its first frame");
         held += WINDOW;
         stream.owner.advance(OwnerPhase::Retiring);
         retiring.push(stream);
@@ -147,25 +195,30 @@ fn retiring_generations_count_against_the_node_across_reconnects() {
         let usage = node.report_usage(bound());
         assert_eq!(usage.owners.retiring, generation);
         assert_eq!(usage.owners.streams(), generation);
-        assert_eq!(usage.raw_bytes, held, "a reconnect resets no node charge");
+        assert_eq!(usage.raw_bytes(), held, "a reconnect resets no held bytes");
         assert!(bound().admits(&usage.owners));
-        assert!(u128::from(usage.raw_bytes) <= retained_bound());
     }
 
     drop(charges);
     drop(retiring);
     let usage = node.usage();
     assert_eq!(usage.owners, OwnerCounts::default());
-    assert_eq!(usage.raw_bytes, 0, "the node returns to its baseline");
+    assert_eq!(usage.raw_bytes(), 0, "the node returns to its baseline");
+    assert!(
+        usage.kinds.iter().all(|kind| kind.raw_bound == 0),
+        "the report drops the gates of ended connections"
+    );
 }
 
 /// A generation that outlives its admission slot breaks the bound. The reader reports
 /// that and refuses nothing.
 #[test]
 fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
-    let node = NodeResources::new(transport());
-    let connection = node.connection();
-    let streams: Vec<_> = (0..=bound().streams).map(|_| connection.stream()).collect();
+    let node = node();
+    let connection = connection(&node);
+    let streams: Vec<_> = (0..=bound().streams)
+        .map(|_| stream(&connection, BLOCKS))
+        .collect();
 
     let usage = node.report_usage(bound());
 
@@ -181,39 +234,44 @@ fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
     drop(handshakes);
 }
 
-/// One stream holds all shared transport bytes and its own floors. Every other stream
-/// keeps its floor, and the sum stays inside the composed bound.
+/// One kind fills its raw and output gates on one connection. Every other kind on
+/// that connection, and the same kind on another connection, still admits a frame,
+/// and the sum stays inside the composed bound.
 #[tokio::test]
 async fn mixed_family_saturation_leaves_every_other_owner_available() {
     timeout(TEST_TIMEOUT, async {
-        let node = NodeResources::new(transport());
-        let connection = node.connection();
-        let blocks = connection.stream();
-        let headers = connection.stream();
-        let discovery = connection.stream();
+        let node = node();
+        let first = connection(&node);
+        let second = connection(&node);
+        let blocks = stream(&first, BLOCKS);
+        let headers = stream(&first, HEADERS);
+        let discovery = stream(&first, DISCOVERY);
 
-        // One stream saturates the shared budgets and its own floors.
-        let (_raw_hold, _output_hold) = node.hold_node_budgets();
-        let _block_raw_floor = blocks.raw.try_admit(WINDOW).expect("the floor is free");
-        let _block_output_floor = blocks.output.try_admit(WINDOW).expect("the floor is free");
+        // One kind saturates its gates.
+        let _block_raw = blocks.raw.try_admit(WINDOW).expect("the gate is free");
+        let _block_output = blocks.output.try_admit(WINDOW).expect("the gate is free");
         assert!(blocks.raw.try_admit(1).is_none());
         assert!(blocks.output.try_admit(1).is_none());
 
-        // Other streams each still make progress on their own floors.
+        // Other kinds, and the same kind elsewhere, each still make progress.
         let header_frame = headers.raw.try_admit(WINDOW);
         let discovery_frame = discovery.output.try_admit(WINDOW);
-        assert!(header_frame.is_some() && discovery_frame.is_some());
+        let other_blocks = stream(&second, BLOCKS).raw.try_admit(WINDOW);
+        assert!(header_frame.is_some() && discovery_frame.is_some() && other_blocks.is_some());
 
-        let compat = connection
+        let compat = first
             .admit_compat_response(1)
             .now_or_never()
-            .expect("the compatibility partition is separate from raw bytes");
+            .expect("the compatibility gate is separate from every kind's gates");
 
         let usage = node.report_usage(bound());
         assert!(bound().admits(&usage.owners));
+        assert_eq!(usage.raw_bytes(), 3 * WINDOW);
+        assert_eq!(usage.output_bytes(), 2 * WINDOW);
+        assert_eq!(usage.compat_response_bytes, 1);
         assert!(
-            u128::from(usage.raw_bytes)
-                + u128::from(usage.output_bytes)
+            u128::from(usage.raw_bytes())
+                + u128::from(usage.output_bytes())
                 + u128::from(usage.compat_response_bytes)
                 <= retained_bound()
         );
@@ -224,38 +282,35 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
     .expect("the composition never waits on a saturated owner");
 }
 
-/// Close and reject frames use the output floor, so a saturated node delays a control
-/// frame by at most one frame on its own stream.
+/// A frame on a full kind waits for that kind's own release. Its cancelled wait takes
+/// nothing, and another kind's frame on the same connection admits at once.
 #[tokio::test]
-async fn control_frames_progress_through_saturated_output() {
-    let node = NodeResources::new(transport());
-    let connection = node.connection();
-    let (_raw_hold, _output_hold) = node.hold_node_budgets();
-    let held_output = node.usage().output_bytes;
+async fn a_full_kind_delays_only_its_own_frames() {
+    let node = node();
+    let connection = connection(&node);
+    let blocks = stream(&connection, BLOCKS);
+    let full = blocks.output.try_admit(WINDOW).expect("the gate is free");
 
-    let control = connection.stream();
+    let control = stream(&connection, HEADERS);
     let close_frame = control
         .output
         .admit(WINDOW)
         .now_or_never()
-        .expect("the floor slot admits the control frame without shared bytes");
+        .expect("another kind's gate admits the control frame at once");
     assert!(close_frame.waited().is_zero());
-    assert_eq!(
-        node.usage().output_bytes,
-        held_output,
-        "a floor frame charges no shared bytes"
-    );
 
-    // A second frame on the same stream waits, and its cancelled wait takes nothing.
+    // A second frame of the full kind waits, and its cancelled wait takes nothing.
     {
-        let waiting = control.output.admit(WINDOW);
+        let waiting = blocks.output.admit(WINDOW);
         futures::pin_mut!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
     }
-    drop(close_frame);
-    let next = timeout(TEST_TIMEOUT, control.output.admit(WINDOW))
+    assert_eq!(node.usage().output_bytes(), 2 * WINDOW);
+    drop(full);
+    let next = timeout(TEST_TIMEOUT, blocks.output.admit(WINDOW))
         .await
-        .expect("the returned floor slot admits the next frame");
-    assert_eq!(node.usage().output_bytes, held_output);
-    drop(next);
+        .expect("the released gate admits the next frame");
+    assert_eq!(node.usage().output_bytes(), 2 * WINDOW);
+    drop((next, close_frame));
+    assert_eq!(node.usage().output_bytes(), 0);
 }

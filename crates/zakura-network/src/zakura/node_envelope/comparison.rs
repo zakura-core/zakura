@@ -53,6 +53,7 @@ use crate::zakura::{
     transport::{
         frame_wire_bytes, NodeResources, ResourceEnvelope, StreamResources, TransportLimits,
     },
+    ReactorBudget, ReactorShares, Stream, DEFAULT_REACTOR_OUTPUT_BYTES,
     DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_RECEIVE_WINDOW,
 };
 
@@ -66,6 +67,18 @@ const PEERS: [usize; 2] = [16, DEFAULT_ZAKURA_MAX_CONNECTIONS];
 const FRAME_BYTES: [u64; 3] = [frame_wire_bytes(0), 1 << 10, 1 << 20];
 /// How long a consumer retains a frame: a local hand-off, then a stalled store.
 const CONSUMER_DELAYS: [Duration; 2] = [Duration::ZERO, Duration::from_millis(5)];
+/// The kind every row moves frames on, and a second kind that one row saturates.
+const MOVING: Stream = row_stream(6);
+const SATURATED: Stream = row_stream(5);
+
+const fn row_stream(kind: u16) -> Stream {
+    Stream {
+        kind,
+        capability: 1 << kind,
+        frame_cap: 1 << 21,
+        ..Stream::PERSISTENT
+    }
+}
 
 /// What a row may lose against its baseline.
 struct Tolerances {
@@ -91,25 +104,53 @@ const TOLERANCES: Tolerances = Tolerances {
 /// Latency below this is scheduler noise, so the p99 comparison ignores it.
 const LATENCY_FLOOR: Duration = Duration::from_millis(1);
 
-/// The transport limits a row measures.
-fn composed_limits(peers: usize) -> TransportLimits {
-    TransportLimits {
-        receive_window: DEFAULT_ZAKURA_RECEIVE_WINDOW,
-        send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
-        max_connections: peers,
-        max_pending_handshakes: 1,
-        max_open_streams: 16,
-        max_frame_bytes: 1 << 21,
+/// The per-kind shares a row measures: each kind's raw share is the default
+/// connection window, and its output share is the default output share.
+fn composed_shares() -> ReactorShares {
+    let window = u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW);
+    ReactorShares {
+        control_receive_bytes: window,
+        kinds: Vec::new(),
+        other: ReactorBudget {
+            receive: window,
+            output: DEFAULT_REACTOR_OUTPUT_BYTES,
+        },
     }
 }
 
-/// The same owners with windows that never bind.
-fn baseline_limits(peers: usize) -> TransportLimits {
-    TransportLimits {
-        receive_window: u32::MAX,
-        send_window: u64::from(u32::MAX),
-        ..composed_limits(peers)
+/// The same owners with gates that never bind.
+fn baseline_shares() -> ReactorShares {
+    ReactorShares {
+        other: ReactorBudget {
+            receive: u64::from(u32::MAX),
+            output: u64::from(u32::MAX),
+        },
+        ..composed_shares()
     }
+}
+
+/// The transport limits of `peers` connections under `shares`.
+fn limits(shares: &ReactorShares, peers: usize) -> TransportLimits {
+    TransportLimits {
+        max_open_streams: 16,
+        control_receive_bytes: shares.control_receive_bytes,
+        connection_shares: ReactorBudget {
+            receive: 2 * shares.other.receive,
+            output: 2 * shares.other.output,
+        },
+        compat_exchange_bytes: 0,
+        send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
+        max_connections: peers,
+        max_pending_handshakes: 1,
+    }
+}
+
+/// A new connection's stream of `kind` on `node`.
+fn open(node: &NodeResources, kind: Stream) -> StreamResources {
+    let connection = node.connection(MOVING.capability | SATURATED.capability);
+    connection
+        .stream(kind.kind, connection.owner())
+        .expect("every row's connection negotiates both kinds")
 }
 
 /// One workload, run against both limits.
@@ -121,7 +162,7 @@ enum Scenario {
     BlockedOutput,
     /// Peers reconnect after every frame, so owners keep entering and leaving.
     ReconnectChurn,
-    /// One family holds the node budgets while others move floor frames.
+    /// One kind fills its gates on every connection while another kind moves frames.
     MixedFamilySaturation,
 }
 
@@ -159,7 +200,7 @@ impl Tally {
             .push(latency);
         let usage = node.usage();
         self.peak_held
-            .fetch_max(usage.raw_bytes + usage.output_bytes, Ordering::Relaxed);
+            .fetch_max(usage.raw_bytes() + usage.output_bytes(), Ordering::Relaxed);
         admitted
     }
 }
@@ -211,36 +252,36 @@ async fn pipe(
 /// Run `scenario` to its end on the current runtime.
 async fn drive(
     scenario: Scenario,
-    limits: TransportLimits,
+    shares: ReactorShares,
     peers: usize,
     bytes: u64,
     delay: Duration,
     tally: Arc<Tally>,
 ) {
-    let node = NodeResources::new(ResourceEnvelope::new(limits));
-    // These hold their budgets until every task below finishes.
-    let (_blocked, _node_budgets);
+    let held = shares.other.receive;
+    let node = NodeResources::new(shares, [MOVING, SATURATED], 1 << 21);
+    // These hold their gates until every task below finishes.
+    let (_blocked, _saturated);
     let mut tasks = zakura_rt::task::JoinSet::new();
     match scenario {
         Scenario::Throughput => {
             for _ in 0..peers {
-                let stream = node.connection().stream();
+                let stream = open(&node, MOVING);
                 let (node, tally) = (node.clone(), tally.clone());
                 tasks.spawn(pipe(node, stream, FRAMES_PER_PEER, bytes, delay, tally));
             }
         }
         Scenario::BlockedOutput => {
-            // These peers fill their connection budgets and hold them to the end.
+            // These peers fill their kind's gate and hold it to the end.
             _blocked = (0..peers / 4)
                 .map(|_| {
-                    let stream = node.connection().stream();
-                    let held = u64::from(limits.receive_window) * 2;
+                    let stream = open(&node, MOVING);
                     let grant = stream.raw.try_admit(held);
                     (stream, grant)
                 })
                 .collect::<Vec<_>>();
             for _ in peers / 4..peers {
-                let stream = node.connection().stream();
+                let stream = open(&node, MOVING);
                 let (node, tally) = (node.clone(), tally.clone());
                 tasks.spawn(pipe(node, stream, FRAMES_PER_PEER, bytes, delay, tally));
             }
@@ -250,7 +291,7 @@ async fn drive(
                 let (node, tally) = (node.clone(), tally.clone());
                 tasks.spawn(async move {
                     for _ in 0..FRAMES_PER_PEER {
-                        let stream = node.connection().stream();
+                        let stream = open(&node, MOVING);
                         let grant = tally.timed(&node, stream.raw.admit(bytes)).await;
                         drop((grant, stream));
                         tally.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -260,13 +301,21 @@ async fn drive(
             }
         }
         Scenario::MixedFamilySaturation => {
-            _node_budgets = node.hold_node_budgets();
+            let mut saturated = Vec::new();
             for _ in 0..peers {
-                let stream = node.connection().stream();
+                let connection = node.connection(MOVING.capability | SATURATED.capability);
+                let full = connection
+                    .stream(SATURATED.kind, connection.owner())
+                    .expect("the row's connection negotiates both kinds");
+                let grants = (full.raw.try_admit(held), full.output.try_admit(held));
+                saturated.push((full, grants));
+                let stream = connection
+                    .stream(MOVING.kind, connection.owner())
+                    .expect("the row's connection negotiates both kinds");
                 let (node, tally) = (node.clone(), tally.clone());
                 tasks.spawn(async move {
                     for _ in 0..FRAMES_PER_PEER {
-                        // Only the stream's floor slot funds this frame.
+                        // Only the moving kind's own gate funds this frame.
                         let grant = tally.timed(&node, stream.output.admit(bytes)).await;
                         drop(grant);
                         tally.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -274,6 +323,7 @@ async fn drive(
                     }
                 });
             }
+            _saturated = saturated;
         }
     }
     while tasks.join_next().await.is_some() {}
@@ -283,7 +333,7 @@ async fn drive(
 /// thread, because [`measure`] counts only its own thread.
 fn run_row(
     scenario: Scenario,
-    limits: TransportLimits,
+    shares: &ReactorShares,
     peers: usize,
     bytes: u64,
     delay: Duration,
@@ -291,7 +341,7 @@ fn run_row(
     let bounded = |run: Arc<Tally>| async move {
         zakura_rt::time::timeout(
             SCENARIO_DEADLINE,
-            drive(scenario, limits, peers, bytes, delay, run),
+            drive(scenario, shares.clone(), peers, bytes, delay, run),
         )
         .await
         .unwrap_or_else(|_| panic!("{scenario:?} lost progress with {peers} peers"));
@@ -368,14 +418,15 @@ fn composed_owners_stay_within_their_tolerances() {
         for peers in PEERS {
             for bytes in FRAME_BYTES {
                 for delay in CONSUMER_DELAYS {
-                    let limits = composed_limits(peers);
-                    let composed = run_row(scenario, limits, peers, bytes, delay);
-                    let baseline = run_row(scenario, baseline_limits(peers), peers, bytes, delay);
+                    let shares = composed_shares();
+                    let composed = run_row(scenario, &shares, peers, bytes, delay);
+                    let baseline = run_row(scenario, &baseline_shares(), peers, bytes, delay);
                     eprintln!(
                         "{scenario:?} peers={peers} bytes={bytes} delay={delay:?} \
                          composed={composed:?} baseline={baseline:?}"
                     );
-                    let bound = ResourceEnvelope::new(limits).retained_frame_bytes();
+                    let bound =
+                        ResourceEnvelope::new(limits(&shares, peers)).retained_frame_bytes();
                     for problem in tolerance_problems(&composed, &baseline, bound) {
                         problems.push(format!(
                             "{scenario:?} peers={peers} bytes={bytes} delay={delay:?}: {problem}"

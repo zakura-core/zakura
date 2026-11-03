@@ -92,6 +92,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "block-decoded-retention" => value(zakura_sim::record::machine::MachineScenario {
             input: include_bytes!("fixtures/block-decoded-retention.bin").to_vec(),
         }),
+        "block-work-owner-cap" => value(zakura_sim::record::machine::MachineScenario {
+            input: include_bytes!("fixtures/block-work-owner-cap.bin").to_vec(),
+        }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
         "discovery-verification-capacity" => value(discovery::CapacityScenario::default()),
         "discovery-record-book" => value(zakura_sim::record::machine::MachineScenario {

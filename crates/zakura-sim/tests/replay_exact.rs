@@ -1194,10 +1194,12 @@ fn work_machine_records_and_replays_without_transport() {
         .any(|step| matches!(step.machine.as_deref(), Some(zakura_sim::record::machine::MachineStep::Work(work)) if work.actual.reserved > 0)));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
-    assert!(matches!(
+    // The property applies from step 3, the first whose model holds a charged
+    // in-flight item, through step 10.
+    assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Held { applicable: 10 }
-    ));
+        PropertyOutcome::Held { applicable: 8 }
+    );
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "work_machine_replay_child"])
         .env("ZAKURA_WORK_MACHINE_CHILD", dir.path())
@@ -1411,7 +1413,7 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
     .unwrap();
     assert_eq!(trace.steps.len(), FUNDING_INPUT.len() / 4 + 1);
     assert_eq!(trace.meta.scenario["input"], json!(FUNDING_INPUT));
-    assert_eq!(trace.meta.generator, 1);
+    assert_eq!(trace.meta.generator, 2);
     assert!(trace
         .steps
         .iter()
@@ -1430,8 +1432,11 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
     assert_eq!(drain.actual.reserved, 0);
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
-    assert!(
-        matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable == u32::try_from(trace.steps.len()).unwrap())
+    // The property applies from the first step whose prefix reaches the
+    // trigger. A `Holds` trigger needs the final drain, so only that step counts.
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 1 }
     );
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "work_funding_replay_child"])
@@ -1473,7 +1478,8 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
             .unwrap()
             .verified());
     }
-    assert!(matches!(
+    // A drain-only run never reaches the trigger, so the property never applies.
+    assert_eq!(
         (entry.witness)(
             &json!({"input": []}),
             PlanInput::Bytes(Vec::new()),
@@ -1481,8 +1487,10 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
             zakura_sim::witness::Expect::Holds,
             &mut zakura_sim::NullSink
         ),
-        Err(zakura_sim::witness::WitnessError::LostTriggerHistory)
-    ));
+        Err(zakura_sim::witness::WitnessError::Outcome(
+            PropertyOutcome::NotApplicable
+        ))
+    );
 }
 
 #[test]

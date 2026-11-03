@@ -49,7 +49,7 @@ pub use error::{
 };
 pub use inputs::{CidGeneratorFactory, EndpointInputs, InitialCidProvider};
 pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
-pub use stream::{RecvStream, SendStream};
+pub use stream::{CreditHold, RecvStream, SendStream};
 
 // API-2, API-5: quinn-proto types that appear in this crate's API.
 pub use quinn_proto::{

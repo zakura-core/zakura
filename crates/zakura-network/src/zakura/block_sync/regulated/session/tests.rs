@@ -430,6 +430,64 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
 mod lifecycle;
 mod load;
 
+/// Servers cut every range to the advertised one block, so the largest served
+/// response is one 2 MB body, its tag and the 9-byte ending, in two frames. A
+/// 128-block request gets the same cap from the server.
+#[test]
+fn the_largest_served_response_is_one_advertised_block() {
+    use crate::zakura::{
+        block_sync::{
+            config::BS_BLOCKS_PER_RESPONSE, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES,
+        },
+        regulation::ResponseCap,
+    };
+    assert_eq!(
+        ZakuraBlockSyncConfig::default().advertised_max_blocks_per_response(),
+        BS_BLOCKS_PER_RESPONSE
+    );
+    assert_eq!(
+        LARGEST_SERVED_RESPONSE,
+        ResponseCap {
+            frames: 1,
+            bytes: 2_000_000 + 1 + 9,
+        }
+    );
+    assert_eq!(LARGEST_SERVED_RESPONSE.output_bytes(), 2_000_026);
+    let largest_request = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST).unwrap();
+    assert_eq!(
+        largest_request
+            .truncated(BS_BLOCKS_PER_RESPONSE)
+            .response_cap(MAX_BS_RESPONSE_BYTES),
+        LARGEST_SERVED_RESPONSE
+    );
+}
+
+/// One-block sizing leaves every default limit as the 128-block sizing set it:
+/// both responses fit the 64 MiB peer output floor (twice the send window), and
+/// the node funds that floor on each of its 512 sessions.
+#[test]
+fn one_block_sizing_keeps_the_default_serving_limits() {
+    use crate::zakura::block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES};
+    let config = ZakuraBlockSyncConfig::default();
+    let limits = serving_limits(&config);
+    let old_largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
+        .unwrap()
+        .response_cap(MAX_BS_RESPONSE_BYTES)
+        .output_bytes();
+    assert_eq!(old_largest, 33_555_601);
+    assert_eq!(
+        limits,
+        ServeLimits {
+            node_execution: NODE_EXECUTION,
+            peer_execution: PEER_EXECUTION,
+            ..sizing::serve_limits(old_largest, sizing::TARGET_RTT, serving_sessions(&config))
+        }
+    );
+    assert_eq!(limits.peer_output_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.node_output_bytes, 32 << 30);
+    assert_eq!((limits.node_execution, limits.peer_execution), (24, 12));
+}
+
 /// Default peer limits budget 2816 requests, so 512 sessions fill exactly 512 MiB.
 #[test]
 fn the_default_serving_limit_fits_the_bookkeeping_budget() {

@@ -257,3 +257,87 @@ fn get_transparent_output_address_with_blocks_for_network(network: Network) {
     // Make sure we didn't accidentally skip all vectors
     assert!(valid_addresses > 0);
 }
+
+/// The address `Output::address` returned when it went through librustzcash's script solver.
+fn solver_address(
+    output: &crate::transparent::Output,
+    network: &Network,
+) -> Option<crate::transparent::Address> {
+    use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
+
+    match TxOut::try_from(output).ok()?.recipient_address()? {
+        TransparentAddress::PublicKeyHash(pkh) => Some(
+            crate::transparent::Address::from_pub_key_hash(network.t_addr_kind(), pkh),
+        ),
+        TransparentAddress::ScriptHash(sh) => Some(crate::transparent::Address::from_script_hash(
+            network.t_addr_kind(),
+            sh,
+        )),
+    }
+}
+
+/// Wraps script bytes in an output with a valid amount.
+fn output_with_script(script: &[u8]) -> crate::transparent::Output {
+    crate::transparent::Output::new(
+        crate::amount::Amount::try_from(1_000).expect("1000 zatoshis is a valid amount"),
+        crate::transparent::Script::new(script),
+    )
+}
+
+/// Script shapes next to P2PKH and P2SH: wrong hash lengths, non-direct pushes,
+/// trailing bytes, and truncated scripts must not yield an address.
+#[test]
+fn output_address_matches_solver_on_near_standard_scripts() {
+    let _init_guard = zakura_test::init();
+    let hash = [0x42u8; 20];
+
+    let p2pkh = [&[0x76, 0xa9, 0x14][..], &hash, &[0x88, 0xac]].concat();
+    let p2sh = [&[0xa9, 0x14][..], &hash, &[0x87]].concat();
+    let scripts = [
+        p2pkh.clone(),
+        p2sh.clone(),
+        // PUSHDATA1 encoding of the same 20-byte hash.
+        [&[0x76, 0xa9, 0x4c, 0x14][..], &hash, &[0x88, 0xac]].concat(),
+        [&[0xa9, 0x4c, 0x14][..], &hash, &[0x87]].concat(),
+        // 19- and 21-byte hashes with matching push lengths.
+        [&[0x76, 0xa9, 0x13][..], &hash[..19], &[0x88, 0xac]].concat(),
+        [&[0xa9, 0x15][..], &hash, &[0x00, 0x87]].concat(),
+        // Push length that disagrees with the hash length.
+        [&[0x76, 0xa9, 0x14][..], &hash, &[0x00, 0x88, 0xac]].concat(),
+        // Trailing and missing bytes.
+        [&p2pkh[..], &[0x00]].concat(),
+        [&p2sh[..], &[0x87]].concat(),
+        p2pkh[..p2pkh.len() - 1].to_vec(),
+        p2sh[1..].to_vec(),
+        Vec::new(),
+    ];
+
+    for network in Network::iter() {
+        for script in &scripts {
+            let output = output_with_script(script);
+            assert_eq!(
+                output.address(&network),
+                solver_address(&output, &network),
+                "script {}",
+                hex::encode(script),
+            );
+        }
+    }
+}
+
+proptest! {
+    /// Random scripts, including ones that start with a standard prefix, get the
+    /// same address as the solver gives them.
+    #[test]
+    fn output_address_matches_solver(
+        prefix in prop::sample::select(vec![vec![], vec![0x76, 0xa9, 0x14], vec![0xa9, 0x14]]),
+        body in prop::collection::vec(any::<u8>(), 0..30),
+        suffix in prop::sample::select(vec![vec![], vec![0x88, 0xac], vec![0x87]]),
+    ) {
+        let script = [prefix, body, suffix].concat();
+        let output = output_with_script(&script);
+        for network in Network::iter() {
+            prop_assert_eq!(output.address(&network), solver_address(&output, &network));
+        }
+    }
+}

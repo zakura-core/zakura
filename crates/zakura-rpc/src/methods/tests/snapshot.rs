@@ -1078,6 +1078,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     mock_tip_sender.send_best_tip_height(fake_tip_height);
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let mock_address_book = MockAddressBookPeers::new(vec![MetaAddr::new_connected(
         SocketAddr::new(

@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "11.0.0"
+version = "12.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -3009,7 +3009,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.1"
+version = "5.0.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.0.1"
+version = "5.1.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.1"
+version = "5.0.2"
 dependencies = [
  "hex",
  "ripemd",

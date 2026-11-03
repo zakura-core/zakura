@@ -3827,13 +3827,15 @@ mod tests {
 
     /// A service admitted while the session's removal waits keeps the
     /// connection: the last read of the owners comes right before the cancel.
+    /// The kept connection's record is charged as an open one, not retired,
+    /// so a later discovery session can still open on it.
     #[tokio::test(start_paused = true)]
     async fn a_service_admitted_during_session_removal_keeps_the_connection(
     ) -> Result<(), crate::BoxError> {
         let (handle, peer_id, _) = handle_with_session(66, 2).await?;
         let key = DiscoverySessionKey::new(peer_id.clone(), 2, 1);
         let (send, _peer_recv) = framed_channel(16);
-        let (mut io, _states) = test_peer_io(handle.clone(), peer_id, send);
+        let (mut io, states) = test_peer_io(handle.clone(), peer_id.clone(), send);
         // The first check after the timeout, the check after the answer wait,
         // and the check that starts `end` find no owner. The fourth follows
         // the session's removal.
@@ -3846,6 +3848,26 @@ mod tests {
         assert_eq!(owner.calls.load(Ordering::SeqCst), 4);
         assert!(!handle.is_current_session(&key).await, "the session ended");
         assert!(!connection.is_cancelled(), "the new owner keeps it open");
+        let mut states = states
+            .lock()
+            .expect("discovery session-state mutex is never poisoned");
+        assert!(
+            !states.is_retired(&peer_id, 2),
+            "a kept connection keeps its record open"
+        );
+        let record = states
+            .records
+            .get(&(peer_id.clone(), 2))
+            .copied()
+            .expect("the session's record outlives it");
+        assert_eq!(
+            record.failed_attempts, 1,
+            "the timed-out exchange is charged as a session that leaves its connection open"
+        );
+        assert!(
+            states.open(&DiscoverySessionKey::new(peer_id, 2, 2)),
+            "a later discovery session opens on the kept connection"
+        );
         Ok(())
     }
 

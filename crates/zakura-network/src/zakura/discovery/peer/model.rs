@@ -8,8 +8,8 @@ use super::super::{
     wire::SEND_INTERVAL,
 };
 use super::state::{
-    CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, PeerStep, SessionCharge,
-    DISCOVERY_ANSWER_WRITE_DEADLINE, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+    Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, PeerStep,
+    SessionCharge, DISCOVERY_ANSWER_WRITE_DEADLINE, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
 };
 
 /// An answer to a `kind` query, minted by claiming a fresh reservation.
@@ -201,15 +201,11 @@ impl Model {
                 } else {
                     CloseReason::ExchangeTimedOut
                 };
-                (
-                    Line::Done,
-                    charged(
-                        SessionCharge::Retire,
-                        PeerOutput::End {
-                            close: Some(reason),
-                        },
-                    ),
-                )
+                let close = Close {
+                    reason,
+                    if_kept: self.settle_open().charge,
+                };
+                (Line::Done, then(PeerOutput::End { close: Some(close) }))
             }
             (line, input) => unreachable!("the model answered {line:?} with {input:?}"),
         };
@@ -243,7 +239,7 @@ pub struct DiscoverySessionReplaySummary {
     pub charges: usize,
     /// Ownership checks after answer settlement.
     pub closing_owner_checks: usize,
-    /// Connection closes after the required checks.
+    /// Connection close requests after the required checks.
     pub closes: usize,
 }
 
@@ -313,27 +309,32 @@ pub(super) fn run(
                 summary.transitions += 1;
                 match step.charge {
                     Some(SessionCharge::Succeed | SessionCharge::Fail) => summary.charges += 1,
-                    Some(SessionCharge::Retire) => assert!(
-                        matches!(step.next, PeerOutput::End { close: Some(_) }),
-                        "{PROPERTY}: retirement requires close"
-                    ),
+                    Some(SessionCharge::Retire) => {
+                        panic!("{PROPERTY}: only IO's close retires the record")
+                    }
                     None => {}
                 }
+                if let PeerOutput::End {
+                    close: Some(Close { if_kept, .. }),
+                } = step.next
+                {
+                    assert!(
+                        sole_then_settled,
+                        "{PROPERTY}: answers settled before close"
+                    );
+                    assert!(!replaced, "{PROPERTY}: replacement forbids close");
+                    assert_eq!(step.charge, None, "{PROPERTY}: a close charges at IO's end");
+                    assert_ne!(
+                        if_kept,
+                        Some(SessionCharge::Retire),
+                        "{PROPERTY}: a kept connection keeps its record"
+                    );
+                    // A kept connection's charge is this session's one charge.
+                    summary.charges += usize::from(if_kept.is_some());
+                    summary.closes += 1;
+                }
                 assert!(summary.charges <= 1, "{PROPERTY}: one session charge");
-                if let PeerOutput::End { close } = step.next {
-                    if close.is_some() {
-                        assert!(
-                            sole_then_settled,
-                            "{PROPERTY}: answers settled before close"
-                        );
-                        assert!(!replaced, "{PROPERTY}: replacement forbids close");
-                        assert_eq!(
-                            step.charge,
-                            Some(SessionCharge::Retire),
-                            "{PROPERTY}: close retires"
-                        );
-                        summary.closes += 1;
-                    }
+                if let PeerOutput::End { .. } = step.next {
                     break;
                 }
             }

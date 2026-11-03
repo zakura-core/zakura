@@ -72,6 +72,7 @@ pub(in crate::zakura::handler) async fn connect_and_serve(
                     i_open_collision_winner: i_open_collision_winner(&local_id, &remote_id),
                     conn,
                     control_handshake: None,
+                    registration_report: None,
                 },
             )
             .await

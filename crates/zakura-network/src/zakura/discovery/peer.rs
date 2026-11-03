@@ -25,7 +25,9 @@ use std::{sync::Arc, time::Duration};
 use zakura_quic::NodeId;
 use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, Notify, PoisonError};
 
-use state::{CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, SessionCharge};
+use state::{
+    Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, SessionCharge,
+};
 #[cfg(test)]
 pub(super) use state::{
     ExchangeProgress, DISCOVERY_ANSWER_WRITE_DEADLINE, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
@@ -237,25 +239,31 @@ impl PeerIO {
     }
 
     /// Ends the session's serving and queries and releases its admission,
-    /// then closes the connection if `close` names a reason.
+    /// then closes the connection if `close` asks to.
     ///
     /// A service can gain the connection while the session's removal waits for
     /// the discovery lock, so the owners are read again right before the
-    /// cancel, with no wait between the two.
-    async fn end(self, close: Option<CloseReason>) {
-        let close = match close {
-            Some(reason) if self.owners().await == Ownership::Sole => Some(reason),
-            _ => None,
+    /// cancel, with no wait between the two. Only that close retires the
+    /// session's record. A connection that stays open is charged as `close`
+    /// says, and its record stays open to later sessions.
+    async fn end(self, close: Option<Close>) {
+        let sole = match close {
+            Some(_) => self.owners().await == Ownership::Sole,
+            None => false,
         };
         self.session.cancel_token().cancel();
         self.queries.retire();
         self.handle.remove_session(&self.slot.key).await;
-        let Some(reason) = close else {
+        let Some(Close { reason, if_kept }) = close else {
             return;
         };
-        if self.other_service_owns_connection() {
+        if !sole || self.other_service_owns_connection() {
+            if let Some(charge) = if_kept {
+                self.charge(charge);
+            }
             return;
         }
+        self.charge(SessionCharge::Retire);
         self.close_cause.record(match reason {
             CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
             CloseReason::ExchangeComplete => "discovery_exchange_complete",

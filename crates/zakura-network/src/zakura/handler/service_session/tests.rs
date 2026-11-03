@@ -729,6 +729,7 @@ impl RawFixture {
                         i_open_collision_winner: false,
                         conn: ZakuraConnTrace::without_peer(1),
                         control_handshake: None,
+                        registration_report: None,
                     },
                 )
                 .await

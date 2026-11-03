@@ -63,22 +63,32 @@ async fn genesis_read_state(
     (state, read, genesis)
 }
 
-/// A real disk result keeps admission after its worker and database handles end.
+/// Replace `read`'s shared retained-byte budget with one of `limit` bytes.
+fn with_budget(
+    read: &mut crate::service::ReadStateService,
+    limit: u64,
+) -> zakura_node_services::block_memory::ReadMemoryBudget {
+    let budget = zakura_node_services::block_memory::ReadMemoryBudget::new(
+        std::num::NonZeroU64::new(limit).unwrap(),
+    );
+    read.db.read_capacity.memory = budget.clone();
+    budget
+}
+
+/// A real disk result keeps its charge after its worker and database handles end.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_block_results_keep_shared_admission_through_final_payload_holders() {
     use crate::{ReadRequest, ReadResponse};
-    use std::{num::NonZeroU16, time::Duration};
+    use std::time::Duration;
     use tokio::time::timeout;
     use tower::ServiceExt;
     use zakura_node_services::block_memory::{model::Probe, AdmissionFailure, BlockHandle};
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let config = Config {
-        read_block_limit: NonZeroU16::MIN,
-        ..Config::ephemeral()
-    };
-    let (state, read, genesis) = genesis_read_state(config).await;
+    let (state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    // One result fills this budget, so a second holder is refused.
+    let budget = with_budget(&mut read, 1);
 
     let ReadResponse::Block(Some(block)) = timeout(
         deadline,
@@ -95,6 +105,11 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     };
     let probe = Probe::new(owner);
     let bytes = owner.decoded_bytes();
+    assert_eq!(
+        budget.retained_bytes(),
+        bytes,
+        "settled to the measured block"
+    );
     let pool = read.db.read_capacity.blocks.clone();
     let header = block.retained_header();
     let transaction = block.transaction(0).unwrap();
@@ -118,14 +133,13 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
             .unwrap_err(),
         AdmissionFailure::Capacity
     );
-    assert_eq!(pool.reserved_blocks(), 1);
+    assert_eq!(budget.retained_bytes(), bytes, "refusals leave no charge");
     let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
     assert_eq!(actual.measured_bytes, Some(bytes));
     assert_eq!(actual.header_holders, 1);
     assert_eq!(actual.transaction_holders, vec![1]);
-    assert_eq!(pool.reserved_bytes(), bytes);
 
-    // Control reads and tip publication do not spend the data-result allowance.
+    // Control reads and tip publication do not spend the data-result budget.
     timeout(
         deadline,
         read.clone()
@@ -138,21 +152,21 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         .unwrap()
         .unwrap();
     assert_eq!(tip.hash, genesis.hash());
-    assert_eq!(pool.reserved_blocks(), 1);
+    assert_eq!(budget.retained_bytes(), bytes);
     drop(tip);
 
     drop(header);
     assert_eq!(transaction.hash(), genesis.transactions[0].hash());
-    assert_eq!(pool.reserved_blocks(), 1);
+    assert_eq!(budget.retained_bytes(), bytes);
     drop(transaction);
+    assert_eq!(budget.retained_bytes(), 0);
     assert_eq!(pool.reserved_blocks(), 0);
-    assert_eq!(pool.reserved_bytes(), 0);
     let actual = probe.read(1, std::slice::from_ref(&pool)).unwrap();
     assert_eq!(actual.holders, 0);
     assert_eq!(actual.header_holders, 0);
     assert_eq!(actual.transaction_holders, vec![0]);
     assert!(read.db.block(Height(1).into()).unwrap().is_none());
-    assert_eq!(pool.reserved_blocks(), 0);
+    assert_eq!(budget.retained_bytes(), 0, "a missing block has no charge");
 
     let (block, size) = read.db.block_and_size(Height(0).into()).unwrap().unwrap();
     assert_eq!(size, genesis.zcash_serialized_size());
@@ -163,7 +177,11 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     drop(state);
     drop(read);
     assert_eq!(block.hash(), genesis.hash());
-    assert_eq!(pool.reserved_blocks(), 1);
+    assert_eq!(
+        budget.retained_bytes(),
+        bytes,
+        "database teardown keeps the charge"
+    );
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -172,7 +190,7 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
         Some(bytes)
     );
     drop(block);
-    assert_eq!(pool.reserved_blocks(), 0);
+    assert_eq!(budget.retained_bytes(), 0);
     assert_eq!(
         probe
             .read(2, std::slice::from_ref(&pool))
@@ -182,24 +200,35 @@ async fn disk_block_results_keep_shared_admission_through_final_payload_holders(
     );
 }
 
-/// Direct reads, services, and iterators share final-holder transaction admission.
+/// Direct reads, services, and iterators share final-holder transaction charges.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_transactions_keep_shared_admission_through_clones_and_database_drop() {
     use crate::{ReadRequest, ReadResponse};
-    use std::{num::NonZeroU16, time::Duration};
+    use std::time::Duration;
     use tokio::time::timeout;
     use tower::ServiceExt;
     use zakura_node_services::block_memory::{
-        model::PayloadProbe, PayloadAdmissionFailure, TransactionHandle,
+        model::PayloadProbe, ReadMemoryExhausted, TransactionHandle,
     };
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let config = Config {
-        read_transaction_limit: NonZeroU16::MIN,
-        ..Config::ephemeral()
-    };
-    let (state, read, genesis) = genesis_read_state(config).await;
+    let (mut state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    // A second block lets replay hold one block's transaction while it reads the next.
+    let block_1: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        deadline,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let budget = with_budget(&mut read, 1);
     let hash = genesis.transactions[0].hash();
     let ReadResponse::Transaction(Some(result)) = timeout(
         deadline,
@@ -212,11 +241,11 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     };
     assert_eq!(result.tx.hash(), hash);
     assert_eq!(result.height, Height(0));
-    let pool = read.db.read_capacity.transactions.clone();
+    let bytes = genesis.transactions[0].decoded_memory_size_bytes();
     assert_eq!(
-        pool.available_slots(),
-        0,
-        "a returned disk allocation must retain admission"
+        budget.retained_bytes(),
+        bytes,
+        "a returned disk allocation must retain its charge"
     );
     let TransactionHandle::Standalone(owner) = &result.tx else {
         panic!("disk transaction results carry standalone admission")
@@ -230,13 +259,13 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
         Some(genesis.transactions[0].zcash_serialized_size())
     );
     assert_eq!(
-        pool.available_slots(),
-        0,
-        "live payloads retain their original admission"
+        budget.retained_bytes(),
+        bytes,
+        "live payloads retain their original charge"
     );
     assert_eq!(
         read.db.clone().transaction(hash).unwrap_err(),
-        PayloadAdmissionFailure::Capacity
+        ReadMemoryExhausted
     );
     let error = timeout(
         deadline,
@@ -246,14 +275,11 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     .unwrap()
     .unwrap_err();
     assert_eq!(
-        error.downcast_ref::<PayloadAdmissionFailure>(),
-        Some(&PayloadAdmissionFailure::Capacity)
+        error.downcast_ref::<ReadMemoryExhausted>(),
+        Some(&ReadMemoryExhausted)
     );
     let mut refused = read.db.transactions_by_height(Height(0));
-    assert_eq!(
-        refused.next().unwrap().unwrap_err(),
-        PayloadAdmissionFailure::Capacity
-    );
+    assert_eq!(refused.next().unwrap().unwrap_err(), ReadMemoryExhausted);
     assert!(
         refused.next().is_none(),
         "a failed iterator ends after its explicit error"
@@ -263,59 +289,48 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
         .await
         .unwrap()
         .unwrap();
-    use crate::service::finalized_state::disk_format::upgrade::{
-        cancel_channel, DbFormatChange, FormatChangeError,
-    };
-    let (_cancel, cancel_receiver) = cancel_channel();
-    let error = DbFormatChange::check_new_blocks(&read.db)
-        .run_format_change_or_check(&read.db, None, &cancel_receiver)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        FormatChangeError::PayloadAdmission(PayloadAdmissionFailure::Capacity)
-    ));
     use crate::service::read::historical_tree::{
         replay_with_subtrees, DerivedFrontiers, HistoricalTreeDerivationError,
     };
     let replay = || {
-        replay_with_subtrees(&read.db, Height(0), 0, DerivedFrontiers::empty(), |_, _| {
-            panic!("genesis has no shielded commitments")
+        replay_with_subtrees(&read.db, Height(1), 0, DerivedFrontiers::empty(), |_, _| {
+            panic!("the first blocks have no shielded commitments")
         })
     };
     assert!(matches!(
         replay(),
         Err(HistoricalTreeDerivationError::PayloadAdmission(
-            PayloadAdmissionFailure::Capacity
+            ReadMemoryExhausted
         ))
     ));
-    drop(retained);
-    assert_eq!(probe.holders(), 0);
-    assert_eq!(probe.serialized_bytes(), None);
-    assert_eq!(pool.available_slots(), 1);
+    // Startup migrations and offline checks are not network work, so they take no charge.
+    use crate::service::finalized_state::disk_format::upgrade::{cancel_channel, DbFormatChange};
+    let (_cancel, cancel_receiver) = cancel_channel();
     DbFormatChange::check_new_blocks(&read.db)
         .run_format_change_or_check(&read.db, None, &cancel_receiver)
         .unwrap();
-    let replayed = replay().expect("historical replay progresses with one transaction slot");
+    drop(retained);
+    assert_eq!(probe.holders(), 0);
+    assert_eq!(probe.serialized_bytes(), None);
+    assert_eq!(budget.retained_bytes(), 0);
+    let replayed = replay().expect("historical replay progresses with one transaction charge");
     assert_eq!(
         replayed.sapling.root(),
         DerivedFrontiers::empty().sapling.root()
     );
-    assert_eq!(pool.available_slots(), 1);
+    assert_eq!(budget.retained_bytes(), 0);
     assert!(read
         .db
         .transaction(zakura_chain::transaction::Hash([0xff; 32]))
         .unwrap()
         .is_none());
-    assert_eq!(pool.available_slots(), 1);
+    assert_eq!(budget.retained_bytes(), 0);
 
     let mut transactions = read.db.transactions_by_height(Height(0));
     let (location, transaction) = transactions.next().unwrap().unwrap();
     assert_eq!(location.height, Height(0));
     assert_eq!(transaction.hash(), hash);
-    assert_eq!(
-        read.db.transaction(hash).unwrap_err(),
-        PayloadAdmissionFailure::Capacity
-    );
+    assert_eq!(read.db.transaction(hash).unwrap_err(), ReadMemoryExhausted);
     let TransactionHandle::Standalone(owner) = &transaction else {
         panic!("decoded iterators return admitted owners")
     };
@@ -324,31 +339,26 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     drop(state);
     drop(read);
     assert_eq!(probe.holders(), 1);
-    assert_eq!(pool.available_slots(), 0);
+    assert_eq!(budget.retained_bytes(), bytes);
     assert_eq!(transaction.hash(), hash);
     drop(transaction);
     assert_eq!(probe.holders(), 0);
-    assert_eq!(pool.available_slots(), 1);
+    assert_eq!(budget.retained_bytes(), 0);
 }
 
-/// Legacy `FindBlockHeaders` results keep their read admission beyond the state
+/// Legacy `FindBlockHeaders` results keep their read charge beyond the state
 /// boundary, with no unfunded copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn find_block_headers_results_keep_their_read_admission() {
     use crate::{service::StateService, ReadRequest, ReadResponse};
-    use std::{num::NonZeroU16, time::Duration};
+    use std::time::Duration;
     use tokio::time::timeout;
     use tower::ServiceExt;
     use zakura_node_services::block_memory::HeaderHandle;
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let limit = NonZeroU16::new(2).unwrap();
-    let config = Config {
-        read_header_limit: limit,
-        ..Config::ephemeral()
-    };
-    let (mut state, read, _, _) = StateService::new(config, &Mainnet, Height::MAX, 0)
+    let (mut state, mut read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
         .await
         .unwrap();
     for bytes in [
@@ -365,6 +375,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
         .unwrap()
         .unwrap();
     }
+    let budget = with_budget(&mut read, u64::MAX);
     let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -383,35 +394,31 @@ async fn find_block_headers_results_keep_their_read_admission() {
     };
     assert_eq!(headers.len(), 1);
     assert!(matches!(headers[0], HeaderHandle::Standalone(_)));
-    let pool = read.db.read_capacity.headers.clone();
     assert_eq!(
-        pool.available_slots(),
-        usize::from(limit.get()) - 1,
-        "a returned response retains each header's slot"
+        budget.retained_bytes(),
+        // A `usize` size always fits in `u64` on supported targets.
+        std::mem::size_of::<zakura_chain::block::Header>() as u64,
+        "a returned response retains each header's charge"
     );
     drop(headers);
-    assert_eq!(pool.available_slots(), usize::from(limit.get()));
+    assert_eq!(budget.retained_bytes(), 0);
 }
 
-/// Header and serialized block results retain shared admission through final holders.
+/// Header and serialized block results retain shared charges through final holders.
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_header_and_raw_block_results_keep_shared_admission() {
     use crate::{ReadRequest, ReadResponse};
-    use std::{num::NonZeroU16, time::Duration};
+    use std::time::Duration;
     use tokio::time::timeout;
     use tower::ServiceExt;
     use zakura_node_services::block_memory::{
-        model::PayloadProbe, HeaderHandle, PayloadAdmissionFailure,
+        model::PayloadProbe, HeaderHandle, ReadMemoryExhausted,
     };
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let config = Config {
-        read_header_limit: NonZeroU16::MIN,
-        read_raw_block_limit: NonZeroU16::MIN,
-        ..Config::ephemeral()
-    };
-    let (state, read, genesis) = genesis_read_state(config).await;
+    let (state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    let budget = with_budget(&mut read, 1);
     let height_zero = crate::HashOrHeight::Height(Height(0));
     let header_read = ReadRequest::BlockHeader(height_zero);
     let ReadResponse::BlockHeader { header, .. } =
@@ -423,11 +430,11 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         panic!("the stored genesis header is available")
     };
     assert_eq!(*header, *genesis.header);
-    let pool = read.db.read_capacity.headers.clone();
+    let header_bytes = u64::try_from(std::mem::size_of::<zakura_chain::block::Header>()).unwrap();
     assert_eq!(
-        pool.available_slots(),
-        0,
-        "a returned disk header must retain admission"
+        budget.retained_bytes(),
+        header_bytes,
+        "a returned disk header must retain its charge"
     );
     let HeaderHandle::Standalone(owner) = &header else {
         panic!("disk header results carry standalone admission")
@@ -440,14 +447,18 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         probe.serialized_bytes(),
         Some(genesis.header.zcash_serialized_size())
     );
-    assert_eq!(pool.available_slots(), 0, "live clones retain admission");
+    assert_eq!(
+        budget.retained_bytes(),
+        header_bytes,
+        "live clones retain the charge"
+    );
     let error = timeout(deadline, read.clone().oneshot(header_read))
         .await
         .unwrap()
         .unwrap_err();
     assert_eq!(
-        error.downcast_ref::<PayloadAdmissionFailure>(),
-        Some(&PayloadAdmissionFailure::Capacity)
+        error.downcast_ref::<ReadMemoryExhausted>(),
+        Some(&ReadMemoryExhausted)
     );
     let error = timeout(
         deadline,
@@ -460,8 +471,8 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
     .unwrap()
     .unwrap_err();
     assert_eq!(
-        error.downcast_ref::<PayloadAdmissionFailure>(),
-        Some(&PayloadAdmissionFailure::Capacity),
+        error.downcast_ref::<ReadMemoryExhausted>(),
+        Some(&ReadMemoryExhausted),
         "an empty Find response cannot hide a capacity refusal"
     );
     // Chain-context reads and control queries stay available at full capacity.
@@ -472,28 +483,28 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         .unwrap();
     drop(clone);
     assert_eq!(probe.holders(), 0);
-    assert_eq!(pool.available_slots(), 1);
+    assert_eq!(budget.retained_bytes(), 0);
     assert!(read
         .db
         .block_header_result(crate::HashOrHeight::Height(Height(9)))
         .unwrap()
         .is_none());
-    assert_eq!(pool.available_slots(), 1);
+    assert_eq!(budget.retained_bytes(), 0);
 
-    let raw_pool = read.db.read_capacity.raw_blocks.clone();
     let raw = read.db.raw_block_result(height_zero).unwrap().unwrap();
     assert_eq!(
         raw.as_slice(),
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice()
     );
+    let raw_bytes = u64::try_from(raw.capacity()).unwrap();
     assert_eq!(
-        raw_pool.available_slots(),
-        0,
-        "a serialized block result must retain admission"
+        budget.retained_bytes(),
+        raw_bytes,
+        "a serialized block result must retain its charge"
     );
     assert_eq!(
         read.db.raw_block_result(height_zero).unwrap_err(),
-        PayloadAdmissionFailure::Capacity
+        ReadMemoryExhausted
     );
     #[cfg(feature = "indexer")]
     {
@@ -508,8 +519,8 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
         .unwrap()
         .unwrap_err();
         assert_eq!(
-            error.downcast_ref::<PayloadAdmissionFailure>(),
-            Some(&PayloadAdmissionFailure::Capacity),
+            error.downcast_ref::<ReadMemoryExhausted>(),
+            Some(&ReadMemoryExhausted),
             "a short range means the chain ended, so refusal stays explicit"
         );
     }
@@ -520,73 +531,14 @@ async fn disk_header_and_raw_block_results_keep_shared_admission() {
     drop(state);
     drop(read);
     assert_eq!(
-        raw_pool.available_slots(),
-        0,
+        budget.retained_bytes(),
+        raw_bytes,
         "database teardown keeps the charge"
     );
     assert_eq!(clone.len(), genesis.zcash_serialized_size());
     drop(clone);
     assert_eq!(probe.holders(), 0);
-    assert_eq!(raw_pool.available_slots(), 1);
-}
-
-/// Index migration reads progress when four workers share one decode slot.
-#[test]
-fn transaction_index_migrations_progress_with_one_decode_slot() {
-    use crate::service::finalized_state::disk_db::WriteDisk;
-    use crate::service::finalized_state::disk_format::upgrade;
-    use std::num::NonZeroU16;
-
-    let _guard = zakura_test::init();
-    let config = Config {
-        read_transaction_limit: NonZeroU16::MIN,
-        ..Config::ephemeral()
-    };
-    let db = ZakuraDb::new(
-        &config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        &Mainnet,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    )
-    .unwrap();
-    let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let mut batch = DiskWriteBatch::new();
-    let transactions = db.db.cf_handle("tx_by_loc").unwrap();
-    // These rows exercise migration reads; they are not a complete chain fixture.
-    for height in 0..32 {
-        batch.zs_insert(
-            &transactions,
-            crate::TransactionLocation::from_index(Height(height), 1),
-            block.transactions[0].clone(),
-        );
-    }
-    db.write_batch(batch).unwrap();
-    let (_, transaction) = db
-        .transactions_by_height(Height(0))
-        .next()
-        .unwrap()
-        .unwrap();
-    assert_eq!(transaction.hash(), block.transactions[0].hash());
-    drop(transaction);
-    let (_cancel, receiver) = upgrade::cancel_channel();
-    let workers = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
-    workers.install(|| {
-        #[cfg(feature = "indexer")]
-        upgrade::track_tx_locs_by_spends::run(Height(31), &db, &receiver).unwrap();
-        #[cfg(not(feature = "indexer"))]
-        upgrade::drop_tx_locs_by_spends::run(Height(31), &db, &receiver).unwrap();
-    });
-    assert_eq!(db.read_capacity.transactions.available_slots(), 1);
+    assert_eq!(budget.retained_bytes(), 0);
 }
 
 /// Storage round-trip test for block and transaction data in the finalized state database.
@@ -864,31 +816,75 @@ fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
     );
 }
 
-/// Variable-size disk reads charge decoded bytes to their final holder, separately
-/// from parser memory, and a refusal is not reported as missing data.
+/// A disk read reserves the decoded bound of its recorded size before it reads, not the
+/// bound of a maximum-size block, and not only the size it measures after decoding.
 #[tokio::test(flavor = "multi_thread")]
-async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
-    use std::num::NonZeroU64;
-    use zakura_node_services::block_memory::{
-        AdmissionFailure, PayloadAdmissionFailure, ReadMemoryBudget,
-    };
+async fn disk_reads_reserve_their_recorded_bound_before_decoding() {
+    use crate::config::MAX_DECODED_BYTES_PER_WIRE_BYTE;
+    use zakura_node_services::block_memory::{AdmissionFailure, ReadMemoryExhausted};
 
     let _guard = zakura_test::init();
-    let (_state, read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    let (_state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    let serialized = u64::try_from(genesis.zcash_serialized_size()).unwrap();
+    let block_bound = serialized * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+    let transaction_bound = u64::try_from(genesis.transactions[0].zcash_serialized_size()).unwrap()
+        * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+    let limit = 16 * block_bound;
+    let budget = with_budget(&mut read, limit);
+    let db = read.db.clone();
+    let height = Height(0).into();
+    // Another holder leaves exactly `room` bytes of the limit.
+    let leave = |room: u64| budget.try_reserve(limit - room).unwrap();
 
-    let mut db = read.db.clone();
-    let budget = ReadMemoryBudget::new(NonZeroU64::MAX, NonZeroU64::MIN);
-    db.read_capacity.memory = budget.clone();
+    let other = leave(block_bound);
+    assert!(
+        db.block(height).unwrap().is_some(),
+        "the recorded size funds the read without a maximum-size reservation"
+    );
+    drop(other);
+    let other = leave(block_bound - 1);
+    assert_eq!(
+        db.block(height).unwrap_err(),
+        AdmissionFailure::Capacity,
+        "the read reserves its whole bound before it decodes"
+    );
+    drop(other);
+
+    let other = leave(transaction_bound - 1);
+    assert_eq!(
+        db.transaction(genesis.transactions[0].hash()).unwrap_err(),
+        ReadMemoryExhausted,
+        "a transaction reserves its bound before it decodes"
+    );
+    drop(other);
+
+    let other = leave(serialized);
+    assert!(db.raw_block_result(height).unwrap().is_some());
+    drop(other);
+    let other = leave(serialized - 1);
+    assert_eq!(
+        db.raw_block_result(height).unwrap_err(),
+        ReadMemoryExhausted
+    );
+    drop(other);
+    assert_eq!(budget.retained_bytes(), 0);
+}
+
+/// Variable-size disk reads charge decoded bytes to their final holder, and a refusal
+/// is not reported as missing data.
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
+    use zakura_node_services::block_memory::{AdmissionFailure, ReadMemoryExhausted};
+
+    let _guard = zakura_test::init();
+    let (_state, mut read, genesis) = genesis_read_state(Config::ephemeral()).await;
+    let budget = with_budget(&mut read, 1);
+    let db = read.db.clone();
     let height = Height(0).into();
 
     let block = db.block(height).unwrap().unwrap();
     let decoded = genesis.attributed_memory_size_bytes();
     assert_eq!(budget.retained_bytes(), decoded);
-    assert_eq!(
-        budget.parser_bytes(),
-        0,
-        "the parser charge ended with the read"
-    );
 
     assert_eq!(
         db.block(height).unwrap_err(),
@@ -901,15 +897,11 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
     );
     assert_eq!(
         db.raw_block_result(height).unwrap_err(),
-        PayloadAdmissionFailure::Capacity
+        ReadMemoryExhausted
     );
     let hash = genesis.transactions[0].hash();
-    assert_eq!(
-        db.transaction(hash).unwrap_err(),
-        PayloadAdmissionFailure::Capacity
-    );
+    assert_eq!(db.transaction(hash).unwrap_err(), ReadMemoryExhausted);
     assert_eq!(budget.retained_bytes(), decoded, "refusals leave no charge");
-    assert_eq!(budget.parser_bytes(), 0);
 
     let transaction = block.transaction(0).unwrap();
     drop(block);
@@ -917,14 +909,7 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
     drop(transaction);
     assert_eq!(budget.retained_bytes(), 0);
 
-    let (raw, stored_size) = db
-        .raw_block_result(height)
-        .map(|raw| {
-            let raw = raw.expect("the block is stored");
-            let size = raw.len();
-            (raw, size)
-        })
-        .unwrap();
+    let raw = db.raw_block_result(height).unwrap().unwrap();
     assert_eq!(
         raw.as_slice(),
         &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]
@@ -933,6 +918,7 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
         budget.retained_bytes(),
         u64::try_from(raw.capacity()).unwrap()
     );
+    let stored_size = raw.len();
     drop(raw);
 
     let (_, size) = db.block_and_size(height).unwrap().unwrap();
@@ -940,41 +926,4 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
 
     assert!(db.block(Height(1).into()).unwrap().is_none());
     assert_eq!(budget.retained_bytes(), 0, "a missing block has no charge");
-    assert_eq!(budget.parser_bytes(), 0);
-}
-
-/// The parser limit refuses rows before a read copies the rest of a block.
-#[tokio::test(flavor = "multi_thread")]
-async fn parser_limit_refuses_reads_while_another_parser_holds_it() {
-    use std::num::NonZeroU64;
-    use zakura_node_services::block_memory::{
-        AdmissionFailure, DecodedBlockPool, ReadMemoryBudget,
-    };
-
-    let _guard = zakura_test::init();
-    let (_state, read, _) = genesis_read_state(Config::ephemeral()).await;
-
-    let mut db = read.db.clone();
-    let budget = ReadMemoryBudget::new(NonZeroU64::new(8).unwrap(), NonZeroU64::MAX);
-    db.read_capacity.memory = budget.clone();
-
-    let pool = DecodedBlockPool::for_block_count(NonZeroU64::new(4).unwrap());
-    let outer = pool.try_decode_bounded(&budget, |outer_scope| {
-        outer_scope.try_charge(8)?;
-        assert_eq!(
-            db.block(Height(0).into()).unwrap_err(),
-            AdmissionFailure::Capacity,
-            "an active parser holds the whole limit"
-        );
-        assert_eq!(budget.retained_bytes(), 0);
-        assert_eq!(budget.parser_bytes(), 8);
-        Ok(None)
-    });
-    assert!(outer.unwrap().is_none());
-    assert_eq!(budget.parser_bytes(), 0);
-
-    assert!(
-        db.block(Height(0).into()).unwrap().is_some(),
-        "a lone parser finishes above its limit"
-    );
 }

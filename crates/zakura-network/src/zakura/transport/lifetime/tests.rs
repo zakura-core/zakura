@@ -44,10 +44,33 @@ fn one_streams_retained_frames_never_use_another_streams_floor() {
 
 #[test]
 fn a_frame_above_a_budget_clamps_to_it_instead_of_waiting_forever() {
-    let (gate, connection, node) = gate(10, 20);
-    let grant = gate.try_admit(1_000).unwrap();
-    assert_eq!((connection.granted(), node.granted()), (10, 20));
+    let (small, connection, node) = gate(10, 20);
+    let grant = small.try_admit(1_000).unwrap();
+    assert_eq!((connection.granted(), node.granted()), (10, 10));
     drop(grant);
+    let (large, connection, node) = gate(30, 20);
+    let grant = large.try_admit(1_000).unwrap();
+    assert_eq!((connection.granted(), node.granted()), (30, 20));
+    drop(grant);
+}
+
+/// With small windows, a frame above its connection's budget takes only
+/// that connection's share of the node budget, so another connection's
+/// frame still takes shared bytes instead of its floor.
+#[test]
+fn a_large_frame_takes_one_connections_share_of_the_node() {
+    let node = OutputByteBudget::new(20).unwrap();
+    let first = FrameGate::new(OutputByteBudget::new(10).unwrap(), node.clone());
+    let second_connection = OutputByteBudget::new(10).unwrap();
+    let second = FrameGate::new(second_connection.clone(), node.clone());
+    let _large = first.try_admit(16 << 20).unwrap();
+    assert_eq!(node.granted(), 10);
+    let _frame = second.try_admit(10).unwrap();
+    assert_eq!(
+        (second_connection.granted(), node.granted()),
+        (10, 20),
+        "the second connection's frame took shared bytes, not its floor"
+    );
 }
 
 /// A failed node grant returns the connection's bytes at once.

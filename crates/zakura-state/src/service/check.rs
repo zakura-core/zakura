@@ -148,8 +148,8 @@ where
 }
 
 /// Checks the recent-chain rules required for prepared mined-block relay.
-pub(crate) fn block_is_valid_for_recent_chain_data<'a, C>(
-    candidate_block: impl Into<block::BlockView<'a>>,
+pub(crate) fn block_is_valid_for_recent_chain_data<C>(
+    candidate_block: &block::BlockRef,
     candidate_height: block::Height,
     network: &Network,
     finalized_tip_height: Option<block::Height>,
@@ -160,7 +160,6 @@ where
     C: IntoIterator,
     C::Item: Borrow<block::Header>,
 {
-    let candidate_block = candidate_block.into();
     let finalized_tip_height = finalized_tip_height
         .expect("finalized state must contain at least one block to do contextual validation");
     check::block_is_not_orphaned(finalized_tip_height, candidate_height)?;

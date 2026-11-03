@@ -2755,9 +2755,9 @@ where
                         .block(height.into())
                         .map(|block| {
                             (
-                                block.block.view().sapling_transactions_count(),
-                                block.block.view().orchard_transactions_count(),
-                                block.block.view().ironwood_transactions_count(),
+                                block.block.sapling_transactions_count(),
+                                block.block.orchard_transactions_count(),
+                                block.block.ironwood_transactions_count(),
                                 block.block.auth_data_root(),
                             )
                         })
@@ -3736,7 +3736,7 @@ fn check_prepared_mined_relay_eligibility_for_state(
     let history_tree = match history_tree {
         Some(history_tree) => history_tree,
         None if matches!(
-            commitment.block.view().commitment(network)?,
+            commitment.block.commitment(network)?,
             block::Commitment::PreSaplingReserved(_)
                 | block::Commitment::FinalSaplingRoot(_)
                 | block::Commitment::ChainHistoryActivationReserved

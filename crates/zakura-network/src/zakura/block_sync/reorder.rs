@@ -452,7 +452,7 @@ impl BufferedBlockBody {
             BufferedBlockBody::RawFramePayload(_) => 0,
             BufferedBlockBody::Decoded { block, .. }
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => {
-                block.view().attributed_memory_size_bytes()
+                block.attributed_memory_size_bytes()
             }
         }
     }

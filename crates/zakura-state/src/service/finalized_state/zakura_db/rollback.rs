@@ -9,7 +9,7 @@ use std::{
 use semver::Version;
 use zakura_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
-    block::{self, Height},
+    block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
     ironwood, orchard,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
@@ -104,14 +104,6 @@ pub struct RollbackFinalizedStateSummary {
 /// Errors returned by finalized-state rollback.
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackFinalizedStateError {
-    /// A standalone disk transaction could not acquire decode admission.
-    #[error("disk transaction admission failed: {0}")]
-    PayloadAdmission(#[from] zakura_node_services::block_memory::PayloadAdmissionFailure),
-
-    /// Disk block decoding or retention exhausted its admission pool.
-    #[error("disk block admission failed: {0}")]
-    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
-
     /// The state database could not be opened for this configuration.
     #[error("cannot open the state database to roll back: {0}")]
     Database(#[from] StateInitError),
@@ -516,7 +508,7 @@ fn prepare_rollback(
         .map(Height)
     {
         let block = db
-            .block(height.into())?
+            .stored_block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         let semantically_verified = SemanticallyVerifiedBlock::from(block.clone())
             .with_deferred_pool_balance_change(deferred_pool_balance_change(db, height, network)?);
@@ -633,8 +625,7 @@ fn load_modern_treestate_at_height(
     })
 }
 
-fn block_has_sprout_commitments<'a>(block: impl Into<zakura_chain::block::BlockView<'a>>) -> bool {
-    let block = block.into();
+fn block_has_sprout_commitments(block: &Block) -> bool {
     block.sprout_note_commitments().next().is_some()
 }
 
@@ -655,15 +646,8 @@ fn rebuild_history_tree_from_upgrade_activation(
 
     let (block, sapling_root, orchard_root, ironwood_root) =
         history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree = HistoryTree::from_parts(
-        network,
-        zakura_chain::history_tree::HistoryTreeBlockParts::from_block(
-            &block,
-            &sapling_root,
-            &orchard_root,
-            &ironwood_root,
-        ),
-    )?;
+    let mut history_tree =
+        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
         let (block, sapling_root, orchard_root, ironwood_root) =
@@ -686,7 +670,7 @@ fn history_rebuild_inputs_at_height(
     height: Height,
 ) -> Result<
     (
-        zakura_node_services::block_memory::BlockHandle,
+        Arc<Block>,
         zakura_chain::sapling::tree::Root,
         zakura_chain::orchard::tree::Root,
         zakura_chain::ironwood::tree::Root,
@@ -694,7 +678,7 @@ fn history_rebuild_inputs_at_height(
     RollbackFinalizedStateError,
 > {
     let block = db
-        .block(height.into())?
+        .stored_block(height.into())
         .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
     if let Some(roots) = db
@@ -737,7 +721,7 @@ fn rebuild_treestate_to_height(
 
     for height in (Height::MIN.0..=target_height.0).map(Height) {
         let block = db
-            .block(height.into())?
+            .stored_block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
         note_commitment_trees.update_trees_parallel(&block)?;
@@ -804,16 +788,15 @@ fn deferred_pool_balance_change(
 ///
 /// Transparent spender entries for the outputs `block` spent are always deleted. A database
 /// without transparent indexes never writes them, so deleting them is a no-op there.
-fn reverse_transparent_block<'a>(
+fn reverse_transparent_block(
     db: &ZakuraDb,
     network: &Network,
     batch: &mut DiskWriteBatch,
     address_balances: &mut HashMap<transparent::Address, Option<AddressBalanceLocation>>,
     height: Height,
-    block: impl Into<zakura_chain::block::BlockView<'a>>,
+    block: &Arc<Block>,
     skip_transparent_indexes: bool,
 ) -> Result<(), RollbackFinalizedStateError> {
-    let block = block.into();
     // Undo the forward write transaction-by-transaction in reverse order, un-crediting each
     // transaction's created outputs before un-debiting its spent inputs.
     //
@@ -823,7 +806,7 @@ fn reverse_transparent_block<'a>(
     // (see `prepare_transparent_transaction_batch`). Undoing the operations in the exact reverse
     // order retraces those same in-range intermediate balances, so the checked balance arithmetic
     // below cannot spuriously overflow or underflow.
-    for (tx_index, transaction) in block.transactions().enumerate().rev() {
+    for (tx_index, transaction) in block.transactions.iter().enumerate().rev() {
         let tx_location = TransactionLocation::from_usize(height, tx_index);
 
         // Un-credit the outputs this transaction created.
@@ -909,11 +892,11 @@ fn finalized_output(
             hash: outpoint.hash,
         },
     )?;
-    let transaction =
-        db.transaction(outpoint.hash)?
-            .ok_or(RollbackFinalizedStateError::MissingTransaction {
-                hash: outpoint.hash,
-            })?;
+    let transaction = db.stored_transaction(outpoint.hash).ok_or(
+        RollbackFinalizedStateError::MissingTransaction {
+            hash: outpoint.hash,
+        },
+    )?;
     let output = transaction
         .0
         .outputs()
@@ -1001,18 +984,13 @@ fn write_address_balances(
     }
 }
 
-fn delete_shielded_block<'a>(
-    db: &ZakuraDb,
-    batch: &mut DiskWriteBatch,
-    block: impl Into<zakura_chain::block::BlockView<'a>>,
-) {
-    let block = block.into();
+fn delete_shielded_block(db: &ZakuraDb, batch: &mut DiskWriteBatch, block: &Block) {
     let sprout_nullifiers = db.db.cf_handle("sprout_nullifiers").unwrap();
     let sapling_nullifiers = db.db.cf_handle("sapling_nullifiers").unwrap();
     let orchard_nullifiers = db.db.cf_handle("orchard_nullifiers").unwrap();
     let ironwood_nullifiers = db.db.cf_handle("ironwood_nullifiers").unwrap();
 
-    for transaction in block.transactions() {
+    for transaction in &block.transactions {
         for nullifier in transaction.sprout_nullifiers() {
             batch.zs_delete(&sprout_nullifiers, nullifier);
         }
@@ -1028,13 +1006,12 @@ fn delete_shielded_block<'a>(
     }
 }
 
-fn delete_block_and_transaction_data<'a>(
+fn delete_block_and_transaction_data(
     db: &ZakuraDb,
     batch: &mut DiskWriteBatch,
     height: Height,
-    block: impl Into<zakura_chain::block::BlockView<'a>>,
+    block: &Block,
 ) -> Result<(), RollbackFinalizedStateError> {
-    let block = block.into();
     let block_hash = db
         .hash(height)
         .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
@@ -1044,7 +1021,7 @@ fn delete_block_and_transaction_data<'a>(
     batch.zs_delete(db.db.cf_handle("height_by_hash").unwrap(), block_hash);
     batch.zs_delete(db.db.cf_handle(BLOCK_INFO).unwrap(), height);
 
-    for tx_index in 0..block.transactions().len() {
+    for tx_index in 0..block.transactions.len() {
         let tx_location = TransactionLocation::from_usize(height, tx_index);
         let tx_hash = db
             .transaction_hash(tx_location)

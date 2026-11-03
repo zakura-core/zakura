@@ -76,13 +76,8 @@ impl BlockRangeSnapshot {
                 return (bytes.len() <= max_bytes).then_some(bytes);
             }
         }
-        // Each worker reads one block at a time, so the worker partition bounds this parser.
-        db.raw_block_bytes_within(
-            height.into(),
-            max_bytes,
-            &mut zakura_node_services::block_memory::ParseScope::statically_bounded(),
-        )
-        .expect("a statically bounded parser scope never refuses a charge")
+        // Each worker reads one block at a time, so the worker partition bounds this read.
+        db.raw_block_bytes_within(height.into(), max_bytes)
     }
 }
 

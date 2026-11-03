@@ -371,7 +371,7 @@ impl StartCmd {
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
             .sync
-            .backend_verification_total()
+            .backend_verification_total(&config.network.network)
             .map_err(|error| eyre!(error))?;
         info!(
             backend_verifications,
@@ -3079,11 +3079,11 @@ mod zakura_header_sync_driver_tests {
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
 
         assert_eq!(
-            block_apply_class((&block1).into(), block::Height(1)),
+            block_apply_class(&block1, block::Height(1)),
             BlockApplyClass::Checkpoint
         );
         assert_eq!(
-            block_apply_class((&block2).into(), block::Height(1)),
+            block_apply_class(&block2, block::Height(1)),
             BlockApplyClass::Full
         );
     }
@@ -4626,6 +4626,65 @@ mod zakura_header_sync_driver_tests {
         assert_failed_block_driver_drains_before_node_shutdown(true).await;
     }
 
+    /// A checkpoint apply can wait forever for the rest of its range. After
+    /// accounting closes, the drain abandons it once its bound passes, so the
+    /// driver exits and the node shuts down.
+    #[tokio::test(start_paused = true)]
+    async fn accounting_failure_abandons_an_apply_that_never_finishes() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let held = Arc::downgrade(&block1);
+        let hash = block1.hash();
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let (block_sync, mut controls) = zakura_network::zakura::BlockSyncHandle::detached();
+        // Nothing notifies this, so the verifier never answers.
+        let never = Arc::new(tokio::sync::Notify::new());
+        let (verifier, mut commits) =
+            height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(never));
+        let handoff = super::zakura::SyncCoordinator::new();
+        let (driver, _shutdown) = DriverParams {
+            handoff: handoff.clone(),
+            ..DriverParams::default()
+        }
+        .spawn(
+            action_rx,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            fixed_tip_read_state(block::Height(1), hash),
+            verifier,
+        );
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
+                token: 1,
+                block: block1.into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(commits.recv().await, Some(block::Height(1)));
+
+        controls.fail_accounting();
+        tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!driver.is_finished(), "the drain waits out its bound");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("the drain bound ends the drain")
+            .expect("the driver drains without panic");
+
+        assert!(held.upgrade().is_none(), "abandoning releases the body");
+        assert!(matches!(
+            controls.try_next_control(),
+            Some(BlockSyncEvent::BlockApplyFinished { token: 1, .. })
+        ));
+        assert!(
+            !matches!(
+                handoff.apply_phase(),
+                zakura_node_services::sync_lifecycle::ApplyPhase::Failed { .. }
+            ),
+            "the abandoned operation gets a terminal result"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn closed_action_channel_drains_the_block_driver_before_node_shutdown() {
         assert_failed_block_driver_drains_before_node_shutdown(false).await;
@@ -4803,7 +4862,7 @@ mod zakura_header_sync_driver_tests {
         let source = test_block_source();
 
         let Some((height, hash, result, event)) =
-            abandoned_block_apply_finished_event(owner, source, 99, block.as_ref().into())
+            abandoned_block_apply_finished_event(owner, source, 99, &block)
         else {
             panic!("test block has a coinbase height");
         };

@@ -47,12 +47,30 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// bound sockets' datagram queues: 15 GiB. CTRL-26 in the zakura-quic spec
 /// lists what it leaves out.
 ///
-/// It funds [`DEFAULT_ZAKURA_MAX_CONNECTIONS`] at the default windows and
-/// reactor shares on every network. On the one socket the default
-/// `listen_addr` binds, Regtest's larger header share needs the most:
-/// 256 MiB + 32 × 64 MiB + 92 × 144,030,963 B = 15,666,767,700 B, which rounds
-/// up to 15 GiB.
-pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = 15 * GIB;
+/// It is what admission charges for [`DEFAULT_ZAKURA_MAX_CONNECTIONS`] at the
+/// default windows and reactor shares on the one socket the default
+/// `listen_addr` binds, rounded up to a whole GiB. Regtest's larger header
+/// share needs the most: 256 MiB + 32 × 64 MiB + 92 × 144,030,963 B =
+/// 15,666,767,700 B.
+pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = {
+    let mainnet = default_budget_need(default_connection_memory(CommonMessage::BUDGET));
+    let regtest = default_budget_need(default_connection_memory(RegtestMessage::BUDGET));
+    let need = if mainnet > regtest { mainnet } else { regtest };
+    // Widening u64 to u128 is lossless. The need is about 15 GiB, so its GiB
+    // count fits in u64.
+    need.div_ceil(GIB as u128) as u64 * GIB
+};
+
+/// The QUIC memory admission charges for the default connection count and
+/// handshake headroom at `memory`, on one socket.
+const fn default_budget_need(memory: ConnectionMemory) -> u128 {
+    budgeted_quic_bytes(
+        1,
+        memory,
+        DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
+    )
+}
 
 /// Fewest connections a peer memory budget must admit, whatever the bootstrap
 /// list (see [`min_budgeted_connections`]).
@@ -293,6 +311,8 @@ mod tests {
         assert_eq!(QuicConfig::default().connection_memory_bytes(), HANDSHAKE);
 
         assert_eq!(DEFAULT_ZAKURA_MAX_CONNECTIONS, 92);
+        // Regtest's need, 15,666,767,700 B, rounded up to a whole GiB.
+        assert_eq!(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, 16_106_127_360);
         assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 96);
         // Every admitted connection at its full window, every handshake, and the
         // one socket the default `listen_addr` binds fit on every network.

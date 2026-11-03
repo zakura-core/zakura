@@ -16,13 +16,13 @@ fn gate(capacity: u64) -> (FrameGate, OutputByteBudget) {
 const HEADERS: Stream = Stream {
     kind: 5,
     capability: 1 << 5,
-    frame_cap: 1024,
+    frame_cap: 20,
     ..Stream::PERSISTENT
 };
 const BLOCKS: Stream = Stream {
     kind: 6,
     capability: 1 << 6,
-    frame_cap: 1024,
+    frame_cap: 20,
     ..Stream::PERSISTENT
 };
 
@@ -181,12 +181,27 @@ fn quic_shares_keep_the_configured_windows() {
 }
 
 #[test]
-#[should_panic(expected = "must hold its largest frame")]
+#[should_panic(expected = "output share of 19 bytes must hold its largest frame")]
 fn an_output_share_below_its_largest_frame_is_refused() {
     let small = ReactorShares {
         other: ReactorBudget {
-            receive: 1024,
-            output: 1023,
+            receive: 20,
+            output: 19,
+        },
+        ..shares()
+    };
+    let _ = NodeResources::new(small, [BLOCKS], 4096);
+}
+
+/// A frame above its raw gate takes the whole gate, so a receive share below
+/// the kind's largest frame would charge that frame less than it holds.
+#[test]
+#[should_panic(expected = "receive share of 19 bytes must hold its largest frame")]
+fn a_receive_share_below_its_largest_frame_is_refused() {
+    let small = ReactorShares {
+        other: ReactorBudget {
+            receive: 19,
+            output: 20,
         },
         ..shares()
     };

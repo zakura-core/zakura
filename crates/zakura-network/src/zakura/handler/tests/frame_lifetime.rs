@@ -155,7 +155,7 @@ async fn a_full_kind_leaves_its_unread_frame_out_of_the_usage_report() -> Result
         control_receive_bytes: 1 << 20,
         kinds: Vec::new(),
         other: ReactorBudget {
-            receive: 64,
+            receive: 1024,
             output: 1024,
         },
     };
@@ -164,11 +164,11 @@ async fn a_full_kind_leaves_its_unread_frame_out_of_the_usage_report() -> Result
 
     let mut paused = tabled_context(None, 128);
     paused.resources = stream_of(&connection, PAUSED.kind);
-    let full = paused.resources.raw.try_admit(64).unwrap();
+    let full = paused.resources.raw.try_admit(1024).unwrap();
     let mut flowing = tabled_context(None, 128);
     flowing.resources = stream_of(&connection, FLOWING.kind);
     assert_eq!(node.usage().owners.setup, 2);
-    assert_eq!(node.usage().raw_bytes(), 64);
+    assert_eq!(node.usage().raw_bytes(), 1024);
 
     let bytes = frame_bytes(1, 16);
     let (_paused_peer_send, _paused_peer_recv, send, recv) = link.open(&bytes).await?;
@@ -189,12 +189,12 @@ async fn a_full_kind_leaves_its_unread_frame_out_of_the_usage_report() -> Result
     let usage = node.usage();
     assert_eq!(
         usage.raw_bytes(),
-        64 + frame_wire_bytes(16),
+        1024 + frame_wire_bytes(16),
         "the unread frame adds no raw charge"
     );
     assert_eq!(
         usage.kinds.iter().map(|kind| kind.raw_bound).sum::<u64>(),
-        128
+        2048
     );
 
     drop(full);
@@ -363,9 +363,9 @@ async fn a_full_kind_gate_leaves_other_kinds_flowing() -> Result<(), BoxError> {
     const HEADERS: Stream = test_stream(905, StreamMode::Persistent);
     const BLOCKS: Stream = test_stream(906, StreamMode::Persistent);
     let mut link = Link::connect().await?;
-    let connection = connection_gates(&[HEADERS, BLOCKS], 64, 1024);
+    let connection = connection_gates(&[HEADERS, BLOCKS], 1024, 1024);
     let headers = stream_of(&connection, HEADERS.kind);
-    let full = headers.raw.try_admit(64).unwrap();
+    let full = headers.raw.try_admit(1024).unwrap();
 
     let bytes = frame_bytes(1, 16);
     let mut header_context = tabled_context(None, 128);

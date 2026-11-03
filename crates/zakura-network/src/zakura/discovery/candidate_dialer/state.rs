@@ -85,14 +85,14 @@ pub(super) enum DialObservation {
 /// goes on waiting for its own dial.
 ///
 /// A registration is keyed by peer, so it cannot say which connection it came
-/// from. `authenticated` says whether this attempt's dial passed TLS, which the
-/// dial reports before it registers the peer. A registration without it belongs
-/// to another connection, so it earns this attempt no success and no failure.
-/// A dial that ended without registering its peer, as [`DialFinish::Refused`]
-/// says, earns no registration credit even when it authenticated.
+/// from. `registered` says whether this attempt's own dial reported that the
+/// supervisor registered the peer on its connection. A registration without
+/// that report belongs to another connection, so it earns this attempt no
+/// success and no failure. A dial that authenticated and was then refused
+/// before registration, as [`DialFinish::Refused`] says, earns no credit.
 pub(super) fn classify_dial(
     observation: DialObservation,
-    authenticated: bool,
+    registered: bool,
 ) -> Option<DiscoveryDialResult> {
     use DiscoveryDialResult as Result;
     Some(match observation {
@@ -100,7 +100,7 @@ pub(super) fn classify_dial(
         // The registration watch can lag a dial that already finished serving.
         DialObservation::DialEnded(_, PeerRegistration::Ended)
         | DialObservation::DialEnded(DialFinish::Served, PeerRegistration::Absent)
-            if authenticated =>
+            if registered =>
         {
             Result::ShortLivedRegistered
         }
@@ -109,9 +109,9 @@ pub(super) fn classify_dial(
             DialFinish::AlpnMismatch => Result::AlpnMismatch,
             DialFinish::Served | DialFinish::Refused | DialFinish::Failed => Result::Failed,
         },
-        DialObservation::RegistrationHealthy if authenticated => Result::Registered,
+        DialObservation::RegistrationHealthy if registered => Result::Registered,
         DialObservation::RegistrationHealthy => Result::ConnectedElsewhere,
-        DialObservation::RegistrationEnded if authenticated => Result::ShortLivedRegistered,
+        DialObservation::RegistrationEnded if registered => Result::ShortLivedRegistered,
         DialObservation::RegistrationEnded => return None,
         DialObservation::WatchClosed => Result::Failed,
     })

@@ -7,7 +7,12 @@
 //! Transport samples (TCP RTT, congestion window, queued bytes) belong on `send_done` rows: add
 //! their fields to [`P2pRow`] and their columns to `tables::P2P`.
 
-use std::{fmt, sync::atomic::Ordering, time::Instant};
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::{atomic::Ordering, Mutex},
+    time::Instant,
+};
 
 use serde::{Serialize, Serializer};
 use zakura_chain::{block, serialization::ZcashSerialize};
@@ -22,6 +27,58 @@ use crate::protocol::external::{InventoryHash, Message, Nonce};
 /// message. A peer can send a far longer inventory list, and without a limit one message would
 /// produce a row of several megabytes. `item_count` and `tx_count` still count the whole message.
 pub(super) const MAX_ROW_BLOCK_HASHES: usize = 500;
+
+/// The number of recent block sizes [`BlockSizes`] keeps.
+///
+/// A node sends and receives the same few tip blocks on every connection, so a short list
+/// avoids almost every repeated serialization.
+const RECENT_BLOCK_SIZES: usize = 16;
+
+/// Serialized sizes of recently traced blocks.
+///
+/// Computing a block's size walks its whole serialization. Without this cache, a block sent to
+/// every peer would be serialized once per traced `block` row.
+#[derive(Debug, Default)]
+pub(super) struct BlockSizes(Mutex<VecDeque<(block::Hash, u64)>>);
+
+impl BlockSizes {
+    /// Returns the serialized size of `block`, computing it only if `hash` is not cached.
+    fn get_or_compute(&self, hash: block::Hash, block: &block::Block) -> u64 {
+        let cached = self
+            .0
+            .lock()
+            .expect("block size cache lock is not poisoned")
+            .iter()
+            .find(|(cached, _)| *cached == hash)
+            .map(|(_, size)| *size);
+        if let Some(size) = cached {
+            return size;
+        }
+
+        // Serialize outside the lock, so other connections are not blocked meanwhile.
+        let size = saturating_count(block.zcash_serialized_size());
+        let mut sizes = self
+            .0
+            .lock()
+            .expect("block size cache lock is not poisoned");
+        if !sizes.iter().any(|(cached, _)| *cached == hash) {
+            if sizes.len() == RECENT_BLOCK_SIZES {
+                sizes.pop_front();
+            }
+            sizes.push_back((hash, size));
+        }
+        size
+    }
+
+    /// Records `size` for `hash`, so tests can tell a cached size from a computed one.
+    #[cfg(test)]
+    pub(super) fn insert(&self, hash: block::Hash, size: u64) {
+        self.0
+            .lock()
+            .expect("block size cache lock is not poisoned")
+            .push_back((hash, size));
+    }
+}
 
 /// A send recorded by [`ConnectionTrace::p2p_send_start`], completed by
 /// [`ConnectionTrace::p2p_send_done`].
@@ -117,7 +174,7 @@ impl ConnectionTrace {
         let seq = state.next_seq.fetch_add(1, Ordering::Relaxed);
         let msg_type = msg.command();
         state.emitter.emit_event(|| P2pRow {
-            summary: Some(summarize(msg)),
+            summary: Some(summarize(msg, &state.block_sizes)),
             ..state.row(self.id, "send_start", Some(seq), msg_type)
         });
 
@@ -154,7 +211,7 @@ impl ConnectionTrace {
         };
 
         state.emitter.emit_event(|| P2pRow {
-            summary: Some(summarize(msg)),
+            summary: Some(summarize(msg, &state.block_sizes)),
             ..state.row(self.id, "recv", None, msg.command())
         });
     }
@@ -184,7 +241,9 @@ impl ConnectionState {
 }
 
 /// Extracts identifying fields from `msg` without copying its payload.
-fn summarize(msg: &Message) -> MessageSummary<'_> {
+///
+/// Block sizes come from `block_sizes`, so a block is serialized at most once while it is cached.
+fn summarize<'a>(msg: &'a Message, block_sizes: &BlockSizes) -> MessageSummary<'a> {
     match msg {
         Message::Version(version) => MessageSummary {
             height: Some(version.start_height.0),
@@ -223,12 +282,15 @@ fn summarize(msg: &Message) -> MessageSummary<'_> {
             item_count: Some(saturating_count(addrs.len())),
             ..MessageSummary::default()
         },
-        Message::Block(block) => MessageSummary {
-            hash: Some(block.hash().to_string()),
-            height: block.coinbase_height().map(|height| height.0),
-            body_bytes: Some(saturating_count(block.zcash_serialized_size())),
-            ..MessageSummary::default()
-        },
+        Message::Block(block) => {
+            let hash = block.hash();
+            MessageSummary {
+                hash: Some(hash.to_string()),
+                height: block.coinbase_height().map(|height| height.0),
+                body_bytes: Some(block_sizes.get_or_compute(hash, block)),
+                ..MessageSummary::default()
+            }
+        }
         Message::Tx(tx) => MessageSummary {
             hash: Some(tx.id().mined_id().to_string()),
             body_bytes: Some(saturating_count(tx.size())),

@@ -46,6 +46,8 @@ static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct LifecycleTrace {
     emitter: Option<JsonlEventEmitter>,
     next_broadcast_id: Arc<AtomicU64>,
+    /// Shared by every connection, so a broadcast serializes its block once, not once per peer.
+    block_sizes: Arc<p2p::BlockSizes>,
 }
 
 impl LifecycleTrace {
@@ -60,6 +62,7 @@ impl LifecycleTrace {
             emitter: selected
                 .then(|| JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id())),
             next_broadcast_id: Arc::new(AtomicU64::new(1)),
+            block_sizes: Arc::default(),
         }
     }
 
@@ -92,6 +95,7 @@ impl LifecycleTrace {
                 queued: AtomicU64::new(0),
                 active: Mutex::new(None),
                 dispatching: Mutex::new(None),
+                block_sizes: self.block_sizes.clone(),
             })),
         }
     }
@@ -133,6 +137,8 @@ struct ConnectionState {
     active: Mutex<Option<request::ActiveRequest>>,
     /// The identifier of the request the peer set is handing to this connection's client.
     dispatching: Mutex<Option<u64>>,
+    /// Serialized sizes of recently traced blocks, shared by every connection.
+    block_sizes: Arc<p2p::BlockSizes>,
 }
 
 impl ConnectionTrace {

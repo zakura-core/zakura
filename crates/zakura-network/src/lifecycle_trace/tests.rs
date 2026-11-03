@@ -411,6 +411,33 @@ fn p2p_block_rows_record_hash_height_and_size() {
 }
 
 #[test]
+fn p2p_block_rows_reuse_cached_block_sizes() {
+    use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+
+    let (trace, mut rx) = capture(JsonlTraceTables::all());
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    let other: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    // A size no serialization produces shows that the row reads the cache.
+    trace.block_sizes.insert(block.hash(), 7);
+
+    let sender = trace.connection(false, "first");
+    let receiver = trace.connection(true, "second");
+    sender.p2p_recv(&Message::Block(block.clone()));
+    receiver.p2p_recv(&Message::Block(block));
+    sender.p2p_recv(&Message::Block(other.clone()));
+    receiver.p2p_recv(&Message::Block(other.clone()));
+
+    let rows = rows(&drain(&mut rx), tables::P2P);
+    let sizes: Vec<_> = rows.iter().map(|row| row["body_bytes"].clone()).collect();
+    let other_size = other.zcash_serialized_size().to_string();
+    assert_eq!(sizes, ["7", "7", other_size.as_str(), other_size.as_str()]);
+}
+
+#[test]
 fn unselected_tables_build_no_rows() {
     let (trace, mut rx) = capture(JsonlTraceTables::from_names(["mining"]).unwrap());
     let conn = trace.connection(false, "quiet");

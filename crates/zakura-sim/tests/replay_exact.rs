@@ -1766,11 +1766,12 @@ fn discovery_book_records_and_replays_signed_samples() {
     assert!(books().all(|book| book.actual == book.expected));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
+    // The property applies from the first step whose prefix reaches the
+    // trigger, so 13 of the input's 20 steps count.
+    assert_eq!(trace.steps.len(), 20);
     assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Held {
-            applicable: u32::try_from(trace.steps.len()).unwrap()
-        }
+        PropertyOutcome::Held { applicable: 13 }
     );
     replay_in_child(dir.path());
 

@@ -1411,7 +1411,7 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
     .unwrap();
     assert_eq!(trace.steps.len(), FUNDING_INPUT.len() / 4 + 1);
     assert_eq!(trace.meta.scenario["input"], json!(FUNDING_INPUT));
-    assert_eq!(trace.meta.generator, 1);
+    assert_eq!(trace.meta.generator, 2);
     assert!(trace
         .steps
         .iter()

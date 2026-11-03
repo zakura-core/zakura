@@ -1,6 +1,10 @@
 //! Runtime-owner histories over the real queue and an independent funding ledger.
 //!
-//! Decoder 1 reads at most 128 quadruples without padding the final input.
+//! Generator 2 runs the queue under [`OWNER_CAP`], so admission also refuses a
+//! request that would take its session past the owner cap. Generator 1 ran an
+//! uncapped queue. Both read the same bytes.
+//!
+//! The decoder reads at most 128 quadruples without padding the final input.
 //! The first byte selects one of 25 operations. The remaining bytes select
 //! bounded heights, request/receipt indices, ranges and estimates.
 //! Operations cover extend, take, admit, publish, writer start/completion,
@@ -26,6 +30,14 @@ use crate::zakura::{
 
 const LIMIT: u64 = 1_000;
 const PROPERTY: &str = "block/work-funding";
+
+/// The owner cap the driver's queue admits against: an above-floor request
+/// may bring its session's published reservations to [`LIMIT`], and a floor
+/// request, which may also overdraw the budget, to 1,500 bytes.
+const OWNER_CAP: OwnerReservationCap = OwnerReservationCap {
+    above_floor: LIMIT,
+    floor: 1_500,
+};
 
 /// A request's retained runtime owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +239,7 @@ struct Driver {
 impl Driver {
     fn new() -> Self {
         let budget = ByteBudget::new(LIMIT);
-        let work = Arc::new(WorkQueue::new(height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::new(height(0), budget.clone()).with_owner_cap(OWNER_CAP));
         work.lock().state.set_estimate_floor(1);
         Self {
             work,
@@ -429,6 +441,16 @@ impl Driver {
         });
     }
 
+    /// The ledger charge the model's in-flight heights hold for `session`.
+    fn session_charge(&self, session: u64) -> u64 {
+        self.model
+            .entries
+            .values()
+            .filter(|entry| entry.owner.is_some_and(|owner| owner.session_id == session))
+            .map(|entry| entry.charge)
+            .sum()
+    }
+
     fn admit(&mut self, index: usize, floor: u32) -> Result<(), String> {
         if self.expected_requests[index].view.phase != FundingRequestPhase::Taken {
             return Ok(());
@@ -445,6 +467,15 @@ impl Driver {
             .is_unpublished(current.view.owner.unwrap(), &current.view.heights)
         {
             Err("StaleClaim")
+        } else if self.session_charge(current.view.owner.unwrap().session_id)
+            + current.taken_estimates.iter().sum::<u64>()
+            > if current.view.heights[0] > floor + 1 {
+                OWNER_CAP.above_floor
+            } else {
+                OWNER_CAP.floor
+            }
+        {
+            Err("OwnerCap")
         } else if self.expected().reserved + current.taken_estimates.iter().sum::<u64>() > LIMIT
             && current.view.heights[0] > floor + 1
         {
@@ -926,7 +957,7 @@ fn compare_views(actual: &WorkFundingView, expected: &WorkFundingView) -> Result
     equal(actual, expected, "runtime funding view")
 }
 
-/// Run decoder-v1 runtime-owner inputs and observe obligations before queue destruction.
+/// Run generator-2 runtime-owner inputs and observe obligations before queue destruction.
 /// This target is distinct from the preserved pure-state decoder and consumes at most 512 bytes.
 pub fn trace_work_funding_bytes(data: &[u8]) -> WorkFundingHistory {
     let mut driver = Driver::new();
@@ -1068,6 +1099,25 @@ mod tests {
         );
         assert_eq!(history.steps[12].actual.reserved, 300);
         assert_eq!(history.steps.last().unwrap().actual.quarantined, 0);
+    }
+
+    /// One session publishes 1,000 above-floor bytes, overdraws 500 more
+    /// with a floor request, and its next floor request would pass the floor
+    /// total. The same bytes are the committed `block-work-owner-cap.bin`.
+    pub(super) const OWNER_CAP_INPUT: &[u8] = &[
+        0, 0, 7, 249, 1, 2, 31, 10, 2, 0, 0, 0, 3, 0, 0, 0, 1, 6, 15, 5, 2, 1, 6, 0, 3, 1, 0, 0, 0,
+        8, 1, 249, 1, 8, 7, 3, 2, 2, 8, 0,
+    ];
+
+    #[test]
+    fn owner_cap_refuses_a_floor_request_past_the_floor_overdraft() {
+        let history = check(OWNER_CAP_INPUT);
+        let published = &history.steps[6].actual;
+        assert_eq!(published.queue.reserved, 1_500);
+        assert_eq!(published.reserved, 1_500);
+        let refused = &history.steps[9].actual;
+        assert_eq!(refused.requests[2].phase, FundingRequestPhase::Dropped);
+        assert_eq!(refused.reserved, 1_500);
     }
 
     #[test]

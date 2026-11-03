@@ -139,7 +139,13 @@ impl ReactorState {
         first_unclaimed: Option<block::Height>,
     ) -> WorkReads {
         let best_header_tip = self.progress.best_header_tip;
-        if work_from(first_unclaimed, best_header_tip, self.verified_tip_diverged()).is_none() {
+        if work_from(
+            first_unclaimed,
+            best_header_tip,
+            self.verified_tip_diverged(),
+        )
+        .is_none()
+        {
             return WorkReads::Idle;
         }
         WorkReads::Facts {
@@ -549,12 +555,18 @@ impl QueryState {
                 Some(refresh.revision),
             ),
             QueryStart::Work(work) => {
-                let Some(from) =
-                    work_from(work.first_unclaimed, request.best_header_tip, request.diverged)
-                else {
+                let Some(from) = work_from(
+                    work.first_unclaimed,
+                    request.best_header_tip,
+                    request.diverged,
+                ) else {
                     return QueryPlan::Idle;
                 };
-                if !force && work.backlog.is_some_and(|backlog| backlog >= work.low_water) {
+                if !force
+                    && work
+                        .backlog
+                        .is_some_and(|backlog| backlog >= work.low_water)
+                {
                     return QueryPlan::Idle;
                 }
                 (

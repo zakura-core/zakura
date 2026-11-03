@@ -211,9 +211,9 @@ impl LegacyGossipFrame {
     /// Convert a legacy network request into a gossip frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
-            Request::AdvertiseBlock(hash, _)
-            | Request::AdvertiseBlockToAll(hash)
-            | Request::AdvertiseMinedBlock(hash) => Ok(Self::AdvertiseBlock(hash)),
+            Request::AdvertiseBlock(block, _)
+            | Request::AdvertiseBlockToAll(block)
+            | Request::AdvertiseMinedBlock(block) => Ok(Self::AdvertiseBlock(block.hash)),
             Request::AdvertiseTransactionIds(ids, _) => Self::advertise_transaction_ids(ids),
             request => Err(LegacyGossipError::UnsupportedRequest(request.command())),
         }
@@ -281,7 +281,7 @@ impl LegacyGossipFrame {
     fn into_request(self, peer_id: ZakuraPeerId) -> Request {
         match self {
             Self::AdvertiseBlock(hash) => {
-                Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id)))
+                Request::AdvertiseBlock(hash.into(), Some(PeerSource::Zakura(peer_id)))
             }
             Self::AdvertiseTransactionIds(ids) => Request::AdvertiseTransactionIds(
                 ids.into_iter().collect(),
@@ -4250,11 +4250,14 @@ mod tests {
         adapter
             .ready()
             .await?
-            .call(Request::AdvertiseBlockToAll(block_hash))
+            .call(Request::AdvertiseBlockToAll(block_hash.into()))
             .await?;
 
         match recv_request(&mut rx_b).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(peer_id)),
+            ) => {
                 assert_eq!(hash, block_hash);
                 assert_eq!(peer_id, a_peer_id);
             }
@@ -4621,11 +4624,14 @@ mod tests {
         gossip
             .ready()
             .await?
-            .call(Request::AdvertiseBlockToAll(block.hash()))
+            .call(Request::AdvertiseBlockToAll(block.hash().into()))
             .await?;
 
         match recv_request(&mut rx_b).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(peer_id)),
+            ) => {
                 assert_eq!(hash, block.hash());
                 // C may forward the announcement before the direct A-to-B stream arrives.
                 assert!(peer_id == a_peer_id || peer_id == c_peer_id);
@@ -4633,7 +4639,10 @@ mod tests {
             request => panic!("unexpected B request: {request:?}"),
         }
         match recv_request(&mut rx_c).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(peer_id)),
+            ) => {
                 assert_eq!(hash, block.hash());
                 assert!(peer_id == a_peer_id || peer_id == b_peer_id);
             }
@@ -4778,7 +4787,10 @@ mod tests {
             .await?;
 
         match recv_request(&mut gossip_rx).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(source))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(source)),
+            ) => {
                 assert_eq!(hash, block_hash(12));
                 assert_eq!(source, peer_id);
             }
@@ -5321,18 +5333,24 @@ mod tests {
         adapter
             .ready()
             .await?
-            .call(Request::AdvertiseBlockToAll(block_hash))
+            .call(Request::AdvertiseBlockToAll(block_hash.into()))
             .await?;
 
         match recv_request(&mut rx_b).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(peer_id)),
+            ) => {
                 assert_eq!(hash, block_hash);
                 assert_eq!(peer_id, a_peer_id);
             }
             request => panic!("unexpected B request: {request:?}"),
         }
         match recv_request(&mut rx_c).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(peer_id)),
+            ) => {
                 assert_eq!(hash, block_hash);
                 assert_eq!(peer_id, b_peer_id);
             }
@@ -5343,7 +5361,7 @@ mod tests {
         adapter
             .ready()
             .await?
-            .call(Request::AdvertiseBlockToAll(block_hash))
+            .call(Request::AdvertiseBlockToAll(block_hash.into()))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(rx_c.try_recv().is_err());
@@ -5368,7 +5386,7 @@ mod tests {
         adapter
             .ready()
             .await?
-            .call(Request::AdvertiseBlockToAll(block_hash))
+            .call(Request::AdvertiseBlockToAll(block_hash.into()))
             .await?;
         let _ = recv_request(&mut rx_b).await?;
 
@@ -5847,7 +5865,10 @@ mod tests {
             .await?;
 
         match recv_request(&mut request_rx).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(source))) => {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(source)),
+            ) => {
                 assert_eq!(hash, block_hash(5));
                 assert_eq!(source, peer_id);
             }
@@ -7240,11 +7261,13 @@ mod tests {
         );
 
         for request in [
-            Request::AdvertiseBlockToAll(block_hash(9)),
-            Request::AdvertiseMinedBlock(block_hash(10)),
+            Request::AdvertiseBlockToAll(block_hash(9).into()),
+            Request::AdvertiseMinedBlock(block_hash(10).into()),
         ] {
             let hash = match &request {
-                Request::AdvertiseBlockToAll(hash) | Request::AdvertiseMinedBlock(hash) => *hash,
+                Request::AdvertiseBlockToAll(block) | Request::AdvertiseMinedBlock(block) => {
+                    block.hash
+                }
                 _ => unreachable!(),
             };
             composite.ready().await?.call(request.clone()).await?;
@@ -7252,7 +7275,10 @@ mod tests {
             assert_eq!(recv_request(&mut rx_legacy).await?, request);
             // The native wire frame remains ordinary block inventory.
             match recv_request(&mut rx_b).await? {
-                Request::AdvertiseBlock(received, Some(PeerSource::Zakura(peer_id))) => {
+                Request::AdvertiseBlock(
+                    crate::AdvertisedBlock { hash: received, .. },
+                    Some(PeerSource::Zakura(peer_id)),
+                ) => {
                     assert_eq!(received, hash);
                     assert_eq!(peer_id, a_peer_id);
                 }

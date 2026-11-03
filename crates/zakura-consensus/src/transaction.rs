@@ -202,7 +202,7 @@ impl
 pub enum Request {
     /// Verify the supplied transaction as part of a block.
     Block {
-        /// The transaction hash.
+        /// The mined ID of `transaction`, which the caller must compute from it.
         transaction_hash: transaction::Hash,
         /// The transaction itself.
         transaction: Arc<Transaction>,
@@ -210,6 +210,11 @@ pub enum Request {
         known_outpoint_hashes: Arc<HashSet<transaction::Hash>>,
         /// Additional UTXOs which are known at the time of verification.
         known_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+        /// Outputs the block verifier already read as unspent at the block's parent.
+        ///
+        /// Inputs found here skip the state lookup. Outputs created in the same block stay in
+        /// `known_utxos`, which is checked first. See `zakura_state::ParentInputs::Unspent`.
+        parent_utxos: Arc<HashMap<transparent::OutPoint, transparent::Utxo>>,
         /// The height of the block containing this transaction.
         height: block::Height,
         /// The time that the block was mined.
@@ -312,17 +317,35 @@ impl Request {
 
     /// The unmined transaction ID for the transaction in this request.
     ///
-    /// The shielded verification cache keys its entries on this ID, so it must always be derived
-    /// from the transaction carried here. A witnessed ID's authorizing-data digest is what commits
-    /// the key to the proofs and signatures; keying on a mined ID instead would let a transaction
-    /// be answered from the cached verification of a differently-signed twin. Both arms below
-    /// recompute the ID, and the `Request::Block::transaction_hash` field the caller supplies is
-    /// deliberately not used.
+    /// The shielded verification cache keys its entries on this ID, so it must commit to the
+    /// transaction carried here, including its proofs and signatures. Keying on a mined ID alone
+    /// would let a transaction be answered from the cached verification of a differently-signed
+    /// twin.
+    ///
+    /// A block request reuses the mined ID its caller supplies, which the block verifier computes
+    /// from this same transaction just before building the request, and recomputes the
+    /// authorizing-data digest here. A pre-v5 mined ID already commits to the whole
+    /// transaction, signatures included. A mempool request recomputes the whole ID.
     pub fn tx_id(&self) -> UnminedTxId {
         match self {
-            // TODO: get the precalculated ID from the block verifier. It must be a full unmined
-            // ID recomputed from the transaction, for the reason given above.
-            Request::Block { transaction, .. } => transaction.unmined_id(),
+            Request::Block {
+                transaction,
+                transaction_hash,
+                ..
+            } => {
+                debug_assert_eq!(
+                    transaction.hash(),
+                    *transaction_hash,
+                    "block transaction requests carry the mined ID of their own transaction"
+                );
+                match transaction.auth_digest() {
+                    None => UnminedTxId::Legacy(*transaction_hash),
+                    Some(auth_digest) => UnminedTxId::Witnessed(transaction::WtxId {
+                        id: *transaction_hash,
+                        auth_digest,
+                    }),
+                }
+            }
             Request::Mempool { transaction, .. } => transaction.id(),
         }
     }
@@ -341,6 +364,14 @@ impl Request {
     pub fn known_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>> {
         match self {
             Request::Block { known_utxos, .. } => known_utxos.clone(),
+            Request::Mempool { .. } => HashMap::new().into(),
+        }
+    }
+
+    /// The outputs already read as unspent at the parent of this request's block, if any.
+    fn parent_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::Utxo>> {
+        match self {
+            Request::Block { parent_utxos, .. } => parent_utxos.clone(),
             Request::Mempool { .. } => HashMap::new().into(),
         }
     }
@@ -496,6 +527,10 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
+            // This is the only check on Sapling `cv` encodings before proof
+            // verification: librustzcash keeps `cv` as bytes when it parses, so
+            // `to_librustzcash` no longer rejects an invalid one. Keep it here,
+            // ahead of every conversion and proof.
             check::sapling_point_encodings_are_valid(&tx)?;
 
             // A transaction whose own shielded counts exceed a per-block ZIP 218
@@ -814,6 +849,7 @@ where
         // Additional UTXOs known at the time of validation,
         // i.e., from previous transactions in the block.
         let known_utxos = req.known_utxos();
+        let parent_utxos = req.parent_utxos();
 
         let inputs = tx.inputs();
         let mut spent_utxos = HashMap::new();
@@ -830,6 +866,8 @@ where
                 let utxo = if let Some(output) = known_utxos.get(outpoint) {
                     tracing::trace!("UXTO in known_utxos, discarding query");
                     output.utxo.clone()
+                } else if let Some(utxo) = parent_utxos.get(outpoint) {
+                    utxo.clone()
                 } else if is_mempool {
                     let query = state
                         .clone()
@@ -1011,6 +1049,15 @@ where
         Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        if joinsplit_data.is_none() && sapling_bundle.is_none() {
+            // Only shielded data signs the transaction-wide sighash, so a transparent-only
+            // transaction never needs it; its inputs compute their own sighashes.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1125,6 +1172,15 @@ where
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1206,6 +1262,15 @@ where
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
         let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() && ironwood_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()

@@ -15,6 +15,8 @@ mod priority;
 pub use client::tests::ClientTestHarness;
 
 #[cfg(test)]
+pub(crate) use client::tests::connected::ConnectedClient;
+#[cfg(test)]
 pub(crate) use client::tests::ReceiveRequestAttempt;
 #[cfg(test)]
 pub(crate) use handshake::register_inventory_status;

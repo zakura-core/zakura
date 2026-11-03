@@ -3867,12 +3867,10 @@ mod tests {
         let header = pool
             .try_reserve(
                 zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*block.header),
-            )
-            .unwrap()
-            .retain(*block.header)
-            .unwrap();
+            )?
+            .retain(*block.header)?;
         let response = Response::BlockHeaders(vec![HeaderHandle::from(header)]);
-        assert_eq!(pool.retained_bytes() > 0, true);
+        assert!(pool.retained_bytes() > 0);
 
         let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
         let frames = LegacyResponseCodec::encode_response(5, response, cap, cap)?;

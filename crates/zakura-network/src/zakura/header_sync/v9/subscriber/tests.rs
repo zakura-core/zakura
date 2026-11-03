@@ -12,17 +12,17 @@ use super::*;
 use crate::zakura::{
     framed_channel,
     header_sync::{
-        config::REGTEST_HEADER_BYTES,
+        config::{COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
         v9::{
-            entry_bytes,
+            entry_bytes, largest_page, message_type,
             test_support::{record, HeaderTree, OUTCOME_CODES},
-            Message, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
+            CommonMessage, Message, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
         },
         wire::HeaderEntry,
     },
     regulation::{PrecheckSlot, Publications},
     wire_codec::{decode_frame, encode_frame},
-    CloseCause, Frame, FrameRejection,
+    CloseCause, Frame, FrameRejection, MessageRole,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -438,6 +438,57 @@ fn the_frame_header_check_runs_before_decode() {
         .expect("a received cursor")
         .expect("one header of room is a prefix of a two-header window");
     assert_eq!(reader.check(frame.message_type, len), Ok(()));
+}
+
+/// `header-sync/credit-fits-window`, checked at the transport reader: with the
+/// largest credit and validation paused, the reader queues Mainnet pages until
+/// they spend the whole window, then refuses the next page. The queued bytes
+/// fit the header sync receive share beside its `Status` and update terms.
+///
+/// The simulator witness also needs the per-connection receive window, which
+/// the node composition wires later.
+#[test]
+fn the_largest_credit_fits_the_receive_budget() {
+    const MAINNET: usize = COMMON_HEADER_BYTES;
+    let slot = PrecheckSlot::default();
+    let (_, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let mut sub = Sub::new(MAINNET, fence, &recv);
+    let reader = slot.get().expect("the subscriber attaches its check");
+    let tip = Frontier::new(block::Height(1_000_000), block::Hash([1; 32]));
+    let start = Frontier::new(block::Height(0), block::Hash([2; 32]));
+    let status = super::super::test_support::status::<MAINNET>(tip);
+    let (open, _) = sub
+        .open(&status, &[start], AuxSchema::V1, u32::MAX)
+        .expect("the first Open is recorded");
+    // Widening u32 to u64 is lossless.
+    let window = u64::from(open.added_credit.bytes);
+    assert_eq!(window, 4_000 * smallest_page(MAINNET, AuxSchema::V1) as u64);
+
+    // Largest pages first, then smaller ones, until one-byte pages spend the
+    // last bytes. No page is admitted, so every charge stays queued.
+    let mut queued = 0;
+    for len in [
+        largest_page(MAINNET),
+        smallest_page(MAINNET, AuxSchema::V1),
+        1,
+    ] {
+        while reader.check(message_type::HEADERS, len).is_ok() {
+            // Widening usize to u64 is lossless on supported targets.
+            queued += len as u64;
+        }
+    }
+    assert_eq!(queued, window, "the reader queues exactly the window");
+    assert!(reader.check(message_type::HEADERS, 1).is_err());
+
+    let MessageRole::Subscription { credit, .. } = SUBSCRIBE_HEADERS.role else {
+        panic!("SUBSCRIBE_HEADERS is a subscription row");
+    };
+    // Widening u32 and usize to u64 is lossless on supported targets.
+    let subscription = u64::from(credit.bytes) + largest_page(MAINNET) as u64;
+    assert!(queued <= subscription);
+    assert!(queued + 602 * 122 + 999_154 <= CommonMessage::BUDGET.receive);
 }
 
 /// Path pages start at the highest sent locator on the target's chain, carry

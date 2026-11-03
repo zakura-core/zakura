@@ -1360,7 +1360,8 @@ pub enum Request {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
-    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
+    /// their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {
@@ -1760,7 +1761,8 @@ pub enum ReadRequest {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
-    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
+    /// their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {

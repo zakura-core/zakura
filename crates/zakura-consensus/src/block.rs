@@ -8,7 +8,7 @@
 //! verification, where it may be accepted or rejected.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -650,12 +650,25 @@ where
                     .filter(|outpoint| !known_utxos.contains_key(outpoint))
                     .collect();
                 let parent = block.header.previous_block_hash;
+                // Kept apart from `known_utxos`, which also becomes the block's `new_outputs`
+                // and carries the in-block ordering of each output.
+                let mut parent_utxos = Arc::new(HashMap::new());
                 if !external_inputs.is_empty() {
-                    if let zs::ParentInputs::Missing(outpoint) =
-                        check_parent_inputs(state_service.clone(), parent, external_inputs.clone())
-                            .await
+                    match check_parent_inputs(
+                        state_service.clone(),
+                        parent,
+                        external_inputs.clone(),
+                    )
+                    .await
                     {
-                        return Err(VerifyBlockError::MissingTransparentInput { parent, outpoint });
+                        zs::ParentInputs::Missing(outpoint) => {
+                            return Err(VerifyBlockError::MissingTransparentInput {
+                                parent,
+                                outpoint,
+                            });
+                        }
+                        zs::ParentInputs::Unspent(utxos) => parent_utxos = utxos,
+                        zs::ParentInputs::ParentUnavailable | zs::ParentInputs::Inconclusive => {}
                     }
                 }
 
@@ -680,11 +693,14 @@ where
                             transaction: transaction.clone(),
                             known_outpoint_hashes: known_outpoint_hashes.clone(),
                             known_utxos: known_utxos.clone(),
+                            parent_utxos: parent_utxos.clone(),
                             height,
                             time: block.header.time,
                         });
                     async_checks.push(rsp);
                 }
+                // Free the outputs as soon as the last transaction check finishes with them.
+                drop(parent_utxos);
                 tracing::trace!(len = async_checks.len(), "built async tx checks");
 
                 // Get the transaction results back from the transaction verifier.
@@ -742,7 +758,8 @@ where
                                         zs::ParentInputs::ParentUnavailable => {
                                             VerifyBlockError::ParentUnavailable { parent }
                                         }
-                                        zs::ParentInputs::Inconclusive => {
+                                        zs::ParentInputs::Unspent(_)
+                                        | zs::ParentInputs::Inconclusive => {
                                             VerifyBlockError::Transaction(
                                                 TransactionError::TransparentInputNotFound,
                                             )

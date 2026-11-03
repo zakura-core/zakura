@@ -152,6 +152,18 @@ pub static VERIFYING_KEY_NU6_2: LazyLock<ItemVerifyingKey> =
 pub static VERIFYING_KEY_NU6_3_ONWARD: LazyLock<ItemVerifyingKey> =
     LazyLock::new(|| build_verifying_key(OrchardCircuitVersion::PostNu6_3));
 
+/// Builds every era's verifying key on a blocking thread, current era first.
+///
+/// Started once at node startup, so the first shielded block after a restart does not build a
+/// key on its verification path.
+pub(crate) fn spawn_key_preload() -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(|| {
+        LazyLock::force(&VERIFYING_KEY_NU6_3_ONWARD);
+        LazyLock::force(&VERIFYING_KEY_NU6_2);
+        LazyLock::force(&VERIFYING_KEY_PRE_NU6_2);
+    })
+}
+
 /// A Halo2 verification item, used as the request type of the service.
 ///
 /// The verifying key (pre- vs post-NU6.2) is supplied by whichever [`Verifier`]

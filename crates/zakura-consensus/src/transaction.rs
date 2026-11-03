@@ -210,6 +210,11 @@ pub enum Request {
         known_outpoint_hashes: Arc<HashSet<transaction::Hash>>,
         /// Additional UTXOs which are known at the time of verification.
         known_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+        /// Outputs the block verifier already read as unspent at the block's parent.
+        ///
+        /// Inputs found here skip the state lookup. Outputs created in the same block stay in
+        /// `known_utxos`, which is checked first. See `zakura_state::ParentInputs::Unspent`.
+        parent_utxos: Arc<HashMap<transparent::OutPoint, transparent::Utxo>>,
         /// The height of the block containing this transaction.
         height: block::Height,
         /// The time that the block was mined.
@@ -359,6 +364,14 @@ impl Request {
     pub fn known_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>> {
         match self {
             Request::Block { known_utxos, .. } => known_utxos.clone(),
+            Request::Mempool { .. } => HashMap::new().into(),
+        }
+    }
+
+    /// The outputs already read as unspent at the parent of this request's block, if any.
+    fn parent_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::Utxo>> {
+        match self {
+            Request::Block { parent_utxos, .. } => parent_utxos.clone(),
             Request::Mempool { .. } => HashMap::new().into(),
         }
     }
@@ -836,6 +849,7 @@ where
         // Additional UTXOs known at the time of validation,
         // i.e., from previous transactions in the block.
         let known_utxos = req.known_utxos();
+        let parent_utxos = req.parent_utxos();
 
         let inputs = tx.inputs();
         let mut spent_utxos = HashMap::new();
@@ -852,6 +866,8 @@ where
                 let utxo = if let Some(output) = known_utxos.get(outpoint) {
                     tracing::trace!("UXTO in known_utxos, discarding query");
                     output.utxo.clone()
+                } else if let Some(utxo) = parent_utxos.get(outpoint) {
+                    utxo.clone()
                 } else if is_mempool {
                     let query = state
                         .clone()

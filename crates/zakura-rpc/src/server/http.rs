@@ -124,48 +124,7 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
 
         let (mut parts, body) = request.into_parts();
         if let Some(CollectedRequestBody(bytes)) = parts.extensions.remove() {
-            if content_length(&parts.headers) > MAX_REQUEST_BODY_SIZE {
-                return json_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    response_format(&bytes)
-                        .format_response(MethodResponse::too_large_request(MAX_REQUEST_BODY_SIZE)),
-                );
-            }
-            // The request permit acquired by `call` remains held through preparation,
-            // method execution and legacy response formatting.
-            let prepared = match prepare(
-                &bytes,
-                self.max_batch_entries,
-                usize::try_from(MAX_REQUEST_BODY_SIZE)
-                    .expect("the u32 body limit fits on supported platforms"),
-            ) {
-                Ok(prepared) => prepared,
-                Err(PreparationError::MalformedBody) => {
-                    return json_response(
-                        StatusCode::BAD_REQUEST,
-                        MethodResponse::error(Id::Null, ErrorCode::ParseError.into()),
-                    );
-                }
-                Err(PreparationError::InnerBodyTooLarge(format)) => {
-                    return json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format.format_response(MethodResponse::error(
-                            Id::Null,
-                            ErrorCode::InternalError.into(),
-                        )),
-                    );
-                }
-            };
-            let response = handle_parsed_rpc_call(
-                prepared.message,
-                &self.rpc_service,
-                self.max_response_body_size,
-            )
-            .await;
-            return json_response(
-                StatusCode::OK,
-                prepared.response_format.format_response(response),
-            );
+            return self.answer_collected(&parts.headers, &bytes).await;
         }
 
         let (body, is_single) = match read_body(&parts.headers, body, MAX_REQUEST_BODY_SIZE).await {
@@ -196,6 +155,52 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
         .await;
 
         json_response(StatusCode::OK, response)
+    }
+
+    /// Prepares and answers a bounded body while `call` holds the request permit.
+    async fn answer_collected(&self, headers: &header::HeaderMap, bytes: &[u8]) -> HttpResponse {
+        if content_length(headers) > MAX_REQUEST_BODY_SIZE {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                response_format(bytes)
+                    .format_response(MethodResponse::too_large_request(MAX_REQUEST_BODY_SIZE)),
+            );
+        }
+        // The request permit acquired by `call` remains held through preparation,
+        // method execution and legacy response formatting.
+        let prepared = match prepare(
+            bytes,
+            self.max_batch_entries,
+            usize::try_from(MAX_REQUEST_BODY_SIZE)
+                .expect("the u32 body limit fits on supported platforms"),
+        ) {
+            Ok(prepared) => prepared,
+            Err(PreparationError::MalformedBody) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    MethodResponse::error(Id::Null, ErrorCode::ParseError.into()),
+                );
+            }
+            Err(PreparationError::InnerBodyTooLarge(format)) => {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format.format_response(MethodResponse::error(
+                        Id::Null,
+                        ErrorCode::InternalError.into(),
+                    )),
+                );
+            }
+        };
+        let response = handle_parsed_rpc_call(
+            prepared.message,
+            &self.rpc_service,
+            self.max_response_body_size,
+        )
+        .await;
+        json_response(
+            StatusCode::OK,
+            prepared.response_format.format_response(response),
+        )
     }
 }
 

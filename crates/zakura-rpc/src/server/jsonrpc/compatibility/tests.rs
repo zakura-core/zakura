@@ -9,8 +9,7 @@ const INNER_LIMIT: usize = 10 * 1024 * 1024;
 fn large_block_string_stays_borrowed() {
     let block = "00".repeat(2_000_000);
     let body = format!(r#"{{"jsonrpc":"2.0","method":"submitblock","params":["{block}"],"id":1}}"#);
-    let parsed =
-        prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap_or_else(|_| panic!("valid call"));
+    let parsed = prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap();
     let Body::Call(call) = parsed.message else {
         panic!("expected a call")
     };
@@ -29,8 +28,7 @@ fn parameters_keep_existing_normalization() {
         (r#"["a","b"]"#, r#"["a","b"]"#),
     ] {
         let body = format!(r#"{{"jsonrpc":"2.0","method":"getinfo","params":{params},"id":1}}"#);
-        let parsed =
-            prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap_or_else(|_| panic!("valid call"));
+        let parsed = prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap();
         let Body::Call(call) = parsed.message else {
             panic!("expected a call")
         };
@@ -43,8 +41,7 @@ fn near_limit_numeric_array_uses_one_normalized_parameter_document() {
     let numbers = "0,".repeat(1_999_999);
     let body =
         format!(r#"{{"jsonrpc":"2.0","method":"submitblock","params":[{numbers}1e2],"id":1}}"#);
-    let parsed =
-        prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap_or_else(|_| panic!("valid call"));
+    let parsed = prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap();
     let Body::Call(call) = parsed.message else {
         panic!("expected a call")
     };
@@ -57,12 +54,30 @@ fn near_limit_numeric_array_uses_one_normalized_parameter_document() {
 #[test]
 fn normalization_retains_the_inner_body_limit() {
     let numbers = "1e9,".repeat(200);
-    let body = format!(r#"{{"jsonrpc":"2.0","method":"x","params":[{numbers}0],"id":1}}"#);
-    assert!(body.len() < 1024);
-    assert!(matches!(
-        prepare(body.as_bytes(), 1000, 1024),
-        Err(PreparationError::InnerBodyTooLarge(_))
-    ));
+    for (version, expected) in [
+        (
+            "",
+            r#"{"id":null,"result":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+        ),
+        (
+            r#""jsonrpc":"1.0","#,
+            r#"{"jsonrpc":"1.0","id":null,"result":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+        ),
+        (
+            r#""jsonrpc":"2.0","#,
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+        ),
+    ] {
+        let body = format!(r#"{{{version}"method":"x","params":[{numbers}0],"id":1}}"#);
+        assert!(body.len() < 1024);
+        let Err(PreparationError::InnerBodyTooLarge(format)) = prepare(body.as_bytes(), 1000, 1024)
+        else {
+            panic!("normalized parameters exceed the inner limit")
+        };
+        let response =
+            MethodResponse::error(Id::Null, super::super::ErrorCode::InternalError.into());
+        assert_eq!(format.format_response(response).as_json().get(), expected);
+    }
 }
 
 #[test]
@@ -83,8 +98,7 @@ fn recognized_calls_and_raw_fallback_keep_different_leading_whitespace_rules() {
 fn null_and_invalid_numeric_ids_remain_notifications() {
     for id in ["null", "-1", "1.5", "1e2", "18446744073709551616"] {
         let body = format!(r#"{{"jsonrpc":"2.0","method":"getinfo","params":[],"id":{id}}}"#);
-        let parsed =
-            prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap_or_else(|_| panic!("valid body"));
+        let parsed = prepare(body.as_bytes(), 1000, INNER_LIMIT).unwrap();
         assert!(matches!(parsed.message, Body::Notification(_)), "{id}");
     }
 }

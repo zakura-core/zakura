@@ -14,6 +14,7 @@ pub(in crate::server) struct PreparedRequest<'a> {
 }
 
 /// Failures that occur before a JSON-RPC message can be dispatched.
+#[derive(Debug)]
 pub(in crate::server) enum PreparationError {
     /// The raw fallback does not start with an object or array in the first 128 bytes.
     MalformedBody,
@@ -22,7 +23,7 @@ pub(in crate::server) enum PreparationError {
 }
 
 /// The response envelope expected by a supported client.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(in crate::server) enum ResponseFormat {
     Bitcoind,
     Lightwalletd,

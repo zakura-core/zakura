@@ -204,7 +204,7 @@ fn state_timeout_does_not_dispatch_proofs() {
 #[cfg(feature = "internal-bench")]
 #[test]
 #[ignore = "requires an isolated host; run this test alone in release mode"]
-#[allow(clippy::print_stdout)]
+#[allow(clippy::print_stdout, clippy::assertions_on_constants)]
 fn rejected_anchor_verification_load() {
     use futures::{stream::FuturesUnordered, StreamExt};
     use std::time::Instant;
@@ -213,7 +213,6 @@ fn rejected_anchor_verification_load() {
     // while keeping execution on Linux for /proc CPU accounting.
     // This is intentionally a runtime guard: a const assertion would prevent
     // the benchmark from compiling on other platforms.
-    #[allow(clippy::assertions_on_constants)]
     assert!(
         cfg!(target_os = "linux"),
         "benchmark CPU accounting requires Linux"

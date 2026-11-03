@@ -45,6 +45,9 @@ pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_byte
 // target.
 pub const SOCKET_DATAGRAM_QUEUE_BYTES: u64 = SOCKET_QUEUE_BYTES as u64;
 
+/// The largest `stream_receive_window_bytes` the QUIC config accepts.
+pub const MAX_STREAM_RECEIVE_WINDOW_BYTES: u64 = 256 * MIB;
+
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,7 +188,7 @@ impl QuicConfig {
             "stream_receive_window_bytes",
             u64::from(self.stream_receive_window_bytes),
             64 * KIB,
-            256 * MIB,
+            MAX_STREAM_RECEIVE_WINDOW_BYTES,
         )?;
         check(
             "receive_window_bytes",

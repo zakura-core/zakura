@@ -8676,6 +8676,24 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_valid_cwnd_cap_derives_a_bindable_stream_window() {
+        let mut config = Config::default();
+        let fixed = super::super::BLOCK_SYNC_REACTOR_BUDGET.receive
+            - config.zakura.block_sync.bbr_max_cwnd_bytes;
+        config.zakura.block_sync.bbr_max_cwnd_bytes =
+            zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES - fixed;
+        assert_eq!(config.zakura.block_sync.validate(), Ok(()));
+
+        let limits = ZakuraLocalLimits::from_config(&config);
+
+        assert_eq!(
+            u64::from(limits.quic.stream_receive_window_bytes),
+            zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES
+        );
+        assert_eq!(limits.quic.validate(), Ok(()));
+    }
+
+    #[test]
     fn inbound_queue_depth_is_split_across_ordered_streams() {
         assert_eq!(per_stream_inbound_queue_depth(64, 2), 32);
         assert_eq!(per_stream_inbound_queue_depth(63, 2), 31);

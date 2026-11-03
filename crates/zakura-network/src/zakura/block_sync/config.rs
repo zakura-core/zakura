@@ -639,6 +639,17 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_max_cwnd_bytes < self.bbr_min_cwnd_bytes {
             return Err("bbr_max_cwnd_bytes must be at least bbr_min_cwnd_bytes");
         }
+        // The block-sync share sets the QUIC stream receive window, which
+        // can't exceed QUIC's ceiling.
+        match block_sync_reactor_budget(self.bbr_max_cwnd_bytes, self.floor_bypass_slots) {
+            Ok(budget) if budget.receive <= zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES => {}
+            _ => {
+                return Err(
+                    "bbr_max_cwnd_bytes and floor_bypass_slots must keep the block-sync \
+                     receive share within QUIC's 256 MiB stream receive window",
+                )
+            }
+        }
         if self.max_requests_without_block_progress == 0 {
             return Err("max_requests_without_block_progress must be greater than zero");
         }
@@ -839,5 +850,24 @@ mod owner_cap_tests {
             config.validate(),
             Err("bbr_max_cwnd_bytes must be at least bbr_min_cwnd_bytes")
         );
+    }
+
+    #[test]
+    fn validation_keeps_the_block_sync_share_within_the_quic_stream_window() {
+        let fixed = BLOCK_SYNC_REACTOR_BUDGET.receive - DEFAULT_BS_BBR_MAX_CWND_BYTES;
+        let largest_cwnd = zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES - fixed;
+        let mut config = ZakuraBlockSyncConfig {
+            bbr_max_cwnd_bytes: largest_cwnd,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
+        config.bbr_max_cwnd_bytes += 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .starts_with("bbr_max_cwnd_bytes and floor_bypass_slots"));
+        config.bbr_max_cwnd_bytes = DEFAULT_BS_BBR_MAX_CWND_BYTES;
+        config.floor_bypass_slots = u32::MAX;
+        assert!(config.validate().is_err());
     }
 }

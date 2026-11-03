@@ -155,14 +155,14 @@ proptest! {
             }
 
             // Send a request to all peers
-            let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash, None));
+            let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash.into(), None));
             std::mem::drop(response_future);
 
             // Check how many peers received the request
             let mut received = 0;
             for mut h in handles {
                 if let ReceiveRequestAttempt::Request(client_request) = h.try_to_receive_outbound_client_request() {
-                    prop_assert_eq!(client_request.request, Request::AdvertiseBlock(block_hash, None));
+                    prop_assert_eq!(client_request.request, Request::AdvertiseBlock(block_hash.into(), None));
                     received += 1;
                 };
             }
@@ -225,14 +225,14 @@ proptest! {
                 let number_of_peers_to_broadcast = peer_set.number_of_peers_to_broadcast();
 
                 // Send a request to all peers we have now
-                let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash, None));
+                let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash.into(), None));
                 std::mem::drop(response_future);
 
                 // Check how many peers received the request
                 let mut received = 0;
                 for h in &mut handles {
                     if let ReceiveRequestAttempt::Request(client_request) = h.try_to_receive_outbound_client_request() {
-                        prop_assert_eq!(client_request.request, Request::AdvertiseBlock(block_hash, None));
+                        prop_assert_eq!(client_request.request, Request::AdvertiseBlock(block_hash.into(), None));
                         received += 1;
                     };
                 }
@@ -287,7 +287,7 @@ proptest! {
             }
 
             // this will panic as expected
-            let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash, None));
+            let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash.into(), None));
             std::mem::drop(response_future);
 
             Ok::<_, TestCaseError>(())
@@ -312,6 +312,8 @@ fn sidecar_peer_always_receives_block_gossip() {
     tokio::time::pause();
 
     let config = Config::default();
+    // The advertisement carries no size, so the broadcast uses the minimum window.
+    let window = config.advert_window_min;
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     let mut handles = Vec::with_capacity(TOTAL_PEERS);
@@ -361,7 +363,7 @@ fn sidecar_peer_always_receives_block_gossip() {
                 .ready()
                 .await
                 .unwrap()
-                .call(Request::AdvertiseMinedBlock(block_hash)),
+                .call(Request::AdvertiseMinedBlock(block_hash.into())),
         );
         tokio::task::yield_now().await;
         let mut received = 0;
@@ -378,7 +380,8 @@ fn sidecar_peer_always_receives_block_gossip() {
             sidecar_received,
             "configured sidecar receives the first wave"
         );
-        assert_eq!(received, crate::peer::block_gossip::BLOCK_ADVERT_WINDOW);
+        // The sidecar is advertised outside the window.
+        assert_eq!(received, window + 1);
         tokio::task::yield_now().await;
         // Inventory completion alone cannot start the remaining advertisements.
         for handle in &mut handles {

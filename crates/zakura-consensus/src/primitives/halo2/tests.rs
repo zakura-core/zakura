@@ -1026,3 +1026,17 @@ fn prepared_msm_arming_does_not_change_proving_or_verification() {
         );
     }
 }
+
+/// A batch flushes after 128 weighted actions, and a bundle weighs at least two, so a batch
+/// still holds at most 64 bundles.
+#[test]
+fn bundles_weigh_their_actions_and_at_least_two() {
+    use crate::primitives::batch_control::RequestWeight;
+
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let item = Item::new(bundle, sighash);
+
+    assert_eq!(super::HALO2_MAX_BATCH_SIZE, 128);
+    assert_eq!(item.request_weight(), item.action_count().max(2));
+    assert!(item.request_weight() >= 2);
+}

@@ -379,6 +379,7 @@ async fn run_discovery_dial_once(
         admitted_ip_rx,
         admitted_ip: None,
         registration_rx,
+        own_registration: None,
         registration: PeerRegistration::Absent,
         trace,
     }
@@ -399,6 +400,7 @@ struct DialWatch {
     /// Carries how this attempt's own registration ended. The dial sends it
     /// before it serves the connection, so it is final once the dial ends.
     registration_rx: oneshot::Receiver<DialRegistration>,
+    own_registration: Option<DialRegistration>,
     registration: PeerRegistration,
     trace: ZakuraTrace,
 }
@@ -440,7 +442,8 @@ impl DialWatch {
                 self.registration = PeerRegistration::Ended;
                 trace_dial_phase(&self.trace, self.attempt, DialPhase::RegistrationEnded);
             }
-            if let Some(result) = classify_dial(observation, self.admitted_ip().is_some()) {
+            let registered = self.own_registration() == Some(DialRegistration::Registered);
+            if let Some(result) = classify_dial(observation, registered) {
                 return result;
             }
         }
@@ -501,8 +504,15 @@ impl DialWatch {
         } else {
             PeerRegistration::Ended
         };
-        let own_registration = self.registration_rx.try_recv().ok();
-        DialObservation::DialEnded(dial_finish(dial, own_registration), registration)
+        DialObservation::DialEnded(dial_finish(dial, self.own_registration()), registration)
+    }
+
+    /// How this attempt's own registration ended, once the dial reported it.
+    fn own_registration(&mut self) -> Option<DialRegistration> {
+        if self.own_registration.is_none() {
+            self.own_registration = self.registration_rx.try_recv().ok();
+        }
+        self.own_registration
     }
 
     /// The IP this attempt's dial authenticated, once the dial reported it.

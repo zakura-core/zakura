@@ -33,6 +33,7 @@ mod address_transfers;
 mod backup;
 mod chain;
 mod created_utxos;
+mod proposal_spends;
 mod shared_map;
 
 #[cfg(test)]
@@ -47,6 +48,7 @@ pub(crate) use backup::write_semantically_verified_backup_block;
 pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
 pub(crate) use chain::{Chain, SpendingTransactionId};
 pub(crate) use created_utxos::CreatedUtxos;
+use proposal_spends::ProposalSpends;
 pub(crate) use shared_map::SharedMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +133,12 @@ pub struct NonFinalizedState {
     //
     // TODO: make this field private and set it via an argument to NonFinalizedState::new()
     should_count_metrics: bool,
+
+    /// Whether this state validates block proposals, and so records their spend results.
+    records_proposal_spends: bool,
+
+    /// Spend results from recent proposals, shared with this state's clones.
+    proposal_spends: ProposalSpends,
 }
 
 impl std::fmt::Debug for NonFinalizedState {
@@ -155,6 +163,8 @@ impl Clone for NonFinalizedState {
             precious_sequence: self.precious_sequence,
             precious_blocks: self.precious_blocks.clone(),
             should_count_metrics: self.should_count_metrics,
+            records_proposal_spends: self.records_proposal_spends,
+            proposal_spends: self.proposal_spends.clone(),
         }
     }
 }
@@ -169,6 +179,8 @@ impl NonFinalizedState {
             precious_sequence: 0,
             precious_blocks: HashMap::new(),
             should_count_metrics: true,
+            records_proposal_spends: false,
+            proposal_spends: ProposalSpends::default(),
         }
     }
 
@@ -668,7 +680,8 @@ impl NonFinalizedState {
                 finalized_state.ironwood_tree_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
-            );
+            )
+            .skipping_transparent_address_index(finalized_state.skips_transparent_indexes());
             Arc::new(chain)
         } else {
             // The parent is not the finalized_tip and still exist in the NonFinalizedState
@@ -753,7 +766,8 @@ impl NonFinalizedState {
                 finalized_state.ironwood_tree_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
-            ))
+            )
+            .skipping_transparent_address_index(finalized_state.skips_transparent_indexes()))
         })();
         contextual_metrics.record_duration(
             "state.contextual.chain_new.duration_seconds",
@@ -812,12 +826,23 @@ impl NonFinalizedState {
         }
 
         let transparent_spend_start = Instant::now();
-        let spent_utxos = check::utxo::transparent_spend(
-            &prepared,
-            &new_chain.created_utxos,
-            &new_chain.spent_utxos,
-            finalized_state,
-        );
+        // Repeated proposals must leave cached results available to solved-block commits
+        // while they compute and record their own spend check.
+        let cached_spends = if self.records_proposal_spends {
+            None
+        } else {
+            self.proposal_spends.take(&prepared)
+        };
+        let spent_utxos = match cached_spends {
+            Some(spent_utxos) => Ok(spent_utxos),
+            None => check::utxo::transparent_spend(
+                &prepared,
+                &new_chain.created_utxos,
+                &new_chain.spent_utxos,
+                finalized_state,
+            )
+            .map(Arc::new),
+        };
         contextual_metrics.record_duration(
             "state.contextual.transparent_spend.duration_seconds",
             "state.contextual.mined.transparent_spend.duration_seconds",
@@ -859,7 +884,7 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        let contextual = ContextuallyVerifiedBlock::with_block_and_shared_spent_utxos(
             &self.network,
             prepared,
             spent_utxos,
@@ -892,7 +917,14 @@ impl NonFinalizedState {
             "state.contextual.mined.parallel_update.duration_seconds",
             parallel_update_start.elapsed(),
         );
-        result
+        let chain = result?;
+        if self.records_proposal_spends {
+            let proposal = chain
+                .tip_block()
+                .expect("successful validation added the proposal as the chain tip");
+            self.proposal_spends.remember(proposal);
+        }
+        Ok(chain)
     }
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
@@ -1190,6 +1222,14 @@ impl NonFinalizedState {
     /// Stop tracking metrics for this non-finalized state and all its chains.
     pub fn disable_metrics(&mut self) {
         self.should_count_metrics = false;
+    }
+
+    /// Makes this state record the spend results of the blocks it validates, so the state it
+    /// was cloned from can reuse them when the solved block arrives.
+    ///
+    /// Only for a throwaway clone that validates block proposals.
+    pub(crate) fn record_proposal_spends(&mut self) {
+        self.records_proposal_spends = true;
     }
 }
 

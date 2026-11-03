@@ -36,6 +36,8 @@ use crate::{
 };
 
 #[cfg(test)]
+mod getdata_routing;
+#[cfg(test)]
 mod prop;
 
 #[cfg(test)]

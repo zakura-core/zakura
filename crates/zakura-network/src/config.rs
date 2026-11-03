@@ -35,6 +35,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
+        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_MAX,
+        DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
@@ -354,6 +356,37 @@ pub struct Config {
     /// Enabling this setting reveals peer topology in logs and trace files. Restrict access
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
+
+    /// The number of peers that one legacy block broadcast advertises to at once when the block
+    /// is at least `advert_window_full_size_bytes`, or its size is unknown. At least 1.
+    ///
+    /// The window grows linearly as the block size falls from `advert_window_full_size_bytes`
+    /// to `advert_window_small_size_bytes`.
+    /// Concurrent uploads share one uplink, so a large block goes to fewer peers at a time.
+    /// Set `advert_window_min` and `advert_window_max` to the same value for a fixed window.
+    ///
+    /// Configured block gossip sidecars are always advertised first, outside this window.
+    ///
+    /// Experimental.
+    pub advert_window_min: usize,
+
+    /// The number of peers that one legacy block broadcast advertises to at once when the block
+    /// is at or below `advert_window_small_size_bytes`. At least `advert_window_min`.
+    ///
+    /// Experimental.
+    pub advert_window_max: usize,
+
+    /// The block size in bytes at and below which a legacy block broadcast uses
+    /// `advert_window_max`. Must be below `advert_window_full_size_bytes`.
+    ///
+    /// Experimental.
+    pub advert_window_small_size_bytes: u64,
+
+    /// The block size in bytes at and above which a legacy block broadcast uses
+    /// `advert_window_min`. Must exceed `advert_window_small_size_bytes`.
+    ///
+    /// Experimental.
+    pub advert_window_full_size_bytes: u64,
 }
 
 impl Config {
@@ -925,6 +958,10 @@ impl Default for Config {
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
+            advert_window_min: DEFAULT_ADVERT_WINDOW_MIN,
+            advert_window_max: DEFAULT_ADVERT_WINDOW_MAX,
+            advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
+            advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
         }
     }
 }
@@ -1123,6 +1160,10 @@ struct DConfig {
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
+    advert_window_min: usize,
+    advert_window_max: usize,
+    advert_window_small_size_bytes: u64,
+    advert_window_full_size_bytes: u64,
 }
 
 impl Default for DConfig {
@@ -1146,6 +1187,10 @@ impl Default for DConfig {
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            advert_window_min: config.advert_window_min,
+            advert_window_max: config.advert_window_max,
+            advert_window_small_size_bytes: config.advert_window_small_size_bytes,
+            advert_window_full_size_bytes: config.advert_window_full_size_bytes,
         }
     }
 }
@@ -1215,6 +1260,10 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1256,6 +1305,10 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
         }
     }
 }
@@ -1283,9 +1336,20 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        validate_advert_fanout(
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+        )
+        .map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {
@@ -1422,8 +1486,35 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
         })
     }
+}
+
+/// Checks the block advert fan-out settings.
+fn validate_advert_fanout(
+    advert_window_min: usize,
+    advert_window_max: usize,
+    advert_window_small_size_bytes: u64,
+    advert_window_full_size_bytes: u64,
+) -> Result<(), String> {
+    if advert_window_min == 0 || advert_window_min > advert_window_max {
+        return Err(format!(
+            "advert_window_min and advert_window_max must satisfy \
+             1 <= advert_window_min <= advert_window_max, \
+             got {advert_window_min} and {advert_window_max}"
+        ));
+    }
+    if advert_window_small_size_bytes >= advert_window_full_size_bytes {
+        return Err(format!(
+            "advert_window_small_size_bytes must be below advert_window_full_size_bytes, \
+             got {advert_window_small_size_bytes} and {advert_window_full_size_bytes}"
+        ));
+    }
+    Ok(())
 }
 
 fn zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(zakura: &ZakuraConfig) -> bool {

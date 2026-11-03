@@ -471,14 +471,17 @@ impl BufferedBlockBody {
         &mut self,
         pool: &DecodedBlockPool,
         admission: Admission,
-    ) -> Result<BlockHandle, AdmissionFailure> {
+    ) -> Result<BlockHandle, DecodeRefusal> {
         match self {
             BufferedBlockBody::Decoded { block, .. }
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => Ok(block.clone()),
             BufferedBlockBody::RawFramePayload(payload) => {
                 let block = pool
                     .try_admit(decode_raw_frame_payload(payload), admission)
-                    .map_err(|rejected| rejected.reason)?;
+                    .map_err(|rejected| DecodeRefusal {
+                        reason: rejected.reason,
+                        decoded_bytes: rejected.decoded_bytes,
+                    })?;
                 let decoded_attributed_memory_size_bytes = block.decoded_bytes();
                 let block = BlockHandle::Owned(block);
                 *self = BufferedBlockBody::DecodedWithRawFramePayload {
@@ -490,6 +493,14 @@ impl BufferedBlockBody {
             }
         }
     }
+}
+
+/// Why the pool refused a body's decoded block, and the block's measured size.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct DecodeRefusal {
+    pub(super) reason: AdmissionFailure,
+    /// Attributed bytes of the refused decoded block.
+    pub(super) decoded_bytes: u64,
 }
 
 fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> block::Block {

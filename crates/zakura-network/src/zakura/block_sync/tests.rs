@@ -4982,7 +4982,6 @@ impl TestSequencer {
                 facts.id,
                 &test_decoded_pool(),
                 admission::submission_decode_admission(self.policy.verified_tip(), height),
-                0,
             )
             .unwrap();
         let intent = self

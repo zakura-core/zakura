@@ -264,6 +264,25 @@ impl DecodedBlockPool {
         self.0.capacity.notify_waiters();
     }
 
+    /// Whether the current holders leave room to admit a block of `bytes` under
+    /// `admission`, closure aside. Admission checks again, so a stale `true`
+    /// costs one attempt. Read [`Self::capacity_version`] first, so a release
+    /// after a stale `false` still wakes the caller.
+    pub fn has_room_for(&self, bytes: u64, admission: Admission) -> bool {
+        if self.0.reserved.load(Ordering::Acquire) >= self.0.block_limit {
+            return false;
+        }
+        match self.0.pipeline_limit {
+            Some(limit) if admission == Admission::WithinLimit => self
+                .0
+                .pipeline_bytes
+                .load(Ordering::Acquire)
+                .checked_add(bytes)
+                .is_some_and(|next| next <= limit),
+            _ => true,
+        }
+    }
+
     /// Register a notification before retrying admission, then await it on refusal.
     pub fn capacity(&self) -> &Notify {
         &self.0.capacity
@@ -686,6 +705,26 @@ mod tests {
 
     fn pipeline_pool(limit: u64) -> DecodedBlockPool {
         DecodedBlockPool::for_pipeline(NonZeroU64::new(8).unwrap(), limit)
+    }
+
+    /// `has_room_for` agrees with admission on the count and pipeline limits.
+    #[test]
+    fn room_matches_what_admission_would_admit() {
+        let bytes = block().attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::for_pipeline(NonZeroU64::new(2).unwrap(), 2 * bytes);
+        assert!(pool.has_room_for(2 * bytes, Admission::WithinLimit));
+        assert!(!pool.has_room_for(2 * bytes + 1, Admission::WithinLimit));
+        let first = pool.try_admit(block(), Admission::WithinLimit).unwrap();
+        assert!(pool.has_room_for(bytes, Admission::WithinLimit));
+        assert!(!pool.has_room_for(bytes + 1, Admission::WithinLimit));
+        assert!(pool.has_room_for(bytes + 1, Admission::PipelineExempt));
+        let second = pool.try_admit(block(), Admission::PipelineExempt).unwrap();
+        assert!(
+            !pool.has_room_for(0, Admission::PipelineExempt),
+            "the count limit binds every admission"
+        );
+        drop((first, second));
+        assert!(pool.has_room_for(2 * bytes, Admission::WithinLimit));
     }
 
     #[test]

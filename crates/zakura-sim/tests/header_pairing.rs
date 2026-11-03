@@ -7,6 +7,7 @@
 mod support;
 
 use std::{
+    num::NonZeroU64,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,13 +19,15 @@ use futures::FutureExt;
 use support::{inputs, run};
 use zakura_chain::block;
 use zakura_header_chain::{
-    BodyWorkOwner, BranchId, EngineSnapshot, HeaderGeneration, HeaderLocator, HeaderWorkAuthority,
-    VctRootRepairState, VctRootRepairStatus,
+    BodyWorkOwner, BranchId, EngineSnapshot, HeaderGeneration, HeaderLocator, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, SourceId, VctRootRepairState, VctRootRepairStatus,
 };
 use zakura_network::zakura::{
-    observe::{as_call, CallEnd, HeaderSyncObserver, PortCall, ReactorEvent},
-    spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig,
-    ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
+    observe::{
+        as_call, CallEnd, HeaderSyncObserver, PortCall, ReactorEvent, RequestRef, StorageCallKind,
+    },
+    spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, HeaderTargetPurpose,
+    ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, ApplyHeaderTargetReply, HeaderChainFuture, LocatorReadPermit,
@@ -289,6 +292,113 @@ fn a_drop_with_no_receipt_fails_at_teardown() {
         detail.starts_with("UnpairedDrop: the reactor's teardown is done with call 1"),
         "{detail}"
     );
+}
+
+/// The header work a reactor's teardown can leave open: `round 1` of one peer,
+/// its prepare `call 1`, and the headers that call holds.
+fn open_work(byte: u8) -> [ReactorEvent; 3] {
+    let peer = ZakuraPeerId::new(vec![byte; 32]).expect("32 bytes is a valid peer ID");
+    let hash = block::Hash([byte; 32]);
+    let owner = HeaderSyncWorkOwner::Header(
+        HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(1),
+            branch: BranchId {
+                anchor_hash: hash,
+                target_tip_hash: hash,
+            },
+        }
+        .bind(1, NonZeroU64::new(1).expect("one is nonzero")),
+    );
+    [
+        ReactorEvent::Started {
+            request: RequestRef {
+                peer: peer.clone(),
+                session_id: 1,
+                request_id: 1,
+                incarnation: 1,
+                owner,
+                target_tip_hash: hash,
+            },
+            purpose: HeaderTargetPurpose::Normal,
+        },
+        ReactorEvent::Dispatched {
+            call: 1,
+            op: PortCall::Prepare {
+                peer: peer.clone(),
+                source: SourceId::from_digest([byte; 32]),
+                owner,
+            },
+        },
+        ReactorEvent::HeadersHeld {
+            call: 1,
+            kind: StorageCallKind::Prepare,
+            peer,
+            incarnation: 1,
+            headers: 5,
+        },
+    ]
+}
+
+/// Runs a tapped reactor that reports `events`, then ends, or panics if
+/// `unwinds`, and so drops its observer.
+fn teardown_after(events: Vec<ReactorEvent>, unwinds: bool) -> RunReport {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        for event in events {
+            observer.observe(event);
+        }
+        assert!(!unwinds, "the test reactor unwinds holding its observer");
+    });
+    sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default())
+}
+
+/// The evidence failure ending `report`.
+fn evidence_failure(report: &RunReport) -> &str {
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    detail
+}
+
+/// A call that reports no end fails the run once the reactor's teardown is
+/// done, though it never reached a drop for the pairer to wait on.
+#[test]
+fn a_call_left_unended_fails_at_teardown() {
+    let report = teardown_after(open_work(1).into(), false);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
+}
+
+/// A call that ended and kept its headers fails the run once the reactor's
+/// teardown is done.
+#[test]
+fn headers_left_held_fail_at_teardown() {
+    let mut events = Vec::from(open_work(2));
+    events.push(ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::NotSubmitted,
+    });
+    let report = teardown_after(events, false);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("OpenOwnership: call 1"), "{detail}");
+}
+
+/// A reactor that unwound leaves the same work open, and the teardown check
+/// stays quiet, so the crash isn't read as an ownership bug.
+#[test]
+fn an_unwound_reactor_is_not_reported_as_open_work() {
+    let report = teardown_after(open_work(3).into(), true);
+    if let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness {
+        assert!(
+            !detail.starts_with("UnendedCall") && !detail.starts_with("OpenOwnership"),
+            "{detail}"
+        );
+    }
 }
 
 /// With the node's first locator held until 30 s after its submission, the

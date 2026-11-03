@@ -806,14 +806,16 @@ impl Harness {
                                 OfferedPeerWork::Other
                             }
                         });
-                let decision = decide_offer(OfferFacts {
-                    pruned_pause: blockers.pruned_pause,
-                    covered: blockers.covered,
-                    eligible: blockers.eligible,
-                    work,
-                    held_back: blockers.held_back,
-                    subscription_ready: blockers.subscription_ready,
-                });
+                let decision = decide_offer(
+                    OfferFacts {
+                        pruned_pause: blockers.pruned_pause,
+                        covered: blockers.covered,
+                        eligible: blockers.eligible,
+                        work,
+                    },
+                    || blockers.held_back,
+                    || blockers.subscription_ready,
+                );
                 assert_eq!(
                     decision,
                     self.model_offer(peer, tip, blockers),

@@ -463,10 +463,6 @@ pub(in crate::zakura::header_sync) struct PageFacts {
     pub(in crate::zakura::header_sync) reaches_target: bool,
     /// Headers that this round's credit may still deliver.
     pub(in crate::zakura::header_sync) reserved: usize,
-    /// Whether the aggregate header budget is full.
-    pub(in crate::zakura::header_sync) budget_full: bool,
-    /// Whether the durable prefix has no room for the round's next grant.
-    pub(in crate::zakura::header_sync) durable_prefix_full: bool,
     /// Whether the staged headers form a whole refill batch for the selected tip.
     pub(in crate::zakura::header_sync) checkpoint_prefix_ready: bool,
 }
@@ -515,9 +511,16 @@ impl PageNext {
 /// prefix at capacity bounds response staging, and a checkpoint-sized minimum
 /// lets a selected extension unblock body validation without letting short peer
 /// pages force tiny prefix commits.
+///
+/// `budget_full` says whether the aggregate header budget is full, and
+/// `durable_prefix_full` whether the durable prefix has no room for the
+/// round's next grant. Each is read only when every earlier check passes,
+/// since reading them takes locks, and most pages wait for credit first.
 pub(in crate::zakura::header_sync) fn page_next(
     active: &ActiveHeaderRequest,
     facts: PageFacts,
+    budget_full: impl FnOnce() -> bool,
+    durable_prefix_full: impl FnOnce() -> bool,
 ) -> PageNext {
     let Some(staged_tip) = active.staged_tip() else {
         return PageNext::Malformed {
@@ -538,7 +541,7 @@ pub(in crate::zakura::header_sync) fn page_next(
     if facts.reserved != 0 {
         return PageNext::WaitCredit;
     }
-    if facts.budget_full || facts.durable_prefix_full || facts.checkpoint_prefix_ready {
+    if facts.checkpoint_prefix_ready || budget_full() || durable_prefix_full() {
         return PageNext::Prepare {
             bounded_prefix: true,
         };

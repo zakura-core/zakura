@@ -1265,7 +1265,12 @@ impl HeaderSyncReactor {
             .active(&peer)
             .expect("the page was just staged on this work");
         let facts = self.page_facts(&peer, active, admitted.reaches_target);
-        let next = page_next(active, facts);
+        let next = page_next(
+            active,
+            facts,
+            || self.peer_work_queue.budget_is_full(),
+            || self.durable_prefix_full(active),
+        );
         if next.closes_subscription() {
             self.close_subscription(&peer);
         }
@@ -1339,28 +1344,33 @@ impl HeaderSyncReactor {
         sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
     }
 
-    /// Read the facts that decide what follows the page just staged on `active`.
+    /// Read the lock-free facts that decide what follows the page just staged
+    /// on `active`. [`page_next`] reads the locked ones only when it needs them.
     fn page_facts(
         &self,
         peer: &ZakuraPeerId,
         active: &ActiveHeaderRequest,
         reaches_target: bool,
     ) -> PageFacts {
-        let snapshot = self.committed_snapshot.as_ref();
         PageFacts {
             reaches_target,
             reserved: self.peer_work_queue.reserved_header_count(peer),
-            budget_full: self.peer_work_queue.budget_is_full(),
-            durable_prefix_full: snapshot.is_some_and(|snapshot| {
-                Self::request_header_prefix_remaining(
-                    snapshot,
-                    self.peer_work_queue.claimed_header_count(),
-                    active.target.status.selected_tip_height,
-                ) == 0
-            }),
-            checkpoint_prefix_ready: snapshot
+            checkpoint_prefix_ready: self
+                .committed_snapshot
+                .as_ref()
                 .is_some_and(|snapshot| Self::should_prepare_checkpoint_prefix(snapshot, active)),
         }
+    }
+
+    /// Whether the durable prefix has no room for `active`'s next grant.
+    fn durable_prefix_full(&self, active: &ActiveHeaderRequest) -> bool {
+        self.committed_snapshot.as_ref().is_some_and(|snapshot| {
+            Self::request_header_prefix_remaining(
+                snapshot,
+                self.peer_work_queue.claimed_header_count(),
+                active.target.status.selected_tip_height,
+            ) == 0
+        })
     }
 
     /// Dispatch the prepare that validates `peer`'s staged headers.

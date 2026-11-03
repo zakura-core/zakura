@@ -162,7 +162,7 @@ fn benchmark_fixture(
         block: block.clone().into(),
         hash: block.hash(),
         height: BENCHMARK_HEIGHT,
-        new_outputs,
+        new_outputs: Arc::new(new_outputs),
         transaction_hashes: vec![transaction::Hash([0; 32]); transaction_count + 1].into(),
         deferred_pool_balance_change: None,
         auth_data_root: None,

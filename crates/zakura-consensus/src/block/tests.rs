@@ -728,11 +728,7 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                 assert!(
                     verifier
                         .prepared_candidates
-                        .lookup(
-                            &candidate,
-                            &super::body_digest::BodyDigest::of(&candidate),
-                            &network,
-                        )
+                        .lookup(&candidate, &network,)
                         .is_none(),
                     "{description}: rejected content must not enter the cache",
                 );
@@ -988,18 +984,14 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
         let mut replacement = (*candidate).clone();
         Arc::make_mut(&mut replacement.header).version = index.saturating_add(5);
         verifier.prepared_candidates.insert(
-            prepared::CandidateId::of(&replacement, &network),
             PreparedCandidateSource::ServerTemplate,
             zs::SemanticallyVerifiedBlock::from(Arc::new(replacement)),
+            &network,
         );
     }
     assert!(verifier
         .prepared_candidates
-        .lookup(
-            &candidate,
-            &super::body_digest::BodyDigest::of(&candidate),
-            &network,
-        )
+        .lookup(&candidate, &network,)
         .is_none());
 
     let mut tampered = (*resolved).clone();
@@ -1312,7 +1304,7 @@ async fn parent_outputs_stay_out_of_the_in_block_ordering_check() {
     // at index 1 fails there, and no parent output can stand in for it.
     let transaction_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
     assert_eq!(
-        committed.new_outputs,
+        *committed.new_outputs,
         transparent::new_ordered_outputs(&block, &transaction_hashes)
     );
     assert_eq!(committed.new_outputs[&later_output].tx_index_in_block, 2);

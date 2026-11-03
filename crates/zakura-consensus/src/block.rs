@@ -674,12 +674,21 @@ where
 
                 let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                     Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+                // Flush the shielded batches once this block's shielded transactions have queued
+                // their items, instead of after every transaction starts. See `primitives::flush`.
                 // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the
                 // pointer-keyed registration before the `Arc` address can be reused.
-                let _block_batch_flush = primitives::register_block_verifier_batch_flush(
-                    &known_outpoint_hashes,
-                    block.transactions.len(),
-                );
+                let shielded_transactions = block
+                    .transactions
+                    .iter()
+                    .filter(|tx| tx.has_shielded_data())
+                    .count();
+                let _block_batch_flush = (shielded_transactions > 0).then(|| {
+                    primitives::flush::BlockFlush::register(
+                        &known_outpoint_hashes,
+                        shielded_transactions,
+                    )
+                });
 
                 // Dispatch shielded transactions first: their proof batches are the longest
                 // checks, so starting them before the transparent checks shortens the block's

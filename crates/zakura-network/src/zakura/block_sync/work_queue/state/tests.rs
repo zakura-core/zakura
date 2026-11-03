@@ -161,6 +161,43 @@ fn stale_published_return_after_reset_settles_only_the_old_charge() {
 }
 
 #[test]
+fn a_competing_receipt_ends_only_a_published_reservation() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100)]);
+    assert_eq!(
+        state.end_competing_reservation_at_receipt(height(1)),
+        None,
+        "pending work has no owner"
+    );
+    let a = take(&mut state, 1, 1, 1, 1);
+    assert_eq!(
+        state.end_competing_reservation_at_receipt(height(1)),
+        None,
+        "a provisional take owns nothing yet"
+    );
+    let owner = owner_of(&a);
+    assert_eq!(publish(&mut state, &a), 100);
+
+    assert_eq!(
+        state.end_competing_reservation_at_receipt(height(1)),
+        Some((owner, 100))
+    );
+    assert_eq!(
+        state.end_competing_reservation_at_receipt(height(1)),
+        None,
+        "the charge leaves the ledger once"
+    );
+    assert_eq!(state.reserved_bytes(), 0);
+    let wake = state
+        .defer_received(owner, height(1), hash(1), 100, block::Height(0))
+        .expect("the owner still holds its received height");
+    assert!(
+        wake.revocation,
+        "the owner learns that another attempt answered it"
+    );
+}
+
+#[test]
 fn duplicate_settlement_releases_each_charge_once() {
     let mut state = new_state();
     extend(&mut state, authority(0), &[(1, 100), (2, 50)]);

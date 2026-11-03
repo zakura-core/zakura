@@ -6,7 +6,7 @@
 //! API the caller drives from its own per-peer state (see the ):
 //!
 //! - a height is in **exactly one** of `{below-floor (gone), pending, in_flight}`;
-//! - [`take_in_range`](WorkQueue::take_in_range) moves a contiguous-ascending run
+//! - [`take_request`](WorkQueue::take_request) moves a contiguous-ascending run
 //!   `pending → in_flight` (so one taken chunk maps to one `BlockRangeRequest`),
 //!   bounded only by the caller's servable range and a count cap — never by how
 //!   far above the download floor the heights already are;
@@ -295,6 +295,7 @@ impl WorkQueue {
     /// to a single `BlockRangeRequest`. `high` is the caller's `servable_high`
     /// and is **NOT** clamped to the floor (the download floor is never an upper
     /// bound on the fetch). Returns empty if nothing is eligible.
+    #[cfg(test)]
     pub(super) fn take_in_range(
         &self,
         low: block::Height,
@@ -348,37 +349,56 @@ impl WorkQueue {
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Result<Option<EndedReservation>, ReservationError> {
-        self.begin_receipt(owner, height, false)
+        self.begin_receipt(|state| {
+            state
+                .end_reservation_at_receipt(owner, height, false)
+                .map(|charge| (owner, charge))
+        })
+        .map(|ended| ended.map(|(_, ended)| ended))
     }
 
     /// Transfer a competing request's charge when another attempt receives its body.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn begin_competing_receipt(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Result<Option<EndedReservation>, ReservationError> {
-        self.begin_receipt(owner, height, true)
+        self.begin_receipt(|state| {
+            state
+                .end_reservation_at_receipt(owner, height, true)
+                .map(|charge| (owner, charge))
+        })
+        .map(|ended| ended.map(|(_, ended)| ended))
+    }
+
+    /// Transfer the charge of whichever published request reserves `height`
+    /// when an attempt that holds no request for it receives its body. The
+    /// owner lookup and the transfer share one queue lock, so a request that
+    /// takes the height concurrently can't lose its charge unrevoked. Returns
+    /// `None` for pending work, which has no owner.
+    pub(super) fn begin_unmatched_receipt(
+        &self,
+        height: block::Height,
+    ) -> Result<Option<(zakura_header_chain::BodyWorkOwner, EndedReservation)>, ReservationError>
+    {
+        self.begin_receipt(|state| state.end_competing_reservation_at_receipt(height))
     }
 
     fn begin_receipt(
         &self,
-        owner: zakura_header_chain::BodyWorkOwner,
-        height: block::Height,
-        answered_elsewhere: bool,
-    ) -> Result<Option<EndedReservation>, ReservationError> {
+        end: impl FnOnce(&mut WorkQueueState) -> Option<(zakura_header_chain::BodyWorkOwner, u64)>,
+    ) -> Result<Option<(zakura_header_chain::BodyWorkOwner, EndedReservation)>, ReservationError>
+    {
         let (ended, claim) = {
             let mut inner = self.lock();
-            let Some(charge) =
-                inner
-                    .state
-                    .end_reservation_at_receipt(owner, height, answered_elsewhere)
-            else {
+            let Some((owner, charge)) = end(&mut inner.state) else {
                 return Ok(None);
             };
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             let funding = self.split_receipt_funding(&mut inner, charge, outcome.released_bytes);
             (
-                funding.map(|funding| EndedReservation { charge, funding }),
+                funding.map(|funding| (owner, EndedReservation { charge, funding })),
                 claim,
             )
         };
@@ -407,6 +427,7 @@ impl WorkQueue {
     }
 
     /// Claim a received height and transfer its funding into the handoff.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn claim_receipt_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -696,6 +717,7 @@ impl WorkQueue {
         self.lock().state.pending_contains(height)
     }
 
+    #[cfg(test)]
     pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
         self.lock().state.reserved_in_flight_charge(height)
     }

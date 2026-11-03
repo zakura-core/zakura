@@ -12,7 +12,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use zakura_chain::{block, transaction, transparent};
@@ -31,8 +31,8 @@ const MAX_ENTRIES: usize = 4;
 ///
 /// A retained chain costs more memory than a spend result: it holds its own copy of the parts of
 /// the chain that are not shared between snapshots, and it keeps the partitions the proposal's
-/// update copied. It also holds the parent chain it extended, which stays allocated after the
-/// tip moves on until the entry drops it. Only the newest templates can realistically be solved,
+/// update copied. It also holds the parent chain it extended, until the writer publishes a state
+/// without that parent. Only the newest templates can realistically be solved,
 /// so older entries keep their spend result and drop their chain.
 ///
 /// On a 100-block chain of 165-transaction blocks, `chain_clone_worst_case` puts an unshared
@@ -149,7 +149,22 @@ struct Entry {
     parent_hash: block::Hash,
     transaction_hashes: Arc<[transaction::Hash]>,
     spent_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
-    prepared_proposal: Option<PreparedProposal>,
+    prepared_proposal: Result<PreparedProposal, NotPrepared>,
+}
+
+/// The writer's live chain identities and proposal results, updated under the same lock so a
+/// proposal finishing on an old snapshot cannot restore chains that cleanup already dropped.
+#[derive(Default)]
+struct Cache {
+    entries: VecDeque<Entry>,
+    live_chains: Vec<Weak<Chain>>,
+}
+
+impl Cache {
+    fn retains_parent(&self, proposal: &PreparedProposal) -> bool {
+        let parent = Arc::downgrade(&proposal.parent_chain);
+        self.live_chains.iter().any(|chain| chain.ptr_eq(&parent))
+    }
 }
 
 /// Contextual validation results shared by a non-finalized state and its clones.
@@ -159,9 +174,26 @@ struct Entry {
 /// its transaction IDs commit to the effecting data of every transaction, so a block with the
 /// same parent and the same transaction ID list gets the same result.
 #[derive(Clone, Default)]
-pub(crate) struct ProposalResults(Arc<Mutex<VecDeque<Entry>>>);
+pub(crate) struct ProposalResults(Arc<Mutex<Cache>>);
 
 impl ProposalResults {
+    /// Publishes the accepted writer state's chain identities and drops prepared chains whose
+    /// parent is no longer live. Spend results and the reason reuse became impossible survive.
+    /// Only the writer may call this, after accepting a change, never a proposal or staged clone.
+    pub(crate) fn update_live_chains<'a>(&self, chains: impl Iterator<Item = &'a Arc<Chain>>) {
+        let mut cache = self.lock();
+        cache.live_chains = chains.map(Arc::downgrade).collect();
+        for index in 0..cache.entries.len() {
+            if cache.entries[index]
+                .prepared_proposal
+                .as_ref()
+                .is_ok_and(|proposal| !cache.retains_parent(proposal))
+            {
+                cache.entries[index].prepared_proposal = Err(NotPrepared::ParentChanged);
+            }
+        }
+    }
+
     /// Shares a validated proposal's results without copying them.
     ///
     /// `chain`, when given, must be the chain whose tip is `proposal`. Call only after all
@@ -179,19 +211,29 @@ impl ProposalResults {
             );
         }
 
+        let mut cache = self.lock();
+        let prepared_proposal = chain
+            .ok_or(NotPrepared::ChainNotRetained)
+            .and_then(|proposal| {
+                if cache.retains_parent(&proposal) {
+                    Ok(proposal)
+                } else {
+                    Err(NotPrepared::ParentChanged)
+                }
+            });
         let entry = Entry {
             parent_hash: proposal.block.header.previous_block_hash,
             transaction_hashes: proposal.transaction_hashes.clone(),
             spent_utxos: Arc::clone(&proposal.spent_outputs),
-            prepared_proposal: chain,
+            prepared_proposal,
         };
-        let mut entries = self.lock();
+        let entries = &mut cache.entries;
         entries.retain(|old| !old.matches(entry.parent_hash, &entry.transaction_hashes));
         if entries.len() == MAX_ENTRIES {
             entries.pop_front();
         }
         entries.push_back(entry);
-        bound_prepared_chains(&mut entries);
+        bound_prepared_chains(entries);
     }
 
     /// Takes what a validated proposal for `solved` left behind: the outputs its transparent
@@ -217,8 +259,8 @@ impl ProposalResults {
         };
 
         let reuse = match (parent_chain, entry.prepared_proposal) {
-            (Some(parent_chain), Some(proposal)) => proposal.for_solved_block(solved, parent_chain),
-            (Some(_), None) => Err(NotPrepared::ChainNotRetained),
+            (Some(parent_chain), Ok(proposal)) => proposal.for_solved_block(solved, parent_chain),
+            (Some(_), Err(reason)) => Err(reason),
             (None, _) => Err(NotPrepared::NewChain),
         };
 
@@ -228,7 +270,8 @@ impl ProposalResults {
     /// Removes and returns the entry for a proposal with `block`'s parent and transactions, if
     /// one was validated.
     fn take(&self, block: &SemanticallyVerifiedBlock) -> Option<Entry> {
-        let mut entries = self.lock();
+        let mut cache = self.lock();
+        let entries = &mut cache.entries;
         let index = entries.iter().position(|entry| {
             entry.matches(
                 block.block.header.previous_block_hash,
@@ -238,7 +281,7 @@ impl ProposalResults {
         entries.remove(index)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Cache> {
         // The lock is only held for simple list operations that cannot panic midway.
         self.0
             .lock()
@@ -251,7 +294,9 @@ impl ProposalResults {
 fn bound_prepared_chains(entries: &mut VecDeque<Entry>) {
     let past_the_bound = entries.len().saturating_sub(MAX_PREPARED_CHAINS);
     for entry in entries.iter_mut().take(past_the_bound) {
-        entry.prepared_proposal = None;
+        if entry.prepared_proposal.is_ok() {
+            entry.prepared_proposal = Err(NotPrepared::ChainNotRetained);
+        }
     }
 }
 

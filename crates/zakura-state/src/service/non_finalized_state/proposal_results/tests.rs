@@ -31,6 +31,12 @@ use super::{
     MAX_PREPARED_CHAINS,
 };
 
+/// Publishes through the writer boundary without keeping an extra snapshot alive in the fixture.
+fn publish(state: &NonFinalizedState) {
+    let (sender, _receiver) = tokio::sync::watch::channel(state.clone());
+    state.publish(&sender);
+}
+
 /// The outputs a proposal left for `block`'s spend check, if any.
 fn take_spends(
     results: &ProposalResults,
@@ -137,6 +143,7 @@ fn state_with_spend() -> (
     Arc::make_mut(&mut child)
         .transactions
         .push(Arc::new(spend_transaction(4, outpoint)));
+    publish(&state);
     (finalized, state, child, outpoint, expected)
 }
 
@@ -168,6 +175,7 @@ fn heartwood_state() -> (FinalizedState, NonFinalizedState, Arc<Block>) {
         .expect("the parent commits");
     // Heartwood's activation block requires an all-zero reserved commitment.
     let child = parent.make_fake_child().set_block_commitment([0; 32]);
+    publish(&state);
     (finalized, state, child)
 }
 
@@ -966,7 +974,7 @@ fn only_the_newest_results_keep_their_chain() {
             parent_hash: Hash([u8::try_from(index).expect("the bound fits in a byte"); 32]),
             transaction_hashes: Arc::from(Vec::new()),
             spent_utxos: Arc::default(),
-            prepared_proposal: Some(PreparedProposal::new(&parent_chain, &prepared)),
+            prepared_proposal: Ok(PreparedProposal::new(&parent_chain, &prepared)),
         });
         bound_prepared_chains(&mut entries);
     }
@@ -975,7 +983,7 @@ fn only_the_newest_results_keep_their_chain() {
     assert_eq!(
         entries
             .iter()
-            .filter(|entry| entry.prepared_proposal.is_some())
+            .filter(|entry| entry.prepared_proposal.is_ok())
             .count(),
         MAX_PREPARED_CHAINS,
     );
@@ -984,7 +992,7 @@ fn only_the_newest_results_keep_their_chain() {
             .iter()
             .rev()
             .take(MAX_PREPARED_CHAINS)
-            .all(|entry| entry.prepared_proposal.is_some()),
+            .all(|entry| entry.prepared_proposal.is_ok()),
         "the newest entries are the ones that keep their chain",
     );
 }
@@ -1006,6 +1014,7 @@ fn a_retained_chain_is_the_only_reference_left_to_it() {
         .expect("the proposal is valid");
     drop(proposal_state);
 
+    publish(&state);
     let retained = state
         .proposal_results
         .take(&child.prepare())
@@ -1016,5 +1025,142 @@ fn a_retained_chain_is_the_only_reference_left_to_it() {
         Arc::strong_count(&retained.child_chain),
         1,
         "finishing the retained chain must move it, not copy it",
+    );
+}
+
+/// Both orderings matter: a finished proposal must be cleared when its parent leaves, and a
+/// proposal still validating on the old snapshot must not put those chains back afterwards.
+#[test]
+fn publishing_a_changed_parent_releases_chains_even_when_proposals_stop() {
+    let _init_guard = zakura_test::init();
+    for finish_before_publication in [true, false] {
+        for remove_all_chains in [false, true] {
+            let (finalized, mut state, child, _, _) = state_with_spend();
+            let parent = Arc::downgrade(state.best_chain().unwrap());
+            let old_tip = state.best_tip();
+            let mut proposal_state = state.clone();
+            proposal_state.disable_metrics();
+            proposal_state.record_proposal_results();
+
+            if finish_before_publication {
+                proposal_state
+                    .commit_block(child.clone().prepare(), &finalized)
+                    .expect("the proposal is valid on the original snapshot");
+            }
+
+            if remove_all_chains {
+                let root = state.best_chain().unwrap().non_finalized_root_hash();
+                state.invalidate_block(root).unwrap();
+                assert!(state.is_chain_set_empty());
+            } else {
+                state.finalize();
+                assert_eq!(state.best_tip(), old_tip, "finalization keeps the tip hash");
+            }
+            publish(&state);
+
+            if !finish_before_publication {
+                proposal_state
+                    .commit_block(child.clone().prepare(), &finalized)
+                    .expect("the in-flight proposal finishes on its original snapshot");
+            }
+
+            let prepared = Arc::downgrade(proposal_state.best_chain().unwrap());
+            let spends = proposal_state
+                .best_tip_block()
+                .unwrap()
+                .spent_outputs
+                .clone();
+            drop(proposal_state);
+
+            // Do not submit a block or another proposal before checking release.
+            assert!(
+                parent.upgrade().is_none(),
+                "the old parent is no longer pinned"
+            );
+            assert!(
+                prepared.upgrade().is_none(),
+                "the prepared chain is no longer pinned"
+            );
+            let entry = state.proposal_results.take(&child.prepare()).unwrap();
+            assert!(Arc::ptr_eq(&entry.spent_utxos, &spends));
+            assert_eq!(
+                entry.prepared_proposal.err(),
+                Some(NotPrepared::ParentChanged)
+            );
+        }
+    }
+}
+
+#[test]
+fn unpublished_changes_do_not_discard_a_reusable_proposal() {
+    let _init_guard = zakura_test::init();
+    let (finalized, state, child, _, _) = state_with_spend();
+    let mut proposal_state = state.clone();
+    proposal_state.disable_metrics();
+    proposal_state.record_proposal_results();
+    proposal_state
+        .commit_block(child.clone().prepare(), &finalized)
+        .unwrap();
+    drop(proposal_state);
+
+    let mut staged = state.clone();
+    staged.finalize();
+    drop(staged);
+    publish(&state);
+
+    let (spends, prepared) = state
+        .proposal_results
+        .take_for(&solve(&child).prepare(), state.best_chain());
+    assert!(spends.is_some());
+    assert!(
+        prepared.is_ok(),
+        "only accepted writer changes may discard a prepared chain"
+    );
+}
+
+#[test]
+fn cleanup_preserves_live_side_chains_and_distinct_miss_reasons() {
+    let _init_guard = zakura_test::init();
+    let (finalized, state, child, _, _) = state_with_spend();
+    let (parent, prepared) = prepare(&state, &finalized, child.clone().prepare());
+    let results = ProposalResults::default();
+    let other_parent = Arc::new(parent.as_ref().clone());
+    results.update_live_chains([&parent, &other_parent].into_iter());
+    results.remember(
+        prepared.tip_block().unwrap(),
+        Some(PreparedProposal::new(&parent, &prepared)),
+    );
+
+    // Removing a different chain must leave this proposal reusable, even if it is a side chain.
+    results.update_live_chains([&parent].into_iter());
+    assert!(results
+        .take_for(&solve(&child).prepare(), Some(&parent))
+        .1
+        .is_ok());
+
+    results.remember(
+        prepared.tip_block().unwrap(),
+        Some(PreparedProposal::new(&parent, &prepared)),
+    );
+    // Equal contents and the same tip hash do not make a new allocation the same parent.
+    results.update_live_chains([&other_parent].into_iter());
+    for index in 0..MAX_PREPARED_CHAINS {
+        let mut other = child.as_ref().clone();
+        Arc::make_mut(&mut other.header).previous_block_hash =
+            Hash([u8::try_from(index).unwrap(); 32]);
+        results.remember(
+            &contextual(
+                Arc::new(other).prepare(),
+                &prepared.tip_block().unwrap().spent_outputs,
+            ),
+            None,
+        );
+    }
+    let (spends, reuse) = results.take_for(&solve(&child).prepare(), Some(&other_parent));
+    assert!(spends.is_some());
+    assert_eq!(
+        reuse.err(),
+        Some(NotPrepared::ParentChanged),
+        "the memory bound must preserve the earlier cleanup reason"
     );
 }

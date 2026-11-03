@@ -203,6 +203,14 @@ impl NonFinalizedState {
         }
     }
 
+    /// Publishes an accepted writer state and releases cached proposal chains whose parents
+    /// left it. Call only after accepting the complete change, never on a staged or proposal clone.
+    pub(crate) fn publish(&self, sender: &watch::Sender<Self>) {
+        self.proposal_results.update_live_chains(self.chain_iter());
+        // If the final receiver was just dropped, ignore the error.
+        let _ = sender.send(self.clone());
+    }
+
     /// Writes the current non-finalized state to the backup directory at `backup_dir_path`.
     ///
     /// Reads the existing backup directory contents, writes any blocks that are in the
@@ -237,6 +245,9 @@ impl NonFinalizedState {
         WatchReceiver<NonFinalizedState>,
     ) {
         let with_watch_channel = |non_finalized_state: NonFinalizedState| {
+            non_finalized_state
+                .proposal_results
+                .update_live_chains(non_finalized_state.chain_iter());
             let (sender, receiver) = watch::channel(non_finalized_state.clone());
             (non_finalized_state, sender, WatchReceiver::new(receiver))
         };

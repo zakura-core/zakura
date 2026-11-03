@@ -60,9 +60,10 @@ use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
-    CompatResponseGrant, ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources,
-    OrderedStreamFailure, OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout,
-    StreamResources, TransportLimits, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    CompatResponseGrant, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
+    NodeResources, OrderedStreamFailure, OrderedStreamFailureCause, OwnerGuard, OwnerPhase,
+    ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout, StreamResources,
+    TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -522,6 +523,9 @@ pub struct ZakuraLocalLimits {
     pub max_open_streams: u16,
     /// Maximum inbound queue depth per stream kind.
     pub max_inbound_queue_depth: u16,
+    /// Each stream kind's receive and output share on one connection. Unset,
+    /// [`ReactorShares::from_quic`] derives them from `quic`'s windows.
+    pub reactor_shares: Option<ReactorShares>,
 }
 
 impl ZakuraLocalLimits {
@@ -553,7 +557,27 @@ impl ZakuraLocalLimits {
             max_message_bytes: handshake.max_message_bytes,
             max_open_streams: handshake.max_open_streams,
             max_inbound_queue_depth: handshake.max_inbound_queue_depth,
+            reactor_shares: None,
         }
+    }
+
+    /// These limits with `shares`, and the QUIC windows that carry them: the
+    /// connection window starts at the handshake share, and the stream window
+    /// holds the largest receive share.
+    pub fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
+        self.quic.receive_window_bytes =
+            u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX);
+        self.quic.stream_receive_window_bytes =
+            u32::try_from(shares.stream_receive_window()).unwrap_or(u32::MAX);
+        self.reactor_shares = Some(shares);
+        self
+    }
+
+    /// Each stream kind's receive and output share on one connection.
+    pub fn reactor_shares(&self) -> ReactorShares {
+        self.reactor_shares
+            .clone()
+            .unwrap_or_else(|| ReactorShares::from_quic(&self.quic))
     }
 
     /// Clamp peer-negotiated limits to local hard ceilings.
@@ -598,15 +622,36 @@ impl ZakuraLocalLimits {
         }
     }
 
-    /// Returns the transport's byte and worker bounds under these limits.
-    pub(crate) fn resource_envelope(&self) -> ResourceEnvelope {
+    /// Returns the transport's byte bounds under these limits, for a node
+    /// that serves `registry`'s stream kinds.
+    pub(crate) fn resource_envelope(&self, registry: &ServiceRegistry) -> ResourceEnvelope {
+        let shares = self.reactor_shares();
+        let mut kinds: Vec<u16> = registry
+            .services()
+            .iter()
+            .flat_map(|service| service.streams().iter().map(|stream| stream.kind))
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        let connection_shares = kinds.iter().fold(ReactorBudget::ZERO, |sum, kind| {
+            let share = shares.share(*kind);
+            ReactorBudget {
+                receive: sum.receive.saturating_add(share.receive),
+                output: sum.output.saturating_add(share.output),
+            }
+        });
+        let compat_exchange_bytes = if kinds.contains(&LEGACY_REQUEST_STREAM_KIND) {
+            COMPAT_EXCHANGE_BUDGET.receive
+        } else {
+            0
+        };
         ResourceEnvelope::new(TransportLimits {
-            receive_window: self.quic.receive_window_bytes,
+            control_receive_bytes: shares.control_receive_bytes,
+            connection_shares,
+            compat_exchange_bytes,
             send_window: self.quic.send_window_bytes,
             max_connections: self.max_connections,
             max_pending_handshakes: self.max_pending_handshakes,
-            max_open_streams: self.max_open_streams,
-            max_frame_bytes: self.max_frame_bytes,
         })
     }
 
@@ -1388,10 +1433,11 @@ impl ResponseFrames {
     /// A scripted peer's frames under a real zero-byte grant.
     #[cfg(test)]
     pub(crate) async fn with_zero_grant_for_tests(frames: Vec<Frame>) -> Self {
-        let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(1, 1)));
         Self {
             frames,
-            grant: node.connection().admit_compat_response(0).await,
+            grant: ConnectionResources::unconstrained(&[])
+                .admit_compat_response(0)
+                .await,
         }
     }
 }
@@ -1918,8 +1964,9 @@ impl Drop for RegisteredPeerCleanupGuard {
 struct IncomingStreamSetup {
     io: SetupIo,
     permit: OwnedSemaphorePermit,
-    /// Created with the permit, so this future's first suspend finds it owned.
-    resources: StreamResources,
+    /// Created with the permit, so this future's first suspend finds it
+    /// counted. The stream's gates follow once its prelude names its kind.
+    owner: OwnerGuard,
     stream_id: u64,
     stream: Stream,
     prelude: StreamPrelude,
@@ -2559,7 +2606,15 @@ impl ZakuraProtocolHandler {
         handshake_config.supported_capabilities = registry.supported_capabilities();
         let supported_capabilities =
             Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
-        let envelope = limits.resource_envelope();
+        let envelope = limits.resource_envelope(&registry);
+        let resources = NodeResources::new(
+            limits.reactor_shares(),
+            registry
+                .services()
+                .iter()
+                .flat_map(|service| service.streams().iter().copied()),
+            limits.max_frame_bytes,
+        );
         debug!(
             ?envelope,
             transport_memory_bytes = %envelope.transport_memory_bytes(),
@@ -2577,7 +2632,7 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
-            resources: NodeResources::new(envelope),
+            resources,
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
@@ -2942,7 +2997,13 @@ impl ZakuraProtocolHandler {
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
-        let connection_resources = self.resources.connection();
+        let connection_resources = self.resources.connection(accepted_capabilities);
+        // Set once, for the kinds this connection negotiated (zakura-quic
+        // API-9). The handshake window stays inside it for the control stream.
+        let _ = connection.set_limits(
+            zakura_quic::ConnLimits::default()
+                .with_receive_window(connection_resources.receive_window()),
+        );
         let mut workers = JoinSet::new();
         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();
         let mut pending_sessions = PendingSessions::default();
@@ -3564,7 +3625,7 @@ impl ZakuraProtocolHandler {
                 .trace_stream("rejected.semaphore", stream_id, None);
             return None;
         };
-        let resources = admission.resources.stream();
+        let owner = admission.resources.owner();
 
         // Charge the per-connection stream-open rate token immediately after
         // acquiring a concurrency permit, before parsing the prelude or running
@@ -3751,7 +3812,7 @@ impl ZakuraProtocolHandler {
             Some(IncomingStreamSetup {
                 io,
                 permit,
-                resources,
+                owner,
                 stream_id,
                 stream,
                 prelude,
@@ -3773,13 +3834,20 @@ impl ZakuraProtocolHandler {
         let IncomingStreamSetup {
             io,
             permit,
-            resources: stream_resources,
+            owner,
             stream_id,
             stream,
             prelude,
             session,
         } = incoming;
         let (mut send, mut recv) = io.take();
+        let Some(stream_resources) = admission.resources.stream(stream.kind, owner) else {
+            // Admission checked the kind's capability, and the connection gates
+            // every negotiated kind, so this is a local inconsistency.
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            return None;
+        };
         let resources = if let Some((layout, _)) = &session {
             match pending_sessions.reserve_or_share(layout, &self.registry, admission.direction) {
                 Ok(resources) => resources,
@@ -5427,8 +5495,8 @@ async fn request_stream_worker(
     }
 
     let response_frame_cap = context.outbound_frame_cap;
-    // Fund the whole response before the service runs, so a saturated output budget
-    // stops the request here and no result waits unfunded. The stream's permit and
+    // Fund the whole response before the service runs, so a full output gate stops
+    // the request here and no result waits unfunded. The stream's permit and
     // the raw frame's grant stay held during this wait.
     let bound = response_bound(
         prelude.stream_kind,
@@ -5439,13 +5507,7 @@ async fn request_stream_worker(
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        output = async {
-            if bound.one_frame {
-                context.resources.output.admit(bound.bytes).await
-            } else {
-                context.resources.output.admit_shared(bound.bytes).await
-            }
-        } => output,
+        output = context.resources.output.admit(bound.bytes) => output,
     };
 
     // The raw frame's grant ends with the service's call, which cancelling the
@@ -5486,8 +5548,10 @@ async fn request_stream_worker(
     };
 
     // The result is the worker's own retained memory, and `output` funds it through
-    // the write. A result above its bound has no funding, so it never reaches the
-    // write. The bytes the service did not use return to the budgets now.
+    // the write from its kind's output gate. A result above its bound has no
+    // funding, so it never reaches the write. The bytes the service did not use
+    // return to the gate now. A bound above the gate takes the whole gate, so one
+    // stalled response strands at most its kind's output share.
     let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
         bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
     });
@@ -5617,7 +5681,8 @@ async fn read_frame(
 }
 
 /// Read one frame as [`read_frame`] does, with `gate` admitting its bytes after
-/// the header's checks and before the payload's allocation.
+/// the header's checks and before the payload's allocation. The grant holds
+/// the payload's QUIC credit until it drops.
 async fn read_admitted_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
@@ -5638,10 +5703,27 @@ async fn read_admitted_frame(
     .map(|(frame, grant)| AdmittedFrame { frame, grant })
 }
 
+/// What funds a frame's payload from its allocation on.
+trait PayloadAdmission {
+    /// Keep the QUIC credit of the `payload_len` bytes that `recv` reads next,
+    /// if this admission funds them.
+    fn hold_credit(&mut self, recv: &mut RecvStream, payload_len: usize);
+}
+
+impl PayloadAdmission for () {
+    fn hold_credit(&mut self, _recv: &mut RecvStream, _payload_len: usize) {}
+}
+
+impl PayloadAdmission for FrameGrant {
+    fn hold_credit(&mut self, recv: &mut RecvStream, payload_len: usize) {
+        FrameGrant::hold_credit(self, recv, payload_len);
+    }
+}
+
 /// The frame read itself. `admit` runs once the header passed its checks, and
-/// its result funds the allocation that follows. A stalled peer's in-progress
-/// read and a local wait for capacity have separate bounds: `read_timeout` covers
-/// only the peer's bytes.
+/// its result funds the allocation that follows and holds the payload's QUIC
+/// credit. A stalled peer's in-progress read and a local wait for capacity
+/// have separate bounds: `read_timeout` covers only the peer's bytes.
 async fn read_frame_under<G, Fut>(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
@@ -5651,6 +5733,7 @@ async fn read_frame_under<G, Fut>(
     admit: impl FnOnce(u64) -> Fut,
 ) -> Result<(Frame, G), ZakuraHandlerError>
 where
+    G: PayloadAdmission,
     Fut: future::Future<Output = G>,
 {
     let mut header = [0; FRAME_HEADER_BYTES];
@@ -5707,7 +5790,9 @@ where
             max_frame_bytes,
         });
     }
-    let admission = admit(frame_wire_bytes(payload_len)).await;
+    let mut admission = admit(frame_wire_bytes(payload_len)).await;
+    // Before the payload read, so the hold rides in that read's command.
+    admission.hold_credit(recv, payload_len);
     let mut payload = vec![0; payload_len];
     read_frame_payload(recv, &mut payload, read_timeout).await?;
     #[cfg(any(test, zakura_sim))]
@@ -6120,7 +6205,6 @@ impl LegacyResponseBudget {
         // Widening u32 to usize is lossless on supported targets.
         let frame_payload_bytes = (max_frame_bytes as usize).saturating_sub(FRAME_HEADER_BYTES);
         let one_frame = |payload_bytes: usize| ResponseBound {
-            one_frame: true,
             // Widening usize to u64 is lossless on supported targets.
             bytes: payload_bytes
                 .min(frame_payload_bytes)
@@ -6173,7 +6257,6 @@ impl LegacyResponseBudget {
             .min(most_frames)
             .saturating_add(1);
         ResponseBound {
-            one_frame: false,
             // Widening usize to u64 is lossless on supported targets.
             bytes: payload_bytes.saturating_add(frames.saturating_mul(FRAME_HEADER_BYTES)) as u64,
         }
@@ -6200,8 +6283,6 @@ impl LegacyResponseBudget {
 /// The most output one response to a request can need.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ResponseBound {
-    /// Whether the whole response fits one frame, which a stream's floor slot can fund.
-    one_frame: bool,
     /// Wire bytes, including each frame's header.
     bytes: u64,
 }
@@ -6210,7 +6291,6 @@ impl ResponseBound {
     /// The bound of a request whose response has no derivable limit: any number of
     /// frames, up to the compatibility response cap.
     const MAX: Self = Self {
-        one_frame: false,
         // Widening usize to u64 is lossless on supported targets.
         bytes: COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
     };
@@ -11242,7 +11322,7 @@ mod tests {
             conn: ZakuraConnTrace::placeholder(),
             peer_id: &peer_id,
             stream_sem: &stream_sem,
-            resources: &ConnectionResources::unconstrained(),
+            resources: &ConnectionResources::unconstrained(&[]),
             open_limiter: &mut open_limiter,
             message_buckets: &mut message_buckets,
             workers: &mut workers,

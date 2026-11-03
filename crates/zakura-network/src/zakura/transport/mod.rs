@@ -44,10 +44,11 @@ pub(crate) use io::{
 #[cfg(test)]
 pub(crate) use lifetime::OwnerCounts;
 pub(crate) use lifetime::{
-    frame_wire_bytes, CompatResponseGrant, ConnectionResources, FrameGate, NodeResources,
-    OwnerPhase, ResourceEnvelope, StreamResources, TransportLimits,
+    frame_wire_bytes, CompatResponseGrant, ConnectionResources, FrameGate, FrameGrant,
+    NodeResources, OwnerGuard, OwnerPhase, ResourceEnvelope, StreamResources, TransportLimits,
     COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
+pub use lifetime::{ReactorShares, COMPAT_EXCHANGE_BUDGET, DEFAULT_REACTOR_OUTPUT_BYTES};
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]
 pub(crate) use message_rule::frame_suite::check_frame_filter;

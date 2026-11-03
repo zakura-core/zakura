@@ -1274,6 +1274,58 @@ async fn a_stopped_stream_returns_its_credit() {
     .unwrap();
 }
 
+/// API-10: a credit hold keeps a sender stuck on DATA_BLOCKED after the
+/// receiver read the bytes, and dropping the hold lets it finish.
+#[tokio::test]
+async fn releasing_a_credit_hold_unblocks_the_sender() {
+    const WINDOW: usize = 256 * 1024;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            // usize fits in u32 for this constant.
+            receive_window_bytes: WINDOW as u32,
+            // A larger stream window, so the connection window blocks.
+            stream_receive_window_bytes: 4 * WINDOW as u32,
+            ..test_config()
+        };
+        let (_server, _client, conn, inbound) = held_pair_with(&config, 1).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let writer = tokio::spawn(async move {
+            send.write_all(&[3; 2 * WINDOW]).await.unwrap();
+            send.finish().unwrap();
+        });
+        let (_send, mut recv) = inbound.accept_bi().await.unwrap();
+        let mut frame = vec![0; WINDOW];
+        // usize fits in u64 on supported targets.
+        let hold = recv.hold_credit(WINDOW as u64);
+        recv.read_exact(&mut frame).await.unwrap();
+        while inbound
+            .stats()
+            .await
+            .unwrap()
+            .connection
+            .frame_rx
+            .data_blocked
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut rest = vec![0; WINDOW];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), recv.read_exact(&mut rest[..1]))
+                .await
+                .is_err(),
+            "the hold keeps the read bytes' credit from the sender"
+        );
+        drop(hold);
+        // The cancelled read kept its reply, so no byte is lost.
+        recv.read_exact(&mut rest).await.unwrap();
+        assert!(recv.read_chunk(1).await.unwrap().is_none());
+        writer.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// API-9: raising the stream limit at runtime lets a blocked opener through,
 /// and the load snapshot reports the new limit.
 #[tokio::test]

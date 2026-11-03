@@ -1659,17 +1659,20 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
 
     let config: Config = toml::from_str("").expect("empty config parses");
     assert_eq!(config.advert_window_min, 32);
-    assert_eq!(config.advert_window_max, 48);
+    assert_eq!(config.advert_window_max, 64);
+    assert_eq!(config.advert_window_small_size_bytes, 102_400);
     assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
 
     let config: Config = toml::from_str(
         "advert_window_min = 2\n\
          advert_window_max = 16\n\
+         advert_window_small_size_bytes = 100\n\
          advert_window_full_size_bytes = 1000\n",
     )
     .expect("configured fan-out parses");
     assert_eq!(config.advert_window_min, 2);
     assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_small_size_bytes, 100);
     assert_eq!(config.advert_window_full_size_bytes, 1000);
 
     let serialized = toml::to_string(&config).expect("config serializes");
@@ -1677,8 +1680,12 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     assert_eq!(roundtrip, config);
 
     // Equal bounds are a fixed window.
-    let config: Config = toml::from_str("advert_window_min = 48").expect("equal bounds parse");
+    let config: Config = toml::from_str("advert_window_min = 64").expect("equal bounds parse");
     assert_eq!(config.advert_window_min, config.advert_window_max);
+
+    let config: Config = toml::from_str("advert_window_small_size_bytes = 0")
+        .expect("a zero small-size boundary parses");
+    assert_eq!(config.advert_window_small_size_bytes, 0);
 }
 
 #[test]
@@ -1691,11 +1698,23 @@ fn invalid_advert_fanout_config_is_rejected() {
             "advert_window_min = 10\nadvert_window_max = 9",
             "advert_window_min",
         ),
-        // The default maximum of 48 is below this minimum, and the reverse.
-        ("advert_window_min = 49", "advert_window_min"),
+        // The default maximum of 64 is below this minimum, and the reverse.
+        ("advert_window_min = 65", "advert_window_min"),
         ("advert_window_max = 31", "advert_window_max"),
         (
             "advert_window_full_size_bytes = 0",
+            "advert_window_full_size_bytes",
+        ),
+        (
+            "advert_window_small_size_bytes = 1572864",
+            "advert_window_small_size_bytes",
+        ),
+        (
+            "advert_window_small_size_bytes = 1572865",
+            "advert_window_small_size_bytes",
+        ),
+        (
+            "advert_window_full_size_bytes = 102400",
             "advert_window_full_size_bytes",
         ),
         // Removed settings.

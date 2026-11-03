@@ -70,6 +70,7 @@ pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
 pub(crate) struct AdvertFanout {
     min: usize,
     max: usize,
+    small_size_bytes: u64,
     full_size_bytes: u64,
 }
 
@@ -79,20 +80,24 @@ impl AdvertFanout {
         Self {
             min: config.advert_window_min,
             max: config.advert_window_max,
+            small_size_bytes: config.advert_window_small_size_bytes,
             full_size_bytes: config.advert_window_full_size_bytes,
         }
     }
 
     /// Returns the advert window of a block of `size` serialized bytes, and records it in metrics.
     ///
-    /// The window is `min + floor((max - min) * (full_size - size) / full_size)` below the full
-    /// size, and `min` at or above the full size or when the size is unknown.
+    /// Blocks at or below `small_size_bytes` use `max`.
+    /// Blocks at or above `full_size_bytes`, and blocks of unknown size, use `min`.
+    /// Between these sizes, the window decreases linearly from `max` to `min`, rounded down.
     pub(crate) fn window(&self, size: Option<u32>) -> usize {
         let window = size.map_or(self.min, |size| {
-            let below_full = self.full_size_bytes.saturating_sub(u64::from(size));
+            let size = u64::from(size).max(self.small_size_bytes);
+            let below_full = self.full_size_bytes.saturating_sub(size);
+            let size_range = self.full_size_bytes.saturating_sub(self.small_size_bytes);
             // Both factors fit in 64 bits, so the product cannot overflow.
             let above_min = self.max.saturating_sub(self.min) as u128 * u128::from(below_full)
-                / u128::from(self.full_size_bytes.max(1));
+                / u128::from(size_range.max(1));
             // `above_min` is at most `max - min`.
             usize::try_from(above_min).map_or(self.max, |above_min| self.min + above_min)
         });
@@ -1180,24 +1185,29 @@ mod tests {
         (0..count).map(|_| peer().0).collect()
     }
 
-    /// The default window is 32 at or above 1.5 MiB, and rises linearly to 48 at 0 bytes.
+    /// The default window falls linearly from 64 at 100 KiB to 32 at 1.5 MiB.
     #[test]
     fn default_advert_window_follows_block_size() {
         /// A full NU7 block, just below the reference size.
         const FULL_NU7_BLOCK: u32 = 1_513_987;
         const FULL_SIZE: u32 = 1_572_864;
+        const SMALL_SIZE: u32 = 102_400;
+        const MID_SIZE: u32 = (SMALL_SIZE + FULL_SIZE) / 2;
         let fanout = AdvertFanout::from_config(&Config::default());
 
-        assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 32);
+        assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 33);
         assert_eq!(fanout.window(Some(FULL_SIZE)), 32);
         assert_eq!(fanout.window(Some(FULL_SIZE + 1)), 32);
         assert_eq!(fanout.window(Some(u32::MAX)), 32);
-        assert_eq!(fanout.window(Some(0)), 48);
+        assert_eq!(fanout.window(Some(0)), 64);
+        assert_eq!(fanout.window(Some(SMALL_SIZE - 1)), 64);
+        assert_eq!(fanout.window(Some(SMALL_SIZE)), 64);
+        assert_eq!(fanout.window(Some(SMALL_SIZE + 1)), 63);
         assert_eq!(fanout.window(None), 32);
         // The mid-point is exact, and the result floors on either side of it.
-        assert_eq!(fanout.window(Some(FULL_SIZE / 2)), 40);
-        assert_eq!(fanout.window(Some(FULL_SIZE / 2 - 1)), 40);
-        assert_eq!(fanout.window(Some(FULL_SIZE / 2 + 1)), 39);
+        assert_eq!(fanout.window(Some(MID_SIZE)), 48);
+        assert_eq!(fanout.window(Some(MID_SIZE - 1)), 48);
+        assert_eq!(fanout.window(Some(MID_SIZE + 1)), 47);
     }
 
     /// Equal bounds give a fixed window, and large bounds do not overflow.
@@ -1217,13 +1227,36 @@ mod tests {
         assert_eq!(fanout(1, usize::MAX).window(Some(0)), usize::MAX);
     }
 
+    /// Custom size boundaries control both plateaus and the interpolation between them.
+    #[test]
+    fn advert_window_uses_configured_sizes() {
+        let fanout = AdvertFanout::from_config(&Config {
+            advert_window_min: 4,
+            advert_window_max: 12,
+            advert_window_small_size_bytes: 100,
+            advert_window_full_size_bytes: 1_000,
+            ..Config::default()
+        });
+        for size in [0, 99, 100] {
+            assert_eq!(fanout.window(Some(size)), 12);
+        }
+        assert_eq!(fanout.window(Some(101)), 11);
+        assert_eq!(fanout.window(Some(550)), 8);
+        for size in [1_000, 1_001, u32::MAX] {
+            assert_eq!(fanout.window(Some(size)), 4);
+        }
+        assert_eq!(fanout.window(None), 4);
+    }
+
     /// Broadcasts advertise to the window's peers at once, up to the peers they have.
     #[tokio::test(start_paused = true)]
     async fn first_wave_follows_block_size() {
         let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
-        assert_eq!(wave(100, 1_513_987).await.len(), 32);
+        assert_eq!(wave(100, 1_513_987).await.len(), 33);
         assert_eq!(wave(100, 10_000_000).await.len(), 32);
-        assert_eq!(wave(100, 2_000).await.len(), 47);
+        assert_eq!(wave(100, 2_000).await.len(), 64);
+        assert_eq!(wave(100, 102_400).await.len(), 64);
+        assert_eq!(wave(100, 102_401).await.len(), 63);
         assert_eq!(wave(40, 2_000).await.len(), 40);
     }
 
@@ -1511,6 +1544,7 @@ mod tests {
                 fanout: AdvertFanout::from_config(&Config {
                     advert_window_min: 1,
                     advert_window_max: 2,
+                    advert_window_small_size_bytes: 0,
                     advert_window_full_size_bytes: 100,
                     ..Config::default()
                 }),

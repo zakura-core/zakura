@@ -88,10 +88,15 @@ pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 /// This will be used as `Config.advert_window_min` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
 
-/// The default advert window of an empty block.
+/// The default advert window of a block at or below the small size.
 ///
 /// This will be used as `Config.advert_window_max` if it is not configured.
-pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 48;
+pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+
+/// The default block size that gets the maximum advert window, 100 KiB.
+///
+/// This will be used as `Config.advert_window_small_size_bytes` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES: u64 = 102_400;
 
 /// The default block size that gets the minimum advert window, 1.5 MiB.
 ///

@@ -262,13 +262,17 @@ impl QueuedBlocks {
             .expect("replacement hash exists in the queue");
         let replacement = self
             .blocks
-            .get(&hash)
+            .get_mut(&hash)
             .expect("replacement was inserted under the same hash");
         assert_eq!(old.0.height, replacement.0.height);
         assert_eq!(
             old.0.block.header.previous_block_hash,
             replacement.0.block.header.previous_block_hash
         );
+        // A redelivery gets a new verifier receipt once earlier attempts finish.
+        if old.0.block == replacement.0.block {
+            replacement.0.receipt_order = old.0.receipt_order;
+        }
 
         for outpoint in old.0.new_outputs.keys() {
             self.known_utxos.remove(outpoint);
@@ -299,7 +303,7 @@ impl QueuedBlocks {
     }
 
     /// Try to look up this UTXO in any queued block.
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         self.known_utxos.get(outpoint).cloned()
     }
@@ -426,7 +430,7 @@ impl SentHashes {
     }
 
     /// Try to look up this UTXO in any sent block.
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         self.known_utxos
             .get(outpoint)

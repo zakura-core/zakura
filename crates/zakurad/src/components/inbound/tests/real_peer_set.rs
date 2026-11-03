@@ -15,7 +15,11 @@ use tokio::{
     task::JoinHandle,
 };
 use tower::{
-    buffer::Buffer, builder::ServiceBuilder, load_shed::LoadShed, util::BoxService, ServiceExt,
+    buffer::Buffer,
+    builder::ServiceBuilder,
+    load_shed::LoadShed,
+    util::{BoxCloneSyncService, BoxService},
+    ServiceExt,
 };
 use tracing::instrument::WithSubscriber;
 
@@ -904,23 +908,26 @@ async fn setup(
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
-    Buffer<zakura_network::Client, zakura_network::Request>,
+    Buffer<
+        zakura_network::Request,
+        <zakura_network::Client as tower::Service<zakura_network::Request>>::Future,
+    >,
     // inbound service
     LoadShed<
         Buffer<
-            BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
             zakura_network::Request,
+            futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
         >,
     >,
     // outbound peer set (only has the connected peer)
+    BoxCloneSyncService<zakura_network::Request, zakura_network::Response, BoxError>,
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
-        zakura_network::Request,
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     // mocked services
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion, RouterError>,
@@ -1034,32 +1041,28 @@ async fn setup(
         .service(BoxService::new(mock_tx_verifier.clone()));
 
     // Mempool
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let mempool_config = MempoolConfig::default();
+    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
         peer_set.clone(),
         state_service.clone(),
-        tower::util::BoxCloneService::new(read_only_state_service),
+        tower::util::BoxCloneService::new(read_only_state_service.clone()),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
+        misbehavior_sender.clone(),
+        Vec::new(),
     );
 
     // Enable the mempool
     mempool_service.enable(&mut recent_syncs).await;
-    let mempool_service = ServiceBuilder::new()
-        .buffer(10)
-        .boxed()
-        // boxed() needs this extra tiny buffer
-        .buffer(1)
-        .service(mempool_service);
+    // BoxService needs this extra tiny buffer
+    let mempool_service = Buffer::new(BoxService::new(Buffer::new(mempool_service, 10)), 1);
 
     // Initialize the inbound service
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book,
         block_download_peer_set: peer_set.clone(),
@@ -1080,6 +1083,7 @@ async fn setup(
         sync_status.clone(),
         chain_tip_change,
         peer_set.clone(),
+        read_only_state_service,
         Some(submitblock_channel.receiver()),
     ));
 
@@ -1173,7 +1177,7 @@ mod submitblock_test {
 
         // State
         let state_config = StateConfig::ephemeral();
-        let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
+        let (_state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
                 .await
                 .expect("ephemeral state initialization succeeds");
@@ -1219,6 +1223,7 @@ mod submitblock_test {
             .send(MinedBlockEvent::Committed {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
+                size: 1_000,
             })
             .unwrap();
         let gossip_task_handle = tokio::spawn(
@@ -1226,6 +1231,7 @@ mod submitblock_test {
                 sync_status.clone(),
                 chain_tip_change,
                 peer_set.clone(),
+                read_only_state_service,
                 Some(submitblock_channel.receiver()),
             )
             .in_current_span(),

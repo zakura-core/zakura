@@ -2,10 +2,13 @@
 
 mod config;
 mod datadir;
+mod download;
 mod managed;
 mod manifest;
 mod preflight;
 mod supervisor;
+#[cfg(unix)]
+mod unix;
 
 pub use config::{Config, ZcashdBinarySource as ConfigZcashdBinarySource};
 pub use datadir::{effective_zcashd_datadir, ensure_zcashd_datadir, resolve_zcashd_datadir_path};

@@ -9,7 +9,7 @@ use std::{
     fmt::{self, Debug},
 };
 
-use derive_getters::Getters;
+use getset::Getters;
 use itertools::Itertools;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -93,6 +93,7 @@ where
 {
     /// The net value of Sapling spend transfers minus output transfers.
     /// Denoted as `valueBalanceSapling` in the spec.
+    #[getset(get = "pub")]
     pub value_balance: Amount,
 
     /// A bundle of spends and outputs, containing at least one spend or
@@ -100,10 +101,12 @@ where
     ///
     /// In V5 transactions, also contains a shared anchor, if there are any
     /// spends.
+    #[getset(get = "pub")]
     pub transfers: TransferData<AnchorV>,
 
     /// A signature on the transaction hash.
     /// Denoted as `bindingSigSapling` in the spec.
+    #[getset(get = "pub")]
     pub binding_sig: Signature<Binding>,
 }
 
@@ -329,18 +332,18 @@ where
     /// (`Transaction::sapling_point_encodings_are_valid`), so a `None` here means
     /// the caller is working with an unvalidated transaction.
     pub fn binding_verification_key(&self) -> Option<redjubjub::VerificationKeyBytes<Binding>> {
-        let cv_old: sapling_crypto::value::CommitmentSum = self
-            .spends()
-            .map(|spend| spend.cv.commitment())
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .sum();
-        let cv_new: sapling_crypto::value::CommitmentSum = self
-            .outputs()
-            .map(|output| output.cv.commitment())
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .sum();
+        let cv_old = sapling_crypto::value::CommitmentSum::try_sum(
+            &self
+                .spends()
+                .map(|spend| spend.cv.unvalidated())
+                .collect::<Vec<_>>(),
+        )?;
+        let cv_new = sapling_crypto::value::CommitmentSum::try_sum(
+            &self
+                .outputs()
+                .map(|output| output.cv.unvalidated())
+                .collect::<Vec<_>>(),
+        )?;
 
         Some(
             (cv_old - cv_new)
@@ -422,6 +425,11 @@ where
 }
 
 impl TrustedPreallocate for Groth16Proof {
+    fn min_serialized_size() -> u64 {
+        const GROTH16_PROOF_BYTES: u64 = 192;
+        GROTH16_PROOF_BYTES
+    }
+
     fn max_allocation() -> u64 {
         // Each V5 transaction proof array entry must have a corresponding
         // spend or output prefix. We use the larger limit, so we don't reject

@@ -98,8 +98,8 @@ pub(crate) enum BlockApplyTerminal {
 
 /// Authorization for one legacy fallback round after native admission stops.
 ///
-/// Full semantic commits drain before this lease activates. The block driver transfers incomplete
-/// checkpoint ranges to the shared checkpoint verifier so fallback can supply their missing bodies.
+/// Native admission stops before this lease activates. The block driver transfers accepted applies
+/// to the shared verifier and state, so fallback can supply the bodies they wait for.
 #[derive(Debug)]
 pub(crate) struct LegacyFallbackLease {
     coordinator: Arc<SyncCoordinator>,

@@ -2,10 +2,10 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use color_eyre::eyre::Report;
-use once_cell::sync::Lazy;
+use eyre::Report;
+use tracing::Instrument;
 
 use zakura_chain::{
     block::{Block, Height},
@@ -16,9 +16,9 @@ use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use zakura_state::*;
 
-static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
+static COMMIT_FINALIZED_BLOCK_MAINNET: LazyLock<
     Vec<(Request, Result<Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
@@ -37,9 +37,9 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
     ]
 });
 
-static COMMIT_FINALIZED_BLOCK_TESTNET: Lazy<
+static COMMIT_FINALIZED_BLOCK_TESTNET: LazyLock<
     Vec<(Request, Result<Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES[..])
             .unwrap()
@@ -68,7 +68,6 @@ async fn check_transcripts_testnet() -> Result<(), Report> {
     check_transcripts(Network::new_default_testnet()).await
 }
 
-#[spandoc::spandoc]
 async fn check_transcripts(network: Network) -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -86,8 +85,12 @@ async fn check_transcripts(network: Network) -> Result<(), Report> {
         let (service, _, _, _) =
             zakura_state::init(Config::ephemeral(), &network, Height::MAX, 0).await?;
         let transcript = Transcript::from(transcript_data.iter().cloned());
-        /// SPANDOC: check the on disk service against the transcript
-        transcript.check(service).await?;
+        async { transcript.check(service).await }
+            .instrument(tracing::error_span!(
+                "check_transcripts::comment",
+                text = %"check the on disk service against the transcript"
+            ))
+            .await?;
     }
 
     Ok(())

@@ -289,7 +289,7 @@ fn full_activation_list_contains_all_upgrades() {
     let network = Network::Mainnet;
     let full_list = network.full_activation_list();
 
-    // NU7 is unscheduled on Mainnet (no activation height committed), so it is absent from the
-    // full activation list even though it is always present in the iter.
-    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 1);
+    // ZIP 259 schedules every upgrade through NU7 on Mainnet, so the full
+    // activation list and the iter cover the same upgrades.
+    assert_eq!(full_list.len(), NetworkUpgrade::iter().count());
 }

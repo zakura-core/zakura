@@ -1,5 +1,206 @@
 use super::*;
 
+#[test]
+fn saturated_store_admits_commit_window_repairs_after_reopen() {
+    for reconciled in [false, true] {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (mut engine_config, anchor, metadata) = fixture();
+        let network = engine_config.network().clone();
+        let finalized = Frontier::new(anchor.height, anchor.hash);
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        store.initialize(metadata, anchor.clone()).unwrap();
+
+        let mut batch = DiskWriteBatch::new();
+        stage_full_state_canonical_hash(&store, &mut batch, finalized);
+        let mut selected = Vec::new();
+        let mut parent = anchor.clone();
+        for height in 1..=5 {
+            let mut header = *parent.header;
+            header.previous_block_hash = parent.hash;
+            header.time += chrono::Duration::seconds(1);
+            let header = Arc::new(header);
+            let node = HeaderNode::from_durable_parts(
+                header.clone(),
+                header.hash(),
+                parent.hash,
+                block::Height(height),
+                parent.block_work,
+                parent
+                    .work_coordinate()
+                    .checked_add(parent.block_work)
+                    .unwrap(),
+                HeaderValidationState::Valid,
+                Default::default(),
+                BodyValidationState::Unknown,
+                Vec::new(),
+            )
+            .unwrap();
+            store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(&node),
+                )
+                .unwrap();
+            parent = node.clone();
+            selected.push(node);
+        }
+        store.db.write(batch).unwrap();
+        let (runtime, _) = store.startup(&engine_config).unwrap();
+        let before = runtime.publisher().snapshot();
+        assert_eq!(
+            before.frontiers.header_best.hash,
+            selected.last().unwrap().hash
+        );
+
+        // An older store retained input above the commit window on the protected selected path.
+        let mut batch = DiskWriteBatch::new();
+        for (index, node) in selected.iter_mut().enumerate().skip(2) {
+            let delivery = AuxDelivery::new(
+                EvidenceId::from_digest([u8::try_from(index).unwrap(); 32]),
+                node.hash,
+                SourceId::from_digest([0x92; 32]),
+                body_owner(&before, 1, 1).into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            );
+            node.aux_delivery_ids.push(delivery.delivery_id);
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(node),
+                )
+                .unwrap();
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_AUX_DELIVERY,
+                    HeaderAuxDeliveryKey {
+                        header: node.hash,
+                        delivery: delivery.delivery_id,
+                    }
+                    .as_bytes(),
+                    &delivery,
+                )
+                .unwrap();
+        }
+        runtime.store.db.write(batch).unwrap();
+        drop(runtime);
+
+        // Three rows on the selected path above the commit window fill the store.
+        engine_config.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
+        engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        let (runtime, report) = if reconciled {
+            store.startup_reconciled(&engine_config, finalized, Vec::new(), Vec::new())
+        } else {
+            store.startup(&engine_config)
+        }
+        .expect("a saturated store starts without settlement");
+        assert_eq!(report.current.frontiers, before.frontiers);
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 3);
+        let reader = runtime.reader();
+        let owner = body_owner(&report.current, 2, 2);
+        let context = reader
+            .vct_repair_context(owner, selected[0].height)
+            .unwrap()
+            .unwrap()
+            .bounded_prefix(1)
+            .unwrap();
+        assert!(
+            context.admission_capacity_available,
+            "the empty commit window still admits its own repair"
+        );
+        let lease = reader.validation_context(finalized.hash).unwrap().unwrap();
+        drop(reader);
+        let rules = HeaderRules::for_validation_lease(&lease).unwrap();
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(&[selected[0].header.clone()]),
+            finalized,
+            &rules,
+            &SystemClock,
+        )
+        .unwrap();
+        let target = Frontier::new(selected[0].height, selected[0].hash);
+        let source = SourceId::from_digest([0x93; 32]);
+        let repair = AuxDelivery::new(
+            EvidenceId::from_digest([0x94; 32]),
+            target.hash,
+            source,
+            owner.into(),
+            zakura_header_chain::BodySizeHint::Unknown,
+            Some(zakura_header_chain::TreeAuxRecordV1 {
+                height: target.height,
+                sapling_root: Default::default(),
+                orchard_root: Default::default(),
+                ironwood_root: Default::default(),
+                sapling_tx_count: 0,
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: [0; 32].into(),
+            }),
+        );
+        let result = runtime.apply_combined(
+            TransitionRequest {
+                expected_version: report.current.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: owner.into(),
+                    source,
+                    parent_hash: finalized.hash,
+                    target_tip_hash: target.hash,
+                    completion: TargetCompletion::SelectedAuxiliaryRepair {
+                        common_ancestor: finalized,
+                        selected_target: target,
+                        episode: context.episode,
+                    },
+                    batch,
+                    aux: vec![repair],
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+            DiskWriteBatch::new(),
+            || {},
+        );
+        assert!(
+            matches!(result, Ok(ApplyResult::Committed)),
+            "the repair evicts speculative input: {result:?}"
+        );
+        drop(runtime);
+
+        let (runtime, _) = HeaderChainStore::new(open(&db_config, &network))
+            .startup(&engine_config)
+            .expect("the repaired store reopens");
+        let rows = runtime.store.load_aux_deliveries().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows
+            .iter()
+            .any(|row| row.delivery().delivery_id == repair.delivery_id));
+        // The highest speculative row goes first; every header stays retained.
+        assert!(rows
+            .iter()
+            .all(|row| row.delivery().header_hash != selected[4].hash));
+        for node in &selected {
+            assert!(runtime.store.header_node(node.hash).unwrap().is_some());
+        }
+    }
+}
+
 /// Commit one deferred header at `insertion_time`, then return the closed database.
 fn commit_deferral(
     header_generation: HeaderGeneration,

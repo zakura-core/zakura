@@ -412,10 +412,12 @@ fn mining_template_requires_parent_pools_at_reissuance_activation() {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::test_runner::Config::with_cases(std::env::var("NSM_HISTORY_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(64)))]
+    #![proptest_config(proptest::test_runner::Config::with_cases(std::env::var("NSM_HISTORY_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(8)))]
 
     /// Exercise accounting transitions through real databases. Partial claims intentionally
     /// bypass semantic subsidy validation; this property tests the state accounting layer.
+    /// Pull requests run eight cases; the extended reissuance CI job sets
+    /// `NSM_HISTORY_CASES` for a broader search.
     #[test]
     fn balance_rollback_replay_and_fork_equivalence(
         claims in proptest::collection::vec(0u32..=1_000_000, 2..12),
@@ -423,7 +425,7 @@ proptest::proptest! {
         reissuance in proptest::bool::ANY,
     ) {
         use zakura_chain::parameters::subsidy::halving_block_subsidy;
-        use crate::{rollback_finalized_state, RollbackFinalizedStateOptions};
+        use crate::RollbackFinalizedStateOptions;
         let _guard = zakura_test::init();
         let network = accounting_network(reissuance);
         let dir = tempfile::tempdir().unwrap();
@@ -455,22 +457,25 @@ proptest::proptest! {
         }
         let target = target_offset % claims.len();
         let target_height = Height(START.0 - 1 + u32::try_from(target).unwrap());
-        drop(state);
-        rollback_finalized_state(config.clone(), &network, RollbackFinalizedStateOptions {
+        // Keep this history's database open for rollback and replay. Offline
+        // reopen/lock handling is covered by the rollback tests; both modes use
+        // the same rollback implementation here.
+        state.db.rollback_for_test(&network, RollbackFinalizedStateOptions {
             target_height, keep_rolled_back_blocks: true, max_checkpoint_height: Some(Height(0)),
         }).unwrap();
-        let mut state = FinalizedState::new(&config, &network).unwrap();
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), snapshots[target]);
         for (index, block) in blocks.iter().enumerate().skip(target + 1) {
             commit(&mut state, block).unwrap();
             proptest::prop_assert_eq!(state.db.finalized_value_pool(), snapshots[index]);
             proptest::prop_assert_eq!(*state.db.block_info(block.coinbase_height().unwrap().into()).unwrap().value_pools(), snapshots[index]);
         }
-        drop(state);
-        rollback_finalized_state(config.clone(), &network, RollbackFinalizedStateOptions {
+        state.db.rollback_for_test(&network, RollbackFinalizedStateOptions {
             target_height, keep_rolled_back_blocks: false, max_checkpoint_height: Some(Height(0)),
         }).unwrap();
+        // Retain a reopen check for persisted rollback state and format validity.
+        drop(state);
         let mut state = FinalizedState::new(&config, &network).unwrap();
+        proptest::prop_assert_eq!(state.db.finalized_value_pool(), snapshots[target]);
         let height = target_height.next().unwrap();
         let deficit = i128::from(i64::from(snapshots[target].nsm_value_balance_amount()));
         let bonus = reissuance_bonus(&network, height, deficit);
@@ -628,7 +633,11 @@ fn migration_retry_matches_fresh_sync(network: Network) {
         .unwrap();
     drop(state);
     let old_path = config.db_path(STATE_DATABASE_KIND, 28, &network);
-    let new_path = config.db_path(STATE_DATABASE_KIND, 29, &network);
+    let new_path = config.db_path(
+        STATE_DATABASE_KIND,
+        state_database_format_version_in_code().major,
+        &network,
+    );
     std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
     std::fs::rename(&new_path, &old_path).unwrap();
     assert!(FinalizedState::new(&config, &network).is_err());
@@ -884,7 +893,8 @@ fn deficit_validation_accepts_block_info_rows_with_appended_fields() {
         .zs_insert(&START, &RawBytes::from_bytes(bytes));
     state.db.write_batch(batch).unwrap();
 
-    let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
+    let (_cancel_sender, cancel_receiver) =
+        crate::service::finalized_state::disk_format::upgrade::cancel_channel();
     assert_eq!(
         nsm_value_balance_pool::Upgrade
             .validate(&state.db, &cancel_receiver)

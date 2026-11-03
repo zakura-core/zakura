@@ -6,7 +6,12 @@ use std::{collections::HashSet, iter, net::SocketAddr, str::FromStr, sync::Arc, 
 
 use futures::FutureExt;
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    builder::ServiceBuilder,
+    util::{BoxCloneSyncService, BoxService},
+    Service, ServiceExt,
+};
 use tracing::{Instrument, Span};
 
 use zakura_chain::{
@@ -14,7 +19,7 @@ use zakura_chain::{
     block::{Block, Height},
     fmt::humantime_seconds,
     parameters::Network::{self, *},
-    serialization::{DateTime32, ZcashDeserializeInto},
+    serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{UnminedTx, UnminedTxId, VerifiedUnminedTx},
 };
 use zakura_consensus::{error::TransactionError, transaction, Config as ConsensusConfig};
@@ -57,10 +62,43 @@ use InventoryResponse::*;
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 async fn wait_for_gossip() {
-    // Let background gossip tasks arm their timers before this paused runtime
-    // advances to the next gossip deadline.
+    // Let background gossip tasks run, then wait out the transaction gossip delay.
     tokio::task::yield_now().await;
     tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
+}
+
+/// The committed-tip advertisement of `block`, with the size the state reads.
+fn advertised(block: &Block) -> zakura_network::AdvertisedBlock {
+    zakura_network::AdvertisedBlock::new(block.hash(), block.zcash_serialized_size())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn empty_mempool_requests_return_empty_inventory() {
+    let (
+        inbound_service,
+        _mempool_guard,
+        _committed_blocks,
+        _added_transactions,
+        _mock_tx_verifier,
+        mut peer_set,
+        _state_guard,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let response = timeout(
+        Duration::from_secs(1),
+        inbound_service.oneshot(Request::MempoolTransactionIds),
+    )
+    .await
+    .expect("the empty mempool must answer promptly")
+    .expect("the initialized mempool answers transaction ID requests");
+    // A nil response sends nothing on the wire and leaves the peer waiting for its timeout.
+    assert_eq!(response, Response::TransactionIds(Vec::new()));
+    peer_set.expect_no_requests().await;
+    sync_gossip_task_handle.abort();
+    tx_gossip_task_handle.abort();
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -90,17 +128,11 @@ async fn mempool_requests_for_transactions() {
         .clone()
         .oneshot(Request::MempoolTransactionIds)
         .await;
+    // Even an empty mempool must produce an inventory reply, not leave the peer waiting.
     match response {
         Ok(Response::TransactionIds(response)) => assert_eq!(response, added_transaction_ids),
-        Ok(Response::Nil) => assert!(
-            added_transaction_ids.is_empty(),
-            "`MempoolTransactionIds` request should match added_transaction_ids {added_transaction_ids:?}, got Ok(Nil)"
-        ),
-        _ => unreachable!(
-            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`, got {:?}",
-            response
-        ),
-    };
+        response => panic!("Mempool requests must return transaction IDs, got {response:?}"),
+    }
 
     // Test `Request::TransactionsById`
     let hash_set = added_transaction_ids
@@ -210,7 +242,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![test_transaction_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Make sure there is an additional request broadcasting the
@@ -482,7 +514,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![test_transaction_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Make sure there is an additional request broadcasting the
@@ -591,7 +623,9 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+// Use real time until the expected gossip is observed. The state writer acknowledges
+// commits before publishing tips, so a paused clock can reach the gossip timeout first.
+#[tokio::test(flavor = "current_thread")]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -668,7 +702,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![tx1_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Add a new block to the state (make the chain tip advance)
@@ -691,7 +725,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     wait_for_gossip().await;
     let possible_requests = &mut [
         Request::AdvertiseTransactionIds(hs, None),
-        Request::AdvertiseBlock(block_two.hash(), None),
+        Request::AdvertiseBlock(advertised(&block_two), None),
     ]
     .to_vec();
 
@@ -731,18 +765,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         .oneshot(Request::MempoolTransactionIds)
         .await;
 
-    match request {
-        Ok(Response::TransactionIds(response)) => {
-            assert_eq!(response, vec![tx1_id])
-        }
-        Ok(Response::Nil) => panic!(
-            "response to `MempoolTransactionIds` request should match {:?}",
-            vec![tx1_id]
-        ),
-        _ => unreachable!(
-            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`"
-        ),
-    };
+    assert_eq!(
+        request.expect("the initialized mempool answers transaction ID requests"),
+        Response::TransactionIds(vec![tx1_id]),
+    );
 
     // As our test transaction will expire at a block height greater or equal to 3 we need to push block 3.
     let block_three: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
@@ -758,7 +784,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 
     // Test the block is gossiped
     peer_set
-        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
+        .expect_request(Request::AdvertiseBlock(advertised(&block_three), None))
         .await
         .respond(Response::Nil);
 
@@ -809,7 +835,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![tx2_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Check if tx1 was added to the rejected list as well
@@ -867,7 +893,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 
         // Test the block is gossiped
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(advertised(&block), None))
             .await
             .respond(Response::Nil);
 
@@ -877,19 +903,14 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .await;
 
         // tx2 is still in the mempool as the blockchain progress because the zero expiration height
-        match request {
-            Ok(Response::TransactionIds(response)) => {
-                assert_eq!(response, vec![tx2_id])
-            }
-            Ok(Response::Nil) => panic!(
-                "response to `MempoolTransactionIds` request should match {:?}",
-                vec![tx2_id]
-            ),
-            _ => unreachable!(
-                "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`"
-            ),
-        };
+        assert_eq!(
+            request.expect("the initialized mempool answers transaction ID requests"),
+            Response::TransactionIds(vec![tx2_id]),
+        );
     }
+
+    // All commits and expected gossip are done, so the quiet check can use virtual time.
+    tokio::time::pause();
 
     // check that nothing unexpected happened
     peer_set.expect_no_requests().await;
@@ -951,7 +972,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     let _request = inbound_service
         .clone()
         .oneshot(Request::AdvertiseBlock(
-            block_hash,
+            block_hash.into(),
             Some(zakura_network::PeerSource::LegacySocket(advertiser_addr)),
         ))
         .await?;
@@ -994,9 +1015,9 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     // The poisoned block must not reach the state.
     let response = state_service
         .clone()
-        .oneshot(zakura_state::Request::Depth(block_hash))
+        .oneshot(zakura_state::Request::Block(block_hash.into()))
         .await?;
-    assert_eq!(response, zakura_state::Response::Depth(None));
+    assert_eq!(response, zakura_state::Response::Block(None));
 
     // The block must also be re-requested, without a download source, so it routes through the
     // peer set rather than back to the peer that just poisoned it. Honest peers' `inv`s for this
@@ -1015,6 +1036,91 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         .respond(Response::Blocks(vec![Available((canonical, None))]));
 
     tx_verifier.expect_no_requests().await;
+
+    Ok(())
+}
+
+/// Test that a poisoned parent recovery scores its supplying peer without re-requesting the parent.
+///
+/// A re-request would be an ordinary download, outside the recovery bounds.
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result<(), crate::BoxError>
+{
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        _tx_verifier,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        _sync_gossip_task_handle,
+        _tx_gossip_task_handle,
+        mut misbehavior_rx,
+    ) = setup_with_misbehavior_receiver(false).await;
+
+    // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
+    // the tip child.
+    let parent: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
+    let child_hash = child.hash();
+    let parent_hash = parent.hash();
+    let poisoned_parent = poison_coinbase_height(&parent, Height(1));
+
+    let advertiser_addr: PeerSocketAddr = "127.0.0.1:8233".parse()?;
+    let source = zakura_network::PeerSource::LegacySocket(advertiser_addr);
+
+    let _request = inbound_service
+        .clone()
+        .oneshot(Request::AdvertiseBlock(
+            child_hash.into(),
+            Some(source.clone()),
+        ))
+        .await?;
+
+    peer_set
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: iter::once(child_hash).collect(),
+            source: source.clone(),
+        })
+        .await
+        .respond(Response::Blocks(vec![Available((
+            child,
+            Some(advertiser_addr),
+        ))]));
+
+    peer_set
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: iter::once(parent_hash).collect(),
+            source,
+        })
+        .await
+        .respond(Response::Blocks(vec![Available((
+            poisoned_parent,
+            Some(advertiser_addr),
+        ))]));
+
+    // The score is sent from `Inbound::poll_ready`, so drive it until the report lands.
+    let mut report = None;
+    for _ in 0..50 {
+        let _ = inbound_service
+            .clone()
+            .oneshot(Request::MempoolTransactionIds)
+            .await;
+
+        if let Ok(received) = timeout(Duration::from_millis(100), misbehavior_rx.recv()).await {
+            report = Some(received);
+            break;
+        }
+    }
+    assert_eq!(
+        report.expect("a poisoned parent recovery must score its supplier"),
+        Some((advertiser_addr, 100)),
+    );
+
+    peer_set.expect_no_requests().await;
 
     Ok(())
 }
@@ -1045,7 +1151,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash, None))
+        .oneshot(Request::AdvertiseBlock(block_hash.into(), None))
         .await?;
 
     // Block is fetched, and committed to the state
@@ -1081,7 +1187,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash, None))
+        .oneshot(Request::AdvertiseBlock(block_hash.into(), None))
         .await?;
 
     // Block is fetched, but the downloader drops it because it is too high
@@ -1092,9 +1198,9 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
 
     let response = state_service
         .clone()
-        .oneshot(zakura_state::Request::Depth(block_hash))
+        .oneshot(zakura_state::Request::Block(block_hash.into()))
         .await?;
-    assert_eq!(response, zakura_state::Response::Depth(None));
+    assert_eq!(response, zakura_state::Response::Block(None));
 
     // TODO: check that the block is not queued in the checkpoint verifier or non-finalized state
 
@@ -1174,8 +1280,9 @@ async fn caches_getaddr_response() {
 
         let peer_set = MockService::build()
             .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
-            .for_unit_tests();
-        let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+            .for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>();
+        let buffered_peer_set =
+            BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
         let buffered_mempool_service =
             Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 10);
@@ -1249,17 +1356,20 @@ async fn setup(
     add_transactions: bool,
 ) -> (
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
     Vec<Arc<Block>>,
     Vec<VerifiedUnminedTx>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
@@ -1300,17 +1410,20 @@ async fn setup_with_misbehavior_receiver(
     add_transactions: bool,
 ) -> (
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
     Vec<Arc<Block>>,
     Vec<VerifiedUnminedTx>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
@@ -1351,7 +1464,8 @@ async fn setup_with_misbehavior_receiver(
     let mut peer_set = MockService::build()
         .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
         .for_unit_tests();
-    let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+    let buffered_peer_set =
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
     let mock_tx_verifier = MockService::build().for_unit_tests();
     let buffered_tx_verifier = Buffer::new(BoxService::new(mock_tx_verifier.clone()), 10);
@@ -1408,18 +1522,19 @@ async fn setup_with_misbehavior_receiver(
     // Don't wait for the chain tip update here, we wait for expect_request(AdvertiseBlock) below,
     // which is called by the gossip_best_tip_block_hashes task once the chain tip changes.
 
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (misbehavior_sender, misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &MempoolConfig::default(),
         false,
         buffered_peer_set.clone(),
         state_service.clone(),
-        tower::util::BoxCloneService::new(read_only_state_service),
+        tower::util::BoxCloneService::new(read_only_state_service.clone()),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
+        misbehavior_sender.clone(),
+        Vec::new(),
     );
 
     // Pretend we're close to tip
@@ -1431,6 +1546,7 @@ async fn setup_with_misbehavior_receiver(
             sync_status.clone(),
             chain_tip_change.clone(),
             peer_set.clone(),
+            read_only_state_service,
             Some(submitblock_channel.receiver()),
         )
         .in_current_span(),
@@ -1442,7 +1558,7 @@ async fn setup_with_misbehavior_receiver(
     // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
     for block in committed_blocks.iter().skip(1) {
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(advertised(block), None))
             .await
             .respond(Response::Nil);
     }
@@ -1484,7 +1600,6 @@ async fn setup_with_misbehavior_receiver(
     let inbound_service = BoxService::new(inbound_service);
     let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
 
-    let (misbehavior_sender, misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book,
         block_download_peer_set: buffered_peer_set,

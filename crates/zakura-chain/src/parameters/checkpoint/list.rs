@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     ops::{Bound, RangeBounds},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use crate::{block, parameters::Network, BoxError};
@@ -41,15 +41,23 @@ const MAINNET_CHECKPOINTS: &str = include_str!("main-checkpoints.txt");
 /// information.
 pub(crate) const TESTNET_CHECKPOINTS: &str = include_str!("test-checkpoints.txt");
 
-lazy_static::lazy_static! {
-    /// Parsed mainnet checkpoint list, cached to avoid re-parsing on every use.
-    static ref MAINNET_CHECKPOINT_LIST: Arc<CheckpointList> =
-        Arc::new(MAINNET_CHECKPOINTS.parse().expect("hard-coded mainnet checkpoint list parses"));
+/// Parsed mainnet checkpoint list, cached to avoid re-parsing on every use.
+static MAINNET_CHECKPOINT_LIST: LazyLock<Arc<CheckpointList>> = LazyLock::new(|| {
+    Arc::new(
+        MAINNET_CHECKPOINTS
+            .parse()
+            .expect("hard-coded mainnet checkpoint list parses"),
+    )
+});
 
-    /// Parsed testnet checkpoint list, cached to avoid re-parsing on every use.
-    pub(crate) static ref TESTNET_CHECKPOINT_LIST: Arc<CheckpointList> =
-        Arc::new(TESTNET_CHECKPOINTS.parse().expect("hard-coded testnet checkpoint list parses"));
-}
+/// Parsed testnet checkpoint list, cached to avoid re-parsing on every use.
+pub(crate) static TESTNET_CHECKPOINT_LIST: LazyLock<Arc<CheckpointList>> = LazyLock::new(|| {
+    Arc::new(
+        TESTNET_CHECKPOINTS
+            .parse()
+            .expect("hard-coded testnet checkpoint list parses"),
+    )
+});
 
 impl Network {
     /// Returns the hash for the genesis block in `network`.

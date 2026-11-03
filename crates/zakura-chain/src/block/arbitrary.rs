@@ -137,40 +137,6 @@ impl LedgerState {
         Self::arbitrary_with(LedgerStateOverride::default())
     }
 
-    /// Returns a strategy for creating arbitrary `LedgerState`s, without any
-    /// overrides.
-    pub fn no_override_strategy() -> BoxedStrategy<Self> {
-        Self::arbitrary_with(LedgerStateOverride {
-            network_override: None,
-            height_override: None,
-            previous_block_hash_override: None,
-            network_upgrade_override: None,
-            transaction_version_override: None,
-            transaction_has_valid_network_upgrade: false,
-            always_has_coinbase: false,
-        })
-    }
-
-    /// Returns a strategy for creating `LedgerState`s with features from
-    /// `network_upgrade_override`.
-    ///
-    /// These features ignore the actual tip height and network.
-    pub fn network_upgrade_strategy(
-        network_upgrade_override: NetworkUpgrade,
-        transaction_version_override: impl Into<Option<u32>>,
-        transaction_has_valid_network_upgrade: bool,
-    ) -> BoxedStrategy<Self> {
-        Self::arbitrary_with(LedgerStateOverride {
-            network_override: None,
-            height_override: None,
-            previous_block_hash_override: None,
-            network_upgrade_override: Some(network_upgrade_override),
-            transaction_version_override: transaction_version_override.into(),
-            transaction_has_valid_network_upgrade,
-            always_has_coinbase: false,
-        })
-    }
-
     /// Returns a strategy for creating `LedgerState`s that always have coinbase
     /// transactions.
     ///

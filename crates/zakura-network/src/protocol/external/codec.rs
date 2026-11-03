@@ -18,10 +18,9 @@ use zakura_chain::{
     block::{self, Block},
     parameters::{Magic, Network},
     serialization::{
-        sha256d, zcash_deserialize_external_count, zcash_deserialize_string_external_count,
-        CompactSizeMessage, FakeWriter, ReadZcashExt, SerializationError as Error,
-        ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
-        MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter,
+        ReadZcashExt, SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashReader, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -139,13 +138,6 @@ impl Builder {
         self
     }
 
-    /// Configure the codec for the given [`Version`].
-    #[allow(dead_code)]
-    pub fn for_version(mut self, version: Version) -> Self {
-        self.version = version;
-        self
-    }
-
     /// Configure the codec's maximum accepted payload size, in bytes.
     #[allow(dead_code)]
     pub fn with_max_body_len(mut self, len: usize) -> Self {
@@ -239,7 +231,7 @@ impl Codec {
     /// Write the body of the message into the given writer. This allows writing
     /// the message body prior to writing the header, so that the header can
     /// contain a checksum of the message body.
-    fn write_body<W: Write>(&self, msg: &Message, mut writer: W) -> Result<(), Error> {
+    fn write_body<W: Write + ?Sized>(&self, msg: &Message, writer: &mut W) -> Result<(), Error> {
         match msg {
             Message::Version(VersionMessage {
                 version,
@@ -259,8 +251,8 @@ impl Codec {
                 // serialization can not error.
                 writer.write_i64::<LittleEndian>(timestamp.timestamp())?;
 
-                address_recv.zcash_serialize(&mut writer)?;
-                address_from.zcash_serialize(&mut writer)?;
+                address_recv.zcash_serialize(writer)?;
+                address_from.zcash_serialize(writer)?;
 
                 writer.write_u64::<LittleEndian>(nonce.0)?;
 
@@ -271,7 +263,7 @@ impl Codec {
                     ));
                 }
 
-                user_agent.zcash_serialize(&mut writer)?;
+                user_agent.zcash_serialize(writer)?;
                 writer.write_u32::<LittleEndian>(start_height.0)?;
                 writer.write_u8(*relay as u8)?;
             }
@@ -295,7 +287,7 @@ impl Codec {
                     ));
                 }
 
-                message.zcash_serialize(&mut writer)?;
+                message.zcash_serialize(writer)?;
 
                 writer.write_u8(*ccode as u8)?;
 
@@ -305,7 +297,7 @@ impl Codec {
                     ));
                 }
 
-                reason.zcash_serialize(&mut writer)?;
+                reason.zcash_serialize(writer)?;
                 if let Some(data) = data {
                     writer.write_all(data)?;
                 }
@@ -327,27 +319,27 @@ impl Codec {
                 // Regardless of the way we received the address,
                 // Zebra always sends `addr` messages
                 let v1_addrs: Vec<AddrV1> = addrs.iter().map(|addr| AddrV1::from(*addr)).collect();
-                v1_addrs.zcash_serialize(&mut writer)?
+                v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) => block.zcash_serialize(&mut writer)?,
+            Message::Block(block) => block.zcash_serialize(writer)?,
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
-                known_blocks.zcash_serialize(&mut writer)?;
+                known_blocks.zcash_serialize(writer)?;
                 stop.unwrap_or(block::Hash([0; 32]))
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
             }
             Message::GetHeaders { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
-                known_blocks.zcash_serialize(&mut writer)?;
+                known_blocks.zcash_serialize(writer)?;
                 stop.unwrap_or(block::Hash([0; 32]))
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
             }
-            Message::Headers(headers) => headers.zcash_serialize(&mut writer)?,
-            Message::Inv(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::GetData(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::Tx(transaction) => transaction.transaction().zcash_serialize(&mut writer)?,
+            Message::Headers(headers) => headers.zcash_serialize(writer)?,
+            Message::Inv(hashes) => hashes.zcash_serialize(writer)?,
+            Message::GetData(hashes) => hashes.zcash_serialize(writer)?,
+            Message::NotFound(hashes) => hashes.zcash_serialize(writer)?,
+            Message::Tx(transaction) => transaction.transaction().zcash_serialize(writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
         }
         Ok(())
@@ -477,7 +469,7 @@ impl Decoder for Codec {
                         continue 'messages;
                     }
 
-                    let mut body_reader = Cursor::new(&body);
+                    let mut body_reader = &body[..];
 
                     // The body bytes are owned locally and the decoder state was
                     // reset above, before entering this unwind boundary. Body
@@ -533,7 +525,7 @@ impl Decoder for Codec {
 
                         // Bitcoin allows extra data at the end of most messages,
                         // so old nodes can read newer formats and ignore extra fields.
-                        let extra_bytes = body.len() as u64 - body_reader.position();
+                        let extra_bytes = body_reader.len();
                         if extra_bytes == 0 {
                             trace!(?extra_bytes, %msg, "finished message decoding");
                         } else {
@@ -748,8 +740,8 @@ impl Codec {
         Ok(Message::GetAddr)
     }
 
-    fn read_block<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
-        let result = Self::deserialize_block_spawning(reader);
+    fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let result = self.deserialize_block_spawning(reader);
         let block = result?.into();
 
         #[cfg(test)]
@@ -778,9 +770,10 @@ impl Codec {
     /// See [Zcash block header] for the enumeration of these fields.
     ///
     /// [Zcash block header](https://zips.z.cash/protocol/protocol.pdf#page=84)
-    fn read_headers<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
+    fn read_headers(&self, bytes: &mut &[u8]) -> Result<Message, Error> {
+        let mut reader = ZcashReader::from_slice(bytes);
         // CompactSizeMessage is bounded to MAX_PROTOCOL_MESSAGE_LEN on deserialization.
-        let count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let count: CompactSizeMessage = reader.read_value()?;
         // Infallible: CompactSizeMessage wraps u32, which always fits in usize.
         let count: usize = count.into();
         if count > MAX_HEADERS_PER_MESSAGE {
@@ -788,10 +781,7 @@ impl Codec {
                 "headers message exceeds the protocol limit of 160 entries",
             ));
         }
-        Ok(Message::Headers(zcash_deserialize_external_count(
-            count,
-            &mut reader,
-        )?))
+        Ok(Message::Headers(reader.read_external_count(count)?))
     }
 
     fn read_getheaders<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
@@ -821,8 +811,8 @@ impl Codec {
         Ok(Message::NotFound(Vec::zcash_deserialize(reader)?))
     }
 
-    fn read_tx<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
-        let result = Self::deserialize_transaction_spawning(reader);
+    fn read_tx(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let result = self.deserialize_transaction_spawning(reader);
         let transaction = result?.into();
 
         #[cfg(test)]
@@ -850,9 +840,7 @@ impl Codec {
 
     /// Given the reader, deserialize the transaction in the rayon thread pool.
     #[allow(clippy::unwrap_in_result)]
-    fn deserialize_transaction_spawning<R: Read + std::marker::Send>(
-        reader: R,
-    ) -> Result<Transaction, Error> {
+    fn deserialize_transaction_spawning(&self, reader: &mut &[u8]) -> Result<Transaction, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -865,7 +853,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize(reader)))
+                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_from_slice(reader)))
             })
         });
 
@@ -874,7 +862,7 @@ impl Codec {
 
     /// Given the reader, deserialize the block in the rayon thread pool.
     #[allow(clippy::unwrap_in_result)]
-    fn deserialize_block_spawning<R: Read + std::marker::Send>(reader: R) -> Result<Block, Error> {
+    fn deserialize_block_spawning(&self, reader: &mut &[u8]) -> Result<Block, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -887,7 +875,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize(reader)))
+                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_from_slice(reader)))
             })
         });
 

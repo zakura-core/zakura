@@ -23,8 +23,8 @@ use crate::components::{health::ChainTipMetrics, sync::SyncStatus};
 /// The amount of time between progress logs.
 const LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The amount of time between progress bar updates.
-const PROGRESS_BAR_INTERVAL: Duration = Duration::from_secs(5);
+/// The interval between sync progress checks.
+const PROGRESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The number of blocks we consider to be close to the tip.
 ///
@@ -59,8 +59,7 @@ const SYNC_PERCENT_FRAC_DIGITS: usize = 3;
 // TODO: change to HeightDiff?
 const MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE: u32 = 10;
 
-/// Logs Zebra's estimated progress towards the chain tip every minute or so, and
-/// updates a terminal progress bar every few seconds.
+/// Logs Zakura's estimated progress towards the chain tip every minute or so.
 ///
 /// TODO:
 /// - log progress towards, remaining blocks before, and remaining time to next network upgrade
@@ -102,8 +101,6 @@ pub async fn show_block_chain_progress(
     // The last time we logged an update.
     let mut last_log_time = Instant::now();
 
-    #[cfg(feature = "progress-bar")]
-    let block_bar = howudoin::new().label("Blocks");
     let mut is_chain_metrics_chan_closed = false;
 
     loop {
@@ -121,18 +118,6 @@ pub async fn show_block_chain_progress(
                 .best_tip_height()
                 .expect("unexpected empty state: estimate requires a block height");
             let network_upgrade = NetworkUpgrade::current(&network, current_height);
-
-            // Send progress reports for block height
-            //
-            // TODO: split the progress bar height update into its own function.
-            #[cfg(feature = "progress-bar")]
-            if matches!(howudoin::cancelled(), Some(true)) {
-                block_bar.close();
-            } else {
-                block_bar
-                    .set_pos(current_height.0)
-                    .set_len(u64::from(estimated_height.0));
-            }
 
             let mut remaining_sync_blocks = estimated_height - current_height;
 
@@ -166,7 +151,7 @@ pub async fn show_block_chain_progress(
             // Skip logging and status updates if it isn't time for them yet.
             let elapsed_since_log = instant_now.saturating_duration_since(last_log_time);
             if elapsed_since_log < LOG_INTERVAL {
-                tokio::time::sleep(PROGRESS_BAR_INTERVAL).await;
+                tokio::time::sleep(PROGRESS_CHECK_INTERVAL).await;
                 continue;
             } else {
                 last_log_time = instant_now;
@@ -229,10 +214,6 @@ pub async fn show_block_chain_progress(
                      and your computer clock and time zone",
                     time_since_last_state_block_chrono.num_minutes(),
                 );
-
-                // TODO: use add_warn(), but only add each warning once
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: sync has stalled"));
             } else if is_syncer_stopped && remaining_sync_blocks > MIN_SYNC_WARNING_BLOCKS {
                 // We've stopped syncing blocks, but we estimate we're a long way from the tip.
                 //
@@ -248,11 +229,6 @@ pub async fn show_block_chain_progress(
                      Hint: check your network connection, \
                      and your computer clock and time zone",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!(
-                    "{network_upgrade}: sync is very slow, or estimated tip is wrong"
-                ));
             } else if is_syncer_stopped && current_height <= after_checkpoint_height {
                 // We've stopped syncing blocks,
                 // but we're below the minimum height estimated from our checkpoints.
@@ -272,9 +248,6 @@ pub async fn show_block_chain_progress(
                      Dev Hint: were the checkpoints updated in the last {} minutes?",
                     min_minutes_after_checkpoint_update,
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: sync is very slow"));
             } else if is_syncer_stopped {
                 // We've stayed near the tip for a while, and we've stopped syncing lots of blocks.
                 // So we're mostly using gossiped blocks now.
@@ -286,9 +259,6 @@ pub async fn show_block_chain_progress(
                     %time_since_last_state_block,
                     "finished initial sync to chain tip, using gossiped blocks",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: waiting for next block"));
             } else if remaining_sync_blocks <= MAX_CLOSE_TO_TIP_BLOCKS {
                 // We estimate we're near the tip, but we have been syncing lots of blocks recently.
                 // We might also be using some gossiped blocks.
@@ -301,9 +271,6 @@ pub async fn show_block_chain_progress(
                     "close to finishing initial sync, \
                      confirming using syncer and gossiped blocks",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: finishing initial sync"));
             } else {
                 // We estimate we're far from the tip, and we've been syncing lots of blocks.
                 info!(
@@ -314,14 +281,9 @@ pub async fn show_block_chain_progress(
                     %time_since_last_state_block,
                     "estimated progress to chain tip",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: syncing blocks"));
             }
         } else {
             let sync_percent = format!("{:.SYNC_PERCENT_FRAC_DIGITS$} %", 0.0f64,);
-            #[cfg(feature = "progress-bar")]
-            let network_upgrade = NetworkUpgrade::Genesis;
 
             if is_syncer_stopped {
                 // We've stopped syncing blocks,
@@ -333,9 +295,6 @@ pub async fn show_block_chain_progress(
                      Hint: check your network connection, \
                      and your computer clock and time zone",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: can't download genesis block"));
             } else {
                 // We're waiting for the genesis block to be committed to the state,
                 // before we can estimate the best chain tip.
@@ -344,15 +303,10 @@ pub async fn show_block_chain_progress(
                     current_height = %"None",
                     "initial sync is waiting to download the genesis block",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!(
-                    "{network_upgrade}: waiting to download genesis block"
-                ));
             }
         }
 
-        tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_BAR_INTERVAL)).await;
+        tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_CHECK_INTERVAL)).await;
     }
 }
 

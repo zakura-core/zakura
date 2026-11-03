@@ -1,41 +1,39 @@
 //! Fixed test vectors for codec.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::LazyLock;
 
 use chrono::DateTime;
 use futures::prelude::*;
-use lazy_static::lazy_static;
 
 use super::*;
 
-lazy_static! {
-    static ref VERSION_TEST_VECTOR: Message = {
-        let services = PeerServices::NODE_NETWORK;
-        let timestamp = Utc
-            .timestamp_opt(1_568_000_000, 0)
-            .single()
-            .expect("in-range number of seconds and valid nanosecond");
+static VERSION_TEST_VECTOR: LazyLock<Message> = LazyLock::new(|| {
+    let services = PeerServices::NODE_NETWORK;
+    let timestamp = Utc
+        .timestamp_opt(1_568_000_000, 0)
+        .single()
+        .expect("in-range number of seconds and valid nanosecond");
 
-        VersionMessage {
-            version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+    VersionMessage {
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        services,
+        timestamp,
+        address_recv: AddrInVersion::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
             services,
-            timestamp,
-            address_recv: AddrInVersion::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
-                services,
-            ),
-            address_from: AddrInVersion::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
-                services,
-            ),
-            nonce: Nonce(0x9082_4908_8927_9238),
-            user_agent: "Zebra".to_owned(),
-            start_height: block::Height(540_000),
-            relay: true,
-        }
-        .into()
-    };
-}
+        ),
+        address_from: AddrInVersion::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
+            services,
+        ),
+        nonce: Nonce(0x9082_4908_8927_9238),
+        user_agent: "Zebra".to_owned(),
+        start_height: block::Height(540_000),
+        relay: true,
+    }
+    .into()
+});
 
 /// Check that the version test vector serializes and deserializes correctly
 #[test]

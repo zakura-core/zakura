@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use semver::Version;
 use tower::{util::BoxService, Service};
 

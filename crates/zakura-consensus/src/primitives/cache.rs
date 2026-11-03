@@ -18,7 +18,7 @@
 //! Sapling has one verifying key pair for all of history, so one cache covers it.
 //!
 //! Only `Ok` results are cached. A batch error is not per-item evidence, because
-//! [`Fallback`](tower_fallback::Fallback) re-verifies failures singly, and it may not be a verdict
+//! [`Fallback`](super::fallback::Fallback) re-verifies failures singly, and it may not be a verdict
 //! at all — a shut-down batch worker reports the same way. Caching it would reject a valid block.
 
 use std::{
@@ -419,7 +419,7 @@ where
     /// is whether the inner service will be used at all. Delegating would reserve inner capacity
     /// for every request, including the hits that never spend it:
     ///
-    ///   * [`Batch::poll_ready`](tower_batch_control::Batch) holds a semaphore permit until
+    ///   * [`Batch::poll_ready`](super::batch_control::Batch) holds a semaphore permit until
     ///     `Batch::call` consumes it. A hit never calls, so it holds that permit until the handle
     ///     drops, denying capacity to a genuine miss.
     ///   * `Batch::poll_ready` also errors once its worker exits. Callers poll before they call,

@@ -49,10 +49,11 @@ pub use constants::{
     MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
-    AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
-    HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    StateInitError, ValidateContextError,
+    AwaitBlockInfoError, BlockHeaderNotFound, BoxError, CloneError, CommitBlockError,
+    CommitCheckpointVerifiedError, CommitSemanticallyVerifiedError, DuplicateNullifierError,
+    HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable,
+    MissingSproutTipTree, PreciousError, StateInitError, TransparentIndexesUnavailable,
+    ValidateContextError,
 };
 pub use header_chain::*;
 pub use request::{
@@ -66,9 +67,9 @@ pub use request::{
 pub use request::Spend;
 
 pub use response::{
-    AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility,
-    ReadResponse, Response,
+    AnyTx, AuthDataCommitment, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock,
+    MinedTx, NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs,
+    PreparedMinedRelayEligibility, ReadResponse, Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
@@ -119,6 +120,8 @@ pub use service::finalized_state::{
     produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
+#[cfg(feature = "internal-bench")]
+pub use service::non_finalized_state::{benchmark_height_map, HeightMapBenchmarkSample};
 pub use service::read::{
     derive_historical_frontiers, ChainTipInfo, ChainTipStatus, DerivedFrontiers,
     HistoricalTreeCache, MAX_CACHED_FRONTIERS,

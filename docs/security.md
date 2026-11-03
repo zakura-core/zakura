@@ -22,6 +22,8 @@ The Zakura team is committed to working with researchers who submit security vul
 
 Please submit issues privately through GitHub's security advisory reporting for this repository: <https://github.com/zakura-core/zakura/security/advisories/new>.
 
+If you cannot use GitHub, email the maintainers at <ewillbefull@gmail.com>. This is also the address that automated scanning services, such as Anthropic's OSS Scanner, report to.
+
 If an issue also affects upstream [Zebra](https://github.com/ZcashFoundation/zebra), please also report it to the Zcash Foundation by following [upstream's security policy](https://github.com/ZcashFoundation/zebra/blob/main/SECURITY.md). Issues in Zakura's own additions (for example the experimental Zakura P2P v2 stack) should be reported only to us.
 
 ## Coordinated Security Releases

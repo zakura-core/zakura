@@ -1,8 +1,11 @@
 //! Tests for the [`zakura_test::command`] module.
 
-use std::{process::Command, time::Duration};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use regex::RegexSet;
 use tempfile::tempdir;
 
@@ -95,35 +98,6 @@ fn finish_before_timeout_output_single_line() -> Result<()> {
     Ok(())
 }
 
-/// Test if a process that keeps on producing output, but doesn't produce any newlines,
-/// is killed after the timeout.
-///
-/// This test fails due to bugs in TestDirExt, see #1140 for details.
-//#[test]
-//#[ignore]
-#[allow(dead_code)]
-fn kill_on_timeout_continuous_output_no_newlines() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    const TEST_CMD: &str = "head";
-    // Skip the test if the test system does not have the command
-    if !is_command_available(TEST_CMD, &["/dev/null"]) {
-        return Ok(());
-    }
-
-    let mut child = tempdir()?
-        .spawn_child_with_command(TEST_CMD, args!["-c", "1024", "/dev/zero"])?
-        .with_timeout(Duration::from_secs(2));
-
-    // We need to use expect_stdout_line_matches, because wait_with_output ignores timeouts.
-    // We use a non-matching regex, to trigger the timeout.
-    assert!(child
-        .expect_stdout_line_matches("this regex should not match")
-        .is_err());
-
-    Ok(())
-}
-
 /// Test if tests pass for a process that produces a small amount of output,
 /// with no newlines, then exits before the timeout.
 //
@@ -141,34 +115,6 @@ fn finish_before_timeout_short_output_no_newlines() -> Result<()> {
 
     let mut child = tempdir()?
         .spawn_child_with_command(TEST_CMD, args!["zakura_test_output"])?
-        .with_timeout(Duration::from_secs(2));
-
-    // We need to use expect_stdout_line_matches, because wait_with_output ignores timeouts.
-    // We use a non-matching regex, to trigger the timeout.
-    assert!(child
-        .expect_stdout_line_matches("this regex should not match")
-        .is_err());
-
-    Ok(())
-}
-
-/// Test if the timeout works for a process that produces no output.
-///
-/// This test fails due to bugs in TestDirExt, see #1140 for details.
-// #[test]
-// #[ignore]
-#[allow(dead_code)]
-fn kill_on_timeout_no_output() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    const TEST_CMD: &str = "sleep";
-    // Skip the test if the test system does not have the command
-    if !is_command_available(TEST_CMD, &["0"]) {
-        return Ok(());
-    }
-
-    let mut child = tempdir()?
-        .spawn_child_with_command(TEST_CMD, args!["120"])?
         .with_timeout(Duration::from_secs(2));
 
     // We need to use expect_stdout_line_matches, because wait_with_output ignores timeouts.
@@ -351,6 +297,17 @@ fn failure_regex_reads_multi_line_output_on_expect_line() {
         .unwrap()
         .with_timeout(Duration::from_secs(5))
         .with_failure_regex_set("failure_message", RegexSet::empty());
+
+    // Error reporting kills the child after the first failure line. Wait until
+    // echo has written both lines so the assertion only checks unread output.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "echo did not exit within 5 seconds"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Any method that reads output should work here.
     // We use a non-matching regex, to trigger the failure panic.

@@ -21,7 +21,7 @@ mod tests;
 use ValueBalanceError::*;
 
 /// A balance in each chain value pool or transaction value pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ValueBalance<C> {
     transparent: Amount<C>,
     sprout: Amount<C>,
@@ -610,7 +610,7 @@ impl ValueBalance<NonNegative> {
     }
 }
 
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, PartialEq, Eq)]
 /// Errors that can be returned when validating a [`ValueBalance`]
 pub enum ValueBalanceError {
     /// transparent amount error {0}
@@ -653,6 +653,64 @@ pub enum ValueBalanceError {
 
     /// ValueBalance is unparsable
     Unparsable,
+}
+
+impl<C> fmt::Debug for ValueBalance<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_value_balance(
+            f,
+            [
+                &self.transparent,
+                &self.sprout,
+                &self.sapling,
+                &self.orchard,
+                &self.deferred,
+                &self.ironwood,
+                &self.nsm_value_balance,
+            ],
+        )
+    }
+}
+
+/// The body of `ValueBalance<C>`'s `Debug`, kept non-generic so it is compiled
+/// once. Matches the output `#[derive(Debug)]` would produce.
+fn debug_value_balance(f: &mut fmt::Formatter<'_>, pools: [&dyn fmt::Debug; 7]) -> fmt::Result {
+    let [transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance] = pools;
+    f.debug_struct("ValueBalance")
+        .field("transparent", transparent)
+        .field("sprout", sprout)
+        .field("sapling", sapling)
+        .field("orchard", orchard)
+        .field("deferred", deferred)
+        .field("ironwood", ironwood)
+        .field("nsm_value_balance", nsm_value_balance)
+        .finish()
+}
+
+// Written out instead of derived: derived `Debug` is `#[inline]`, so every
+// codegen unit that formats this type compiles its own copy. The output
+// matches the derive.
+impl fmt::Debug for ValueBalanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Transparent(e) => f.debug_tuple("Transparent").field(e).finish(),
+            Sprout(e) => f.debug_tuple("Sprout").field(e).finish(),
+            Sapling(e) => f.debug_tuple("Sapling").field(e).finish(),
+            Orchard(e) => f.debug_tuple("Orchard").field(e).finish(),
+            Deferred(e) => f.debug_tuple("Deferred").field(e).finish(),
+            Ironwood(e) => f.debug_tuple("Ironwood").field(e).finish(),
+            NsmValueBalance(e) => f.debug_tuple("NsmValueBalance").field(e).finish(),
+            NsmSeedMismatch { derived, expected } => f
+                .debug_struct("NsmSeedMismatch")
+                .field("derived", derived)
+                .field("expected", expected)
+                .finish(),
+            ScheduledIssuance(e) => f.debug_tuple("ScheduledIssuance").field(e).finish(),
+            MissingCoinbaseHeight => f.write_str("MissingCoinbaseHeight"),
+            Total(e) => f.debug_tuple("Total").field(e).finish(),
+            Unparsable => f.write_str("Unparsable"),
+        }
+    }
 }
 
 impl fmt::Display for ValueBalanceError {

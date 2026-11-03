@@ -5,28 +5,27 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
+    sync::LazyLock,
     task::{Context, Poll},
 };
-
-use futures::{future::BoxFuture, FutureExt};
-use once_cell::sync::Lazy;
-use rand_10::rng as thread_rng;
-use tokio::sync::watch;
-use tower::{util::ServiceFn, Service};
-use tower_batch_control::{Batch, BatchControl, RequestWeight};
-use tower_fallback::Fallback;
-
-use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
-use zakura_chain::transaction::{SigHash, UnminedTxId};
-use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::value::ZatBalance;
-
-use crate::{error::TransactionError, BoxError};
 use zakura_jsonl_trace::block_profile::{
     self as profiles,
     shared::SharedBatch,
     verification::{Pool, Workload},
 };
+
+use super::batch_control::{Batch, BatchControl, RequestWeight};
+use super::fallback::Fallback;
+use futures::{future::BoxFuture, FutureExt};
+use rand_10::rng as thread_rng;
+use tokio::sync::watch;
+use tower::{util::ServiceFn, Service};
+
+use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
+use zakura_chain::transaction::{SigHash, UnminedTxId};
+use zcash_protocol::value::ZatBalance;
+
+use crate::{error::TransactionError, BoxError};
 
 use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 
@@ -39,22 +38,7 @@ mod tests;
 /// one verifier is named the same way everywhere.
 pub(super) const VERIFIER_NAME: &str = "groth16_sapling";
 
-/// Sapling prover containing spend and output params for the Sapling circuit.
-///
-/// Used to:
-///
-/// - construct Sapling outputs in coinbase txs, and
-/// - verify Sapling shielded data in the tx verifier.
-static SAPLING: Lazy<LocalTxProver> = Lazy::new(LocalTxProver::bundled);
-
-/// Returns the process-wide Sapling prover for constructing Sapling proofs, initializing it on
-/// first use.
-///
-/// The bundled Sapling spend and output proving parameters are parsed once, then the same prover is
-/// reused for proof construction and verification for the lifetime of the process.
-pub fn sapling_prover() -> &'static LocalTxProver {
-    Lazy::force(&SAPLING)
-}
+use sapling_crypto::circuit::pinned_verifying_keys as verifying_keys;
 
 /// A Sapling verification item, used as the request type of the service.
 ///
@@ -93,6 +77,7 @@ impl Item {
 }
 
 impl Item {
+    /// Adds this item to the shared CPU work recorded for its batch.
     fn profile_batch(&self, batch: &mut SharedBatch) {
         batch.add(
             self.profile.clone(),
@@ -145,15 +130,14 @@ impl RequestWeight for Item {
 /// Handles batching incoming requests, driving batches to completion, and reporting results.
 #[derive(Default)]
 pub struct Verifier {
-    /// A batch verifier for Sapling shielded data.
-    batch: BatchValidator,
-    profile: SharedBatch,
+    /// Items awaiting preparation and validation on a blocking worker.
+    batch: Vec<Item>,
 
     /// A channel for broadcasting the verification result of the batch.
     ///
     /// Each batch gets a newly created channel, so there is only ever one result sent per channel.
     /// Tokio doesn't have a oneshot multi-consumer channel, so we use a watch channel.
-    tx: watch::Sender<Option<bool>>,
+    tx: watch::Sender<Option<BatchResult>>,
 }
 
 impl fmt::Debug for Verifier {
@@ -165,24 +149,54 @@ impl fmt::Debug for Verifier {
     }
 }
 
+/// Preparation results in admission order, plus proof/signature validation.
+#[derive(Debug)]
+struct BatchResult {
+    checks: Vec<bool>,
+    valid: bool,
+}
+
+/// Prepares and validates a batch on a CPU worker.
+fn validate_batch(items: Vec<Item>) -> BatchResult {
+    let mut profile = SharedBatch::default();
+    for item in &items {
+        item.profile_batch(&mut profile);
+    }
+    let mut batch = BatchValidator::default();
+    // Failed preparation can leave proofs and signatures in the validator.
+    // Successful batch validation must not turn that item's failure into Ok.
+    let checks = items
+        .into_iter()
+        .map(|item| {
+            let _scope = item.profile.enter();
+            batch.check_bundle(item.bundle, item.sighash.into())
+        })
+        .collect();
+    let (spend_vk, output_vk) = verifying_keys();
+    let valid = profile.measure(|| batch.validate(spend_vk, output_vk, thread_rng()));
+    BatchResult { checks, valid }
+}
+
 impl Drop for Verifier {
     // Flush the current batch in case there are still any pending futures.
     //
     // Flushing the batch means we need to validate it. This function fires off the validation and
     // returns immediately, usually before the validation finishes.
     fn drop(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+
         let batch = mem::take(&mut self.batch);
-        let profile = mem::take(&mut self.profile);
         let tx = mem::take(&mut self.tx);
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
-            let _unassigned = zakura_jsonl_trace::block_profile::Context::default().enter();
-            let (spend_vk, output_vk) = SAPLING.verifying_keys();
-
-            // Validate the batch and send the result through the channel.
-            let res = profile.measure(|| batch.validate(&spend_vk, &output_vk, thread_rng()));
-            let _ = tx.send(Some(res));
+            // Closing the channel on panic makes pending items fail closed,
+            // without letting a detached Rayon panic abort the process.
+            if let Ok(result) = std::panic::catch_unwind(|| validate_batch(batch)) {
+                let _ = tx.send(Some(result));
+            }
         });
     }
 }
@@ -201,32 +215,26 @@ impl Service<BatchControl<Item>> for Verifier {
             BatchControl::Item(item) => {
                 let mut rx = self.tx.subscribe();
 
-                item.profile_batch(&mut self.profile);
-                let bundle_check = self
-                    .batch
-                    .check_bundle(item.bundle, item.sighash.into())
-                    .then_some(())
-                    .ok_or(TransactionError::SaplingVerificationFailed);
+                // Preparation decodes proofs and curve points. Keep it out of
+                // this async worker so separate batches can prepare in parallel.
+                let index = self.batch.len();
+                self.batch.push(item);
 
-                if bundle_check.is_err() {
-                    self.profile.partial();
-                }
                 async move {
-                    bundle_check.map_err(BoxError::from)?;
-
                     rx.changed()
                         .await
                         .map_err(|_| BoxError::from("verifier was dropped without flushing"))?;
 
                     // We use a new channel for each batch, so we always get the correct
                     // batch result here.
-                    let is_valid = *rx.borrow().as_ref().ok_or_else(|| {
-                        Box::<dyn std::error::Error + Send + Sync>::from(
-                            "threadpool unexpectedly dropped channel sender",
-                        )
+                    let result = rx.borrow();
+                    let result = result.as_ref().ok_or_else(|| {
+                        BoxError::from("threadpool unexpectedly dropped channel sender")
                     })?;
-
-                    if is_valid {
+                    if !result.checks[index] {
+                        return Err(TransactionError::SaplingVerificationFailed.into());
+                    }
+                    if result.valid {
                         metrics::counter!("proofs.sapling.verified").increment(1);
                         Ok(())
                     } else {
@@ -239,20 +247,16 @@ impl Service<BatchControl<Item>> for Verifier {
 
             BatchControl::Flush => {
                 let batch = mem::take(&mut self.batch);
-                let profile = mem::take(&mut self.profile);
                 let tx = mem::take(&mut self.tx);
 
                 async move {
                     let start = std::time::Instant::now();
-                    let spawn_result = tokio::task::spawn_blocking(move || {
-                        let (spend_vk, output_vk) = SAPLING.verifying_keys();
-                        profile.measure(|| batch.validate(&spend_vk, &output_vk, thread_rng()))
-                    })
-                    .await;
+                    let spawn_result =
+                        tokio::task::spawn_blocking(move || validate_batch(batch)).await;
                     let duration = start.elapsed().as_secs_f64();
 
                     let result_label = match &spawn_result {
-                        Ok(true) => "success",
+                        Ok(result) if result.valid => "success",
                         _ => "failure",
                     };
                     metrics::histogram!(
@@ -262,10 +266,9 @@ impl Service<BatchControl<Item>> for Verifier {
                     )
                     .record(duration);
 
-                    // Extract the value before consuming spawn_result
-                    let is_valid = spawn_result.as_ref().ok().copied();
-                    let _ = tx.send(is_valid);
-                    spawn_result.map(|_| ()).map_err(Self::Error::from)
+                    let result = spawn_result.map_err(Self::Error::from)?;
+                    let _ = tx.send(Some(result));
+                    Ok(())
                 }
                 .boxed()
             }
@@ -278,29 +281,20 @@ pub fn verify_single(
     item: Item,
 ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>> {
     async move {
-        let mut verifier = Verifier::default();
-
-        verifier.profile.fallback();
-        item.profile_batch(&mut verifier.profile);
-        let check = verifier
-            .batch
-            .check_bundle(item.bundle, item.sighash.into())
-            .then_some(())
-            .ok_or(TransactionError::SaplingVerificationFailed);
-        if check.is_err() {
-            verifier.profile.partial();
-        }
-        check.map_err(BoxError::from)?;
-
-        let is_valid = tokio::task::spawn_blocking(move || {
-            let (spend_vk, output_vk) = SAPLING.verifying_keys();
-
-            mem::take(&mut verifier.profile).measure(|| {
-                mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
+        let mut profile = SharedBatch::default();
+        profile.fallback();
+        item.profile_batch(&mut profile);
+        let is_valid = spawn_fallback(move || {
+            profile.measure(|| {
+                let mut batch = BatchValidator::default();
+                if !batch.check_bundle(item.bundle, item.sighash.into()) {
+                    return false;
+                }
+                let (spend_vk, output_vk) = verifying_keys();
+                batch.validate(spend_vk, output_vk, thread_rng())
             })
         })
-        .await
-        .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;
+        .await?;
 
         if is_valid {
             Ok(())
@@ -309,6 +303,19 @@ pub fn verify_single(
         }
     }
     .boxed()
+}
+
+/// Runs fallback verification on Rayon, returning an error if it panics.
+///
+/// An uncaught panic in a detached Rayon task aborts the process. Keep the
+/// panic-to-error boundary previously provided by Tokio's blocking task.
+async fn spawn_fallback<F>(verify: F) -> Result<bool, BoxError>
+where
+    F: FnOnce() -> bool + Send + std::panic::UnwindSafe + 'static,
+{
+    super::spawn_fifo(move || std::panic::catch_unwind(verify))
+        .await?
+        .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))
 }
 
 /// The batching-and-fallback stack for Sapling bundle verification, before caching.
@@ -326,8 +333,8 @@ type VerifierService = Cached<BatchFallbackService>;
 /// gossiped into the mempool does not have to be verified again when the block that mines it
 /// arrives. One cache covers all of Sapling: its spend and output verifying keys have never
 /// changed, so unlike Orchard there are no circuit eras to keep apart.
-pub static VERIFIER: Lazy<VerifierService> =
-    Lazy::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME));
+pub static VERIFIER: LazyLock<VerifierService> =
+    LazyLock::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME));
 
 /// Builds the uncached batching-and-fallback stack.
 fn batch_fallback_verifier() -> BatchFallbackService {

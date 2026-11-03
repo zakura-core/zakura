@@ -16,6 +16,12 @@ pub(crate) trait AttributedMemorySize {
     fn attributed_memory_size_bytes(&self) -> u64;
 }
 
+impl<T: AttributedMemorySize> AttributedMemorySize for Box<T> {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        inline_size_bytes::<T>().saturating_add(T::attributed_memory_size_bytes(self))
+    }
+}
+
 /// Returns the inline size of `T`, saturating if `usize` is wider than `u64`.
 pub(crate) fn inline_size_bytes<T>() -> u64 {
     u64::try_from(size_of::<T>()).unwrap_or(u64::MAX)

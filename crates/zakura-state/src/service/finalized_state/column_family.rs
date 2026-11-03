@@ -126,17 +126,6 @@ where
         }
     }
 
-    /// Wraps an existing write batch, and returns a typed writer for this column family.
-    ///
-    /// These methods are the only way to get a `WriteTypedBatch`, which ensures
-    /// that the read and write types are consistent.
-    pub fn take_batch_for_writing(
-        self,
-        batch: DiskWriteBatch,
-    ) -> WriteTypedBatch<'cf, Key, Value, DiskWriteBatch> {
-        WriteTypedBatch { inner: self, batch }
-    }
-
     /// Wraps an existing write batch reference, and returns a typed writer for this column family.
     ///
     /// These methods are the only way to get a `WriteTypedBatch`, which ensures

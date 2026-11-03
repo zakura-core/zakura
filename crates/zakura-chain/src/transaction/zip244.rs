@@ -180,7 +180,7 @@ impl io::Write for HashWriter<'_> {
 /// Write a value's canonical [`ZcashSerialize`] bytes into a BLAKE2b state.
 fn update_serialized<T: ZcashSerialize>(state: &mut State, value: &T) {
     value
-        .zcash_serialize(HashWriter(state))
+        .zcash_serialize(&mut HashWriter(state))
         .expect("writing to a BLAKE2b state is infallible");
 }
 

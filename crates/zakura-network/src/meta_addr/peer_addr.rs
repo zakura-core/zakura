@@ -16,7 +16,6 @@ use proptest_derive::Arbitrary;
 )]
 #[serde(transparent)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[derive(schemars::JsonSchema)]
 pub struct PeerSocketAddr(SocketAddr);
 
 impl fmt::Debug for PeerSocketAddr {

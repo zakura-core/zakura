@@ -176,6 +176,7 @@ jobs:
             continuous-sync-audit-state-
 
       - name: Audit controllers
+        id: audit
         if: env.ACTION == 'audit'
         run: |
           set -euo pipefail
@@ -196,6 +197,12 @@ jobs:
           # A run is capped at 48h, so only flag a node that has not completed one
           # in four days -- long enough that a legitimately long run cannot trip it.
           MAX_COMPLETION_AGE: "345600"
+
+      # ci_alert.py reads this successful step from the attempt's jobs API.
+      # Keep its name and the audit step name aligned with that notification contract.
+      - name: Audit notification handled
+        if: ${{ !cancelled() && steps.audit.outputs.notification_handled == 'true' }}
+        run: echo "The audit sent or intentionally suppressed its notifications."
 
       # Runs even when the audit exits non-zero, or a persistent failure would
       # never record its `last_sent` and would re-page on every cycle.

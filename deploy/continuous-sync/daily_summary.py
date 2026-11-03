@@ -18,7 +18,7 @@ import time
 import tomllib
 from zoneinfo import ZoneInfo
 
-from deploy import DeployError, Node, completion_updates, post_slack, slack_webhook_url, sync_label
+from deploy import DeployError, Node, completion_updates, post_slack, sync_label
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -26,6 +26,11 @@ STATE_VERSION = 1
 spec = importlib.util.spec_from_file_location("summary_monitor", SCRIPT_DIR / "alert-monitor.py")
 monitor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(monitor)
+
+
+def slack_webhook_url() -> str:
+    """Use only the monitoring destination, never fall back to failure alerts."""
+    return os.environ.get("SLACK_MONITORING_WEBHOOK_URL", "")
 
 
 def latest_slot(timestamp: int, settings: dict) -> tuple[str, int]:
@@ -148,7 +153,7 @@ def deliver(config: dict, path: Path, timestamp: int, *, dry_run: bool = False) 
     if dry_run:
         print(text)
         return 0
-    if not post_slack(text):
+    if not post_slack(text, webhook=destination):
         raise DeployError("summary Slack delivery failed; completion cursors retained for retry")
     # The slot belongs to this attempt's snapshot. A later retry never shifts the next deadline.
     save_state(path, {**state, "last_slot": slot, "last_posted_at": timestamp,
@@ -189,7 +194,21 @@ def check_status(config: dict, path: Path, timestamp: int) -> int:
     return int(overdue)
 
 
-def main() -> int:
+def migrate_destination(config: dict, path: Path, timestamp: int, expected: str) -> int:
+    """Rebind validated delivery history under the CLI lock without consuming runs."""
+    state = load_state(path, timestamp, config["summary"], {node["name"] for node in config["nodes"]})
+    if state["destination"] != expected:
+        raise DeployError("saved destination does not match the expected destination; state unchanged")
+    destination = slack_webhook_url()
+    if not destination:
+        raise DeployError("SLACK_MONITORING_WEBHOOK_URL is not configured; state unchanged")
+    save_state(path, {**state, "destination": hashlib.sha256(destination.encode()).hexdigest()})
+    print("summary destination migrated; delivery history retained and no Slack post sent")
+    return 0
+
+
+def main(argv=None) -> int:
+    """Run sender operations on the configured host with serialized state writes."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=SCRIPT_DIR / "nodes.toml")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -197,8 +216,10 @@ def main() -> int:
     run.add_argument("--dry-run", action="store_true")
     seed = sub.add_parser("initialize")
     seed.add_argument("--from-file", type=Path, required=True)
+    migrate = sub.add_parser("migrate-destination", help="retain delivery history when changing the monitoring webhook")
+    migrate.add_argument("--expected-destination", required=True, help="SHA-256 digest currently stored in delivery state")
     sub.add_parser("status")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         with args.config.open("rb") as file:
             config = tomllib.load(file)
@@ -217,6 +238,8 @@ def main() -> int:
                 raise DeployError("another summary invocation holds the delivery lock") from error
             if args.command == "initialize":
                 return initialize(config, path, args.from_file, timestamp)
+            if args.command == "migrate-destination":
+                return migrate_destination(config, path, timestamp, args.expected_destination)
             return deliver(config, path, timestamp, dry_run=args.dry_run)
     except (DeployError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"summary failed: {error}", file=sys.stderr)

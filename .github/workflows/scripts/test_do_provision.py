@@ -5,7 +5,7 @@ import argparse
 import json
 import subprocess
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import do_artifact_retention as retention
@@ -60,6 +60,53 @@ def args(*extra):
 
 
 class Selection(unittest.TestCase):
+    def test_vct_handoff_never_substitutes_a_closer_ordinary_snapshot(self):
+        ordinary = snapshot(height=99, prefix="zakura-pr-state-mainnet-", id="ordinary")
+        ordinary["name"] = ordinary["name"].replace("-h", "-finalized-h")
+        approach = snapshot(height=90)
+        self.assertEqual(
+            p.select_state([ordinary, approach], "nyc1", "mainnet", "vct-handoff", 100),
+            approach,
+        )
+        self.assertIsNone(
+            p.select_state([ordinary], "nyc1", "mainnet", "vct-handoff", 100)
+        )
+        self.assertIsNone(
+            p.select_state([ordinary, approach], "nyc1", "mainnet", "vct-handoff", 100, "ordinary")
+        )
+
+    def test_vct_handoff_requires_eligible_regional_approach(self):
+        for state in (snapshot(height=100), snapshot(region="sfo3")):
+            for selected_id in ("", "state"):
+                with self.subTest(state=state, selected_id=selected_id):
+                    self.assertIsNone(
+                        p.select_state([state], "nyc1", "mainnet", "vct-handoff", 100, selected_id)
+                    )
+        for network, checkpoint in (("testnet", 100), ("mainnet", None), ("mainnet", 0)):
+            with self.assertRaises(ValueError):
+                p.select_state([snapshot()], "nyc1", network, "vct-handoff", checkpoint)
+
+    def test_vct_validation_fixture_requires_exact_id(self):
+        validation = snapshot(prefix="zakura-pr-validation-approach-mainnet-")
+        self.assertIsNone(
+            p.select_state([validation], "nyc1", "mainnet", "vct-handoff", 100)
+        )
+        self.assertEqual(
+            p.select_state([validation], "nyc1", "mainnet", "vct-handoff", 100, "state"),
+            validation,
+        )
+
+    def test_vct_handoff_uses_fallback_region_with_dedicated_fixture(self):
+        request = args("--network", "mainnet", "--mode", "vct-handoff", "--checkpoint", "100")
+        ordinary = snapshot(prefix="zakura-pr-state-mainnet-", id="ordinary")
+        plans = p.plans(
+            request,
+            [image("nyc1"), image("sfo3")],
+            [ordinary, snapshot("sfo3")],
+            [size("c-8", ["nyc1", "sfo3"])],
+        )
+        self.assertEqual([plan["region"] for plan in plans], ["sfo3"])
+
     def test_nyc3_incident_uses_shared_cpu_only_with_explicit_policy(self):
         sizes = [
             size("c-8"),
@@ -496,6 +543,73 @@ class Retention(unittest.TestCase):
         self.assertEqual(
             kept, {f"{r}-{n}" for r in ("nyc1", "sfo3") for n in (50, 150, 200)}
         )
+
+    def test_only_validation_artifacts_past_the_ttl_expire(self):
+        now = datetime(2026, 10, 26, tzinfo=timezone.utc)
+        old, fresh = "2026-10-18T00:00:00Z", "2026-10-21T00:00:00Z"
+        items = [
+            dict(
+                id="old-state",
+                name="zakura-pr-validation-state-mainnet-x",
+                created_at=old,
+            ),
+            dict(id="old-node", name="zakura-pr-validation-node-x", created_at=old),
+            dict(
+                id="fresh",
+                name="zakura-pr-validation-approach-mainnet-x",
+                created_at=fresh,
+            ),
+            dict(id="ordinary", name="zakura-pr-state-mainnet-x", created_at=old),
+            dict(id="backup", name="zakura-pr-state-zcashd-mainnet-x", created_at=old),
+        ]
+        self.assertEqual(
+            retention.expired_validation_ids(items, now), {"old-state", "old-node"}
+        )
+
+    @patch.object(retention, "output")
+    @patch.object(retention, "doctl")
+    def test_main_deletes_only_expired_available_validation_artifacts(self, api, _):
+        old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        images = [
+            image("nyc1", id="current", created=datetime.now(timezone.utc).isoformat()),
+            dict(
+                id="v-node",
+                name="zakura-pr-validation-node-x",
+                regions=["nyc1"],
+                created_at=old,
+                status="available",
+            ),
+            dict(
+                id="v-pending",
+                name="zakura-pr-validation-node-y",
+                regions=["nyc1"],
+                created_at=old,
+                status="pending",
+            ),
+        ]
+        volume_snapshots = [
+            dict(
+                id="v-state",
+                name="zakura-pr-validation-state-testnet-x",
+                regions=["nyc1"],
+                created_at=old,
+            ),
+            dict(
+                id="zcashd",
+                name="zakura-pr-state-zcashd-mainnet-x",
+                regions=["nyc1"],
+                created_at=old,
+            ),
+        ]
+        api.side_effect = lambda *a: (
+            images
+            if a[:2] == ("image", "list-user")
+            else volume_snapshots if a[:2] == ("snapshot", "list") else None
+        )
+        with patch("sys.argv", ["retention", "--checkpoint", "100", "--apply"]):
+            retention.main()
+        deleted = {c.args[2] for c in api.call_args_list if c.args[1] == "delete"}
+        self.assertEqual(deleted, {"v-node", "v-state"})
 
     def test_stale_or_missing_regions_are_visible(self):
         now = datetime(2026, 9, 4, tzinfo=timezone.utc)

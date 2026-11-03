@@ -1,4 +1,4 @@
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 pub struct TestVector {
     pub(crate) domain: Vec<u8>,
@@ -7,8 +7,8 @@ pub struct TestVector {
 }
 
 // From https://github.com/zcash/zcash-test-vectors/blob/master/test-vectors/rust/orchard_sinsemilla.rs
-lazy_static! {
-    pub static ref SINSEMILLA: [TestVector; 11] = [
+pub static SINSEMILLA: LazyLock<[TestVector; 11]> = LazyLock::new(|| {
+    [
         TestVector {
             domain: vec![
                 0x7a, 0x2e, 0x63, 0x61, 0x73, 0x68, 0x3a, 0x74, 0x65, 0x73, 0x74, 0x2d, 0x53, 0x69,
@@ -256,5 +256,5 @@ lazy_static! {
                 0xce, 0xb6, 0x0b, 0x00,
             ],
         },
-    ];
-}
+    ]
+});

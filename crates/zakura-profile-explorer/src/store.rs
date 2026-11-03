@@ -439,7 +439,7 @@ impl Store {
             self.used.saturating_add(size * 2) < self.budget * 9 / 10,
             "profile storage pressure"
         );
-        let id = format!("{:032x}", rand::random::<u128>());
+        let id = format!("{:032x}", rand_10::random::<u128>());
         let temp = self.path.join("chunks").join(format!("{id}.tmp"));
         let final_path = temp.with_extension("zst");
         let size = write_payload(&temp, &final_path, &compressed, |size| {

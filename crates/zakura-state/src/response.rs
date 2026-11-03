@@ -1,7 +1,7 @@
 //! State [`tower::Service`] response types.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -46,6 +46,21 @@ pub enum PreparedMinedRelayEligibility {
     Unavailable,
 }
 
+/// Whether a block's header commits to the authorizing data in its body.
+///
+/// From NU5, the block hash commits to authorizing data only through `hashBlockCommitments`
+/// (ZIP 244), so a body can match its header's transaction IDs and still carry different
+/// signatures, proofs, or scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthDataCommitment {
+    /// The header commits to the body's authorizing data. Before NU5, transaction IDs do.
+    Bound,
+    /// The body's authorizing data does not match the header's commitment.
+    Mismatch(block::CommitmentError),
+    /// The parent's history tree is not available, so the binding is unknown.
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
@@ -81,8 +96,9 @@ pub enum Response {
     /// of block hashes that were reconsidered in the state and successfully re-committed.
     Reconsidered(Vec<block::Hash>),
 
-    /// Response to [`Request::Depth`] with the depth of the specified block.
-    Depth(Option<u32>),
+    /// Response to [`Request::PreciousBlock`] indicating that the state contains the block
+    /// and applied the preference where it could.
+    Precious,
 
     /// Response to [`Request::Tip`] with the current best chain tip.
     //
@@ -92,9 +108,6 @@ pub enum Response {
 
     /// Response to [`Request::BlockLocator`] with a block locator object.
     BlockLocator(Vec<block::Hash>),
-
-    /// Response to [`Request::Transaction`] with the specified transaction.
-    Transaction(Option<Arc<Transaction>>),
 
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
@@ -139,6 +152,9 @@ pub enum Response {
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
+    /// Response to [`Request::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
+
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -154,14 +170,22 @@ pub enum Response {
 }
 
 /// The result of checking a candidate block's external inputs against its parent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentInputs {
+    /// Every input is unspent at the parent, with the output each one spends.
+    ///
+    /// The block verifier hands these outputs to its transaction checks, so they are read once
+    /// per block. The map holds each output once while the block verifies, in addition to the
+    /// copies the transaction checks make of the outputs they spend. Its locking scripts are
+    /// capped per check, see `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
+    Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),
     /// The parent is neither in a non-finalized chain nor the finalized tip,
     /// so no chain can accept the candidate now.
     ParentUnavailable,
-    /// Every input is unspent at the parent, or the parent context changed during the read.
+    /// The state could not decide, for example because the parent context changed during the read,
+    /// or every input was found but their outputs were too large to keep.
     Inconclusive,
 }
 
@@ -510,7 +534,7 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
 
-    /// Response to [`Request::Transaction`] with the specified transaction.
+    /// Response to [`ReadRequest::AnyChainTransaction`] with the specified transaction.
     AnyChainTransaction(Option<AnyTx>),
 
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
@@ -560,6 +584,9 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::ReleaseRetainedHeaderPath`].
     RetainedHeaderPathReleased(bool),
+
+    /// Response to [`ReadRequest::SelectedChainMembership`].
+    SelectedChainMembership(zakura_node_services::header_chain::SelectedChainMembership),
 
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
@@ -639,6 +666,9 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
+
+    /// Response to [`ReadRequest::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
 
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -726,7 +756,6 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::FinalizedTip(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
-            ReadResponse::Depth(depth) => Ok(Response::Depth(depth)),
             ReadResponse::BestChainNextMedianTimePast(median_time_past) => Ok(Response::BestChainNextMedianTimePast(median_time_past)),
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
@@ -745,9 +774,6 @@ impl TryFrom<ReadResponse> for Response {
                 height,
                 next_block_hash
             }),
-            ReadResponse::Transaction(tx_info) => {
-                Ok(Response::Transaction(tx_info.map(|tx_info| tx_info.tx)))
-            }
             ReadResponse::AnyChainTransaction(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
@@ -766,10 +792,15 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
             }
+            ReadResponse::AuthDataCommitment(commitment) => {
+                Ok(Response::AuthDataCommitment(commitment))
+            }
 
             ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
 
-            ReadResponse::UsageInfo(_)
+            ReadResponse::Depth(_)
+            | ReadResponse::Transaction(_)
+            | ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::BlockSizesByHash(_)
@@ -793,6 +824,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::RetainedHeaderPathLease(_)
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)
+            | ReadResponse::SelectedChainMembership(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::Blocks(_)

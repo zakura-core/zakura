@@ -26,8 +26,8 @@ use crate::components::mempool::tests::{
 use crate::components::mempool::{
     config::Config,
     storage::{
-        eviction_list::EvictionList, MempoolError, RejectionError, SameEffectsTipRejectionError,
-        Storage, MAX_EVICTION_MEMORY_ENTRIES,
+        eviction_list::EvictionList, ExactTipRejectionError, MempoolError, RejectionError,
+        SameEffectsTipRejectionError, Storage, MAX_EVICTION_MEMORY_ENTRIES,
     },
     SameEffectsChainRejectionError,
 };
@@ -85,7 +85,7 @@ fn reject_lists_enforce_production_capacity() {
     for index in 0..=production_capacity {
         let id = cheap_rejection_id(index);
         tip_rejected.reject(id, SameEffectsTipRejectionError::SpendConflict.into());
-        chain_rejected.reject(id, SameEffectsChainRejectionError::RandomlyEvicted.into());
+        chain_rejected.reject(id, SameEffectsChainRejectionError::Expired.into());
 
         if index == production_capacity - 1 {
             assert_eq!(
@@ -202,7 +202,7 @@ proptest! {
             (0..test_capacity).map(|index| rejection_id_with_index(rejection_template, index));
 
         for rejection in unique_ids {
-            storage.reject(rejection, SameEffectsChainRejectionError::RandomlyEvicted.into());
+            storage.reject(rejection, ExactTipRejectionError::Evicted.into());
         }
 
         // Make sure there were no duplicates
@@ -221,8 +221,8 @@ proptest! {
                     Ok(tx_id)
                 );
             } else {
-                // The final transaction will cause a random eviction,
-                // which might return an error if this transaction is chosen
+                // The final transaction either evicts cheaper transactions, or is rejected
+                // because it pays too little to evict them.
                 let result = storage.insert(transaction.clone(), Vec::new(), None);
 
                 if result.is_ok() {
@@ -233,22 +233,18 @@ proptest! {
                 } else {
                     prop_assert_eq!(
                         result,
-                        Err(MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::RandomlyEvicted))
+                        Err(MempoolError::StorageExactTip(ExactTipRejectionError::BelowEvictionCost))
                     );
                 }
             }
         }
 
-        // Check if at least one transaction was evicted.
-        // (More than one an be evicted to meet the limit.)
         prop_assert!(storage.transaction_count() <= MEMPOOL_TX_COUNT);
+        prop_assert!(storage.total_cost() <= cost_limit);
 
-        // Since we inserted more than the configured capacity,
-        // the storage should have removed the older entries and kept its size
-        prop_assert_eq!(
-            storage.rejected_transaction_count(),
-            TEST_REJECTION_LIST_CAPACITY
-        );
+        // The eviction or the rejection pushed the tip rejection list over its capacity, so
+        // the storage cleared it.
+        prop_assert!(storage.rejected_transaction_count() < TEST_REJECTION_LIST_CAPACITY);
     }
 
     /// Test that the reject list length limits are applied when directly rejecting transactions.
@@ -327,9 +323,9 @@ proptest! {
             rejection_template
         }).collect();
 
-        storage.reject(unique_ids[0], SameEffectsChainRejectionError::RandomlyEvicted.into());
+        storage.reject(unique_ids[0], SameEffectsChainRejectionError::Expired.into());
         thread::sleep(Duration::from_millis(11));
-        storage.reject(unique_ids[1], SameEffectsChainRejectionError::RandomlyEvicted.into());
+        storage.reject(unique_ids[1], SameEffectsChainRejectionError::Expired.into());
 
         prop_assert_eq!(storage.rejected_transaction_count(), 1);
     }
@@ -670,7 +666,7 @@ impl SpendConflictTestInput {
     ///
     /// This may clear the entire Sprout joinsplit data.
     fn remove_joinsplits_with_conflicts<P: ZkSnarkProof>(
-        maybe_joinsplit_data: &mut Option<JoinSplitData<P>>,
+        maybe_joinsplit_data: &mut Option<Box<JoinSplitData<P>>>,
         conflicts: &HashSet<sprout::Nullifier>,
     ) {
         let mut should_clear_joinsplit_data = false;
@@ -749,15 +745,15 @@ impl SpendConflictTestInput {
     ///
     /// This may clear the entire shielded data.
     fn remove_sapling_transfers_with_conflicts<A>(
-        maybe_shielded_data: &mut Option<sapling::ShieldedData<A>>,
+        maybe_shielded_data: &mut Option<Box<sapling::ShieldedData<A>>>,
         conflicts: &HashSet<sapling::Nullifier>,
     ) where
         A: sapling::AnchorVariant + Clone,
     {
-        if let Some(shielded_data) = maybe_shielded_data.take() {
+        if let Some(shielded_data) = maybe_shielded_data.take().map(|data| *data) {
             match shielded_data.transfers {
                 sapling::TransferData::JustOutputs { .. } => {
-                    *maybe_shielded_data = Some(shielded_data)
+                    *maybe_shielded_data = Some(Box::new(shielded_data))
                 }
 
                 sapling::TransferData::SpendsAndMaybeOutputs {
@@ -772,19 +768,19 @@ impl SpendConflictTestInput {
                         .collect();
 
                     if let Ok(spends) = AtLeastOne::try_from(updated_spends) {
-                        *maybe_shielded_data = Some(sapling::ShieldedData {
+                        *maybe_shielded_data = Some(Box::new(sapling::ShieldedData {
                             transfers: sapling::TransferData::SpendsAndMaybeOutputs {
                                 shared_anchor,
                                 spends,
                                 maybe_outputs,
                             },
                             ..shielded_data
-                        });
+                        }));
                     } else if let Ok(outputs) = AtLeastOne::try_from(maybe_outputs) {
-                        *maybe_shielded_data = Some(sapling::ShieldedData {
+                        *maybe_shielded_data = Some(Box::new(sapling::ShieldedData {
                             transfers: sapling::TransferData::JustOutputs { outputs },
                             ..shielded_data
-                        });
+                        }));
                     }
                 }
             }
@@ -828,10 +824,10 @@ impl SpendConflictTestInput {
     ///
     /// This may clear the entire shielded data.
     fn remove_orchard_actions_with_conflicts(
-        maybe_shielded_data: &mut Option<orchard::ShieldedData>,
+        maybe_shielded_data: &mut Option<Box<orchard::ShieldedData>>,
         conflicts: &HashSet<orchard::Nullifier>,
     ) {
-        if let Some(shielded_data) = maybe_shielded_data.take() {
+        if let Some(shielded_data) = maybe_shielded_data.take().map(|data| *data) {
             let updated_actions: Vec<_> = shielded_data
                 .actions
                 .to_vec()
@@ -840,10 +836,10 @@ impl SpendConflictTestInput {
                 .collect();
 
             if let Ok(actions) = AtLeastOne::try_from(updated_actions) {
-                *maybe_shielded_data = Some(orchard::ShieldedData {
+                *maybe_shielded_data = Some(Box::new(orchard::ShieldedData {
                     actions,
                     ..shielded_data
-                });
+                }));
             }
         }
     }
@@ -958,12 +954,15 @@ impl SproutSpendConflict {
     /// transaction.
     ///
     /// The transaction will then conflict with any other transaction with the same new nullifier.
-    pub fn apply_to(self, joinsplit_data: &mut Option<transaction::JoinSplitData<Groth16Proof>>) {
+    pub fn apply_to(
+        self,
+        joinsplit_data: &mut Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
+    ) {
         if let Some(existing_joinsplit_data) = joinsplit_data.as_mut() {
             existing_joinsplit_data.first.nullifiers[0] =
                 self.new_joinsplit_data.first.nullifiers[0];
         } else {
-            *joinsplit_data = Some(self.new_joinsplit_data.0);
+            *joinsplit_data = Some(Box::new(self.new_joinsplit_data.0));
         }
     }
 }
@@ -1005,10 +1004,11 @@ impl<A: sapling::AnchorVariant + Clone> SaplingSpendConflict<A> {
     /// the transaction, and then the spend is added.
     ///
     /// The transaction will then conflict with any other transaction with the same new nullifier.
-    pub fn apply_to(self, sapling_shielded_data: &mut Option<sapling::ShieldedData<A>>) {
+    pub fn apply_to(self, sapling_shielded_data: &mut Option<Box<sapling::ShieldedData<A>>>) {
         use sapling::TransferData::*;
 
-        let shielded_data = sapling_shielded_data.get_or_insert(self.fallback_shielded_data.0);
+        let shielded_data =
+            sapling_shielded_data.get_or_insert_with(|| Box::new(self.fallback_shielded_data.0));
 
         match &mut shielded_data.transfers {
             SpendsAndMaybeOutputs { ref mut spends, .. } => {
@@ -1039,7 +1039,7 @@ impl OrchardSpendConflict {
     /// the new action is inserted in the transaction.
     ///
     /// The transaction will then conflict with any other transaction with the same new nullifier.
-    pub fn apply_to(self, orchard_shielded_data: &mut Option<orchard::ShieldedData>) {
+    pub fn apply_to(self, orchard_shielded_data: &mut Option<Box<orchard::ShieldedData>>) {
         if let Some(shielded_data) = orchard_shielded_data.as_mut() {
             shielded_data
                 .actions
@@ -1049,7 +1049,7 @@ impl OrchardSpendConflict {
                 .action
                 .nullifier = self.new_shielded_data.actions.first().action.nullifier;
         } else {
-            *orchard_shielded_data = Some(self.new_shielded_data.0);
+            *orchard_shielded_data = Some(Box::new(self.new_shielded_data.0));
         }
     }
 }

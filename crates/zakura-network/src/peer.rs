@@ -1,5 +1,6 @@
 //! Peer connection handling.
 
+pub(crate) mod block_gossip;
 mod client;
 mod connection;
 mod connector;
@@ -14,6 +15,8 @@ mod priority;
 pub use client::tests::ClientTestHarness;
 
 #[cfg(test)]
+pub(crate) use client::tests::connected::ConnectedClient;
+#[cfg(test)]
 pub(crate) use client::tests::ReceiveRequestAttempt;
 #[cfg(test)]
 pub(crate) use handshake::register_inventory_status;
@@ -24,6 +27,7 @@ pub(crate) use client::{CancelHeartbeatTask, ClientRequest};
 
 pub use client::Client;
 pub use connection::Connection;
+pub(crate) use connection::ConnectionRequests;
 pub use connector::{Connector, OutboundConnectorRequest};
 pub use error::{ErrorSlot, HandshakeError, NotFoundClass, PeerError, SharedPeerError};
 pub use handshake::{ConnectedAddr, ConnectionInfo, Handshake, HandshakeRequest};

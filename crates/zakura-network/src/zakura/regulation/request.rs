@@ -3,12 +3,12 @@
 //! Policies supply the codec and response bound. Sequential serving tasks wait
 //! for admission before dispatching work; this layer owns capacity and lifetimes.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{CancellationToken, Mutex},
+};
 
 use super::{slots::WeakSlotBudget, SlotBudget, SlotPermit};
 use crate::zakura::transport::{Frame, FrameGuard};

@@ -4,8 +4,7 @@
 //! one receive half, one bounded send half, and the peer cancellation token.
 
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::sync::{mpsc, CancellationToken};
 
 use super::{Frame, FramedRecv, FramedSend};
 use crate::{zakura::ZakuraPeerId, BoxError};
@@ -69,15 +68,6 @@ impl PeerStreamSession {
     /// Try to queue a raw frame without awaiting capacity.
     pub fn try_send_frame(&self, frame: Frame) -> Result<(), OrderedSendError> {
         try_send_frame(&self.send, frame)
-    }
-
-    /// Encode and try to queue a frame without awaiting capacity.
-    pub fn try_send_encoded(
-        &self,
-        encode: impl FnOnce() -> Result<Frame, BoxError>,
-    ) -> Result<(), OrderedSendError> {
-        let frame = encode().map_err(OrderedSendError::Encode)?;
-        self.try_send_frame(frame)
     }
 
     /// Split into fields for service-specific session workers.

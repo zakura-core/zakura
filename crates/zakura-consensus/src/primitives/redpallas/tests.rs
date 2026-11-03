@@ -6,7 +6,7 @@ use super::*;
 
 use std::time::Duration;
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tower::ServiceExt;
 

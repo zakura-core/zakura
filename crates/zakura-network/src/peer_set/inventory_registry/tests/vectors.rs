@@ -6,8 +6,8 @@ use zakura_chain::{block, serialization::AtLeastOne, transaction};
 
 use crate::{
     peer_set::inventory_registry::{
-        tests::new_inv_registry, InventoryMarker, InventoryStatus, MAX_INV_PER_MAP,
-        MAX_PEERS_PER_INV,
+        tests::new_inv_registry, InventoryChange, InventoryMarker, InventoryStatus,
+        MAX_INV_PER_MAP, MAX_PEERS_PER_INV,
     },
     protocol::external::InventoryHash,
     PeerSocketAddr,
@@ -298,5 +298,29 @@ async fn inv_registry_limit_for(status: InventoryMarker) {
                 limited_count,
             );
         }
+    }
+}
+
+/// An oversized multi-hash change keeps only [`MAX_INV_PER_MAP`] hashes, and does not pin
+/// the allocation for the rest.
+#[test]
+fn multi_change_caps_before_collecting() {
+    let peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let hashes: Vec<InventoryHash> = (0..50_000u32)
+        .map(|i| {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            InventoryHash::Tx(transaction::Hash(bytes))
+        })
+        .collect();
+
+    for change in [
+        InventoryChange::new_available_multi(&hashes, peer),
+        InventoryChange::new_missing_multi(&hashes, peer),
+    ] {
+        let (InventoryStatus::Available((kept, _)) | InventoryStatus::Missing((kept, _))) =
+            change.expect("the change has hashes");
+        assert_eq!(kept.len(), MAX_INV_PER_MAP);
+        assert!(kept.as_vec().capacity() <= 2 * MAX_INV_PER_MAP);
     }
 }

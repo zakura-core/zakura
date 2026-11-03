@@ -1,3 +1,4 @@
+use crate::serialization::ZcashReader;
 use std::{fmt, io, sync::Arc};
 
 use hex::{FromHex, ToHex};
@@ -120,14 +121,16 @@ impl From<Arc<Header>> for Hash {
 }
 
 impl ZcashSerialize for Hash {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.0)?;
         Ok(())
     }
 }
 
 impl ZcashDeserialize for Hash {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(Hash(reader.read_32_bytes()?))
     }
 }

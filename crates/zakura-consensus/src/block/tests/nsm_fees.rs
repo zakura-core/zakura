@@ -105,6 +105,9 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
                     zs::Request::CommitSemanticallyVerifiedBlock(block) => {
                         zs::Response::Committed(block.hash)
                     }
+                    zs::Request::CheckAuthDataCommitment(_) => {
+                        zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
+                    }
                     _ => panic!("unexpected state request: {request:?}"),
                 })
             });
@@ -122,7 +125,11 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
                 *fee = Amount::try_from(1).unwrap();
                 Ok(response)
             });
-            let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+            let verifier = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            );
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 verifier.oneshot(Request::Commit(Arc::new(block))),
@@ -195,6 +202,7 @@ proptest::proptest! {
                             assert!(excess <= 0, "overflowing fees must not reach state commit");
                             zs::Response::Committed(block.hash)
                         },
+                        zs::Request::CheckAuthDataCommitment(_) => zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound),
                         _ => panic!("unexpected state request: {request:?}"),
                     })
                 });
@@ -212,7 +220,7 @@ proptest::proptest! {
                         Ok::<_, BoxError>(response)
                     }
                 });
-                let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+                let verifier = SemanticBlockVerifier::new(&network, crate::transaction::boxed_state(state), crate::transaction::boxed_transaction_verifier(transaction));
                 let result = tokio::time::timeout(std::time::Duration::from_secs(10),
                     verifier.oneshot(Request::Commit(Arc::new(block)))).await.unwrap();
                 if excess > 0 {

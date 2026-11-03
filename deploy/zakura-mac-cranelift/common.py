@@ -1,0 +1,222 @@
+"""Bounded JSON transport and canonical mainnet comparison records."""
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+MAX_JSON = 256 * 1024
+POOLS = ("sapling", "orchard", "ironwood")
+
+
+class Unavailable(Exception):
+    """A sample cannot establish a comparison result."""
+
+
+def integer(value, name="height"):
+    if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+        raise Unavailable(f"invalid {name}")
+    return value
+
+
+def hex_bytes(value, length=None):
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value):
+        raise Unavailable("invalid hex data")
+    result = bytes.fromhex(value)
+    if length is not None and len(result) != length:
+        raise Unavailable("invalid hash length")
+    return result.hex()
+
+
+def atomic_json(path, value, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".pending-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            os.fchmod(stream.fileno(), mode)
+            json.dump(value, stream, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_json(path):
+    with Path(path).open() as stream:
+        return json.load(stream)
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        raise urllib.error.HTTPError(request.full_url, code, "redirect refused", headers, response)
+
+
+class Transport:
+    def __init__(self, timeout=10, deadline=None):
+        self.timeout, self.deadline = timeout, deadline
+        # Do not send loopback requests through operator-defined HTTP proxies.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def json(self, url, payload=None, headers=None, method=None):
+        data = None if payload is None else json.dumps(payload).encode()
+        request = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json", **(headers or {})}, method=method,
+        )
+        timeout = self.timeout
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise Unavailable("comparison time budget exhausted")
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                body = response.read(MAX_JSON + 1)
+                if len(body) > MAX_JSON:
+                    raise Unavailable("oversize JSON response")
+                return json.loads(body)
+        except urllib.error.HTTPError:
+            raise
+        except (OSError, ValueError) as error:
+            raise Unavailable(type(error).__name__) from None
+
+
+class RPC:
+    def __init__(self, url, transport=None):
+        if not re.fullmatch(r"http://127\.0\.0\.1:[0-9]{1,5}", url):
+            raise ValueError("RPC must use a fixed loopback listener")
+        self.url = url
+        self.transport = transport or Transport()
+
+    def call(self, method, *params):
+        try:
+            result = self.transport.json(self.url, {"jsonrpc": "2.0", "id": 1,
+                                                   "method": method, "params": list(params)})
+        except urllib.error.HTTPError as error:
+            raise Unavailable(f"RPC HTTP {error.code}") from None
+        if not isinstance(result, dict) or result.get("error") or "result" not in result:
+            raise Unavailable("RPC result unavailable")
+        return result["result"]
+
+    def tip(self):
+        info = self.call("getblockchaininfo")
+        if not isinstance(info, dict) or info.get("chain") != "main":
+            raise Unavailable("reference is not mainnet")
+        height = integer(info.get("blocks"))
+        return {"height": height, "hash": hex_bytes(self.call("getblockhash", height), 32)}
+
+    def block(self, height):
+        integer(height)
+        before = hex_bytes(self.call("getblockhash", height), 32)
+        tree = self.call("z_gettreestate", before)
+        record = {"height": height, "hash": before, "pools": {}}
+        if not isinstance(tree, dict):
+            raise Unavailable("malformed tree state")
+        if integer(tree.get("height")) != height or hex_bytes(tree.get("hash"), 32) != before:
+            raise Unavailable("tree state identity mismatch")
+        # The bootstrap gate is above all three pools' activation heights.
+        for pool in POOLS:
+            try:
+                commitments = tree[pool]["commitments"]
+                record["pools"][pool] = {
+                    "root": hex_bytes(commitments["finalRoot"], 32),
+                    "frontier": hex_bytes(commitments["finalState"]),
+                }
+            except (KeyError, TypeError):
+                raise Unavailable(f"missing activated pool: {pool}") from None
+        if hex_bytes(self.call("getblockhash", height), 32) != before:
+            raise Unavailable("chain changed during read")
+        return record
+
+
+def canonical_record(record, height):
+    if not isinstance(record, dict):
+        raise Unavailable("malformed block record")
+    if integer(record.get("height")) != height:
+        raise Unavailable("wrong height returned")
+    result = {"height": height, "hash": hex_bytes(record.get("hash"), 32), "pools": {}}
+    try:
+        for pool in POOLS:
+            data = record["pools"][pool]
+            result["pools"][pool] = {"root": hex_bytes(data["root"], 32),
+                                     "frontier": hex_bytes(data["frontier"])}
+    except (KeyError, TypeError):
+        raise Unavailable("missing activated pool") from None
+    return result
+
+
+def public_status(status, identifier, alerts_muted=True):
+    if not isinstance(status, dict):
+        raise ValueError("malformed status")
+    if not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
+        raise ValueError("invalid opaque identifier")
+    result = {"verifier_id": identifier, "schema_version": 1}
+    # Never forward receipts, diagnostic strings, OS metadata, peer IDs or hosts.
+    for key in ("sample_time", "compared_through"):
+        value = status.get(key)
+        result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
+    sample = status.get("verifier")
+    sample = sample if isinstance(sample, dict) else {}
+    tip = sample.get("tip")
+    tip = tip if isinstance(tip, dict) else {}
+    value = tip.get("height")
+    result["mac_tip"] = value if type(value) is int and value >= 0 else None
+    value = tip.get("hash") if isinstance(tip, dict) else None
+    result["mac_tip_hash"] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value) else ""
+    receipt = sample.get("receipt") or {}
+    value = receipt.get("source_sha") if isinstance(receipt, dict) else None
+    result["source_sha"] = value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{40}", value) else ""
+    resources = sample.get("resources") or {}
+    for key in ("node_rss_bytes", "free_disk_bytes"):
+        value = resources.get(key) if isinstance(resources, dict) else None
+        result[key] = value if type(value) is int and value >= 0 else None
+    ancestors = sample.get("ancestor_hashes") or {}
+    result["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+        if isinstance(depth, str) and len(depth) <= 10 and depth.isdecimal() and 0 < int(depth) <= 0xFFFFFFFF
+        and isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value)} if isinstance(ancestors, dict) else {}
+    result["alerts_muted"] = alerts_muted
+    condition = status.get("condition", "unavailable")
+    if condition in {"matching", "catching_up", "unavailable", "chain_disagreement", "tree_mismatch", "coverage_gap"}:
+        result["condition"] = condition
+    else:
+        raise ValueError("invalid comparison condition")
+    return result
+
+
+def rotate(path, limit, segments=3, copy_truncate=False):
+    """Bound backups; copy/truncate only for logs whose producer keeps an open FD."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < limit:
+        return
+    for index in range(segments, 1, -1):
+        previous = Path(str(path) + f".{index - 1}")
+        if previous.exists():
+            previous.replace(str(path) + f".{index}")
+    if copy_truncate:
+        shutil.copyfile(path, str(path) + ".1")
+        with path.open("r+") as stream:
+            stream.truncate(0)
+    else:
+        path.replace(str(path) + ".1")

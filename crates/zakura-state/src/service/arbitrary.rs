@@ -207,7 +207,7 @@ pub async fn populated_state(
     blocks: impl IntoIterator<Item = Arc<Block>>,
     network: &Network,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     ReadStateService,
     LatestChainTip,
     ChainTipChange,

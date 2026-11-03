@@ -68,7 +68,7 @@ fn equihash_solution_test_vectors() {
 }
 
 #[test]
-fn equihash_solution_test_vectors_are_valid() -> color_eyre::eyre::Result<()> {
+fn equihash_solution_test_vectors_are_valid() -> eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
     for block in zakura_test::vectors::BLOCKS.iter() {

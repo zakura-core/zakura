@@ -6,6 +6,8 @@
 
 use super::*;
 use crate::zakura::transport::SessionLayout;
+use zakura_node_services::task::erased;
+use zakura_rt::sync::Barrier;
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.
 ///
@@ -83,6 +85,36 @@ impl PreparedStream {
     }
 }
 
+#[cfg(any(test, zakura_sim))]
+impl PreparedStream {
+    /// Attach a stream tap to the reader and service, and report `Admitted`
+    /// with the depths its worker installs, when the connection has a
+    /// transport observer.
+    fn observe_admission(&self, session_id: u64, inbound_depth: usize, outbound_depth: usize) {
+        let (Some(conn), Some((send, _))) = (self.context.close_cause.tap(), self.io.0.as_ref())
+        else {
+            return;
+        };
+        let quic_stream = send.id();
+        self.context
+            .precheck
+            .observe_with(Arc::new(crate::zakura::StreamTap::new(
+                conn.clone(),
+                quic_stream,
+            )));
+        conn.emit(crate::zakura::TransportEvent::Admitted {
+            conn_id: conn.conn_id(),
+            quic_stream,
+            kind: self.stream.kind,
+            version: self.stream.version,
+            session_id,
+            negotiated_limits: self.context.limits,
+            inbound_depth,
+            outbound_depth,
+        });
+    }
+}
+
 /// Incomplete setup retains every arrived stream under the first arrival's deadline.
 struct PendingSession {
     id: u64,
@@ -150,12 +182,12 @@ impl PendingSessions {
         let kind = layout.primary().kind;
         // Remove first so every invalid continuation releases the existing offer.
         let pending = self.sessions.remove(&kind);
-        if (layout.is_multi_stream() && id == 0) || !layout.streams.contains(&incoming.stream) {
+        if (layout.is_multi_stream() && id == 0) || !layout.streams().contains(&incoming.stream) {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
         let mut pending = pending.unwrap_or_else(|| PendingSession {
             id,
-            streams: Vec::with_capacity(layout.streams.len()),
+            streams: Vec::with_capacity(layout.streams().len()),
             deadline: Instant::now() + incoming.context.limits.prelude_timeout,
         });
         if pending.id != id {
@@ -169,13 +201,13 @@ impl PendingSessions {
         }
         if Instant::now() >= pending.deadline
             || pending.streams.iter().any(|s| {
-                s.stream.kind == incoming.stream.kind || !layout.streams.contains(&s.stream)
+                s.stream.kind == incoming.stream.kind || !layout.streams().contains(&s.stream)
             })
         {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
         pending.streams.push(incoming);
-        if pending.streams.len() == layout.streams.len() {
+        if pending.streams.len() == layout.streams().len() {
             pending.streams.sort_unstable_by_key(|s| s.stream.kind);
             Ok(Some(pending.streams))
         } else {
@@ -213,7 +245,7 @@ pub(super) fn spawn_service_session(
         opened_locally,
     };
     let mut running = futures::stream::FuturesUnordered::new();
-    let application_drain = Arc::new(tokio::sync::Barrier::new(streams.len()));
+    let application_drain = Arc::new(Barrier::new(streams.len()));
     for mut prepared in streams {
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =
@@ -223,6 +255,8 @@ pub(super) fn spawn_service_session(
         if prepared.context.messages.is_some() {
             prepared.context.precheck.pause();
         }
+        #[cfg(any(test, zakura_sim))]
+        prepared.observe_admission(admitted.session_id, inbound_depth, outbound_depth);
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,
@@ -249,13 +283,16 @@ pub(super) fn spawn_service_session(
             .await;
         });
     }
-    workers.spawn(async move {
-        let _cancel_on_exit = cancel.clone().drop_guard();
-        while running.next().await.is_some() {
-            cancel.cancel();
-        }
-        let _ = exits.send(exit);
-    });
+    workers.spawn_named(
+        "service_session",
+        erased(async move {
+            let _cancel_on_exit = cancel.clone().drop_guard();
+            while running.next().await.is_some() {
+                cancel.cancel();
+            }
+            let _ = exits.send(exit);
+        }),
+    );
     admitted
 }
 

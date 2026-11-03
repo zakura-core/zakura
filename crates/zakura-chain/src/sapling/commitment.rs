@@ -1,20 +1,12 @@
 //! Note and value commitments.
 
+use crate::serialization::ZcashReader;
 use std::io;
+use std::io::Read as _;
 
 use hex::{FromHex, FromHexError, ToHex};
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
-
-#[cfg(test)]
-mod test_vectors;
-
-/// The randomness used in the Pedersen Hash for note commitment.
-///
-/// Equivalent to `sapling_crypto::note::CommitmentRandomness`,
-/// but we can't use it directly as it is not public.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CommitmentRandomness(jubjub::Fr);
 
 /// A Sapling value commitment, stored as its 32-byte compressed encoding.
 ///
@@ -30,11 +22,12 @@ pub struct CommitmentRandomness(jubjub::Fr);
 /// a canonical, non-small-order point. The not-small-order check is deferred to
 /// the semantic verifier and mempool, which call
 /// [`ValueCommitment::is_valid_not_small_order`] (via
-/// [`Transaction::sapling_point_encodings_are_valid`]) and also convert the
-/// transaction through librustzcash, whose `read_value_commitment` rejects a
-/// small-order `cv`. The checkpoint verifier trusts block hashes and skips the
-/// check. Covered by
-/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash`.
+/// [`Transaction::sapling_point_encodings_are_valid`]) before any proof work.
+/// librustzcash's parser keeps `cv` as bytes too, so converting a transaction
+/// does not reject an invalid `cv`; that early check is the node's first
+/// rejection, and the library's Sapling verifier (`ValueCommitment::try_point`)
+/// is the second. The checkpoint verifier trusts block hashes and skips the
+/// check. Covered by `sapling_small_order_cv_epk_deferred_to_semantic_checks`.
 ///
 /// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -52,6 +45,13 @@ impl ValueCommitment {
         sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).into_option()
     }
 
+    /// Wraps the stored bytes as a `sapling_crypto` value commitment without
+    /// decompressing them. The point is validated only when it is recovered, for
+    /// example by `CommitmentSum::try_sum` or the Sapling verifier.
+    pub fn unvalidated(&self) -> sapling_crypto::value::ValueCommitment {
+        sapling_crypto::value::ValueCommitment::from_bytes_unvalidated(self.0)
+    }
+
     /// Return the stored 32-byte (little-endian) compressed encoding.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
@@ -65,9 +65,10 @@ impl ValueCommitment {
     /// transactions.
     ///
     /// To stay in consensus with the rest of the network, this must accept
-    /// exactly the `cv` encodings librustzcash accepts, so it calls the same
-    /// `from_bytes_not_small_order` that `read_value_commitment` uses. Do not
-    /// swap in a different decoder. Equivalence is pinned by
+    /// exactly the `cv` encodings librustzcash's Sapling verifier accepts.
+    /// `from_bytes_not_small_order` applies the same rule as the verifier's
+    /// `ValueCommitment::try_point`. Do not swap in a different decoder.
+    /// Equivalence is pinned by
     /// `sapling_point_checks_match_librustzcash_predicates`.
     pub fn is_valid_not_small_order(&self) -> bool {
         bool::from(
@@ -123,7 +124,9 @@ impl From<jubjub::ExtendedPoint> for ValueCommitment {
 }
 
 impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut buf = [0u8; 32];
         reader.read_exact(&mut buf)?;
 
@@ -135,7 +138,9 @@ impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
 }
 
 impl ZcashDeserialize for ValueCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // Store the raw bytes without decompressing the Jubjub point; the point
         // and its not-small-order check are recovered lazily in
         // `ValueCommitment::commitment`.
@@ -146,14 +151,16 @@ impl ZcashDeserialize for ValueCommitment {
 }
 
 impl ZcashSerialize for ValueCommitment {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.0)?;
         Ok(())
     }
 }
 
 impl ZcashDeserialize for sapling_crypto::note::ExtractedNoteCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut buf = [0u8; 32];
         reader.read_exact(&mut buf)?;
 

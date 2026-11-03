@@ -29,11 +29,18 @@ use crate::{
 /// Returns the total transparent balance and received balance for the supplied [`transparent::Address`]es.
 ///
 /// If the addresses do not exist in the non-finalized `chain` or finalized `db`, returns zero.
+///
+/// # Errors
+///
+/// Returns [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable) if `db`
+/// skips transparent indexes.
 pub fn transparent_balance(
     chain: Option<Arc<Chain>>,
     db: &ZakuraDb,
     addresses: HashSet<transparent::Address>,
 ) -> Result<(Amount<NonNegative>, u64), BoxError> {
+    db.check_transparent_indexes_available()?;
+
     let mut balance_result = finalized_transparent_balance(db, &addresses);
 
     // Retry the finalized balance query if it was interrupted by a finalizing block
@@ -77,7 +84,7 @@ fn finalized_transparent_balance(
     // Check if the finalized state changed while we were querying it
     let original_finalized_tip = db.tip();
 
-    let finalized_balance = db.partial_finalized_transparent_balance(addresses);
+    let finalized_balance = db.partial_finalized_transparent_balance(addresses)?;
 
     let finalized_tip = db.tip();
 

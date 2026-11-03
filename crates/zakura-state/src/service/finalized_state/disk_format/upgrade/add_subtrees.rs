@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, TryRecvError};
-use hex_literal::hex;
 use itertools::Itertools;
+use std::sync::mpsc::TryRecvError;
 use tracing::instrument;
 
 use zakura_chain::{
@@ -17,7 +16,7 @@ use zakura_chain::{
 };
 
 use crate::service::finalized_state::{
-    disk_format::upgrade::{CancelFormatChange, FormatChangeError},
+    disk_format::upgrade::{CancelFormatChange, CancelReceiver, FormatChangeError},
     ZakuraDb,
 };
 
@@ -25,7 +24,7 @@ use crate::service::finalized_state::{
 #[allow(clippy::unwrap_in_result)]
 pub(super) fn detailed_check(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), String>, FormatChangeError> {
     // Fast-synced databases deliberately have no per-height note-commitment
     // trees or subtrees below the checkpoint handoff height, so the subtree
@@ -96,9 +95,11 @@ fn first_sapling_mainnet_subtree() -> NoteCommitmentSubtree<sapling_crypto::Node
     // ```
     NoteCommitmentSubtree {
         index: 0.into(),
-        root: sapling_crypto::Node::from_bytes(hex!(
-            "754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13"
-        ))
+        root: sapling_crypto::Node::from_bytes([
+            0x75, 0x4b, 0xb5, 0x93, 0xea, 0x42, 0xd2, 0x31, 0xa7, 0xdd, 0xf3, 0x67, 0x64, 0x0f,
+            0x09, 0xbb, 0xf5, 0x9d, 0xc0, 0x0f, 0x2c, 0x1d, 0x20, 0x03, 0xcc, 0x34, 0x0e, 0x0c,
+            0x01, 0x6b, 0x5b, 0x13,
+        ])
         .expect("test vector is valid"),
         end_height: Height(558822),
     }
@@ -112,10 +113,14 @@ fn first_orchard_mainnet_subtree() -> NoteCommitmentSubtree<orchard::tree::Node>
     // ```
     NoteCommitmentSubtree {
         index: 0.into(),
-        root: hex!("d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b")
-            .as_slice()
-            .try_into()
-            .expect("test vector is valid"),
+        root: [
+            0xd4, 0xe3, 0x23, 0xb3, 0xae, 0x0c, 0xab, 0xfb, 0x6b, 0xe4, 0x08, 0x7f, 0xec, 0x8c,
+            0x66, 0xd9, 0xa9, 0xbb, 0xfc, 0x35, 0x4b, 0xf1, 0xd9, 0x58, 0x8b, 0x66, 0x20, 0x44,
+            0x81, 0x82, 0x06, 0x3b,
+        ]
+        .as_slice()
+        .try_into()
+        .expect("test vector is valid"),
         end_height: Height(1707429),
     }
 }
@@ -233,7 +238,7 @@ fn quick_check_orchard_subtrees(db: &ZakuraDb) -> Result<(), &'static str> {
 /// Returns an error if a note commitment subtree is missing or incorrect.
 fn check_sapling_subtrees(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), &'static str>, CancelFormatChange> {
     let Some(NoteCommitmentSubtreeIndex(mut first_incomplete_subtree_index)) =
         db.sapling_tree_for_tip().subtree_index()
@@ -364,7 +369,7 @@ fn check_sapling_subtrees(
 /// Returns an error if a note commitment subtree is missing or incorrect.
 fn check_orchard_subtrees(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), &'static str>, CancelFormatChange> {
     let Some(NoteCommitmentSubtreeIndex(mut first_incomplete_subtree_index)) =
         db.orchard_tree_for_tip().subtree_index()

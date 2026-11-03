@@ -7,18 +7,31 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{collections::BTreeSet, fmt, fs::File, io::Read, panic, path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet, fmt, fs::File, future::Future, io::Read, net::SocketAddr, panic,
+    path::Path, sync::Arc, time::Duration,
+};
 
 use chrono::{TimeZone, Utc};
 use cookie::Cookie;
-use der::{asn1::GeneralizedTime, Decode, Header, Reader, SliceReader, Tag};
-use jsonrpsee::server::{
-    middleware::rpc::RpcServiceBuilder, serve_with_graceful_shutdown, stop_channel, Server,
-    ServerHandle,
+use hyper::{
+    body::{Body, Bytes, Incoming},
+    server::conn::http1,
+    Request, Response,
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
+    service::TowerToHyperService,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use tokio::{net::TcpListener, task::JoinHandle};
-use tokio_rustls::{rustls::ServerConfig as RustlsServerConfig, TlsAcceptor};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{watch, Notify, Semaphore},
+    task::{JoinHandle, JoinSet},
+    time::{timeout, timeout_at, Instant},
+};
+use tokio_rustls::{rustls::ServerConfig as RustlsServerConfig, server::TlsStream, TlsAcceptor};
 use tracing::*;
 
 use zakura_chain::{
@@ -28,25 +41,34 @@ use zakura_chain::{
 use zakura_consensus::router::service_trait::BlockVerifierService;
 use zakura_network::AddressBookPeers;
 use zakura_node_services::mempool::MempoolService;
+use zakura_node_services::task::spawn_erased;
 use zakura_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
     config,
-    methods::{
-        rpc_method_access, RpcAccess, RpcImpl, RpcServer as _, RpcSurface, RPC_METHOD_ACCESS,
-    },
+    methods::{rpc_method_access, RpcAccess, RpcImpl, RpcSurface, RPC_METHOD_ACCESS},
     server::{
+        http::{HttpBody, JsonRpcHttpService},
         http_request_compatibility::HttpRequestMiddlewareLayer,
-        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
+        rpc_call_compatibility::FixRpcResponseMiddleware,
+        rpc_logger::RpcLoggerMiddleware,
+        rpc_metrics::RpcMetricsMiddleware,
+        rpc_service::{RpcMethods, RpcService},
         rpc_tracing::RpcTracingMiddleware,
     },
 };
 
 pub mod cookie;
 pub mod error;
+#[cfg(feature = "fuzz-impl")]
+pub mod fuzz;
+pub mod http;
 pub mod http_request_compatibility;
+pub mod jsonrpc;
 pub mod rpc_call_compatibility;
+pub mod rpc_logger;
 pub mod rpc_metrics;
+pub mod rpc_service;
 pub mod rpc_tracing;
 
 #[cfg(test)]
@@ -90,6 +112,42 @@ pub const OPENED_RPC_ENDPOINT_MSG: &str = "Opened RPC endpoint at ";
 pub const OPENED_ADMIN_RPC_ENDPOINT_MSG: &str = "Opened admin RPC endpoint at ";
 
 type ServerTask = JoinHandle<Result<(), tower::BoxError>>;
+
+/// Maximum number of TCP connections waiting for a TLS handshake per listener.
+const MAX_PENDING_TLS_HANDSHAKES: usize = 128;
+
+/// Time allowed for a TLS handshake, measured from TCP acceptance.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for established TLS connections to finish during shutdown.
+const TLS_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of open TLS connections per listener, including pending
+/// handshakes.
+const MAX_TLS_CONNECTIONS: usize = 256;
+
+/// Time allowed for a TLS client to send each request's HTTP headers, measured
+/// from when the connection starts waiting for them.
+///
+/// This closes connections that are silent after the handshake or idle between
+/// keep-alive requests. It does not limit time spent handling a request.
+const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of entries in a JSON-RPC batch, counting notifications and
+/// invalid entries.
+///
+/// The server decodes every entry of an admitted batch before running the first
+/// one, and keeps them until the batch finishes. A larger batch is rejected after
+/// a shallow parse of the array, before any entry is decoded or run.
+const MAX_RPC_BATCH_REQUESTS: usize = 1_000;
+
+/// Time allowed for a plain HTTP client to send its first request, measured from
+/// TCP acceptance.
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of characters of each request or response payload in TRACE
+/// logs.
+const MAX_RPC_LOG_CHARS: usize = 1024;
 
 impl RpcServer {
     /// Starts the primary RPC server.
@@ -201,8 +259,7 @@ impl RpcServer {
             .expect("caller should make sure listen_addr is set");
 
         let rpc = rpc.with_rpc_surface(surface);
-        let mut methods = rpc.into_rpc();
-        configure_rpc_methods(&mut methods, surface)?;
+        let enabled_methods = enabled_rpc_methods(registered_methods(&rpc), surface)?;
 
         // The largest RPC request is submitblock, which sends a full block
         // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
@@ -217,94 +274,69 @@ impl RpcServer {
             HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
 
-        let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
-
-        let rpc_middleware = RpcServiceBuilder::new()
-            .rpc_logger(1024)
-            .layer_fn(FixRpcResponseMiddleware::new)
-            .layer_fn(RpcMetricsMiddleware::new)
-            .layer_fn(RpcTracingMiddleware::new);
+        let max_response_body_size = conf.max_response_body_size;
+        let rpc_service = RpcLoggerMiddleware::new(
+            FixRpcResponseMiddleware::new(RpcMetricsMiddleware::new(RpcTracingMiddleware::new(
+                RpcService::new(rpc, enabled_methods, max_response_body_size),
+            ))),
+            MAX_RPC_LOG_CHARS,
+        );
+        let service = tower::ServiceBuilder::new()
+            .layer(http_middleware_layer)
+            .service(JsonRpcHttpService::new(
+                rpc_service,
+                MAX_RPC_BATCH_REQUESTS,
+                max_response_body_size,
+            ));
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;
             let listener = TcpListener::bind(listen_addr).await?;
             let local_addr = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(tls_config);
-            let service_builder = Server::builder()
-                .http_only()
-                .set_http_middleware(http_middleware)
-                .set_rpc_middleware(rpc_middleware)
-                .max_response_body_size(
-                    conf.max_response_body_size
-                        .try_into()
-                        .expect("should be valid"),
-                )
-                .to_service_builder();
             let (stop_handle, server_handle) = stop_channel();
 
             info!("{opened_endpoint_msg}{local_addr}");
 
-            return Ok(tokio::spawn(async move {
-                loop {
-                    let (socket, remote_addr) = tokio::select! {
-                        result = listener.accept() => match result {
-                            Ok(connection) => connection,
-                            Err(error) => return Err(error.into()),
-                        },
-                        _ = stop_handle.clone().shutdown() => break,
-                    };
-
-                    let acceptor = acceptor.clone();
-                    let service = service_builder
-                        .clone()
-                        .build(methods.clone(), stop_handle.clone());
-                    let stopped = stop_handle.clone().shutdown();
-
-                    tokio::spawn(async move {
-                        match acceptor.accept(socket).await {
-                            Ok(stream) => {
-                                if let Err(error) =
-                                    serve_with_graceful_shutdown(stream, service, stopped).await
-                                {
-                                    warn!(
-                                        ?error,
-                                        %remote_addr,
-                                        "TLS RPC connection terminated with an error"
-                                    );
-                                }
-                            }
-                            Err(error) => {
+            return Ok(spawn_erased(async move {
+                run_tls_listener(
+                    listener,
+                    acceptor,
+                    stop_handle,
+                    server_handle,
+                    MAX_PENDING_TLS_HANDSHAKES,
+                    TLS_HANDSHAKE_TIMEOUT,
+                    MAX_TLS_CONNECTIONS,
+                    move |stream, remote_addr, stop_handle| {
+                        let service = service.clone();
+                        async move {
+                            if let Err(error) = serve_tls_connection(
+                                stream,
+                                service,
+                                stop_handle.shutdown(),
+                                TLS_HEADER_READ_TIMEOUT,
+                            )
+                            .await
+                            {
                                 warn!(
                                     ?error,
                                     %remote_addr,
-                                    "TLS RPC handshake failed"
+                                    "TLS RPC connection terminated with an error"
                                 );
                             }
                         }
-                    });
-                }
-
-                drop(server_handle);
+                    },
+                )
+                .await?;
                 Ok(())
             }));
         }
 
-        let server = Server::builder()
-            .http_only()
-            .set_http_middleware(http_middleware)
-            .set_rpc_middleware(rpc_middleware)
-            .max_response_body_size(
-                conf.max_response_body_size
-                    .try_into()
-                    .expect("should be valid"),
-            )
-            .build(listen_addr)
-            .await?;
+        let listener = TcpListener::bind(listen_addr).await?;
+        info!("{opened_endpoint_msg}{}", listener.local_addr()?);
 
-        info!("{opened_endpoint_msg}{}", server.local_addr()?);
-
-        Ok(tokio::spawn(async move {
-            server.start(methods).stopped().await;
+        Ok(spawn_erased(async move {
+            run_listener(listener, service).await;
             Ok(())
         }))
     }
@@ -366,16 +398,259 @@ impl RpcServer {
     }
 }
 
-/// Validates the RPC method classification and removes methods that are not
-/// available on restricted unauthenticated listeners.
-fn configure_rpc_methods<Context>(
-    methods: &mut jsonrpsee::RpcModule<Context>,
-    surface: RpcSurface,
+/// Stops a listener and its connections.
+#[derive(Clone, Debug)]
+struct ServerHandle(Arc<watch::Sender<()>>);
+
+impl ServerHandle {
+    /// Tells the listener and its connections to stop.
+    fn stop(&self) -> Result<(), watch::error::SendError<()>> {
+        self.0.send(())
+    }
+}
+
+/// Lets a listener and its connections know when to stop.
+#[derive(Clone, Debug)]
+struct StopHandle(watch::Receiver<()>);
+
+impl StopHandle {
+    /// Waits until [`ServerHandle::stop`] is called, or every [`ServerHandle`] is dropped.
+    async fn shutdown(mut self) {
+        let _ = self.0.changed().await;
+    }
+}
+
+/// Returns a connected [`StopHandle`] and [`ServerHandle`].
+fn stop_channel() -> (StopHandle, ServerHandle) {
+    let (sender, receiver) = watch::channel(());
+    (StopHandle(receiver), ServerHandle(Arc::new(sender)))
+}
+
+/// Accepts plain HTTP connections and serves each one in its own task, until the task running
+/// this future is aborted.
+///
+/// Connections are served with HTTP/1 or HTTP/2, and closed if they don't send a request within
+/// [`FIRST_REQUEST_TIMEOUT`]. When this future is dropped, open connections finish their
+/// in-flight requests and close, like `jsonrpsee`'s server did when it stopped.
+async fn run_listener<S>(listener: TcpListener, service: S)
+where
+    S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    // Dropping this future drops `_server_handle`, which tells every connection to shut down.
+    let (stop_handle, _server_handle) = stop_channel();
+
+    loop {
+        let (socket, remote_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                debug!(?error, "Error while awaiting a new RPC connection");
+                continue;
+            }
+        };
+
+        if let Err(error) = socket.set_nodelay(true) {
+            warn!(?error, %remote_addr, "Could not set NODELAY on RPC socket");
+            continue;
+        }
+
+        let request_received = Arc::new(Notify::new());
+        let service = {
+            let request_received = request_received.clone();
+            let service = service.clone();
+            tower::service_fn(move |request| {
+                request_received.notify_one();
+                tower::ServiceExt::oneshot(service.clone(), request)
+            })
+        };
+
+        let stopped = stop_handle.clone().shutdown();
+        tokio::spawn(async move {
+            let builder = auto::Builder::new(TokioExecutor::new());
+            let connection = builder.serve_connection_with_upgrades(
+                TokioIo::new(socket),
+                TowerToHyperService::new(service),
+            );
+            tokio::pin!(connection, stopped);
+
+            let result = tokio::select! {
+                result = &mut connection => result,
+                () = &mut stopped => {
+                    // The connection must keep being polled until its graceful shutdown finishes.
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+                () = no_request_within(&request_received, FIRST_REQUEST_TIMEOUT) => {
+                    Err("no request received in time".into())
+                }
+            };
+
+            if let Err(error) = result {
+                debug!(?error, %remote_addr, "RPC connection failed");
+            }
+        });
+    }
+}
+
+/// Returns after `timeout` if `request_received` isn't notified by then, or never returns
+/// otherwise.
+async fn no_request_within(request_received: &Notify, timeout_duration: Duration) {
+    if timeout(timeout_duration, request_received.notified())
+        .await
+        .is_ok()
+    {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Accepts TLS connections with bounded handshake work, a bounded number of
+/// open connections, and owned tasks.
+///
+/// Keeping the [`JoinSet`] inside this future also cancels connections if the
+/// listener task is aborted. Established connections get a bounded grace period
+/// on normal shutdown or an accept error.
+#[allow(clippy::too_many_arguments)]
+async fn run_tls_listener<F, Fut>(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    stop_handle: StopHandle,
+    server_handle: ServerHandle,
+    max_pending_handshakes: usize,
+    handshake_timeout: Duration,
+    max_connections: usize,
+    serve_connection: F,
 ) -> Result<(), std::io::Error>
 where
-    Context: Send + Sync + 'static,
+    F: Fn(TlsStream<TcpStream>, SocketAddr, StopHandle) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
-    let registered: BTreeSet<_> = methods.method_names().collect();
+    let permits = Arc::new(Semaphore::new(max_pending_handshakes));
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
+    let mut connections = JoinSet::new();
+    let stopped = stop_handle.clone().shutdown();
+    tokio::pin!(stopped);
+
+    let result = loop {
+        let (socket, remote_addr) = tokio::select! {
+            biased;
+            _ = &mut stopped => break Ok(()),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(?error, "TLS RPC connection task failed");
+                }
+                continue;
+            }
+            accepted = listener.accept() => match accepted {
+                Ok(connection) => connection,
+                Err(error) => break Err(error),
+            },
+        };
+        let deadline = Instant::now() + handshake_timeout;
+
+        // Reject excess sockets before spawning, rather than accumulating tasks
+        // waiting for capacity. The handshake permit is held only during the
+        // handshake; the connection permit is held until the task finishes.
+        let Ok(connection_permit) = connection_permits.clone().try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
+        let acceptor = acceptor.clone();
+        let stop_handle = stop_handle.clone();
+        let serve_connection = serve_connection.clone();
+
+        connections.spawn(async move {
+            let handshake = tokio::select! {
+                biased;
+                _ = stop_handle.clone().shutdown() => return,
+                handshake = timeout_at(deadline, acceptor.accept(socket)) => handshake,
+            };
+            drop(permit);
+
+            match handshake {
+                Ok(Ok(stream)) => serve_connection(stream, remote_addr, stop_handle).await,
+                Ok(Err(error)) => {
+                    warn!(?error, %remote_addr, "TLS RPC handshake failed");
+                }
+                Err(_) => {
+                    warn!(%remote_addr, "TLS RPC handshake timed out");
+                }
+            }
+            drop(connection_permit);
+        });
+    };
+
+    drop(listener);
+    let _ = server_handle.stop();
+    let drain = async {
+        while let Some(completed) = connections.join_next().await {
+            if let Err(error) = completed {
+                warn!(?error, "TLS RPC connection task failed during shutdown");
+            }
+        }
+    };
+    if timeout(TLS_CONNECTION_SHUTDOWN_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        connections.shutdown().await;
+    }
+
+    result
+}
+
+/// Serves HTTP/1 requests on an established TLS connection until the client
+/// closes it, it exceeds `header_read_timeout`, or `stopped` resolves.
+///
+/// Unlike plain HTTP connections, these only support HTTP/1, and close
+/// connections whose request headers are too slow.
+async fn serve_tls_connection<S, B>(
+    stream: TlsStream<TcpStream>,
+    service: S,
+    stopped: impl Future<Output = ()>,
+    header_read_timeout: Duration,
+) -> Result<(), tower::BoxError>
+where
+    S: tower::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<tower::BoxError>,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<tower::BoxError>,
+{
+    let connection = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+    tokio::pin!(connection, stopped);
+
+    tokio::select! {
+        result = &mut connection => return result.map_err(Into::into),
+        _ = &mut stopped => {}
+    }
+    connection.as_mut().graceful_shutdown();
+    connection.await.map_err(Into::into)
+}
+
+/// Returns the names of every method in `methods`.
+fn registered_methods<M: RpcMethods>(_methods: &M) -> &'static [&'static str] {
+    M::METHOD_NAMES
+}
+
+/// Validates the RPC method classification against the `registered` methods, and returns the
+/// methods that are available on `surface`.
+///
+/// Restricted unauthenticated listeners only get the methods classified as unauthenticated.
+fn enabled_rpc_methods(
+    registered: &[&'static str],
+    surface: RpcSurface,
+) -> Result<Vec<&'static str>, std::io::Error> {
+    let registered: BTreeSet<_> = registered.iter().copied().collect();
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
 
     if classified.len() != RPC_METHOD_ACCESS.len() {
@@ -393,17 +668,13 @@ where
         )));
     }
 
-    if surface == RpcSurface::Restricted {
-        for method_name in registered {
-            if rpc_method_access(method_name) != Some(RpcAccess::Unauthenticated) {
-                methods
-                    .remove_method(method_name)
-                    .expect("method exists because it came from method_names");
-            }
-        }
-    }
-
-    Ok(())
+    Ok(registered
+        .into_iter()
+        .filter(|method_name| {
+            surface != RpcSurface::Restricted
+                || rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated)
+        })
+        .collect())
 }
 
 /// Selects the primary listener's method surface.
@@ -559,30 +830,25 @@ fn warn_if_certificates_are_not_current(cert_chain: &[CertificateDer<'static>], 
 fn certificate_validity(
     certificate: &CertificateDer<'_>,
     now: i64,
-) -> Result<CertificateValidity, der::Error> {
-    let mut reader = SliceReader::new(certificate.as_ref())?;
-    let (tag, certificate) = read_der_value(&mut reader)?;
-    tag.assert_eq(Tag::Sequence)?;
+) -> Result<CertificateValidity, InvalidCertificateDer> {
+    let mut input = certificate.as_ref();
+    let mut certificate = read_der_value_with_tag(&mut input, DER_SEQUENCE)?;
+    let mut tbs_certificate = read_der_value_with_tag(&mut certificate, DER_SEQUENCE)?;
 
-    let mut reader = SliceReader::new(certificate)?;
-    let (tag, tbs_certificate) = read_der_value(&mut reader)?;
-    tag.assert_eq(Tag::Sequence)?;
-
-    let mut reader = SliceReader::new(tbs_certificate)?;
-    if reader.peek_header()?.tag.is_context_specific() {
+    if tbs_certificate
+        .first()
+        .is_some_and(|&tag| tag & DER_CLASS_MASK == DER_CONTEXT_SPECIFIC_CLASS)
+    {
         // `version` is only encoded when it isn't the default.
-        read_der_value(&mut reader)?;
+        read_der_value(&mut tbs_certificate)?;
     }
-    read_der_value(&mut reader)?; // serialNumber
-    read_der_value(&mut reader)?; // signature
-    read_der_value(&mut reader)?; // issuer
+    read_der_value(&mut tbs_certificate)?; // serialNumber
+    read_der_value(&mut tbs_certificate)?; // signature
+    read_der_value(&mut tbs_certificate)?; // issuer
 
-    let (tag, validity) = read_der_value(&mut reader)?;
-    tag.assert_eq(Tag::Sequence)?;
-
-    let mut reader = SliceReader::new(validity)?;
-    let not_before = read_x509_time(&mut reader)?;
-    let not_after = read_x509_time(&mut reader)?;
+    let mut validity = read_der_value_with_tag(&mut tbs_certificate, DER_SEQUENCE)?;
+    let not_before = read_x509_time(&mut validity)?;
+    let not_after = read_x509_time(&mut validity)?;
 
     Ok(if now < not_before {
         CertificateValidity::NotYetValid { not_before }
@@ -593,54 +859,122 @@ fn certificate_validity(
     })
 }
 
-/// Reads the next DER tag-length-value item, returning its tag and the bytes of its value.
-fn read_der_value<'a>(reader: &mut SliceReader<'a>) -> Result<(Tag, &'a [u8]), der::Error> {
-    let header = Header::decode(reader)?;
-    let value = reader.read_slice(header.length)?;
+/// Why [`certificate_validity`] couldn't read a certificate's validity dates.
+#[derive(Debug, Eq, PartialEq)]
+struct InvalidCertificateDer(&'static str);
 
-    Ok((header.tag, value))
+/// The DER `SEQUENCE` tag, which is always constructed.
+const DER_SEQUENCE: u8 = 0x30;
+/// The DER `UTCTime` tag.
+const DER_UTC_TIME: u8 = 0x17;
+/// The DER `GeneralizedTime` tag.
+const DER_GENERALIZED_TIME: u8 = 0x18;
+/// The class bits of a DER tag.
+const DER_CLASS_MASK: u8 = 0xc0;
+/// The class bits of a context-specific DER tag.
+const DER_CONTEXT_SPECIFIC_CLASS: u8 = 0x80;
+/// The low tag bits that mark a multi-byte tag number.
+const DER_MULTI_BYTE_TAG: u8 = 0x1f;
+/// The length byte bit that marks a long-form length.
+const DER_LONG_FORM_LENGTH: u8 = 0x80;
+
+/// Reads the next DER tag-length-value item from the front of `input`,
+/// returning its tag and the bytes of its value.
+///
+/// Only accepts single-byte tags and minimal definite lengths of up to four bytes,
+/// which covers every field up to and including the certificate's validity.
+fn read_der_value<'a>(input: &mut &'a [u8]) -> Result<(u8, &'a [u8]), InvalidCertificateDer> {
+    let (&tag, rest) = input
+        .split_first()
+        .ok_or(InvalidCertificateDer("missing tag"))?;
+    if tag & DER_MULTI_BYTE_TAG == DER_MULTI_BYTE_TAG {
+        return Err(InvalidCertificateDer("unsupported multi-byte tag"));
+    }
+
+    let (&length_byte, mut rest) = rest
+        .split_first()
+        .ok_or(InvalidCertificateDer("missing length"))?;
+    let length = if length_byte & DER_LONG_FORM_LENGTH == 0 {
+        usize::from(length_byte)
+    } else {
+        // The low bits count the big-endian length bytes that follow.
+        // Zero is BER's indefinite length, which DER forbids.
+        let length_byte_count = usize::from(length_byte & !DER_LONG_FORM_LENGTH);
+        if !(1..=4).contains(&length_byte_count) {
+            return Err(InvalidCertificateDer("unsupported length encoding"));
+        }
+
+        let (length_bytes, after_length) = rest
+            .split_at_checked(length_byte_count)
+            .ok_or(InvalidCertificateDer("truncated length"))?;
+        rest = after_length;
+
+        // At most four bytes, so the length fits in a `u32`.
+        let length = length_bytes
+            .iter()
+            .fold(0_u32, |length, &byte| (length << 8) | u32::from(byte));
+        if length_bytes[0] == 0 || length < u32::from(DER_LONG_FORM_LENGTH) {
+            return Err(InvalidCertificateDer("non-minimal length"));
+        }
+
+        usize::try_from(length)
+            .map_err(|_| InvalidCertificateDer("length does not fit in memory"))?
+    };
+
+    let (value, rest) = rest
+        .split_at_checked(length)
+        .ok_or(InvalidCertificateDer("truncated value"))?;
+    *input = rest;
+
+    Ok((tag, value))
 }
 
-/// Reads an X.509 `Time` as Unix seconds.
+/// Reads the next DER item from the front of `input`, which must have the tag `expected_tag`,
+/// returning the bytes of its value.
+fn read_der_value_with_tag<'a>(
+    input: &mut &'a [u8],
+    expected_tag: u8,
+) -> Result<&'a [u8], InvalidCertificateDer> {
+    let (tag, value) = read_der_value(input)?;
+    if tag != expected_tag {
+        return Err(InvalidCertificateDer("unexpected tag"));
+    }
+
+    Ok(value)
+}
+
+/// Reads an X.509 `Time` as Unix seconds, including dates before the Unix epoch.
 ///
 /// RFC 5280 section 4.1.2.5 encodes years from 1950 through 2049 as
-/// `UTCTime`, and later years as `GeneralizedTime`.
-fn read_x509_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
-    match reader.peek_header()?.tag {
-        Tag::UtcTime => read_utc_time(reader),
-        Tag::GeneralizedTime => i64::try_from(
-            GeneralizedTime::decode(reader)?
-                .to_unix_duration()
-                .as_secs(),
-        )
-        .map_err(|_| Tag::GeneralizedTime.value_error()),
-        tag => Err(tag.value_error()),
-    }
-}
+/// `UTCTime` (`YYMMDDHHMMSSZ`), and later years as `GeneralizedTime` (`YYYYMMDDHHMMSSZ`).
+fn read_x509_time(input: &mut &[u8]) -> Result<i64, InvalidCertificateDer> {
+    let (tag, value) = read_der_value(input)?;
+    let invalid_time = || InvalidCertificateDer("invalid X.509 time");
+    let digits = value.strip_suffix(b"Z").ok_or_else(invalid_time)?;
 
-/// Reads an RFC 5280 `UTCTime`, including dates before the Unix epoch.
-///
-/// The [`der::asn1::UtcTime`] decoder only supports years from 1970 onward,
-/// while RFC 5280 requires support for the full 1950–2049 range.
-fn read_utc_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
-    let (tag, value) = read_der_value(reader)?;
-    tag.assert_eq(Tag::UtcTime)?;
-
-    let Some(digits) = value.strip_suffix(b"Z").filter(|digits| digits.len() == 12) else {
-        return Err(Tag::UtcTime.value_error());
+    let (year, digits) = match (tag, digits.len()) {
+        (DER_UTC_TIME, 12) => {
+            let short_year = i32::from(decode_two_digits_at(digits, 0)?);
+            let year = if short_year >= 50 {
+                1900 + short_year
+            } else {
+                2000 + short_year
+            };
+            (year, &digits[2..])
+        }
+        (DER_GENERALIZED_TIME, 14) => {
+            let century = i32::from(decode_two_digits_at(digits, 0)?);
+            let year_of_century = i32::from(decode_two_digits_at(digits, 2)?);
+            (century * 100 + year_of_century, &digits[4..])
+        }
+        _ => return Err(invalid_time()),
     };
 
-    let short_year = decode_two_digits_at(Tag::UtcTime, digits, 0)?;
-    let year = if short_year >= 50 {
-        1900 + i32::from(short_year)
-    } else {
-        2000 + i32::from(short_year)
-    };
-    let month = decode_two_digits_at(Tag::UtcTime, digits, 2)?;
-    let day = decode_two_digits_at(Tag::UtcTime, digits, 4)?;
-    let hour = decode_two_digits_at(Tag::UtcTime, digits, 6)?;
-    let minute = decode_two_digits_at(Tag::UtcTime, digits, 8)?;
-    let second = decode_two_digits_at(Tag::UtcTime, digits, 10)?;
+    let month = decode_two_digits_at(digits, 0)?;
+    let day = decode_two_digits_at(digits, 2)?;
+    let hour = decode_two_digits_at(digits, 4)?;
+    let minute = decode_two_digits_at(digits, 6)?;
+    let second = decode_two_digits_at(digits, 8)?;
 
     Utc.with_ymd_and_hms(
         year,
@@ -652,22 +986,16 @@ fn read_utc_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
     )
     .single()
     .map(|date_time| date_time.timestamp())
-    .ok_or_else(|| Tag::UtcTime.value_error())
+    .ok_or_else(invalid_time)
 }
 
 /// Decodes two ASCII decimal digits at `offset`.
-fn decode_two_digits_at(tag: Tag, value: &[u8], offset: usize) -> Result<u8, der::Error> {
+fn decode_two_digits_at(value: &[u8], offset: usize) -> Result<u8, InvalidCertificateDer> {
     let Some(&[tens, ones]) = value.get(offset..offset.saturating_add(2)) else {
-        return Err(tag.value_error());
+        return Err(InvalidCertificateDer("missing time digits"));
     };
-
-    decode_two_digits(tag, tens, ones)
-}
-
-/// Decodes two validated ASCII decimal digits.
-fn decode_two_digits(tag: Tag, tens: u8, ones: u8) -> Result<u8, der::Error> {
     if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
-        return Err(tag.value_error());
+        return Err(InvalidCertificateDer("invalid time digits"));
     }
 
     // Each operand is at most 9, so the result fits in a `u8`.

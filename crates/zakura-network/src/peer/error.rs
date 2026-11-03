@@ -4,7 +4,6 @@ use std::{borrow::Cow, sync::Arc};
 
 use thiserror::Error;
 
-use tracing_error::TracedError;
 use zakura_chain::serialization::SerializationError;
 
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
 /// branch on the `notfound` kind without string-matching `Debug` output (which a variant rename
 /// would silently break, disabling the syncer's retry paths).
 #[derive(Debug, Clone)]
-pub struct SharedPeerError(Arc<TracedError<PeerError>>, NotFoundClass);
+pub struct SharedPeerError(Arc<PeerError>, NotFoundClass);
 
 /// Typed classification of `notfound`-style peer errors, computed when a [`SharedPeerError`] is
 /// constructed (the only construction path is the `From` impl below, so this stays in sync with
@@ -58,14 +57,12 @@ where
             PeerError::NotFoundRegistry(_) => NotFoundClass::Registry,
             _ => NotFoundClass::Other,
         };
-        Self(Arc::new(TracedError::from(inner)), class)
+        Self(Arc::new(inner), class)
     }
 }
 
 impl SharedPeerError {
     /// Returns a debug-formatted string describing the inner [`PeerError`].
-    ///
-    /// Unfortunately, [`TracedError`] makes it impossible to get a reference to the original error.
     pub fn inner_debug(&self) -> String {
         format!("{:?}", self.0.as_ref())
     }
@@ -131,6 +128,11 @@ pub enum PeerError {
     /// There are no ready remote peers.
     #[error("No ready peers available")]
     NoReadyPeers,
+
+    /// A block advert was sent as an ordinary request. Block adverts go through the dedicated
+    /// block advert service, which reaches busy peers.
+    #[error("block adverts require the dedicated block advert service")]
+    AdvertRequiresDedicatedService,
 
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
@@ -198,6 +200,7 @@ impl PeerError {
             PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
+            PeerError::AdvertRequiresDedicatedService => "AdvertRequiresDedicatedService".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),

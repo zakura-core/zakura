@@ -1,11 +1,11 @@
 //! Validates cached roots in genesis and historical note commitment trees.
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use zakura_chain::{block::Height, sprout};
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::CancelFormatChange;
+use super::{CancelFormatChange, CancelReceiver};
 
 /// Quickly check that the genesis trees and sprout tip tree have cached roots.
 ///
@@ -86,7 +86,7 @@ pub(super) fn quick_check(db: &ZakuraDb) -> Result<(), String> {
 /// If the state is empty.
 pub(super) fn detailed_check(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), String>, CancelFormatChange> {
     // A fast-synced database deliberately has no per-height note-commitment trees
     // below the checkpoint handoff height, so the per-height tree scans below do

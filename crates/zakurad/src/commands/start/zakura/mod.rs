@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+mod block_range_source;
 pub(crate) mod block_sync_driver;
 mod coordinator;
 pub(crate) mod frontier;

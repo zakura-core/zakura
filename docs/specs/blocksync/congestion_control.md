@@ -185,7 +185,9 @@ miss deadlines; only the wedged one is disconnected, with no slowness-based disc
 **Observability (SHOULD).** Each peer SHOULD emit a periodic `block_peer_bbr` heartbeat
 (~10 s) with full controller state (window, base round-trip, BDR, phase, delay ceiling,
 reliability, no-progress streak) **even while idle**, so a trace distinguishes a settled
-controller (window stable, reliability ≈ 1.0) from an oscillating one.
+controller (window stable, reliability ≈ 1.0) from an oscillating one. It SHOULD also emit
+one immediately after each batch of expired requests, so the dip and the seal are visible
+even when the peer is parked before it is asked again.
 
 **Numeric safety (MUST).** Arithmetic over untrusted values MUST saturate or be checked;
 rates and BDP products MUST be clamped to finite, non-negative values before sizing a

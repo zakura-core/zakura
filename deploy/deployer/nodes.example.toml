@@ -13,7 +13,7 @@ state_cache_dir = "/var/lib/zakura"
 #                                            # service, leaving config/unit/cache untouched (systemd only)
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
-# identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id
+# identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the Zakura node_id
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
 storage_mode    = "archive"                 # "archive" serves all history; "pruned" does not
 p2p_stack       = "dual"                     # legacy | zakura | dual | default
@@ -28,7 +28,7 @@ p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # node. Use for a private dev cohort: same dev_network tag + the same bootstrap
 # peers isolate the fleet's v2 overlay (see deploy/runner/ for the perf harness).
 # [defaults.zakura]
-# listen_addr     = "0.0.0.0:8234"          # NOT loopback (iroh single-socket)
+# listen_addr     = "0.0.0.0:8234"          # NOT loopback (single QUIC socket)
 # dev_network     = "my-cohort"             # same string on every cohort node
 # bootstrap_peers = ["nodeid@1.2.3.4:8234"] # node_id@addr of the other peers
 

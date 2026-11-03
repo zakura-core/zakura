@@ -1,7 +1,6 @@
 //! In-process Zakura node lifecycle.
 
-use abscissa_core::config::Override;
-use color_eyre::Report;
+use eyre::Report;
 use tokio_util::sync::CancellationToken;
 
 use crate::{commands::StartCmd, components::tokio::run_until_shutdown, config::ZakuradConfig};
@@ -21,12 +20,11 @@ pub struct NodeServices {
     pub sync_status: crate::components::sync::SyncStatus,
     /// Buffered access to the node's mempool.
     pub mempool: tower::buffer::Buffer<
-        tower::util::BoxService<
-            zakura_node_services::mempool::Request,
-            zakura_node_services::mempool::Response,
-            crate::BoxError,
-        >,
         zakura_node_services::mempool::Request,
+        futures::future::BoxFuture<
+            'static,
+            Result<zakura_node_services::mempool::Response, crate::BoxError>,
+        >,
     >,
 }
 

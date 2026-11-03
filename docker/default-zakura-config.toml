@@ -71,11 +71,6 @@ use_color = true
 
 # log_file = "/home/zebra/.local/state/zakura.log"
 
-# Sending tracing events to systemd-journald is disabled by default. To enable
-# it, uncomment the line below.
-
-# use_journald = true
-
 [metrics]
 # Metrics via Prometheus are disabled by default. To enable them, uncomment the
 # line below and alternatively set your own port.

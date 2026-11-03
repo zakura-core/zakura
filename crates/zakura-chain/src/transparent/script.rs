@@ -1,5 +1,6 @@
 //! Bitcoin script for Zebra
 
+use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
@@ -99,14 +100,16 @@ impl FromHex for Script {
 }
 
 impl ZcashSerialize for Script {
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         zcash_serialize_bytes(&self.0, writer)
     }
 }
 
 impl ZcashDeserialize for Script {
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        Vec::zcash_deserialize(reader).map(Script)
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        reader.read_value::<Vec<_>>().map(Script)
     }
 }
 

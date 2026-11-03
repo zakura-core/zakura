@@ -23,13 +23,21 @@
 //! But we want to download and gossip transactions,
 //! even when there are no other service requests.
 //!
+//! Each task sends its result before it signals the shared verification
+//! [`Notify`], so a mempool request sent after that signal can drain the
+//! result. If Tokio's cooperative budget stops a drain while results are still
+//! queued, the downloader signals again. The queue checker waits on this
+//! signal, so verified transactions reach the mempool without waiting for its
+//! periodic check.
+//!
 //! [`Mempool`]: super::Mempool
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -40,12 +48,16 @@ use futures::{
 };
 use pin_project::{pin_project, pinned_drop};
 use thiserror::Error;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot, Notify},
+    task::JoinHandle,
+};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{
     block::Height,
+    parameters::NetworkUpgrade,
     transaction::{self, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -59,9 +71,26 @@ use crate::components::{
     sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT},
 };
 
-use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
+use super::{
+    peer_cooldown::PeerCooldowns, queue_source_log_label, storage::NonStandardTransactionError,
+    MempoolError,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The result a download and verify task sends to [`Downloads`].
+type TaskResult = Result<
+    Result<
+        (
+            VerifiedUnminedTx,
+            Vec<transparent::OutPoint>,
+            Option<Height>,
+            Option<oneshot::Sender<Result<(), BoxError>>>,
+        ),
+        Box<(TransactionDownloadVerifyError, UnminedTxId)>,
+    >,
+    (UnminedTxId, tokio::time::error::Elapsed),
+>;
 
 fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource> {
     match source {
@@ -73,13 +102,13 @@ fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource>
 }
 
 /// Returns the peer address to attribute a peer-pushed transaction's verification
-/// failure to, for the mempool misbehavior channel.
+/// failure to, for the mempool's peer cooldowns.
 ///
-/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], which is the key
-/// the misbehavior channel bans on. Zakura peers yield `None`, matching the
-/// advertised-download path, which also delivers Zakura-served transactions with
-/// no advertiser address (see `legacy_gossip.rs`).
-fn misbehavior_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
+/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], whose IP address
+/// keys the cooldowns. Zakura peers yield `None`, matching the advertised-download
+/// path, which also delivers Zakura-served transactions with no advertiser address
+/// (see `legacy_gossip.rs`).
+fn advertiser_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
     match source {
         QueueSource::LegacySocket(addr) => Some(PeerSocketAddr::from(*addr)),
         QueueSource::Zakura(_) => None,
@@ -165,7 +194,18 @@ pub enum TransactionDownloadVerifyError {
         error: zakura_consensus::error::TransactionError,
         advertiser_addr: Option<PeerSocketAddr>,
         tip_height: Option<Height>,
+        /// The version of the transaction that failed verification.
+        transaction_version: u32,
+        /// The network upgrade that the transaction declares in its consensus
+        /// branch ID, if any.
+        transaction_network_upgrade: Option<NetworkUpgrade>,
+        /// True if the mempool queued this verification again after a chain tip
+        /// reset. The peer relayed the transaction before the reset.
+        retried_after_tip_reset: bool,
     },
+
+    #[error("transaction was served by a peer in a transaction cooldown")]
+    PeerCoolingDown,
 }
 
 /// Represents a [`Stream`] of download and verification tasks.
@@ -200,25 +240,27 @@ where
     /// The maximum serialized size of a transaction accepted into the mempool.
     max_transaction_bytes: u64,
 
+    /// Peers whose transactions are not verified, shared with the mempool.
+    peer_cooldowns: PeerCooldowns,
+
+    /// Signalled after each download and verify task sends its result, and
+    /// again when a drain yields with results still queued.
+    verification_finished: Arc<Notify>,
+
     // Internal downloads state
-    /// A list of pending transaction download and verify tasks.
+    /// Pending transaction download and verify tasks, polled to propagate panics.
     #[pin]
-    pending: FuturesUnordered<
-        JoinHandle<
-            Result<
-                Result<
-                    (
-                        VerifiedUnminedTx,
-                        Vec<transparent::OutPoint>,
-                        Option<Height>,
-                        Option<oneshot::Sender<Result<(), BoxError>>>,
-                    ),
-                    Box<(TransactionDownloadVerifyError, UnminedTxId)>,
-                >,
-                (UnminedTxId, tokio::time::error::Elapsed),
-            >,
-        >,
-    >,
+    pending: FuturesUnordered<JoinHandle<()>>,
+
+    /// Sends task results to [`Self::results`]. Replaced by [`Self::cancel_all`],
+    /// so cancelled tasks can't deliver results.
+    results_tx: mpsc::UnboundedSender<TaskResult>,
+
+    /// Results of finished tasks, in completion order.
+    results: mpsc::UnboundedReceiver<TaskResult>,
+
+    /// The number of queued tasks whose results have not been returned yet.
+    in_flight: usize,
 
     /// A list of channels that can be used to cancel pending transaction
     /// download and verify tasks. Each entry also stores the corresponding
@@ -267,18 +309,30 @@ where
     >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = self.project();
+        let mut this = self.project();
+
+        // Results arrive on their own channel; the handles only propagate panics.
+        while let Poll::Ready(Some(join_result)) = this.pending.as_mut().poll_next(cx) {
+            join_result.expect("transaction download and verify tasks must not panic");
+        }
+
         // CORRECTNESS
         //
-        // The current task must be scheduled for wakeup every time we return
-        // `Poll::Pending`.
+        // The current task is scheduled for wakeup every time we return `Poll::Pending`.
         //
-        // If no download and verify tasks have exited since the last poll, this
-        // task is scheduled for wakeup when the next task becomes ready.
-        //
-        // TODO: this would be cleaner with poll_map (#2693)
-        let item = if let Some(join_result) = ready!(this.pending.poll_next(cx)) {
-            let result = join_result.expect("transaction download and verify tasks must not panic");
+        // Tokio's cooperative budget can return `Pending` while results are still
+        // queued. The mempool only drains results when it receives a request, and
+        // `Notify` coalesces signals, so signal again rather than leaving those
+        // results for the queue checker's periodic fallback.
+        let result = this.results.poll_recv(cx);
+        if result.is_pending() && !this.results.is_empty() {
+            this.verification_finished.notify_one();
+        }
+
+        let item = if let Some(result) = ready!(result) {
+            *this.in_flight = this.in_flight.checked_sub(1).expect(
+                "each result belongs to an in-flight task, because cancel_all replaces the channel",
+            );
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
                     let hash = tx.transaction.id();
@@ -318,7 +372,7 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.pending.size_hint()
+        (self.in_flight, Some(self.in_flight))
     }
 }
 
@@ -341,6 +395,8 @@ where
     /// `state` is used to check if transactions are already in the state.
     /// `expose_peer_addresses` controls whether legacy peer labels are unredacted.
     /// `max_transaction_bytes` limits the serialized size of accepted transactions.
+    /// `peer_cooldowns` lists the peers whose transactions are not verified.
+    /// `verification_finished` is signalled after each task sends its result.
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
@@ -351,14 +407,22 @@ where
         state: ZS,
         expose_peer_addresses: bool,
         max_transaction_bytes: u64,
+        peer_cooldowns: PeerCooldowns,
+        verification_finished: Arc<Notify>,
     ) -> Self {
+        let (results_tx, results) = mpsc::unbounded_channel();
         Self {
             network,
             verifier,
             state,
             expose_peer_addresses,
             max_transaction_bytes,
+            peer_cooldowns,
+            verification_finished,
             pending: FuturesUnordered::new(),
+            results_tx,
+            results,
+            in_flight: 0,
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
         }
@@ -371,16 +435,39 @@ where
     /// When `source` is `Some`, the per-peer cap
     /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
     /// locally-pushed transactions pass `None` and are not capped per peer.
+    pub fn download_if_needed_and_verify(
+        &mut self,
+        gossiped_tx: Gossip,
+        source: Option<QueueSource>,
+        rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
+    ) -> Result<(), MempoolError> {
+        self.queue(gossiped_tx, source, rsp_tx, false)
+    }
+
+    /// Queue a transaction that was pending before a chain tip reset for
+    /// download (if needed) and verification.
+    ///
+    /// A failure can still ban `source`, but it does not start a cooldown,
+    /// because the peer relayed the transaction before the reset.
+    pub fn retry_after_tip_reset(
+        &mut self,
+        gossiped_tx: Gossip,
+        source: Option<QueueSource>,
+    ) -> Result<(), MempoolError> {
+        self.queue(gossiped_tx, source, None, true)
+    }
+
     #[instrument(
         skip(self, gossiped_tx, source, rsp_tx),
         fields(txid = %gossiped_tx.id(), source = tracing::field::Empty)
     )]
     #[allow(clippy::unwrap_in_result)]
-    pub fn download_if_needed_and_verify(
+    fn queue(
         &mut self,
         gossiped_tx: Gossip,
         source: Option<QueueSource>,
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
+        retried_after_tip_reset: bool,
     ) -> Result<(), MempoolError> {
         let txid = gossiped_tx.id();
         let source_label = source
@@ -392,25 +479,23 @@ where
         if self.cancel_handles.contains_key(&txid) {
             debug!(
                 ?txid,
-                queue_len = self.pending.len(),
+                queue_len = self.in_flight,
                 ?MAX_INBOUND_CONCURRENCY,
                 "transaction id already queued for inbound download: ignored transaction"
             );
-            metrics::gauge!("mempool.currently.queued.transactions",)
-                .set(self.pending.len() as f64);
+            metrics::gauge!("mempool.currently.queued.transactions",).set(self.in_flight as f64);
 
             return Err(MempoolError::AlreadyQueued);
         }
 
-        if self.pending.len() >= MAX_INBOUND_CONCURRENCY {
+        if self.in_flight >= MAX_INBOUND_CONCURRENCY {
             debug!(
                 ?txid,
-                queue_len = self.pending.len(),
+                queue_len = self.in_flight,
                 ?MAX_INBOUND_CONCURRENCY,
                 "too many transactions queued for inbound download: ignored transaction"
             );
-            metrics::gauge!("mempool.currently.queued.transactions",)
-                .set(self.pending.len() as f64);
+            metrics::gauge!("mempool.currently.queued.transactions",).set(self.in_flight as f64);
 
             return Err(MempoolError::FullQueue);
         }
@@ -438,8 +523,9 @@ where
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
         let download_source = source.as_ref().and_then(peer_source_from_queue_source);
-        let pushed_advertiser_addr = source.as_ref().and_then(misbehavior_addr_from_queue_source);
+        let pushed_advertiser_addr = source.as_ref().and_then(advertiser_addr_from_queue_source);
         let max_transaction_bytes = self.max_transaction_bytes;
+        let peer_cooldowns = self.peer_cooldowns.clone();
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -500,6 +586,16 @@ where
                         }
                     };
 
+                    // The Zakura codec does not check that a response only holds
+                    // requested transactions. `poll_next` releases this task's
+                    // cancel handle and peer slot under the verified transaction's
+                    // ID, so a substituted transaction would leak them.
+                    if tx.id() != txid {
+                        return Err(TransactionDownloadVerifyError::DownloadFailed(
+                            BoxError::from("peer responded with an unrequested transaction").into(),
+                        ));
+                    }
+
                     metrics::counter!(
                         "mempool.downloaded.transactions.total",
                         "version" => format!("{}",tx.transaction().version()),
@@ -518,6 +614,16 @@ where
 
             trace!(?txid, "got tx");
 
+            // A peer can enter a cooldown after this download was queued, and
+            // the crawler queues downloads without checking the cooldowns.
+            let is_cooling_down = advertiser_addr
+                .is_some_and(|addr| peer_cooldowns.is_cooling_down(addr.ip(), Instant::now()));
+            if is_cooling_down {
+                return Err(TransactionDownloadVerifyError::PeerCoolingDown);
+            }
+
+            let transaction_version = tx.transaction().version();
+            let transaction_network_upgrade = tx.transaction().network_upgrade();
             let result = verifier
                 .oneshot(tx::Request::Mempool {
                     transaction: tx.clone(),
@@ -535,7 +641,14 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height } )
+            result.map_err(|e| TransactionDownloadVerifyError::Invalid {
+                error: e.into(),
+                advertiser_addr,
+                tip_height,
+                transaction_version,
+                transaction_network_upgrade,
+                retried_after_tip_reset,
+            })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(
@@ -554,6 +667,8 @@ where
         })
         .in_current_span();
 
+        let results_tx = self.results_tx.clone();
+        let verification_finished = self.verification_finished.clone();
         let task = tokio::spawn(async move {
             let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
 
@@ -596,10 +711,14 @@ where
                 },
             };
 
-            result
+            // Send before signalling, so a mempool woken by the signal can drain
+            // this result. The receiver is gone if the downloader was reset or dropped.
+            let _ = results_tx.send(result);
+            verification_finished.notify_one();
         });
 
         self.pending.push(task);
+        self.in_flight += 1;
         if let Some(source) = &source {
             // The per-peer cap check above ensures this can't exceed
             // `MAX_INBOUND_CONCURRENCY_PER_PEER`.
@@ -614,11 +733,11 @@ where
 
         debug!(
             ?txid,
-            queue_len = self.pending.len(),
+            queue_len = self.in_flight,
             ?MAX_INBOUND_CONCURRENCY,
             "queued transaction hash for download"
         );
-        metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
+        metrics::gauge!("mempool.currently.queued.transactions",).set(self.in_flight as f64);
         metrics::counter!("mempool.queued.transactions.total").increment(1);
 
         Ok(())
@@ -649,18 +768,21 @@ where
     /// Cancel all running tasks and reset the downloader state.
     // Note: copied from zakurad/src/components/sync/downloads.rs
     pub fn cancel_all(&mut self) {
-        // Replace the pending task list with an empty one and drop it.
+        // Replace the pending task list and the result channel, dropping
+        // queued results.
         let _ = std::mem::take(&mut self.pending);
+        (self.results_tx, self.results) = mpsc::unbounded_channel();
+        self.in_flight = 0;
         // Signal cancellation to all running tasks.
-        // Since we already dropped the JoinHandles above, they should
-        // fail silently.
+        // Since we already replaced the result channel above, their results
+        // are dropped silently.
         for (_hash, (cancel_tx, _gossip, _source)) in self.cancel_handles.drain() {
             let _ = cancel_tx.send(CancelDownloadAndVerify);
         }
         self.pending_per_peer.clear();
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
-        metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
+        metrics::gauge!("mempool.currently.queued.transactions",).set(self.in_flight as f64);
     }
 
     /// Decrement the per-peer pending count for `source`, removing the entry
@@ -677,14 +799,14 @@ where
     /// Get the number of currently in-flight download tasks.
     #[allow(dead_code)]
     pub fn in_flight(&self) -> usize {
-        self.pending.len()
+        self.in_flight
     }
 
     /// Get a list of the currently pending transaction requests.
-    pub fn transaction_requests(&self) -> impl Iterator<Item = &Gossip> {
+    pub fn transaction_requests(&self) -> impl Iterator<Item = (&Gossip, &Option<QueueSource>)> {
         self.cancel_handles
             .iter()
-            .map(|(_tx_id, (_handle, tx, _source))| tx)
+            .map(|(_tx_id, (_handle, tx, source))| (tx, source))
     }
 
     /// Reject transactions that exceed the configured serialized size limit.
@@ -774,7 +896,7 @@ mod tests {
         UnminedTxId::from_legacy_id(transaction::Hash(bytes))
     }
 
-    fn empty_v5_transaction(byte: u8) -> transaction::UnminedTx {
+    fn empty_v5_transaction(expiry_height: u32) -> transaction::UnminedTx {
         use zakura_chain::{
             block,
             parameters::NetworkUpgrade,
@@ -784,7 +906,7 @@ mod tests {
         transaction::UnminedTx::from(Transaction::V5 {
             network_upgrade: NetworkUpgrade::Nu5,
             lock_time: LockTime::min_lock_time_timestamp(),
-            expiry_height: block::Height(u32::from(byte)),
+            expiry_height: block::Height(expiry_height),
             inputs: Vec::new(),
             outputs: Vec::new(),
             sapling_shielded_data: None,
@@ -805,7 +927,38 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn retry_requests_preserve_pushed_transaction_sources() {
+        let mut downloads = pending_downloads();
+        let transaction = empty_v5_transaction(1);
+        let source = QueueSource::LegacySocket("203.0.113.7:8233".parse().unwrap());
+        downloads
+            .download_if_needed_and_verify(
+                Gossip::Tx(transaction.clone()),
+                Some(source.clone()),
+                None,
+            )
+            .unwrap();
+        let retries: Vec<_> = downloads
+            .transaction_requests()
+            .map(|(tx, source)| (tx.clone(), source.clone()))
+            .collect();
+        downloads.cancel_all();
+        for (tx, source) in retries {
+            downloads
+                .download_if_needed_and_verify(tx, source, None)
+                .unwrap();
+        }
+        assert_eq!(downloads.pending_per_peer.get(&source), Some(&1));
+        assert!(downloads
+            .transaction_requests()
+            .any(|(tx, retry_source)| tx.id() == transaction.id()
+                && retry_source.as_ref() == Some(&source)));
     }
 
     #[tokio::test]
@@ -874,6 +1027,8 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -924,6 +1079,8 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -942,6 +1099,54 @@ mod tests {
                 if error.0 == txid
                     && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
         ));
+    }
+
+    /// A response that holds a different transaction is a download failure. The
+    /// requested ID's cancel handle and peer slot are released.
+    #[tokio::test]
+    async fn unrequested_transaction_response_is_download_failure() {
+        let requested = tx_id(7);
+        let source = QueueSource::Zakura(vec![7; 32]);
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                    zn::InventoryResponse::Available((empty_v5_transaction(1), None)),
+                ]))
+            })),
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("unrequested transactions must not be verified");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(requested), Some(source.clone()), None)
+            .expect("download is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("unrequested transaction response should complete")
+            .expect("download stream should yield an item")
+            .expect("unrequested transaction response should not time out");
+
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.0 == requested
+                    && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
+        ));
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(!downloads.pending_per_peer.contains_key(&source));
     }
 
     #[tokio::test]
@@ -983,6 +1188,8 @@ mod tests {
             })),
             false,
             max_transaction_bytes,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -997,6 +1204,125 @@ mod tests {
 
         assert!(result.is_ok(), "transaction at the limit should verify");
         assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The mempool only drains verified transactions when it is polled, so
+    /// the signal must not fire until the result can be drained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verification_finished_signal_follows_drainable_result() {
+        let verification_finished = Arc::new(Notify::new());
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    panic!("unexpected transaction verifier request: {request:?}");
+                };
+                let miner_fee = transaction.conventional_fee();
+                let transaction =
+                    VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                        .expect("test transaction pays its conventional fee");
+
+                Ok::<_, BoxError>(tx::Response::Mempool {
+                    transaction,
+                    spent_mempool_outpoints: Vec::new(),
+                })
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            PeerCooldowns::default(),
+            verification_finished.clone(),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Tx(empty_v5_transaction(1)), None, None)
+            .expect("pushed transaction is queued");
+
+        tokio::time::timeout(Duration::from_secs(1), verification_finished.notified())
+            .await
+            .expect("finished verification should signal the mempool");
+
+        let result = futures::FutureExt::now_or_never(downloads.next())
+            .expect("signalled result should be drainable without waiting")
+            .expect("download stream should yield an item")
+            .expect("pushed transaction should not time out");
+        assert!(result.is_ok(), "pushed transaction should verify");
+    }
+
+    /// One coalesced signal must drain a batch larger than Tokio's cooperative budget.
+    #[tokio::test(start_paused = true)]
+    async fn budget_yield_with_queued_results_signals_again() {
+        const BATCH: usize = 500;
+
+        let verification_finished = Arc::new(Notify::new());
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    panic!("unexpected transaction verifier request: {request:?}");
+                };
+                let miner_fee = transaction.conventional_fee();
+                let transaction =
+                    VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                        .expect("test transaction pays its conventional fee");
+
+                Ok::<_, BoxError>(tx::Response::Mempool {
+                    transaction,
+                    spent_mempool_outpoints: Vec::new(),
+                })
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            PeerCooldowns::default(),
+            verification_finished.clone(),
+        );
+
+        for index in 0..BATCH {
+            let index = u32::try_from(index).expect("the batch size fits in u32");
+            downloads
+                .download_if_needed_and_verify(Gossip::Tx(empty_v5_transaction(index)), None, None)
+                .expect("pushed transaction is queued");
+        }
+
+        // Paused time only advances once every runnable task has finished.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(downloads.pending.iter().all(JoinHandle::is_finished));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut drained = 0;
+            while drained < BATCH {
+                verification_finished.notified().await;
+                // Like the mempool: drain ready results, then return readiness on `Pending`.
+                futures::future::poll_fn(|cx| {
+                    while let Poll::Ready(Some(_)) = Pin::new(&mut downloads).poll_next(cx) {
+                        drained += 1;
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued results must not wait for the queue checker's fallback");
+        assert_eq!(downloads.in_flight(), 0);
     }
 
     #[tokio::test]
@@ -1036,6 +1362,8 @@ mod tests {
             })),
             false,
             max_bytes,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1119,6 +1447,8 @@ mod tests {
             })),
             false,
             max_bytes,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
         downloads
@@ -1147,11 +1477,19 @@ mod tests {
     }
 
     /// A directly pushed transaction from a legacy-socket peer must keep that
-    /// peer's address on the `Invalid` verification error, so the mempool can
-    /// score the peer's misbehavior. Regression test for the push-path
-    /// attribution gap.
+    /// peer's address and the transaction version on the `Invalid` verification
+    /// error, so the mempool can ban or cool down that peer. Regression test for
+    /// the push-path attribution gap.
     #[tokio::test]
     async fn pushed_transaction_attributes_invalid_error_to_peer() {
+        for retried in [false, true] {
+            pushed_transaction_failure_attribution(retried).await;
+        }
+    }
+
+    /// Checks the peer attribution of a pushed transaction's verification
+    /// failure, after a chain tip reset if `retried`.
+    async fn pushed_transaction_failure_attribution(retried: bool) {
         use zakura_consensus::error::TransactionError;
 
         let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
@@ -1162,7 +1500,7 @@ mod tests {
             BoxCloneService::new(service_fn(|_request| async move {
                 panic!("pushed transactions must not be downloaded");
             })),
-            // Reject with a consensus error that carries a nonzero misbehavior score.
+            // Reject with a consensus error that penalizes the peer.
             BoxCloneService::new(service_fn(|_request| async move {
                 Err(Box::new(TransactionError::WrongVersion) as BoxError)
             })),
@@ -1175,17 +1513,20 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
         );
 
-        downloads
-            .download_if_needed_and_verify(
-                Gossip::Tx(transaction),
-                Some(QueueSource::LegacySocket(
-                    peer_addr.remove_socket_addr_privacy(),
-                )),
-                None,
-            )
-            .expect("download is queued");
+        let gossip = Gossip::Tx(transaction);
+        let source = Some(QueueSource::LegacySocket(
+            peer_addr.remove_socket_addr_privacy(),
+        ));
+        if retried {
+            downloads.retry_after_tip_reset(gossip, source)
+        } else {
+            downloads.download_if_needed_and_verify(gossip, source, None)
+        }
+        .expect("download is queued");
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
             .await
@@ -1201,10 +1542,75 @@ mod tests {
                 error,
                 TransactionDownloadVerifyError::Invalid {
                     advertiser_addr: Some(addr),
+                    transaction_version: 5,
+                    transaction_network_upgrade: Some(NetworkUpgrade::Nu5),
+                    retried_after_tip_reset,
                     ..
-                } if addr == peer_addr
+                } if addr == peer_addr && retried_after_tip_reset == retried
             ),
-            "expected the pushed transaction failure to carry the peer address, got {error:?}"
+            "expected the pushed transaction failure to carry the peer address, version, and upgrade, got {error:?}"
+        );
+    }
+
+    /// A transaction served by a peer in a cooldown must not be verified, even
+    /// when the crawler queued it without a peer source, and even when the
+    /// cooldown started after the download was queued.
+    #[tokio::test]
+    async fn transaction_served_by_cooling_down_peer_is_not_verified() {
+        let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let transaction = empty_v5_transaction(1);
+        let txid = transaction.id();
+        let peer_cooldowns = PeerCooldowns::default();
+
+        let served_transaction = transaction.clone();
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(move |request| {
+                let transaction = served_transaction.clone();
+                async move {
+                    assert!(
+                        matches!(request, zn::Request::TransactionsById(_)),
+                        "unexpected network request: {request:?}"
+                    );
+                    Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                        zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+                    ]))
+                }
+            })),
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("transactions from a cooling down peer must not be verified");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            peer_cooldowns.clone(),
+            Arc::new(Notify::new()),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+            .expect("download is queued");
+
+        // The current-thread runtime has not run the download task yet.
+        peer_cooldowns.record_invalid_transaction(peer_addr.ip(), Instant::now());
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("download should complete")
+            .expect("download stream should yield an item")
+            .expect("download should not time out");
+
+        let error = result
+            .expect_err("a transaction from a cooling down peer should not be accepted")
+            .1;
+        assert!(
+            matches!(error, TransactionDownloadVerifyError::PeerCoolingDown),
+            "expected a peer cooldown error, got {error:?}"
         );
     }
 }

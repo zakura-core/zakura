@@ -38,6 +38,7 @@ mod tests;
 /// ```
 /// # use zakura_network::zakura::{MessageRole, MessageRule, PayloadLen};
 /// const GET_ITEMS: MessageRule = MessageRule {
+///     name: "get-items",
 ///     message_type: 2,
 ///     payload: PayloadLen::exact(8),
 ///     role: MessageRole::Request {
@@ -46,6 +47,7 @@ mod tests;
 ///     },
 /// };
 /// const ITEMS_DONE: MessageRule = MessageRule {
+///     name: "items-done",
 ///     message_type: 4,
 ///     payload: PayloadLen::exact(8),
 ///     role: MessageRole::Response {
@@ -56,6 +58,11 @@ mod tests;
 /// ```
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MessageRule {
+    /// Row name: words of lowercase ASCII letters and digits joined by single
+    /// hyphens, unique within a session layout. [`Stream::check_layout`]
+    /// enforces both. Property IDs, labels, and metric labels use it, so a
+    /// rename is a deliberate change.
+    pub name: &'static str,
     /// Frame-header message type.
     pub message_type: u16,
     /// Payload length bounds, checked from the frame header before the payload
@@ -94,6 +101,62 @@ pub enum MessageRole {
         /// limited rate.
         cadence: Option<Cadence>,
     },
+    /// A request that opens, renews, and closes a subscription.
+    ///
+    /// The subscriber sends `Open`, `Grant`, and `Close` updates as frames of
+    /// this row; the payload tells them apart. The publisher pushes pages
+    /// while the subscriber's credit lasts, then ends the subscription with a
+    /// terminal outcome. Pages are response rows that do not end the exchange,
+    /// and the terminal outcome is a response row that does.
+    ///
+    /// Updates change a live exchange. They are not new commitments, so
+    /// serving never receives them.
+    ///
+    /// A subscription row needs a persistent stream, a live subscription,
+    /// nonzero credit, a cursor history that covers the credit, and a page row
+    /// whose smallest payload fits the byte credit. Each broken rule fails the
+    /// build. This one has no page row:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
+    /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 1,
+    ///         credit: Credit { objects: 16, bytes: 4096 },
+    ///         cursor_history: 16,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// const ENDED: MessageRule = MessageRule {
+    ///     name: "ended",
+    ///     message_type: 3,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// };
+    /// const FEED: [Stream; 1] = [Stream {
+    ///     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    ///     messages: Some(&[WATCH, ENDED]), ..Stream::PERSISTENT
+    /// }];
+    /// const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    ///
+    /// [`LayoutError`](layout::LayoutError) lists the other rules, each with
+    /// a failing declaration.
+    Subscription {
+        /// Most live or closing subscriptions one peer session may hold.
+        max_live: u32,
+        /// Most credit a subscription may hold beyond its acknowledged
+        /// progress. See [`Credit`].
+        credit: Credit,
+        /// Sent pages the publisher remembers so that an acknowledgement can
+        /// name one. It must cover `credit.objects`.
+        cursor_history: u32,
+        /// Receiver-side bucket for updates, where declared.
+        cadence: Option<Cadence>,
+    },
     /// Part of the answer to a request that the receiver sent earlier.
     Response {
         /// Message type of the request this message answers.
@@ -106,6 +169,25 @@ pub enum MessageRole {
         /// that do not end it may precede the ending, as bounded by the reactor.
         ends_exchange: bool,
     },
+}
+
+/// A subscription's credit window: objects and encoded payload bytes.
+///
+/// The window is the credit the subscriber granted minus the progress it
+/// acknowledged. Each grant must keep the window within these values. Both
+/// sides compute the same window: pages in flight move credit from "unspent"
+/// to "unacknowledged", which the window counts either way. So a grant that
+/// breaks it is a protocol violation.
+///
+/// Every page spends at least one object, so the publisher never holds more
+/// unacknowledged pages than `objects`. A cursor history of `objects` entries
+/// therefore always suffices.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Credit {
+    /// Objects, such as headers or items.
+    pub objects: u32,
+    /// Encoded payload bytes of the pages, frame headers excluded.
+    pub bytes: u32,
 }
 
 /// A row's rate: the sender's obligation and the receiver's bucket.
@@ -135,6 +217,7 @@ pub enum MessageRole {
 ///     send_interval: Duration::from_secs(30),
 /// };
 /// # const STATUS: MessageRule = MessageRule {
+/// #     name: "status",
 /// #     message_type: 1,
 /// #     payload: PayloadLen::exact(8),
 /// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
@@ -158,6 +241,7 @@ pub enum MessageRole {
 ///     send_interval: Duration::from_secs(30),
 /// };
 /// # const STATUS: MessageRule = MessageRule {
+/// #     name: "status",
 /// #     message_type: 1,
 /// #     payload: PayloadLen::exact(8),
 /// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
@@ -180,6 +264,7 @@ pub enum MessageRole {
 ///     send_interval: Duration::from_secs(30),
 /// };
 /// # const STATUS: MessageRule = MessageRule {
+/// #     name: "status",
 /// #     message_type: 1,
 /// #     payload: PayloadLen::exact(8),
 /// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },

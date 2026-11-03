@@ -163,11 +163,40 @@ so this audit is a checklist, backed by the resumable retry above.
 
 A crate that has never been published cannot be bootstrapped this way, because
 its trusted-publisher configuration lives on a crate that does not yet exist.
-Reserve the name manually with a narrowly scoped token from a trusted
-maintainer machine, add the configuration, and only then let CI publish it;
-never store that bootstrap token in GitHub. `publish` mode refuses to run when
-the plan contains an unpublished crate name, rather than discovering it
-mid-upload.
+Before merging a new publishable crate:
+
+1. Create or reuse its reservation in
+   [`zakura-core/reserved`](https://github.com/zakura-core/reserved), following
+   that repository's README. Add the blank `0.0.0` placeholder and crate-list
+   entry, and link the reservation PR from the implementation PR. Check existing
+   entries and PRs first to avoid duplicate reservations.
+2. Publish the reservation from a trusted maintainer machine using the reserved
+   repository's `scripts/publish-reservations.sh` and a narrowly scoped token.
+   Never store that bootstrap token in GitHub. Confirm the name exists on
+   crates.io; a reservation committed to Git alone is insufficient.
+3. Ensure Sean Bowe (`ebfull`) is a crates.io co-owner. An existing owner runs
+   `cargo owner --add ebfull <crate-name>` if needed. Sean must accept the
+   invitation at [crates.io invitations](https://crates.io/me/invitations).
+   Verify `cargo owner --list <crate-name>` includes `ebfull`; a pending
+   invitation is not completed ownership. If permission is denied, ask an
+   existing owner to invite him.
+4. Configure the crate's trusted publisher as described above before letting
+   CI publish the implementation.
+
+After the first implementation version is published, follow the reserved
+repository's graduation instructions to remove the placeholder from its
+workspace and record the implementation repository in its README.
+
+`publish` mode refuses to run when the plan contains an unpublished crate name,
+rather than discovering it mid-upload. The required `test success` check also
+rejects publishable workspace crates whose names do not yet exist on crates.io,
+before they can merge. This
+requires an initial publication, not publication of every pending version bump.
+Crates with `publish = false` are exempt. The GitHub-only release override does
+not bypass this check.
+
+The reservation PR and accepted co-ownership are manual review requirements;
+the CI check verifies that the crate name exists on crates.io.
 
 The workflow filename is part of the crates.io configuration: it is matched
 against the OIDC `workflow_ref` claim, which names the workflow a run _starts

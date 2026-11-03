@@ -1,12 +1,9 @@
 //! The response of one served request: frames, then exactly one ending.
 
-use std::{
-    fmt,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{fmt, sync::Arc};
 
 use thiserror::Error;
-use tokio::sync::mpsc;
+use zakura_rt::sync::{mpsc, Mutex, MutexGuard, PoisonError};
 
 use super::{Commitment, ResponseGrants};
 use crate::zakura::{
@@ -203,13 +200,22 @@ impl SinkCore {
         {
             return Err(over);
         }
-        frames
-            .send(ResponseFrame {
+        let publish = || {
+            frames.send(ResponseFrame {
                 frame,
                 guard: FrameGuard::new(self.grants.clone()),
                 ends,
             })
-            .map_err(|_| SinkError::Closed)?;
+        };
+        if ends {
+            self.commitment
+                .as_mut()
+                .expect("an open sink keeps its commitment")
+                .queue_ending(publish)
+        } else {
+            publish()
+        }
+        .map_err(|_| SinkError::Closed)?;
         self.progress.bytes = bytes;
         if ends {
             // The ending is in the ordered output: the exchange is complete on
@@ -266,7 +272,7 @@ where
         }
     }
 
-    fn core(&self) -> std::sync::MutexGuard<'_, SinkCore> {
+    fn core(&self) -> MutexGuard<'_, SinkCore> {
         self.core.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

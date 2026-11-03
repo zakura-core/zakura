@@ -78,28 +78,6 @@ pub enum BlockSyncEvent {
         /// Typed, evidence-bearing verifier outcome.
         outcome: BlockApplyOutcome,
     },
-    /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
-    BlockRangeResponseFinished {
-        /// Peer whose served-response slot can be released.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        requested_count: u32,
-        /// Number of blocks read from state and sent in the response.
-        returned_count: u32,
-    },
-    /// State returned committed bodies requested by a peer and the reactor should send them.
-    BlockRangeResponseReady {
-        /// Peer whose inbound request is being served.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        requested_count: u32,
-        /// Bounded committed blocks returned by state.
-        blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
-    },
 }
 
 /// Result of applying a block-sync body through the verifier driver.
@@ -178,11 +156,6 @@ impl BlockApplyOutcome {
     /// Canonical typed verification evidence.
     pub fn verification(&self) -> &zakura_header_chain::BodyVerificationOutcome {
         self.verification.as_ref()
-    }
-
-    /// Consume this wrapper and return canonical typed verification evidence.
-    pub fn into_verification(self) -> zakura_header_chain::BodyVerificationOutcome {
-        *self.verification
     }
 
     pub(crate) fn attributed_source(&self) -> Option<zakura_header_chain::SourceId> {
@@ -269,15 +242,6 @@ pub enum BlockSyncAction {
         /// Atomic durable coordinates that own this state query and its result.
         scope: zakura_header_chain::BodyWorkAuthority,
     },
-    /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
-    QueryBlocksByHeightRange {
-        /// Peer that requested the range.
-        peer: ZakuraPeerId,
-        /// First height.
-        start: block::Height,
-        /// Maximum count.
-        count: u32,
-    },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
         /// Exact network request that owns this verifier submission.
@@ -331,7 +295,6 @@ impl BlockSyncAction {
     pub(super) fn metric_label(&self) -> &'static str {
         match self {
             Self::QueryNeededBlocks { .. } => "query_needed_blocks",
-            Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
             Self::SubmitBlock { .. } => "submit_block",
             Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
             Self::RecordBodyInvalid { .. } => "record_body_invalid",
@@ -347,28 +310,25 @@ impl BlockSyncAction {
 pub enum BlockSyncMisbehavior {
     /// A stream-6 payload was malformed before semantic handling.
     MalformedMessage,
-    /// A peer sent blocks that were not requested.
-    UnsolicitedBlock,
-    /// A peer requested more blocks than this node advertised it can serve.
-    GetBlocksTooLong,
-    /// A peer exceeded this node's inbound `GetBlocks` serving budget.
-    GetBlocksSpam,
     /// A peer supplied a body whose payload does not match its requested header.
     BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
     /// A commitment-matching body deterministically failed consensus.
     ConsensusBodyInvalid(zakura_header_chain::ConsensusBodyInvalid),
     /// A peer supplied another invalid block payload.
     InvalidBlock,
-    /// A body exceeded its advertised size hint by more than the tolerance. Advisory: the hash-matched body is still accepted. The report names the body's supplier even though the hint may have come from a different header supplier.
-    SizeMismatch,
-    /// Peer status is internally impossible.
-    InvalidStatus,
-    /// A response terminator arrived without an outstanding range.
-    UnsolicitedDone,
     /// A peer reported a requested range unavailable.
     RangeUnavailable,
     /// A peer sent too many status frames.
     StatusSpam,
+}
+
+impl BlockSyncMisbehavior {
+    /// Whether this violation proves the peer served a tampered body.
+    ///
+    /// See [`zakura_header_chain::BodyCommitmentKind::proves_tampered_body`].
+    pub fn proves_tampered_body(&self) -> bool {
+        matches!(self, Self::BodyPayloadMismatch(mismatch) if mismatch.kind.proves_tampered_body())
+    }
 }
 
 /// The shared routine→reactor channel (per-peer routines inverted data flow).
@@ -390,16 +350,6 @@ pub(super) enum RoutineToReactor {
         peer: ZakuraPeerId,
         /// Whether the rate meter allows sending a `Status` reply now.
         send_reply: bool,
-    },
-    /// A peer requested OUR committed blocks (serving). The reactor runs the
-    /// state query + driver path and sends via the peer's session clone.
-    ServeGetBlocks {
-        /// Peer that requested the range.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        count: u32,
     },
     /// A routine drained its pending work; the producer should re-query (it
     /// self-gates on low-water, so the ping is idempotent/cheap).

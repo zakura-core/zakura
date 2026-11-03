@@ -6,11 +6,15 @@
 #![doc(html_favicon_url = "https://zakura.com/assets/rustdoc/zakura-favicon-128.png")]
 #![doc(html_logo_url = "https://zakura.com/assets/rustdoc/zakura-icon.png")]
 #![doc(html_root_url = "https://docs.rs/zakura_chain")]
-// Required by bitvec! macro
-#![recursion_limit = "256"]
 // Long tuple and result types are routine in this crate, and factoring them
 // into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
+
+// Lets the serialization tests measure what a decoder actually reserves.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: zakura_test::allocations::TrackingAllocator =
+    zakura_test::allocations::TrackingAllocator;
 
 #[macro_use]
 extern crate bitflags;

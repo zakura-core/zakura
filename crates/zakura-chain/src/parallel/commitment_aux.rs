@@ -7,7 +7,9 @@
 //! The final-frontier handoff payload (§5.2) is *not* here: it is embedded in the
 //! binary, not carried on the wire, so `tree_aux` is a roots-only stream.
 
+use crate::serialization::ZcashReader;
 use std::io;
+use std::io::Read as _;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -75,11 +77,11 @@ pub struct BlockCommitmentRoots {
 }
 
 impl ZcashSerialize for BlockCommitmentRoots {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_u32::<LittleEndian>(self.height.0)?;
-        self.sapling_root.zcash_serialize(&mut writer)?;
-        self.orchard_root.zcash_serialize(&mut writer)?;
-        self.ironwood_root.zcash_serialize(&mut writer)?;
+        self.sapling_root.zcash_serialize(writer)?;
+        self.orchard_root.zcash_serialize(writer)?;
+        self.ironwood_root.zcash_serialize(writer)?;
         writer.write_u64::<LittleEndian>(self.sapling_tx)?;
         writer.write_u64::<LittleEndian>(self.orchard_tx)?;
         writer.write_u64::<LittleEndian>(self.ironwood_tx)?;
@@ -89,14 +91,16 @@ impl ZcashSerialize for BlockCommitmentRoots {
 }
 
 impl ZcashDeserialize for BlockCommitmentRoots {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // The height is an unvalidated `u32` here; an out-of-range or wrong height simply
         // fails to match any local header during verification (design §6), so it is
         // harmless. The Sapling/Orchard root parsers reject malformed root bytes.
         let height = block::Height(reader.read_u32::<LittleEndian>()?);
-        let sapling_root = sapling::tree::Root::zcash_deserialize(&mut reader)?;
-        let orchard_root = orchard::tree::Root::zcash_deserialize(&mut reader)?;
-        let ironwood_root = ironwood::tree::Root::zcash_deserialize(&mut reader)?;
+        let sapling_root = reader.read_value::<sapling::tree::Root>()?;
+        let orchard_root = reader.read_value::<orchard::tree::Root>()?;
+        let ironwood_root = reader.read_value::<ironwood::tree::Root>()?;
         let sapling_tx = reader.read_u64::<LittleEndian>()?;
         let orchard_tx = reader.read_u64::<LittleEndian>()?;
         let ironwood_tx = reader.read_u64::<LittleEndian>()?;

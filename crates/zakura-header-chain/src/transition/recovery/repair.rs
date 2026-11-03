@@ -135,8 +135,8 @@ fn compare_by_key<T, K: Ord, F: FnMut(&T) -> K>(
     T: Clone + Eq,
 {
     let mut expected = expected.to_vec();
-    actual.sort_by_key(&mut key);
-    expected.sort_by_key(key);
+    actual.sort_unstable_by_key(&mut key);
+    expected.sort_unstable_by_key(&mut key);
     if actual != expected {
         repairs.insert(repair);
     }

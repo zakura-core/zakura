@@ -4,10 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 use zakura_chain::{block::Height, serialization::ZcashDeserializeInto};
 use zakura_header_chain::EvidenceId;
 
-use super::{
-    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
-    VCT_AWAIT_SUCCESSOR_WAIT,
-};
+use super::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
 use crate::{
     request::CheckpointVerifiedBlock,
     service::{
@@ -188,21 +185,15 @@ fn on_retryable_error_parks_the_block_for_retry() {
 }
 
 #[test]
-fn on_retryable_error_wait_depends_on_root_availability() {
+fn missing_successor_does_not_request_replacement_roots() {
     let mut manager = VctWriteRetryManager::default();
-
-    let missing_root_wait = manager.on_retryable_error(Height(1), MISSING_ROOT, queued_block(1));
-    assert_eq!(missing_root_wait, VctWriteRetryWait::HeaderChainInsert);
-
-    let successor_wait = manager.on_retryable_error(
+    manager.on_retryable_error(
         Height(2),
         VctWriteRetryCause::MissingSuccessor,
         queued_block(2),
     );
-    assert_eq!(
-        successor_wait,
-        VctWriteRetryWait::Delay(VCT_AWAIT_SUCCESSOR_WAIT)
-    );
+    assert!(manager.committer_repair_height.is_none());
+    assert!(manager.take_retryable_block().is_some());
 }
 
 #[test]

@@ -41,8 +41,8 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
         actual.push(reason);
         Ok(())
     })?;
-    expected.sort_by_key(|(hash, reason)| (hash.0, reason.clone()));
-    actual.sort_by_key(|(hash, reason)| (hash.0, reason.clone()));
+    expected.sort_unstable_by_key(|(hash, reason)| (hash.0, reason.clone()));
+    actual.sort_unstable_by_key(|(hash, reason)| (hash.0, reason.clone()));
     if expected != actual {
         let hash = expected
             .iter()

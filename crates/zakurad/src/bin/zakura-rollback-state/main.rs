@@ -7,12 +7,14 @@
 use clap::Parser;
 use zakurad::commands::rollback_state::RollbackStateCmd;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "../zakurad/cpu_features.rs"]
+mod cpu_features;
+
 /// Process entry point for `zakura-rollback-state`.
 fn main() {
-    if let Err(error) = color_eyre::install() {
-        eprintln!("failed to install error handler: {error}");
-        std::process::exit(1);
-    }
+    #[cfg(target_arch = "x86_64")]
+    cpu_features::exit_if_cpu_lacks_pasta_assembly_features();
 
     let command = RollbackStateCmd::parse();
 

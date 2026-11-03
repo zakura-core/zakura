@@ -4,7 +4,8 @@ expression: block_template
 ---
 {
   "capabilities": [
-    "proposal"
+    "proposal",
+    "submitsolution"
   ],
   "version": 4,
   "previousblockhash": "0000000000d723156d9b65ffcf4984da7a19675ed7e2f06d9e5d5188af087bf8",

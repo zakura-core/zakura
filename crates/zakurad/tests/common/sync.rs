@@ -40,10 +40,6 @@ pub const STOP_AT_HEIGHT_REGEX: &str = "stopping at configured height";
 pub const SYNC_FINISHED_REGEX: &str =
     r"finished initial sync to chain tip, using gossiped blocks .*sync_percent.*=.*100\.";
 
-/// The text that should be logged every time Zebra checks the sync progress.
-#[cfg(feature = "lightwalletd-grpc-tests")]
-pub const SYNC_PROGRESS_REGEX: &str = r"sync_percent";
-
 /// The text that should be logged when Zebra loads its compiled-in checkpoints.
 #[cfg(feature = "zakura-checkpoints")]
 pub const CHECKPOINT_VERIFIER_REGEX: &str =
@@ -106,12 +102,17 @@ pub enum MempoolBehavior {
     #[allow(dead_code)]
     ShouldAutomaticallyActivate,
 
+    /// Mempool activation may race with shutdown and is not checked.
+    ///
+    /// Like [`Self::ShouldNotActivate`], the node must exit successfully by itself.
+    MayActivate,
+
     /// The mempool should not become active during the test.
     ///
     /// # Correctness
     ///
-    /// Unlike the other mempool behaviours, `zakurad` must stop after logging the stop regex,
-    /// without being killed by [`sync_until`] test harness.
+    /// `zakurad` must stop after logging the stop regex, without being killed
+    /// by the [`sync_until`] test harness.
     ///
     /// Since it needs to collect all the output,
     /// the test harness can't kill `zakurad` after it logs the `stop_regex`.
@@ -123,9 +124,9 @@ impl MempoolBehavior {
     pub fn enable_at_height(&self) -> Option<u32> {
         match self {
             MempoolBehavior::ForceActivationAt(height) => Some(height.0),
-            MempoolBehavior::ShouldAutomaticallyActivate | MempoolBehavior::ShouldNotActivate => {
-                None
-            }
+            MempoolBehavior::ShouldAutomaticallyActivate
+            | MempoolBehavior::MayActivate
+            | MempoolBehavior::ShouldNotActivate => None,
         }
     }
 
@@ -277,13 +278,12 @@ pub fn sync_until_with_config(
 
         Ok(dir)
     } else {
-        // Require that the mempool didn't activate,
-        // checking the entire `zakurad` output after it exits.
+        // Check the entire `zakurad` output after it exits successfully.
         //
         // # Correctness
         //
-        // Unlike the other mempool behaviours, `zakurad` must stop after logging the stop regex,
-        // without being killed by [`sync_until`] test harness.
+        // `zakurad` must stop after logging the stop regex, without being killed
+        // by the test harness.
         //
         // Since it needs to collect all the output,
         // the test harness can't kill `zakurad` after it logs the `stop_regex`.
@@ -300,11 +300,12 @@ pub fn sync_until_with_config(
             output.stdout_line_contains("no legacy chain found")?;
         }
 
-        // check it did not activate or use the mempool
-        assert!(output.stdout_line_contains("activating mempool").is_err());
-        assert!(output
-            .stdout_line_contains("sending mempool transaction broadcast")
-            .is_err());
+        if mempool_behavior.require_no_activation() {
+            assert!(output.stdout_line_contains("activating mempool").is_err());
+            assert!(output
+                .stdout_line_contains("sending mempool transaction broadcast")
+                .is_err());
+        }
 
         // check it logged the stop regex before exiting
         output.stdout_line_matches(stop_regex)?;

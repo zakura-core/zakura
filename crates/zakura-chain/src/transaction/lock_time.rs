@@ -1,5 +1,6 @@
 //! Transaction LockTime.
 
+use crate::serialization::ZcashReader;
 use std::io;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -102,7 +103,7 @@ impl LockTime {
 
 impl ZcashSerialize for LockTime {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // This implementation does not check the invariants on `LockTime` so that the
         // serialization is fallible only if the underlying writer is. This ensures that
         // we can always compute a hash of a transaction object.
@@ -117,7 +118,9 @@ impl ZcashSerialize for LockTime {
 
 impl ZcashDeserialize for LockTime {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let n = reader.read_u32::<LittleEndian>()?;
         if n < Self::MIN_TIMESTAMP.try_into().expect("fits in u32") {
             Ok(LockTime::Height(block::Height(n)))

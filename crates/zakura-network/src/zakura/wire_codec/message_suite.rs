@@ -12,7 +12,8 @@
 //! - **Header mutations.** Each flag bit, each undeclared message type, and a
 //!   payload one byte past the row's maximum fail to decode.
 //! - **Payload mutations.** Every short prefix and one trailing byte fail to
-//!   decode.
+//!   decode. Where an opaque row admits the changed length, the changed
+//!   payload instead decodes and re-encodes to the same bytes.
 //! - **Domain violations.** Each violation fails with the error it names.
 //! - **Hostile payloads.** Arbitrary payloads within each row's bounds, and
 //!   valid payloads with one byte changed, decode without panicking. Whatever
@@ -54,6 +55,14 @@ where
 
     /// Frames that pass their row's header checks but break a domain rule.
     fn violations() -> Vec<Violation<Self>>;
+
+    /// Message types whose payload ends in bytes the family does not parse,
+    /// such as block sync's `Block` body. Such a row decodes every length
+    /// within its bounds, so the payload mutations require those lengths to
+    /// decode instead of fail.
+    fn opaque_types() -> &'static [u16] {
+        &[]
+    }
 }
 
 /// Run every deterministic check for `M`.
@@ -107,6 +116,12 @@ where
         sampled, declared,
         "every row needs a sample and every sample a row"
     );
+    for opaque in M::opaque_types() {
+        assert!(
+            declared.contains(opaque),
+            "opaque type {opaque} must name a row"
+        );
+    }
 }
 
 fn check_tight_bounds<M: MessageSample>(samples: &[M])
@@ -147,24 +162,41 @@ where
     M::Error: Debug,
 {
     let len = frame.payload.len();
+    let rule = MessageRule::find(M::RULES, frame.message_type).expect("samples use rows");
+    let admitted =
+        |len: usize| M::opaque_types().contains(&rule.message_type) && rule.payload.contains(len);
+    // An admitted length decodes and re-encodes to the same bytes; any other
+    // length fails.
+    let check_changed = |changed: &Frame, what: &str| {
+        let decoded = decode_checked::<M>(changed);
+        if admitted(changed.payload.len()) {
+            let decoded = decoded.unwrap_or_else(|error| {
+                panic!(
+                    "{what} of a {len}-byte opaque type {} payload was rejected: {error:?}",
+                    frame.message_type
+                )
+            });
+            let reencoded = encode_frame(&decoded).expect("decoded messages encode");
+            assert_eq!(reencoded.payload, changed.payload, "{what} re-encodes");
+        } else {
+            assert!(
+                decoded.is_err(),
+                "{what} of a {len}-byte type {} payload was accepted",
+                frame.message_type
+            );
+        }
+    };
     for prefix in prefixes(len) {
         let truncated = Frame {
             payload: frame.payload[..prefix].to_vec(),
             ..frame.clone()
         };
-        assert!(
-            decode_checked::<M>(&truncated).is_err(),
-            "a {prefix}-byte prefix of a {len}-byte type {} payload was accepted",
-            frame.message_type
-        );
+        check_changed(&truncated, &format!("a {prefix}-byte prefix"));
     }
 
     let mut trailing = frame.clone();
     trailing.payload.push(0);
-    assert!(
-        decode_checked::<M>(&trailing).is_err(),
-        "a trailing byte was accepted"
-    );
+    check_changed(&trailing, "a trailing byte");
 
     for bit in 0..u16::BITS {
         let flagged = Frame {
@@ -177,7 +209,6 @@ where
         );
     }
 
-    let rule = MessageRule::find(M::RULES, frame.message_type).expect("samples use rows");
     let mut oversized = frame.clone();
     oversized.payload.resize(rule.payload.max() + 1, 0);
     assert!(

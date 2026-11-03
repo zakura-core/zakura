@@ -929,7 +929,7 @@ fn start_inner(
         .unwrap_or_default();
     let after = recorder.now();
     let run = Run {
-        id: format!("{:032x}", rand::random::<u128>()),
+        id: format!("{:032x}", rand_10::random::<u128>()),
         node: config.node.clone(),
         session: config.session.clone(),
         network,

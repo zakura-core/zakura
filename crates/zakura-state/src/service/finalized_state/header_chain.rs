@@ -29,6 +29,7 @@ use zakura_header_chain::{
     TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
     ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
+use zakura_node_services::header_chain::{SelectedChainMembership, ServingCapacitySignal};
 
 use crate::{
     RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
@@ -277,6 +278,10 @@ impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
         self.0.map_or(&[], |inner| inner.evicted_bodies(event))
     }
 
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.0.and_then(|inner| inner.verified_tip(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.0
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -312,6 +317,10 @@ struct StateIssuedAuthority<'a> {
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
         self.inner.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.inner.and_then(|inner| inner.verified_tip(event))
     }
 
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
@@ -386,21 +395,63 @@ pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries
         .into_iter()
-        .filter(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected())
-        .min_by_key(|delivery| {
-            (
-                if delivery.is_authenticated() {
-                    0
-                } else if delivery.is_unauthenticated() {
-                    1
-                } else if delivery.is_disputed() {
-                    2
-                } else {
-                    3
-                },
-                delivery.delivery_id,
-            )
-        })
+        .filter(vct_auxiliary_delivery_is_usable)
+        .min_by_key(vct_auxiliary_delivery_rank)
+}
+
+/// Returns whether an ambiguous boundary repair can retain a new payload at both headers.
+///
+/// A full bucket replaces one of its own unauthenticated rows. Each other header needs an
+/// aggregate slot, and `auxiliary_repair_capacity` reports the same shared slots for every such
+/// header, so the slots must cover all of them together.
+fn ambiguous_repair_capacity_suffices(
+    engine: &HeaderChainEngine,
+    targets: [block::Hash; 2],
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let mut needed_slots = 0;
+    let mut shared_slots = usize::MAX;
+    for target in targets {
+        let capacity = engine.auxiliary_repair_capacity(target, limits);
+        if engine.aux_deliveries(target).len() >= limits.max_aux_deliveries_per_header.get() {
+            if capacity == 0 {
+                return false;
+            }
+        } else {
+            needed_slots += 1;
+            shared_slots = capacity;
+        }
+    }
+    shared_slots >= needed_slots
+}
+
+/// Returns every usable VCT auxiliary delivery for a retained header in selection order.
+pub(crate) fn ranked_vct_auxiliary_deliveries(deliveries: Vec<AuxDelivery>) -> Vec<AuxDelivery> {
+    let mut usable: Vec<_> = deliveries
+        .into_iter()
+        .filter(vct_auxiliary_delivery_is_usable)
+        .collect();
+    usable.sort_unstable_by_key(vct_auxiliary_delivery_rank);
+    usable
+}
+
+fn vct_auxiliary_delivery_is_usable(delivery: &AuxDelivery) -> bool {
+    delivery.tree_aux.is_some() && !delivery.is_rejected()
+}
+
+fn vct_auxiliary_delivery_rank(delivery: &AuxDelivery) -> (u8, EvidenceId) {
+    (
+        if delivery.is_authenticated() {
+            0
+        } else if delivery.is_unauthenticated() {
+            1
+        } else if delivery.is_disputed() {
+            2
+        } else {
+            3
+        },
+        delivery.delivery_id,
+    )
 }
 
 /// Match durable base data and any outcome that the live engine still treats as authoritative.
@@ -435,6 +486,19 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
             || (row.outcome_status_code() == authoritative_status
                 && row.observation_digests() == authoritative_observations
                 && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
+}
+
+/// Return whether a selected repair can add input to, or replace input in, one header's bucket.
+fn repair_bucket_admits(
+    engine: &HeaderChainEngine,
+    hash: block::Hash,
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let deliveries = engine.aux_deliveries(hash);
+    deliveries.len() < limits.max_aux_deliveries_per_header.get()
+        || deliveries
+            .iter()
+            .any(|delivery| !delivery.is_authenticated())
 }
 
 fn auxiliary_rows_are_coherent(
@@ -477,7 +541,10 @@ pub enum HeaderChainStoreError {
     #[error(transparent)]
     Codec(#[from] HeaderChainValueError),
     /// Pure transition planning rejected the request before commit.
-    #[error(transparent)]
+    ///
+    /// Not transparent, so header sync can find the planner failure through
+    /// `source()` to classify the refusal.
+    #[error("{0}")]
     Transition(#[from] TransitionFailure),
     /// The writer could not install a committed transition in memory.
     /// The writer must fail closed.
@@ -913,7 +980,9 @@ struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
-    reservations: HashMap<SourceId, u64>,
+    reservations: HashMap<SourceId, (u64, RetainedPathCapacity, Option<ServingCapacitySignal>)>,
+    general_capacity: Option<ServingCapacitySignal>,
+    fallback_capacity: Option<ServingCapacitySignal>,
     // Idle hash indexes hold no serving capacity, retention roots, or disk snapshots.
     continuations: HashMap<SourceId, CanonicalHeaderPathCursor>,
 }
@@ -921,14 +990,23 @@ struct RetainedPathLeaseRegistry {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum RetainedPathCapacity {
     General,
-    FinalizedFallback,
+    Bounded,
 }
 
 impl RetainedPathCapacity {
+    fn for_range(ancestor: Frontier, target: Frontier) -> Self {
+        let count = target.height.0.saturating_sub(ancestor.height.0);
+        if count <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE {
+            Self::Bounded
+        } else {
+            Self::General
+        }
+    }
+
     fn limit(self) -> usize {
         match self {
             Self::General => MAX_RETAINED_PATH_LEASES.saturating_sub(1),
-            Self::FinalizedFallback => MAX_RETAINED_PATH_LEASES,
+            Self::Bounded => MAX_RETAINED_PATH_LEASES,
         }
     }
 }
@@ -947,6 +1025,7 @@ enum CanonicalHeaderPathPosition {
 
 #[derive(Clone, Debug)]
 struct CanonicalHeaderPathCursor {
+    capacity_signal: Option<ServingCapacitySignal>,
     lease_id: u64,
     peer: SourceId,
     session_id: u64,
@@ -955,9 +1034,9 @@ struct CanonicalHeaderPathCursor {
     scope: HeaderWorkAuthority,
     position: CanonicalHeaderPathPosition,
     last_frontier: Frontier,
-    retained_ancestor: Option<block::Hash>,
     retained_path: Arc<[block::Hash]>,
     idle_deadline: Instant,
+    capacity: RetainedPathCapacity,
 }
 
 impl CanonicalHeaderPathCursor {
@@ -982,8 +1061,8 @@ struct RetainedPathLeaseSpec {
     common_ancestor: Frontier,
     scope: HeaderWorkAuthority,
     position: CanonicalHeaderPathPosition,
-    retained_ancestor: Option<block::Hash>,
     retained_path: Arc<[block::Hash]>,
+    capacity: RetainedPathCapacity,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -992,6 +1071,45 @@ struct CanonicalHeaderPathAdvance {
     position: CanonicalHeaderPathPosition,
     last_frontier: Frontier,
     now: Instant,
+}
+
+/// Owns a blocking acquisition until the state-service caller receives its result.
+pub(crate) struct PendingRetainedPathAcquisition {
+    reader: HeaderChainReader,
+    outcome: Option<RetainedPathLeaseOutcome>,
+}
+
+impl PendingRetainedPathAcquisition {
+    pub(crate) fn new(reader: HeaderChainReader, outcome: RetainedPathLeaseOutcome) -> Self {
+        Self {
+            reader,
+            outcome: Some(outcome),
+        }
+    }
+
+    pub(crate) fn into_outcome(mut self) -> RetainedPathLeaseOutcome {
+        self.outcome
+            .take()
+            .expect("pending acquisition owns its outcome")
+    }
+}
+
+impl Drop for PendingRetainedPathAcquisition {
+    fn drop(&mut self) {
+        if let Some(RetainedPathLeaseOutcome::Acquired(lease)) = self.outcome.take() {
+            if let Err(error) = self.reader.release_retained_path(
+                lease.peer,
+                lease.session_id,
+                lease.lease_id,
+                lease.scope,
+            ) {
+                tracing::error!(
+                    ?error,
+                    "failed to release an abandoned header path acquisition"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1013,6 +1131,18 @@ impl RetainedPathReservation {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .commit_reservation(self.peer, self.reservation_id, spec, now);
+        self.active = false;
+        Ok(outcome)
+    }
+    /// Gives up reserve admission for a path that only ordinary capacity can serve.
+    ///
+    /// See [`RetainedPathLeaseRegistry::reject_beyond_reserve`] for the returned signal.
+    fn reject_beyond_reserve(mut self) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        let outcome = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .reject_beyond_reserve(self.peer, self.reservation_id);
         self.active = false;
         Ok(outcome)
     }
@@ -1041,7 +1171,40 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
-        self.by_peer.remove(&peer)
+        let mut cursor = self.by_peer.remove(&peer)?;
+        if let Some(signal) = cursor.capacity_signal.take() {
+            signal.release();
+        }
+        self.notify_capacity();
+        Some(cursor)
+    }
+
+    /// Counts reservations and leases admitted to ordinary capacity.
+    fn general_count(&self) -> usize {
+        self.by_peer
+            .values()
+            .filter(|cursor| cursor.capacity == RetainedPathCapacity::General)
+            .count()
+            + self
+                .reservations
+                .values()
+                .filter(|(_, class, _)| *class == RetainedPathCapacity::General)
+                .count()
+    }
+
+    fn notify_capacity(&mut self) {
+        let occupied = self.by_peer.len().saturating_add(self.reservations.len());
+        let general_count = self.general_count();
+        if general_count < RetainedPathCapacity::General.limit() {
+            if let Some(signal) = self.general_capacity.take() {
+                signal.release();
+            }
+        }
+        if occupied < RetainedPathCapacity::Bounded.limit() {
+            if let Some(signal) = self.fallback_capacity.take() {
+                signal.release();
+            }
+        }
     }
 
     fn reserve(
@@ -1049,24 +1212,74 @@ impl RetainedPathLeaseRegistry {
         peer: SourceId,
         now: Instant,
         capacity: RetainedPathCapacity,
-    ) -> Option<u64> {
+    ) -> Result<(u64, RetainedPathCapacity), RetainedPathLeaseOutcome> {
         self.expire(now);
-        if self.by_peer.contains_key(&peer)
-            || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
-        {
-            return None;
+        if let Some(cursor) = self.by_peer.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                cursor.capacity_signal.get_or_insert_default().clone(),
+            ));
         }
-        let reservation_id = self.next_reservation_id.checked_add(1)?;
+        if let Some((_, _, signal)) = self.reservations.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        // Ordinary transfers count only against ordinary slots, so a reserve lease never
+        // consumes one of them. A bounded request uses the reserve only when they are full.
+        let general_count = self.general_count();
+        let admitted_capacity = if general_count < RetainedPathCapacity::General.limit() {
+            RetainedPathCapacity::General
+        } else if capacity == RetainedPathCapacity::Bounded
+            && self.by_peer.len() + self.reservations.len() < RetainedPathCapacity::Bounded.limit()
+        {
+            RetainedPathCapacity::Bounded
+        } else {
+            let signal = match capacity {
+                RetainedPathCapacity::General => &mut self.general_capacity,
+                RetainedPathCapacity::Bounded => &mut self.fallback_capacity,
+            };
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        };
+        let reservation_id = self
+            .next_reservation_id
+            .checked_add(1)
+            .ok_or(RetainedPathLeaseOutcome::Busy)?;
         self.next_reservation_id = reservation_id;
-        self.reservations.insert(peer, reservation_id);
-        Some(reservation_id)
+        self.reservations
+            .insert(peer, (reservation_id, admitted_capacity, None));
+        Ok((reservation_id, admitted_capacity))
     }
 
     fn release_reservation(&mut self, peer: SourceId, reservation_id: u64) {
-        if self.reservations.get(&peer) == Some(&reservation_id) {
-            self.reservations.remove(&peer);
+        if self
+            .reservations
+            .get(&peer)
+            .is_some_and(|(id, _, _)| *id == reservation_id)
+        {
+            let (_, _, signal) = self
+                .reservations
+                .remove(&peer)
+                .expect("the reservation matches");
+            if let Some(signal) = signal {
+                signal.release();
+            }
+            self.notify_capacity();
         }
+    }
+
+    /// Releases a reserve admission whose path needs ordinary capacity and returns the ordinary
+    /// capacity signal, already released when an ordinary slot freed after admission.
+    fn reject_beyond_reserve(
+        &mut self,
+        peer: SourceId,
+        reservation_id: u64,
+    ) -> RetainedPathLeaseOutcome {
+        self.release_reservation(peer, reservation_id);
+        let signal = self.general_capacity.get_or_insert_default().clone();
+        self.notify_capacity();
+        RetainedPathLeaseOutcome::CapacityBusy(signal)
     }
 
     fn commit_reservation(
@@ -1076,18 +1289,29 @@ impl RetainedPathLeaseRegistry {
         spec: RetainedPathLeaseSpec,
         now: Instant,
     ) -> RetainedPathLeaseOutcome {
-        if peer != spec.peer || self.reservations.get(&peer) != Some(&reservation_id) {
+        if peer != spec.peer
+            || !self
+                .reservations
+                .get(&peer)
+                .is_some_and(|(id, class, _)| *id == reservation_id && *class == spec.capacity)
+        {
             return RetainedPathLeaseOutcome::Busy;
         }
-        self.reservations.remove(&peer);
         if self.by_peer.contains_key(&peer) {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         }
         let Some(lease_id) = self.next_lease_id.checked_add(1) else {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         };
         self.next_lease_id = lease_id;
+        let (_, _, capacity_signal) = self
+            .reservations
+            .remove(&peer)
+            .expect("the reservation matches");
         let cursor = CanonicalHeaderPathCursor {
+            capacity_signal,
             lease_id,
             peer: spec.peer,
             session_id: spec.session_id,
@@ -1096,9 +1320,9 @@ impl RetainedPathLeaseRegistry {
             scope: spec.scope,
             position: spec.position,
             last_frontier: spec.common_ancestor,
-            retained_ancestor: spec.retained_ancestor,
             retained_path: spec.retained_path,
             idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
+            capacity: spec.capacity,
         };
         let lease = cursor.lease();
         self.by_peer.insert(spec.peer, cursor);
@@ -1434,6 +1658,59 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         Ok(self.store.snapshot()?.frontiers.header_best)
+    }
+
+    /// Report whether the committed selected chain contains the header `hash`.
+    ///
+    /// At and above the finalized frontier, the retained graph gives the height and the in-memory
+    /// selected projection answers. Below it, the canonical finalized indexes answer, read from a
+    /// RocksDB snapshot captured with the frontier. Neither walks ancestry.
+    pub(crate) fn selected_chain_membership(
+        &self,
+        hash: block::Hash,
+    ) -> Result<SelectedChainMembership, HeaderChainStoreError> {
+        let (finalized, retained, read) = {
+            let _writer = self
+                .store
+                .writer
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let engine = self
+                .transition_engine
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let finalized = engine.snapshot().frontiers.finalized;
+            let retained = engine
+                .graph()
+                .header_node(hash)
+                .map(|node| Frontier::new(node.height, node.hash));
+            if let Some(frontier) = retained.filter(|node| node.height >= finalized.height) {
+                // Widening u32 to usize is lossless on supported targets.
+                let offset = (frontier.height.0 - finalized.height.0) as usize;
+                let projection = engine.selected_projection();
+                if projection.first() != Some(&finalized) {
+                    return Err(StoreError::Incoherent(
+                        "selected projection disagrees with its published bounds",
+                    )
+                    .into());
+                }
+                return Ok(if projection.get(offset) == Some(&frontier) {
+                    SelectedChainMembership::Selected(frontier)
+                } else {
+                    SelectedChainMembership::NotSelected
+                });
+            }
+            (finalized, retained.is_some(), self.store.audit_snapshot()?)
+        };
+        // Finalized rows below the captured frontier never change, so this read needs no lock.
+        Ok(match read.finalized_frontier(hash)? {
+            Some(frontier) if frontier.height < finalized.height => {
+                SelectedChainMembership::Selected(frontier)
+            }
+            // A retained fork below the finalized frontier is never selected.
+            _ if retained => SelectedChainMembership::NotSelected,
+            _ => SelectedChainMembership::NotRetained,
+        })
     }
 
     /// Capture full-state data and the durable selected projection from one transition generation.
@@ -1781,17 +2058,14 @@ impl HeaderChainReader {
             } else {
                 None
             };
-        let deliveries = self.coherent_aux_deliveries(&target)?;
+        self.coherent_aux_deliveries(&target)?;
         let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
         let engine = self
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let total_delivery_count = engine.aux_delivery_count();
-        let admission_capacity_available = deliveries.len()
-            < self.config.limits.max_aux_deliveries_per_header.get()
-            && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
-            && !snapshot.alarms.resource_stalled;
+        let repair_capacity = engine.auxiliary_repair_capacity(target_hash, self.config.limits);
+        let admission_capacity_available = repair_capacity > 0 && !snapshot.alarms.resource_stalled;
         let mut context = zakura_header_chain::VctRepairContext::from_durable_rows(
             selected_target,
             HeaderLocator::for_continuation(parent),
@@ -1800,18 +2074,21 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
-        if !durable_rows.is_empty() || !admission_capacity_available {
+        if let Some(ambiguous) = self.ambiguous_vct_repair_context(
+            &engine,
+            &context,
+            &durable_rows,
+            boundary_hash.filter(|_| height < checkpoint_ceiling),
+        )? {
+            return Ok(Some(ambiguous));
+        }
+        if zakura_header_chain::VctRepairContext::rows_constrain_repair(&durable_rows)
+            || !admission_capacity_available
+        {
             return Ok(Some(context));
         }
 
-        let available_aggregate_capacity = self
-            .config
-            .limits
-            .max_aux_deliveries_total
-            .get()
-            .saturating_sub(total_delivery_count);
-        let range_limit =
-            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get());
+        let range_limit = repair_capacity.min(self.config.limits.max_headers_per_transition.get());
         if range_limit <= 1 {
             return Ok(Some(context));
         }
@@ -1868,7 +2145,9 @@ impl HeaderChainReader {
                 )
                 .into());
             }
-            if !candidate_rows.is_empty() {
+            if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
+                || !repair_bucket_admits(&engine, candidate.hash, self.config.limits)
+            {
                 break;
             }
             suffix.push(candidate);
@@ -1890,6 +2169,67 @@ impl HeaderChainReader {
         drop(engine);
         context = context.extend_empty_selected_range(&suffix, terminal_boundary_hash)?;
         Ok(Some(context))
+    }
+
+    /// Extend a one-header VCT repair over its successor when one observation disputed both.
+    ///
+    /// Returns `Ok(None)` when the successor is absent or its rows show no ambiguous dispute.
+    fn ambiguous_vct_repair_context(
+        &self,
+        engine: &HeaderChainEngine,
+        context: &zakura_header_chain::VctRepairContext,
+        durable_rows: &[UntrustedAuxDeliveryRow],
+        successor_hash: Option<block::Hash>,
+    ) -> Result<Option<zakura_header_chain::VctRepairContext>, HeaderChainStoreError> {
+        let Some(successor_hash) = successor_hash else {
+            return Ok(None);
+        };
+        let successor_height = context
+            .target
+            .height
+            .next()
+            .map_err(|_| StoreError::Incoherent("VCT repair successor height overflowed"))?;
+        let successor = Frontier::new(successor_height, successor_hash);
+        let successor_node =
+            engine
+                .graph()
+                .header_node(successor_hash)
+                .ok_or(StoreError::Incoherent(
+                    "VCT repair successor references a missing node",
+                ))?;
+        let successor_rows = self.store.untrusted_aux_deliveries(successor_hash)?;
+        if !auxiliary_rows_are_coherent(
+            &successor_node.aux_delivery_ids,
+            engine.aux_deliveries(successor_hash),
+            &successor_rows,
+        ) {
+            return Err(StoreError::Incoherent(
+                "retained node and auxiliary delivery index disagree",
+            )
+            .into());
+        }
+        let selected = engine.selected_projection();
+        let terminal_boundary_hash = selected
+            .binary_search_by_key(&successor_height, |frontier| frontier.height)
+            .ok()
+            .filter(|index| selected[*index] == successor)
+            .ok_or(StoreError::Incoherent(
+                "VCT repair successor disagrees with the selected projection",
+            ))
+            .map(|index| selected.get(index.saturating_add(1)).map(|next| next.hash))?;
+        let successor_capacity_available = context.admission_capacity_available
+            && ambiguous_repair_capacity_suffices(
+                engine,
+                [context.target.hash, successor_hash],
+                self.config.limits,
+            );
+        Ok(context.clone().extend_ambiguous_boundary(
+            successor,
+            terminal_boundary_hash,
+            successor_capacity_available,
+            durable_rows,
+            &successor_rows,
+        )?)
     }
 
     /// Install the cursor only while its exact target is still available.
@@ -1924,82 +2264,18 @@ impl HeaderChainReader {
         reservation.commit(spec, Instant::now())
     }
 
-    /// Lease one bounded canonical range that ends below the finalized frontier.
+    /// Lease one immutable path from the nearest locator ancestor to an exact target.
     ///
-    /// Refusing a finalized target would strand any node whose VCT repair height every peer has
-    /// already finalized: the requester has no other way to obtain those headers and their
-    /// authenticated roots. The fallback accepts a canonical locator within one protocol range
-    /// of the target.
-    fn acquire_finalized_target_path(
-        &self,
-        reservation: RetainedPathReservation,
-        session_id: u64,
-        scope: HeaderWorkAuthority,
-        locator_hashes: &[block::Hash],
-        snapshot: &EngineSnapshot,
-        read: &audit_snapshot::HeaderChainAuditSnapshot<'_>,
-    ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
-        let peer = reservation.peer;
-        let Some(target) = read.finalized_frontier(scope.branch.target_tip_hash)? else {
-            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
-        };
-        if target.height >= snapshot.frontiers.finalized.height {
-            // A header at or above the finalized frontier belongs to the graph. Its absence there
-            // means the branch moved under the request, so the requester must re-derive it.
-            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
-        }
-        // The nearest canonical locator bounds the leased path. Honouring list order instead
-        // would let a requester place a distant ancestor behind a useless near entry and lease a
-        // complete protocol range it never needed.
-        let mut common_ancestor: Option<Frontier> = None;
-        for locator_hash in locator_hashes {
-            if let Some(frontier) = read.finalized_frontier(*locator_hash)? {
-                let distance = target.height.0.checked_sub(frontier.height.0);
-                if distance.is_some_and(|distance| {
-                    distance > 0 && distance <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
-                }) && common_ancestor.is_none_or(|nearest| frontier.height > nearest.height)
-                {
-                    common_ancestor = Some(frontier);
-                }
-            }
-        }
-        let Some(common_ancestor) = common_ancestor else {
-            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
-        };
-        let next = common_ancestor.height.next().map_err(|_| {
-            StoreError::Incoherent("canonical header cursor start height overflowed")
-        })?;
-        self.commit_path_lease(
-            reservation,
-            RetainedPathLeaseSpec {
-                peer,
-                session_id,
-                target,
-                common_ancestor,
-                scope,
-                position: CanonicalHeaderPathPosition::Finalized {
-                    next,
-                    end: target.height,
-                },
-                retained_ancestor: None,
-                retained_path: Arc::from(Vec::new()),
-            },
-        )
-    }
-
-    /// Lease a canonical header path from a locator intersection up to an exact target.
-    ///
-    /// The target resolves from the retained header graph, or, when it sits below the finalized
-    /// frontier, from the canonical finalized indexes. A VCT repair can ask for a bounded range
-    /// that every peer past it has already finalized. Refusing the second band would strand the
-    /// requester.
+    /// The target resolves from the retained header graph or, below the finalized frontier, from
+    /// the canonical finalized indexes. Storage does not affect locator rules or capacity
+    /// admission. Bounded paths can use the reserved slot; ordinary paths leave that slot
+    /// available for repair.
     ///
     /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
-    /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
-    /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
-    /// lease or capacity is unavailable. A successful page read consumes the lease.
-    /// Explicit release and expiry also free unused leases. The finalized fallback limits the
-    /// complete historical path to one protocol range.
+    /// when no locator hash is an ancestor of it, `HistoryPruned` when the retained path no
+    /// longer reaches a locator or the finalized frontier, and `Busy` when the peer already
+    /// holds a lease or capacity is unavailable. A successful page read consumes the lease.
+    /// Explicit release and expiry also free unused leases.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -2015,6 +2291,23 @@ impl HeaderChainReader {
                 "retained path locator count is outside protocol bounds",
             )));
         }
+        // Reserve before taking any commit lock or resolving peer-selected hashes.
+        // The reserve permits only a protocol-sized ancestry walk.
+        let admission = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .reserve(peer, Instant::now(), RetainedPathCapacity::Bounded);
+        let (reservation_id, capacity) = match admission {
+            Ok(admission) => admission,
+            Err(outcome) => return Ok(outcome),
+        };
+        let reservation = RetainedPathReservation {
+            leases: self.leases.clone(),
+            peer,
+            reservation_id,
+            active: true,
+        };
         // Capture frontiers and durable rows under one short commit barrier. All
         // ancestry reads run outside both locks, and lease installation rechecks
         // the exact target's availability after the snapshot read.
@@ -2029,28 +2322,6 @@ impl HeaderChainReader {
                 .lock()
                 .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
             (engine.snapshot(), self.store.audit_snapshot()?)
-        };
-        let target_node = read.retained_path_node(target_tip_hash)?;
-        // General paths may occupy all but one registry slot. A target outside the retained graph
-        // may use the final slot only when it resolves to the bounded finalized fallback below.
-        let capacity = if target_node.is_some() {
-            RetainedPathCapacity::General
-        } else {
-            RetainedPathCapacity::FinalizedFallback
-        };
-        let reservation_id = self
-            .leases
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .reserve(peer, Instant::now(), capacity);
-        let Some(reservation_id) = reservation_id else {
-            return Ok(RetainedPathLeaseOutcome::Busy);
-        };
-        let reservation = RetainedPathReservation {
-            leases: self.leases.clone(),
-            peer,
-            reservation_id,
-            active: true,
         };
         // Serving reads an exact hash, not the selected branch. The captured scope
         // correlates this lease with its requester and may predate normal head progress.
@@ -2068,13 +2339,11 @@ impl HeaderChainReader {
         if let Some(cursor) = continuation.filter(|cursor| {
             cursor.session_id == session_id
                 && cursor.target.hash == target_tip_hash
-                && locator_hashes.first() == Some(&cursor.last_frontier.hash)
+                && locator_hashes == [cursor.last_frontier.hash]
+                // A continuation cannot extend the range that its admitted class permits.
                 && (capacity == RetainedPathCapacity::General
-                    // Finalized fallback chooses the nearest locator and bounds the full
-                    // remaining range. Multiple locators must use that selection below.
-                    || (locator_hashes.len() == 1
-                        && cursor.target.height.0.saturating_sub(cursor.last_frontier.height.0)
-                            <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE))
+                    || RetainedPathCapacity::for_range(cursor.last_frontier, cursor.target)
+                        == RetainedPathCapacity::Bounded)
         }) {
             return self.commit_path_lease(
                 reservation,
@@ -2085,79 +2354,88 @@ impl HeaderChainReader {
                     common_ancestor: cursor.last_frontier,
                     scope,
                     position: cursor.position,
-                    retained_ancestor: cursor.retained_ancestor,
                     retained_path: cursor.retained_path,
+                    capacity,
                 },
             );
         }
-        let Some(target_node) = target_node else {
-            // The header graph holds only the retained suffix. A VCT repair can ask for a bounded
-            // range that every peer past it has finalized. The target is absent here but present
-            // and immutable in the finalized indexes.
-            return self.acquire_finalized_target_path(
-                reservation,
-                session_id,
-                scope,
-                locator_hashes,
-                &snapshot,
-                &read,
-            );
+        let locators: HashSet<_> = locator_hashes.iter().copied().collect();
+        let mut path = match read.retained_path_node(target_tip_hash)? {
+            Some(target_node) => match read.retained_ancestry_to_nearest_locator(
+                target_node,
+                snapshot.frontiers.finalized,
+                &locators,
+                (capacity == RetainedPathCapacity::Bounded)
+                    .then_some(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE),
+            )? {
+                serving_snapshot::RetainedAncestry::Path(path) => path,
+                serving_snapshot::RetainedAncestry::Pruned => {
+                    return Ok(RetainedPathLeaseOutcome::HistoryPruned)
+                }
+                serving_snapshot::RetainedAncestry::BeyondReserve => {
+                    return reservation.reject_beyond_reserve()
+                }
+            },
+            None => Vec::new(),
         };
-        let target = Frontier::new(target_node.height, target_tip_hash);
-        let Some(mut reverse_path) = read.retained_ancestry_to_locator(
-            target_node,
-            snapshot.frontiers.finalized,
-            locator_hashes,
-        )?
-        else {
-            return Ok(RetainedPathLeaseOutcome::HistoryPruned);
+        let target = match path.first().copied() {
+            Some(target) => target,
+            None => match read.finalized_frontier(target_tip_hash)? {
+                Some(target) if target.height < snapshot.frontiers.finalized.height => target,
+                _ => return Ok(RetainedPathLeaseOutcome::TargetNotRetained),
+            },
         };
-        reverse_path.reverse();
-        let mut intersection = None;
-        for locator_hash in locator_hashes {
-            if let Some(common_index) = reverse_path
-                .iter()
-                .position(|frontier| frontier.hash == *locator_hash)
-            {
-                intersection = Some((
-                    reverse_path[common_index],
-                    CanonicalHeaderPathPosition::Retained { next: 0 },
-                    common_index.saturating_add(1),
-                    Some(reverse_path[common_index].hash),
-                ));
-                break;
-            }
-            if let Some(frontier) = read.finalized_frontier(*locator_hash)? {
-                if frontier.height < snapshot.frontiers.finalized.height {
-                    let next = frontier.height.next().map_err(|_| {
-                        StoreError::Incoherent("canonical header cursor start height overflowed")
-                    })?;
-                    intersection = Some((
-                        frontier,
-                        CanonicalHeaderPathPosition::Finalized {
-                            next,
-                            end: snapshot.frontiers.finalized.height,
-                        },
-                        1,
-                        None,
-                    ));
-                    break;
+        path.reverse();
+        let finalized_end = target.height.min(snapshot.frontiers.finalized.height);
+        // The downward walk stops at the nearest retained locator. Finalized locators
+        // cannot improve that intersection, so they need no database reads.
+        let mut common_ancestor = path
+            .first()
+            .copied()
+            .filter(|frontier| locators.contains(&frontier.hash));
+        if common_ancestor.is_none() {
+            for locator_hash in locator_hashes {
+                if let Some(ancestor) = read
+                    .finalized_frontier(*locator_hash)?
+                    .filter(|frontier| frontier.height <= finalized_end)
+                {
+                    if common_ancestor.is_none_or(|nearest| ancestor.height > nearest.height) {
+                        common_ancestor = Some(ancestor);
+                    }
+                    if ancestor.height == finalized_end {
+                        break;
+                    }
                 }
             }
         }
-        let Some((common_ancestor, mut position, retained_start, retained_ancestor)) = intersection
-        else {
+        let Some(common_ancestor) = common_ancestor else {
             return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
         };
-        let retained_path: Arc<[block::Hash]> = reverse_path[retained_start..]
+        if capacity == RetainedPathCapacity::Bounded
+            && RetainedPathCapacity::for_range(common_ancestor, target)
+                != RetainedPathCapacity::Bounded
+        {
+            return reservation.reject_beyond_reserve();
+        }
+        let retained_path: Arc<[block::Hash]> = path
             .iter()
+            .filter(|frontier| {
+                frontier.height > common_ancestor.height && frontier.height > finalized_end
+            })
             .map(|frontier| frontier.hash)
             .collect();
-        if retained_path.is_empty()
-            && matches!(position, CanonicalHeaderPathPosition::Retained { .. })
-        {
-            position = CanonicalHeaderPathPosition::Complete;
-        }
+        let position = if common_ancestor == target {
+            CanonicalHeaderPathPosition::Complete
+        } else if common_ancestor.height < finalized_end {
+            CanonicalHeaderPathPosition::Finalized {
+                next: common_ancestor.height.next().map_err(|_| {
+                    StoreError::Incoherent("canonical header cursor start height overflowed")
+                })?,
+                end: finalized_end,
+            }
+        } else {
+            CanonicalHeaderPathPosition::Retained { next: 0 }
+        };
         self.commit_path_lease(
             reservation,
             RetainedPathLeaseSpec {
@@ -2167,8 +2445,8 @@ impl HeaderChainReader {
                 common_ancestor,
                 scope,
                 position,
-                retained_ancestor,
                 retained_path,
+                capacity,
             },
         )
     }
@@ -2452,6 +2730,13 @@ impl HeaderChainRuntime {
         &self.publisher
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_auxiliary_limits_for_test(&mut self, per_header: usize, total: usize) {
+        self.config.limits.max_aux_deliveries_per_header =
+            std::num::NonZeroUsize::new(per_header).unwrap();
+        self.config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(total).unwrap();
+    }
+
     /// Return a read-only handle whose compound reads share the transition lock.
     pub(crate) fn reader(&self) -> HeaderChainReader {
         HeaderChainReader {
@@ -2487,19 +2772,6 @@ impl HeaderChainRuntime {
         context: &TransitionContext<'_>,
     ) -> Result<ApplyResult, HeaderChainStoreError> {
         self.apply_combined(request, context, DiskWriteBatch::new(), || {})
-    }
-
-    #[cfg(test)]
-    fn apply_with_fault<F>(
-        &self,
-        request: TransitionRequest,
-        context: &TransitionContext<'_>,
-        fault: F,
-    ) -> Result<ApplyResult, HeaderChainStoreError>
-    where
-        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
-    {
-        self.apply_combined_with_fault(request, context, DiskWriteBatch::new(), || {}, fault)
     }
 
     pub(in crate::service) fn apply_combined<M>(
@@ -2987,6 +3259,7 @@ impl HeaderChainRuntime {
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
         if let TransitionEvent::InsertHeaders(insert) = &request.event {
+            let mut ambiguous_repair = false;
             if let zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                 common_ancestor,
                 selected_target,
@@ -3083,40 +3356,74 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
-                let aggregate_capacity_available = transition_engine
-                    .aux_delivery_count()
-                    .checked_add(repair_range.len())
-                    .is_some_and(|count| {
-                        count <= context.config.limits.max_aux_deliveries_total.get()
-                    });
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
                     before.state_version,
                     first_boundary_hash,
-                    aggregate_capacity_available
-                        && transition_engine.aux_deliveries(first_target.hash).len()
-                            < context.config.limits.max_aux_deliveries_per_header.get()
-                        && !before.alarms.resource_stalled,
+                    !before.alarms.resource_stalled,
                     &durable_rows_by_target[0],
                 )?;
-                if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || !aggregate_capacity_available
-                        || before.alarms.resource_stalled
-                    {
-                        return Ok(ApplyResult::Stale(StaleReceipt {
-                            current_version: before.state_version,
-                            branch,
-                        }));
+                let ambiguous_context = match repair_range.as_slice() {
+                    [_, successor] => current.clone().extend_ambiguous_boundary(
+                        *successor,
+                        terminal_boundary_hash,
+                        current.admission_capacity_available,
+                        &durable_rows_by_target[0],
+                        &durable_rows_by_target[1],
+                    )?,
+                    _ => None,
+                };
+                if let Some(ambiguous_context) = ambiguous_context {
+                    current = ambiguous_context;
+                    ambiguous_repair = true;
+                }
+                // An ambiguous repair may add a new payload at both headers. An empty range shares
+                // the aggregate slots across its headers.
+                let capacity_suffices = match (ambiguous_repair, repair_range.as_slice()) {
+                    (true, [target, successor]) => ambiguous_repair_capacity_suffices(
+                        &transition_engine,
+                        [target.hash, successor.hash],
+                        context.config.limits,
+                    ),
+                    _ => {
+                        transition_engine
+                            .auxiliary_repair_capacity(first_target.hash, context.config.limits)
+                            >= repair_range.len()
                     }
-                    current = current
-                        .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
-                    && current.episode != episode
-                {
-                    current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
+                };
+                if !capacity_suffices {
+                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
+                }
+                if !ambiguous_repair {
+                    if repair_range.len() > 1 {
+                        if durable_rows_by_target.iter().any(|rows| {
+                            zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
+                        }) || repair_range.iter().any(|target| {
+                            !repair_bucket_admits(
+                                &transition_engine,
+                                target.hash,
+                                context.config.limits,
+                            )
+                        }) || before.alarms.resource_stalled
+                        {
+                            return Ok(ApplyResult::Stale(StaleReceipt {
+                                current_version: before.state_version,
+                                branch,
+                            }));
+                        }
+                        current = current.extend_empty_selected_range(
+                            &repair_range[1..],
+                            terminal_boundary_hash,
+                        )?;
+                    } else if !zakura_header_chain::VctRepairContext::rows_constrain_repair(
+                        &durable_rows_by_target[0],
+                    ) && current.admission_capacity_available
+                        && current.episode != episode
+                    {
+                        current =
+                            current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
+                    }
                 }
                 if current.episode != episode {
                     return Ok(ApplyResult::Stale(StaleReceipt {
@@ -3124,6 +3431,8 @@ impl HeaderChainRuntime {
                         branch,
                     }));
                 }
+                // An ambiguous boundary repair needs one new payload. Admission drops the other.
+                let mut admits_new_input = false;
                 for delivery in &insert.aux {
                     let live_deliveries = transition_engine.aux_deliveries(delivery.header_hash);
                     let repeats_retained_payload = live_deliveries.iter().any(|retained| {
@@ -3132,12 +3441,19 @@ impl HeaderChainRuntime {
                     let retained_source = live_deliveries.iter().any(|retained| {
                         retained.tree_aux.is_some() && retained.source == delivery.source
                     });
-                    if repeats_retained_payload || retained_source {
+                    admits_new_input |= !repeats_retained_payload && !retained_source;
+                    if (repeats_retained_payload || retained_source) && !ambiguous_repair {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
                             branch,
                         }));
                     }
+                }
+                if !admits_new_input {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
                 }
             }
 
@@ -3177,6 +3493,18 @@ impl HeaderChainRuntime {
                 else {
                     continue;
                 };
+                // Header admission drops a retained payload, so its old outcome cannot block the
+                // new payload of an ambiguous boundary repair.
+                if ambiguous_repair
+                    && transition_engine
+                        .aux_deliveries(delivery.header_hash)
+                        .iter()
+                        .any(|retained| {
+                            retained.semantic_fingerprint() == delivery.semantic_fingerprint()
+                        })
+                {
+                    continue;
+                }
                 let durable_rows = self.store.untrusted_aux_deliveries(target.hash)?;
                 if let Some(target_node) = transition_engine.graph().header_node(target.hash) {
                     if !auxiliary_rows_are_coherent(
@@ -5966,6 +6294,16 @@ impl HeaderChainStore {
     }
 
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
+        self.header_node_hashed(hash)
+            .map(|node| node.map(|(node, _)| node))
+    }
+
+    /// Like [`Self::header_node`], also returning the header hash computed by this read's decode,
+    /// for checks later in the same operation. It is never kept across operations.
+    fn header_node_hashed(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Option<(HeaderNode, zakura_header_chain::HashedHeader)>, StoreError> {
         #[cfg(test)]
         TEST_HEADER_NODE_DISK_READS.with(|reads| {
             reads.set(
@@ -5975,17 +6313,25 @@ impl HeaderChainStore {
                     .expect("test header-node disk read count stays below u64::MAX"),
             );
         });
-        let value = self
-            .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
-            .map_err(store_error)?;
+        // Same as `get_value::<HeaderNodeDisk>`, keeping the decode's header hash.
+        let value = (|| -> Result<_, HeaderChainStoreError> {
+            let cf = self.cf(HEADER_NODE_BY_HASH)?;
+            self.db
+                .raw_get_cf(&cf, hash.0.as_ref())?
+                .map(|raw| HeaderNodeDisk::decode_hashed(&raw).map_err(Into::into))
+                .transpose()
+        })()
+        .map_err(store_error)?;
         value
-            .map(|value| {
+            .map(|(value, hashed)| {
                 if value.hash != hash {
                     return Err(StoreError::Incoherent("node key/hash mismatch"));
                 }
                 let reasons = self.direct_reasons(hash).map_err(store_error)?;
+                let evidence = hashed.clone();
                 value
-                    .into_domain(reasons)
+                    .into_domain_hashed(hashed, reasons)
+                    .map(|node| (node, evidence))
                     .map_err(|_| StoreError::Incoherent("invalid durable node"))
             })
             .transpose()
@@ -6030,21 +6376,18 @@ impl HeaderChainStore {
         network: &Network,
     ) -> Result<ValidationLease, StoreError> {
         let metadata = self.metadata()?;
-        let parent_node = self
-            .header_node(parent)?
+        let (parent_node, parent_header) = self
+            .header_node_hashed(parent)?
             .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
         let parent_frontier = Frontier::new(parent_node.height, parent);
-        let mut predecessors = vec![zakura_header_chain::HeaderContextFact {
-            frontier: parent_frontier,
-            header: parent_node.header.clone(),
-        }];
+        let mut predecessors = vec![(parent_frontier, parent_header)];
         predecessors.extend(
-            authenticated_context_headers(self, parent, None)?
+            authenticated_context_headers_with_hashes(self, parent, None)?
                 .into_iter()
                 .rev()
-                .map(|context| context.fact()),
+                .map(|(context, header)| (Frontier::new(context.height, header.hash()), header)),
         );
-        Ok(ValidationLease::new(
+        Ok(ValidationLease::from_hashed_predecessors(
             parent_frontier,
             predecessors,
             network.clone(),
@@ -6175,6 +6518,24 @@ fn authenticated_context_headers(
     parent: block::Hash,
     staged_nodes: Option<&HashMap<block::Hash, &HeaderNode>>,
 ) -> Result<Vec<HeaderValidationContextDisk>, StoreError> {
+    authenticated_context_headers_with_hashes(store, parent, staged_nodes)
+        .map(|contexts| contexts.into_iter().map(|(context, _)| context).collect())
+}
+
+/// Like [`authenticated_context_headers`], and also returns each context header as a
+/// [`zakura_header_chain::HashedHeader`]: the header with the hash its integrity-checking decode
+/// computed, which this function has checked against the stored hash and the predecessor linkage.
+fn authenticated_context_headers_with_hashes(
+    store: &HeaderChainStore,
+    parent: block::Hash,
+    staged_nodes: Option<&HashMap<block::Hash, &HeaderNode>>,
+) -> Result<
+    Vec<(
+        HeaderValidationContextDisk,
+        zakura_header_chain::HashedHeader,
+    )>,
+    StoreError,
+> {
     let staged_parent = staged_nodes.and_then(|nodes| nodes.get(&parent).copied());
     let stored_parent = if staged_parent.is_none() {
         store.header_node(parent)?
@@ -6197,28 +6558,45 @@ fn authenticated_context_headers(
             .map_err(|_| StoreError::Incoherent("validation context height underflow"))?;
         let staged_node = staged_nodes.and_then(|nodes| nodes.get(&current_hash).copied());
         let stored_node = if staged_node.is_none() {
-            store.header_node(current_hash)?
+            store.header_node_hashed(current_hash)?
         } else {
             None
         };
-        let context = if let Some(node) = staged_node.or(stored_node.as_ref()) {
-            HeaderValidationContextDisk {
-                header: node.header.clone(),
-                height: node.height,
-            }
+        let (context, header) = if let Some((node, header)) = stored_node {
+            // `header_node_hashed` just decoded this node from disk; its header hash was computed
+            // from these bytes by that decode and checked against the stored hash there and in
+            // `HeaderNode::from_hashed_durable_parts`.
+            (
+                HeaderValidationContextDisk {
+                    header: node.header,
+                    height: node.height,
+                },
+                header,
+            )
+        } else if let Some(node) = staged_node {
+            // Staged nodes are caller-supplied in-memory values with public fields: hash them.
+            (
+                HeaderValidationContextDisk {
+                    header: node.header.clone(),
+                    height: node.height,
+                },
+                zakura_header_chain::HashedHeader::new(node.header.clone()),
+            )
         } else {
-            store
+            let context = store
                 .get_value::<HeaderValidationContextDisk>(HEADER_VALIDATION_CONTEXT, current_hash.0)
                 .map_err(store_error)?
-                .ok_or(StoreError::Incoherent("validation context has a gap"))?
+                .ok_or(StoreError::Incoherent("validation context has a gap"))?;
+            let header = zakura_header_chain::HashedHeader::new(context.header.clone());
+            (context, header)
         };
-        if context.header.hash() != current_hash || context.height != expected_height {
+        if header.hash() != current_hash || context.height != expected_height {
             return Err(StoreError::Incoherent(
                 "invalid immutable validation context",
             ));
         }
         current_hash = context.header.previous_block_hash;
-        contexts.push(context);
+        contexts.push((context, header));
     }
     contexts.reverse();
     Ok(contexts)
@@ -6244,25 +6622,6 @@ impl HeaderChainStore {
             .single()
             .ok_or(StoreError::Incoherent("invalid deferred-index timestamp"))
             .map(Some)
-    }
-
-    fn projection_entries(&self, family: &'static str) -> Result<Vec<Frontier>, StoreError> {
-        let mut projection = Vec::new();
-        for (key, value) in self.scan_raw(family).map_err(store_error)? {
-            if key.len() != 4 || value.len() != 32 {
-                return Err(StoreError::Incoherent("invalid projection row width"));
-            }
-            let height = HeaderHeightKey::from_bytes(&key).0;
-            let hash = block::Hash(
-                value
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Incoherent("invalid projection hash"))?,
-            );
-            projection.push(Frontier::new(height, hash));
-        }
-        projection.sort_unstable_by_key(|frontier| (frontier.height, frontier.hash.0));
-        Ok(projection)
     }
 
     fn projection_hash(

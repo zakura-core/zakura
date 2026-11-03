@@ -8,8 +8,6 @@ use halo2::{
 // Only the test-vector hash below rebuilds a `HashDomain` from raw message bits;
 // the production Merkle path uses a cached domain in `crate::orchard::tree`.
 #[cfg(test)]
-use bitvec::prelude::*;
-#[cfg(test)]
 use sinsemilla::HashDomain;
 
 /// [Coordinate Extractor for Pallas][concreteextractorpallas]
@@ -63,11 +61,11 @@ pub fn pallas_group_hash(D: &[u8], M: &[u8]) -> pallas::Point {
 /// [`crate::orchard::tree`] hashes through a cached domain instead.
 #[cfg(test)]
 #[allow(non_snake_case)]
-pub fn sinsemilla_hash(D: &[u8], M: &BitVec<u8, Lsb0>) -> Option<pallas::Base> {
+pub fn sinsemilla_hash(D: &[u8], M: &[bool]) -> Option<pallas::Base> {
     let domain = std::str::from_utf8(D).expect("must be valid UTF-8");
     let hash_domain = HashDomain::new(domain);
 
-    hash_domain.hash(M.iter().map(|b| *b.as_ref())).into()
+    hash_domain.hash(M.iter().copied()).into()
 }
 
 #[cfg(test)]
@@ -88,10 +86,8 @@ mod tests {
 
         for tv in tests::vectors::SINSEMILLA.iter() {
             let D = tv.domain.as_slice();
-            let M: &BitVec<u8, Lsb0> = &tv.msg.iter().collect();
-
             assert_eq!(
-                sinsemilla_hash(D, M).expect("should not fail per Theorem 5.4.4"),
+                sinsemilla_hash(D, &tv.msg).expect("should not fail per Theorem 5.4.4"),
                 pallas::Base::from_repr(tv.hash).unwrap()
             )
         }

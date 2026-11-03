@@ -1,11 +1,9 @@
 //! Mining config
 
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, ops::Deref, sync::LazyLock};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{serde_as, DisplayFromStr};
 
-use strum_macros::EnumIter;
 use zakura_chain::parameters::NetworkKind;
 use zcash_address::ZcashAddress;
 use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_LEN};
@@ -33,14 +31,15 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
     MAX_MINER_DATA_LEN - ZAKURA_COINBASE_MARKER.len() - ZAKURA_COINBASE_SEPARATOR.len() - 2;
 
 /// Mining configuration section.
-#[serde_as]
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
-    /// Used in coinbase tx constructed in `getblocktemplate` RPC.
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    /// Used in coinbase tx constructed in `getblocktemplate` RPC. Sapling-only
+    /// addresses are unsupported. Unified addresses use their Orchard receiver
+    /// for Ironwood rewards after NU6.3, or their transparent receiver otherwise.
+    #[serde(with = "miner_address")]
     pub miner_address: Option<ZcashAddress>,
 
     /// Optional tag that Zakura appends to the coinbase input of every block it
@@ -57,8 +56,9 @@ pub struct Config {
 
     /// Mine blocks using Zakura's internal miner, without an external mining pool or equihash solver.
     ///
-    /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
-    /// for a valid Proof of Work.
+    /// Requires a `zakurad` built with the experimental `internal-miner` feature, which solves
+    /// Equihash with one low-priority thread. Miners that share a `miner_address` should set
+    /// distinct `extra_coinbase_data`, so they do not search identical work.
     ///
     /// The internal miner is off by default.
     #[serde(default)]
@@ -67,6 +67,34 @@ pub struct Config {
     /// Advertise prepared mined block hashes after expected-work validation and state admission,
     /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
+}
+
+mod miner_address {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use zcash_address::ZcashAddress;
+
+    pub(super) fn serialize<S>(
+        address: &Option<ZcashAddress>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        address
+            .as_ref()
+            .map(ToString::to_string)
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<ZcashAddress>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|encoded| encoded.parse())
+            .transpose()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for Config {
@@ -146,7 +174,7 @@ impl Serialize for ExtraCoinbaseData {
 }
 
 /// The desired address type for the `mining.miner_address` field in the config.
-#[derive(EnumIter, Eq, PartialEq, Default, Hash)]
+#[derive(Eq, PartialEq, Default, Hash)]
 pub enum MinerAddressType {
     /// A unified address, containing the components of all the other address types.
     Unified,
@@ -167,40 +195,56 @@ pub fn default_miner_address(kind: NetworkKind, addr_type: &MinerAddressType) ->
     MINER_ADDRESS[&kind][addr_type]
 }
 
-lazy_static::lazy_static! {
-    static ref MINER_ADDRESS: HashMap<NetworkKind, HashMap<MinerAddressType, &'static str>> = [
-        (NetworkKind::Mainnet, [
-            (MinerAddressType::Unified, "u1cymdny2u2vllkx7t5jnelp0kde0dgnwu0jzmggzguxvxj6fe7gpuqehywejndlrjwgk9snr6g69azs8jfet78s9zy60uepx6tltk7ee57jlax49dezkhkgvjy2puuue6dvaevt53nah7t2cc2k4p0h0jxmlu9sx58m2xdm5f9sy2n89jdf8llflvtml2ll43e334avu2fwytuna404a"),
-            // (MinerAddressType::Orchard, "u1hmfjpqdxaec3mvqypl7fkqcy53u438csydljpuepsfs7jx6sjwyznuzlna8qsslj3tg6sn9ua4q653280aqv4m2fjd4csptwxq3fjpwy"),
-            (MinerAddressType::Sapling, "zs1xl84ekz6stprmvrp39s77mf9t953nqjndwlcjtzfrr3cgjjez87639xm4u9pfuvylrhec3uryy5"),
-            (MinerAddressType::Transparent, "t1T92bmyoPM7PTSWUnaWnLGcxkF6Jp1AwMY"),
-        ].into()),
-        (NetworkKind::Testnet, [
-            (MinerAddressType::Unified, "utest10a8k6aw5w33kvyt7x6fryzu7vvsjru5vgcfnvr288qx2zm6p63ygcajtaze0px08t583dyrgr42vasazjhhnntus2tqrpkzu0dm2l4cgf3ld6wdqdrf3jv8mvfx9c80e73syer9l2wlgawjtf7yvj0eqwdf354trtelxnr0fhpw9792eaf49ghstkyftc9lwqqwy4ye0cleagp4nzyt"),
-            // (MinerAddressType::Orchard, "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp"),
-            (MinerAddressType::Sapling, "ztestsapling1xl84ekz6stprmvrp39s77mf9t953nqjndwlcjtzfrr3cgjjez87639xm4u9pfuvylrhecet38rq"),
-            (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
-        ].into()),
-        (NetworkKind::Regtest, [
-            (MinerAddressType::Unified, "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv"),
-            // (MinerAddressType::Orchard, "uregtest1pszqlgxaf5w8mu2yd9uygg8cswp0ec4f7eejqnqc35tztw4tk0sxnt3pym2f3s2872cy2ruuc5n8y9cen5q6ngzlmzu8ztrjesv8zm9j"),
-            (MinerAddressType::Sapling, "zregtestsapling1xl84ekz6stprmvrp39s77mf9t953nqjndwlcjtzfrr3cgjjez87639xm4u9pfuvylrhecx0c2j8"),
-            (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
-        ].into()),
-    ].into();
-}
+static MINER_ADDRESS: LazyLock<HashMap<NetworkKind, HashMap<MinerAddressType, &'static str>>> =
+    LazyLock::new(|| {
+        [
+    (NetworkKind::Mainnet, [
+        (MinerAddressType::Unified, "u1cymdny2u2vllkx7t5jnelp0kde0dgnwu0jzmggzguxvxj6fe7gpuqehywejndlrjwgk9snr6g69azs8jfet78s9zy60uepx6tltk7ee57jlax49dezkhkgvjy2puuue6dvaevt53nah7t2cc2k4p0h0jxmlu9sx58m2xdm5f9sy2n89jdf8llflvtml2ll43e334avu2fwytuna404a"),
+        // (MinerAddressType::Orchard, "u1hmfjpqdxaec3mvqypl7fkqcy53u438csydljpuepsfs7jx6sjwyznuzlna8qsslj3tg6sn9ua4q653280aqv4m2fjd4csptwxq3fjpwy"),
+        (MinerAddressType::Sapling, "zs1xl84ekz6stprmvrp39s77mf9t953nqjndwlcjtzfrr3cgjjez87639xm4u9pfuvylrhec3uryy5"),
+        (MinerAddressType::Transparent, "t1T92bmyoPM7PTSWUnaWnLGcxkF6Jp1AwMY"),
+    ].into()),
+    (NetworkKind::Testnet, [
+        (MinerAddressType::Unified, "utest10a8k6aw5w33kvyt7x6fryzu7vvsjru5vgcfnvr288qx2zm6p63ygcajtaze0px08t583dyrgr42vasazjhhnntus2tqrpkzu0dm2l4cgf3ld6wdqdrf3jv8mvfx9c80e73syer9l2wlgawjtf7yvj0eqwdf354trtelxnr0fhpw9792eaf49ghstkyftc9lwqqwy4ye0cleagp4nzyt"),
+        // (MinerAddressType::Orchard, "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp"),
+        (MinerAddressType::Sapling, "ztestsapling1xl84ekz6stprmvrp39s77mf9t953nqjndwlcjtzfrr3cgjjez87639xm4u9pfuvylrhecet38rq"),
+        (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
+    ].into()),
+    (NetworkKind::Regtest, [
+        (MinerAddressType::Unified, "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv"),
+        // (MinerAddressType::Orchard, "uregtest1pszqlgxaf5w8mu2yd9uygg8cswp0ec4f7eejqnqc35tztw4tk0sxnt3pym2f3s2872cy2ruuc5n8y9cen5q6ngzlmzu8ztrjesv8zm9j"),
+        (MinerAddressType::Sapling, "zregtestsapling1xl84ekz6stprmvrp39s77mf9t953nqjndwlcjtzfrr3cgjjez87639xm4u9pfuvylrhecx0c2j8"),
+        (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
+    ].into()),
+].into()
+    });
 
 #[cfg(test)]
 mod tests {
     use super::Config;
 
     #[test]
-    fn optimistic_block_inventory_defaults_on_and_can_be_disabled() {
-        let default: Config = toml::from_str("").expect("empty mining config uses defaults");
-        assert!(default.optimistic_block_inventory);
+    fn miner_address_preserves_string_encoding_and_optional_defaults() {
+        let encoded = "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq";
+        let config: Config = toml::from_str(&format!("miner_address = {encoded:?}")).unwrap();
+        assert_eq!(config.miner_address.as_ref().unwrap().to_string(), encoded);
+        let serialized = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["miner_address"],
+            encoded
+        );
 
-        let disabled: Config = toml::from_str("optimistic_block_inventory = false")
-            .expect("the optimistic inventory option is valid");
-        assert!(!disabled.optimistic_block_inventory);
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!({"miner_address": null}),
+        ] {
+            assert!(serde_json::from_value::<Config>(json)
+                .unwrap()
+                .miner_address
+                .is_none());
+        }
+        assert!(toml::from_str::<Config>("miner_address = 'invalid'").is_err());
+        assert!(toml::from_str::<Config>("miner_address = 42").is_err());
     }
 }

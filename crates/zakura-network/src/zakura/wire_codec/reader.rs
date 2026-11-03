@@ -22,6 +22,23 @@ impl<'a> BoundedReader<'a> {
         self.unread.len()
     }
 
+    /// Consume the remaining payload as opaque bytes without allocating.
+    pub(crate) fn take_remaining(&mut self) -> &'a [u8] {
+        std::mem::take(&mut self.unread)
+    }
+
+    /// Read the next `len` bytes without copying them.
+    ///
+    /// `item` names the item being read in a truncation error.
+    pub(crate) fn bytes(&mut self, len: usize, item: &'static str) -> Result<&'a [u8], WireError> {
+        if len > self.unread.len() {
+            return Err(WireError::Truncated(item));
+        }
+        let (bytes, rest) = self.unread.split_at(len);
+        self.unread = rest;
+        Ok(bytes)
+    }
+
     /// Read one typed item.
     pub fn read<T: Wire>(&mut self) -> Result<T::Value, WireError> {
         T::decode(self)

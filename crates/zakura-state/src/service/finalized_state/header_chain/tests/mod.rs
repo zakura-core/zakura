@@ -1,5 +1,6 @@
 //! Tests for the durable header-chain store and runtime.
 
+mod auxiliary_sequences;
 mod crash;
 mod runtime;
 mod startup;

@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use futures::{Future, FutureExt, StreamExt};
 use indexmap::IndexSet;
 use tower::{timeout::Timeout, Service};
@@ -41,7 +41,7 @@ use crate::{
         sync::{
             self,
             downloads::{
-                lookahead_heights, BlockDownloadVerifyError, Downloads,
+                lookahead_heights, BlockDownloadVerifyError, Downloads, ParentWait,
                 VERIFICATION_PIPELINE_DROP_LIMIT,
             },
             legacy_trace::LegacySyncTrace,
@@ -157,7 +157,8 @@ async fn profile_tip_requires_a_positive_peer_confirmation() -> Result<(), crate
     Ok(())
 }
 
-/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
+/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and
+/// blocks 3-4 using extend_tips, discarding each response's trailing hash.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
 #[tokio::test(start_paused = true)]
@@ -972,264 +973,6 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         "legacy sync should continue after the checkpoint range completes"
     );
     sync_task.abort();
-
-    Ok(())
-}
-
-/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips,
-/// with unrelated trailing hashes that are discarded.
-///
-/// This test also makes sure that the syncer downloads blocks in order.
-#[tokio::test(start_paused = true)]
-async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
-    // Get services
-    let (
-        chain_sync_future,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        mut state_service,
-        _mock_chain_tip_sender,
-    ) = setup();
-
-    // Get blocks
-    let block0: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
-    let block0_hash = block0.hash();
-
-    let block1: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
-    let block1_hash = block1.hash();
-
-    let block2: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
-    let block2_hash = block2.hash();
-
-    let block3: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
-    let block3_hash = block3.hash();
-
-    let block4: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?;
-    let block4_hash = block4.hash();
-
-    let block5: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?;
-    let block5_hash = block5.hash();
-
-    // Start the syncer
-    let chain_sync_task_handle = tokio::spawn(chain_sync_future);
-
-    // ChainSync::request_genesis
-
-    // State is checked for genesis
-    state_service
-        .expect_request(zs::Request::KnownBlock(block0_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-
-    // Block 0 is fetched and committed to the state
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
-            None,
-        ))]));
-
-    block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
-        .await
-        .respond(block0_hash);
-
-    // Check that nothing unexpected happened.
-    // We expect more requests to the state service, because the syncer keeps on running.
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-
-    // State is checked for genesis again
-    state_service
-        .expect_request(zs::Request::KnownBlock(block0_hash))
-        .await
-        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
-
-    // ChainSync::obtain_tips
-
-    // State is asked for a block locator.
-    state_service
-        .expect_request(zs::Request::BlockLocator)
-        .await
-        .respond(zs::Response::BlockLocator(vec![block0_hash]));
-
-    // Network is sent the block locator
-    peer_set
-        .expect_request(zn::Request::FindBlocks {
-            known_blocks: vec![block0_hash],
-            stop: None,
-        })
-        .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
-
-    // State is checked for each candidate hash before it is queued.
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-    }
-
-    // Check that nothing unexpected happened.
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-
-    // State is checked for all non-tip blocks (blocks 1 & 2) in response order
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-
-    // Blocks 1 & 2 are fetched in order, then verified concurrently
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
-            None,
-        ))]));
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
-            None,
-        ))]));
-
-    // We can't guarantee the verification request order
-    let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
-        [(block1_hash, block1), (block2_hash, block2)]
-            .iter()
-            .cloned()
-            .collect();
-
-    for _ in 1..=2 {
-        block_verifier_router
-            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
-            .await
-            .respond_with(|req| req.block().hash());
-    }
-    assert_eq!(
-        remaining_blocks,
-        HashMap::new(),
-        "expected all non-tip blocks to be verified by obtain tips"
-    );
-
-    // Check that nothing unexpected happened.
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    // ChainSync::extend_tips
-
-    // Network is sent a block locator based on the tip
-    peer_set
-        .expect_request(zn::Request::FindBlocks {
-            known_blocks: vec![block1_hash],
-            stop: None,
-        })
-        .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
-        ]));
-
-    for hash in [block3_hash, block4_hash] {
-        state_service
-            .expect_request(zs::Request::KnownBlock(hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-    }
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block1_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
-    }
-
-    // Check that nothing unexpected happened.
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    // Blocks 3 & 4 are fetched in order, then verified concurrently
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block3.clone(),
-            None,
-        ))]));
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block4.clone(),
-            None,
-        ))]));
-
-    // We can't guarantee the verification request order
-    let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
-        [(block3_hash, block3), (block4_hash, block4)]
-            .iter()
-            .cloned()
-            .collect();
-
-    for _ in 3..=4 {
-        block_verifier_router
-            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
-            .await
-            .respond_with(|req| req.block().hash());
-    }
-    assert_eq!(
-        remaining_blocks,
-        HashMap::new(),
-        "expected all non-tip blocks to be verified by extend tips"
-    );
-
-    // Check that nothing unexpected happened.
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    let chain_sync_result = chain_sync_task_handle.now_or_never();
-    assert!(
-        chain_sync_result.is_none(),
-        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
-    );
 
     Ok(())
 }
@@ -3908,6 +3651,9 @@ async fn empty_block_response_is_retryable_download_failure() {
         peer_set.clone(),
         verifier,
         chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3956,6 +3702,9 @@ async fn block_download_network_readiness_times_out() {
         NeverReadyNetwork,
         verifier,
         chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -3973,11 +3722,33 @@ async fn block_download_network_readiness_times_out() {
     assert_eq!(downloads.in_flight(), 0);
 }
 
-/// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`.
+/// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`, whose parent waits
+/// panic.
 fn setup_downloads(
     peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
     verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     chain_tip: MockChainTip,
+) -> Downloads<
+    MockService<zn::Request, zn::Response, PanicAssertion>,
+    MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    MockChainTip,
+> {
+    setup_downloads_with_parent_wait(
+        peer_set,
+        verifier,
+        chain_tip,
+        ParentWait(Arc::new(|parent| {
+            panic!("unexpected parent wait for {parent:?}")
+        })),
+    )
+}
+
+/// Builds a [`Downloads`] like [`setup_downloads`], with `parent_wait` for unconfirmed bindings.
+fn setup_downloads_with_parent_wait(
+    peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
+    verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    chain_tip: MockChainTip,
+    parent_wait: ParentWait,
 ) -> Downloads<
     MockService<zn::Request, zn::Response, PanicAssertion>,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
@@ -3990,6 +3761,7 @@ fn setup_downloads(
         peer_set,
         verifier,
         chain_tip,
+        parent_wait,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
@@ -4145,6 +3917,229 @@ async fn tip_child_rejects_forged_high_coinbase_height() {
     verifier.expect_no_requests().await;
 }
 
+/// Returns a verifier error for a body whose binding couldn't be confirmed before `parent`
+/// committed.
+fn unconfirmed_verifier_error(parent: block::Hash) -> zn::BoxError {
+    RouterError::Block {
+        source: Box::new(VerifyBlockError::AuthDataUnconfirmed {
+            parent,
+            source: Box::new(VerifyBlockError::Transaction(
+                TransactionError::Halo2VerificationFailed,
+            )),
+        }),
+    }
+    .into()
+}
+
+/// A body whose binding is unconfirmed waits for its parent in the download task, then verifies
+/// once more. If the parent never commits, the task returns the unconfirmed error without a
+/// second verification.
+#[tokio::test]
+async fn unconfirmed_binding_reverifies_after_the_parent_commits() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let hash = block.hash();
+    let parent = block.header.previous_block_hash;
+
+    for parent_commits in [true, false] {
+        let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+        let mut verifier =
+            MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+        let (chain_tip, chain_tip_sender) = MockChainTip::new();
+        chain_tip_sender.send_best_tip_height(Height(1_687_106));
+        chain_tip_sender.send_best_tip_hash(parent);
+
+        let waits = Arc::new(AtomicUsize::new(0));
+        let parent_wait = {
+            let waits = waits.clone();
+            ParentWait(Arc::new(move |waited_for| {
+                assert_eq!(waited_for, parent);
+                waits.fetch_add(1, Ordering::SeqCst);
+                async move { parent_commits }.boxed()
+            }))
+        };
+        let mut downloads = setup_downloads_with_parent_wait(
+            peer_set.clone(),
+            verifier.clone(),
+            chain_tip,
+            parent_wait,
+        );
+        downloads
+            .download_and_verify(hash)
+            .await
+            .expect("queuing a fresh hash succeeds");
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+
+        verifier
+            .expect_request(zakura_consensus::Request::Commit(block.clone()))
+            .await
+            .respond(Err(unconfirmed_verifier_error(parent)));
+        if parent_commits {
+            verifier
+                .expect_request(zakura_consensus::Request::Commit(block.clone()))
+                .await
+                .respond(hash);
+        }
+
+        let result = downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking");
+        assert_eq!(waits.load(Ordering::SeqCst), 1, "{parent_commits}");
+        if parent_commits {
+            assert_eq!(result.expect("the second verification succeeds").1, hash);
+        } else {
+            let error = result.expect_err("the binding stays unconfirmed");
+            assert!(
+                TestChainSync::unconfirmed_binding(&error).is_some(),
+                "{error:?}"
+            );
+            assert!(!TestChainSync::should_restart_sync(&error, false));
+        }
+        verifier.expect_no_requests().await;
+    }
+}
+
+/// Cancelling the pipeline ends a download task that is waiting for the parent of an
+/// unconfirmed binding.
+#[tokio::test]
+async fn cancel_all_ends_a_parent_wait() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let hash = block.hash();
+    let parent = block.header.previous_block_hash;
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_hash(parent);
+
+    // The wait holds `guard` until the task drops it, and reports when it starts.
+    let (guard, mut guard_dropped) = tokio::sync::oneshot::channel::<()>();
+    let (started, wait_started) = tokio::sync::oneshot::channel::<()>();
+    let handles = std::sync::Mutex::new(Some((guard, started)));
+    let parent_wait = ParentWait(Arc::new(move |_| {
+        let (guard, started) = handles
+            .lock()
+            .expect("the lock is never poisoned")
+            .take()
+            .expect("the task waits for its parent once");
+        let _ = started.send(());
+        async move {
+            let _guard = guard;
+            std::future::pending::<bool>().await
+        }
+        .boxed()
+    }));
+    let mut downloads = setup_downloads_with_parent_wait(
+        peer_set.clone(),
+        verifier.clone(),
+        chain_tip,
+        parent_wait,
+    );
+    downloads
+        .download_and_verify(hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+    verifier
+        .expect_request(zakura_consensus::Request::Commit(block))
+        .await
+        .respond(Err(unconfirmed_verifier_error(parent)));
+    wait_started.await.expect("the task waits for the parent");
+
+    downloads.cancel_all();
+    tokio::time::timeout(Duration::from_secs(10), &mut guard_dropped)
+        .await
+        .expect("the waiting task ends after cancellation")
+        .expect_err("the task drops the wait instead of finishing it");
+    assert_eq!(downloads.in_flight(), 0);
+    verifier.expect_no_requests().await;
+}
+
+/// A state service that never becomes ready.
+#[derive(Clone)]
+struct NeverReadyState;
+
+impl Service<zs::Request> for NeverReadyState {
+    type Response = zs::Response;
+    type Error = crate::BoxError;
+    type Future = std::future::Ready<Result<zs::Response, crate::BoxError>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn call(&mut self, request: zs::Request) -> Self::Future {
+        unreachable!("a never-ready service is never called: {request:?}")
+    }
+}
+
+/// The parent wait gives up at its own limit when the state never becomes ready, which the
+/// state's own `AwaitBlockInfo` limit doesn't cover, so a stalled state can't hold a download
+/// task past that limit.
+#[tokio::test(start_paused = true)]
+async fn parent_wait_times_out_when_the_state_is_never_ready() {
+    let wait = sync::state_parent_wait(NeverReadyState);
+    let start = tokio::time::Instant::now();
+
+    let committed = (wait.0)(block::Hash([0xAA; 32])).await;
+
+    assert!(
+        !committed,
+        "an expired wait counts as the parent not committing"
+    );
+    assert_eq!(start.elapsed(), sync::UNCONFIRMED_BINDING_PARENT_WAIT);
+}
+
+/// A block whose binding is still unconfirmed after the download task waited is dropped without
+/// a retry, a restart, or a score for its supplier.
+#[tokio::test]
+async fn unconfirmed_binding_drops_block_without_restart_or_score() {
+    let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+    let error = BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::AuthDataUnconfirmed {
+                parent,
+                source: Box::new(VerifyBlockError::Transaction(
+                    TransactionError::Halo2VerificationFailed,
+                )),
+            }),
+        },
+        height: Height(42),
+        hash,
+        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("an unconfirmed binding does not restart sync");
+    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+    assert_eq!(chain_sync.utxo_race_drops, 0);
+    peers.expect_no_requests().await;
+    state.expect_no_requests().await;
+}
+
 /// The canonical tip child is unaffected: its coinbase height matches the tip, so it reaches
 /// the verifier as before.
 #[tokio::test]
@@ -4247,11 +4242,114 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
     verifier.expect_no_requests().await;
 }
 
-/// A poisoned tip child must be requeued immediately, and its supplier scored, instead of
-/// leaving the newest block for the next discovery round.
+/// Weak-work blocks must fail admission without verification, scoring, or a restart.
+#[tokio::test]
+async fn mainnet_work_floor_rejects_downloads_before_verification() {
+    use zakura_chain::work::difficulty::ParameterDifficulty as _;
+
+    let _init_guard = zakura_test::init();
+    for checkpoint_sync in [true, false] {
+        let config = zakura_consensus::Config {
+            checkpoint_sync,
+            ..Default::default()
+        };
+        let (_, max_checkpoint_height) =
+            zakura_consensus::router::init_checkpoint_list(config, &Network::Mainnet);
+        let floor = crate::components::download_work::MAINNET_WORK_FLOOR_HEIGHT;
+        for tip_height in [floor.previous().unwrap(), floor] {
+            let (_, pause_height, _) = lookahead_heights(
+                Some(tip_height),
+                sync::MIN_CONCURRENCY_LIMIT,
+                sync::lookahead_limit_multiplier(&Network::Mainnet, tip_height),
+            );
+            let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .expect("test vector deserializes");
+
+            // Admission must reject both coinbase-only blocks and blocks with external
+            // inputs, before either can enter the semantic verifier or its state waits.
+            for (height, initially_paused) in [
+                (floor.previous().unwrap(), false),
+                (floor, false),
+                (floor.next().unwrap(), false),
+                (pause_height.next().unwrap(), false),
+                (tip_height, true),
+            ] {
+                if tip_height < floor && height <= floor {
+                    continue;
+                }
+                for coinbase_only in [false, true] {
+                    let mut candidate = poison_coinbase_height(&canonical, height);
+                    let block = Arc::make_mut(&mut candidate);
+                    if coinbase_only {
+                        block.transactions.truncate(1);
+                    }
+                    *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = height;
+                    let header = Arc::make_mut(&mut block.header);
+                    header.previous_block_hash = block::Hash([0x55; 32]);
+                    header.difficulty_threshold =
+                        Network::Mainnet.target_difficulty_limit().to_compact();
+                    header.merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
+                    let hash = candidate.hash();
+
+                    let mut peer_set =
+                        MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+                    let mut verifier = MockService::build()
+                        .for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+                    let (chain_tip, tip_sender) = MockChainTip::new();
+                    tip_sender.send_best_tip_height(tip_height);
+                    tip_sender.send_best_tip_hash(block::Hash([0xAA; 32]));
+                    let (pause_sender, pause_receiver) =
+                        tokio::sync::watch::channel(initially_paused);
+                    let mut downloads = Downloads::new(
+                        peer_set.clone(),
+                        verifier.clone(),
+                        chain_tip,
+                        ParentWait(Arc::new(|parent| {
+                            panic!("rejected block must not wait for parent {parent}")
+                        })),
+                        pause_sender,
+                        sync::MIN_CONCURRENCY_LIMIT,
+                        Network::Mainnet,
+                        max_checkpoint_height,
+                        LegacySyncTrace::new(None, false),
+                    );
+
+                    downloads.download_and_verify(hash).await.unwrap();
+                    peer_set
+                        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+                        .await
+                        .respond(zn::Response::Blocks(vec![Available((candidate, None))]));
+                    let error = downloads.next().await.unwrap().unwrap_err();
+                    assert!(matches!(
+                        error,
+                        BlockDownloadVerifyError::BelowMinimumWork { height: rejected_height, hash: rejected_hash }
+                            if rejected_height == height && rejected_hash == hash
+                    ));
+                    assert_eq!(
+                        *pause_receiver.borrow(),
+                        initially_paused,
+                        "a rejected block must neither pause nor resume downloads",
+                    );
+                    assert!(!TestChainSync::should_restart_sync(&error, false));
+                    verifier.expect_no_requests().await;
+
+                    let (mut syncer, _, _, _, _, _) = setup_chain_sync();
+                    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+                    syncer.misbehavior_sender = misbehavior_tx;
+                    syncer.handle_block_response(Err(error)).unwrap();
+                    assert!(misbehavior_rx.try_recv().is_err());
+                }
+            }
+        }
+    }
+}
+
+/// A poisoned tip child must be requeued immediately, and its supplier scored,
+/// instead of leaving the newest block for the next discovery round.
 #[tokio::test]
 async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
-    for error_kind in 0..3 {
+    for error_kind in 0..4 {
         let (
             mut chain_sync,
             _sync_status,
@@ -4288,7 +4386,7 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
-            _ => BlockDownloadVerifyError::Invalid {
+            2 => BlockDownloadVerifyError::Invalid {
                 error: RouterError::Checkpoint {
                     source: Box::new(zakura_consensus::VerifyCheckpointError::VerifyBlock(
                         VerifyBlockError::Block {
@@ -4303,6 +4401,16 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
+            _ => checkpoint_commit_error(
+                zs::ValidateContextError::InvalidBlockCommitment(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        expected: [0; 32],
+                        actual: [1; 32],
+                    },
+                ),
+                block_hash,
+                addr,
+            ),
         };
 
         let requeue = tokio::spawn(async move {
@@ -4333,6 +4441,80 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
 
         block_verifier_router.expect_no_requests().await;
     }
+    Ok(())
+}
+
+/// Wraps a contextual error the way a failed checkpoint commit reports it to the syncer.
+fn checkpoint_commit_error(
+    error: zs::ValidateContextError,
+    hash: block::Hash,
+    addr: PeerSocketAddr,
+) -> BlockDownloadVerifyError {
+    let source: crate::BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(
+        zs::CommitBlockError::ValidateContextError(Box::new(error)),
+    ));
+    BlockDownloadVerifyError::Invalid {
+        error: RouterError::Checkpoint {
+            source: Box::new(
+                zakura_consensus::VerifyCheckpointError::CommitCheckpointVerified(source),
+            ),
+        },
+        height: Height(1_687_106),
+        hash,
+        advertiser_addr: Some(addr),
+    }
+}
+
+/// A block the state dropped behind a forged ancestor body is requeued without restarting the
+/// round, and its supplier is not scored.
+#[tokio::test]
+async fn rejected_body_descendant_requeues_without_scoring() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let block_hash = block::Hash::from([0xAC; 32]);
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    let error = checkpoint_commit_error(
+        zs::ValidateContextError::AncestorBodyRejected(block::Hash::from([0xAB; 32])),
+        block_hash,
+        addr,
+    );
+
+    let requeue = tokio::spawn(async move {
+        let result = chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await;
+        (result, chain_sync)
+    });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Err(not_found_block_error(block_hash)));
+
+    let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
+    result?;
+
+    assert!(
+        misbehavior_rx.try_recv().is_err(),
+        "the supplier of a descendant did not cause its ancestor's failure"
+    );
+    assert_eq!(
+        chain_sync.poisoned_block_retry_counts.get(&block_hash),
+        Some(&1),
+        "the requeue must be counted against the retry budget"
+    );
+
+    block_verifier_router.expect_no_requests().await;
     Ok(())
 }
 

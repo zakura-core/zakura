@@ -1,5 +1,6 @@
 //! Serializes and deserializes transparent data.
 
+use crate::serialization::ZcashReader;
 use std::io;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -9,8 +10,7 @@ use zcash_transparent::coinbase::{MAX_COINBASE_SCRIPT_LEN, MIN_COINBASE_SCRIPT_L
 use crate::{
     block::Height,
     serialization::{
-        zcash_deserialize_bytes_external_count, CompactSizeMessage, ReadZcashExt,
-        SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+        CompactSizeMessage, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     transaction,
 };
@@ -96,7 +96,7 @@ fn parse_coinbase_height(script_sig: &[u8]) -> Result<(Height, Vec<u8>), Seriali
 }
 
 impl ZcashSerialize for OutPoint {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.hash.0[..])?;
         writer.write_u32::<LittleEndian>(self.index)?;
         Ok(())
@@ -104,7 +104,9 @@ impl ZcashSerialize for OutPoint {
 }
 
 impl ZcashDeserialize for OutPoint {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(OutPoint {
             hash: transaction::Hash(reader.read_32_bytes()?),
             index: reader.read_u32::<LittleEndian>()?,
@@ -135,15 +137,15 @@ impl ZcashSerialize for Input {
     ///
     /// This check is required, because the genesis block does not include an encoded
     /// coinbase height,
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         match self {
             Input::PrevOut {
                 outpoint,
                 unlock_script,
                 sequence,
             } => {
-                outpoint.zcash_serialize(&mut writer)?;
-                unlock_script.zcash_serialize(&mut writer)?;
+                outpoint.zcash_serialize(writer)?;
+                unlock_script.zcash_serialize(writer)?;
                 writer.write_u32::<LittleEndian>(*sequence)?;
             }
             Input::Coinbase { sequence, .. } => {
@@ -154,7 +156,7 @@ impl ZcashSerialize for Input {
                 // Write the script sig containing the height and data.
                 self.coinbase_script()
                     .ok_or_else(|| io::Error::other("invalid coinbase script sig"))?
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
 
                 // Write the sequence.
                 writer.write_u32::<LittleEndian>(*sequence)?;
@@ -165,7 +167,9 @@ impl ZcashSerialize for Input {
 }
 
 impl ZcashDeserialize for Input {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // This inlines the OutPoint deserialization to peek at the hash value and detect whether we
         // have a coinbase input.
         let hash = reader.read_32_bytes()?;
@@ -189,14 +193,14 @@ impl ZcashDeserialize for Input {
             // > A coinbase transaction script MUST have length in {2 .. 100} bytes.
             //
             // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
-            let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+            let len: CompactSizeMessage = reader.read_value()?;
             let len: usize = len.into();
             if len < MIN_COINBASE_SCRIPT_LEN {
                 return Err(SerializationError::Parse("Coinbase script is too short"));
             } else if len > MAX_COINBASE_SCRIPT_LEN {
                 return Err(SerializationError::Parse("Coinbase script is too long"));
             }
-            let script_sig = zcash_deserialize_bytes_external_count(len, &mut reader)?;
+            let script_sig = reader.read_bytes(len)?;
 
             let (height, data) = if script_sig.as_slice() == GENESIS_COINBASE_SCRIPT_SIG {
                 (Height::MIN, GENESIS_COINBASE_SCRIPT_SIG.to_vec())
@@ -215,7 +219,7 @@ impl ZcashDeserialize for Input {
                     hash: transaction::Hash(hash),
                     index: reader.read_u32::<LittleEndian>()?,
                 },
-                unlock_script: Script::zcash_deserialize(&mut reader)?,
+                unlock_script: reader.read_value::<Script>()?,
                 sequence: reader.read_u32::<LittleEndian>()?,
             })
         }
@@ -223,20 +227,22 @@ impl ZcashDeserialize for Input {
 }
 
 impl ZcashSerialize for Output {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.value.zcash_serialize(&mut writer)?;
-        self.lock_script.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.value.zcash_serialize(writer)?;
+        self.lock_script.zcash_serialize(writer)?;
         Ok(())
     }
 }
 
 impl ZcashDeserialize for Output {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        mut reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let reader = &mut reader;
 
         Ok(Output {
-            value: reader.zcash_deserialize_into()?,
-            lock_script: Script::zcash_deserialize(reader)?,
+            value: reader.read_value()?,
+            lock_script: reader.read_value::<Script>()?,
         })
     }
 }

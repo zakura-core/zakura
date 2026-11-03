@@ -16,7 +16,7 @@ use std::{
 use chrono::{TimeZone, Utc};
 use futures::{channel::oneshot, future, pin_mut, FutureExt, SinkExt, StreamExt};
 use indexmap::IndexSet;
-use rand::{rngs::OsRng, RngCore};
+use rand_10::Rng;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -35,13 +35,14 @@ use zakura_chain::{
     parameters::Network,
     serialization::{DateTime32, SerializationError},
 };
+use zakura_node_services::task::erased;
 
 use crate::{
     constants,
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
-        MinimumPeerVersion, PeerError,
+        CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
+        HandshakeError, MinimumPeerVersion, PeerError,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -56,7 +57,7 @@ use crate::{
         P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
-    BoxError, Config, PeerSocketAddr, VersionMessage,
+    BannedIps, BoxError, Config, PeerSocketAddr, VersionMessage,
 };
 
 #[cfg(test)]
@@ -93,6 +94,9 @@ where
     /// drop (operator-configured block-gossip / zcashd-compat sidecars),
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
+
+    /// The live ban list, rechecked by each connection before it writes a block advert.
+    bans: BannedIps,
 
     parent_span: Span,
 }
@@ -140,6 +144,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            bans: self.bans.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -497,6 +502,7 @@ where
     peer_registry: Option<PeerRegistry>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
+    bans: Option<BannedIps>,
 }
 
 impl<S, C> Builder<S, C>
@@ -581,6 +587,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
+            bans: self.bans,
         }
     }
 
@@ -607,6 +614,14 @@ where
     /// exempted and every connection behaves exactly as before.
     pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
         self.protected_peer_ips = Some(protected_peer_ips);
+        self
+    }
+
+    /// Share the live ban list with connection advert delivery. Optional.
+    ///
+    /// If this is unset, block adverts are not checked against bans when they are written.
+    pub fn with_bans(mut self, bans: BannedIps) -> Self {
+        self.bans = Some(bans);
         self
     }
 
@@ -659,6 +674,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            bans: self.bans.unwrap_or_default(),
             parent_span: Span::current(),
         })
     }
@@ -686,6 +702,7 @@ where
             peer_registry: None,
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
+            bans: None,
         }
     }
 }
@@ -1219,7 +1236,7 @@ where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut upgrade_nonce);
 
     let init = P2pV2UpgradeInit {
         magic: PRELUDE_MAGIC,
@@ -1341,7 +1358,7 @@ where
     };
 
     let mut responder_upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut responder_upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut responder_upgrade_nonce);
 
     let accept = P2pV2UpgradeAccept {
         magic: PRELUDE_MAGIC,
@@ -1551,6 +1568,7 @@ where
         let our_services = self.our_services;
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
+        let bans = self.bans.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
 
@@ -1587,9 +1605,10 @@ where
                 user_agent,
                 our_services,
                 relay,
-                minimum_peer_version,
+                minimum_peer_version.clone(),
                 is_protected_peer,
             )
+            .boxed()
             .await
             {
                 Ok(info) => {
@@ -1646,6 +1665,7 @@ where
                     peer_registry.as_ref(),
                     &address_book_updater,
                 )
+                .boxed()
                 .await
                 {
                     Ok(
@@ -1712,6 +1732,9 @@ where
             // and between the different connection tasks. We create separate tasks and channels
             // for each new connection.
             let (server_tx, server_rx) = futures::channel::mpsc::channel(0);
+            // Bound pending adverts; slow peers can catch up through later tip gossip.
+            let (block_advert_tx, block_advert_rx) =
+                tokio::sync::mpsc::channel(super::block_gossip::BLOCK_ADVERT_QUEUE);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1834,7 +1857,12 @@ where
 
             let server = Connection::new(
                 inbound_service,
-                server_rx,
+                ConnectionRequests {
+                    client_rx: server_rx,
+                    block_advert_rx,
+                    minimum_peer_version,
+                    bans,
+                },
                 error_slot.clone(),
                 peer_tx,
                 connection_tracker,
@@ -1842,6 +1870,10 @@ where
                 addr_label,
                 alternate_addrs.collect(),
             );
+
+            let block_uploads = server.block_uploads.clone();
+            let request_slot = server.request_slot.clone();
+            let client_peer_registry_updater = peer_registry_updater.clone();
 
             let connection_task = tokio::spawn(
                 async move {
@@ -1865,9 +1897,13 @@ where
             );
 
             let client = Client {
+                block_uploads,
+                request_slot,
+                peer_registry_updater: client_peer_registry_updater,
                 connection_info,
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,
+                block_advert_tx,
                 inv_collector,
                 error_slot,
                 connection_task,
@@ -1881,7 +1917,7 @@ where
         let fut = timeout(constants::HANDSHAKE_TIMEOUT, fut);
 
         // Spawn a new task to drive this handshake, forwarding panics to the calling task.
-        tokio::spawn(fut.instrument(negotiator_span))
+        tokio::spawn(erased(fut.instrument(negotiator_span)))
             .map(
                 |join_result: Result<
                     Result<Result<Client, HandshakeError>, error::Elapsed>,

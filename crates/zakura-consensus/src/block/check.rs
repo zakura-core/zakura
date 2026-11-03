@@ -49,6 +49,11 @@ impl UnmatchedCoinbaseOutputs {
         self.outputs.remove(index);
         true
     }
+
+    /// Removes one output paying the required amount to the configured address.
+    fn remove_payment(&mut self, address: &Address, amount: Amount<NonNegative>) -> bool {
+        self.remove(&Output::new(amount, address.script()))
+    }
 }
 
 /// Checks if there is exactly one coinbase transaction in `Block`,
@@ -166,6 +171,27 @@ pub fn equihash_solution_is_valid(
     PowPolicy::validating(network).validate_solution(header)
 }
 
+/// Returns `true` if `header` passes the context-free proof of work checks of the block verifier
+/// on `network`, or if `network` waives them.
+///
+/// This lets callers reject blocks that cost nothing to make before spending anything on them.
+/// It does not check the block's difficulty against the chain.
+pub fn proof_of_work_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> bool {
+    match PowPolicy::for_network(network) {
+        Ok(policy) if policy.is_authenticated_custom_waiver() => true,
+        Ok(_) => {
+            difficulty_is_valid(header, network, height, hash).is_ok()
+                && equihash_solution_is_valid(header, network).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
 /// subsidy in `block` is valid for `network`
 ///
@@ -188,12 +214,6 @@ pub fn subsidy_is_valid(
             .ok_or(SubsidyError::NoCoinbase)?
             .outputs(),
     );
-
-    let mut has_amount = |addr: &Address, amount| {
-        assert!(addr.is_script_hash(), "address must be P2SH");
-
-        coinbase_outputs.remove(&Output::new(amount, addr.script()))
-    };
 
     // # Note
     //
@@ -222,7 +242,7 @@ pub fn subsidy_is_valid(
                 "founders reward address must be defined for height: {height:?}"
             )))?;
 
-            if !has_amount(&addr, founders_reward(net, height)) {
+            if !coinbase_outputs.remove_payment(&addr, founders_reward(net, height)) {
                 Err(SubsidyError::FoundersRewardNotFound)?;
             }
         }
@@ -286,7 +306,7 @@ pub fn subsidy_is_valid(
             deferred_pool_balance_change = lockbox_disbursements.into_iter().try_fold(
                 deferred_pool_balance_change,
                 |balance, (addr, expected_amount)| {
-                    if !has_amount(&addr, expected_amount) {
+                    if !coinbase_outputs.remove_payment(&addr, expected_amount) {
                         Err(SubsidyError::OneTimeLockboxDisbursementNotFound)?;
                     }
 
@@ -306,7 +326,7 @@ pub fn subsidy_is_valid(
                             .to_string(),
                     ))?;
 
-                if !has_amount(addr, expected_amount) {
+                if !coinbase_outputs.remove_payment(addr, expected_amount) {
                     Err(SubsidyError::FundingStreamNotFound)?;
                 }
 
@@ -571,7 +591,8 @@ pub fn merkle_root_validity(
 mod tests {
     use zakura_chain::{
         amount::{Amount, NonNegative},
-        transparent::{Output, Script},
+        parameters::NetworkKind,
+        transparent::{Address, Output, Script},
     };
 
     use super::UnmatchedCoinbaseOutputs;
@@ -595,5 +616,25 @@ mod tests {
         assert!(outputs.remove(&repeated_output));
         assert!(!outputs.remove(&repeated_output));
         assert!(outputs.remove(&distinct_output));
+    }
+
+    #[test]
+    fn coinbase_payment_matches_configured_address_and_amount() {
+        let nu7_fpf_address: Address = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG"
+            .parse()
+            .expect("ZIP 2008 specifies a valid transparent address");
+        let p2sh_address = Address::from_script_hash(NetworkKind::Mainnet, [0; 20]);
+        let wrong_address = Address::from_pub_key_hash(NetworkKind::Mainnet, [0; 20]);
+        let amount = Amount::<NonNegative>::new(1);
+
+        for address in [p2sh_address, nu7_fpf_address] {
+            let mut outputs =
+                UnmatchedCoinbaseOutputs::new(&[Output::new(amount, address.script())]);
+
+            assert!(!outputs.remove_payment(&wrong_address, amount));
+            assert!(!outputs.remove_payment(&address, Amount::new(2)));
+            assert!(outputs.remove_payment(&address, amount));
+            assert!(!outputs.remove_payment(&address, amount));
+        }
     }
 }

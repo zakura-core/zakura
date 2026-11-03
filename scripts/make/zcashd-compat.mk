@@ -9,6 +9,7 @@
 	compat-zcashd-status \
 	compat-status-sync \
 	compat-test-regtest \
+	compat-test-nu7 \
 	compat-test-soak \
 	compat-test-mainnet \
 	compat-test-testnet
@@ -34,11 +35,11 @@ ZAKURA_DOCKER_IMAGE ?= zakura:zcashd-compat
 ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/crates/zakurad/zcashd-compat-manifest.json
 ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
 ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
-ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_url' $(ZCASHD_COMPAT_MANIFEST))
-ZCASHD_COMPAT_SHA256 ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_sha256' $(ZCASHD_COMPAT_MANIFEST))
+ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_binary_url' $(ZCASHD_COMPAT_MANIFEST))
+ZCASHD_COMPAT_SHA256 ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_binary_sha256' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_ARTIFACT_DIR ?= $(CURDIR)/target/zcashd-compat
-ZCASHD_COMPAT_ARCHIVE_PATH ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/zcashd-compat.tar.gz
-ZCASHD_COMPAT_EXTRACT_DIR ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/extracted
+# Docker build context that compat-zcashd-prepare fills with ./bin/zcashd.
+ZCASHD_COMPAT_CONTEXT_DIR ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/context
 # Optional override for callers that prepare zcashd by other means.
 # This directory must contain a Linux executable at ./bin/zcashd.
 ZCASHD_COMPAT_BUILD_CONTEXT ?=
@@ -51,14 +52,14 @@ compat-zcashd-prepare:
 		echo "Using provided zcashd build context: $(ZCASHD_COMPAT_BUILD_CONTEXT)"; \
 		test -x "$(ZCASHD_COMPAT_BUILD_CONTEXT)/bin/zcashd"; \
 	else \
-		echo "Fetching hash-pinned zcashd-compat archive..."; \
-		mkdir -p "$(ZCASHD_COMPAT_ARTIFACT_DIR)"; \
-		curl -fsSL "$(ZCASHD_COMPAT_URL)" -o "$(ZCASHD_COMPAT_ARCHIVE_PATH)"; \
-		echo "$(ZCASHD_COMPAT_SHA256)  $(ZCASHD_COMPAT_ARCHIVE_PATH)" | sha256sum -c -; \
-		rm -rf "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
-		mkdir -p "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
-		tar -xzf "$(ZCASHD_COMPAT_ARCHIVE_PATH)" -C "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
-		test -x "$(ZCASHD_COMPAT_EXTRACT_DIR)/bin/zcashd"; \
+		echo "Fetching hash-pinned zcashd-compat executable..."; \
+		"$(CURDIR)/scripts/resolve-zcashd-compat-manifest.sh" \
+			--manifest-path "$(ZCASHD_COMPAT_MANIFEST)" \
+			--target-triple "$(ZCASHD_COMPAT_TARGET_TRIPLE)" \
+			--binary-url "$(ZCASHD_COMPAT_URL)" \
+			--binary-sha256 "$(ZCASHD_COMPAT_SHA256)" \
+			--prepare-build-context "$(ZCASHD_COMPAT_CONTEXT_DIR)"; \
+		test -x "$(ZCASHD_COMPAT_CONTEXT_DIR)/bin/zcashd"; \
 	fi
 
 compat-docker-build: compat-zcashd-prepare
@@ -66,7 +67,7 @@ compat-docker-build: compat-zcashd-prepare
 	@set -eu; \
 	context_dir="$(ZCASHD_COMPAT_BUILD_CONTEXT)"; \
 	if [ -z "$$context_dir" ]; then \
-		context_dir="$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
+		context_dir="$(ZCASHD_COMPAT_CONTEXT_DIR)"; \
 	fi; \
 	docker build -f ./docker/Dockerfile --target runtime-zcashd-compat \
 		--build-context "zcashd_compat=$$context_dir" \
@@ -203,6 +204,12 @@ compat-test-regtest:
 	TEST_ZCASHD_COMPAT=1 \
 	TEST_ZCASHD_PATH="$(TEST_ZCASHD_PATH)" \
 	cargo nextest run --profile zcashd-compat-integration --run-ignored=only
+
+# Run only the NU7 activation tests against a fresh regtest environment with NU7 at 210.
+compat-test-nu7:
+	TEST_ZCASHD_COMPAT=1 \
+	TEST_ZCASHD_PATH="$(TEST_ZCASHD_PATH)" \
+	cargo nextest run --profile zcashd-compat-nu7 --run-ignored=only
 
 # Run a long zcashd-compat reorg churn soak against a fresh regtest environment.
 # Override TEST_ZCASHD_COMPAT_REORG_ITERATIONS for shorter local smoke runs.

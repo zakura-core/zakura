@@ -116,6 +116,8 @@ pub(super) struct Harness {
     runtime: Option<HeaderChainRuntime>,
     model: HashMap<block::Hash, ModelNode>,
     finalized: Frontier,
+    // The last expected tip, which integrated selection preserves on equal work.
+    header_best: Frontier,
     verified_path: Vec<Frontier>,
     next_request_id: u64,
     rejections: usize,
@@ -205,13 +207,14 @@ impl Harness {
                 body_verified: false,
             },
         );
-        let harness = Self {
+        let mut harness = Self {
             universe,
             config,
             db_config,
             runtime: Some(runtime),
             model,
             finalized: frontier,
+            header_best: frontier,
             verified_path: vec![frontier],
             next_request_id: 1,
             rejections: 0,
@@ -735,7 +738,7 @@ impl Harness {
         }
     }
 
-    fn assert_coherent(&self) {
+    fn assert_coherent(&mut self) {
         let runtime = self.runtime();
         let plan = audit_store(&runtime.store, &self.config)
             .expect("the production exhaustive audit accepts every writer state");
@@ -812,7 +815,13 @@ impl Harness {
                     Frontier::new(node.height, *hash),
                 )
             })
-            .max_by_key(|(score, _)| *score)
+            .max_by_key(|(score, tip)| {
+                (
+                    score.suffix_work,
+                    *tip == self.header_best,
+                    score.tip_hash.0,
+                )
+            })
             .expect("the model always retains the finalized candidate");
         assert_eq!(durable.header_best_score, expected_score);
         assert_eq!(durable.frontiers.header_best, expected_tip);
@@ -838,6 +847,7 @@ impl Harness {
                 .expect("the verified projection is readable"),
             self.verified_path
         );
+        self.header_best = expected_tip;
     }
 
     fn path_to(&self, mut hash: block::Hash) -> Vec<Frontier> {

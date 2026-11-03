@@ -1,0 +1,7 @@
+# BuildKit reads this file instead of the repository's .dockerignore when it builds
+# .oss-scanner/Dockerfile, because it sits beside that Dockerfile under the same name.
+# The repository's .dockerignore excludes everything the production images don't need,
+# such as docs/, scripts/ and qa/. A security audit wants all of it, so this file
+# excludes only build output.
+target/
+**/target/

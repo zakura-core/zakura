@@ -36,11 +36,11 @@ struct Live {
 }
 
 impl Live {
-    fn new(capacity: &ServeCapacity, index: usize) -> Self {
+    fn new(order: OutputOrder, capacity: &ServeCapacity, index: usize) -> Self {
         // Sessions 0 and 1 share a peer, so their budgets are shared.
         let peer = u8::try_from(index.min(1)).expect("few sessions") + 1;
         Self {
-            session: session(capacity, peer, LIMIT),
+            session: session_in(order, capacity, peer, LIMIT),
             held: Default::default(),
             released: Vec::new(),
         }
@@ -51,7 +51,7 @@ impl Live {
     }
 }
 
-fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+fn run(order: OutputOrder, ops: Vec<Op>) -> Result<(), TestCaseError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -62,7 +62,9 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
             ..LIMITS
         };
         let capacity = capacity(limits);
-        let mut live: Vec<Live> = (0..SESSIONS).map(|i| Live::new(&capacity, i)).collect();
+        let mut live: Vec<Live> = (0..SESSIONS)
+            .map(|i| Live::new(order, &capacity, i))
+            .collect();
         let mut retired = Vec::new();
         for op in ops {
             match op {
@@ -90,7 +92,8 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                     }
                 }
                 Op::Reconnect { session } => {
-                    let old = std::mem::replace(&mut live[session], Live::new(&capacity, session));
+                    let old =
+                        std::mem::replace(&mut live[session], Live::new(order, &capacity, session));
                     old.session.cancel.cancel();
                     retired.push(old);
                 }
@@ -146,6 +149,8 @@ proptest! {
 
     #[test]
     fn operation_sequences_keep_every_bound(ops in prop::collection::vec(op(), 1..48)) {
-        run(ops)?;
+        for order in ORDERS {
+            run(order, ops.clone())?;
+        }
     }
 }

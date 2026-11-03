@@ -1,7 +1,5 @@
 //! Stable ordered key encodings for the fork-aware header-chain schema.
 
-#![allow(dead_code)] // These codecs are consumed by the serialized state adapter in PR-8.
-
 use thiserror::Error;
 use zakura_chain::block;
 use zakura_header_chain::{EvidenceId, FinalityEpoch};

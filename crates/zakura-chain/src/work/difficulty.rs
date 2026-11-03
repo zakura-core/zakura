@@ -691,33 +691,6 @@ impl PartialCumulativeWork {
     pub fn checked_sub(self, rhs: Work) -> Option<Self> {
         self.0.checked_sub(rhs.0).map(Self)
     }
-
-    /// Returns a floating-point work multiplier that can be used for display.
-    /// The returned value is the work as a multiple of the target difficulty limit for `network`.
-    pub fn difficulty_multiplier_for_display(&self, network: Network) -> f64 {
-        // This calculation is similar to the `getdifficulty` RPC, see that code for details.
-
-        let pow_limit = network
-            .target_difficulty_limit()
-            .to_compact()
-            .to_work()
-            .expect("target difficult limit is valid work");
-
-        let pow_limit = u256_to_f64(pow_limit.as_u256());
-        let work = u256_to_f64(self.as_u256());
-
-        work / pow_limit
-    }
-
-    /// Returns floating-point work bits that can be used for display.
-    /// The returned value is the number of hash bits represented by the work.
-    pub fn difficulty_bits_for_display(&self) -> f64 {
-        // This calculation is similar to `zcashd`'s bits display in its logs.
-
-        let work = u256_to_f64(self.as_u256());
-
-        work.log2()
-    }
 }
 
 /// Network methods related to Difficulty

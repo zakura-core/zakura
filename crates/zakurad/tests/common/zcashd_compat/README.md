@@ -80,6 +80,17 @@ make compat-test-soak \
   TEST_ZCASHD_COMPAT_REORG_ITERATIONS=500
 ```
 
+### NU7 Activation Tests
+
+The `zcashd_compat_nu7_*` tests run regtest with every upgrade through NU6.3 at
+height 1 and NU7 at 210, a zero-value NU6.1 lockbox disbursement marker, and the
+same initial NSM value balance on both sides. They run with the rest of the
+regtest suite, and this runs only them:
+
+```console
+make compat-test-nu7
+```
+
 ### External — Mainnet / Testnet (deployment validation)
 
 The test harness connects to pre-running zakurad and zcashd instances.
@@ -175,6 +186,10 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_reorg_zakura_tip_behind_local` | reorg | Recoverable Zakura-tip-behind-local state and required recovery | **Skipped** |
 | `zcashd_compat_reorg_context_zakura_tip_behind_recovers` | reorg | No sticky failure on tip-behind after paused reorg convergence | **Skipped** |
 | `zcashd_compat_reorg_churn` | reorg | Repeated small reorg stress loop | **Skipped** |
+| `zcashd_compat_nu7_activation_follows_zakurad` | nu7 | Same tip, branch, NSM value balance, supply and subsidy across NU7 | **Skipped** |
+| `zcashd_compat_nu7_fee_burn_and_wallet_transactions` | nu7 | ZIP 235 fee burn on both sides; v5 transactions with the NU7 expiry | **Skipped** |
+| `zcashd_compat_nu7_burst_sync_and_restart` | nu7 | 300-block burst without reconnecting; NSM value balance after restart | **Skipped** |
+| `zcashd_compat_nu7_sapling_spend_reorg_and_restart` | nu7 | Pre-NU7 Sapling note spent after activation; Sapling spends after a reorg and a restart | **Skipped** |
 
 ## Prerequisites for External Mode
 
@@ -211,6 +226,9 @@ crates/zakurad/tests/common/
     │                          getwalletinfo_fields_present
     ├── tx_flow.rs             transparent_tx_in_mempool, transparent_tx_confirms
     ├── resilience.rs          zakurad_clean_shutdown, zcashd_restarts_after_exit
+    ├── nu7.rs                 activation_follows_zakurad, fee_burn_and_wallet_transactions,
+    │                          burst_sync_and_restart, sapling_spend_reorg_and_restart
+    │                          (NU7 regtest profile)
     ├── network.rs             peer_connectivity, mempool_info_valid,
     │                          historical_block_consistent
     └── reorg.rs               basic_depth1, equal_work_race,

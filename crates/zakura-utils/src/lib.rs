@@ -3,11 +3,9 @@
 #![doc(html_logo_url = "https://zakura.com/assets/rustdoc/zakura-icon.png")]
 #![doc(html_root_url = "https://docs.rs/zakura_utils")]
 
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Initialise tracing using its defaults.
 pub fn init_tracing() {
-    tracing_subscriber::Registry::default()
-        .with(tracing_error::ErrorLayer::default())
-        .init();
+    tracing_subscriber::Registry::default().init();
 }

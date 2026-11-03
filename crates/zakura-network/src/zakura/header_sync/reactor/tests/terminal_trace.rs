@@ -35,10 +35,13 @@ fn trace_active_request(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId) -> Act
     active
 }
 
+/// A `SubscriptionSuperseded` outcome emits one request terminal row that
+/// names the exact session, request, and branch.
 #[tokio::test]
-async fn busy_outcome_emits_exact_bounded_request_terminal() {
-    let mut capture = TraceCapture::for_test("busy_outcome_emits_exact_bounded_request_terminal")
-        .expect("trace capture starts");
+async fn superseded_outcome_emits_exact_bounded_request_terminal() {
+    let mut capture =
+        TraceCapture::for_test("superseded_outcome_emits_exact_bounded_request_terminal")
+            .expect("trace capture starts");
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -58,14 +61,13 @@ async fn busy_outcome_emits_exact_bounded_request_terminal() {
         .expect("the request remains active")
         .phase = HeaderTargetPhase::Receiving;
 
-    reactor.handle_headers_outcome(
+    reactor.deliver_outcome(
         peer.clone(),
         session_id,
-        active.owner.header_authority(),
         HeadersOutcome {
-            request_id: active.request_id.get(),
-            target_tip_hash: active.target.status.selected_tip_hash,
-            outcome: HeadersOutcomeCode::Busy,
+            subscription_id: active.request_id.get(),
+            initial_target_tip_hash: active.target.status.selected_tip_hash,
+            outcome: HeadersOutcomeCode::SubscriptionSuperseded,
         },
     );
 
@@ -91,7 +93,10 @@ async fn busy_outcome_emits_exact_bounded_request_terminal() {
             (hs_trace::BRANCH_ANCHOR, TraceValue::Str(&anchor_hash)),
             (hs_trace::BRANCH_TARGET, TraceValue::Str(&target_hash)),
             (hs_trace::TARGET_HASH, TraceValue::Str(&target_hash)),
-            (hs_trace::OUTCOME, TraceValue::Str("busy")),
+            (
+                hs_trace::OUTCOME,
+                TraceValue::Str("subscription_superseded"),
+            ),
         ],
     );
     assert!(reactor.peer_work_queue.active(&peer).is_none());

@@ -33,13 +33,6 @@ SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 # Make the build platform available as a variable
 ARG BUILDPLATFORM
 
-# Install zebra build deps
-RUN apt-get -qq update && \
-    apt-get -qq install -y --no-install-recommends \
-    libclang-dev \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
-
 # Build arguments and variables
 ARG CARGO_INCREMENTAL
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
@@ -122,9 +115,6 @@ RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
     chown -R ${UID}:${GID} ${CARGO_HOME} && \
     chown -R ${UID}:${GID} ${CARGO_TARGET_DIR}
 
-# Copy the lightwalletd binary and source files to be able to run tests
-COPY --link --from=electriccoinco/lightwalletd:v0.4.17 /usr/local/bin/lightwalletd /usr/local/bin/
-
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT [ "entrypoint.sh", "test" ]
@@ -134,13 +124,17 @@ CMD [ "cargo", "test" ]
 #
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
-# Always use portable Pasta arithmetic here, including with custom FEATURES.
 # Release archives and both runtime image variants inherit these binaries.
+# Default Cargo features enable BMI2/ADX Pasta assembly on x86-64.
+# Use FEATURES="default-release-binaries,portable" for older x86-64 CPUs.
 FROM deps AS release
 
 ARG SHORT_SHA
 ARG FEATURES
-ENV FEATURES=${FEATURES},portable
+ENV FEATURES=${FEATURES}
+# Compress debug sections with zlib, roughly 275 MB -> 110 MB on disk.
+# Not zstd: std's backtrace symbolizer only reads zlib, and file:line would be lost.
+ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib"
 
 # Set the working directory for the build.
 ARG HOME
@@ -149,20 +143,23 @@ WORKDIR ${HOME}
 ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
-RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batch-control \
-    --mount=type=bind,source=crates/tower-fallback,target=crates/tower-fallback \
-    --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
-    --mount=type=bind,source=crates/xtask,target=crates/xtask \
+RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-chain,target=crates/zakura-chain \
+    --mount=type=bind,source=crates/zakura-mmr-tree,target=crates/zakura-mmr-tree \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-jsonl-trace,target=crates/zakura-jsonl-trace \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
+    --mount=type=bind,source=crates/zakura-quic,target=crates/zakura-quic \
+    --mount=type=bind,source=crates/zakura-rt,target=crates/zakura-rt \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
+    --mount=type=bind,source=crates/zakura-scheduler,target=crates/zakura-scheduler \
+    --mount=type=bind,source=crates/zakura-sim,target=crates/zakura-sim \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
+    --mount=type=bind,source=crates/zakura-storage,target=crates/zakura-storage \
     --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
     --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \
     --mount=type=bind,source=crates/zakurad,target=crates/zakurad \

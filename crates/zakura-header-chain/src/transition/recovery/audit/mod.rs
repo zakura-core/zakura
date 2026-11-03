@@ -128,7 +128,7 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     {
         violations.push(AuditViolation::Limits);
     }
-    violations.sort_by_key(violation_key);
+    violations.sort_unstable_by_key(violation_key);
     violations.dedup();
     if !violations.is_empty() {
         return Err(RecoveryFailure::Source { violations });

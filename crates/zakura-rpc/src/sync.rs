@@ -21,6 +21,7 @@ use zakura_state::{
 };
 
 use zakura_chain::diagnostic::task::WaitForPanics;
+use zakura_node_services::task::spawn_erased;
 
 use crate::indexer::{
     indexer_client::IndexerClient, BlockAndHash, BlockRequest, Empty,
@@ -364,7 +365,7 @@ impl TrustedChainSync {
         // finalized-state catch-up to finish.
         let finalized_tip_updater_db = db.clone();
         let finalized_tip_updater_client = indexer_rpc_client.clone();
-        let finalized_tip_updater = tokio::spawn(async move {
+        let finalized_tip_updater = spawn_erased(async move {
             update_finalized_chain_tip(
                 finalized_tip_updater_db,
                 finalized_tip_updater_client,
@@ -385,7 +386,7 @@ impl TrustedChainSync {
             receipt_session: None,
         };
 
-        let sync_task = tokio::spawn(async move {
+        let sync_task = spawn_erased(async move {
             syncer.sync().await;
         });
 
@@ -830,7 +831,7 @@ pub fn init_read_state_with_syncer(
 > {
     let network = network.clone();
     let indexer_rpc = indexer_rpc.into();
-    tokio::spawn(async move {
+    spawn_erased(async move {
         if config.ephemeral {
             return Err("standalone read state service cannot be used with ephemeral state".into());
         }

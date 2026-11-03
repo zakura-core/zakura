@@ -5,6 +5,62 @@ use super::super::{
 use super::*;
 
 #[test]
+fn integrated_header_selection_preserves_the_first_selected_equal_work_tip() {
+    let (mut store, _) = TestStore::new(EngineMode::Integrated);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let a = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x31);
+    let b = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x32);
+    let first = if a.hash.0 < b.hash.0 { a } else { b };
+    synchronize_fixture(&mut store, first);
+    store.selected = path(&store.graph, first).unwrap();
+    store.metadata.frontiers.header_best = first;
+    store.metadata.header_best_score = store.graph.header_chain_score(first.hash).unwrap();
+    let engine = crate::HeaderChainEngine::from_test_state(
+        store.graph,
+        store.metadata,
+        store.selected,
+        store.verified,
+        store.aux,
+    )
+    .expect(
+        "hydration preserves the selected equal-work header rather than its hash-ranked sibling",
+    );
+    assert_eq!(engine.graph().select_best_header_chain().unwrap().0, first);
+    let overlay = crate::graph::GraphOverlay::new(engine.graph());
+    assert_eq!(overlay.select_best_header_chain().unwrap().0, first);
+    let other = if first == a { b } else { a };
+    let mut graph = engine.graph().clone();
+    graph
+        .add_eligibility_reason(
+            first.hash,
+            EligibilityReason::CheckpointConflict {
+                height: first.height,
+                expected: other.hash,
+            },
+        )
+        .unwrap();
+    assert_eq!(graph.select_best_header_chain().unwrap().0, other);
+    assert_eq!(
+        crate::graph::GraphOverlay::new(&graph)
+            .select_best_header_chain()
+            .unwrap()
+            .0,
+        other
+    );
+    let mut graph = engine.graph().clone();
+    let stronger = insert_verified_branch(&mut graph, other, 1, difficulty, 0x33);
+    assert_eq!(graph.select_best_header_chain().unwrap().0, stronger);
+    assert_eq!(
+        crate::graph::GraphOverlay::new(&graph)
+            .select_best_header_chain()
+            .unwrap()
+            .0,
+        stronger
+    );
+}
+
+#[test]
 fn malformed_full_state_paths_fail_with_exact_shape_errors() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
@@ -118,7 +174,7 @@ fn projection_delta_and_verified_selection_cover_fork_boundaries() {
         .set_body_validation_state(first.hash, BodyValidationState::Unknown)
         .expect("the intermediate body becomes unverified");
     assert_eq!(
-        select_fully_verified_path(&store.graph)
+        select_fully_verified_path(&store.graph, None)
             .expect("verified selection remains finalized-rooted"),
         vec![anchor],
         "a verified descendant cannot jump over an unverified parent"
@@ -832,5 +888,98 @@ fn transition_installs_only_on_its_exact_source_engine() {
     assert_eq!(
         engine.selected_projection().last().copied(),
         Some(expected.frontiers.header_best)
+    );
+}
+
+#[test]
+fn preferred_verified_tip_must_be_a_connected_greatest_work_tip() {
+    let (mut store, _) = TestStore::new(EngineMode::Integrated);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let mut siblings = [0x31, 0x32]
+        .map(|seed| insert_verified_branch(&mut store.graph, anchor, 1, difficulty, seed));
+    siblings.sort_unstable_by_key(|frontier| frontier.hash.0);
+    let [hash_loser, hash_winner] = siblings;
+
+    // An equal-work tip whose own body is unverified.
+    let header_only = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x33);
+    store
+        .graph
+        .set_body_validation_state(header_only.hash, BodyValidationState::Unknown)
+        .expect("the header-only tip body becomes unverified");
+    // A verified tip with more work, above an unverified parent body.
+    let disconnected = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x34);
+    let unverified_parent = store
+        .graph
+        .header_ancestor(disconnected.hash, block::Height(1))
+        .expect("the test ancestry is coherent")
+        .expect("the two-header branch contains height one");
+    store
+        .graph
+        .set_body_validation_state(unverified_parent.hash, BodyValidationState::Unknown)
+        .expect("the intermediate body becomes unverified");
+    store
+        .graph
+        .recompute_all_header_eligibility()
+        .expect("the fixture eligibility cache recomputes");
+    let unknown = Frontier::new(hash_loser.height, block::Hash([0xee; 32]));
+    let tip_mismatch = TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::header_path(
+        HeaderPathKind::Verified,
+        HeaderPathProblem::TipMismatch,
+    ));
+
+    // Without a preference, the raw hash breaks the tie among connected verified tips.
+    assert_eq!(
+        select_fully_verified_path(&store.graph, None).unwrap(),
+        vec![anchor, hash_winner]
+    );
+    assert_eq!(
+        select_fully_verified_path(&store.graph, Some(hash_loser)).unwrap(),
+        vec![anchor, hash_loser]
+    );
+    for (preferred, reason) in [
+        (unknown, "an unknown hash"),
+        (header_only, "an equal-work tip without a verified body"),
+        (disconnected, "a higher-work tip above an unverified body"),
+    ] {
+        assert_eq!(
+            select_fully_verified_path(&store.graph, Some(preferred)),
+            Err(tip_mismatch.clone()),
+            "full state cannot prefer {reason}"
+        );
+    }
+
+    // A connected tip with more work still wins, so an equal-work preference no longer applies.
+    // The tip above an unverified body now has equal work, so only its ancestry excludes it.
+    let extended = insert_verified_branch(&mut store.graph, hash_winner, 1, difficulty, 0x35);
+    store
+        .graph
+        .recompute_all_header_eligibility()
+        .expect("the fixture eligibility cache recomputes");
+    assert_eq!(
+        store
+            .graph
+            .header_chain_score(extended.hash)
+            .unwrap()
+            .suffix_work,
+        store
+            .graph
+            .header_chain_score(disconnected.hash)
+            .unwrap()
+            .suffix_work
+    );
+    for (preferred, reason) in [
+        (hash_loser, "an eligible tip with less work"),
+        (disconnected, "an equal-work tip above an unverified body"),
+    ] {
+        assert_eq!(
+            select_fully_verified_path(&store.graph, Some(preferred)),
+            Err(tip_mismatch.clone()),
+            "full state cannot prefer {reason}"
+        );
+    }
+    assert_eq!(
+        select_fully_verified_path(&store.graph, Some(extended)).unwrap(),
+        vec![anchor, hash_winner, extended]
     );
 }

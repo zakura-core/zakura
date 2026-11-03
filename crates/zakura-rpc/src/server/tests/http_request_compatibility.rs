@@ -8,13 +8,12 @@ use std::{
 
 use bytes::Bytes;
 use http_body::Frame;
-use jsonrpsee::{
-    core::BoxError,
-    server::{HttpBody, HttpRequest, HttpResponse},
-};
-use tower::Service;
+use tower::{BoxError, Service};
 
-use crate::server::http_request_compatibility::HttpRequestMiddleware;
+use crate::server::{
+    http::{HttpBody, HttpRequest, HttpResponse},
+    http_request_compatibility::HttpRequestMiddleware,
+};
 
 /// A body that always returns an error, simulating a TCP RST during body collection.
 struct ErrorBody;
@@ -57,11 +56,10 @@ impl Service<HttpRequest> for MockRpcService {
 /// so a TCP RST during body reading would panic the process.
 #[tokio::test]
 async fn request_body_error_returns_err_instead_of_panic() {
-    let error_body = HttpBody::new(ErrorBody);
     let request = HttpRequest::builder()
         .method("POST")
         .header("content-type", "appliion/json")
-        .body(error_body)
+        .body(ErrorBody)
         .expect("valid request");
 
     let mut middleware = HttpRequestMiddleware::new(MockRpcService, None, 2_097_152);

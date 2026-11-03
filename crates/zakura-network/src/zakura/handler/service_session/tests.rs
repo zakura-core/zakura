@@ -1,6 +1,6 @@
 use super::*;
 use crate::zakura::testkit::LocalEndpointFactory;
-use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths};
+use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths, P2P_V2_ALPN};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATA: Stream = Stream {
@@ -182,8 +182,8 @@ impl Session {
 }
 
 struct Fixture {
-    router: Router,
-    client: Endpoint,
+    server: QuicEndpoint,
+    client: QuicEndpoint,
     connection: Connection,
     serving: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     server_sessions: mpsc::Receiver<Peer>,
@@ -225,17 +225,17 @@ impl Fixture {
         if let Some(max_open_streams) = max_open_streams {
             local.max_open_streams = max_open_streams;
         }
-        let server = LocalEndpointFactory::with_transport_config(local.transport_config())
+        let server = LocalEndpointFactory::with_limits(&local)
             .endpoint(93101)
             .await?;
-        let client = LocalEndpointFactory::with_transport_config(local.transport_config())
+        let client = LocalEndpointFactory::with_limits(&local)
             .endpoint(93102)
             .await?;
         let (server_tx, server_sessions) = mpsc::channel(2);
         let (client_tx, client_sessions) = mpsc::channel(2);
         let (server_sibling_tx, server_siblings) = mpsc::channel(1);
         let (client_sibling_tx, client_siblings) = mpsc::channel(1);
-        let handler = |sessions, siblings, endpoint: Endpoint, fail_reservation| {
+        let handler = |sessions, siblings, endpoint: QuicEndpoint, fail_reservation| {
             ZakuraProtocolHandler::new_with_registry(
                 ZakuraSupervisorHandle::new(16),
                 Network::Mainnet,
@@ -260,9 +260,9 @@ impl Fixture {
                     .unwrap(),
                 ),
             )
-            .with_endpoint(endpoint)
+            .with_local_node_id(endpoint.local_id())
         };
-        let server_opens = i_open_collision_winner(&server.id(), &client.id());
+        let server_opens = i_open_collision_winner(&server.local_id(), &client.local_id());
         let server_handler = handler(
             server_tx,
             server_sibling_tx,
@@ -275,19 +275,19 @@ impl Fixture {
             client.clone(),
             fail_first_reservation && !server_opens,
         );
-        let router = Router::builder(server).accept(ALPN, server_handler).spawn();
-        let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+        server.serve(server_handler)?;
+        let address = LocalEndpointFactory::node_addr(&server).await;
         let (connection, serving) = super::super::tests::connection::connect_and_serve(
             &client,
             address,
             client_handler,
             local,
-            ALPN,
+            P2P_V2_ALPN,
             TEST_TIMEOUT,
         )
         .await?;
         Ok(Self {
-            router,
+            server,
             client,
             connection,
             serving,
@@ -308,8 +308,8 @@ impl Fixture {
     async fn close(self) -> Result<(), BoxError> {
         self.connection.close(0u32.into(), b"test complete");
         timeout(TEST_TIMEOUT, self.serving).await???;
-        timeout(TEST_TIMEOUT, self.client.close()).await?;
-        timeout(TEST_TIMEOUT, self.router.shutdown()).await??;
+        timeout(TEST_TIMEOUT, self.client.shutdown()).await?;
+        timeout(TEST_TIMEOUT, self.server.shutdown()).await?;
         Ok(())
     }
 }
@@ -394,6 +394,46 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
     assert!(!server_sibling.service_cancel_token().is_cancelled());
     assert!(fixture.connection.close_reason().is_none());
     assert!(timeout(TEST_TIMEOUT, writes).await??.is_err());
+
+    let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
+    assert_eq!(replacement_client.conn_id, client.conn_id);
+    assert_ne!(replacement_client.id, client.id);
+    exchange(&mut replacement_client, &mut replacement_server).await?;
+    let ping = frame(1, 19, 64);
+    timeout(TEST_TIMEOUT, sibling_send.send(ping.clone())).await??;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+        Some(ping)
+    );
+    fixture.close().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_local_frame_retires_only_its_session() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let mut fixture = Fixture::start().await?;
+    let (client, server) = fixture.sessions().await?;
+    let mut client_sibling = timeout(TEST_TIMEOUT, fixture.client_siblings.recv())
+        .await
+        .expect("the client admits the sibling service")
+        .ok_or("missing client sibling")?;
+    let mut server_sibling = timeout(TEST_TIMEOUT, fixture.server_siblings.recv())
+        .await
+        .expect("the server admits the sibling service")
+        .ok_or("missing server sibling")?;
+    let (mut sibling_recv, _send) = client_sibling.take_stream(SIBLING.kind).unwrap();
+    let (_recv, sibling_send) = server_sibling.take_stream(SIBLING.kind).unwrap();
+
+    // A payload as large as the whole frame cap leaves no room for the header.
+    let oversize = frame(2, 43, usize::try_from(DATA.frame_cap)?);
+    timeout(TEST_TIMEOUT, client.data_send.send(oversize)).await??;
+    timeout(TEST_TIMEOUT, client.cancel.cancelled()).await?;
+    timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
+    assert!(!client.connection_cancel.is_cancelled());
+    assert!(!server.connection_cancel.is_cancelled());
+    assert!(!client_sibling.service_cancel_token().is_cancelled());
+    assert!(!server_sibling.service_cancel_token().is_cancelled());
+    assert!(fixture.connection.close_reason().is_none());
 
     let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
     assert_eq!(replacement_client.conn_id, client.conn_id);
@@ -502,55 +542,56 @@ async fn request_backpressure_survives_write_timeout_and_pair_cancellation() -> 
 #[derive(Debug)]
 struct RawConnection(mpsc::Sender<Connection>);
 
-impl ProtocolHandler for RawConnection {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.0
-            .send(connection.clone())
-            .await
-            .map_err(AcceptError::from_err)?;
-        connection.closed().await;
-        Ok(())
+impl Acceptor for RawConnection {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
+        let accepted = self.0.clone();
+        Box::pin(async move {
+            if accepted.send(connection.clone()).await.is_ok() {
+                connection.closed().await;
+            }
+        })
     }
 }
 
-async fn raw_connection() -> Result<(Router, Endpoint, Connection, Connection), BoxError> {
+async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Connection), BoxError>
+{
     let local = ZakuraLocalLimits::from_config(&Config::default());
-    let transport = || {
-        local
-            .transport_config_builder()
-            .stream_receive_window(64_000u32.into())
-            .receive_window(128_000u32.into())
-            .send_window(64_000)
-            .build()
+    // The smallest windows the transport accepts (zakura-quic CTRL-5, CTRL-7).
+    let factory = || {
+        LocalEndpointFactory::with_limits(&local).quic_config(QuicConfig {
+            stream_receive_window_bytes: 64 * 1024,
+            receive_window_bytes: 128 * 1024,
+            send_window_bytes: 64 * 1024,
+            ..local.quic.clone()
+        })
     };
-    let server = LocalEndpointFactory::with_transport_config(transport())
-        .endpoint(93201)
-        .await?;
-    let client = LocalEndpointFactory::with_transport_config(transport())
-        .endpoint(93202)
-        .await?;
+    let server = factory().endpoint(93201).await?;
+    let client = factory().endpoint(93202).await?;
     let (accepted, mut connections) = mpsc::channel(1);
-    let router = Router::builder(server)
-        .accept(ALPN, RawConnection(accepted))
-        .spawn();
+    server.serve(RawConnection(accepted))?;
     let connection = timeout(
         TEST_TIMEOUT,
-        client.connect(
-            LocalEndpointFactory::node_addr(router.endpoint()).await,
-            ALPN,
-        ),
+        client.connect(LocalEndpointFactory::node_addr(&server).await, &[ALPN]),
     )
     .await??;
     let remote = timeout(TEST_TIMEOUT, connections.recv())
         .await?
         .ok_or("missing connection")?;
-    Ok((router, client, connection, remote))
+    Ok((server, client, connection, remote))
 }
 
 /// Run the real post-handshake connection loop with a raw peer controlling setup bytes.
 struct RawFixture {
-    router: Router,
-    client: Endpoint,
+    server: QuicEndpoint,
+    client: QuicEndpoint,
     connection: Connection,
     serving: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     shutdown: CancellationToken,
@@ -635,7 +676,7 @@ impl RawFixture {
         setup_timeout: Duration,
         streams: &'static [Stream],
     ) -> Result<Self, BoxError> {
-        let (router, client, connection, remote) = raw_connection().await?;
+        let (server, client, connection, remote) = raw_connection().await?;
         let local = ZakuraLocalLimits::from_config(&Config::default());
         let (sessions_tx, sessions) = mpsc::channel(2);
         let (siblings_tx, siblings) = mpsc::channel(1);
@@ -662,13 +703,13 @@ impl RawFixture {
         let shutdown = handler.shutdown.clone();
         let mut limits = local.clamp(&local.initial_limits());
         limits.prelude_timeout = setup_timeout;
-        let peer_id = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
+        let peer_id = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
         let transcript_hash = native_connection_transcript_hash(
             ServicePeerDirection::Inbound,
-            &router.endpoint().id(),
-            &client.id(),
+            &server.local_id(),
+            &client.local_id(),
         );
-        let remote_ip = confirmed_remote_ip(&remote);
+        let remote_ip = Some(remote.admitted_ip());
         let serving = AbortOnDropHandle::new(tokio::spawn(async move {
             handler
                 .register_and_serve(
@@ -683,12 +724,13 @@ impl RawFixture {
                         transcript_hash,
                         i_open_collision_winner: false,
                         conn: ZakuraConnTrace::without_peer(1),
+                        control_handshake: None,
                     },
                 )
                 .await
         }));
         Ok(Self {
-            router,
+            server,
             client,
             connection,
             serving,
@@ -738,8 +780,8 @@ impl RawFixture {
         self.shutdown.cancel();
         timeout(Duration::from_millis(500), &mut self.serving).await???;
         self.connection.close(0u32.into(), b"test complete");
-        timeout(TEST_TIMEOUT, self.client.close()).await?;
-        timeout(TEST_TIMEOUT, self.router.shutdown()).await??;
+        timeout(TEST_TIMEOUT, self.client.shutdown()).await?;
+        timeout(TEST_TIMEOUT, self.server.shutdown()).await?;
         Ok(())
     }
 }
@@ -1110,13 +1152,13 @@ async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<
     fixture.close().await
 }
 
-fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerContext {
+fn raw_worker_context(client: &QuicEndpoint, slots: Arc<Semaphore>) -> StreamWorkerContext {
     let local = ZakuraLocalLimits::from_config(&Config::default());
     let cancel = CancellationToken::new();
     let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
     StreamWorkerContext {
         conn: ZakuraConnTrace::without_peer(1),
-        peer_id: ZakuraPeerId::new(client.id().as_bytes().to_vec()).unwrap(),
+        peer_id: ZakuraPeerId::new(client.local_id().as_bytes().to_vec()).unwrap(),
         stream_id: 1,
         _permit: slots.try_acquire_owned().unwrap(),
         limits: local.clamp(&local.initial_limits()),
@@ -1139,7 +1181,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
 #[tokio::test]
 async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    let (router, client, connection, remote) = raw_connection().await?;
+    let (server, client, connection, remote) = raw_connection().await?;
     for (reset, drop_receiver) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
         peer_send
@@ -1209,8 +1251,8 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         assert_eq!(resources.available_permits(), 1);
     }
     connection.close(0u32.into(), b"done");
-    timeout(TEST_TIMEOUT, client.close()).await?;
-    timeout(TEST_TIMEOUT, router.shutdown()).await??;
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
     Ok(())
 }
 
@@ -1219,6 +1261,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
 #[tokio::test]
 async fn request_response_tables_reject_the_other_role_before_payloads() -> Result<(), BoxError> {
     const PING: MessageRule = MessageRule {
+        name: "ping",
         message_type: LEGACY_REQUEST_PING,
         payload: PayloadLen::exact(8),
         role: MessageRole::Request {
@@ -1227,6 +1270,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
         },
     };
     const PONG: MessageRule = MessageRule {
+        name: "pong",
         message_type: LEGACY_RESPONSE_PONG,
         payload: PayloadLen::exact(8),
         role: MessageRole::Response {
@@ -1235,7 +1279,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
         },
     };
     let _guard = zakura_test::init();
-    let (router, client, connection, remote) = raw_connection().await?;
+    let (server, client, connection, remote) = raw_connection().await?;
     let stream = Stream {
         kind: LEGACY_REQUEST_STREAM_KIND,
         mode: StreamMode::RequestResponse,
@@ -1320,8 +1364,8 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
         )
     );
     connection.close(0u32.into(), b"done");
-    timeout(TEST_TIMEOUT, client.close()).await?;
-    timeout(TEST_TIMEOUT, router.shutdown()).await??;
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
     Ok(())
 }
 
@@ -1329,7 +1373,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
 async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
 ) -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    let (router, client, connection, remote) = raw_connection().await?;
+    let (server, client, connection, remote) = raw_connection().await?;
     let local = ZakuraLocalLimits::from_config(&Config::default());
     let permits = Arc::new(Semaphore::new(2));
     let (sessions, _sessions_rx) = mpsc::channel(1);
@@ -1348,7 +1392,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     );
     let mut limits = local.clamp(&local.initial_limits());
     limits.prelude_timeout = Duration::from_millis(100);
-    let peer = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
+    let peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
     let (freshness, _freshness_rx) = watch::channel(Instant::now());
     let cancel = CancellationToken::new();
     let mut pending = PendingSessions::default();
@@ -1434,15 +1478,15 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     );
     drop(offers);
     connection.close(0u32.into(), b"done");
-    timeout(TEST_TIMEOUT, client.close()).await?;
-    timeout(TEST_TIMEOUT, router.shutdown()).await??;
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    let (router, client, connection, remote) = raw_connection().await?;
+    let (server, client, connection, remote) = raw_connection().await?;
     let (sessions, _sessions_rx) = mpsc::channel(1);
     let service = Arc::new(SessionService {
         streams: &[DATA, REQUESTS],
@@ -1507,8 +1551,110 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
     assert!(pending.deadline().is_none());
     assert!(workers.is_empty());
     connection.close(0u32.into(), b"done");
-    timeout(TEST_TIMEOUT, client.close()).await?;
-    timeout(TEST_TIMEOUT, router.shutdown()).await??;
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let (server, client, connection, remote) = raw_connection().await?;
+    let (sessions, _sessions_rx) = mpsc::channel(1);
+    let (siblings, _siblings_rx) = mpsc::channel(1);
+    let local = ZakuraLocalLimits::from_config(&Config::default());
+    let handler = ZakuraProtocolHandler::new_with_registry(
+        ZakuraSupervisorHandle::new(16),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        local.clone(),
+        Arc::new(ServiceRegistry::new(vec![
+            Arc::new(SessionService {
+                streams: &[DATA, REQUESTS],
+                capacity: None,
+                opening: SessionOpening::EitherSide,
+                fail_first_reservation: std::sync::atomic::AtomicBool::new(false),
+                sessions,
+            }),
+            Arc::new(SiblingService {
+                sessions: siblings,
+                retired: false,
+            }),
+        ])?),
+    );
+    let header = u32::try_from(FRAME_HEADER_BYTES)?;
+    for (cap, admitted) in [(0, false), (header, false), (header + 1, true)] {
+        let slots = Arc::new(Semaphore::new(1));
+        let context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
+        let close_cause = context.close_cause.clone();
+        let mut workers = JoinSet::new();
+        let mut open_limiter = TokenBucket::new(100);
+        let mut buckets = MessageRateBuckets::new();
+        let mut pending = PendingSessions::default();
+        let (exits, _exit_rx) = mpsc::unbounded_channel();
+        let mut admission = StreamAdmission {
+            is_initiator: false,
+            direction: ServicePeerDirection::Inbound,
+            conn: context.conn,
+            peer_id: &context.peer_id,
+            stream_sem: &slots,
+            open_limiter: &mut open_limiter,
+            message_buckets: &mut buckets,
+            workers: &mut workers,
+            limits: context.limits,
+            accepted_capabilities: SIBLING.capability,
+            connection_token: context.connection_token.clone(),
+            close_cause: context.close_cause,
+            freshness_tx: context.freshness_tx,
+        };
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: SIBLING.kind,
+            stream_version: SIBLING.version,
+            request_id: None,
+            max_frame_bytes: cap,
+        };
+        send.write_all(&prelude.encode()?).await?;
+        let (accepted_send, accepted_recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+        let session = timeout(
+            TEST_TIMEOUT,
+            handler.admit_bi_stream(
+                accepted_send,
+                accepted_recv,
+                &mut admission,
+                2,
+                exits,
+                &mut pending,
+            ),
+        )
+        .await?;
+        assert_eq!(session.is_some(), admitted, "cap {cap}");
+        assert_eq!(
+            context.connection_token.is_cancelled(),
+            !admitted,
+            "cap {cap}"
+        );
+        if !admitted {
+            assert_eq!(close_cause.get(), Some("undersized_frame_cap"), "cap {cap}");
+            let mut byte = [0; 1];
+            let read = timeout(TEST_TIMEOUT, recv.read_exact(&mut byte)).await?;
+            assert!(
+                matches!(
+                    read,
+                    Err(zakura_quic::ReadExactError::ReadError(zakura_quic::ReadError::Reset(code)))
+                        if code == VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE)
+                ),
+                "cap {cap}: {read:?}"
+            );
+        } else {
+            assert_eq!(close_cause.get(), None, "cap {cap}");
+        }
+        context.connection_token.cancel();
+    }
+    connection.close(0u32.into(), b"done");
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
     Ok(())
 }
 
@@ -1606,7 +1752,7 @@ impl Drop for CancellingWriteClaim {
 #[tokio::test]
 async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    let (router, client, connection, remote) = raw_connection().await?;
+    let (server, client, connection, remote) = raw_connection().await?;
     for expected in [
         Some(OrderedStreamFailure::RemoteClose),
         Some(OrderedStreamFailure::WriteTimeout),
@@ -1672,8 +1818,8 @@ async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(),
         assert!(!connection_cancel.is_cancelled());
     }
     connection.close(0u32.into(), b"done");
-    timeout(TEST_TIMEOUT, client.close()).await?;
-    timeout(TEST_TIMEOUT, router.shutdown()).await??;
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
     Ok(())
 }
 

@@ -122,7 +122,7 @@ sequenceDiagram
   R->>E: install_committed_transition
   R-->>W: ApplyResult
   R->>P: publish the committed snapshot
-  P->>N: GetHeaders for the next target
+  P->>N: Grant or Open for the next target
 ```
 
 The reactor learns what happened from the publisher rather than from the value its own call
@@ -131,7 +131,7 @@ returned. Every frontier it schedules against is therefore already on disk.
 ## Peer to Reactor
 
 The delivery arrives as
-[`HeaderSyncMessage::Headers`](../../../crates/zakura-network/src/zakura/header_sync/wire.rs) on
+a [`Headers`](../../../crates/zakura-network/src/zakura/header_sync/v9/wire.rs) page on
 the header-sync stream. Peers are not trusted. Authenticating a peer's key establishes who sent
 the message, and it says nothing about whether the contents are true, so every field in the
 message is a claim. If the reactor derived a chain fact from that claim, the peer would take

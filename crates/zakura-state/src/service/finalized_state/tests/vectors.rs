@@ -5,7 +5,7 @@
 //! use empty trees.
 
 use hex::FromHex;
-use rand::random;
+use rand_10::random;
 
 use halo2::pasta::{group::ff::PrimeField, pallas};
 

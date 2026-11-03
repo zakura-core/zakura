@@ -1,0 +1,1265 @@
+//! The `Plan`: every choice a run makes.
+//!
+//! A run asks for two kinds of choice. A pick chooses one enabled action at
+//! each step. A draw answers a random value that production code asked for,
+//! such as an unbiased `select!` start. Both come from a [`PlanInput`]:
+//! fuzz bytes, decoded lazily, or a readable [`Plan`] script.
+//!
+//! Once bytes run out, picks fall back to round-robin over the enabled set and
+//! draws to a fair default, so an empty or truncated input is still a valid,
+//! bounded run (M1.4).
+
+use std::{collections::VecDeque, fmt};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::{
+    record::{DrawRecord, StepRecord},
+    trace::{Invalid, Trace},
+    Category, Identity,
+};
+
+/// A `u64` that serializes as a lowercase `0x` hex string, so JSON tools keep
+/// every bit. Only the canonical form deserializes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HexU64(pub u64);
+
+impl fmt::Display for HexU64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
+}
+
+impl Serialize for HexU64 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for HexU64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.strip_prefix("0x")
+            .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+            .map(HexU64)
+            .filter(|value| value.to_string() == text)
+            .ok_or_else(|| serde::de::Error::custom(format!("not a canonical 0x hex u64: {text}")))
+    }
+}
+
+/// A readable list of choices, one per real choice or draw, in run order.
+///
+/// A pick with one enabled action, or a draw with bound 1, isn't a real
+/// choice and has no entry. Once the list runs out, every choice takes the
+/// default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Plan {
+    /// The choices, in the order the run asks for them.
+    pub choices: Vec<PlanChoice>,
+}
+
+impl Plan {
+    /// A plan input that decodes `bytes` as fuzz input.
+    pub fn from_fuzz(bytes: &[u8]) -> PlanInput {
+        PlanInput::Bytes(bytes.to_vec())
+    }
+}
+
+/// One entry of a [`Plan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanChoice {
+    /// Pick the enabled action with this identity.
+    Pick(String),
+    /// Answer a draw with this value, reduced below the draw's bound.
+    Draw(HexU64),
+    /// Take the default: the round-robin pick, or the default draw.
+    Default,
+}
+
+impl fmt::Display for PlanChoice {
+    /// `pick <identity>` or `draw <hex>`, a stable form for records.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanChoice::Pick(identity) => write!(f, "pick {identity}"),
+            PlanChoice::Draw(value) => write!(f, "draw {value}"),
+            PlanChoice::Default => f.write_str("default"),
+        }
+    }
+}
+
+/// Where a run's choices come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanInput {
+    /// Fuzz bytes, decoded one choice at a time.
+    Bytes(Vec<u8>),
+    /// A scripted plan that follows picks by identity. Test scaffolding only.
+    Script(Plan),
+    /// A recorded trace's every pick and draw, which the run must make again
+    /// exactly (traces.md, Replay). Only [`crate::trace::replay`] builds one.
+    Trace(TraceScript),
+    /// A shrink candidate's picks and draws, which the run follows where it
+    /// can and skips where it can't (traces.md, Trace shrinking).
+    Skip(SkipScript),
+}
+
+/// One step of a shrink candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Candidate {
+    /// A recorded step. The run takes its pick if `by` is `bytes` and the
+    /// pick is enabled, and the round-robin pick otherwise. Its draws answer
+    /// the step's draws where they match ([`SkipScript`]).
+    Recorded(StepRecord),
+    /// The round-robin pick, with default draws.
+    Default,
+}
+
+/// A shrink candidate as a run's input: the `init` draws, then one
+/// [`Candidate`] per step, in run order.
+///
+/// Step `n` takes the `n`th candidate. A recorded pick that isn't enabled
+/// at its step is skipped, and the round-robin pick runs instead. A draw
+/// whose identity or bound doesn't match its step's next recorded draw gets
+/// the default answer, as an exhausted input's does. A
+/// [`Candidate::Default`] takes the round-robin pick and default draws.
+/// After the last candidate, every choice takes the default.
+///
+/// A pick or draw that equals the default counts as one, so `by` is
+/// `bytes` only where the candidate's choice differs from the default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkipScript {
+    init: VecDeque<DrawRecord>,
+    steps: VecDeque<Candidate>,
+}
+
+impl SkipScript {
+    /// A script of `init` draws and one candidate per step.
+    pub fn new(init: Vec<DrawRecord>, steps: Vec<Candidate>) -> Self {
+        SkipScript {
+            init: init.into(),
+            steps: steps.into(),
+        }
+    }
+}
+
+/// A trace's picks and draws in run order, for Exact replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceScript {
+    entries: VecDeque<Recorded>,
+    /// True if the trace is a prefix, so running past its last step stops
+    /// the replay instead of diverging.
+    prefix: bool,
+}
+
+impl TraceScript {
+    /// `trace`'s `init` draws, then each step's pick and draws. Fails on a
+    /// draw whose recorded value isn't below its bound, so a hand-edited
+    /// trace can't hand production code an out-of-range answer.
+    pub(crate) fn new(trace: &Trace, prefix: bool) -> Result<Self, Invalid> {
+        let mut entries = VecDeque::new();
+        // `init` is line 2, and step n is line n + 2.
+        for draw in trace.init.iter().flat_map(|init| &init.draws) {
+            entries.push_back(Recorded::draw(0, 2, draw)?);
+        }
+        for step in &trace.steps {
+            let line = usize::try_from(step.step).map_or(usize::MAX, |n| n.saturating_add(2));
+            entries.push_back(Recorded::Pick {
+                step: step.step,
+                pick: step.pick.clone(),
+                options: step.options,
+                by: step.by,
+                offset: step.offset,
+            });
+            for draw in &step.draws {
+                entries.push_back(Recorded::draw(step.step, line, draw)?);
+            }
+        }
+        Ok(TraceScript { entries, prefix })
+    }
+}
+
+/// One recorded pick or draw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Recorded {
+    Pick {
+        step: u64,
+        pick: String,
+        options: usize,
+        by: By,
+        offset: Option<usize>,
+    },
+    Draw {
+        step: u64,
+        draw: String,
+        bound: u64,
+        value: u64,
+        by: By,
+    },
+}
+
+impl Recorded {
+    /// The entry for `draw`, taken at `step` and read from `line`. Fails if
+    /// its value isn't below its bound.
+    fn draw(step: u64, line: usize, draw: &DrawRecord) -> Result<Self, Invalid> {
+        let DrawRecord {
+            draw,
+            bound,
+            value,
+            by,
+        } = draw;
+        if bound.0 != 0 && value.0 >= bound.0 {
+            return Err(Invalid::Malformed {
+                line,
+                reason: format!("draw {draw} answers {value}, not below {bound}"),
+            });
+        }
+        Ok(Recorded::Draw {
+            step,
+            draw: draw.clone(),
+            bound: bound.0,
+            value: value.0,
+            by: *by,
+        })
+    }
+
+    /// The step that made it. `init` draws are step 0.
+    fn step(&self) -> u64 {
+        match self {
+            Recorded::Pick { step, .. } | Recorded::Draw { step, .. } => *step,
+        }
+    }
+}
+
+impl fmt::Display for Recorded {
+    /// `pick <identity>` or `draw <identity> below <bound>`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Recorded::Pick { pick, .. } => write!(f, "pick {pick}"),
+            Recorded::Draw { draw, bound, .. } => write!(f, "draw {draw} below {}", HexU64(*bound)),
+        }
+    }
+}
+
+/// What made a choice, as records show it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum By {
+    /// Input bytes, or a [`PlanInput::Script`] entry, which has no offset.
+    Bytes,
+    /// The fallback, once the input ran out.
+    Default,
+    /// The only option.
+    Forced,
+}
+
+/// A scripted plan or trace that the run couldn't follow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanError {
+    /// The script picks an action that isn't enabled.
+    NotEnabled {
+        /// The scripted identity.
+        wanted: String,
+    },
+    /// The script has a pick where the run asked for a draw, or the reverse.
+    Mismatch {
+        /// What the run asked for: `pick` or `draw`.
+        wanted: &'static str,
+        /// The script's entry.
+        found: PlanChoice,
+    },
+    /// The run asked for a pick or draw other than the trace's next one.
+    Diverged(Divergence),
+    /// The run went past a prefix trace's last step, so the prefix replayed
+    /// in full.
+    PrefixEnd {
+        /// The prefix's last step.
+        step: u64,
+    },
+}
+
+/// How a run left its trace. Steps count from 1, and step 0 is `init`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Divergence {
+    /// The recorded pick isn't enabled. Identities compare in full, `at`
+    /// included.
+    Pick {
+        /// The step.
+        step: u64,
+        /// The recorded pick.
+        wanted: String,
+        /// Every enabled identity.
+        ready: Vec<String>,
+    },
+    /// A different number of actions is enabled.
+    Options {
+        /// The step.
+        step: u64,
+        /// The recorded count.
+        recorded: usize,
+        /// The count now.
+        found: usize,
+    },
+    /// A drain step's round-robin pick isn't the recorded one.
+    DrainPick {
+        /// The step.
+        step: u64,
+        /// The recorded pick.
+        wanted: String,
+        /// The round-robin pick.
+        found: String,
+    },
+    /// A draw's identity or bound isn't the recorded one.
+    Draw {
+        /// The step.
+        step: u64,
+        /// The recorded draw and bound.
+        wanted: String,
+        /// The run's draw and bound.
+        found: String,
+    },
+    /// The run asked for a pick where the trace has a draw, or the reverse.
+    Kind {
+        /// The trace entry's step.
+        step: u64,
+        /// What the run asked for: `pick` or `draw`.
+        wanted: &'static str,
+        /// The trace's entry.
+        found: String,
+    },
+    /// The run asked for a pick or draw after the trace's last one.
+    PastEnd {
+        /// The step it asked in.
+        step: u64,
+        /// What it asked for: `pick` or `draw`.
+        wanted: &'static str,
+    },
+    /// The run ended before the trace's last pick or draw.
+    Unreached {
+        /// The first unreached entry's step.
+        step: u64,
+        /// The entry.
+        wanted: String,
+    },
+}
+
+impl Divergence {
+    /// The step it happened at.
+    pub fn step(&self) -> u64 {
+        match self {
+            Divergence::Pick { step, .. }
+            | Divergence::Options { step, .. }
+            | Divergence::DrainPick { step, .. }
+            | Divergence::Draw { step, .. }
+            | Divergence::Kind { step, .. }
+            | Divergence::PastEnd { step, .. }
+            | Divergence::Unreached { step, .. } => *step,
+        }
+    }
+}
+
+impl fmt::Display for Divergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Divergence::Pick {
+                step,
+                wanted,
+                ready,
+            } => write!(
+                f,
+                "step {step}: recorded pick {wanted} isn't enabled; enabled: {}",
+                ready.join(", ")
+            ),
+            Divergence::Options {
+                step,
+                recorded,
+                found,
+            } => write!(
+                f,
+                "step {step}: {found} actions are enabled, and the trace recorded {recorded}"
+            ),
+            Divergence::DrainPick {
+                step,
+                wanted,
+                found,
+            } => write!(
+                f,
+                "step {step}: the drain picked {found}, and the trace recorded {wanted}"
+            ),
+            Divergence::Draw {
+                step,
+                wanted,
+                found,
+            } => write!(
+                f,
+                "step {step}: the run took {found}, and the trace recorded {wanted}"
+            ),
+            Divergence::Kind {
+                step,
+                wanted,
+                found,
+            } => write!(
+                f,
+                "step {step}: the run asked for a {wanted}, and the trace has {found}"
+            ),
+            Divergence::PastEnd { step, wanted } => write!(
+                f,
+                "step {step}: the run asked for a {wanted} after the trace's last one"
+            ),
+            Divergence::Unreached { step, wanted } => {
+                write!(f, "step {step}: the run ended before the trace's {wanted}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanError::NotEnabled { wanted } => write!(f, "scripted pick {wanted} isn't enabled"),
+            PlanError::Mismatch { wanted, found } => {
+                write!(
+                    f,
+                    "the run asked for a {wanted}, but the script has {found}"
+                )
+            }
+            PlanError::Diverged(divergence) => write!(f, "the replay diverged at {divergence}"),
+            PlanError::PrefixEnd { step } => {
+                write!(f, "the prefix replayed to its last step, {step}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
+
+/// A pick: the chosen index into the enabled set, and what chose it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Decision {
+    /// Index into the enabled set.
+    pub(crate) index: usize,
+    /// What made the choice.
+    pub(crate) by: By,
+    /// Where the choice's bytes start in the input, when `by` is `Bytes`.
+    pub(crate) offset: Option<usize>,
+}
+
+/// A draw's answer, already below its bound, and what chose it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Answer {
+    /// The value production code sees.
+    pub(crate) value: u64,
+    /// What made the choice.
+    pub(crate) by: By,
+    /// Where the choice's bytes start in the input, when `by` is `Bytes`.
+    pub(crate) offset: Option<usize>,
+}
+
+/// The remaining input.
+#[derive(Debug)]
+enum Input {
+    Bytes {
+        bytes: Vec<u8>,
+        offset: usize,
+    },
+    Script(VecDeque<PlanChoice>),
+    Trace {
+        script: TraceScript,
+        /// The step of the last recorded pick taken, 0 before the first.
+        step: u64,
+    },
+    Skip {
+        script: SkipScript,
+        /// The current step's recorded draws, not yet answered. Before the
+        /// first pick, draws come from `script.init` instead.
+        draws: VecDeque<DrawRecord>,
+        /// True once the first pick took its candidate.
+        picked: bool,
+    },
+}
+
+/// Makes a run's choices from its [`PlanInput`].
+#[derive(Debug)]
+pub(crate) struct Decider {
+    input: Input,
+    /// The previous pick's `(category, key)`. Every pick moves it.
+    cursor: Option<(Category, String)>,
+    /// The real choices made so far, as a script that replays them.
+    resolved: Vec<PlanChoice>,
+    /// Default choices made since the last entry of `resolved`. They become
+    /// [`PlanChoice::Default`] entries only if a later choice isn't a
+    /// default, so an exhausted input's defaults take no room.
+    pending_defaults: usize,
+}
+
+impl Decider {
+    /// A decider that reads `input` from its start.
+    pub(crate) fn new(input: PlanInput) -> Self {
+        let input = match input {
+            PlanInput::Bytes(bytes) => Input::Bytes { bytes, offset: 0 },
+            PlanInput::Script(plan) => Input::Script(plan.choices.into()),
+            PlanInput::Trace(script) => Input::Trace { script, step: 0 },
+            PlanInput::Skip(script) => Input::Skip {
+                script,
+                draws: VecDeque::new(),
+                picked: false,
+            },
+        };
+        Decider {
+            input,
+            cursor: None,
+            resolved: Vec::new(),
+            pending_defaults: 0,
+        }
+    }
+
+    /// Picks one of `options`, which must be non-empty, sorted and free of
+    /// duplicate identities.
+    ///
+    /// One option is forced and takes no input. Otherwise bytes choose
+    /// `value % n`, a script entry chooses by identity, and an exhausted input
+    /// takes the first option whose key sorts after the previous pick,
+    /// wrapping to the start. A skip script follows [`SkipScript`]'s rule.
+    pub(crate) fn pick(&mut self, options: &[Identity]) -> Result<Decision, PlanError> {
+        assert!(!options.is_empty(), "a pick needs an enabled action");
+        debug_assert!(
+            options.windows(2).all(|w| w[0] < w[1]),
+            "the enabled set is sorted and has no duplicates"
+        );
+        let n = options.len();
+        let decision = if let Input::Trace { .. } = self.input {
+            let (recorded, by, offset) = self.next_recorded_pick(options)?;
+            Decision {
+                index: options
+                    .iter()
+                    .position(|o| o.to_string() == recorded)
+                    .ok_or_else(|| {
+                        PlanError::Diverged(Divergence::Pick {
+                            step: self.trace_step(),
+                            wanted: recorded,
+                            ready: options.iter().map(ToString::to_string).collect(),
+                        })
+                    })?,
+                by,
+                offset,
+            }
+        } else if let Input::Skip { .. } = self.input {
+            self.skip_pick(options)
+        } else if n == 1 {
+            Decision {
+                index: 0,
+                by: By::Forced,
+                offset: None,
+            }
+        } else {
+            // usize always fits in u128.
+            let n = n as u128;
+            match self.next_input(width(n)) {
+                Some(Next::Bytes { value, offset }) => Decision {
+                    // The remainder is below n, which came from a usize.
+                    index: (u128::from(value) % n) as usize,
+                    by: By::Bytes,
+                    offset: Some(offset),
+                },
+                Some(Next::Script(PlanChoice::Pick(wanted))) => Decision {
+                    index: options
+                        .iter()
+                        .position(|o| o.to_string() == wanted)
+                        .ok_or(PlanError::NotEnabled { wanted })?,
+                    by: By::Bytes,
+                    offset: None,
+                },
+                Some(Next::Script(found @ PlanChoice::Draw(_))) => {
+                    return Err(PlanError::Mismatch {
+                        wanted: "pick",
+                        found,
+                    })
+                }
+                Some(Next::Script(PlanChoice::Default)) | None => Decision {
+                    index: self.round_robin(options),
+                    by: By::Default,
+                    offset: None,
+                },
+            }
+        };
+        let picked = &options[decision.index];
+        self.resolve(decision.by, || PlanChoice::Pick(picked.to_string()));
+        self.cursor = Some((picked.category, picked.key.clone()));
+        Ok(decision)
+    }
+
+    /// A skip script's pick: the next candidate's recorded pick if it's
+    /// enabled and was chosen by bytes, else the round-robin pick. Takes the
+    /// candidate, and its draws become the step's.
+    fn skip_pick(&mut self, options: &[Identity]) -> Decision {
+        let fallback = self.round_robin(options);
+        let Input::Skip {
+            script,
+            draws,
+            picked,
+        } = &mut self.input
+        else {
+            unreachable!("only called for a skip script");
+        };
+        *picked = true;
+        let index = match script.steps.pop_front() {
+            Some(Candidate::Recorded(step)) => {
+                *draws = step.draws.into();
+                match step.by {
+                    By::Bytes => options
+                        .iter()
+                        .position(|o| o.to_string() == step.pick)
+                        .unwrap_or(fallback),
+                    By::Default | By::Forced => fallback,
+                }
+            }
+            Some(Candidate::Default) | None => {
+                draws.clear();
+                fallback
+            }
+        };
+        Decision {
+            index,
+            by: if options.len() == 1 {
+                By::Forced
+            } else if index == fallback {
+                By::Default
+            } else {
+                By::Bytes
+            },
+            offset: None,
+        }
+    }
+
+    /// Notes a choice made `by`, for [`resolved`](Self::resolved): `choice`
+    /// for a bytes choice, a pending default for a default one, and nothing
+    /// for a forced one.
+    fn resolve(&mut self, by: By, choice: impl FnOnce() -> PlanChoice) {
+        match by {
+            By::Bytes => {
+                let defaults = std::mem::take(&mut self.pending_defaults);
+                self.resolved
+                    .extend(std::iter::repeat_n(PlanChoice::Default, defaults));
+                self.resolved.push(choice());
+            }
+            By::Default => self.pending_defaults += 1,
+            By::Forced => {}
+        }
+    }
+
+    /// Picks one of `options` by round-robin alone, ignoring the input, as
+    /// the drain after a budget does. The same preconditions as
+    /// [`pick`](Self::pick) apply.
+    ///
+    /// A trace input still checks the pick against its record, so a drain
+    /// that leaves the trace stops before the step runs.
+    pub(crate) fn pick_round_robin(&mut self, options: &[Identity]) -> Result<Decision, PlanError> {
+        assert!(!options.is_empty(), "a pick needs an enabled action");
+        let decision = Decision {
+            index: self.round_robin(options),
+            by: if options.len() == 1 {
+                By::Forced
+            } else {
+                By::Default
+            },
+            offset: None,
+        };
+        if let Input::Skip { .. } = self.input {
+            // The drain takes the round-robin pick whatever the candidate
+            // says, but the candidate's draws still answer the step's.
+            self.skip_pick(options);
+        }
+        if let Input::Trace { .. } = self.input {
+            // Round-robin makes the same `by` the recording did, so only the
+            // pick needs checking.
+            let (recorded, _, _) = self.next_recorded_pick(options)?;
+            let found = options[decision.index].to_string();
+            if found != recorded {
+                return Err(PlanError::Diverged(Divergence::DrainPick {
+                    step: self.trace_step(),
+                    wanted: recorded,
+                    found,
+                }));
+            }
+        }
+        let picked = &options[decision.index];
+        self.cursor = Some((picked.category, picked.key.clone()));
+        Ok(decision)
+    }
+
+    /// Answers draw `identity` below `bound`, or any `u64` when `bound` is
+    /// 0.
+    ///
+    /// `ordinal` counts this draw among its task's draws of the same kind,
+    /// from 1. An exhausted input answers [`default_draw`] for it. A trace
+    /// input answers the recorded value, after checking the identity and
+    /// bound, bound-1 draws included. A skip script follows
+    /// [`SkipScript`]'s rule.
+    pub(crate) fn draw(
+        &mut self,
+        identity: &str,
+        bound: u64,
+        ordinal: u32,
+    ) -> Result<Answer, PlanError> {
+        let answer = match self.input {
+            Input::Trace { .. } => self.next_recorded_draw(identity, bound)?,
+            Input::Skip { .. } => self.skip_draw(identity, bound, ordinal),
+            Input::Bytes { .. } | Input::Script(_) => self.input_draw(bound, ordinal)?,
+        };
+        self.resolve(answer.by, || PlanChoice::Draw(HexU64(answer.value)));
+        Ok(answer)
+    }
+
+    /// A skip script's draw: the step's next recorded draw, which it takes,
+    /// answers it if that draw has `identity` and `bound` and bytes chose
+    /// it. Otherwise the draw gets the default answer.
+    fn skip_draw(&mut self, identity: &str, bound: u64, ordinal: u32) -> Answer {
+        let Input::Skip {
+            script,
+            draws,
+            picked,
+        } = &mut self.input
+        else {
+            unreachable!("only called for a skip script");
+        };
+        let recorded = if *picked {
+            draws.pop_front()
+        } else {
+            script.init.pop_front()
+        };
+        if bound == 1 {
+            return Answer {
+                value: 0,
+                by: By::Forced,
+                offset: None,
+            };
+        }
+        let default = default_draw(bound, ordinal);
+        let value = recorded
+            .filter(|d| d.by == By::Bytes && d.draw == identity && d.bound.0 == bound)
+            .map_or(default, |d| reduce(d.value.0, bound));
+        Answer {
+            value,
+            by: if value == default {
+                By::Default
+            } else {
+                By::Bytes
+            },
+            offset: None,
+        }
+    }
+
+    /// A bytes or script input's draw.
+    fn input_draw(&mut self, bound: u64, ordinal: u32) -> Result<Answer, PlanError> {
+        if bound == 1 {
+            return Ok(Answer {
+                value: 0,
+                by: By::Forced,
+                offset: None,
+            });
+        }
+        let range = match bound {
+            0 => 1 << 64,
+            bound => u128::from(bound),
+        };
+        let answer = match self.next_input(width(range)) {
+            Some(Next::Bytes { value, offset }) => Answer {
+                value: reduce(value, bound),
+                by: By::Bytes,
+                offset: Some(offset),
+            },
+            Some(Next::Script(PlanChoice::Draw(HexU64(value)))) => Answer {
+                value: reduce(value, bound),
+                by: By::Bytes,
+                offset: None,
+            },
+            Some(Next::Script(found @ PlanChoice::Pick(_))) => {
+                return Err(PlanError::Mismatch {
+                    wanted: "draw",
+                    found,
+                })
+            }
+            Some(Next::Script(PlanChoice::Default)) | None => Answer {
+                value: default_draw(bound, ordinal),
+                by: By::Default,
+                offset: None,
+            },
+        };
+        Ok(answer)
+    }
+
+    /// Fails if a trace input has picks or draws the run never reached.
+    /// Other inputs always pass.
+    pub(crate) fn finish(&self) -> Result<(), PlanError> {
+        match &self.input {
+            Input::Trace { script, .. } => match script.entries.front() {
+                Some(next) => Err(PlanError::Diverged(Divergence::Unreached {
+                    step: next.step(),
+                    wanted: next.to_string(),
+                })),
+                None => Ok(()),
+            },
+            Input::Bytes { .. } | Input::Script(_) | Input::Skip { .. } => Ok(()),
+        }
+    }
+
+    /// The step of the last recorded pick a trace input gave, 0 before the
+    /// first or for other inputs.
+    fn trace_step(&self) -> u64 {
+        match self.input {
+            Input::Trace { step, .. } => step,
+            Input::Bytes { .. } | Input::Script(_) | Input::Skip { .. } => 0,
+        }
+    }
+
+    /// Takes a trace input's next entry, which must be a pick among
+    /// `options.len()` actions. Returns its identity, `by` and offset.
+    fn next_recorded_pick(
+        &mut self,
+        options: &[Identity],
+    ) -> Result<(String, By, Option<usize>), PlanError> {
+        let Input::Trace { script, step } = &mut self.input else {
+            unreachable!("only called for a trace input");
+        };
+        let diverged = |d| Err(PlanError::Diverged(d));
+        match script.entries.pop_front() {
+            Some(Recorded::Pick {
+                step: at,
+                pick,
+                options: recorded,
+                by,
+                offset,
+            }) => {
+                *step = at;
+                if recorded != options.len() && options.iter().any(|o| o.to_string() == pick) {
+                    return diverged(Divergence::Options {
+                        step: at,
+                        recorded,
+                        found: options.len(),
+                    });
+                }
+                Ok((pick, by, offset))
+            }
+            Some(found @ Recorded::Draw { .. }) => diverged(Divergence::Kind {
+                step: found.step(),
+                wanted: "pick",
+                found: found.to_string(),
+            }),
+            None if script.prefix => Err(PlanError::PrefixEnd { step: *step }),
+            None => diverged(Divergence::PastEnd {
+                step: step.saturating_add(1),
+                wanted: "pick",
+            }),
+        }
+    }
+
+    /// Takes a trace input's next entry, which must be draw `identity` below
+    /// `bound`, and answers it.
+    fn next_recorded_draw(&mut self, identity: &str, bound: u64) -> Result<Answer, PlanError> {
+        let Input::Trace { script, step } = &mut self.input else {
+            unreachable!("only called for a trace input");
+        };
+        let diverged = |d| Err(PlanError::Diverged(d));
+        match script.entries.pop_front() {
+            Some(Recorded::Draw {
+                draw,
+                bound: recorded,
+                value,
+                by,
+                step: at,
+            }) => {
+                if draw != identity || recorded != bound {
+                    return diverged(Divergence::Draw {
+                        step: at,
+                        wanted: format!("{draw} below {}", HexU64(recorded)),
+                        found: format!("{identity} below {}", HexU64(bound)),
+                    });
+                }
+                Ok(Answer {
+                    value,
+                    by,
+                    offset: None,
+                })
+            }
+            Some(found @ Recorded::Pick { .. }) => diverged(Divergence::Kind {
+                // The draw belongs to the step before the recorded pick.
+                step: found.step().saturating_sub(1),
+                wanted: "draw",
+                found: found.to_string(),
+            }),
+            None => diverged(Divergence::PastEnd {
+                step: *step,
+                wanted: "draw",
+            }),
+        }
+    }
+
+    /// The real choices made so far, as a script that replays them. A
+    /// default between two other choices is a [`PlanChoice::Default`] entry.
+    /// Defaults after the last other choice have none, since a script that
+    /// ran out takes the same defaults.
+    pub(crate) fn resolved(&self) -> Plan {
+        Plan {
+            choices: self.resolved.clone(),
+        }
+    }
+
+    /// The next choice's input: `width` little-endian bytes, or a script
+    /// entry. `None` once the input is exhausted.
+    ///
+    /// A read cut short by the end of the bytes is zero-padded and still
+    /// counts as bytes. The input is exhausted after it.
+    fn next_input(&mut self, width: usize) -> Option<Next> {
+        match &mut self.input {
+            Input::Bytes { bytes, offset } => {
+                let start = *offset;
+                let available = bytes.get(start..).unwrap_or_default();
+                if available.is_empty() {
+                    None
+                } else {
+                    let mut le = [0u8; 8];
+                    let taken = available.len().min(width);
+                    le[..taken].copy_from_slice(&available[..taken]);
+                    *offset = start + taken;
+                    Some(Next::Bytes {
+                        value: u64::from_le_bytes(le),
+                        offset: start,
+                    })
+                }
+            }
+            Input::Script(choices) => choices.pop_front().map(Next::Script),
+            Input::Trace { .. } | Input::Skip { .. } => {
+                unreachable!("trace and skip inputs take recorded entries instead")
+            }
+        }
+    }
+
+    /// The round-robin default: the first option whose key sorts after the
+    /// previous pick, wrapping to the start.
+    ///
+    /// It's fair only while the enabled set stays fixed: each of `k` options
+    /// is then picked within `k` steps. A changing set can keep putting one
+    /// off. With `{a, z}`, then `{b, z}`, then `{c, z}`, each pick lands on
+    /// the new key after the previous one, and `z` waits.
+    fn round_robin(&self, options: &[Identity]) -> usize {
+        let Some((category, key)) = &self.cursor else {
+            return 0;
+        };
+        options
+            .iter()
+            .position(|o| (o.category, &o.key) > (*category, key))
+            .unwrap_or(0)
+    }
+}
+
+/// One choice's raw input.
+enum Next {
+    Bytes { value: u64, offset: usize },
+    Script(PlanChoice),
+}
+
+/// The fair default for an exhausted draw: `(ordinal - 1) % bound`, so
+/// successive `select!` polls in one task rotate through their branches
+/// instead of always starting at branch 0. A bound-0 draw, a seed, gets 0.
+pub(crate) fn default_draw(bound: u64, ordinal: u32) -> u64 {
+    debug_assert!(ordinal >= 1, "draw ordinals count from 1");
+    match bound {
+        0 => 0,
+        bound => u64::from(ordinal.saturating_sub(1)) % bound,
+    }
+}
+
+/// `value` reduced below `bound`, or kept whole when `bound` is 0.
+fn reduce(value: u64, bound: u64) -> u64 {
+    match bound {
+        0 => value,
+        bound => value % bound,
+    }
+}
+
+/// How many input bytes choose among `range` values: 1 up to 256, 2 up to
+/// 65,536, then 4, then 8.
+fn width(range: u128) -> usize {
+    match range {
+        0..=0x100 => 1,
+        0x101..=0x1_0000 => 2,
+        0x1_0001..=0x1_0000_0000 => 4,
+        _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use zakura_scheduler::{At, Op};
+
+    use super::*;
+
+    /// `n` task identities, `t0.1` to `t<n-1>.1`, sorted.
+    fn tasks(n: usize) -> Vec<Identity> {
+        let mut ids: Vec<Identity> = (0..n)
+            .map(|i| {
+                Identity::task(
+                    format!("t{i:03}.1"),
+                    At {
+                        op: Op::Poll,
+                        n: 1,
+                        object: None,
+                        site: None,
+                    },
+                )
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A decider over fuzz `bytes`.
+    fn bytes(bytes: &[u8]) -> Decider {
+        Decider::new(Plan::from_fuzz(bytes))
+    }
+
+    #[test]
+    fn empty_input_is_all_defaults() {
+        let options = tasks(3);
+        let mut d = bytes(&[]);
+        let picks: Vec<_> = (0..6).map(|_| d.pick(&options).unwrap()).collect();
+        assert!(picks
+            .iter()
+            .all(|p| p.by == By::Default && p.offset.is_none()));
+        let indices: Vec<_> = picks.iter().map(|p| p.index).collect();
+        assert_eq!(indices, [0, 1, 2, 0, 1, 2]);
+        assert_eq!(d.draw("t:rng#1", 3, 1).unwrap().by, By::Default);
+        assert!(d.resolved().choices.is_empty());
+    }
+
+    #[test]
+    fn a_sole_option_is_forced_and_takes_no_bytes() {
+        let mut d = bytes(&[1]);
+        let forced = d.pick(&tasks(1)).unwrap();
+        assert_eq!((forced.index, forced.by), (0, By::Forced));
+        assert_eq!(d.draw("t:rng#1", 1, 1).unwrap().by, By::Forced);
+        let next = d.pick(&tasks(2)).unwrap();
+        assert_eq!((next.index, next.by, next.offset), (1, By::Bytes, Some(0)));
+    }
+
+    #[test]
+    fn widths_follow_the_option_count() {
+        // 256 options take one byte, 257 take two, little-endian.
+        let mut d = bytes(&[255, 0x02, 0x01, 7]);
+        assert_eq!(d.pick(&tasks(256)).unwrap().index, 255);
+        let two = d.pick(&tasks(300)).unwrap();
+        assert_eq!((two.index, two.offset), (0x0102, Some(1)));
+        assert_eq!(d.draw("t:rng#1", 5, 1).unwrap().value, 2);
+        // A bound-0 draw takes eight bytes and keeps the whole value.
+        let mut d = bytes(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let seed = d.draw("t:rng#1", 0, 1).unwrap();
+        assert_eq!(seed.value, 0x0807_0605_0403_0201);
+        assert_eq!((seed.by, seed.offset), (By::Bytes, Some(0)));
+    }
+
+    #[test]
+    fn wide_bounds_take_four_and_eight_bytes() {
+        let mut d = bytes(&[
+            0x34, 0x12, // bound 0x1_0000: two bytes
+            0x78, 0x56, 0x34, 0x12, // bound 0x1_0001: four bytes
+            0xff, 0xff, 0xff, 0xff, // bound 2^32: four bytes
+            1, 2, 3, 4, 5, 6, 7, 8, // bound 2^32 + 1: eight bytes
+        ]);
+        let cases = [
+            (0x1_0000, 0x1234, 0),
+            (0x1_0001, 0x1234_5678 % 0x1_0001, 2),
+            (1 << 32, 0xffff_ffff, 6),
+            ((1 << 32) + 1, 0x0807_0605_0403_0201 % ((1 << 32) + 1), 10),
+        ];
+        for (bound, value, offset) in cases {
+            let answer = d.draw("t:rng#1", bound, 1).unwrap();
+            assert_eq!(
+                (answer.value, answer.by, answer.offset),
+                (value, By::Bytes, Some(offset)),
+                "bound {bound:#x}"
+            );
+        }
+        assert_eq!(
+            d.draw("t:rng#1", 2, 1).unwrap().by,
+            By::Default,
+            "all 18 bytes used"
+        );
+    }
+
+    #[test]
+    fn truncated_input_pads_then_runs_out() {
+        // Two bytes wanted, one left: the value is 0x0001, still from bytes.
+        let mut d = bytes(&[9, 1]);
+        assert_eq!(d.pick(&tasks(4)).unwrap().index, 1);
+        let short = d.pick(&tasks(300)).unwrap();
+        assert_eq!(
+            (short.index, short.by, short.offset),
+            (1, By::Bytes, Some(1))
+        );
+        assert_eq!(d.pick(&tasks(4)).unwrap().by, By::Default);
+        let seed = d.draw("t:rng#1", 0, 1).unwrap();
+        assert_eq!((seed.value, seed.by), (0, By::Default));
+    }
+
+    #[test]
+    fn default_draws_rotate_but_seeds_are_zero() {
+        let values: Vec<_> = (1..=7).map(|n| default_draw(3, n)).collect();
+        assert_eq!(values, [0, 1, 2, 0, 1, 2, 0]);
+        assert_eq!(default_draw(0, 5), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "draw ordinals count from 1")]
+    fn default_draw_rejects_ordinal_zero() {
+        default_draw(3, 0);
+    }
+
+    #[test]
+    fn round_robin_follows_keys_as_the_set_changes() {
+        let all = tasks(4);
+        let mut d = bytes(&[]);
+        assert_eq!(d.pick(&all).unwrap().index, 0);
+        // t000 left. The next key after it is t001.
+        assert_eq!(d.pick(&all[1..]).unwrap().index, 0);
+        // t002 left. The next key after t001 is t003.
+        let without_t002 = [all[0].clone(), all[1].clone(), all[3].clone()];
+        assert_eq!(d.pick(&without_t002).unwrap().index, 2);
+        // Wrap to the start.
+        assert_eq!(d.pick(&all).unwrap().index, 0);
+    }
+
+    #[test]
+    fn script_follows_identities() {
+        let options = tasks(3);
+        let script = Plan {
+            choices: vec![
+                PlanChoice::Pick(options[2].to_string()),
+                PlanChoice::Draw(HexU64(7)),
+            ],
+        };
+        let mut d = Decider::new(PlanInput::Script(script));
+        let pick = d.pick(&options).unwrap();
+        assert_eq!((pick.index, pick.by, pick.offset), (2, By::Bytes, None));
+        assert_eq!(d.draw("t:rng#1", 3, 1).unwrap().value, 1);
+        // The script ran out, so round-robin goes on after t002.
+        assert_eq!(d.pick(&options).unwrap().index, 0);
+    }
+
+    #[test]
+    fn script_errors_name_the_problem() {
+        let options = tasks(2);
+        let missing = Plan {
+            choices: vec![PlanChoice::Pick("task:gone.1:poll#1".into())],
+        };
+        assert_eq!(
+            Decider::new(PlanInput::Script(missing)).pick(&options),
+            Err(PlanError::NotEnabled {
+                wanted: "task:gone.1:poll#1".into()
+            })
+        );
+        let draw_first = Plan {
+            choices: vec![PlanChoice::Draw(HexU64(1))],
+        };
+        assert!(matches!(
+            Decider::new(PlanInput::Script(draw_first)).pick(&options),
+            Err(PlanError::Mismatch { wanted: "pick", .. })
+        ));
+    }
+
+    #[test]
+    fn plans_and_hex_round_trip_as_json() {
+        let plan = Plan {
+            choices: vec![
+                PlanChoice::Pick("task:root.1:poll#1".into()),
+                PlanChoice::Draw(HexU64(u64::MAX)),
+            ],
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(
+            json,
+            r#"{"choices":[{"pick":"task:root.1:poll#1"},{"draw":"0xffffffffffffffff"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Plan>(&json).unwrap(), plan);
+        for bad in [r#""0X1""#, r#""0x01""#, r#""1""#, r#""0xA""#] {
+            assert!(serde_json::from_str::<HexU64>(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<Plan>(r#"{"choices":[],"extra":1}"#).is_err());
+    }
+
+    /// One choice a test run asks for: a pick among this many tasks, or a
+    /// draw with this bound.
+    #[derive(Clone, Debug)]
+    enum Ask {
+        Pick(usize),
+        Draw(u64),
+    }
+
+    /// Runs `asks` through `d`, returning each pick's index or draw's value.
+    fn answers(d: &mut Decider, asks: &[Ask]) -> Vec<u64> {
+        asks.iter()
+            .enumerate()
+            .map(|(i, ask)| match ask {
+                // usize always fits in u64 on supported targets.
+                Ask::Pick(n) => d.pick(&tasks(*n)).unwrap().index as u64,
+                // The test's ordinal only needs to differ between draws.
+                Ask::Draw(bound) => d.draw("t:rng#1", *bound, i as u32 + 1).unwrap().value,
+            })
+            .collect()
+    }
+
+    fn ask() -> impl Strategy<Value = Ask> {
+        prop_oneof![
+            (1usize..300).prop_map(Ask::Pick),
+            prop_oneof![Just(0u64), 1u64..70_000].prop_map(Ask::Draw),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn round_robin_fair(k in 1usize..24, prefix in proptest::collection::vec(any::<u8>(), 0..16)) {
+            // After any input runs out, each of k continuously enabled
+            // actions is picked within every k consecutive steps.
+            let options = tasks(k);
+            let mut d = bytes(&prefix);
+            for _ in 0..prefix.len() {
+                d.pick(&options).unwrap();
+            }
+            let picks: Vec<usize> = (0..3 * k).map(|_| d.pick(&options).unwrap().index).collect();
+            for window in picks.windows(k) {
+                let mut seen = window.to_vec();
+                seen.sort_unstable();
+                seen.dedup();
+                prop_assert_eq!(seen.len(), k);
+            }
+        }
+
+        #[test]
+        fn resolved_script_replays_bytes(
+            input in proptest::collection::vec(any::<u8>(), 0..64),
+            asks in proptest::collection::vec(ask(), 0..48),
+        ) {
+            let mut from_bytes = bytes(&input);
+            let expected = answers(&mut from_bytes, &asks);
+            let mut scripted = Decider::new(PlanInput::Script(from_bytes.resolved()));
+            prop_assert_eq!(answers(&mut scripted, &asks), expected);
+        }
+
+        #[test]
+        fn every_answer_is_in_range(
+            input in proptest::collection::vec(any::<u8>(), 0..64),
+            asks in proptest::collection::vec(ask(), 0..48),
+        ) {
+            let mut d = bytes(&input);
+            for (value, ask) in answers(&mut d, &asks).into_iter().zip(&asks) {
+                match ask {
+                    // usize always fits in u64 on supported targets.
+                    Ask::Pick(n) => prop_assert!(value < *n as u64),
+                    Ask::Draw(0) => {}
+                    Ask::Draw(bound) => prop_assert!(value < *bound),
+                }
+            }
+        }
+    }
+}

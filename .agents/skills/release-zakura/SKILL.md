@@ -95,7 +95,27 @@ For crates.io publishing:
    plans that dependent closure as `cascade` rows; never drop them from a
    crates.io-publishing release.
 5. Refresh `Cargo.lock`.
-6. Confirm unchanged published versions still satisfy the resulting graph:
+6. Audit every publishable crate's reservation in
+   [`zakura-core/reserved`](https://github.com/zakura-core/reserved). Each merged
+   PR that introduced a publishable crate should already have created or reused
+   its reservation and linked the reservation PR from the implementation PR.
+   Do not assume this happened: if a reservation is missing, ensure it is created
+   as part of the release process before publishing the release. Follow the
+   reserved repository's README, reusing existing reservations or graduation
+   records rather than duplicating placeholders for crates already released.
+   For a name not yet registered on crates.io, publish its blank `0.0.0`
+   placeholder from a trusted maintainer machine.
+   Ensure Sean Bowe (`ebfull`) is a crates.io co-owner: an existing owner runs
+   `cargo owner --add ebfull <crate-name>` if needed, Sean accepts the invitation,
+   and `cargo owner --list <crate-name>` must include `ebfull`. Report pending
+   invitations and owner-permission blockers explicitly; neither completes setup.
+   Configure its trusted publisher before CI publishes the implementation.
+   The required CI check blocks unpublished crate names; the reservation PR and
+   accepted co-ownership are manual review requirements. See
+   [the setup instructions](../../../docs/release-tag-protection.md#one-time-setup).
+   Pending version bumps of existing crates remain allowed, and crates with
+   `publish = false` are exempt. The GitHub-only override cannot bypass this gate.
+7. Confirm unchanged published versions still satisfy the resulting graph:
    `./scripts/check-crate-publish-graph.sh` dry-run-publishes the publish
    set against the live index, then asserts that the Cargo.lock cargo
    writes into each packaged archive resolves every workspace crate at its
@@ -103,10 +123,6 @@ For crates.io publishing:
    runs the same script as the `crates.io publish graph` job in
    `tests-unit.yml` (part of `test success`), so a missing cascade bump
    cannot merge. It is also step 5 of `make pre-release`.
-7. Reserve any crate name the release adds. The same check warns when a
-   selected crate has never been published; CI cannot bootstrap it, because
-   its crates.io Trusted Publishing entry lives on a crate that must already
-   exist. Publish the name manually and configure it before the release.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.

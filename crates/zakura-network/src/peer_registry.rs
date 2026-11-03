@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use zakura_chain::block;
+
 use crate::{
     peer::ConnectionInfo,
     protocol::external::types::Version,
@@ -22,6 +24,8 @@ pub struct ConnectedPeer {
     pub user_agent: Arc<str>,
     /// The protocol version advertised by the peer.
     pub version: Version,
+    /// The best chain height the peer advertised during the handshake.
+    pub start_height: block::Height,
     /// Whether the remote peer initiated the connection.
     pub is_inbound: bool,
     /// The latest heartbeat round-trip time.
@@ -37,6 +41,7 @@ impl ConnectedPeer {
             addr: connection_info.connected_addr.diagnostic_remote_addr()?,
             user_agent: sanitize_subversion(&connection_info.remote.user_agent).into(),
             version: connection_info.remote.version,
+            start_height: connection_info.remote.start_height,
             is_inbound: connection_info.connected_addr.is_inbound(),
             rtt: None,
             ping_sent_at: None,
@@ -75,7 +80,7 @@ impl PeerRegistry {
             .values()
             .cloned()
             .collect();
-        connected_peers.sort_by(|left, right| {
+        connected_peers.sort_unstable_by(|left, right| {
             left.addr
                 .cmp(&right.addr)
                 .then(left.is_inbound.cmp(&right.is_inbound))
@@ -221,6 +226,16 @@ pub(crate) struct PeerRegistryUpdater {
 }
 
 impl PeerRegistryUpdater {
+    pub(crate) fn rtt(&self) -> Option<Duration> {
+        self.registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .active_connections
+            .get(&self.key)
+            .and_then(|peer| peer.rtt)
+    }
+
     pub(crate) fn record_ping_sent(&self, now: Instant) {
         self.registry
             .update_connection(&self.key, |connected_peer| {
@@ -270,6 +285,7 @@ mod tests {
                 .expect("test address parses"),
             user_agent: Arc::from("/Zakura:1.0.0/"),
             version: Version(1),
+            start_height: block::Height(0),
             is_inbound: false,
             rtt: None,
             ping_sent_at: None,

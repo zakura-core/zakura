@@ -19,7 +19,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 axum = "0.8"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 zstd = "0.13"
-rand.workspace = true
+rand_10.workspace = true
 hex.workspace = true
 fs2 = "0.4"
 rustc-demangle = "0.1"

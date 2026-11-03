@@ -14,9 +14,11 @@
 //! - Hyperledger Besu (Ethereum execution client)
 //! - Hyperledger Fabric
 
-use jsonrpsee::{
-    server::middleware::rpc::{layer::ResponseFuture, RpcServiceT},
-    MethodResponse,
+use std::future::Future;
+
+use super::{
+    jsonrpc::{MethodResponse, Notification, Request},
+    rpc_service::RpcServiceT,
 };
 use tracing::{info_span, Instrument};
 
@@ -45,13 +47,8 @@ impl<S> RpcTracingMiddleware<S> {
     }
 }
 
-impl<'a, S> RpcServiceT<'a> for RpcTracingMiddleware<S>
-where
-    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
-{
-    type Future = ResponseFuture<futures::future::BoxFuture<'a, MethodResponse>>;
-
-    fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
+impl<S: RpcServiceT> RpcServiceT for RpcTracingMiddleware<S> {
+    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
         let service = self.service.clone();
         let method = request.method_name().to_owned();
 
@@ -70,21 +67,26 @@ where
         let span_for_record = span.clone();
 
         // Instrument the ENTIRE future with the span
-        ResponseFuture::future(Box::pin(
-            async move {
-                let response = service.call(request).await;
+        async move {
+            let response = service.call(request).await;
 
-                // Record error details if the response is an error
-                if response.is_error() {
-                    span_for_record.record("otel.status_code", "ERROR");
-                    if let Some(error_code) = response.as_error_code() {
-                        span_for_record.record("rpc.error_code", error_code);
-                    }
+            // Record error details if the response is an error
+            if response.is_error() {
+                span_for_record.record("otel.status_code", "ERROR");
+                if let Some(error_code) = response.as_error_code() {
+                    span_for_record.record("rpc.error_code", error_code);
                 }
-
-                response
             }
-            .instrument(span),
-        ))
+
+            response
+        }
+        .instrument(span)
+    }
+
+    fn notification<'a>(
+        &self,
+        notification: Notification<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.notification(notification)
     }
 }

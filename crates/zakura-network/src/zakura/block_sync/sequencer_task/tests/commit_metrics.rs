@@ -114,6 +114,7 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                         frontiers,
                         Some(super::super::test_work_scope()),
                         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                         body_rx,
                         control_rx,
                         input_bytes.clone(),
@@ -176,6 +177,7 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                             BTreeSet::new(),
                             None,
                             None,
+                            Some(identity.0.authority.body_work_epoch),
                         )
                         .await;
                         assert_eq!(recorder.bytes.load(Ordering::Relaxed), 0);
@@ -196,6 +198,7 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                             BTreeSet::new(),
                             None,
                             semantic,
+                            Some(owner.authority.body_work_epoch),
                         )
                         .await;
                         assert_eq!(task.sequencer.in_flight_submission_count(), 0);

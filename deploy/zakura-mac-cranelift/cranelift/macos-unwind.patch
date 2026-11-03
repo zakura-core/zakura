@@ -1,0 +1,128 @@
+diff --git a/src/debuginfo/object.rs b/src/debuginfo/object.rs
+index 0af03ff..aef90ee 100644
+--- a/src/debuginfo/object.rs
++++ b/src/debuginfo/object.rs
+@@ -80,17 +80,31 @@ fn add_debug_reloc(
+                 }
+             }
+         };
++        let macho_personality = self.object.format() == object::BinaryFormat::MachO
++            && self.object.architecture() == object::Architecture::Aarch64
++            && self.object.symbol(symbol).name == b"_rust_eh_personality"
++            && reloc.kind == object::RelocationKind::Relative
++            && reloc.size == 4;
++        let flags = if macho_personality {
++            RelocationFlags::MachO {
++                r_type: object::macho::ARM64_RELOC_POINTER_TO_GOT,
++                r_pcrel: true,
++                r_length: 2,
++            }
++        } else {
++            RelocationFlags::Generic {
++                kind: reloc.kind,
++                encoding: RelocationEncoding::Generic,
++                size: reloc.size * 8,
++            }
++        };
+         self.object
+             .add_relocation(
+                 from.0,
+                 Relocation {
+                     offset: u64::from(reloc.offset),
+                     symbol,
+-                    flags: RelocationFlags::Generic {
+-                        kind: reloc.kind,
+-                        encoding: RelocationEncoding::Generic,
+-                        size: reloc.size * 8,
+-                    },
++                    flags,
+                     addend: i64::try_from(symbol_offset).unwrap() + reloc.addend,
+                 },
+             )
+diff --git a/src/debuginfo/unwind.rs b/src/debuginfo/unwind.rs
+index ad0a15b..ec7d6fe 100644
+--- a/src/debuginfo/unwind.rs
++++ b/src/debuginfo/unwind.rs
+@@ -56,7 +56,13 @@ pub(crate) fn new(module: &mut dyn Module, pic_eh_frame: bool) -> Self {
+                         gimli::DwEhPe(
+                             gimli::DW_EH_PE_indirect.0
+                                 | gimli::DW_EH_PE_pcrel.0
+-                                | gimli::DW_EH_PE_sdata8.0,
++                                | if module.isa().triple().binary_format
++                                    == target_lexicon::BinaryFormat::Macho
++                                {
++                                    gimli::DW_EH_PE_sdata4.0
++                                } else {
++                                    gimli::DW_EH_PE_sdata8.0
++                                },
+                         )
+                     } else {
+                         todo!()
+@@ -86,24 +92,35 @@ pub(crate) fn new(module: &mut dyn Module, pic_eh_frame: bool) -> Self {
+                     )
+                     .unwrap();
+ 
+-                // Use indirection here to support PIC the case where rust_eh_personality is defined in
+-                // another DSO.
+-                let personality_ref = module
+-                    .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
+-                    .unwrap();
+-
+-                let mut personality_ref_data = DataDescription::new();
+-                // Note: Must not use define_zeroinit. The unwinder can't handle this being in the .bss
+-                // section.
+-                let pointer_bytes = usize::from(module.target_config().pointer_bytes());
+-                personality_ref_data.define(vec![0; pointer_bytes].into_boxed_slice());
+-                let personality_func_ref =
+-                    module.declare_func_in_data(personality, &mut personality_ref_data);
+-                personality_ref_data.write_function_addr(0, personality_func_ref);
+-
+-                module.define_data(personality_ref, &personality_ref_data).unwrap();
+-
+-                cie.personality = Some((code_ptr_encoding, address_for_data(personality_ref)));
++                let personality_address = if module.isa().triple().binary_format
++                    == target_lexicon::BinaryFormat::Macho
++                    && matches!(
++                        module.isa().triple().architecture,
++                        target_lexicon::Architecture::Aarch64(_)
++                    ) {
++                    // Mach-O represents this indirection with a pointer-to-GOT relocation.
++                    address_for_func(personality)
++                } else {
++                    // Use indirection here to support PIC the case where rust_eh_personality is defined in
++                    // another DSO.
++                    let personality_ref = module
++                        .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
++                        .unwrap();
++
++                    let mut personality_ref_data = DataDescription::new();
++                    // Note: Must not use define_zeroinit. The unwinder can't handle this being in the .bss
++                    // section.
++                    let pointer_bytes = usize::from(module.target_config().pointer_bytes());
++                    personality_ref_data.define(vec![0; pointer_bytes].into_boxed_slice());
++                    let personality_func_ref =
++                        module.declare_func_in_data(personality, &mut personality_ref_data);
++                    personality_ref_data.write_function_addr(0, personality_func_ref);
++
++                    module.define_data(personality_ref, &personality_ref_data).unwrap();
++
++                    address_for_data(personality_ref)
++                };
++                cie.personality = Some((code_ptr_encoding, personality_address));
+             }
+ 
+             Some(frame_table.add_cie(cie))
+@@ -204,7 +221,12 @@ pub(crate) fn add_function(
+ 
+                     let mut data = DataDescription::new();
+                     data.define(gcc_except_table.writer.into_vec().into_boxed_slice());
+-                    data.set_custom_section(".gcc_except_table");
++                    if module.isa().triple().binary_format != target_lexicon::BinaryFormat::Macho {
++                        data.set_custom_section(".gcc_except_table");
++                    }
++                    // On Mach-O use the shared read-only data section: the FDE points
++                    // directly to each LSDA symbol. Custom sections are allocated per
++                    // data object, which can exhaust ld64's parser stack for large CGUs.
+ 
+                     for reloc in &gcc_except_table.relocs {
+                         match reloc.name {

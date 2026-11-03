@@ -1,8 +1,9 @@
 //! ZIP 218 moves the third halving, and with it the end of the ZIP 214 Revision 2
 //! funding streams and the funding stream address period.
 //!
-//! The NU7 heights here are the zakura#1059 estimates. They are not final, so the
-//! expected halving heights also follow from the closed forms below.
+//! The Mainnet NU7 height below is the ZIP 259 consensus parameter; the Testnet
+//! NU7 height is a zakura#1059 estimate. The expected halving heights also follow
+//! from the closed forms below.
 
 use std::collections::HashMap;
 
@@ -16,17 +17,19 @@ use crate::{
         constants::activation_heights,
         subsidy::{
             constants::{mainnet, testnet as testnet_constants},
-            funding_stream_address_period, halving_block_subsidy, height_for_halving,
-            nu7_adjusted_funding_stream_height, FundingStreamReceiver, FundingStreams,
-            ParameterSubsidy,
+            funding_stream_address_period, funding_stream_values, halving_block_subsidy,
+            height_for_halving, nu7_adjusted_funding_stream_height, scheduled_issuance_zatoshis,
+            FundingStreamReceiver, FundingStreams, ParameterSubsidy,
         },
         testnet::{self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams},
         Network, NU7_POW_TARGET_SPACING_RATIO,
     },
 };
 
-/// The Mainnet NU7 activation height estimate.
-const MAINNET_NU7: u32 = 3_543_000;
+use crate::{parameters::NetworkKind, transparent::Address};
+
+/// The ZIP 259 Mainnet NU7 activation height.
+const MAINNET_NU7: u32 = activation_heights::mainnet::NU7.0;
 
 /// The Testnet NU7 activation height estimate.
 const TESTNET_NU7: u32 = 4_386_000;
@@ -37,13 +40,13 @@ const MAINNET_THIRD_HALVING: u32 = 4_406_400;
 /// The Testnet third halving before ZIP 218.
 const TESTNET_THIRD_HALVING: u32 = 4_476_000;
 
-/// The index of the ZIP 214 Revision 2 funding streams in the built-in lists.
+/// ZIP 214 Revision 2's funding stream index in the built-in lists.
+/// "Revision 2" names the ZIP 214 stream rules, not a revision of Mainnet.
 const REVISION_2: usize = 2;
 
-/// Returns a configured network with the Mainnet activation heights and NU7 at `nu7`.
-///
-/// Mainnet has no NU7 activation height, so this network stands in for Mainnet with one.
-fn mainnet_with_nu7(nu7: Option<u32>) -> Network {
+/// Returns a configured network with the Mainnet activation heights and NU7 at `nu7`,
+/// replacing the built-in ZIP 259 Mainnet activation height (or removing it for `None`).
+pub(super) fn mainnet_with_nu7(nu7: Option<u32>) -> Network {
     let mut activation_heights: testnet::ConfiguredActivationHeights =
         Network::Mainnet.activation_list().into();
     activation_heights.nu7 = nu7;
@@ -54,6 +57,150 @@ fn mainnet_with_nu7(nu7: Option<u32>) -> Network {
         .clear_funding_streams()
         .to_network()
         .expect("configured network is valid")
+}
+
+/// An explicit configured Testnet with Mainnet's activation schedule and a synthetic P2SH
+/// Revision 2 stream. It stands in for `Network::Mainnet`: configured Testnets reject
+/// the actual Mainnet P2PKH ZIP 2008 address, which is checked separately.
+fn mainnet_schedule_with_test_stream() -> Network {
+    let mut activation_heights: testnet::ConfiguredActivationHeights =
+        Network::Mainnet.activation_list().into();
+    activation_heights.nu7 = Some(MAINNET_NU7);
+
+    let addresses: Vec<String> = (0..36)
+        .map(|index| Address::from_script_hash(NetworkKind::Testnet, [index; 20]).to_string())
+        .collect();
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+        .with_funding_streams(vec![ConfiguredFundingStreams {
+            height_range: Some(Height(3_146_400)..Height(6_132_390)),
+            recipients: Some(vec![
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 12,
+                    addresses: None,
+                },
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::MajorGrants,
+                    numerator: 8,
+                    addresses: Some(addresses),
+                },
+            ]),
+        }])
+        .to_network()
+        .expect("test-only Mainnet schedule is valid")
+}
+
+#[test]
+fn mainnet_nu7_boundaries_match_fixed_oracle() {
+    let _init_guard = zakura_test::init();
+
+    const STREAM_START: u32 = 3_146_400;
+    const ACTIVATION: u32 = MAINNET_NU7;
+    const ROTATION: u32 = 3_612_390;
+    const OLD_END: u32 = 4_406_400;
+    const MOVED_END: u32 = 6_132_390;
+
+    let network = mainnet_schedule_with_test_stream();
+    assert_eq!(
+        crate::parameters::NetworkUpgrade::Nu7.activation_height(&Network::Mainnet),
+        Some(Height(ACTIVATION)),
+        "the configured schedule matches built-in Mainnet",
+    );
+    assert_eq!(
+        crate::parameters::NetworkUpgrade::Nu7.activation_height(&network),
+        Some(Height(ACTIVATION)),
+    );
+    let stream = network.funding_streams(Height(STREAM_START)).unwrap();
+    assert_eq!(
+        stream.height_range(),
+        &(Height(STREAM_START)..Height(MOVED_END))
+    );
+    assert_eq!(height_for_halving(3, &network), Some(Height(MOVED_END)));
+    assert_eq!(
+        stream
+            .recipient(FundingStreamReceiver::MajorGrants)
+            .unwrap()
+            .numerator(),
+        8
+    );
+    assert_eq!(
+        stream
+            .recipient(FundingStreamReceiver::Deferred)
+            .unwrap()
+            .numerator(),
+        12
+    );
+
+    // ZIP 218 keeps the current address period at activation, moves the next
+    // rotation, and leaves the old end inside the funding stream.
+    let start_period = funding_stream_address_period(Height(STREAM_START), &network);
+    for (height, index, subsidy, grants, deferred) in [
+        (ACTIVATION - 1, 11, 156_250_000, 12_500_000, 18_750_000),
+        (ACTIVATION, 11, 52_083_333, 4_166_666, 6_249_999),
+        (ACTIVATION + 1, 11, 52_083_333, 4_166_666, 6_249_999),
+        (ROTATION - 1, 11, 52_083_333, 4_166_666, 6_249_999),
+        (ROTATION, 12, 52_083_333, 4_166_666, 6_249_999),
+        (ROTATION + 1, 12, 52_083_333, 4_166_666, 6_249_999),
+        (MOVED_END - 1, 35, 52_083_333, 4_166_666, 6_249_999),
+    ] {
+        assert_eq!(
+            funding_stream_address_period(Height(height), &network) - start_period,
+            index,
+            "address index at {height}",
+        );
+        let actual_subsidy = halving_block_subsidy(Height(height), &network).unwrap();
+        assert_eq!(i64::from(actual_subsidy), subsidy, "subsidy at {height}");
+        let values = funding_stream_values(Height(height), &network, actual_subsidy).unwrap();
+        assert_eq!(
+            i64::from(values[&FundingStreamReceiver::MajorGrants]),
+            grants,
+            "grants at {height}"
+        );
+        assert_eq!(
+            i64::from(values[&FundingStreamReceiver::Deferred]),
+            deferred,
+            "deferred at {height}"
+        );
+    }
+
+    for height in [OLD_END - 1, OLD_END, OLD_END + 1] {
+        assert!(
+            network.funding_streams(Height(height)).is_some(),
+            "stream at {height}"
+        );
+    }
+    for height in [MOVED_END, MOVED_END + 1] {
+        assert!(
+            network.funding_streams(Height(height)).is_none(),
+            "no stream at {height}"
+        );
+        let subsidy = halving_block_subsidy(Height(height), &network).unwrap();
+        assert_eq!(i64::from(subsidy), 26_041_666, "subsidy at {height}");
+        assert!(funding_stream_values(Height(height), &network, subsidy)
+            .unwrap()
+            .is_empty());
+    }
+
+    // These independent sums include every scheduled block from stream start
+    // through moved end, including per-block rounding after activation.
+    let before = u128::from(ACTIVATION - STREAM_START);
+    let after = u128::from(MOVED_END - ACTIVATION);
+    assert_eq!(before, 397_005);
+    assert_eq!(after, 2_588_985);
+    assert_eq!(
+        before * 156_250_000 + after * 52_083_333,
+        196_874_999_137_005
+    );
+    assert_eq!(before * 12_500_000 + after * 4_166_666, 15_749_998_274_010);
+    assert_eq!(before * 18_750_000 + after * 6_249_999, 23_624_997_411_015);
+    assert_eq!(
+        scheduled_issuance_zatoshis(Height(MOVED_END - 1), &network).unwrap()
+            - scheduled_issuance_zatoshis(Height(STREAM_START - 1), &network).unwrap(),
+        196_874_999_137_005,
+    );
 }
 
 /// Returns the Testnet network with NU7 at `nu7` and the built-in funding streams.
@@ -80,8 +227,19 @@ fn zip_218_third_and_fourth_halving_heights() {
 
     // H3' = A + 3 · (H3 − A), which is 13,219,200 − 2A on Mainnet and 13,428,000 − 2A
     // on Testnet. The fourth halving is one post-NU7 halving interval later.
+    // The built-in Mainnet schedule moves its halvings the same way as the
+    // equivalent configured network.
+    assert_eq!(
+        height_for_halving(3, &Network::Mainnet),
+        Some(Height(6_132_390))
+    );
+    assert_eq!(
+        height_for_halving(4, &Network::Mainnet),
+        Some(Height(11_172_390))
+    );
+
     for (network, third, fourth) in [
-        (mainnet_with_nu7(Some(MAINNET_NU7)), 6_133_200, 11_173_200),
+        (mainnet_with_nu7(Some(MAINNET_NU7)), 6_132_390, 11_172_390),
         (
             testnet_network_with_nu7(Some(TESTNET_NU7)),
             4_656_000,
@@ -104,7 +262,7 @@ fn zip_218_third_and_fourth_halving_heights() {
     }
 
     assert_eq!(
-        6_133_200,
+        6_132_390,
         13_219_200 - 2 * MAINNET_NU7,
         "the Mainnet closed form"
     );
@@ -168,26 +326,28 @@ fn nu7_adjusted_funding_stream_height_cases() {
 fn revision_2_funding_streams_end_at_the_zip_218_third_halving() {
     let _init_guard = zakura_test::init();
 
-    // Mainnet has no NU7 activation height, so the built-in streams keep their heights.
+    // The built-in Mainnet Revision 2 stream ends at the ZIP 218 moved third halving.
     let mainnet_streams = Network::Mainnet.all_funding_streams();
     assert_eq!(mainnet_streams.len(), 3);
     assert_eq!(
+        mainnet_streams[REVISION_2].height_range(),
+        &(activation_heights::mainnet::NU6_1
+            ..height_for_halving(3, &Network::Mainnet).expect("the halving has a height")),
+    );
+    assert_eq!(
         mainnet_streams[REVISION_2].height_range().end,
-        Height(MAINNET_THIRD_HALVING)
+        Height(6_132_390)
     );
     assert_eq!(mainnet_streams, &*mainnet::FUNDING_STREAMS);
 
-    // With NU7, the Mainnet Revision 2 stream ends at the moved third halving.
-    let mainnet_network = mainnet_with_nu7(Some(MAINNET_NU7));
-    let mainnet_revision_2 = mainnet::FUNDING_STREAMS[REVISION_2]
-        .clone()
-        .with_nu7_adjusted_end_height(Some(Height(MAINNET_NU7)));
+    // The built-in end is the pre-ZIP 218 third halving moved by the ZIP 259 activation.
     assert_eq!(
-        mainnet_revision_2.height_range(),
-        &(mainnet_streams[REVISION_2].height_range().start
-            ..height_for_halving(3, &mainnet_network).expect("the halving has a height")),
+        nu7_adjusted_funding_stream_height(
+            Height(MAINNET_THIRD_HALVING),
+            Some(Height(MAINNET_NU7))
+        ),
+        Some(Height(6_132_390)),
     );
-    assert_eq!(mainnet_revision_2.height_range().end, Height(6_133_200));
 
     // The earlier Mainnet streams ended before NU7 and stay where they are.
     for funding_streams in &mainnet_streams[..REVISION_2] {
@@ -210,9 +370,33 @@ fn revision_2_funding_streams_end_at_the_zip_218_third_halving() {
         testnet_network_with_nu7(None).all_funding_streams(),
         &*testnet_constants::FUNDING_STREAMS,
     );
+    // Default Testnet now schedules NU7, moving the third halving and the
+    // inherited Revision 2 end while leaving earlier streams unchanged.
+    let default_testnet = Network::new_default_testnet();
+    let default_streams = default_testnet.all_funding_streams();
+    let num_periods = usize::try_from(required_addresses(
+        default_streams[REVISION_2].height_range(),
+        &default_testnet,
+    ))
+    .expect("the Testnet funding periods fit in usize");
+    assert_eq!(num_periods, 27);
     assert_eq!(
-        Network::new_default_testnet().all_funding_streams(),
-        &*testnet_constants::FUNDING_STREAMS,
+        default_streams[REVISION_2]
+            .recipient(FundingStreamReceiver::MajorGrants)
+            .expect("Revision 2 has an FPF recipient")
+            .addresses()
+            .len(),
+        num_periods,
+    );
+    assert_eq!(
+        default_streams[..REVISION_2],
+        testnet_constants::FUNDING_STREAMS[..REVISION_2],
+    );
+    let third_halving = Height(4_497_948);
+    assert_eq!(height_for_halving(3, &default_testnet), Some(third_halving));
+    assert_eq!(
+        default_streams[REVISION_2].height_range().end,
+        third_halving
     );
 
     // Testnet with NU7 moves only the Revision 2 end height.
@@ -351,18 +535,16 @@ fn moved_heights_keep_their_address_period() {
         assert_eq!(period(new_end), old_period(TESTNET_THIRD_HALVING));
     }
 
-    // The Mainnet Revision 2 stream still needs exactly its 36 recipient addresses.
-    let mainnet_network = mainnet_with_nu7(Some(MAINNET_NU7));
-    let mainnet_revision_2 = mainnet::FUNDING_STREAMS[REVISION_2]
-        .clone()
-        .with_nu7_adjusted_end_height(Some(Height(MAINNET_NU7)));
+    // The Mainnet Revision 2 stream still needs exactly its 36 recipient addresses,
+    // both with the built-in moved end and with the pre-ZIP 218 end without NU7.
+    let mainnet_revision_2 = &mainnet::FUNDING_STREAMS[REVISION_2];
     assert_eq!(
-        required_addresses(mainnet_revision_2.height_range(), &mainnet_network),
+        required_addresses(mainnet_revision_2.height_range(), &Network::Mainnet),
         36,
     );
     assert_eq!(
         required_addresses(
-            mainnet::FUNDING_STREAMS[REVISION_2].height_range(),
+            &(activation_heights::mainnet::NU6_1..Height(MAINNET_THIRD_HALVING)),
             &mainnet_with_nu7(None)
         ),
         36,
@@ -707,9 +889,12 @@ proptest! {
         prop_assert_eq!(network.funding_streams(range.end), None);
 
         let network = mainnet_with_nu7(Some(mainnet_nu7));
-        let revision_2 = mainnet::FUNDING_STREAMS[REVISION_2]
-            .clone()
-            .with_nu7_adjusted_end_height(Some(Height(mainnet_nu7)));
+        // The pre-ZIP 218 Revision 2 range, moved by the hypothetical activation height.
+        let revision_2 = FundingStreams::new(
+            activation_heights::mainnet::NU6_1..Height(MAINNET_THIRD_HALVING),
+            HashMap::new(),
+        )
+        .with_nu7_adjusted_end_height(Some(Height(mainnet_nu7)));
         let range = revision_2.height_range();
         prop_assert_eq!(
             range.start,

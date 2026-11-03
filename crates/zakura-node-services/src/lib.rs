@@ -5,6 +5,7 @@ pub mod header_chain;
 pub mod mempool;
 pub mod service_traits;
 pub mod sync_lifecycle;
+pub mod task;
 
 #[cfg(any(test, feature = "rpc-client"))]
 pub mod rpc_client;

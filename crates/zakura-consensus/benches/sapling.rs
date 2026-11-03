@@ -36,8 +36,7 @@ use zakura_chain::{
     transparent,
 };
 
-use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
-use zcash_proofs::prover::LocalTxProver;
+use sapling_crypto::{bundle::Authorized, circuit::pinned_verifying_keys, BatchValidator, Bundle};
 use zcash_protocol::value::ZatBalance;
 
 /// A Sapling bundle paired with its transaction sighash, ready for verification.
@@ -98,8 +97,7 @@ fn extract_sapling_items_from_blocks() -> Vec<SaplingItem> {
 }
 
 fn bench_sapling_verify(c: &mut Criterion) {
-    let sapling = LocalTxProver::bundled();
-    let (spend_vk, output_vk) = sapling.verifying_keys();
+    let (spend_vk, output_vk) = pinned_verifying_keys();
     let source_items = extract_sapling_items_from_blocks();
 
     let mut group = c.benchmark_group("groth16_sapling");
@@ -110,7 +108,7 @@ fn bench_sapling_verify(c: &mut Criterion) {
         b.iter(|| {
             let mut batch = BatchValidator::default();
             assert!(batch.check_bundle(item.bundle.clone(), item.sighash.into()));
-            assert!(batch.validate(&spend_vk, &output_vk, thread_rng()));
+            assert!(batch.validate(spend_vk, output_vk, thread_rng()));
         })
     });
 
@@ -126,7 +124,7 @@ fn bench_sapling_verify(c: &mut Criterion) {
                     for item in items {
                         let mut batch = BatchValidator::default();
                         assert!(batch.check_bundle(item.bundle.clone(), item.sighash.into()));
-                        assert!(batch.validate(&spend_vk, &output_vk, thread_rng()));
+                        assert!(batch.validate(spend_vk, output_vk, thread_rng()));
                     }
                 })
             },
@@ -148,7 +146,7 @@ fn bench_sapling_verify(c: &mut Criterion) {
                     for item in items {
                         assert!(batch.check_bundle(item.bundle.clone(), item.sighash.into()));
                     }
-                    assert!(batch.validate(&spend_vk, &output_vk, thread_rng()));
+                    assert!(batch.validate(spend_vk, output_vk, thread_rng()));
                 })
             },
         );

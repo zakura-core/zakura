@@ -33,6 +33,7 @@ use zakura_chain::{
 };
 
 use zakura_node_services::mempool;
+use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_state as zs;
 
 use crate::{
@@ -94,15 +95,32 @@ where
 }
 
 /// Routes transaction-verifier reads around the serialized read-write state buffer.
-#[derive(Clone, Debug)]
+///
+/// The transaction verifier clones this router for every transaction, and most block
+/// transactions never read state through it. The read service is shared, so that clone stays
+/// cheap, and copied only for a read request. The mutex makes the shared service `Sync`
+/// without requiring it of the service itself; it is held only to copy the service.
+#[derive(Debug)]
 struct TransactionStateRouter<S, R> {
     state: S,
-    read_state: R,
+    read_state: Arc<std::sync::Mutex<R>>,
+}
+
+impl<S: Clone, R> Clone for TransactionStateRouter<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            read_state: Arc::clone(&self.read_state),
+        }
+    }
 }
 
 impl<S, R> TransactionStateRouter<S, R> {
     fn new(state: S, read_state: R) -> Self {
-        Self { state, read_state }
+        Self {
+            state,
+            read_state: Arc::new(std::sync::Mutex::new(read_state)),
+        }
     }
 }
 
@@ -141,7 +159,11 @@ where
             request => return self.state.clone().oneshot(request).boxed(),
         };
 
-        let read_state = self.read_state.clone();
+        let read_state = self
+            .read_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         async move {
             let response = read_state.oneshot(read_request).await?;
             response.try_into().map_err(BoxError::from)
@@ -282,6 +304,24 @@ impl RouterError {
         }
     }
 
+    /// See [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            RouterError::Checkpoint { source, .. } => source.is_auth_commitment_mismatch(),
+            RouterError::Block { source, .. } => source.is_auth_commitment_mismatch(),
+        }
+    }
+
+    /// See [`zs::ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            RouterError::Checkpoint { source, .. } => {
+                source.is_descendant_of_auth_commitment_mismatch()
+            }
+            RouterError::Block { source, .. } => source.is_descendant_of_auth_commitment_mismatch(),
+        }
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
@@ -355,7 +395,7 @@ where
                     parent: block.header.previous_block_hash.0,
                     height: block.coinbase_height().map(|h| h.0),
                     transactions: u32::try_from(block.transactions.len()).unwrap_or(u32::MAX),
-                    mode: if request.should_cache() {
+                    mode: if matches!(request, Request::Prepare { .. }) {
                         Mode::Preparation
                     } else if request.is_proposal() {
                         Mode::Proposal
@@ -472,10 +512,10 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -492,6 +532,9 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    // Keys are built off the async workers; nothing waits for them, so startup is not delayed.
+    let _key_preload = crate::primitives::halo2::spawn_key_preload();
+
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
 
@@ -501,7 +544,7 @@ where
     let checkpoint_sync = config.checkpoint_sync;
     let checkpoint_network = network.clone();
 
-    let state_checkpoint_verify_handle = tokio::task::spawn(
+    let state_checkpoint_verify_handle = spawn_erased(
         // TODO: move this into an async function?
         async move {
             tracing::info!("starting state checkpoint validation");
@@ -578,7 +621,7 @@ where
     // transaction verification
 
     let transaction = transaction::Verifier::new(network, transaction_state, mempool);
-    let transaction = Buffer::new(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
+    let transaction = spawn_buffer(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
 
     // block verification
     let (list, max_checkpoint_height) = init_checkpoint_list(config, network);
@@ -614,7 +657,7 @@ where
         block,
     };
 
-    let router = Buffer::new(BoxService::new(router), VERIFIER_BUFFER_BOUND);
+    let router = spawn_buffer(BoxService::new(router), VERIFIER_BUFFER_BOUND);
 
     let task_handles = BackgroundTaskHandles {
         state_checkpoint_verify_handle,
@@ -632,10 +675,10 @@ pub async fn init<S, Mempool>(
     state_service: S,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -661,10 +704,10 @@ pub async fn init_with_read_state<S, R, Mempool>(
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -721,10 +764,10 @@ pub async fn init_test<S>(
     network: &Network,
     state_service: S,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -738,7 +781,10 @@ where
         network,
         state_service.clone(),
         oneshot::channel::<
-            Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+            Buffer<
+                mempool::Request,
+                futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+            >,
         >()
         .1,
     )

@@ -6,8 +6,8 @@ use chrono::Utc;
 use zakura_chain::block;
 
 use super::super::{
-    audit_store, audit_store_for_trust_anchor_update, AuditViolation, RecoveryFailure,
-    RecoveryRepair,
+    audit_store, audit_store_for_trust_anchor_update, audit_store_for_trust_anchor_update_at,
+    AuditViolation, RecoveryFailure, RecoveryRepair,
 };
 use super::fixture;
 use crate::{
@@ -39,6 +39,11 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
     ));
     let plan = audit_store_for_trust_anchor_update(&store, &config)
         .expect("a future checkpoint extension can rebind an otherwise coherent store");
+    assert_eq!(
+        audit_store_for_trust_anchor_update_at(&store, &config, Utc::now()),
+        Ok(plan.clone()),
+        "an injected recovery time plans the same rebind"
+    );
     assert_eq!(
         plan.repairs,
         BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])

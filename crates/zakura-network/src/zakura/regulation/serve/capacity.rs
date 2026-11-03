@@ -1,14 +1,15 @@
 //! Serving capacity: node budgets, per-peer budgets, and serving metrics.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError,
-    },
-};
+use std::sync::Arc;
 
 use thiserror::Error;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        counter::{AtomicU64, AtomicUsize, Ordering},
+        Mutex, PoisonError,
+    },
+};
 
 use crate::zakura::{
     regulation::{
@@ -41,8 +42,8 @@ pub(crate) struct ServeLimits {
 /// A serving configuration that cannot work.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum ServeConfigError {
-    /// The row is not a request row.
-    #[error("message type {message_type} is not a request row")]
+    /// The row is not a request or subscription row.
+    #[error("message type {message_type} is not a request or subscription row")]
     NotARequest {
         /// The row's message type.
         message_type: u16,
@@ -56,6 +57,9 @@ pub(crate) enum ServeConfigError {
 }
 
 /// Metric labels and test counters for one request row.
+///
+/// The counters only feed gauges and tests, so they're `sync::counter`
+/// atomics, which cost no preemption points in the simulator.
 #[derive(Debug)]
 pub(super) struct ServeMetrics {
     service: &'static str,
@@ -195,16 +199,23 @@ pub(crate) struct ServeCapacity {
 }
 
 impl ServeCapacity {
-    /// Capacity for the request `row` of `service`.
+    /// Capacity for the request or subscription `row` of `service`.
+    ///
+    /// A subscription row's capacity serves its pages through
+    /// [`Self::push`].
     pub(crate) fn new(
         service: &'static str,
         request: &'static MessageRule,
         limits: ServeLimits,
     ) -> Result<Self, ServeConfigError> {
-        let MessageRole::Request { max_in_flight, .. } = request.role else {
-            return Err(ServeConfigError::NotARequest {
-                message_type: request.message_type,
-            });
+        let max_in_flight = match request.role {
+            MessageRole::Request { max_in_flight, .. } => max_in_flight,
+            MessageRole::Subscription { max_live, .. } => max_live,
+            _ => {
+                return Err(ServeConfigError::NotARequest {
+                    message_type: request.message_type,
+                })
+            }
         };
         let limit = |limit| ServeConfigError::Limit { limit };
         SlotBudget::new(limits.peer_output_responses)
@@ -271,6 +282,16 @@ impl ServeCapacity {
         (budgets.execution.reserved(), budgets.output.granted())
     }
 
+    /// Take every free node execution slot and output byte, so serving
+    /// waits until the returned hold drops.
+    #[cfg(test)]
+    pub(crate) fn hold_node_for_test(&self) -> NodeHold {
+        NodeHold {
+            _execution: self.node_execution.hold_free(),
+            _output: self.node_output.hold_free(),
+        }
+    }
+
     /// Requests served above the advertised limit, within the margin.
     #[cfg(test)]
     pub(crate) fn over_limit_count(&self) -> u64 {
@@ -285,6 +306,14 @@ impl ServeCapacity {
             self.metrics.waiting.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Every node slot and byte a test took. Dropping it releases them.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NodeHold {
+    _execution: Vec<crate::zakura::regulation::SlotPermit>,
+    _output: Option<crate::zakura::regulation::OutputGrant>,
 }
 
 /// One peer's execution slots and output bytes.

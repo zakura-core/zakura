@@ -1,4 +1,4 @@
-use super::{wire::*, *};
+use super::{wire::*, work_queue::OwnerReservationCap, *};
 
 /// Blocks this node requests per `GetBlocks` message and advertises per response.
 ///
@@ -162,6 +162,16 @@ pub const DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT: u32 = 100;
 /// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
 pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
+/// Default hard cap `C` on one peer's byte cwnd: the request bytes this node
+/// authorizes one peer to have outstanding, before the floor bypass.
+///
+/// A reservation lives from publication until its body arrives, so a peer
+/// carrying `R` bytes per second at round trip `T` needs `R·T` bytes reserved.
+/// At 1 Gbps and 250 ms that is 125,000,000 B/s × 0.25 s = 31,250,000 bytes
+/// (29.8 MiB). 24 MiB would cap such a peer at about 805 Mbps. 32 MiB
+/// (33,554,432 bytes) carries 1.07 Gbps at 250 ms, which leaves about 18 ms
+/// for the peer's serve time.
+pub const DEFAULT_BS_BBR_MAX_CWND_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Unit the per-peer BBR cwnd budgets in-flight work against. The controller itself is
 /// unit-agnostic (it sizes a cwnd from measured delivery rate × RTprop); the unit only
@@ -311,6 +321,12 @@ pub struct ZakuraBlockSyncConfig {
     /// cold-start byte window before the first delivery sample, and as the binding
     /// operating window for low-latency peers whose byte-BDP is below it.
     pub bbr_min_cwnd_bytes: u64,
+    /// Hard cap `C` on one peer's byte cwnd. The work queue also caps one
+    /// session's published reservations at `C` plus the floor bypass (see
+    /// [`ZakuraBlockSyncConfig::owner_reservation_cap`]), so a peer never has
+    /// more request bytes outstanding than its share of the receive window.
+    /// Must be at least `bbr_min_cwnd_bytes`.
+    pub bbr_max_cwnd_bytes: u64,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
     /// Weight (`0..=100`) with which measured reliability discounts the BDP-derived cwnd:
@@ -364,6 +380,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_startup_growth_percent: DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT,
             bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
             bbr_min_cwnd_bytes: DEFAULT_BS_BBR_MIN_CWND_BYTES,
+            bbr_max_cwnd_bytes: DEFAULT_BS_BBR_MAX_CWND_BYTES,
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
             bbr_reliability_weight_percent: DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT,
             bbr_cwnd_unit: CwndUnit::Bytes,
@@ -456,6 +473,55 @@ impl ZakuraBlockSyncConfig {
         u64::from(self.advertised_max_response_bytes()).max(worst_case_blocks)
     }
 
+    /// The largest estimate one request reserves: `k·B`, with `k` blocks per
+    /// request and `B` the per-block worst case.
+    fn request_byte_ceiling(&self) -> u64 {
+        u64::from(self.advertised_max_blocks_per_response())
+            .saturating_mul(BS_PER_BLOCK_WORST_CASE_BYTES)
+    }
+
+    /// The work queue's cap on one session's published reservations.
+    ///
+    /// An above-floor request may bring the session to `C + k·B`: the routine
+    /// admits it only while its reservations are below the cwnd, at most `C`,
+    /// and the take always keeps its first item. A floor request may also
+    /// use the floor bypass, `floor_bypass_slots · k·B` more.
+    pub(super) fn owner_reservation_cap(&self) -> OwnerReservationCap {
+        let request = self.request_byte_ceiling();
+        let above_floor = self.bbr_max_cwnd_bytes.saturating_add(request);
+        let bypass = u64::from(self.floor_bypass_slots).saturating_mul(request);
+        OwnerReservationCap {
+            above_floor,
+            floor: above_floor.saturating_add(bypass),
+        }
+    }
+
+    /// The most request bytes one session may have reserved:
+    /// `C + (floor_bypass_slots + 1)·k·B`. The default is 32 MiB + 3 × 2 MB.
+    pub fn owner_reservation_ceiling(&self) -> u64 {
+        self.owner_reservation_cap().floor
+    }
+
+    /// `x`, the connections that can carry block sync: the inbound plus
+    /// outbound peer limit, clamped to `max_connections`.
+    pub fn block_sync_connections(&self, max_connections: usize) -> usize {
+        self.peer_limits
+            .max_inbound_peers
+            .saturating_add(self.peer_limits.max_outbound_peers)
+            .min(max_connections)
+    }
+
+    /// The node in-flight byte budget derived from the per-peer cap:
+    /// `x × C`, with `x` from [`Self::block_sync_connections`].
+    ///
+    /// `max_inflight_block_bytes` keeps its fixed default until node
+    /// composition passes the node's `max_connections` here.
+    pub fn derived_max_inflight_block_bytes(&self, max_connections: usize) -> u64 {
+        // Widening usize to u64 is lossless on every supported target.
+        (self.block_sync_connections(max_connections) as u64)
+            .saturating_mul(self.bbr_max_cwnd_bytes)
+    }
+
     /// Validate production-safety bounds after deserialization.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.max_inflight_block_bytes == 0 {
@@ -475,6 +541,9 @@ impl ZakuraBlockSyncConfig {
         }
         if self.bbr_min_cwnd_bytes == 0 {
             return Err("bbr_min_cwnd_bytes must be greater than zero");
+        }
+        if self.bbr_max_cwnd_bytes < self.bbr_min_cwnd_bytes {
+            return Err("bbr_max_cwnd_bytes must be at least bbr_min_cwnd_bytes");
         }
         if self.max_requests_without_block_progress == 0 {
             return Err("max_requests_without_block_progress must be greater than zero");
@@ -579,4 +648,63 @@ pub fn clamp_advertised_inflight(count: u32) -> u32 {
 /// Clamp an advertised response byte target to the largest stream-6 message.
 pub fn clamp_advertised_response_bytes(bytes: u32) -> u32 {
     bytes.clamp(1, MAX_BS_RESPONSE_BYTES)
+}
+
+#[cfg(test)]
+mod owner_cap_tests {
+    use super::*;
+    use crate::zakura::DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
+
+    #[test]
+    fn the_default_cwnd_cap_carries_one_gigabit_at_250_milliseconds() {
+        let bytes_per_second = 1_000_000_000 / 8;
+        let in_flight = bytes_per_second / 4;
+        assert_eq!(in_flight, 31_250_000);
+        assert!(DEFAULT_BS_BBR_MAX_CWND_BYTES >= in_flight);
+    }
+
+    #[test]
+    fn the_owner_cap_adds_one_request_and_the_floor_bypass_to_the_cwnd_cap() {
+        let config = ZakuraBlockSyncConfig::default();
+        let cap = config.owner_reservation_cap();
+        assert_eq!(
+            cap.above_floor,
+            DEFAULT_BS_BBR_MAX_CWND_BYTES + BS_PER_BLOCK_WORST_CASE_BYTES
+        );
+        assert_eq!(
+            cap.floor,
+            DEFAULT_BS_BBR_MAX_CWND_BYTES + 3 * BS_PER_BLOCK_WORST_CASE_BYTES
+        );
+        assert_eq!(config.owner_reservation_ceiling(), 33_554_432 + 6_000_000);
+    }
+
+    #[test]
+    fn derived_inflight_bytes_count_block_sync_connections() {
+        let config = ZakuraBlockSyncConfig::default();
+        assert_eq!(
+            config.block_sync_connections(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS),
+            92
+        );
+        assert_eq!(
+            config.derived_max_inflight_block_bytes(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS),
+            92 * DEFAULT_BS_BBR_MAX_CWND_BYTES
+        );
+        // The peer limits bind when the node admits more connections.
+        assert_eq!(config.block_sync_connections(10_000), 512);
+        assert_eq!(config.block_sync_connections(0), 0);
+    }
+
+    #[test]
+    fn validation_requires_the_cwnd_cap_to_hold_the_minimum_cwnd() {
+        let mut config = ZakuraBlockSyncConfig {
+            bbr_max_cwnd_bytes: DEFAULT_BS_BBR_MIN_CWND_BYTES,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
+        config.bbr_max_cwnd_bytes -= 1;
+        assert_eq!(
+            config.validate(),
+            Err("bbr_max_cwnd_bytes must be at least bbr_min_cwnd_bytes")
+        );
+    }
 }

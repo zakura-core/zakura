@@ -64,7 +64,8 @@ const FUNDING: Machine = Machine {
     name: "block/work-funding",
     identity: "block-work-funding",
     claim: "At each completed driver operation and before queue destruction, actual queue funding and retained request/receipt reservations agree with the independent model.",
-    generator: 1,
+    // Generator 2 caps each session's published reservations.
+    generator: 2,
     budget: 129,
     history: |input| {
         zakura_network::zakura::trace_work_funding_bytes(input)

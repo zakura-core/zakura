@@ -693,6 +693,52 @@ fn mutex_kept_across_runs_gets_a_fresh_identity() {
     assert_ne!(fresh_id, kept_id);
 }
 
+#[test]
+fn mutex_points_name_their_mutex() {
+    use zakura_scheduler::{
+        At, Op,
+        RunOutcome::{Parked, Reached},
+    };
+    let reach = |s: &mut Scheduler, task: zakura_scheduler::JoinHandle| match s.run(task.task()) {
+        Reached(at) => at,
+        other => panic!("expected a point, got {other:?}"),
+    };
+    let shared = Arc::new(RtMutex::new(()));
+    let own = Arc::new(RtMutex::new(()));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let held = shared.clone();
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = held.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    let waiter = s.spawn_root("waiter", async move { drop(shared.lock().unwrap()) });
+    let other = s.spawn_root("other", async move { drop(own.lock().unwrap()) });
+    assert!(
+        s.ready().iter().all(|r| r.at.object.is_none()),
+        "the top of a coroutine touches no object"
+    );
+
+    let at = reach(&mut s, holder);
+    assert_eq!((at.op, at.n), (Op::Lock, 1));
+    let shared_id = at.object.expect("a lock point names its mutex");
+    run_until_waiting(&mut s, holder.task());
+
+    let at = reach(&mut s, waiter);
+    assert_eq!((at.op, at.object), (Op::Lock, Some(shared_id)));
+    let offered: Vec<At> = s.ready().iter().map(|r| r.at).collect();
+    assert!(offered.contains(&at), "ready() offers the same point");
+    assert_eq!(s.run(waiter.task()), Parked(shared_id));
+
+    let lock = reach(&mut s, other);
+    let own_id = lock.object.expect("a lock point names its mutex");
+    assert_ne!(own_id, shared_id);
+    let release = reach(&mut s, other);
+    assert_eq!((release.op, release.object), (Op::Release, Some(own_id)));
+}
+
 /// Runs one task that draws an `rng()` value and builds a map, with `seed`
 /// answering every draw. Returns the draws seen, the value, and key order.
 fn drawing_run(seed: u64) -> (Vec<zakura_scheduler::Draw>, u64, Vec<u32>) {

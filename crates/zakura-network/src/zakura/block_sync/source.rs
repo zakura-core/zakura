@@ -68,6 +68,39 @@ pub struct BlockRangeReadResult {
 pub struct BlockRangeReadLease {
     pub(super) work: WorkLease,
     pub(super) _session: Option<FramedSend>,
+    /// Reports the frames the response queues, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observed: Option<super::block_sync_observe::ServingReporter>,
+}
+
+/// The session end of a [`BlockRangeReadLease::detached`] lease. Dropping it
+/// cancels the read, as a closed serving session does.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+#[derive(Debug)]
+pub struct DetachedReadSession(WorkLease);
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl Drop for DetachedReadSession {
+    fn drop(&mut self) {
+        self.0.cancel_detached();
+    }
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl BlockRangeReadLease {
+    /// A lease outside any serving session, with its session end, for a
+    /// range source's own tests. Serving builds every other lease.
+    pub fn detached() -> (Self, DetachedReadSession) {
+        let work = WorkLease::detached();
+        let session = DetachedReadSession(work.clone());
+        let lease = BlockRangeReadLease {
+            work,
+            _session: None,
+            #[cfg(any(test, zakura_sim))]
+            observed: None,
+        };
+        (lease, session)
+    }
 }
 
 impl BlockRangeReadLease {

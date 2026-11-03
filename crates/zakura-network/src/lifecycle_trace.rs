@@ -5,7 +5,7 @@
 //!
 //! - `p2p`: every wire message on a legacy connection. Sends record both the attempt
 //!   (`send_start`) and the completed framed write and flush (`send_done`); receives record the
-//!   decoded message (`recv`). Inventory rows list every block hash in the batch.
+//!   decoded message (`recv`). Inventory rows list every block hash in the batch, up to 500 hashes.
 //! - `p2p_request`: an outbound request's path through the peer set and the connection: peer
 //!   selection (`dispatch`), the connection channel (`enqueue`, `dequeue`), the request write
 //!   (`write`), and its completion (`finish`).

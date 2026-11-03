@@ -9,6 +9,8 @@ use zakura_rt::sync::{
 };
 
 use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::block_sync::block_sync_observe::{BlockEvent, RequestStep};
 use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
 
 const UNPUBLISHED: u8 = 0;
@@ -22,8 +24,14 @@ mod tests;
 
 /// Observes whether transport skipped an attempt without retaining its work or
 /// byte reservation. The routine can keep this after the writer drops its claim.
+///
+/// In test and simulator builds it also carries its request's reporter, so
+/// every expiry reports its step, whichever owner expires the request.
 #[derive(Clone, Debug)]
-pub(in crate::zakura::block_sync) struct RequestWriteStatus(Arc<AtomicU8>);
+pub(in crate::zakura::block_sync) struct RequestWriteStatus(
+    Arc<AtomicU8>,
+    #[cfg(any(test, zakura_sim))] Option<Arc<RequestReporter>>,
+);
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn was_skipped(&self) -> bool {
@@ -36,7 +44,7 @@ impl RequestWriteStatus {
     }
 
     /// Where the frame write stands now.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::block_sync) fn phase(&self) -> RequestWritePhase {
         match self.0.load(Ordering::Acquire) {
             UNPUBLISHED => RequestWritePhase::Unpublished,
@@ -49,19 +57,55 @@ impl RequestWriteStatus {
     }
 
     /// Retire a queued attempt atomically against writer startup. Returns true
-    /// only for the transition; a started frame remains the transport's owner.
+    /// only for the transition, which test and simulator builds report as
+    /// `RequestStep::Expired`; a started frame remains the transport's owner.
+    ///
+    /// The report follows the compare-exchange, so on a multi-threaded
+    /// runtime the handle's drop on another thread can report
+    /// `Dropped(Skipped)` before this reports `Expired`.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
-        self.0
+        let expired = self
+            .0
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        #[cfg(any(test, zakura_sim))]
+        if let (true, Some(reporter)) = (expired, &self.1) {
+            reporter.report(RequestStep::Expired);
+        }
+        expired
+    }
+}
+
+/// Reports one request's steps to the queue's observer.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+pub(in crate::zakura::block_sync) struct RequestReporter {
+    observer: crate::zakura::block_sync::block_sync_observe::ObserverSlot,
+    owner: BodyWorkOwner,
+    heights: Vec<block::Height>,
+    estimated_bytes: u64,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl RequestReporter {
+    fn report(&self, step: RequestStep) {
+        observe!(
+            self.observer,
+            BlockEvent::Request {
+                owner: self.owner,
+                heights: self.heights.clone(),
+                estimated_bytes: self.estimated_bytes,
+                step,
+            }
+        );
     }
 }
 
 /// Where a request's frame write stands. A queued request is published but
 /// not yet sent: transport can still skip it.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(in crate::zakura::block_sync) enum RequestWritePhase {
+pub enum RequestWritePhase {
     /// The attempt holds its items provisionally and hasn't published them.
     Unpublished,
     /// Published and queued for transport.
@@ -92,6 +136,9 @@ pub(crate) struct RequestWrite {
     budget: ByteBudget,
     cancel: CancellationToken,
     state: Arc<AtomicU8>,
+    /// Reports this request's steps, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    reporter: Arc<RequestReporter>,
 }
 
 impl RequestWrite {
@@ -104,6 +151,13 @@ impl RequestWrite {
     ) -> Arc<Self> {
         let estimated_bytes = items.iter().map(|(_, item)| item.estimated_bytes).sum();
         Arc::new(Self {
+            #[cfg(any(test, zakura_sim))]
+            reporter: Arc::new(RequestReporter {
+                observer: work.observer.clone(),
+                owner,
+                heights: items.iter().map(|(height, _)| *height).collect(),
+                estimated_bytes,
+            }),
             owner,
             items,
             estimated_bytes,
@@ -114,8 +168,14 @@ impl RequestWrite {
         })
     }
 
+    #[cfg(not(any(test, zakura_sim)))]
     pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
         RequestWriteStatus(self.state.clone())
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
+        RequestWriteStatus(self.state.clone(), Some(self.reporter.clone()))
     }
 
     /// Record outstanding state and enqueue into already-reserved capacity under
@@ -157,8 +217,16 @@ impl RequestWrite {
             },
         );
         self.state.store(QUEUED, Ordering::Release);
+        #[cfg(any(test, zakura_sim))]
+        self.observe(RequestStep::Published);
         publish();
         true
+    }
+
+    /// Reports `step` to the queue's observer, if one is installed.
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, step: RequestStep) {
+        self.reporter.report(step);
     }
 
     pub(super) fn owner(&self) -> BodyWorkOwner {
@@ -172,6 +240,8 @@ impl RequestWrite {
     /// A reserved queue slot lost its receiver during publication. Settle the
     /// ledger now even if that closed channel retains a copy of this claim.
     pub(in crate::zakura::block_sync) fn delivery_failed(&self) {
+        #[cfg(any(test, zakura_sim))]
+        self.observe(RequestStep::DeliveryFailed);
         self.cancel.cancel();
         self.expire_unwritten();
         let released = self
@@ -198,6 +268,8 @@ impl RequestWrite {
     }
 
     pub(super) fn reset(&self) {
+        #[cfg(any(test, zakura_sim))]
+        self.observe(RequestStep::Reset);
         self.expire_unwritten();
         if self.state.load(Ordering::Acquire) == STARTED {
             // The prefix already belongs to this ordered stream. Cancelling the
@@ -221,13 +293,21 @@ impl FrameWriteClaim for RequestWrite {
             self.expire_unwritten();
             return false;
         }
-        self.state
+        let started = self
+            .state
             .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        #[cfg(any(test, zakura_sim))]
+        if started {
+            self.observe(RequestStep::Started);
+        }
+        started
     }
 
     fn written(&self) {
         self.state.store(WRITTEN, Ordering::Release);
+        #[cfg(any(test, zakura_sim))]
+        self.observe(RequestStep::Written);
         self.work.lock().request_writes.remove(&self.owner);
     }
 }
@@ -257,5 +337,7 @@ impl Drop for RequestWrite {
                 self.work.lock().request_writes.remove(&self.owner);
             }
         }
+        #[cfg(any(test, zakura_sim))]
+        self.observe(RequestStep::Dropped(self.status().phase()));
     }
 }

@@ -1,0 +1,9 @@
+# The committed fuzz input `header-wire-bad-content.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `bad-content` scenario, and
+# `header-wire-bad-content.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "f7aee76ea13764c299490f53bfa27595f41f932540cb274e4e86d984ed0a3e35"
+scenario_sha256 = "a667f2ccc1965c42edea2eb0df7e27ecc227d14e93f5140a2ba478fde962fefb"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

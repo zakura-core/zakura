@@ -3,6 +3,8 @@
 //!
 //! This module holds the wire codec, the message table, the publisher, and the
 //! subscriber. The service runs one publisher and one subscriber per session.
+//! The codec and the message table are public, so simulator peers can build
+//! and read every version 9 message.
 
 mod publisher;
 mod subscriber;
@@ -21,7 +23,10 @@ use crate::zakura::{
     Frame,
 };
 pub(crate) use wire::*;
-pub use wire::{Headers, HeadersOutcome, HeadersOutcomeCode, Status};
+pub use wire::{
+    layout, rows, CommonMessage, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message,
+    Operation, RegtestMessage, Status, SubscribeHeaders,
+};
 
 /// Page reads that may run at once across the node. Each read holds a
 /// retained-path lease in state, which bounds its own capacity, so this keeps

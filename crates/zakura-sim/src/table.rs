@@ -16,7 +16,8 @@
 //! node's reader reaching the bytes that decide the label;
 //! [`Observation::ConnectionClosed`]; and [`Observation::Misbehavior`].
 //! Each judged frame needs exactly one earlier `PeerFrame` with its
-//! connection, stream and sequence number, and a judged fault needs a
+//! connection, stream, QUIC stream and sequence number, and a judged fault
+//! needs a
 //! registered `<label>-closes` property for its rule. A missing or repeated
 //! label, or an unclaimed fault, fails the run as a harness failure, so it
 //! can't hide an obligation.
@@ -542,26 +543,29 @@ struct Sent<'a> {
     exhausted: bool,
 }
 
-/// The frame `seq` the peer sent on `connection` and `stream`, from
-/// `entries`. Every judged frame needs exactly one label there, so a missing
-/// or repeated `PeerFrame` is missing evidence, described in the error.
+/// The frame `seq` the peer sent on `connection`, `stream` and
+/// `quic_stream`, from `entries`. Every judged frame needs exactly one label
+/// there, so a missing or repeated `PeerFrame` is missing evidence,
+/// described in the error.
 fn sent(
     entries: &[Entry],
     connection: u64,
     stream: StreamId,
+    quic_stream: Option<u64>,
     seq: u64,
 ) -> Result<Sent<'_>, String> {
     let mut labels = entries.iter().filter_map(|entry| match &entry.obs {
         Observation::PeerFrame {
             connection: c,
             stream: s,
+            quic_stream: quic,
             seq: q,
             row,
             rule_stream,
             label,
             exhausted,
             ..
-        } if (*c, *s, *q) == (connection, stream, seq) => Some(Sent {
+        } if (*c, *s, *quic, *q) == (connection, stream, quic_stream, seq) => Some(Sent {
             stream,
             row: row.as_deref(),
             rule_stream: *rule_stream,
@@ -570,7 +574,8 @@ fn sent(
         }),
         _ => None,
     });
-    let frame = format!("connection {connection} judged frame {seq} on {stream}");
+    let on = quic_stream.map_or(String::new(), |quic| format!(" (QUIC stream {quic})"));
+    let frame = format!("connection {connection} judged frame {seq} on {stream}{on}");
     match (labels.next(), labels.next()) {
         (Some(sent), None) => Ok(sent),
         (None, _) => Err(format!("{frame} has no PeerFrame label before it")),
@@ -588,8 +593,11 @@ fn judged(entries: &[Entry], connection: u64) -> Result<Vec<Sent<'_>>, String> {
             Observation::FrameJudged {
                 connection: c,
                 stream,
+                quic_stream,
                 seq,
-            } if c == connection => Some(sent(&entries[..at], connection, stream, seq)),
+            } if c == connection => {
+                Some(sent(&entries[..at], connection, stream, quic_stream, seq))
+            }
             _ => None,
         })
         .collect()
@@ -633,6 +641,7 @@ fn unclaimed_fault<S: HasView>(cx: &CheckCtx<'_, S>, id: &GeneratedId<'_>) -> Op
         let Observation::FrameJudged {
             connection,
             stream,
+            quic_stream,
             seq,
         } = entry.obs
         else {
@@ -641,7 +650,7 @@ fn unclaimed_fault<S: HasView>(cx: &CheckCtx<'_, S>, id: &GeneratedId<'_>) -> Op
         if stream != id.stream {
             return None;
         }
-        let frame = sent(&entries[..start + at], connection, stream, seq).ok()?;
+        let frame = sent(&entries[..start + at], connection, stream, quic_stream, seq).ok()?;
         if consequence(frame.label) == Consequence::NoPunishment {
             return None;
         }
@@ -674,13 +683,14 @@ fn check_closes<S: HasView>(
         let Observation::FrameJudged {
             connection,
             stream,
+            quic_stream,
             seq,
         } = entry.obs
         else {
             continue;
         };
         let before = &entries[..start + at];
-        let frame = match sent(before, connection, stream, seq) {
+        let frame = match sent(before, connection, stream, quic_stream, seq) {
             Ok(frame) => frame,
             Err(missing) => {
                 cx.missing_evidence(missing);
@@ -734,9 +744,10 @@ fn check_never_closes<S: HasView>(
             Observation::FrameJudged {
                 connection,
                 stream,
+                quic_stream,
                 seq,
             } => {
-                match sent(before, *connection, *stream, *seq) {
+                match sent(before, *connection, *stream, *quic_stream, *seq) {
                     Ok(frame) if *stream == id.stream && applies(&frame) => {
                         verdict = Verdict::Holds;
                     }

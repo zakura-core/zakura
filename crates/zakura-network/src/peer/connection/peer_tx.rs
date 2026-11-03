@@ -46,6 +46,35 @@ where
         result
     }
 
+    /// Sends `msg` if `authorized()` still holds once the sink is ready, rechecking it
+    /// immediately before starting the local write.
+    ///
+    /// Returns `Ok(false)` without writing anything if authorization was revoked, and a timeout
+    /// error if readiness and the write together take too long.
+    pub(crate) async fn send_authorized(
+        &mut self,
+        msg: Message,
+        authorized: impl FnOnce() -> bool,
+    ) -> Result<bool, PeerError> {
+        let mut send = None;
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            futures::future::poll_fn(|cx| std::pin::Pin::new(&mut self.inner).poll_ready(cx))
+                .await?;
+            if !authorized() {
+                return Ok(false);
+            }
+            send = self.trace.p2p_send_start(&msg);
+            std::pin::Pin::new(&mut self.inner).start_send(msg)?;
+            self.inner.flush().await?;
+            Ok(true)
+        })
+        .await
+        .map_err(|_| PeerError::ConnectionSendTimeout)
+        .and_then(|result| result);
+        self.trace.p2p_send_done(send, &result.as_ref().map(|_| ()));
+        result
+    }
+
     /// Flush any remaining output and close this [`PeerTx`], if necessary.
     ///
     /// Returns a timeout error if flushing takes too long.

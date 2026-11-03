@@ -14,10 +14,7 @@ use zakura_chain::{block, serialization::ZcashSerialize};
 use zakura_jsonl_trace::{impl_jsonl_trace_event, saturating_count, saturating_micros, tables};
 
 use super::{ConnectionState, ConnectionTrace};
-use crate::{
-    protocol::external::{InventoryHash, Message, Nonce},
-    PeerError,
-};
+use crate::protocol::external::{InventoryHash, Message, Nonce};
 
 /// The most block hashes one `p2p` row lists.
 ///
@@ -132,7 +129,11 @@ impl ConnectionTrace {
     }
 
     /// Records that the write started by [`Self::p2p_send_start`] returned `result`.
-    pub(crate) fn p2p_send_done(&self, send: Option<SendTrace>, result: &Result<(), PeerError>) {
+    pub(crate) fn p2p_send_done(
+        &self,
+        send: Option<SendTrace>,
+        result: &Result<(), impl fmt::Display>,
+    ) {
         let (Some(state), Some(send)) = (self.p2p(), send) else {
             return;
         };

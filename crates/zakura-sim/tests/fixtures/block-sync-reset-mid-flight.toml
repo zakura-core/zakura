@@ -1,0 +1,14 @@
+# The committed fuzz input `block-sync-reset-mid-flight.bin`: the harness
+# that runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes, `ff 0c`, pick the reset-mid-flight scenario: two mirrors
+# serve sixteen bodies, and the chain resets to a fork from height 8 once the
+# node submits its third body.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "fc591c33d3cc19cf3b7773e48e4431229c8ea36911f432912f12966cb88cf427"
+scenario_sha256 = "ef7a2693943a5f576cfab7e8029e9ceef242b4bd6c02d7d5b726c360bf127914"
+source = "crates/zakura-sim/tests/block_semantic_properties.rs"
+
+[[witness]]
+property = "block-sync/submit-only-requested"
+expect = "holds"

@@ -764,6 +764,7 @@ fn session_advertising(
         },
         pages,
         cancel.clone(),
+        None,
     );
     (publisher, recv, cancel, task)
 }
@@ -1395,6 +1396,7 @@ async fn a_page_job_panic_ends_a_terminal_wait_on_a_full_queue() {
         },
         limits(),
         CancellationToken::new(),
+        None,
     );
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
@@ -1446,6 +1448,7 @@ async fn a_terminal_wait_keeps_the_other_page_moving() {
         },
         limits(),
         CancellationToken::new(),
+        None,
     );
     // The first subscription's page waits in its read, holding the slot.
     let mut first = Subscriber::new();

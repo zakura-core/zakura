@@ -233,6 +233,9 @@ pub struct ZakuraTestNodeBuilder {
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
     block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
+    /// The observer the node's handler reports transport events to.
+    #[cfg(test)]
+    transport_observer: Option<Arc<dyn crate::zakura::TransportObserver>>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +295,8 @@ impl ZakuraTestNodeBuilder {
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
             block_range_source: None,
+            #[cfg(test)]
+            transport_observer: None,
         }
     }
 
@@ -403,6 +408,16 @@ impl ZakuraTestNodeBuilder {
         snapshots: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     ) -> Self {
         self.header_snapshot_override = Some(snapshots);
+        self
+    }
+
+    /// Report the node's transport events to `observer`.
+    #[cfg(test)]
+    pub(crate) fn transport_observer(
+        mut self,
+        observer: Arc<dyn crate::zakura::TransportObserver>,
+    ) -> Self {
+        self.transport_observer = Some(observer);
         self
     }
 
@@ -600,6 +615,10 @@ impl ZakuraTestNodeBuilder {
         );
         if let Some(supported_capabilities) = self.supported_capabilities {
             handler = handler.with_supported_capabilities(supported_capabilities);
+        }
+        #[cfg(test)]
+        if let Some(observer) = self.transport_observer {
+            handler = handler.with_transport_observer(observer);
         }
         let handler = handler.with_local_node_id(endpoint.local_id());
         endpoint.serve(handler.clone())?;

@@ -10,7 +10,9 @@ use std::{any::Any, fmt, panic::AssertUnwindSafe, sync::Arc};
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
 
-use super::{events::HeaderPortOperation, ActiveHeaderRequest, HeaderTargetPurpose};
+use super::{
+    events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
+};
 pub use super::{reactor::HeaderRequestTerminal, scheduler::peer_work::HeaderTargetPhase};
 use crate::zakura::ZakuraPeerId;
 
@@ -99,6 +101,17 @@ pub enum ReactorEvent {
         target_tip_hash: block::Hash,
         /// Which capacity refused it.
         cause: WaitCause,
+    },
+    /// The reactor dispatched a violation by `peer` to storage.
+    Misbehavior {
+        /// The violating peer.
+        peer: ZakuraPeerId,
+        /// What the peer did.
+        reason: HeaderSyncMisbehavior,
+        /// The session whose message or work showed the violation, if known.
+        origin: Option<u64>,
+        /// `peer`'s current session when the violation was dispatched.
+        current: Option<u64>,
     },
 }
 

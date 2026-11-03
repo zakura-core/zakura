@@ -85,6 +85,36 @@ impl PreparedStream {
     }
 }
 
+#[cfg(any(test, zakura_sim))]
+impl PreparedStream {
+    /// Attach a stream tap to the reader and service, and report `Admitted`
+    /// with the depths its worker installs, when the connection has a
+    /// transport observer.
+    fn observe_admission(&self, session_id: u64, inbound_depth: usize, outbound_depth: usize) {
+        let (Some(conn), Some((send, _))) = (self.context.close_cause.tap(), self.io.0.as_ref())
+        else {
+            return;
+        };
+        let quic_stream = send.id();
+        self.context
+            .precheck
+            .observe_with(Arc::new(crate::zakura::StreamTap::new(
+                conn.clone(),
+                quic_stream,
+            )));
+        conn.emit(crate::zakura::TransportEvent::Admitted {
+            conn_id: conn.conn_id(),
+            quic_stream,
+            kind: self.stream.kind,
+            version: self.stream.version,
+            session_id,
+            negotiated_limits: self.context.limits,
+            inbound_depth,
+            outbound_depth,
+        });
+    }
+}
+
 /// Incomplete setup retains every arrived stream under the first arrival's deadline.
 struct PendingSession {
     id: u64,
@@ -225,6 +255,8 @@ pub(super) fn spawn_service_session(
         if prepared.context.messages.is_some() {
             prepared.context.precheck.pause();
         }
+        #[cfg(any(test, zakura_sim))]
+        prepared.observe_admission(admitted.session_id, inbound_depth, outbound_depth);
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,

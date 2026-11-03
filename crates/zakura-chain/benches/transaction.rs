@@ -18,9 +18,10 @@
 //! Transactions are extracted from real mainnet blocks in `zakura-test` vectors.
 //! Versions V1 through V5 are represented by transactions from blocks at the
 //! appropriate network upgrade heights. The benchmark serializes each transaction
-//! to bytes first, then benchmarks both deserialization and serialization. The
-//! ZIP-244 digest benchmarks also construct an Ironwood-only V6 transaction from
-//! a real shielded bundle.
+//! to bytes first, then benchmarks both deserialization and serialization.
+//! Deserialization, mempool preparation, and ZIP-244 digest benchmarks also
+//! construct an Ironwood-only V6 transaction from a real Orchard bundle. That
+//! synthetic transaction exercises encoding and hashing, not verification.
 
 // Disabled due to warnings in criterion macros
 #![allow(missing_docs)]
@@ -33,7 +34,7 @@ use zakura_chain::{
     block::{Block, Height},
     parameters::NetworkUpgrade,
     serialization::{ZcashDeserialize, ZcashSerialize},
-    transaction::{LockTime, Transaction},
+    transaction::{LockTime, Transaction, UnminedTx},
 };
 
 /// Extracts the first transaction matching a given version from a block.
@@ -57,6 +58,24 @@ fn first_v5_orchard_only_tx(block: &Block) -> Option<Arc<Transaction>> {
                 && tx.has_orchard_shielded_data()
         })
         .cloned()
+}
+
+/// Returns an Orchard-only transaction from the NU5 mainnet vectors.
+fn orchard_only_tx() -> Arc<Transaction> {
+    let nu5_blocks = [
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687108_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687113_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687121_BYTES.as_slice(),
+    ];
+    nu5_blocks
+        .into_iter()
+        .find_map(|block_bytes| {
+            let block = Block::zcash_deserialize(Cursor::new(block_bytes)).expect("valid block");
+            first_v5_orchard_only_tx(&block)
+        })
+        .expect("vectors contain an Orchard-only v5 tx")
 }
 
 /// Constructs an Ironwood-only v6 transaction from a real Orchard bundle.
@@ -129,6 +148,18 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
         tx_samples.push(("V5 orchard", bytes));
     }
 
+    let orchard_tx = orchard_only_tx();
+    for (label, tx) in [
+        ("V5 orchard only", orchard_tx.clone()),
+        ("V6 ironwood only", v6_ironwood_only_tx(&orchard_tx)),
+    ] {
+        tx_samples.push((
+            label,
+            tx.zcash_serialize_to_vec()
+                .expect("vector bundles and synthetic transaction fields have valid encodings"),
+        ));
+    }
+
     for (label, tx_bytes) in &tx_samples {
         group.bench_with_input(
             BenchmarkId::new("deserialize", label),
@@ -150,23 +181,27 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
     }
 
     group.finish();
+
+    // Includes decoding, Arc allocation, cached IDs/size/fee, and destruction.
+    // State queries, verification, and mempool storage insertion are excluded.
+    let mut group = c.benchmark_group("Transaction Mempool Preparation");
+    for (label, tx_bytes) in &tx_samples {
+        group.bench_with_input(
+            BenchmarkId::new("decode_unmined", label),
+            tx_bytes,
+            |b, bytes| {
+                b.iter(|| {
+                    let tx = Arc::new(Transaction::zcash_deserialize(Cursor::new(bytes)).unwrap());
+                    UnminedTx::from(tx)
+                })
+            },
+        );
+    }
+    group.finish();
 }
 
 fn bench_zip244_digests(c: &mut Criterion) {
-    let nu5_blocks = [
-        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_1687108_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_1687113_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_1687121_BYTES.as_slice(),
-    ];
-    let orchard_tx = nu5_blocks
-        .into_iter()
-        .find_map(|block_bytes| {
-            let block = Block::zcash_deserialize(Cursor::new(block_bytes)).expect("valid block");
-            first_v5_orchard_only_tx(&block)
-        })
-        .expect("vectors contain an Orchard-only v5 tx");
+    let orchard_tx = orchard_only_tx();
     let ironwood_tx = v6_ironwood_only_tx(&orchard_tx);
 
     assert_eq!(ironwood_tx.version(), 6);

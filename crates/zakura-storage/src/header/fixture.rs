@@ -43,6 +43,11 @@ impl HeaderFixture {
         self.genesis.header.clone()
     }
 
+    /// The anchor's block.
+    pub fn genesis_block(&self) -> Arc<block::Block> {
+        self.genesis.clone()
+    }
+
     /// The anchor, genesis at height 0.
     pub fn anchor(&self) -> Frontier {
         Frontier::new(block::Height(0), self.genesis.hash())
@@ -67,20 +72,37 @@ impl HeaderFixture {
                 .0
                 .checked_add(offset)
                 .expect("fixture heights stay small");
-            let mut header = *self.genesis.header;
-            header.previous_block_hash = parent_hash;
-            header.nonce.0[0] = branch;
-            header.nonce.0[1..5].copy_from_slice(&height.to_le_bytes());
-            header.time = self
-                .genesis
-                .header
-                .time
-                .checked_add_signed(chrono::Duration::seconds(i64::from(height)))
-                .expect("fixture times stay representable");
+            let header =
+                self.header_at(parent_hash, height, branch, self.genesis.header.merkle_root);
             parent_hash = header.hash();
             headers.push(Arc::new(header));
         }
         headers
+    }
+
+    /// The fixture header at `height` on `branch`, extending `parent_hash`
+    /// and committing to `merkle_root`. [`Self::extend`] builds each header
+    /// this way with the genesis root. The block fixture passes its body's
+    /// root.
+    pub(crate) fn header_at(
+        &self,
+        parent_hash: block::Hash,
+        height: u32,
+        branch: u8,
+        merkle_root: block::merkle::Root,
+    ) -> block::Header {
+        let mut header = *self.genesis.header;
+        header.previous_block_hash = parent_hash;
+        header.merkle_root = merkle_root;
+        header.nonce.0[0] = branch;
+        header.nonce.0[1..5].copy_from_slice(&height.to_le_bytes());
+        header.time = self
+            .genesis
+            .header
+            .time
+            .checked_add_signed(chrono::Duration::seconds(i64::from(height)))
+            .expect("fixture times stay representable");
+        header
     }
 
     /// The request a requester sends to prepare `headers`, which extend
@@ -98,7 +120,25 @@ impl HeaderFixture {
         headers: &[Arc<block::Header>],
         request_id: u64,
     ) -> PrepareHeaderTarget {
-        let last = headers.last().expect("a target has headers");
+        let sized: Vec<_> = headers.iter().map(|header| (header.clone(), 0)).collect();
+        self.sized_target_request(snapshot, parent, &sized, request_id)
+    }
+
+    /// [`Self::target_request`] with an advertised body size for each
+    /// header, which the engine keeps as that header's size hint. A size of
+    /// 0 advertises none.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::target_request`] does.
+    pub fn sized_target_request(
+        &self,
+        snapshot: &EngineSnapshot,
+        parent: Frontier,
+        headers: &[(Arc<block::Header>, u32)],
+        request_id: u64,
+    ) -> PrepareHeaderTarget {
+        let (last, _) = headers.last().expect("a target has headers");
         let count = u32::try_from(headers.len()).expect("a fixture batch fits u32");
         let height = parent
             .height
@@ -118,9 +158,9 @@ impl HeaderFixture {
             target,
             entries: headers
                 .iter()
-                .map(|header| TargetEntry {
+                .map(|(header, body_size)| TargetEntry {
                     header: header.clone(),
-                    body_size: 0,
+                    body_size: *body_size,
                     tree_aux: None,
                 })
                 .collect::<Vec<_>>()

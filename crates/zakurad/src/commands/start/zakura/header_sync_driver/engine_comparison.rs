@@ -32,49 +32,113 @@ use zakura_storage::header::{
 
 use super::*;
 
-/// The production adapter over an ephemeral Regtest state whose header-chain
-/// runtime has attached at genesis, as `zakurad` starts it.
-async fn production() -> Arc<dyn Port> {
-    let network = HeaderFixture::regtest().network().clone();
-    let config = zakura_state::Config {
-        ephemeral: true,
-        debug_skip_non_finalized_state_backup_task: true,
-        enable_zakura_header_seed_from_committed_blocks: true,
-        ..Default::default()
-    };
-    let (mut state, read_state, _, _, authority) =
-        zakura_state::init_with_header_chain_body_evidence(config, &network, block::Height(0), 2)
+/// zakura-state's write service, shared by its callers.
+pub(crate) type SharedState = Arc<
+    tokio::sync::Mutex<
+        tower::util::BoxService<
+            zakura_state::Request,
+            zakura_state::Response,
+            zakura_state::BoxError,
+        >,
+    >,
+>;
+
+/// An ephemeral Regtest zakura-state whose header-chain runtime has
+/// attached at genesis, as `zakurad` starts it.
+pub(crate) struct ProductionState {
+    /// The write service.
+    pub(crate) state: SharedState,
+    /// The read service.
+    pub(crate) read_state: zakura_state::ReadStateService,
+    /// The authority the block-sync driver seals body evidence with.
+    pub(crate) authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+    /// Regtest.
+    pub(crate) network: zakura_chain::parameters::Network,
+}
+
+impl ProductionState {
+    /// Starts the state and waits for its header runtime to attach.
+    pub(crate) async fn start() -> Self {
+        let network = HeaderFixture::regtest().network().clone();
+        let config = zakura_state::Config {
+            ephemeral: true,
+            debug_skip_non_finalized_state_backup_task: true,
+            enable_zakura_header_seed_from_committed_blocks: true,
+            ..Default::default()
+        };
+        let (mut state, read_state, _, _, authority) =
+            zakura_state::init_with_header_chain_body_evidence(
+                config,
+                &network,
+                block::Height(0),
+                2,
+            )
             .await
             .expect("the ephemeral state starts");
-    state
-        .ready()
-        .await
-        .expect("the state is ready for genesis")
-        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
-            block::genesis::regtest_genesis_block().into(),
-        ))
-        .await
-        .expect("genesis commits");
-    state
-        .ready()
-        .await
-        .expect("the state performs semantic handoff");
-    read_state
-        .subscribe_header_runtime_status()
-        .wait_for(|status| matches!(status, HeaderRuntimeStatus::Ready { .. }))
-        .await
-        .expect("the header runtime attaches at genesis");
-    let state = {
-        let state = Arc::new(tokio::sync::Mutex::new(state));
+        state
+            .ready()
+            .await
+            .expect("the state is ready for genesis")
+            .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                block::genesis::regtest_genesis_block().into(),
+            ))
+            .await
+            .expect("genesis commits");
+        state
+            .ready()
+            .await
+            .expect("the state performs semantic handoff");
+        read_state
+            .subscribe_header_runtime_status()
+            .wait_for(|status| matches!(status, HeaderRuntimeStatus::Ready { .. }))
+            .await
+            .expect("the header runtime attaches at genesis");
+        ProductionState {
+            state: Arc::new(tokio::sync::Mutex::new(state)),
+            read_state,
+            authority,
+            network,
+        }
+    }
+
+    /// The write service, for one more caller.
+    pub(crate) fn writer(
+        &self,
+    ) -> impl tower::Service<
+        zakura_state::Request,
+        Response = zakura_state::Response,
+        Error = zakura_state::BoxError,
+        Future = impl std::future::Future<
+            Output = Result<zakura_state::Response, zakura_state::BoxError>,
+        > + Send,
+    > + Clone
+           + Send
+           + Sync
+           + 'static {
+        let state = self.state.clone();
         service_fn(move |request| {
             let state = state.clone();
             async move { state.lock().await.ready().await?.call(request).await }
         })
-    };
-    let snapshots = read_state.subscribe_header_chain_snapshots();
-    Arc::new(HeaderChainServicePort::new(
-        state, read_state, authority, network, snapshots,
-    ))
+    }
+
+    /// The production header-chain port over this state.
+    pub(crate) fn port(&self) -> Arc<dyn Port> {
+        let snapshots = self.read_state.subscribe_header_chain_snapshots();
+        Arc::new(HeaderChainServicePort::new(
+            self.writer(),
+            self.read_state.clone(),
+            self.authority.clone(),
+            self.network.clone(),
+            snapshots,
+        ))
+    }
+}
+
+/// The production adapter over an ephemeral Regtest state whose header-chain
+/// runtime has attached at genesis, as `zakurad` starts it.
+async fn production() -> Arc<dyn Port> {
+    ProductionState::start().await.port()
 }
 
 /// How long `both` waits, in wall-clock time, for `production` to start.

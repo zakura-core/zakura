@@ -1300,6 +1300,64 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
     assert!(futures::poll!(ranking.as_mut()).is_ready());
 }
 
+/// #1812: a measured peer whose routine parks on a full sequencer input
+/// queue can't request the floor, so an unmeasured peer stops deferring the
+/// floor to it and is woken to rank again. Once the queue has room and the
+/// handoff completes, the measured peer is the preferred carrier again.
+#[tokio::test]
+async fn a_routine_parked_on_a_full_sequencer_queue_does_not_hold_the_floor() {
+    let ((mut fast, mut fast_outbound, pool, _fast_connection, _), blocks, _fast_bodies) =
+        bulk_routine();
+    let index = |height: block::Height| usize::try_from(height.0 - 1).unwrap();
+    // Answer the probe, then one request of the next window, so the fast peer
+    // is measured, has a free slot and still waits on a request.
+    let mut requested = Vec::new();
+    while requested.len() < 2 {
+        fast.try_fill().await;
+        requested = requested_heights(&mut fast_outbound);
+        let answered = requested[0];
+        deliver(
+            &mut fast,
+            BlockSyncMessage::Block(blocks[index(answered)].clone()),
+        )
+        .await;
+        deliver(
+            &mut fast,
+            BlockSyncMessage::BlocksDone {
+                start_height: answered,
+                returned: 1,
+            },
+        )
+        .await;
+    }
+    let second = requested[1];
+    assert!(fast.window.bbr_rtprop_ms(Instant::now()).is_some());
+    let registry = Arc::clone(&fast.registry);
+    let floor = fast
+        .work
+        .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
+        .expect("the fast peer left work behind");
+    let (slow, _slow_outbound) = slower_floor_peer(&fast, pool, floor);
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+
+    let (bodies, mut received) = mpsc::channel(1);
+    let held = bodies.clone().try_reserve_owned().unwrap();
+    fast.sequencer_input = bodies;
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    let block = blocks[index(second)].clone();
+    let mut parked = Box::pin(deliver(&mut fast, BlockSyncMessage::Block(block)));
+    assert!(futures::poll!(&mut parked).is_pending());
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+
+    drop(held);
+    parked.await;
+    received.try_recv().unwrap();
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+}
+
 /// Two sessions that open every request their window allows and then withhold
 /// every ending hold at most a quarter of the node pool together, so a third
 /// session can still reserve.

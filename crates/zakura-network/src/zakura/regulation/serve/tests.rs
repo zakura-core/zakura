@@ -141,8 +141,8 @@ pub(super) fn peer(n: u8) -> ZakuraPeerId {
 }
 
 /// One served session, its output, and its cancellation.
-pub(super) struct Session {
-    pub(super) serve: Serve<Scripted>,
+pub(super) struct Session<P: Produce = Scripted> {
+    pub(super) serve: Serve<P>,
     pub(super) output: FramedRecv,
     pub(super) cancel: CancellationToken,
 }
@@ -1381,4 +1381,140 @@ async fn one_slot_serving_drains_before_control_uses_the_slot() {
         assert!(!cancel.is_cancelled());
         cancel.cancel();
     }
+}
+
+/// [`Scripted`], logging the node execution slots held at each lease report.
+#[derive(Debug)]
+struct Leased {
+    capacity: ServeCapacity,
+    log: Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+}
+
+static SCRIPTED: Scripted = Scripted;
+
+impl Produce for Leased {
+    type Request = Job;
+    type Message = Probe;
+
+    fn response_cap(&self, job: &Job) -> ResponseCap {
+        SCRIPTED.response_cap(job)
+    }
+
+    async fn produce(
+        &self,
+        job: &Job,
+        lease: WorkLease,
+        sink: ResponseSink<Probe>,
+    ) -> Result<Responded, ServeEnd> {
+        SCRIPTED.produce(job, lease, sink).await
+    }
+
+    fn local_failure(&self, job: &Job, sent: SinkProgress) -> Probe {
+        SCRIPTED.local_failure(job, sent)
+    }
+
+    fn observe_lease(&self, _job: &Job) -> Option<ReleaseReport> {
+        let held = self.capacity.node_execution_held();
+        self.log.lock().unwrap().push(("acquired", held));
+        let (capacity, log) = (self.capacity.clone(), self.log.clone());
+        Some(ReleaseReport::new(move || {
+            let held = capacity.node_execution_held();
+            log.lock().unwrap().push(("released", held));
+        }))
+    }
+}
+
+/// A [`Leased`] session and its log.
+fn leased(
+    capacity: &ServeCapacity,
+) -> (
+    Session<Leased>,
+    Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+) {
+    let log = Arc::default();
+    let (send, output) = framed_channel(64);
+    let cancel = CancellationToken::new();
+    let serve = capacity.session_with_order(
+        OutputOrder::Admission,
+        Arc::new(Leased {
+            capacity: capacity.clone(),
+            log: Arc::clone(&log),
+        }),
+        &peer(1),
+        4,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    (
+        Session {
+            serve,
+            output,
+            cancel,
+        },
+        log,
+    )
+}
+
+/// Dispatch reports each lease right after it takes the slots, before it can
+/// take the next request's slots, and each release reports once both slots
+/// returned. Two queued requests let dispatch take both requests' slots
+/// before either task first runs.
+#[tokio::test]
+async fn each_lease_reports_while_it_holds_its_slots() {
+    let capacity = capacity(LIMITS);
+    let gate = Arc::new(Semaphore::new(0));
+    let (mut session, log) = leased(&capacity);
+    let logged = || log.lock().unwrap().clone();
+    session.serve.admit(gated(&gate)).unwrap();
+    session.serve.admit(gated(&gate)).unwrap();
+    settle().await;
+    assert_eq!(logged(), [("acquired", 1), ("acquired", 2)]);
+    gate.add_permits(2);
+    for _ in 0..2 {
+        assert_eq!(next(&mut session.output).await, Probe::Done(0));
+    }
+    settle().await;
+    assert_eq!(
+        logged(),
+        [
+            ("acquired", 1),
+            ("acquired", 2),
+            ("released", 1),
+            ("released", 0)
+        ]
+    );
+}
+
+/// A lease clone that `produce` leaves running keeps the slots, so the
+/// release reports only once that clone drops.
+#[tokio::test]
+async fn a_leaked_lease_clone_delays_the_release_report() {
+    let capacity = capacity(LIMITS);
+    let probe = ExecutionProbe::new(true, false);
+    let _release = probe.release_on_drop();
+    let (mut session, log) = leased(&capacity);
+    let logged = || log.lock().unwrap().clone();
+    session
+        .serve
+        .admit(Job {
+            blocking: Some(probe.clone()),
+            detach_blocking: true,
+            ..job()
+        })
+        .unwrap();
+    assert_eq!(next(&mut session.output).await, Probe::Done(0));
+    probe.wait_started(1).await;
+    settle().await;
+    assert_eq!(logged(), [("acquired", 1)]);
+    probe.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while logged().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the release reports once the blocking operation ends");
+    assert_eq!(logged(), [("acquired", 1), ("released", 0)]);
 }

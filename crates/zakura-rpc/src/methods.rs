@@ -2040,7 +2040,6 @@ where
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
-        let sync_status = self.gbt.sync_status();
         let read_state = self.read_state.clone();
 
         if let Some(HexData(block_proposal_bytes)) = parameters
@@ -2052,11 +2051,10 @@ where
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
-                sync_status,
+                self.gbt.prepared_candidates(),
                 parameters
                     .as_ref()
-                    .and_then(|params| params.work_id.as_deref())
-                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
+                    .and_then(|params| params.work_id.as_deref()),
             )
             .await;
         }
@@ -2098,7 +2096,7 @@ where
                 //
                 // Optional TODO:
                 // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                check_synced_to_tip(&self.network, latest_chain_tip.clone())?;
                 // TODO: return an error if we have no peers, like `zcashd` does,
                 //       and add a developer config that mines regardless of how many peers we have.
                 // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
@@ -3518,39 +3516,37 @@ where
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
 
-        // Fetch the block referenced by [`hash_or_height`] from the state.
+        // Get the header of the block that [`hash_or_height`] identifies from the state.
         //
         // # Concurrency
         //
         // For consistency, this lookup must be performed first, then all the other lookups must
         // be based on the hash.
-        //
-        // TODO: If this RPC is called a lot, just get the block header, rather than the whole block.
-        let block = match call_service(
-            &mut read_state,
-            zakura_state::ReadRequest::Block(hash_or_height),
-        )
-        .await?
+        let response = match read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
         {
-            zakura_state::ReadResponse::Block(Some(block)) => block,
-            zakura_state::ReadResponse::Block(None) => {
+            Ok(response) => response,
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 return Err("the requested block is not in the main chain")
                     .map_error(server::error::LegacyCode::InvalidParameter);
             }
-            _ => unreachable!("unmatched response to a block request"),
+            Err(error) => return Err(error).map_misc_error(),
+        };
+        let zakura_state::ReadResponse::BlockHeader {
+            header,
+            hash,
+            height,
+            ..
+        } = response
+        else {
+            unreachable!("unmatched response to a block header request")
         };
 
-        let hash = hash_or_height
-            .hash_or_else(|_| Some(block.hash()))
-            .expect("block hash");
-
-        let height = hash_or_height
-            .height_or_else(|_| block.coinbase_height())
-            .expect("verified blocks have a coinbase height");
-
-        let time = u32::try_from(block.header.time.timestamp())
+        let time = u32::try_from(header.time.timestamp())
             .expect("Timestamps of valid blocks always fit into u32.");
 
         let sapling = if network.is_nu_active(consensus::NetworkUpgrade::Sapling, height.into()) {
@@ -3889,31 +3885,34 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block) => block,
-            Err(error) => {
-                tracing::info!(
-                    ?error,
-                    "submit block failed: block bytes could not be deserialized into a structurally valid block"
-                );
-                self.mining_trace.block_submitted(BlockSubmission {
-                    submission: MinedBlockSubmission::FullBlock,
-                    hash: None,
-                    height: None,
-                    result: "rejected",
-                    reason: Some(&error),
-                    elapsed: submitted_at.elapsed(),
-                });
+        let block = match self
+            .gbt
+            .prepared_candidates()
+            .decode_submitted(&block_bytes)
+        {
+            Some(block) => block,
+            None => match block_bytes.zcash_deserialize_into::<Block>() {
+                Ok(block) => Arc::new(block),
+                Err(error) => {
+                    tracing::info!(
+                        ?error,
+                        "submit block failed: block bytes could not be deserialized into a structurally valid block"
+                    );
+                    self.mining_trace.block_submitted(BlockSubmission {
+                        submission: MinedBlockSubmission::FullBlock,
+                        hash: None,
+                        height: None,
+                        result: "rejected",
+                        reason: Some(&error),
+                        elapsed: submitted_at.elapsed(),
+                    });
 
-                return Ok(SubmitBlockErrorResponse::Rejected.into());
-            }
+                    return Ok(SubmitBlockErrorResponse::Rejected.into());
+                }
+            },
         };
-        self.run_mined_block_lifecycle(
-            Arc::new(block),
-            submitted_at,
-            MinedBlockSubmission::FullBlock,
-        )
-        .await
+        self.run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::FullBlock)
+            .await
     }
 
     async fn submit_solution(

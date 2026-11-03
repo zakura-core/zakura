@@ -63,6 +63,11 @@ impl SendStream {
         }
     }
 
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
+    }
+
     /// Writes all of `buf`. Returns once at most [`WRITE_AHEAD_BYTES`] of this
     /// stream's data wait for quinn-proto, which waits on the peer's flow
     /// control and the send window.
@@ -200,6 +205,11 @@ impl RecvStream {
             stopped: false,
             pending: None,
         }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
     }
 
     /// Waits until data is buffered; returns `false` at the end of the stream.

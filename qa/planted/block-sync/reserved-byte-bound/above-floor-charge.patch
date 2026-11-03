@@ -1,0 +1,26 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/admission.rs b/crates/zakura-network/src/zakura/block_sync/admission.rs
+index f04f77e0c..1d77681da 100644
+--- a/crates/zakura-network/src/zakura/block_sync/admission.rs
++++ b/crates/zakura-network/src/zakura/block_sync/admission.rs
+@@ -371,7 +371,7 @@ pub(super) fn admit(
+         )
+     };
+ 
+-    let max_request_bytes = if priority == RequestPriority::Floor {
++    let max_request_bytes = if matches!(priority, RequestPriority::Floor | RequestPriority::AboveFloor) {
+         max_request_bytes.max(1)
+     } else {
+         max_request_bytes
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+index 4d654417a..8f62823c1 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+@@ -1633,7 +1633,7 @@ impl PeerRoutine {
+         if self.budget.try_reserve(reserved_bytes) {
+             return true;
+         }
+-        if priority == RequestPriority::Floor {
++        if matches!(priority, RequestPriority::Floor | RequestPriority::AboveFloor) {
+             // Only a request that starts at the download floor or the next
+             // height gets here. The WorkQueue owns each height once, so at
+             // most two such overdrafts are live, each past the max by at most

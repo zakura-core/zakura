@@ -33,6 +33,9 @@ use crate::zakura::ZakuraPeerId;
 #[derive(Clone, Debug)]
 pub(crate) struct CloseCause {
     reason: Arc<OnceLock<&'static str>>,
+    /// The connection's transport observer, attached before registration.
+    #[cfg(any(test, zakura_sim))]
+    tap: Arc<OnceLock<Arc<super::ConnTap>>>,
 }
 
 impl CloseCause {
@@ -40,12 +43,73 @@ impl CloseCause {
     pub(crate) fn new() -> Self {
         Self {
             reason: Arc::new(OnceLock::new()),
+            #[cfg(any(test, zakura_sim))]
+            tap: Arc::new(OnceLock::new()),
         }
     }
 
     /// Record `reason` if no earlier close cause was recorded.
+    ///
+    /// In test and simulator builds, the call that records the first cause
+    /// reports it as `CloseDecided`.
     pub(crate) fn record(&self, reason: &'static str) {
+        #[cfg(not(any(test, zakura_sim)))]
         let _ = self.reason.set(reason);
+        #[cfg(any(test, zakura_sim))]
+        if self.reason.set(reason).is_ok() {
+            if let Some(tap) = self.tap.get() {
+                tap.decide(Some(reason));
+            }
+        }
+    }
+
+    /// Report this connection's close decision and teardown through `tap`.
+    /// Only the first call attaches one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<super::ConnTap>) {
+        let _ = self.tap.set(tap);
+    }
+
+    /// The connection's transport observer, if one is attached.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn tap(&self) -> Option<&Arc<super::ConnTap>> {
+        self.tap.get()
+    }
+
+    /// Report `CloseDecided` with no cause if none was recorded first. The
+    /// first decision wins, so a cause recorded after this isn't reported.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn cancelled_without_cause(&self) {
+        if let (None, Some(tap)) = (self.reason.get(), self.tap.get()) {
+            tap.decide(None);
+        }
+    }
+
+    /// Decide the close with no cause right when `token` is cancelled, by a
+    /// direct cancel or a parent's, unless a cause was recorded first. The
+    /// simulator token's hook runs inside that cancel and adds no scheduling
+    /// point. The test build's token is tokio's, which has no hook.
+    #[cfg(zakura_sim)]
+    pub(crate) fn decide_when_cancelled(&self, token: &zakura_rt::sync::CancellationToken) {
+        let cause = self.clone();
+        token.on_cancel(move || cause.cancelled_without_cause());
+    }
+
+    /// Report `TornDown`, once the connection's workers drained and its peer
+    /// was unregistered. A drain that timed out doesn't call it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn torn_down(&self) {
+        if let Some(tap) = self.tap.get() {
+            tap.emit(super::TransportEvent::TornDown {
+                conn_id: tap.conn_id(),
+            });
+        }
+    }
+
+    /// Return the recorded reason, or `None` when no local path recorded one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn get(&self) -> Option<&'static str> {
+        self.reason.get().copied()
     }
 
     /// Return the recorded reason, or `default` when no local path recorded one.

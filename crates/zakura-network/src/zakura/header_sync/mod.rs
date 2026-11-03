@@ -18,7 +18,7 @@ mod scheduler;
 mod service;
 #[cfg(test)]
 mod tests;
-pub(crate) mod v9;
+pub mod v9;
 mod wire;
 
 pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};

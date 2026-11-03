@@ -345,7 +345,8 @@ impl NodeResources {
     ///
     /// This only observes. It never refuses an owner, because a stuck worker that
     /// outlived its drain timeout already holds what it holds. Connections call it
-    /// when they start and end, so it reports no byte gauges.
+    /// when they start and end. The endpoint's usage timer sets the byte gauges
+    /// with [`NodeUsage::record`].
     pub(crate) fn report_usage(&self, bound: OwnerBound) -> NodeUsage {
         let usage = self.usage();
         if !bound.admits(&usage.owners) {
@@ -735,6 +736,34 @@ impl NodeUsage {
     #[cfg(test)]
     pub(crate) fn output_bytes(&self) -> u64 {
         self.kinds.iter().map(|kind| kind.output_held).sum()
+    }
+
+    /// Set the held and bound gauges of every kind.
+    #[cfg_attr(zakura_sim, allow(dead_code))]
+    pub(crate) fn record(&self) {
+        let compat = self.compat_response_bytes;
+        // Byte counts stay far below 2^53, so f64 represents them exactly.
+        metrics::gauge!("zakura.p2p.compat_exchange.held_bytes").set(compat as f64);
+        for kind in &self.kinds {
+            let label = kind.kind.to_string();
+            for (gate, held, bound) in [
+                ("raw", kind.raw_held, kind.raw_bound),
+                ("output", kind.output_held, kind.output_bound),
+            ] {
+                metrics::gauge!(
+                    "zakura.p2p.gate.held_bytes",
+                    "kind" => label.clone(),
+                    "gate" => gate,
+                )
+                .set(held as f64);
+                metrics::gauge!(
+                    "zakura.p2p.gate.bound_bytes",
+                    "kind" => label.clone(),
+                    "gate" => gate,
+                )
+                .set(bound as f64);
+            }
+        }
     }
 }
 

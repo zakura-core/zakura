@@ -206,6 +206,10 @@ const STREAM_PRELUDE_REQUEST_ID_FLAG_OFFSET: usize = STREAM_PRELUDE_FIXED_BYTES 
 const STREAM_PRELUDE_REQUEST_ID_BYTES: usize = 8;
 const STREAM_PRELUDE_CAP_BYTES: usize = 4;
 const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often the endpoint reports each stream kind's held and gated bytes.
+#[cfg(not(zakura_sim))]
+const TRANSPORT_USAGE_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
@@ -4817,6 +4821,27 @@ async fn spawn_zakura_endpoint_inner(
                             break;
                         }
                     }
+                }
+            }
+        });
+        endpoint.push_header_sync_task(task).await;
+    }
+
+    // Report each stream kind's held and gated bytes. The report reads one
+    // semaphore per gate on a timer, so frames do no extra work. The simulator
+    // keeps its schedule free of this timer.
+    #[cfg(not(zakura_sim))]
+    {
+        let shutdown = endpoint.background_shutdown_token();
+        let resources = endpoint.handler.resources.clone();
+        let task = spawn_erased_named("transport_usage_report", async move {
+            let mut ticks = zakura_rt::time::interval(TRANSPORT_USAGE_REPORT_INTERVAL);
+            ticks.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
+            loop {
+                zakura_rt::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = ticks.tick() => resources.usage().record(),
                 }
             }
         });

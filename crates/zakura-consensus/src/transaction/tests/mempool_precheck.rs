@@ -162,8 +162,10 @@ fn state_timeout_does_not_dispatch_proofs() {
             .await;
         verification.await.unwrap_err()
     });
-    assert!(
-        matches!(error, TransactionError::InternalDowncastError(message) if message.contains("Elapsed"))
+    let expected = TransactionError::from(BoxError::from(tower::timeout::error::Elapsed::new()));
+    assert_eq!(
+        error, expected,
+        "preserve the state service timeout conversion"
     );
     assert_eq!(
         zakura_test::MULTI_THREADED_RUNTIME.block_on(async { proof_calls(&tx, upgrade) }),

@@ -776,23 +776,36 @@ pub(crate) fn recover(db: &Connection, path: &Path) -> Result<()> {
 }
 
 pub(crate) fn prune(db: &Connection, path: &Path, mut bytes: u64) -> Result<u64> {
-    let files: Vec<(String, i64)> = db
-        .prepare("SELECT id,bytes FROM cpu ORDER BY start_us LIMIT 4096")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    // Capture offsets restart at zero with each node. Evict older runs first,
+    // then their oldest captures, so restarting cannot evict the newest profiles.
+    let runs: Vec<String> = db
+        .prepare("SELECT id FROM runs WHERE EXISTS(SELECT 1 FROM cpu WHERE run=runs.id) ORDER BY utc_ms,id LIMIT 4096")?
+        .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let initial = bytes;
-    for (id, size) in files {
-        if bytes == 0 {
+    let mut remaining = 4096;
+    for run in runs {
+        if bytes == 0 || remaining == 0 {
             break;
         }
-        db.execute("UPDATE cpu SET deleting=1 WHERE id=?", [&id])?;
-        match fs::remove_file(path.join("cpu").join(format!("{id}.zst"))) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        let files: Vec<(String, i64)> = db
+            .prepare("SELECT id,bytes FROM cpu WHERE run=? ORDER BY start_us,id LIMIT ?")?
+            .query_map(params![run, remaining], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, size) in files {
+            if bytes == 0 {
+                break;
+            }
+            db.execute("UPDATE cpu SET deleting=1 WHERE id=?", [&id])?;
+            match fs::remove_file(path.join("cpu").join(format!("{id}.zst"))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            db.execute("DELETE FROM cpu WHERE id=?", [&id])?;
+            bytes = bytes.saturating_sub(u64::try_from(size)?);
+            remaining -= 1;
         }
-        db.execute("DELETE FROM cpu WHERE id=?", [&id])?;
-        bytes = bytes.saturating_sub(u64::try_from(size)?);
     }
     Ok(initial - bytes)
 }

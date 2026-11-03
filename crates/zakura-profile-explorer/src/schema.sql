@@ -59,7 +59,9 @@ CREATE INDEX IF NOT EXISTS cpu_bytes ON cpu(bytes);
 -- Recovery and oldest-first eviction must also avoid loading symbol metadata.
 -- id is already unique. Declaring that here lets SQLite prefer this covering lookup.
 CREATE UNIQUE INDEX IF NOT EXISTS cpu_recovery ON cpu(deleting,id);
-CREATE INDEX IF NOT EXISTS cpu_retention ON cpu(start_us,id,bytes);
+CREATE INDEX IF NOT EXISTS runs_by_age ON runs(utc_ms,id);
+CREATE INDEX IF NOT EXISTS cpu_run_retention ON cpu(run,start_us,id,bytes);
+DROP INDEX IF EXISTS cpu_retention;
 CREATE TABLE IF NOT EXISTS status (
  id INTEGER PRIMARY KEY CHECK(id=1), updated_ms INTEGER NOT NULL,
  errors INTEGER NOT NULL, budget INTEGER NOT NULL, used INTEGER NOT NULL,

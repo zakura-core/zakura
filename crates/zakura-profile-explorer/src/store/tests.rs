@@ -1699,7 +1699,9 @@ fn retained_cpu_recovery_and_eviction_are_indexed() -> Result<()> {
     let db = Connection::open_in_memory()?;
     let schema = include_str!("../schema.sql");
     db.execute_batch(schema)?;
-    db.execute_batch("DROP INDEX cpu_recovery; DROP INDEX cpu_retention")?;
+    db.execute_batch(
+        "DROP INDEX cpu_recovery; DROP INDEX cpu_run_retention; DROP INDEX runs_by_age",
+    )?;
     db.execute(
         "INSERT INTO runs(id,metadata,utc_ms,seen_ms) VALUES(?, '{}', 0, 0)",
         [RUN],
@@ -1721,8 +1723,12 @@ fn retained_cpu_recovery_and_eviction_are_indexed() -> Result<()> {
         ),
         ("DELETE FROM cpu WHERE deleting=1", "INDEX cpu_recovery"),
         (
-            "SELECT id,bytes FROM cpu ORDER BY start_us LIMIT 4096",
-            "COVERING INDEX cpu_retention",
+            "SELECT id,bytes FROM cpu WHERE run='example' ORDER BY start_us,id LIMIT 4096",
+            "COVERING INDEX cpu_run_retention",
+        ),
+        (
+            "SELECT id FROM runs WHERE EXISTS(SELECT 1 FROM cpu WHERE run=runs.id) ORDER BY utc_ms,id LIMIT 4096",
+            "COVERING INDEX runs_by_age",
         ),
     ] {
         let plan = db
@@ -1747,5 +1753,40 @@ fn retained_cpu_recovery_and_eviction_are_indexed() -> Result<()> {
         db.query_row("SELECT count(*) FROM cpu", [], |r| r.get::<_, i64>(0))?,
         1
     );
+    Ok(())
+}
+
+/// A fresh run's small offsets must not outrank captures retained from an older run.
+#[test]
+fn cpu_retention_preserves_new_runs_and_can_drain_multiple_old_runs() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    fs::create_dir_all(temp.path().join("cpu"))?;
+    let db = Connection::open_in_memory()?;
+    db.execute_batch(include_str!("../schema.sql"))?;
+    for (run, utc) in [("empty", 0), ("older", 1), ("old", 2), ("new", 3)] {
+        db.execute(
+            "INSERT INTO runs(id,metadata,utc_ms,seen_ms) VALUES(?, '{}', ?, 0)",
+            params![run, utc],
+        )?;
+    }
+    for (id, run, start) in [
+        ("old_late", "old", 9000),
+        ("new_early", "new", 1),
+        ("old_early", "old", 8000),
+        ("oldest", "older", 10000),
+    ] {
+        db.execute("INSERT INTO cpu(id,run,start_us,end_us,samples,bytes,metadata) VALUES(?,?,?,20000,1,4096,'{}')", params![id,run,start])?;
+        fs::write(
+            temp.path().join("cpu").join(format!("{id}.zst")),
+            b"capture",
+        )?;
+    }
+    assert_eq!(crate::cpu::prune(&db, temp.path(), 8192)?, 8192);
+    assert!(!temp.path().join("cpu/oldest.zst").exists());
+    assert!(!temp.path().join("cpu/old_early.zst").exists());
+    assert!(temp.path().join("cpu/old_late.zst").exists());
+    assert!(temp.path().join("cpu/new_early.zst").exists());
+    assert_eq!(crate::cpu::prune(&db, temp.path(), 4096)?, 4096);
+    assert!(temp.path().join("cpu/new_early.zst").exists());
     Ok(())
 }

@@ -4272,7 +4272,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
                         sync::MIN_CONCURRENCY_LIMIT,
                         Network::Mainnet,
                         max_checkpoint_height,
-                        LegacySyncTrace::new(None, false),
+                        LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
                     );
 
                     downloads.download_and_verify(hash).await.unwrap();

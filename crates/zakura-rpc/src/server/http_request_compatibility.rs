@@ -2,7 +2,7 @@
 //!
 //! These fixes are applied at the HTTP level, before the RPC request is parsed.
 
-use std::future::Future;
+use std::{borrow::Cow, future::Future};
 
 use std::pin::Pin;
 
@@ -10,6 +10,7 @@ use futures::{future, FutureExt};
 use http_body_util::{BodyExt, Limited};
 use hyper::header;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use tower::BoxError;
 use tower::Service;
 
@@ -138,6 +139,12 @@ impl<S> HttpRequestMiddleware<S> {
             .collect()
             .await?
             .to_bytes();
+        if is_canonical_json_rpc_2_call(&bytes) {
+            return Ok((
+                JsonRpcVersion::TwoPointZero,
+                HttpRequest::from_parts(parts, HttpBody::from(bytes)),
+            ));
+        }
         let (version, bytes) =
             if let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(bytes.as_ref()) {
                 let version = request.version();
@@ -154,7 +161,7 @@ impl<S> HttpRequestMiddleware<S> {
             };
         Ok((
             version,
-            HttpRequest::from_parts(parts, HttpBody::from(bytes.as_ref().to_vec())),
+            HttpRequest::from_parts(parts, HttpBody::from(bytes)),
         ))
     }
     /// Maps JSON-2.0 to whatever JSON-RPC version the client is using.
@@ -164,6 +171,10 @@ impl<S> HttpRequestMiddleware<S> {
     ) -> Result<HttpResponse<HttpBody>, BoxError> {
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await?.to_bytes();
+        if matches!(version, JsonRpcVersion::TwoPointZero) {
+            // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
+            return Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes)));
+        }
         let bytes =
             if let Ok(response) = serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref()) {
                 serde_json::to_vec(&response.into_version(version))
@@ -172,10 +183,7 @@ impl<S> HttpRequestMiddleware<S> {
             } else {
                 bytes
             };
-        Ok(HttpResponse::from_parts(
-            parts,
-            HttpBody::from(bytes.as_ref().to_vec()),
-        ))
+        Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes)))
     }
 }
 
@@ -261,6 +269,73 @@ enum JsonRpcVersion {
     Unknown,
 }
 
+/// Returns whether `body` is a JSON-RPC 2.0 call that [`JsonRpcRequest::into_2`] would only
+/// re-encode, so the server can read it as sent.
+///
+/// The server reads a few things differently from their re-encoded form: whitespace inside
+/// positional parameters, duplicate or reordered named parameters, leading whitespace, a `null`
+/// ID (which re-encoding drops) and unknown fields (which re-encoding drops). So this accepts
+/// only a body that starts with `{`, has no other fields, has a non-`null` ID or none, and has
+/// no parameters or positional parameters that re-encode to the same bytes. This avoids
+/// copying and re-encoding large parameters, such as a block's hex in `submitblock`.
+fn is_canonical_json_rpc_2_call(body: &[u8]) -> bool {
+    if body.first() != Some(&b'{') {
+        return false;
+    }
+    let Ok(call) = serde_json::from_slice::<'_, PlainJsonRpc2Call<'_>>(body) else {
+        return false;
+    };
+    let id_is_kept = call.id.is_none_or(|id| {
+        // `RawValue` holds validated JSON, so its first byte tells the value's type.
+        matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9'))
+    });
+    call.jsonrpc == "2.0" && id_is_kept && call.params.is_none_or(is_canonical_array)
+}
+
+/// Returns whether `params` is a JSON array that re-encodes to the same bytes.
+fn is_canonical_array(params: &RawValue) -> bool {
+    let Ok(items) = serde_json::from_str::<'_, Vec<&RawValue>>(params.get()) else {
+        return false;
+    };
+    // A compact array has exactly one byte between neighbouring items and around the ends.
+    let compact_len = 2
+        + items.iter().map(|item| item.get().len()).sum::<usize>()
+        + items.len().saturating_sub(1);
+    compact_len == params.get().len()
+        && items.iter().all(|item| {
+            let item = item.get();
+            // A JSON string can only contain a quote or control character as an escape, so
+            // one without a backslash re-encodes unchanged.
+            (item.starts_with('"') && !item.contains('\\'))
+                || serde_json::from_str::<serde_json::Value>(item)
+                    .and_then(|value| serde_json::to_string(&value))
+                    .is_ok_and(|encoded| encoded == item)
+        })
+}
+
+/// A JSON-RPC 2.0 call with only the standard fields, borrowed from the request body.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlainJsonRpc2Call<'a> {
+    #[serde(borrow)]
+    jsonrpc: Cow<'a, str>,
+    /// Required, so that a call without a method isn't treated as a plain call.
+    #[serde(borrow, rename = "method")]
+    _method: Cow<'a, str>,
+    #[serde(borrow, default)]
+    params: Option<&'a RawValue>,
+    /// `Some` whenever the field is present, including `null`.
+    #[serde(borrow, default, deserialize_with = "present")]
+    id: Option<&'a RawValue>,
+}
+
+/// Deserializes a field that is present, even if it is `null`, as `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<&'de RawValue>, D::Error> {
+    <&RawValue>::deserialize(deserializer).map(Some)
+}
+
 /// A version-agnostic JSON-RPC request.
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRpcRequest {
@@ -326,20 +401,7 @@ impl JsonRpcResponse {
                     .or_else(|| serde_json::value::to_raw_value(&()).ok());
                 self.error = self.error.or(Some(serde_json::Value::Null));
             }
-            JsonRpcVersion::TwoPointZero => {
-                // The server should be returning valid JSON-RPC 2.0 responses. However,
-                // a valid result of `null` can be parsed into `None` by this parser, so
-                // we map the result explicitly to `Null` when there is no error.
-                assert_eq!(self.jsonrpc.as_deref(), Some("2.0"));
-                if self.error.is_none() {
-                    self.result = self
-                        .result
-                        .or_else(|| serde_json::value::to_raw_value(&()).ok());
-                } else {
-                    assert!(self.result.is_none());
-                }
-            }
-            JsonRpcVersion::Unknown => (),
+            JsonRpcVersion::TwoPointZero | JsonRpcVersion::Unknown => (),
         }
         self
     }

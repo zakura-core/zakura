@@ -190,7 +190,7 @@ impl QuicConfig {
         check(
             "receive_window_bytes",
             u64::from(self.receive_window_bytes),
-            u64::from(self.stream_receive_window_bytes),
+            64 * KIB,
             GIB,
         )?;
         check("send_window_bytes", self.send_window_bytes, 64 * KIB, GIB)?;
@@ -484,10 +484,17 @@ mod tests {
         assert_eq!(config.validate().unwrap_err().key, "idle_timeout_secs");
 
         let config = QuicConfig {
-            receive_window_bytes: 1024 * 1024,
+            receive_window_bytes: 32 * 1024,
             ..QuicConfig::default()
         };
         assert_eq!(config.validate().unwrap_err().key, "receive_window_bytes");
+
+        // A handshake window below the stream window is valid (CTRL-6).
+        let config = QuicConfig {
+            receive_window_bytes: 1024 * 1024,
+            ..QuicConfig::default()
+        };
+        assert!(config.validate().is_ok());
 
         let config = QuicConfig {
             retry_threshold: Some(70_000),

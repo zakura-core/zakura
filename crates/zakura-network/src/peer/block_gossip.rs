@@ -474,6 +474,11 @@ impl From<bool> for AdvertOutcome {
 #[error("block advertisement candidates lost authorization")]
 struct RevokedCandidates;
 
+/// A newer block became the tip while the advert waited for a connected peer.
+#[derive(Debug, thiserror::Error)]
+#[error("block advertisement superseded by a newer tip before any peer connected")]
+struct SupersededAdvert;
+
 /// Advertises `hash` to `peers`, paced through their block uploads.
 ///
 /// Configured sidecars are all advertised at once, first. Other peers are advertised to at most
@@ -558,8 +563,9 @@ impl<C: ChainTip + Clone + Send + 'static> tower::Service<Request> for BlockAdve
 impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     /// Advertises the block in `request` to every eligible connected peer.
     ///
-    /// Waits for an authorized connected peer, refreshing candidates after revocation. The
-    /// caller owns the overall deadline and cancellation, including any wait for new peers.
+    /// Waits for an authorized connected peer, refreshing candidates after revocation. Gives up
+    /// if a different block becomes the best tip while it waits. The caller owns the overall
+    /// deadline and cancellation, including any wait for new peers.
     pub(crate) fn advertise(
         &mut self,
         request: Request,
@@ -612,6 +618,17 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                 }
                 // Do not replay the same rejected snapshot or reset the caller's deadline.
                 peers.changed().await.map_err(|_| "peer set stopped")?;
+
+                // While this advert waited for a peer, a newer block may have become the tip.
+                // That block has its own advert, and peers only need the tip, so an older
+                // advert would only make a newly connected peer process stale inventory first.
+                if minimum
+                    .chain_tip()
+                    .best_tip_hash()
+                    .is_some_and(|tip| tip != block.hash)
+                {
+                    return Err(Box::new(SupersededAdvert) as BoxError);
+                }
             }
         }
         .boxed()
@@ -1700,6 +1717,77 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(slots.available_uploads(), 1);
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// Builds an advertiser with no connected peers, whose best tip is `tip`.
+    fn advertiser_without_peers(
+        tip: block::Hash,
+    ) -> (
+        BlockAdvertiser<zakura_chain::chain_tip::mock::MockChainTip>,
+        watch::Sender<Vec<BlockGossipPeer>>,
+        zakura_chain::chain_tip::mock::MockChainTipSender,
+    ) {
+        let (chain_tip, tip_sender) = zakura_chain::chain_tip::mock::MockChainTip::new();
+        tip_sender.send_best_tip_hash(tip);
+        let (published, peers) = watch::channel(Vec::new());
+        let advertiser = BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(1),
+            minimum_peer_version: MinimumPeerVersion::new(
+                chain_tip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+        };
+        (advertiser, published, tip_sender)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_advert_is_dropped_when_a_newer_block_becomes_the_tip() {
+        timeout(Duration::from_secs(1), async {
+            let old = block::Hash([75; 32]);
+            let (advertiser, published, tip_sender) = advertiser_without_peers(old);
+            let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+                advertiser,
+                Request::AdvertiseMinedBlock(old.into()),
+            ));
+            tokio::task::yield_now().await;
+
+            tip_sender.send_best_tip_hash(block::Hash([76; 32]));
+            let (peer, mut receiver) = peer();
+            published.send_replace(vec![peer]);
+
+            let error = broadcast.await.unwrap().unwrap_err();
+            assert!(error.is::<SupersededAdvert>());
+            assert!(
+                receiver.try_recv().is_err(),
+                "the newly connected peer never sees the stale advert"
+            );
+        })
+        .await
+        .expect("the stale advert gives up as soon as a peer connects");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_advert_for_the_current_tip_reaches_the_first_peer() {
+        timeout(Duration::from_secs(1), async {
+            let tip = block::Hash([77; 32]);
+            let (advertiser, published, _tip_sender) = advertiser_without_peers(tip);
+            let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+                advertiser,
+                Request::AdvertiseMinedBlock(tip.into()),
+            ));
+            tokio::task::yield_now().await;
+
+            let (peer, mut receiver) = peer();
+            published.send_replace(vec![peer]);
+            accept(&mut receiver, tip).await;
+            broadcast.abort();
+        })
+        .await
+        .expect("the tip advert reaches the first connected peer");
     }
 
     #[test]

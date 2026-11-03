@@ -54,6 +54,22 @@ use zakura_rt::sync::{
     Notify,
 };
 
+/// Updates an `AtomicU64` with `AcqRel` and `Acquire` orderings, keeping the
+/// value when `f` returns `None`. Rust 1.99 deprecates std's `fetch_update` in
+/// favor of `try_update`, which the 1.97 MSRV lacks. The simulator's atomic has
+/// its own `fetch_update`, so its schedule stays the same.
+pub(crate) trait CheckedUpdate {
+    /// Applies `f` atomically; returns the previous value, or the current one on refusal.
+    fn checked_update(&self, f: impl FnMut(u64) -> Option<u64>) -> Result<u64, u64>;
+}
+
+impl CheckedUpdate for AtomicU64 {
+    #[allow(deprecated)]
+    fn checked_update(&self, f: impl FnMut(u64) -> Option<u64>) -> Result<u64, u64> {
+        self.fetch_update(Ordering::AcqRel, Ordering::Acquire, f)
+    }
+}
+
 #[cfg(any(test, zakura_sim, feature = "test-support"))]
 pub mod model;
 
@@ -212,9 +228,7 @@ impl DecodedBlockPool {
         if self
             .0
             .counted_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-            })
+            .checked_update(|used| used.checked_add(bytes))
             .is_err()
         {
             self.close();
@@ -346,9 +360,7 @@ impl DecodedBlockPool {
         if self
             .0
             .capacity_version
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |version| {
-                version.checked_add(1)
-            })
+            .checked_update(|version| version.checked_add(1))
             .is_err()
         {
             self.0.closed.store(true, Ordering::Release);
@@ -395,7 +407,7 @@ impl DecodedBlockPool {
         }
         self.0
             .pipeline_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .checked_update(|used| {
                 let next = used.checked_add(bytes)?;
                 (next <= limit || admission == Admission::PipelineExempt).then_some(next)
             })
@@ -407,9 +419,7 @@ impl DecodedBlockPool {
         if self
             .0
             .pipeline_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_sub(bytes)
-            })
+            .checked_update(|used| used.checked_sub(bytes))
             .is_err()
         {
             self.close();
@@ -438,17 +448,11 @@ impl DecodedBlockPool {
                     if self
                         .0
                         .counted_bytes
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                            used.checked_add(bytes)
-                        })
+                        .checked_update(|used| used.checked_add(bytes))
                         .is_err()
                     {
                         self.close();
-                        let _ = self.0.reserved.fetch_update(
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            |used| used.checked_sub(1),
-                        );
+                        let _ = self.0.reserved.checked_update(|used| used.checked_sub(1));
                         return Err(AdmissionFailure::Closed);
                     }
                     let charge = Charge {
@@ -495,9 +499,7 @@ impl Drop for Charge {
             .pool
             .0
             .counted_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_sub(self.bytes)
-            })
+            .checked_update(|used| used.checked_sub(self.bytes))
             .is_err()
         {
             self.pool.close();
@@ -507,9 +509,7 @@ impl Drop for Charge {
             .pool
             .0
             .reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_sub(1)
-            })
+            .checked_update(|used| used.checked_sub(1))
             .is_err()
         {
             self.pool.close();
@@ -869,7 +869,7 @@ impl ByteGauge {
     /// past its limit only while another holder exists, so a lone reader finishes.
     fn try_add(&self, held: u64, bytes: u64) -> Result<(), ReadMemoryExhausted> {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .checked_update(|used| {
                 let next = used.checked_add(bytes)?;
                 (next <= self.limit || used == held).then_some(next)
             })
@@ -880,9 +880,7 @@ impl ByteGauge {
     fn release(&self, bytes: u64) {
         let _ = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+            .checked_update(|used| Some(used.saturating_sub(bytes)));
     }
 }
 

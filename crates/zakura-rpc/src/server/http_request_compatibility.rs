@@ -139,7 +139,7 @@ impl<S> HttpRequestMiddleware<S> {
             .collect()
             .await?
             .to_bytes();
-        if is_canonical_json_rpc_2_call(&bytes) {
+        if can_forward_json_rpc_2_call_unchanged(&bytes) {
             return Ok((
                 JsonRpcVersion::TwoPointZero,
                 HttpRequest::from_parts(parts, HttpBody::from(bytes)),
@@ -278,18 +278,25 @@ enum JsonRpcVersion {
 /// only a body that starts with `{`, has no other fields, has a non-`null` ID or none, and has
 /// no parameters or positional parameters that re-encode to the same bytes. This avoids
 /// copying and re-encoding large parameters, such as a block's hex in `submitblock`.
-fn is_canonical_json_rpc_2_call(body: &[u8]) -> bool {
+fn can_forward_json_rpc_2_call_unchanged(body: &[u8]) -> bool {
     if body.first() != Some(&b'{') {
         return false;
     }
+
     let Ok(call) = serde_json::from_slice::<'_, PlainJsonRpc2Call<'_>>(body) else {
         return false;
     };
-    let id_is_kept = call.id.is_none_or(|id| {
-        // `RawValue` holds validated JSON, so its first byte tells the value's type.
+
+    if call.jsonrpc != "2.0" {
+        return false;
+    }
+
+    let id_is_absent_or_string_or_number = call.id.is_none_or(|id| {
+        // RawValue is valid JSON; the first byte distinguishes strings and numbers.
         matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9'))
     });
-    call.jsonrpc == "2.0" && id_is_kept && call.params.is_none_or(is_canonical_array)
+
+    id_is_absent_or_string_or_number && call.params.is_none_or(is_canonical_array)
 }
 
 /// Returns whether `params` is a JSON array that re-encodes to the same bytes.

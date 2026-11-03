@@ -82,7 +82,7 @@ fn replay(data: &[u8], mut after_step: impl FnMut(&mut QueryState, u8)) -> Block
                     diverged: false,
                     start: QueryStart::Work(WorkFacts {
                         first_unclaimed: Some(block::Height(1)),
-                        backlog: 0,
+                        backlog: None,
                         low_water: 5,
                     }),
                 });

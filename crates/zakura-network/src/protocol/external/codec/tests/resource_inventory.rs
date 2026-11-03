@@ -158,9 +158,8 @@ fn unknown_commands_are_ignored_after_their_checksum() {
     bytes.extend_from_slice(&ping);
     let mut codec = full_codec();
     let mut src = BytesMut::from(&bytes[..]);
-    assert!(matches!(codec.decode(&mut src), Ok(None)));
-    assert_eq!(src.len(), ping.len(), "the discarded body left the buffer");
     assert!(matches!(codec.decode(&mut src), Ok(Some(Message::Ping(_)))));
+    assert!(src.is_empty(), "the discarded body left the buffer");
 
     let mut bad = header(UNKNOWN_COMMAND, &[0], 1);
     bad.push(1);
@@ -168,7 +167,7 @@ fn unknown_commands_are_ignored_after_their_checksum() {
     assert!(full_codec().decode(&mut src).is_err());
 }
 
-/// One Bloom command per decode turn's count bound, followed by a ping.
+/// `commands` Bloom commands with `body_len`-byte bodies, then a ping.
 fn bloom_burst(commands: usize, body_len: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     for _ in 0..commands {
@@ -178,65 +177,58 @@ fn bloom_burst(commands: usize, body_len: usize) -> Vec<u8> {
     bytes
 }
 
-/// L.ignored: a burst below the bound stays in one decode turn, so the message after
-/// it arrives without another socket read.
+/// L.ignored and L.unknown: one decode call discards a run of Bloom and unknown
+/// commands and returns the next message. The work is bounded by the buffered bytes,
+/// and no command in the run faults the peer.
 #[test]
-fn a_short_bloom_burst_stays_in_one_turn() {
-    let bytes = bloom_burst(MAX_DISCARDED_COMMANDS_PER_DECODE_TURN - 1, 8);
+fn a_discard_run_ends_at_the_next_message() {
+    let mut bytes = message(UNKNOWN_COMMAND, &[1; 8]);
+    bytes.extend_from_slice(&message(&BLOOM_FILTER_COMMANDS[0], &[1; 8]));
+    bytes.extend_from_slice(&message(UNKNOWN_COMMAND, &[1; 8]));
+    bytes.extend_from_slice(&bloom_burst(1000, 8));
     let mut src = BytesMut::from(&bytes[..]);
     assert!(matches!(
         full_codec().decode(&mut src),
         Ok(Some(Message::Ping(_)))
     ));
+    assert!(src.is_empty());
 }
 
-/// L.ignored: a long burst ends each turn at the count bound. No turn loses a byte or
-/// faults the peer, and the following message survives.
-#[test]
-fn a_long_bloom_burst_pauses_at_the_count_bound() {
-    let bytes = bloom_burst(MAX_DISCARDED_COMMANDS_PER_DECODE_TURN + 1, 8);
-    let one_command = HEADER_LEN + 8;
-    let mut codec = full_codec();
-    let mut src = BytesMut::from(&bytes[..]);
-    let before = src.len();
-    assert!(matches!(codec.decode(&mut src), Ok(None)));
-    assert_eq!(
-        before - src.len(),
-        MAX_DISCARDED_COMMANDS_PER_DECODE_TURN * one_command
+/// L.ignored and L.unknown: discarded commands never leave a complete message waiting
+/// for another socket read. Each peer sends discarded commands and a ping, then goes
+/// quiet, and the reader still yields the ping.
+#[tokio::test(start_paused = true)]
+async fn a_quiet_peer_gets_its_message_after_discarded_commands() {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::FramedRead;
+
+    let ping = message(b"ping\0\0\0\0\0\0\0\0", &7u64.to_le_bytes());
+    let mut unknown_then_ping = message(UNKNOWN_COMMAND, &[1; 8]);
+    unknown_then_ping.extend_from_slice(&ping);
+    let cases = [
+        ("64 Bloom commands", bloom_burst(64, 8)),
+        ("1000 Bloom commands", bloom_burst(1000, 8)),
+        ("2 MiB of Bloom bodies", bloom_burst(64, 32 * 1024)),
+        ("an unknown command", unknown_then_ping),
+    ];
+
+    let mut stalled = Vec::new();
+    for (case, bytes) in cases {
+        let (mut peer, local) = tokio::io::duplex(bytes.len());
+        peer.write_all(&bytes).await.unwrap();
+        let mut reader = FramedRead::new(local, full_codec());
+        // The clock is paused, so the timeout fires as soon as the reader waits.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(60), reader.next()).await;
+        if !matches!(next, Ok(Some(Ok(Message::Ping(_))))) {
+            stalled.push((case, format!("{next:?}")));
+        }
+        drop(peer);
+    }
+    assert!(
+        stalled.is_empty(),
+        "the ping stalled behind discarded commands: {stalled:?}"
     );
-    assert!(matches!(codec.decode(&mut src), Ok(Some(Message::Ping(_)))));
-    assert!(src.is_empty());
-}
-
-/// L.ignored: checksum work also ends a turn. The command that crosses the byte bound
-/// finishes first, so one large legal body always makes progress.
-#[test]
-fn large_bloom_bodies_pause_at_the_byte_bound() {
-    let body_len = MAX_DISCARDED_BYTES_PER_DECODE_TURN / 2;
-    let bytes = bloom_burst(3, body_len);
-    let mut codec = full_codec();
-    let mut src = BytesMut::from(&bytes[..]);
-    let before = src.len();
-    assert!(matches!(codec.decode(&mut src), Ok(None)));
-    assert_eq!(before - src.len(), 2 * (HEADER_LEN + body_len));
-    // The next turn starts a new bound, so the last body stays below it.
-    assert!(matches!(codec.decode(&mut src), Ok(Some(Message::Ping(_)))));
-}
-
-/// L.unknown: one unknown command ends its turn, so a run of them does one checksum
-/// per turn. Neither the run nor a Bloom command before it faults the peer.
-#[test]
-fn each_unknown_command_ends_its_turn() {
-    let mut bytes = message(&BLOOM_FILTER_COMMANDS[0], &[1; 8]);
-    let unknown = message(UNKNOWN_COMMAND, &[1; 8]);
-    bytes.extend_from_slice(&unknown);
-    bytes.extend_from_slice(&unknown);
-    let mut codec = full_codec();
-    let mut src = BytesMut::from(&bytes[..]);
-    assert!(matches!(codec.decode(&mut src), Ok(None)));
-    assert_eq!(src.len(), unknown.len());
-    assert!(matches!(codec.decode(&mut src), Ok(None)));
-    assert!(src.is_empty());
 }
 
 /// L.handshake: a `version` user agent above its limit stops at its length.

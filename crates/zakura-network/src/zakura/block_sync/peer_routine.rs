@@ -1314,12 +1314,8 @@ impl PeerRoutine {
         self.state
             .record_late_body(Instant::now(), self.config.effective_liveness_timeout());
 
-        self.io.send_under_receipt(
-            body,
-            owner,
-            funding,
-            admitted_estimate_bytes,
-        );
+        self.io
+            .send_under_receipt(body, owner, funding, admitted_estimate_bytes);
         true
     }
 
@@ -3894,10 +3890,7 @@ mod tests {
                 matches!(block, BlockHandle::Owned(_)),
                 "the real frame decoder must retain an admitted owner"
             );
-            assert_eq!(
-                block.view().attributed_memory_size_bytes(),
-                pool.reserved_bytes()
-            );
+            assert_eq!(block.attributed_memory_size_bytes(), pool.reserved_bytes());
             let retained = block.transaction(0).unwrap();
             let hash = retained.hash();
             drop(block);
@@ -3981,7 +3974,7 @@ mod tests {
                 .body
                 .decoded_block(&pool, Admission::PipelineExempt)
                 .unwrap();
-            assert_eq!(block.view().attributed_memory_size_bytes(), bytes);
+            assert_eq!(block.attributed_memory_size_bytes(), bytes);
             assert_eq!(pool.pipeline_bytes(), bytes);
         }
     }

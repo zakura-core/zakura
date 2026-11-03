@@ -898,15 +898,20 @@ impl Harness {
         if self.model.cached_deferred {
             // The views hide this deadline: the model bounds a deferred pass's
             // refill rather than predicting it.
+            // Messages carry virtual milliseconds, never absolute instants,
+            // so a saved failure gives the same message in a new process.
+            let millis = |at: Option<Instant>| at.map(|at| self.millis(at));
             let next = self.state.next_deadline();
             assert!(
                 next.is_some_and(|next| next <= self.now + CACHED_PASS_REFILL),
                 "{PROPERTY}"
             );
             assert_eq!(
-                next,
-                self.model_deadline()
-                    .map_or(next, |deadline| next.min(Some(deadline))),
+                millis(next),
+                millis(
+                    self.model_deadline()
+                        .map_or(next, |deadline| next.min(Some(deadline)))
+                ),
                 "{PROPERTY}"
             );
         }

@@ -15,7 +15,7 @@ use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use semver::Version;
 
 use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
-use zakura_node_services::block_memory::{DecodedBlockPool, DecodedPayloadPool, ReadMemoryBudget};
+use zakura_node_services::block_memory::{DecodedBlockPool, ReadMemoryBudget};
 
 use crate::{
     config::database_format_version_on_disk,
@@ -69,6 +69,9 @@ pub mod arbitrary;
 /// Wrapper struct to ensure high-level `zakura-state` database access goes through the correct API.
 ///
 /// Admission and memory limits for reads. Clones share every limit.
+///
+/// Worker slots bound transient parser memory: each worker reads one result at a time.
+/// One retained-byte budget bounds every result that leaves its worker.
 #[derive(Clone, Debug)]
 struct ReadCapacity {
     /// Shared admission for blocking read-service jobs, including cancelled waiters' jobs.
@@ -77,20 +80,11 @@ struct ReadCapacity {
     /// Admission reserved for bounded chain-tip and depth queries.
     control_workers: crate::request::ReadWorkerPool,
 
-    /// Parser and retained-result byte limits for variable-size disk reads.
+    /// Retained bytes of disk results until their final holders drop them.
     memory: ReadMemoryBudget,
 
-    /// Disk block decoding and final-holder admission.
+    /// Disk blocks' final-holder ownership. Its count never refuses: `memory` bounds it.
     blocks: DecodedBlockPool,
-
-    /// Standalone decoded headers.
-    headers: DecodedPayloadPool,
-
-    /// Serialized block copies.
-    raw_blocks: DecodedPayloadPool,
-
-    /// Standalone decoded transactions from lookups and iterators.
-    transactions: DecodedPayloadPool,
 
     /// Chain-tip publication cannot spend ordinary callers' result capacity.
     chain_tip_blocks: DecodedBlockPool,
@@ -99,22 +93,14 @@ struct ReadCapacity {
 impl ReadCapacity {
     fn new(config: &Config) -> Self {
         Self {
-            workers: crate::request::ReadWorkerPool::new(
-                usize::from(config.read_concurrency_limit.get()),
-                usize::from(config.read_waiter_limit.get()),
-            ),
+            workers: crate::request::ReadWorkerPool::new(usize::from(
+                config.read_concurrency_limit.get(),
+            )),
             control_workers: crate::request::ReadWorkerPool::new(
                 crate::constants::CONTROL_READ_CONCURRENCY,
-                crate::constants::CONTROL_READ_WAITERS,
             ),
-            memory: ReadMemoryBudget::new(
-                config.read_parser_byte_limit,
-                config.read_result_byte_limit,
-            ),
-            blocks: DecodedBlockPool::for_block_count(config.read_block_limit.into()),
-            headers: DecodedPayloadPool::new(config.read_header_limit),
-            raw_blocks: DecodedPayloadPool::new(config.read_raw_block_limit),
-            transactions: DecodedPayloadPool::new(config.read_transaction_limit),
+            memory: ReadMemoryBudget::new(config.read_result_byte_limit()),
+            blocks: DecodedBlockPool::for_block_count(std::num::NonZeroU64::MAX),
             chain_tip_blocks: DecodedBlockPool::for_block_count(
                 std::num::NonZeroU64::new(crate::constants::CHAIN_TIP_BLOCK_RETENTION)
                     .expect("chain-tip retention has a nonzero fixed allowance"),
@@ -509,21 +495,14 @@ impl ZakuraDb {
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
                 if disk_version >= self.db.format_version_in_code() {
-                    let result = DbFormatChange::check_new_blocks(self).run_format_change_or_check(
-                        self,
-                        // The initial tip height is not used by the new blocks format check.
-                        None,
-                        &never_cancel_receiver,
-                    );
-                    match result {
-                        Err(error) if error.is_read_capacity_exhausted() => {
-                            tracing::warn!(
-                                ?error,
-                                "final database format check incomplete: live results hold read capacity"
-                            );
-                        }
-                        result => result.expect("final database format check must succeed"),
-                    }
+                    DbFormatChange::check_new_blocks(self)
+                        .run_format_change_or_check(
+                            self,
+                            // The initial tip height is not used by the new blocks format check.
+                            None,
+                            &never_cancel_receiver,
+                        )
+                        .expect("cancel handle is never used");
                 }
             }
         }

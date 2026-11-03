@@ -88,6 +88,18 @@ pub(super) enum CloseReason {
     ExchangeTimedOut,
 }
 
+/// A session's request to close its discovery-only connection.
+///
+/// Another service can gain the connection before IO closes it. IO then keeps
+/// the connection open and charges `if_kept`, as a session that leaves its
+/// connection open is charged. When IO closes the connection, it retires the
+/// session's record instead, so the connection reopens no session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct Close {
+    pub(super) reason: CloseReason,
+    pub(super) if_kept: Option<SessionCharge>,
+}
+
 /// The operation IO runs next.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum PeerOutput {
@@ -110,8 +122,8 @@ pub(super) enum PeerOutput {
     WaitForAnswers { deadline: Duration },
     /// Mark the peer's exchange as short-lived.
     MarkShortLived,
-    /// End the session, and close its connection if `close` names a reason.
-    End { close: Option<CloseReason> },
+    /// End the session, and close its connection if `close` asks to.
+    End { close: Option<Close> },
 }
 
 /// The outcome of the last [`PeerOutput`].
@@ -284,17 +296,18 @@ impl PeerState {
             (Phase::MarkingShortLived, PeerInput::ShortLivedMarked) => {
                 self.phase = Phase::Ended;
                 // The close's answer wait can finish a timed-out exchange.
-                let close = if self.progress.complete() {
+                let reason = if self.progress.complete() {
                     CloseReason::ExchangeComplete
                 } else {
                     CloseReason::ExchangeTimedOut
                 };
                 // A retired session is never charged, so a timed-out exchange
-                // that closes its connection settles here.
-                PeerStep::new(
-                    Some(SessionCharge::Retire),
-                    PeerOutput::End { close: Some(close) },
-                )
+                // that closes its connection settles at the close.
+                let close = Close {
+                    reason,
+                    if_kept: self.open_charge(),
+                };
+                PeerStep::then(PeerOutput::End { close: Some(close) })
             }
             (phase, input) => {
                 unreachable!(
@@ -318,13 +331,17 @@ impl PeerState {
     /// bound.
     fn release(&mut self) -> PeerStep {
         self.phase = Phase::Ended;
-        let charge = self.timed_out.then(|| {
+        PeerStep::new(self.open_charge(), PeerOutput::End { close: None })
+    }
+
+    /// The charge for a session that leaves its connection open.
+    fn open_charge(&self) -> Option<SessionCharge> {
+        self.timed_out.then(|| {
             if self.progress.complete() {
                 SessionCharge::Succeed
             } else {
                 SessionCharge::Fail
             }
-        });
-        PeerStep::new(charge, PeerOutput::End { close: None })
+        })
     }
 }

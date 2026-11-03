@@ -36,7 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use zakura_node_services::block_memory::TransactionHandle;
+use zakura_node_services::block_memory::{is_read_capacity_refusal, TransactionHandle};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -2629,18 +2629,28 @@ where
             .clone()
             .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
             .await
-            .map_err(|_| "block height not in best chain")
-            .map_error(
-                // ## Compatibility with `zcashd`.
-                //
-                // Since this function is reused by getblock(), we return the errors
-                // expected by it (they differ whether a hash or a height was passed).
-                if hash_or_height.hash().is_some() {
-                    server::error::LegacyCode::InvalidAddressOrKey
+            .map_err(|error| {
+                if is_read_capacity_refusal(&*error) {
+                    // A capacity refusal says nothing about the block, so the caller can retry.
+                    ErrorObject::new(
+                        server::error::LegacyCode::OutOfMemory,
+                        "state read capacity is temporarily exhausted, retry later",
+                    )
                 } else {
-                    server::error::LegacyCode::InvalidParameter
-                },
-            )?
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    ErrorObject::new(
+                        if hash_or_height.hash().is_some() {
+                            server::error::LegacyCode::InvalidAddressOrKey
+                        } else {
+                            server::error::LegacyCode::InvalidParameter
+                        },
+                        "block height not in best chain",
+                    )
+                }
+            })?
         else {
             panic!("unexpected response to BlockHeader request")
         };

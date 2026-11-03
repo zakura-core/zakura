@@ -910,34 +910,41 @@ impl HeaderSyncReactor {
             status,
         };
         let work_order = target.claimed_work_order(local);
-        let decision = decide_offer(OfferFacts {
-            pruned_pause: self.state.pruned_pause_holds(
-                &peer,
-                local.frontiers.header_best,
-                Instant::now(),
-            ),
-            covered: self.state.completed_targets.contains(
-                local.header_generation,
-                zakura_header_chain::BranchId::new(local.frontiers.finalized.hash, target_tip_hash),
-            ),
-            eligible: target.is_discovery_eligible(local)
-                && self.negotiated_response_limits(&target.status).1 != 0,
-            work: self
-                .peer_work_queue
-                .active(&peer)
-                .map_or(OfferedPeerWork::Idle, |active| {
-                    if matches!(active.purpose, HeaderTargetPurpose::Normal)
-                        && active.target.status.selected_tip_hash == target_tip_hash
-                    {
-                        OfferedPeerWork::SameOrdinaryTarget
-                    } else {
-                        OfferedPeerWork::Other
-                    }
-                }),
-            held_back: self.ordinary_discovery_paused()
-                || self.ordinary_headroom(&peer, &target.status) == 0,
-            subscription_ready: self.subscription_ready(&peer, target_tip_hash),
-        });
+        let decision = decide_offer(
+            OfferFacts {
+                pruned_pause: self.state.pruned_pause_holds(
+                    &peer,
+                    local.frontiers.header_best,
+                    Instant::now(),
+                ),
+                covered: self.state.completed_targets.contains(
+                    local.header_generation,
+                    zakura_header_chain::BranchId::new(
+                        local.frontiers.finalized.hash,
+                        target_tip_hash,
+                    ),
+                ),
+                eligible: target.is_discovery_eligible(local)
+                    && self.negotiated_response_limits(&target.status).1 != 0,
+                work: self
+                    .peer_work_queue
+                    .active(&peer)
+                    .map_or(OfferedPeerWork::Idle, |active| {
+                        if matches!(active.purpose, HeaderTargetPurpose::Normal)
+                            && active.target.status.selected_tip_hash == target_tip_hash
+                        {
+                            OfferedPeerWork::SameOrdinaryTarget
+                        } else {
+                            OfferedPeerWork::Other
+                        }
+                    }),
+            },
+            || {
+                self.ordinary_discovery_paused()
+                    || self.ordinary_headroom(&peer, &target.status) == 0
+            },
+            || self.subscription_ready(&peer, target_tip_hash),
+        );
         match decision {
             OfferDecision::Spend {
                 cause,

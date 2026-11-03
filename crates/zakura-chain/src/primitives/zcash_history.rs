@@ -40,12 +40,11 @@ pub struct HistoryTreeBlockParts<'a> {
 impl<'a> HistoryTreeBlockParts<'a> {
     /// Build history tree parts from a full block and its note commitment roots.
     pub fn from_block(
-        block: impl Into<crate::block::BlockView<'a>>,
+        block: &'a crate::block::BlockRef,
         sapling_root: &'a sapling::tree::Root,
         orchard_root: &'a orchard::tree::Root,
         ironwood_root: &'a ironwood::tree::Root,
     ) -> Self {
-        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("block must have coinbase height during contextual verification");

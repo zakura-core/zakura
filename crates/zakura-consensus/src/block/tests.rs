@@ -1086,7 +1086,7 @@ async fn cancelled_block_verification_keeps_downstream_payloads_charged() {
 
 #[test]
 fn owned_block_view_preserves_consensus_checks_and_charge() -> Result<(), Report> {
-    use zakura_chain::block::BlockView;
+    use zakura_chain::block::BlockRef;
     use zakura_chain::serialization::ZcashSerialize;
     use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
@@ -1101,7 +1101,7 @@ fn owned_block_view_preserves_consensus_checks_and_charge() -> Result<(), Report
     let bytes = block.attributed_memory_size_bytes();
     let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
-    let view = BlockView::from(&owner);
+    let view: &BlockRef = &owner;
     let coinbase = check::coinbase_is_first(&owner)?;
     let retained = owner.transaction(0).unwrap();
     assert!(std::ptr::eq(coinbase, &*retained));

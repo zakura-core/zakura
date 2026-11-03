@@ -1,13 +1,14 @@
 --- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
 +++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
-@@ -569,9 +569,7 @@
-         hash: transaction::Hash,
-     ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, PayloadAdmissionFailure> {
-         let mut location_and_time = None;
--        let transaction = self
--            .read_capacity
--            .transactions
-+        let transaction = zakura_node_services::block_memory::DecodedPayloadPool::new(self.config.read_transaction_limit)
-             .try_decode_bounded::<Transaction>(&self.read_capacity.memory, |scope| {
-                 scope.try_charge(MAX_BLOCK_BYTES)?;
-                 let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+@@ -578,7 +578,10 @@ impl ZakuraDb {
+         let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
+             return Ok(None);
+         };
+-        let transaction = self.decode_transaction(&raw)?;
++        let transaction: TransactionHandle = zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
++            .try_reserve(0)?
++            .retain(Transaction::from_bytes(raw.raw_bytes()))?
++            .into();
+         Ok(Some((transaction, location.height, header.time)))
+     }
+ 

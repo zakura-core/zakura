@@ -304,7 +304,6 @@ impl AuditHistoricalTreestatesCmd {
 
         let print_samples = self.print_samples;
         let mut samples: Vec<DerivationSample> = Vec::with_capacity(total);
-        let mut sample_error = None;
         let mut report = |sample: &DerivationSample| {
             let completed = samples.len() + 1;
             if print_samples {
@@ -315,13 +314,7 @@ impl AuditHistoricalTreestatesCmd {
                     sample.height.0 + 1
                         - sample.replayed_blocks.min(u64::from(sample.height.0) + 1) as u32,
                 );
-                let inputs = match zakura_state::replay_inputs(db, from, sample.height) {
-                    Ok(inputs) => inputs,
-                    Err(error) => {
-                        sample_error.get_or_insert((sample.height, error));
-                        return;
-                    }
-                };
+                let inputs = zakura_state::replay_inputs(db, from, sample.height);
                 println!(
                     "SAMPLE {} {} {} {} {}",
                     sample.height.0,
@@ -372,12 +365,6 @@ impl AuditHistoricalTreestatesCmd {
             zakura_state::measure_derivations(db, &cache, heights, AUDIT_REPLAY_BLOCKS, &mut report)
         };
 
-        if let Some((height, error)) = sample_error {
-            return Err(eyre!(
-                "replay sample failed at height {}: {error}",
-                height.0
-            ));
-        }
         print_walk_summary(&samples);
 
         result.map_err(|(height, error)| eyre!("derivation failed at height {}: {error}", height.0))

@@ -3856,23 +3856,25 @@ mod tests {
         Ok(())
     }
 
-    /// A header read from state keeps its read slot until its response is encoded,
+    /// A header read from state keeps its read charge until its response is encoded,
     /// and it has the same wire form as a counted header.
     #[test]
     fn a_retained_header_response_holds_its_slot_through_encoding() -> Result<(), BoxError> {
-        use zakura_node_services::block_memory::{DecodedPayloadPool, HeaderHandle};
+        use zakura_node_services::block_memory::{HeaderHandle, ReadMemoryBudget};
 
         let block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
-        let pool = DecodedPayloadPool::new(std::num::NonZeroU16::MIN);
+        let pool = ReadMemoryBudget::new(std::num::NonZeroU64::MAX);
         let header = pool
-            .try_decode(|| Some(*block.header))?
-            .expect("the decoder returned a header");
+            .try_reserve(
+                zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*block.header),
+            )?
+            .retain(*block.header)?;
         let response = Response::BlockHeaders(vec![HeaderHandle::from(header)]);
-        assert_eq!(pool.available_slots(), 0);
+        assert!(pool.retained_bytes() > 0);
 
         let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
         let frames = LegacyResponseCodec::encode_response(5, response, cap, cap)?;
-        assert_eq!(pool.available_slots(), 1, "encoding ends the read result");
+        assert_eq!(pool.retained_bytes(), 0, "encoding ends the read result");
 
         let counted = block::CountedHeader {
             header: block.header.clone(),

@@ -12,7 +12,7 @@ use state::{
     admission_decision, block_sync_frontiers, body_completion_authority,
     empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
     AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply, QueryOpening,
-    QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts,
+    QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts, WorkReads,
 };
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased_named;
@@ -1385,7 +1385,10 @@ impl ReactorIO {
         let start = match opening {
             QueryOpening::Closed => return,
             QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
-            QueryOpening::NeedsWork => QueryStart::Work(self.query_work_facts()),
+            QueryOpening::NeedsWork => match self.query_work_facts(force) {
+                Some(facts) => QueryStart::Work(facts),
+                None => return,
+            },
         };
         let proposal = match self.state.propose_query(force, start) {
             QueryPlan::Idle | QueryPlan::Covered => return,
@@ -1419,16 +1422,23 @@ impl ReactorIO {
         }
     }
 
-    /// Read the shared-owner facts an ordinary refill query needs.
-    fn query_work_facts(&self) -> WorkFacts {
-        WorkFacts {
-            first_unclaimed: self
-                .resources
-                .work_queue
-                .first_unclaimed_above(self.state.progress.request_floor),
-            backlog: self.local_body_work_blocks(),
+    /// Read the shared-owner facts an ordinary refill query needs, in stages:
+    /// an idle refill stops after the first unclaimed height, and a forced one
+    /// skips the backlog. `None` means the refill is idle.
+    fn query_work_facts(&self, force: bool) -> Option<WorkFacts> {
+        let first_unclaimed = self
+            .resources
+            .work_queue
+            .first_unclaimed_above(self.state.progress.request_floor);
+        let backlog = match self.state.work_reads(force, first_unclaimed) {
+            WorkReads::Idle => return None,
+            WorkReads::Facts { backlog } => backlog.then(|| self.local_body_work_blocks()),
+        };
+        Some(WorkFacts {
+            first_unclaimed,
+            backlog,
             low_water: self.refill_low_water_blocks(),
-        }
+        })
     }
 
     /// Judges a body completion against the latest committed view, and returns

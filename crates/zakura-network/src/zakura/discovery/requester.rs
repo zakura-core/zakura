@@ -493,7 +493,20 @@ impl Queries {
         let Some(kind) = QueryKind::answered_by(message_type) else {
             return Ok(None);
         };
-        let live = &mut *self.lock();
+        self.claim_locked(&mut self.lock(), kind, message_type, payload_len)
+            .map(Some)
+    }
+
+    /// [`Self::claim`] of a `kind` answer, with the live queries already
+    /// locked. The claim takes the queued frame and counts its answer under
+    /// this one lock.
+    fn claim_locked(
+        &self,
+        live: &mut LiveQueries,
+        kind: QueryKind,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<ClaimedAnswer, ClaimRefused> {
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
@@ -504,11 +517,11 @@ impl Queries {
             .state
             .claim(kind, payload_len)
             .expect("every live reservation records its live query")?;
-        Ok(Some(ClaimedAnswer {
+        Ok(ClaimedAnswer {
             admitted,
             _entry: entry,
             _settling: SettlingHold::new(Held::Answer(kind), &self.settling),
-        }))
+        })
     }
 
     /// Counts one `Hello` in verification until the returned hold drops.
@@ -524,12 +537,18 @@ impl Queries {
     pub(super) async fn answers_settled(&self) {
         let mut settling = self.settling.subscribe();
         loop {
-            // The sender lives in `self`, so the waits cannot fail.
-            let _ = settling.wait_for(|settling| settling.is_empty()).await;
-            if !self.lock().reservations.has_queued() {
+            let settled = {
+                let live = self.lock();
+                // A claim takes the queued frame and counts its answer under
+                // this lock, so the two reads see one ledger.
+                settling.borrow_and_update().is_empty() && !live.reservations.has_queued()
+            };
+            if settled {
                 return;
             }
-            // The reader's claim of the queued frame changes the count.
+            // The sender lives in `self`, so the wait cannot fail. A
+            // settlement or the reader's claim of the queued frame changes
+            // the count.
             let _ = settling.changed().await;
         }
     }

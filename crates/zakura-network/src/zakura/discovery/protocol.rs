@@ -1633,9 +1633,9 @@ impl ZakuraDiscoveryHandle {
         {
             let state = self.inner.lock().await;
             for record in batch {
-                match state.stored_evidence(&record) {
-                    Some(stored) => authentic.push(stored),
-                    None => unverified.push(record),
+                match state.stored_evidence(record) {
+                    Ok(stored) => authentic.push(stored),
+                    Err(record) => unverified.push(record),
                 }
             }
         }
@@ -1809,12 +1809,15 @@ impl ZakuraDiscoveryHandle {
         &self,
         record: ZakuraNodeRecord,
     ) -> Result<VerifiedHold<VerifiedRecord>, DiscoveryBookError> {
-        if let Some(stored) = self.inner.lock().await.stored_evidence(&record) {
-            return Ok(VerifiedHold {
-                result: stored,
-                slot: None,
-            });
-        }
+        let record = match self.inner.lock().await.stored_evidence(record) {
+            Ok(stored) => {
+                return Ok(VerifiedHold {
+                    result: stored,
+                    slot: None,
+                })
+            }
+            Err(record) => record,
+        };
         let VerifiedHold { result, slot } = self
             .verify_off_lock(move |context| VerifiedRecord::verify(record, context))
             .await
@@ -7642,6 +7645,28 @@ mod tests {
         .expect("an identical record needs no verification slot")
         .expect("an authentic record imports");
         assert_eq!(outcome.metadata_updated, 1);
+    }
+
+    /// The stored evidence wraps the incoming record itself, and a changed
+    /// record comes back intact for verification.
+    #[tokio::test]
+    async fn stored_evidence_takes_the_incoming_record() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let secret = secret_key();
+        let stored = runtime_record_with_secret(&secret, 1, service(1), test_addr(1));
+        let newer = runtime_record_with_secret(&secret, 2, service(1), test_addr(1));
+        handle
+            .import_peer_records([stored.clone()], None)
+            .await
+            .expect("an authentic record imports");
+
+        let state = handle.inner.lock().await;
+        assert_eq!(
+            state.stored_evidence(stored.clone()).as_deref(),
+            Ok(&stored)
+        );
+        assert_eq!(state.stored_evidence(newer.clone()).err(), Some(newer));
     }
 
     /// Recounts each relay's third-party entries from the book.

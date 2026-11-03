@@ -7,7 +7,7 @@ use std::{
 use blake2b_simd::Params;
 use chrono::{DateTime, Utc};
 use zakura_chain::{
-    block::{BlockView, Header},
+    block::{BlockRef, Header},
     parameters::Network,
     serialization::{CompactSizeMessage, ZcashSerialize},
     work::equihash::Solution,
@@ -31,8 +31,7 @@ pub(super) struct CandidateId([u8; 32]);
 
 impl CandidateId {
     /// Blake2b-256 of `block` with the header fields a solution sets normalized to fixed values.
-    pub(super) fn of<'a>(block: impl Into<BlockView<'a>>, network: &Network) -> Self {
-        let block = block.into();
+    pub(super) fn of(block: &BlockRef, network: &Network) -> Self {
         let mut header: Header = *block.header();
         header.time =
             DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is a valid UTC timestamp");
@@ -136,9 +135,9 @@ impl PreparedCandidateCache {
     }
 
     /// Returns the prepared verification for `block`'s content, if some source prepared it.
-    pub(super) fn lookup<'a>(
+    pub(super) fn lookup(
         &self,
-        block: impl Into<zakura_chain::block::BlockView<'a>>,
+        block: &zakura_chain::block::BlockRef,
         network: &Network,
     ) -> Option<CacheHit> {
         // Deriving the candidate id costs a full block serialization, so skip it when the cache
@@ -168,9 +167,9 @@ impl PreparedCandidateCache {
     }
 
     /// Reuses and refreshes a server candidate with identical immutable content.
-    pub(super) fn reuse_server_candidate<'a>(
+    pub(super) fn reuse_server_candidate(
         &self,
-        block: impl Into<zakura_chain::block::BlockView<'a>>,
+        block: &zakura_chain::block::BlockRef,
         network: &Network,
     ) -> bool {
         if self.lock()[PreparedCandidateSource::ServerTemplate.index()].is_empty() {

@@ -14,7 +14,7 @@ use zakura_rt::time::Instant;
 use super::{PeerIO, PeerRoutine};
 use crate::zakura::{
     block_sync::{
-        admission::floor_rescue_high,
+        admission::{floor_rescue_high, request_priority, AdmissionSnapshot, RequestPriority},
         events::RoutineToReactor,
         regulated::live_requester::FencedRequest,
         request::{BlockRangeRequest, ExpectedBlock},
@@ -356,8 +356,7 @@ impl PeerRoutine {
     /// above-floor lane.
     ///
     /// Both lanes plan against one admission snapshot, so they decide against
-    /// the same memory picture. Each probe and its take run at separate
-    /// synchronization points, so another routine can take a probed height first.
+    /// the same memory picture.
     fn select_work(
         &self,
         limits: &FillLimits,
@@ -367,11 +366,32 @@ impl PeerRoutine {
         let view = *self.io.sequencer_view.borrow();
         let snapshot = self.io.admission_snapshot(&view);
         let floor_start = self.probe_floor(limits, view.download_floor, now);
+        self.take_selected(limits, request_id, snapshot, floor_start)
+    }
+
+    /// Take the run that `snapshot` admits: from the probed `floor_start` if
+    /// any, else from the first pending height above the floor.
+    ///
+    /// The probe and the take run at separate synchronization points, so
+    /// another routine can take `floor_start` first. The floor take then
+    /// starts above the floor, and it needs an above-floor slot like the
+    /// above-floor lane. A refusal drops the take, which returns its run.
+    fn take_selected(
+        &self,
+        limits: &FillLimits,
+        request_id: NonZeroU64,
+        snapshot: AdmissionSnapshot,
+        floor_start: Option<block::Height>,
+    ) -> Result<TakenWork, FillStop> {
+        let download_floor = snapshot.download_floor;
         if let Some(take) = plan::plan_floor(&self.config, limits, snapshot, floor_start)? {
             let request = self.io.take_work(take, request_id);
-            if !request.items().is_empty() {
+            if let Some((first, _)) = request.items().first() {
+                if request_priority(download_floor, *first) == RequestPriority::AboveFloor {
+                    limits.above_floor_slot()?;
+                }
                 return Ok(TakenWork {
-                    download_floor: view.download_floor,
+                    download_floor,
                     request,
                 });
             }
@@ -390,7 +410,7 @@ impl PeerRoutine {
             return Err(FillStop::NoWork);
         }
         Ok(TakenWork {
-            download_floor: view.download_floor,
+            download_floor,
             request,
         })
     }

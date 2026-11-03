@@ -551,6 +551,49 @@ async fn answers_settled_waits_for_a_frame_the_transport_queued() {
     assert_settles(settled, answer).await;
 }
 
+/// The reader can claim the queued frame between the wait's two reads. The
+/// wait reads the settling count and the queue under the claim's lock, so the
+/// claimed answer still holds it.
+#[tokio::test]
+async fn answers_settled_sees_a_claim_that_takes_the_queued_frame() {
+    let slot = PrecheckSlot::default();
+    let (_peer, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let Session {
+        queries,
+        written: _written,
+        ..
+    } = session_with(reservation_pool(), &recv);
+    queries.send_get_peers(get_peers(1)).await.unwrap();
+    slot.get()
+        .expect("the session attached its precheck")
+        .check(PEERS, peers_len(1))
+        .expect("the transport admits the owed answer");
+
+    let mut live = queries.lock();
+    let waiting = queries.clone();
+    let settled =
+        std::thread::spawn(move || futures::executor::block_on(waiting.answers_settled()));
+    // Let the wait reach the lock this test holds.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let answer = queries
+        .claim_locked(&mut live, QueryKind::Peers, PEERS, peers_len(1))
+        .unwrap();
+    drop(live);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!settled.is_finished(), "the claimed answer holds the wait");
+
+    drop(answer);
+    for _ in 0..500 {
+        if settled.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(settled.is_finished(), "settlement wakes the wait");
+    settled.join().expect("the wait does not panic");
+}
+
 fn query_kind() -> impl proptest::strategy::Strategy<Value = QueryKind> {
     proptest::sample::select(QUERY_KINDS.to_vec())
 }

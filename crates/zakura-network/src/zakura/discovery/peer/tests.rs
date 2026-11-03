@@ -10,7 +10,8 @@ use proptest::prelude::*;
 use super::super::requester::{Asked, QueryKind, QueryState};
 use super::model::*;
 use super::state::{
-    CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, PeerStep, SessionCharge,
+    Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, PeerStep,
+    SessionCharge,
 };
 
 /// A session that sent its exchange and waits for its answers.
@@ -41,8 +42,9 @@ fn settle_initial(state: &mut PeerState, wait: InitialWait) -> PeerStep {
 }
 
 /// Without a `Hello` the exchange never completes, so the initial wait times
-/// out. The session is charged when it leaves the connection open, and
-/// retired when it closes it.
+/// out. The session is charged when it leaves the connection open. When it
+/// asks to close the connection, IO retires it at the close, or charges it
+/// the same failure if another service keeps the connection open.
 #[test]
 fn a_missing_hello_times_out_the_initial_exchange() {
     for (owners, end) in [
@@ -52,12 +54,12 @@ fn a_missing_hello_times_out_the_initial_exchange() {
         ),
         (
             Ownership::Sole,
-            charged(
-                SessionCharge::Retire,
-                PeerOutput::End {
-                    close: Some(CloseReason::ExchangeTimedOut),
-                },
-            ),
+            then(PeerOutput::End {
+                close: Some(Close {
+                    reason: CloseReason::ExchangeTimedOut,
+                    if_kept: Some(SessionCharge::Fail),
+                }),
+            }),
         ),
     ] {
         let mut state = waiting_session();
@@ -168,7 +170,7 @@ fn a_late_completion_settles_a_timed_out_session_as_a_success() {
 }
 
 /// An exchange that the close's answer wait finishes closes as complete, not
-/// as timed out.
+/// as timed out. A connection another service keeps settles it as a success.
 #[test]
 fn an_answer_that_settles_during_the_close_wait_completes_the_exchange() {
     let mut state = waiting_session();
@@ -191,12 +193,12 @@ fn an_answer_that_settles_during_the_close_wait_completes_the_exchange() {
     );
     assert_eq!(
         state.on_input(PeerInput::ShortLivedMarked),
-        charged(
-            SessionCharge::Retire,
-            PeerOutput::End {
-                close: Some(CloseReason::ExchangeComplete),
-            },
-        )
+        then(PeerOutput::End {
+            close: Some(Close {
+                reason: CloseReason::ExchangeComplete,
+                if_kept: Some(SessionCharge::Succeed),
+            }),
+        })
     );
 }
 
@@ -223,12 +225,12 @@ fn a_pending_answer_holds_the_close_until_it_settles() {
     );
     assert_eq!(
         state.on_input(PeerInput::ShortLivedMarked),
-        charged(
-            SessionCharge::Retire,
-            PeerOutput::End {
-                close: Some(CloseReason::ExchangeComplete),
-            },
-        )
+        then(PeerOutput::End {
+            close: Some(Close {
+                reason: CloseReason::ExchangeComplete,
+                if_kept: None,
+            }),
+        })
     );
 }
 

@@ -36,6 +36,18 @@ pub struct HeaderWorkLedger {
     last_incarnation: u64,
     /// Each peer's latest started, unretired round.
     rounds: HashMap<ZakuraPeerId, u64>,
+    /// The handoff whose apply has not yet taken its headers. The reactor
+    /// hands headers over in one step, so the next `HeadersHeld` resolves it.
+    handoff: Option<Handoff>,
+}
+
+/// A prepare's headers on their way to an apply call.
+#[derive(Debug)]
+struct Handoff {
+    prepare: u64,
+    apply: u64,
+    incarnation: u64,
+    headers: usize,
 }
 
 impl HeaderWorkLedger {
@@ -77,6 +89,13 @@ impl HeaderWorkLedger {
                 if record.held.as_ref().is_some_and(|held| !held.ended) {
                     return Err(format!(
                         "OpenOwnership: call {call} was handled with its headers still held"
+                    ));
+                }
+                if let Some(handoff) = self.handoff.as_ref().filter(|h| h.apply == *call) {
+                    return Err(format!(
+                        "UnresolvedHandoff: call {call} was handled before it took the headers \
+                         call {} handed it",
+                        handoff.prepare
                     ));
                 }
             }
@@ -128,6 +147,19 @@ impl HeaderWorkLedger {
                 if record.held.is_some() {
                     return Err(format!("HeldTwice: call {call} took headers again"));
                 }
+                if let Some(handoff) = self.handoff.take() {
+                    if handoff.apply != *call
+                        || handoff.incarnation != *incarnation
+                        || handoff.headers != *headers
+                    {
+                        return Err(format!(
+                            "BadHandoff: call {} handed call {} round {} with {} headers, and \
+                             call {call} took round {incarnation} with {headers} next",
+                            handoff.prepare, handoff.apply, handoff.incarnation, handoff.headers
+                        ));
+                    }
+                }
+                let record = self.record_mut(*call)?;
                 record.held = Some(Held {
                     incarnation: *incarnation,
                     headers: *headers,
@@ -156,7 +188,7 @@ impl HeaderWorkLedger {
                     ));
                 }
                 if let HeaderWorkEnd::HandedToApply { apply } = end {
-                    self.check_handoff(*call, *apply)?;
+                    self.check_handoff(*call, *apply, *incarnation, *headers)?;
                 }
             }
             _ => {}
@@ -164,11 +196,27 @@ impl HeaderWorkLedger {
         Ok(())
     }
 
-    /// Requires `apply` to be an apply call for the same work as the prepare `call`.
-    fn check_handoff(&self, call: u64, apply: u64) -> Result<(), String> {
+    /// Requires `apply` to be an open apply call for the same work as the
+    /// prepare `call`, which holds no headers yet. The next `HeadersHeld` must
+    /// then be `apply`'s, with `incarnation` and `headers`.
+    fn check_handoff(
+        &mut self,
+        call: u64,
+        apply: u64,
+        incarnation: u64,
+        headers: usize,
+    ) -> Result<(), String> {
         let prepare = self.calls.get(&call).map(|record| &record.op);
-        let applied = self.calls.get(&apply).map(|record| &record.op);
-        match (prepare, applied) {
+        let applied = self.calls.get(&apply);
+        if applied.is_some_and(|record| record.end.is_some() || record.held.is_some())
+            || self.handoff.is_some()
+        {
+            return Err(format!(
+                "BadHandoff: call {call} handed its headers to call {apply}, which has ended or \
+                 already holds headers, or another handoff is open"
+            ));
+        }
+        match (prepare, applied.map(|record| &record.op)) {
             (
                 Some(PortCall::Prepare {
                     peer,
@@ -180,7 +228,15 @@ impl HeaderWorkLedger {
                     source: apply_source,
                     owner: apply_owner,
                 }),
-            ) if peer == apply_peer && source == apply_source && owner == apply_owner => Ok(()),
+            ) if peer == apply_peer && source == apply_source && owner == apply_owner => {
+                self.handoff = Some(Handoff {
+                    prepare: call,
+                    apply,
+                    incarnation,
+                    headers,
+                });
+                Ok(())
+            }
             _ => Err(format!(
                 "BadHandoff: call {call} handed its headers to call {apply}, which is not an \
                  apply for the same work"
@@ -188,9 +244,17 @@ impl HeaderWorkLedger {
         }
     }
 
-    /// Requires every call to have ended and every held header to have left its
-    /// call, once the reactor's teardown is done.
+    /// Requires every call to have ended, every held header to have left its
+    /// call, and every handoff to have reached its apply, once the reactor's
+    /// teardown is done.
     pub fn finish(&self) -> Result<(), String> {
+        if let Some(handoff) = &self.handoff {
+            return Err(format!(
+                "UnresolvedHandoff: call {} handed its headers to call {}, which never took \
+                 them",
+                handoff.prepare, handoff.apply
+            ));
+        }
         for (call, record) in &self.calls {
             if record.end.is_none() {
                 return Err(format!("UnendedCall: call {call} never reported its end"));
@@ -370,6 +434,56 @@ mod tests {
         other_peer.push(dispatched(2, apply(2)));
         other_peer.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
         refused_as(other_peer, "BadHandoff");
+    }
+
+    /// A handoff must reach an open apply, which takes the same round and
+    /// count next; one that never arrives fails at teardown.
+    #[test]
+    fn a_handoff_must_reach_its_open_apply() {
+        let base = vec![
+            started(1, 1),
+            dispatched(1, prepare(1)),
+            held(1, StorageCallKind::Prepare, 1, 1),
+            dispatched(2, apply(1)),
+        ];
+
+        let mut ended_apply = base.clone();
+        ended_apply.push(ReactorEvent::CallEnded {
+            call: 2,
+            end: CallEnd::Replied,
+        });
+        ended_apply.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
+        refused_as(ended_apply, "BadHandoff");
+
+        let mut holding_apply = base.clone();
+        holding_apply.push(held(2, StorageCallKind::Apply, 1, 1));
+        holding_apply.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
+        refused_as(holding_apply, "BadHandoff");
+
+        let mut wrong_count = base.clone();
+        wrong_count.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
+        wrong_count.push(ReactorEvent::HeadersHeld {
+            call: 2,
+            kind: StorageCallKind::Apply,
+            peer: peer(1),
+            incarnation: 1,
+            headers: 4,
+        });
+        refused_as(wrong_count, "BadHandoff");
+
+        let mut other_call = base.clone();
+        other_call.push(dispatched(3, apply(1)));
+        other_call.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
+        other_call.push(held(3, StorageCallKind::Apply, 1, 1));
+        refused_as(other_call, "BadHandoff");
+
+        let mut unresolved = base;
+        unresolved.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
+        let ledger = fold(unresolved).expect("an open handoff folds");
+        assert!(ledger
+            .finish()
+            .expect_err("the apply never took the headers")
+            .starts_with("UnresolvedHandoff"));
     }
 
     /// #1842: `Handled` without `CallEnded` fails without waiting for teardown.

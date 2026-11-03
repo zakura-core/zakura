@@ -1,13 +1,14 @@
 --- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
 +++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
-@@ -643,9 +643,7 @@
+@@ -658,7 +658,10 @@ impl ZakuraDb {
                  return None;
              }
-             let mut location = None;
--            let result = self
--                .read_capacity
--                .transactions
-+            let result = zakura_node_services::block_memory::DecodedPayloadPool::new(self.config.read_transaction_limit)
-                 .try_decode_bounded::<Transaction>(&self.read_capacity.memory, |scope| {
-                     scope.try_charge(MAX_BLOCK_BYTES)?;
-                     let Some((next_location, transaction)) = transactions.next() else {
+             let (location, raw) = transactions.next()?;
+-            let transaction = self.decode_transaction(&raw);
++            let transaction = zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
++                .try_reserve(0)
++                .and_then(|reservation| reservation.retain(Transaction::from_bytes(raw.raw_bytes())))
++                .map(TransactionHandle::from);
+             finished = transaction.is_err();
+             Some(transaction.map(|transaction| (location, transaction)))
+         })

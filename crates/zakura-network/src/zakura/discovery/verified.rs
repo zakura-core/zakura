@@ -23,6 +23,18 @@ impl VerifiedRecord {
         record.verify_authentic(context)?;
         Ok(Self(record))
     }
+
+    /// Reuses this evidence for `record` when `record` is identical to the
+    /// verified one. Returns `record` back otherwise.
+    ///
+    /// The evidence takes `record` itself, so the check copies nothing.
+    pub(super) fn covering(&self, record: ZakuraNodeRecord) -> Result<Self, ZakuraNodeRecord> {
+        if self.0 == record {
+            Ok(Self(record))
+        } else {
+            Err(record)
+        }
+    }
 }
 
 impl Deref for VerifiedRecord {

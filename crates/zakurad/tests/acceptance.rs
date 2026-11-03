@@ -3583,7 +3583,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
             );
         }
 
-        tip_hash = block.view().header().previous_block_hash;
+        tip_hash = block.header().previous_block_hash;
     }
 
     assert!(

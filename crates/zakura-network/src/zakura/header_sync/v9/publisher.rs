@@ -230,6 +230,7 @@ impl PublisherOwner {
 
     /// Take the next terminal outcome state lets the task write, and bind it
     /// to its encoded frame and its slot's permit.
+    #[allow(clippy::unwrap_in_result)] // Its expects are local slot and encoding invariants.
     fn next_terminal<const HEADER_BYTES: usize>(&mut self) -> Option<OwnedTerminal> {
         let terminal = self.state.next_terminal()?;
         let permit = self
@@ -459,10 +460,16 @@ enum Admission {
 }
 
 /// How a page in progress finished.
+// The page's frame and send slot trip clippy's size threshold, more so in the
+// simulator build. One `Progress` is returned and moved once per page, so
+// boxing the page would only add an allocation per page.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation per served page"
+)]
 enum Progress<'a> {
-    /// The encoded page and its transport slot, boxed because the slot's send
-    /// handle dwarfs the other variants.
-    Page(Box<(EncodedPage, PushSend<'a>)>),
+    /// The encoded page and its transport slot.
+    Page(EncodedPage, PushSend<'a>),
     Refused(Refusal),
     Closed,
 }
@@ -609,8 +616,7 @@ fn settle(
     match progress {
         // A page whose subscription closed meanwhile spends nothing and drops
         // its slot.
-        Progress::Page(page) => {
-            let (encoded, slot) = *page;
+        Progress::Page(encoded, slot) => {
             if lock(shared).state.commit(key, &encoded.page) {
                 slot.send(encoded.frame);
             }
@@ -724,7 +730,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         {
             return Progress::Refused(Output::Retry.into());
         }
-        Progress::Page(Box::new((encoded, slot)))
+        Progress::Page(encoded, slot)
     })
 }
 
@@ -960,8 +966,11 @@ fn page_output<const HEADER_BYTES: usize>(
     let Some(last) = entries.last() else {
         return Err(on_empty_page(job.following).into());
     };
-    let sent = u32::try_from(entries.len()).expect("a page holds at most MAX_HS_RANGE headers");
-    let Some(height) = page.common_ancestor.height.0.checked_add(sent) else {
+    // A page holds at most `job.count` headers, a u32, so the count converts.
+    let Some((sent, height)) = u32::try_from(entries.len()).ok().and_then(|sent| {
+        let height = page.common_ancestor.height.0.checked_add(sent)?;
+        Some((sent, height))
+    }) else {
         return Err(Output::Stall(Stall::Local, "page_shape").into());
     };
     let last = Frontier::new(block::Height(height), last.header.hash());

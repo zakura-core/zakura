@@ -131,6 +131,28 @@ impl ReactorState {
         ReactorTransition::TipReset { tip }
     }
 
+    /// The reads a refill with `force` needs once it knows `first_unclaimed`.
+    /// The backlog only feeds the low-water gate, which a forced query skips.
+    pub(super) fn work_reads(
+        &self,
+        force: bool,
+        first_unclaimed: Option<block::Height>,
+    ) -> WorkReads {
+        let best_header_tip = self.progress.best_header_tip;
+        if work_from(
+            first_unclaimed,
+            best_header_tip,
+            self.verified_tip_diverged(),
+        )
+        .is_none()
+        {
+            return WorkReads::Idle;
+        }
+        WorkReads::Facts {
+            backlog: !self.queries.forced(force),
+        }
+    }
+
     /// Plan the query that `opening` allows.
     ///
     /// `work` carries the shared-owner facts that [`QueryOpening::NeedsWork`]
@@ -326,6 +348,18 @@ pub(super) struct QueryGate {
     pub(super) best_header_tip: block::Height,
 }
 
+/// The height an ordinary refill starts at: the first unclaimed height up to
+/// the header tip, or the header tip itself when the verified tip diverged.
+fn work_from(
+    first_unclaimed: Option<block::Height>,
+    best_header_tip: block::Height,
+    diverged: bool,
+) -> Option<block::Height> {
+    first_unclaimed
+        .filter(|from| *from <= best_header_tip)
+        .or(diverged.then_some(best_header_tip))
+}
+
 /// What a query may do after [`QueryState::open`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum QueryOpening {
@@ -342,10 +376,20 @@ pub(super) enum QueryOpening {
 pub(super) struct WorkFacts {
     /// The lowest height above the request floor that no work item covers.
     pub(super) first_unclaimed: Option<block::Height>,
-    /// Pending work heights plus unreceived requested heights.
-    pub(super) backlog: usize,
+    /// Pending work heights plus unreceived requested heights. `None` when
+    /// [`WorkReads`] skipped the read for a forced query.
+    pub(super) backlog: Option<usize>,
     /// The refill low-water target in heights.
     pub(super) low_water: usize,
+}
+
+/// The reads an ordinary refill needs after its first unclaimed height.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkReads {
+    /// No height to ask for: the refill is idle, and reads nothing more.
+    Idle,
+    /// Read the low-water target, and the backlog when `backlog` is set.
+    Facts { backlog: bool },
 }
 
 /// Where a proposed query starts.
@@ -498,7 +542,7 @@ impl QueryState {
     ///
     /// An owed forced retry bypasses the low-water gate like `request.force`.
     pub(super) fn propose(&self, request: QueryRequest) -> QueryPlan {
-        let force = request.force || self.retry_forced;
+        let force = self.forced(request.force);
         let (from, limit, hint_revision) = match request.start {
             QueryStart::Refresh(refresh) => (
                 refresh.from,
@@ -511,14 +555,18 @@ impl QueryState {
                 Some(refresh.revision),
             ),
             QueryStart::Work(work) => {
-                let Some(from) = work
-                    .first_unclaimed
-                    .filter(|from| *from <= request.best_header_tip)
-                    .or(request.diverged.then_some(request.best_header_tip))
-                else {
+                let Some(from) = work_from(
+                    work.first_unclaimed,
+                    request.best_header_tip,
+                    request.diverged,
+                ) else {
                     return QueryPlan::Idle;
                 };
-                if !force && work.backlog >= work.low_water {
+                if !force
+                    && work
+                        .backlog
+                        .is_some_and(|backlog| backlog >= work.low_water)
+                {
                     return QueryPlan::Idle;
                 }
                 (
@@ -548,6 +596,12 @@ impl QueryState {
             return QueryPlan::Covered;
         }
         QueryPlan::Dispatch(QueryProposal { query })
+    }
+
+    /// Whether a query with `force` skips the low-water gate. An owed forced
+    /// retry does too.
+    fn forced(&self, force: bool) -> bool {
+        force || self.retry_forced
     }
 
     /// The action channel accepted `proposal`: it becomes the pending query and

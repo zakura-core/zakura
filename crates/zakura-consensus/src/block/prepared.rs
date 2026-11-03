@@ -608,7 +608,14 @@ mod tests {
     fn blocks_sharing_cached_transactions_share_their_body_digest() {
         let network = Network::Mainnet;
         let cache = PreparedCandidateCache::default();
-        let candidate = test_block();
+        let candidate =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES[..])
+                .expect("the NU5 mainnet block vector is valid");
+        assert!(
+            candidate.transactions.len() > 1,
+            "the fixture must exercise more than the first transaction"
+        );
+        let original_digest = BodyDigest::of(&candidate);
         insert(
             &cache,
             &candidate,
@@ -628,12 +635,63 @@ mod tests {
             "a block built from the cached transactions gets their digest"
         );
 
-        let mut copied = solved.clone();
-        copied.transactions[0] = Arc::new(copied.transactions[0].as_ref().clone());
+        for index in 0..solved.transactions.len() {
+            let mut copied = solved.clone();
+            copied.transactions[index] = Arc::new(copied.transactions[index].as_ref().clone());
+            assert_eq!(
+                BodyDigest::of(&copied),
+                original_digest,
+                "a separate allocation preserves the transaction bytes"
+            );
+            assert_eq!(
+                cache.shared_body_digest(&copied),
+                None,
+                "a separate allocation at position {index} must miss, even after a shared prefix"
+            );
+        }
+
+        let mut reordered = solved.clone();
+        reordered.transactions.swap(0, 1);
         assert_eq!(
-            cache.shared_body_digest(&copied),
+            cache.shared_body_digest(&reordered),
             None,
-            "equal but separately parsed transactions are hashed again"
+            "sharing every allocation in a different order must miss"
+        );
+
+        let mut shortened = solved.clone();
+        shortened.transactions.pop();
+        assert_eq!(
+            cache.shared_body_digest(&shortened),
+            None,
+            "a shared prefix without the last transaction must miss"
+        );
+
+        let mut extended = solved.clone();
+        extended.transactions.push(solved.transactions[0].clone());
+        assert_eq!(
+            cache.shared_body_digest(&extended),
+            None,
+            "an extra transaction after the shared list must miss"
+        );
+
+        let mut changed = solved.clone();
+        let coinbase = Arc::make_mut(&mut changed.transactions[0]);
+        let zakura_chain::transparent::Input::Coinbase { data, .. } = &mut coinbase.inputs_mut()[0]
+        else {
+            panic!("the block vector starts with a coinbase transaction");
+        };
+        data.push(7);
+        assert_ne!(BodyDigest::of(&changed), original_digest);
+        assert_eq!(
+            cache.shared_body_digest(&changed),
+            None,
+            "mutating a shared transaction must miss"
+        );
+        assert_eq!(BodyDigest::of(&cached), original_digest);
+        assert_eq!(
+            cache.shared_body_digest(&cached),
+            Some(original_digest),
+            "mutating the submitted copy preserves the cached transactions and digest"
         );
     }
 }

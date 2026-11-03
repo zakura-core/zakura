@@ -51,8 +51,8 @@ use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::peer_memory::{
     budget_admitted_connections, budgeted_max_connections, native_connection_memory_bytes,
-    PeerMemoryBudgetError, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
-    DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
+    PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
@@ -92,9 +92,10 @@ use crate::{
     },
 };
 
-/// Default total Zakura connections when P2P v2 is enabled: as many as the
-/// default peer memory budget admits (see `peer_memory`).
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
+/// Default total Zakura connections when P2P v2 is enabled: 92, the count
+/// the previous 8 GiB budget admitted at the default windows. The default peer
+/// memory budget funds this many (see `peer_memory`).
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 92;
 /// Default per-IP Zakura connection cap.
 pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 /// Default simultaneous Zakura control handshakes.

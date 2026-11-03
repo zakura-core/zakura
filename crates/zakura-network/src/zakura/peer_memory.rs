@@ -29,9 +29,9 @@ use thiserror::Error;
 use zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES;
 
 use super::{
-    discovery::effective_discovery_connection_headroom, DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-    DEFAULT_ZAKURA_RECEIVE_WINDOW, DEFAULT_ZAKURA_SEND_WINDOW,
-    DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
+    discovery::effective_discovery_connection_headroom, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES, DEFAULT_ZAKURA_RECEIVE_WINDOW,
+    DEFAULT_ZAKURA_SEND_WINDOW, DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
 };
 
 /// The native stream kinds a connection may negotiate: legacy gossip, legacy
@@ -63,12 +63,18 @@ pub const DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES: u64 = native_connection_memory
 );
 
 /// Default budget for native QUIC connections' flow-control credit and the
-/// bound sockets' datagram queues. It funds one socket queue and 124 live
-/// connections at [`DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES`], 18,112 MiB, so
-/// the default count stays 92. CTRL-26 in the zakura-quic spec lists what it
-/// leaves out.
-pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 =
-    SOCKET_DATAGRAM_QUEUE_BYTES + 124 * DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES;
+/// bound sockets' datagram queues. CTRL-26 in the zakura-quic spec lists what
+/// it leaves out.
+///
+/// It funds what admission charges for [`DEFAULT_ZAKURA_MAX_CONNECTIONS`] on
+/// the one socket the default `listen_addr` binds: one socket queue, and
+/// every live connection, admitted or in its handshake, at
+/// [`DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES`]. That is
+/// 256 MiB + (92 + 32) × 144 MiB = 18,112 MiB.
+// Widening usize to u64 is lossless on supported targets.
+pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = SOCKET_DATAGRAM_QUEUE_BYTES
+    + (DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES) as u64
+        * DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES;
 
 /// Fewest connections a peer memory budget must admit, whatever the bootstrap
 /// list (see [`min_budgeted_connections`]).
@@ -104,6 +110,12 @@ pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = max_connections_for_budge
     1,
     DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES,
 ) - DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES;
+
+// The default budget funds the default connection count.
+const _: () = assert!(
+    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS >= DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    "the default peer memory budget funds the default connection count"
+);
 
 /// Returns how many connections of `connection_bytes` each fit in
 /// `budget_bytes` after reserving one socket datagram queue for each of

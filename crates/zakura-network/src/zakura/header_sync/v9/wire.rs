@@ -248,16 +248,16 @@ const fn largest_page_under(header_bytes: usize, schema: AuxSchema) -> usize {
 }
 
 /// Mainnet and Testnet messages, whose headers take 1,487 bytes.
-pub(crate) type CommonMessage = Message<COMMON_HEADER_BYTES>;
+pub type CommonMessage = Message<COMMON_HEADER_BYTES>;
 
 /// Regtest messages, whose headers take 177 bytes.
-pub(crate) type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
+pub type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
 
 const _: () = Stream::validate_layout(&CommonMessage::LAYOUT);
 const _: () = Stream::validate_layout(&RegtestMessage::LAYOUT);
 
 /// The version 9 rows of a network whose headers take `header_bytes`.
-pub(crate) const fn rows(header_bytes: usize) -> &'static [MessageRule] {
+pub const fn rows(header_bytes: usize) -> &'static [MessageRule] {
     if header_bytes == REGTEST_HEADER_BYTES {
         &RegtestMessage::ROWS
     } else {
@@ -266,7 +266,7 @@ pub(crate) const fn rows(header_bytes: usize) -> &'static [MessageRule] {
 }
 
 /// The version 9 layout for `network`, chosen by its header size.
-pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
+pub fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
     if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
         &RegtestMessage::LAYOUT
     } else {
@@ -278,27 +278,27 @@ pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [S
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Status {
     /// Height of the sender's finality anchor, excluded from the suffix work.
-    pub(crate) work_anchor_height: block::Height,
+    pub work_anchor_height: block::Height,
     /// Hash of the work anchor.
-    pub(crate) work_anchor_hash: block::Hash,
+    pub work_anchor_hash: block::Hash,
     /// Height of the sender's selected header tip.
-    pub(crate) selected_tip_height: block::Height,
+    pub selected_tip_height: block::Height,
     /// Hash of the sender's selected header tip.
-    pub(crate) selected_tip_hash: block::Hash,
+    pub selected_tip_hash: block::Hash,
     /// Work after the anchor through the selected tip.
-    pub(crate) suffix_cumulative_work: U256,
+    pub suffix_cumulative_work: U256,
     /// Lowest height for which the sender retains headers.
-    pub(crate) oldest_retained_height: block::Height,
+    pub oldest_retained_height: block::Height,
     /// Most headers the sender puts in one page, `1..=MAX_HS_RANGE`.
-    pub(crate) max_headers_per_response: u32,
+    pub max_headers_per_response: u32,
     /// Live subscriptions the sender holds per peer, always
     /// [`MAX_HS_SUBSCRIPTIONS`].
-    pub(crate) max_subscriptions: u16,
+    pub max_subscriptions: u16,
     /// Most bytes in one of the sender's pages. It fits a one-header page
     /// under every advertised schema and stays within 2 MiB.
-    pub(crate) max_message_bytes: u32,
+    pub max_message_bytes: u32,
     /// Bit `n - 1` advertises auxiliary schema `n`.
-    pub(crate) tree_aux_schema_mask: u32,
+    pub tree_aux_schema_mask: u32,
 }
 
 /// A `SubscribeHeaders` operation.
@@ -317,55 +317,55 @@ pub enum Operation {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Cursor {
     /// Height of the last accepted header, or of the first locator.
-    pub(crate) height: block::Height,
+    pub height: block::Height,
     /// Hash of that header.
-    pub(crate) hash: block::Hash,
+    pub hash: block::Hash,
     /// Header credit the subscription's pages consumed through this cursor.
-    pub(crate) headers: u64,
+    pub headers: u64,
     /// Byte credit the subscription's pages consumed through this cursor.
-    pub(crate) bytes: u64,
+    pub bytes: u64,
 }
 
 /// One subscription update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscribeHeaders {
     /// What the update does.
-    pub(crate) operation: Operation,
+    pub operation: Operation,
     /// Nonzero subscription identifier.
-    pub(crate) subscription_id: u64,
+    pub subscription_id: u64,
     /// Zero for `Open`, then one more for each update.
-    pub(crate) update_sequence: u32,
+    pub update_sequence: u32,
     /// The target the subscription's first pages reach.
-    pub(crate) initial_target_tip_hash: block::Hash,
+    pub initial_target_tip_hash: block::Hash,
     /// The start cursor for `Open`, then the last cursor the subscriber
     /// accepted.
-    pub(crate) acknowledged: Cursor,
+    pub acknowledged: Cursor,
     /// `1..=13` unique locator hashes for `Open`, none otherwise.
-    pub(crate) locator_hashes: Vec<block::Hash>,
+    pub locator_hashes: Vec<block::Hash>,
     /// Header credit (`objects`) and byte credit the update adds.
-    pub(crate) added_credit: Credit,
+    pub added_credit: Credit,
     /// The auxiliary schema the subscriber asks for.
-    pub(crate) tree_aux_schema: AuxSchema,
+    pub tree_aux_schema: AuxSchema,
 }
 
 /// One pushed page of headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Headers {
     /// Nonzero subscription identifier.
-    pub(crate) subscription_id: u64,
+    pub subscription_id: u64,
     /// The subscription's initial target.
-    pub(crate) initial_target_tip_hash: block::Hash,
+    pub initial_target_tip_hash: block::Hash,
     /// Height of the header the page's first header extends.
-    pub(crate) common_ancestor_height: block::Height,
+    pub common_ancestor_height: block::Height,
     /// Hash of the header the page's first header extends.
-    pub(crate) common_ancestor_hash: block::Hash,
+    pub common_ancestor_hash: block::Hash,
     /// Whether the page's last header is the initial target.
-    pub(crate) reaches_initial_target: bool,
+    pub reaches_initial_target: bool,
     /// The auxiliary schema of every entry.
-    pub(crate) tree_aux_schema: AuxSchema,
+    pub tree_aux_schema: AuxSchema,
     /// `1..=MAX_HS_RANGE` headers in ascending order, with their hints and
     /// records.
-    pub(crate) entries: Vec<HeaderEntry>,
+    pub entries: Vec<HeaderEntry>,
 }
 
 /// Why a subscription ended.
@@ -404,25 +404,29 @@ impl HeadersOutcomeCode {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeadersOutcome {
     /// Nonzero subscription identifier.
-    pub(crate) subscription_id: u64,
+    pub subscription_id: u64,
     /// The subscription's initial target.
-    pub(crate) initial_target_tip_hash: block::Hash,
+    pub initial_target_tip_hash: block::Hash,
     /// Why the subscription ended.
-    pub(crate) outcome: HeadersOutcomeCode,
+    pub outcome: HeadersOutcomeCode,
 }
 
 /// Every version 9 message on a network whose headers take `HEADER_BYTES`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Message<const HEADER_BYTES: usize> {
+pub enum Message<const HEADER_BYTES: usize> {
+    /// A frontier and serving-caps advertisement.
     Status(Status),
+    /// A subscription update: `Open`, `Grant`, or `Close`.
     SubscribeHeaders(SubscribeHeaders),
+    /// One pushed page of headers.
     Headers(Headers),
+    /// A subscription's terminal outcome.
     HeadersOutcome(HeadersOutcome),
 }
 
 impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     /// The rows of this network's version 9 stream.
-    pub(crate) const ROWS: [MessageRule; 4] = [
+    pub const ROWS: [MessageRule; 4] = [
         STATUS,
         SUBSCRIBE_HEADERS,
         headers_row(HEADER_BYTES),
@@ -430,7 +434,7 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     ];
 
     /// This network's version 9 stream.
-    pub(crate) const LAYOUT: [Stream; 1] = [Stream {
+    pub const LAYOUT: [Stream; 1] = [Stream {
         kind: ZAKURA_STREAM_HEADER_SYNC,
         version: STREAM_VERSION,
         frame_cap: FRAME_CAP,

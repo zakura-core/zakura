@@ -25,7 +25,10 @@ use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
 use crate::{error::TransactionError, BoxError};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tower::Service;
 
 use super::spawn_fifo;
@@ -45,11 +48,32 @@ use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 /// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
 const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
 
-/// The type of verification results.
-type VerifyResult = bool;
+/// The result of one batch: each item's admission result, in admission order, and whether the
+/// admitted items verified.
+#[derive(Debug)]
+struct BatchResult {
+    checks: Vec<Result<(), BatchError>>,
+    valid: bool,
+}
+
+/// A batch whose items have all been admitted to its validator.
+struct PreparedBatch {
+    validator: BatchValidator<'static>,
+    checks: Vec<Result<(), BatchError>>,
+}
+
+/// A batch still admitting items on a blocking thread.
+struct PendingBatch {
+    /// Sends items to the blocking thread, which admits them in order.
+    items: mpsc::UnboundedSender<Item>,
+    /// Finishes once `items` is dropped and every sent item is admitted.
+    prepared: JoinHandle<PreparedBatch>,
+    /// The number of items sent so far, which is the next item's index in `checks`.
+    len: usize,
+}
 
 /// The type of the batch sender channel.
-type Sender = watch::Sender<Option<VerifyResult>>;
+type Sender = watch::Sender<Option<BatchResult>>;
 
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.
@@ -461,8 +485,11 @@ pub struct Verifier {
     /// The verifying key that every batch and fallback from this verifier uses.
     vk: &'static ItemVerifyingKey,
 
-    /// The synchronous Halo2 batch validator.
-    batch: BatchValidator<'static>,
+    /// The batch being admitted, created when its first item arrives.
+    ///
+    /// Admitting a bundle prepares its proof and signatures, which is CPU work, so it runs on a
+    /// blocking thread rather than on the async worker that runs this service.
+    batch: Option<PendingBatch>,
 
     /// A channel for broadcasting the result of a batch to the futures for each batch item.
     ///
@@ -477,51 +504,46 @@ impl Verifier {
         let (tx, _) = watch::channel(None);
         Self {
             vk,
-            batch: BatchValidator::new(vk),
+            batch: None,
             tx,
         }
     }
 
-    /// Returns the batch verifier and channel sender,
-    /// replacing the batch and channel with new empty ones.
-    fn take(&mut self) -> (BatchValidator<'static>, Sender) {
-        // Use a new verifier and channel for each batch.
-        let batch = mem::replace(&mut self.batch, BatchValidator::new(self.vk));
+    /// Returns the pending batch's preparation and the channel sender, replacing the channel with
+    /// a new one.
+    ///
+    /// Dropping the batch's item sender lets its preparation finish, even if the returned
+    /// preparation is never awaited.
+    fn take(&mut self) -> (Option<JoinHandle<PreparedBatch>>, Sender) {
+        let batch = self.batch.take().map(|batch| batch.prepared);
         let (tx, _) = watch::channel(None);
         let tx = mem::replace(&mut self.tx, tx);
 
         (batch, tx)
     }
 
-    /// Synchronously process the batch using its bound verifying key, and send the result using
-    /// the channel sender. This function blocks until the batch is completed.
-    fn verify(batch: BatchValidator<'static>, tx: Sender) {
-        let result = batch.validate(thread_rng());
-        let _ = tx.send(Some(result));
-    }
+    /// Waits for the batch's admission to finish, validates it on the thread pool, and sends the
+    /// result via the channel.
+    async fn flush_spawning(prepared: Option<JoinHandle<PreparedBatch>>, tx: Sender) {
+        let Some(prepared) = prepared else {
+            return;
+        };
 
-    /// Flush the batch using a thread pool, sending the result via the channel.
-    /// This returns immediately, usually before the batch is completed.
-    fn flush_blocking(&mut self) {
-        let (batch, tx) = self.take();
-
-        // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
-        //
-        // We don't care about execution order here, because this method is only called on drop.
-        tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, tx)));
-    }
-
-    /// Flush the batch using a thread pool, validating against the batch's bound key and returning
-    /// the result via the channel. This function returns a future that becomes ready when the batch
-    /// is completed.
-    async fn flush_spawning(batch: BatchValidator<'static>, tx: Sender) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();
-        let result = spawn_fifo(move || batch.validate(thread_rng())).await;
+        let result = match prepared.await {
+            Ok(PreparedBatch { validator, checks }) => spawn_fifo(move || BatchResult {
+                checks,
+                valid: validator.validate(thread_rng()),
+            })
+            .await
+            .ok(),
+            Err(_) => None,
+        };
         let duration = start.elapsed().as_secs_f64();
 
         let result_label = match &result {
-            Ok(true) => "success",
+            Some(result) if result.valid => "success",
             _ => "failure",
         };
         metrics::histogram!(
@@ -531,7 +553,7 @@ impl Verifier {
         )
         .record(duration);
 
-        let _ = tx.send(result.ok());
+        let _ = tx.send(result);
     }
 
     /// Verify a single item against `vk` using a thread pool, and return the result.
@@ -568,19 +590,45 @@ impl Service<BatchControl<Item>> for Verifier {
         match req {
             BatchControl::Item(item) => {
                 tracing::trace!("got item");
-                if let Err(err) = self.batch.queue(item) {
-                    return Box::pin(async move { Err(BoxError::from(err)) });
-                }
+                let batch = self.batch.get_or_insert_with(|| {
+                    let (items, mut rx) = mpsc::unbounded_channel();
+                    let vk = self.vk;
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        let mut validator = BatchValidator::new(vk);
+                        let mut checks = Vec::new();
+                        while let Some(item) = rx.blocking_recv() {
+                            // A bundle the key can't verify is rejected alone, without joining
+                            // the batch.
+                            checks.push(validator.queue(item));
+                        }
+                        PreparedBatch { validator, checks }
+                    });
+                    PendingBatch {
+                        items,
+                        prepared,
+                        len: 0,
+                    }
+                });
+                let index = batch.len;
+                batch.len += 1;
+                // If the preparation thread failed, the flush reports that to every item.
+                let _ = batch.items.send(item);
                 let mut rx = self.tx.subscribe();
                 Box::pin(async move {
                     match rx.changed().await {
                         Ok(()) => {
                             // We use a new channel for each batch,
                             // so we always get the correct batch result here.
-                            let is_valid = *rx
-                                .borrow()
+                            let result = rx.borrow();
+                            let result = result
                                 .as_ref()
                                 .ok_or("threadpool unexpectedly dropped response channel sender. Is Zakura shutting down?")?;
+                            if let Err(error) = &result.checks[index] {
+                                metrics::counter!("proofs.halo2.invalid").increment(1);
+                                return Err(BoxError::from(error.clone()));
+                            }
+
+                            let is_valid = result.valid;
 
                             if is_valid {
                                 tracing::trace!(?is_valid, "verified halo2 proof");
@@ -610,8 +658,11 @@ impl Service<BatchControl<Item>> for Verifier {
 
 impl Drop for Verifier {
     fn drop(&mut self) {
-        // We need to flush the current batch in case there are still any pending futures.
-        // This returns immediately, usually before the batch is completed.
-        self.flush_blocking()
+        // Flush the current batch in case there are still pending futures. Taking the batch
+        // closes its admission, so its preparation thread finishes.
+        let (batch, tx) = self.take();
+        if batch.is_some() {
+            tokio::spawn(Self::flush_spawning(batch, tx));
+        }
     }
 }

@@ -58,10 +58,28 @@ pub fn run_under(
     observed: &[Source],
     script: Vec<Vec<Observation>>,
 ) -> RunReport {
-    let mut checker = RegistryChecker::new(
-        Registry::new(properties).expect("generated IDs are unique"),
+    run_scripted(
         Rc::new(Node),
+        properties,
         Assumptions::none(),
+        observed,
+        script,
+    )
+}
+
+/// [`run_under`] for a harness `handle` whose view the properties read,
+/// with the scenario's `assumptions`.
+pub fn run_scripted<S: HasView>(
+    handle: Rc<S>,
+    properties: Vec<Property<S>>,
+    assumptions: Assumptions<S>,
+    observed: &[Source],
+    script: Vec<Vec<Observation>>,
+) -> RunReport {
+    let mut checker = RegistryChecker::new(
+        Registry::new(properties).expect("property IDs are unique"),
+        handle,
+        assumptions,
         &Sources::observed(observed),
     );
     let batches = Rc::new(RefCell::new(VecDeque::from(script)));

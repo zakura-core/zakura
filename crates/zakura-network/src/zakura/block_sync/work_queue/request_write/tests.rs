@@ -1,4 +1,7 @@
 use super::*;
+use crate::zakura::block_sync::block_sync_observe::{
+    BlockEvent, BlockSyncObserver, ObserverSlot, RequestStep,
+};
 use crate::zakura::{
     block_sync::{test_work_scope, BlockSizeEstimate},
     transport::worker_framed_channel,
@@ -8,7 +11,7 @@ use std::{num::NonZeroU64, time::Duration};
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)))
+        Self(Arc::new(AtomicU8::new(WRITTEN)), None)
     }
 }
 
@@ -99,8 +102,20 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_queue(WorkQueue::new(block::Height(0)))
+    }
+
+    /// A fixture whose queue reports each request step to the returned log.
+    fn observed() -> (Self, StepLog) {
+        let log = StepLog::default();
+        let observer = ObserverSlot(Some(Arc::new(log.clone())));
+        let fixture = Self::with_queue(WorkQueue::new(block::Height(0)).with_observer(observer));
+        (fixture, log)
+    }
+
+    fn with_queue(work: WorkQueue) -> Self {
         let fixture = Self {
-            work: Arc::new(WorkQueue::new(block::Height(0))),
+            work: Arc::new(work),
             budget: ByteBudget::new(1000),
             cancel: CancellationToken::new(),
         };
@@ -847,4 +862,108 @@ fn answered_elsewhere_returns_the_settled_requests_charge() {
     budget.release(ended.released);
     assert_eq!(ended.charge, 1_500);
     assert_eq!(budget.reserved(), 0);
+}
+
+/// The request steps a queue reported, in order.
+#[derive(Clone, Debug, Default)]
+struct StepLog(Arc<std::sync::Mutex<Vec<RequestStep>>>);
+
+impl StepLog {
+    /// Takes the steps reported since the last call.
+    fn take(&self) -> Vec<RequestStep> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+impl BlockSyncObserver for StepLog {
+    fn observe(&self, event: BlockEvent) {
+        if let BlockEvent::Request { step, .. } = event {
+            self.0.lock().unwrap().push(step);
+        }
+    }
+}
+
+#[test]
+fn each_write_outcome_reports_its_steps() {
+    use RequestStep::*;
+    use RequestWritePhase as Phase;
+
+    // Transport writes the frame.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    assert!(claim.publish(|| {}));
+    assert!(claim.try_start());
+    claim.written();
+    drop(claim);
+    assert_eq!(
+        log.take(),
+        [Published, Started, Written, Dropped(Phase::Written)]
+    );
+
+    // The queue lost its receiver during publication.
+    let (mut f, log) = Fixture::observed();
+    let (sender, receiver) = worker_framed_channel(1);
+    let slot = sender.try_reserve_guarded().unwrap();
+    let claim = f.take(1);
+    drop(receiver);
+    assert!(claim.publish(|| {
+        assert!(!slot.send_request(
+            Frame {
+                message_type: 2,
+                flags: 0,
+                payload: vec![],
+            },
+            claim.clone(),
+        ));
+    }));
+    claim.delivery_failed();
+    drop(claim);
+    assert_eq!(
+        log.take(),
+        [Published, DeliveryFailed, Expired, Dropped(Phase::Skipped)]
+    );
+
+    // A queued request expires, so transport skips it.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    assert!(claim.publish(|| {}));
+    f.expire(claim.owner());
+    assert!(!claim.try_start());
+    drop(claim);
+    assert_eq!(log.take(), [Published, Expired, Dropped(Phase::Skipped)]);
+
+    // A routine expires a queued request through the status it kept, as its
+    // timeout and retirement paths do.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    assert!(claim.publish(|| {}));
+    let status = claim.status();
+    assert!(status.expire_unwritten());
+    assert!(!status.expire_unwritten(), "only the transition reports");
+    drop(claim);
+    assert_eq!(log.take(), [Published, Expired, Dropped(Phase::Skipped)]);
+
+    // A reset retires a queued request and a started one. Only the queued
+    // request expires.
+    for started in [false, true] {
+        let (mut f, log) = Fixture::observed();
+        let claim = f.take(1);
+        assert!(claim.publish(|| {}));
+        if started {
+            assert!(claim.try_start());
+        }
+        f.reset();
+        drop(claim);
+        let expected: &[RequestStep] = if started {
+            &[Published, Started, Reset, Dropped(Phase::Started)]
+        } else {
+            &[Published, Reset, Expired, Dropped(Phase::Skipped)]
+        };
+        assert_eq!(log.take(), expected);
+    }
+
+    // A take that never publishes drops unpublished.
+    let (mut f, log) = Fixture::observed();
+    drop(f.take(1));
+    assert_eq!(log.take(), [Dropped(Phase::Unpublished)]);
 }

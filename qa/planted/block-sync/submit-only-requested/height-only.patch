@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+index 3711e4763..8bc690b01 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+@@ -676,9 +676,9 @@ impl SequencerTask {
+     /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
+     /// ready contiguous prefix into applying.
+     fn handle_accept_body(&mut self, mut body: SequencedBody) {
+-        let scope_is_current = self.current_scope.is_some_and(|current| {
+-            current.body_work_epoch == body.owner.authority().body_work_epoch
+-        });
++        // Key the body by its height alone: whatever epoch its owner asked
++        // for it in, the current scope adopts it below.
++        let scope_is_current = self.current_scope.is_some();
+         #[cfg(test)]
+         let scope_is_current = scope_is_current || self.current_scope.is_none();
+         if !scope_is_current {

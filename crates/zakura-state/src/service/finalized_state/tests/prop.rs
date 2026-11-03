@@ -267,7 +267,7 @@ fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<
         outputs: Vec::new(),
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
-        joinsplit_data: Some(JoinSplitData {
+        joinsplit_data: Some(Box::new(JoinSplitData {
             first,
             rest: vec![second],
             pub_key: source
@@ -292,7 +292,7 @@ fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<
                     _ => None,
                 })
                 .expect("the source JoinSplit has a signature"),
-        }),
+        })),
         sapling_shielded_data: None,
     })
 }

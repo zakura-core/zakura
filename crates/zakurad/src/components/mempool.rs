@@ -24,13 +24,19 @@ use std::{
     iter,
     net::IpAddr,
     pin::{pin, Pin},
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, mpsc, oneshot};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneService, Service, ServiceExt};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tower::{
+    buffer::Buffer,
+    timeout::Timeout,
+    util::{BoxCloneService, BoxCloneSyncService},
+    Service, ServiceExt,
+};
 
 use zakura_chain::{
     block::{self, Height},
@@ -119,8 +125,7 @@ fn transaction_error_peer_log_label(
     }
 }
 
-type Outbound =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type Outbound = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;
@@ -134,7 +139,6 @@ type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, Re
 /// mempool and its crawler activate, and at which the mempool starts peer
 /// transaction cooldowns.
 ///
-/// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
 /// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
 /// the gap between the two thresholds keeps the mempool from flapping.
 const MAX_ESTIMATED_DISTANCE_TO_ENABLE: block::HeightDiff = 100;
@@ -621,6 +625,10 @@ pub struct Mempool {
     /// The canonical IPs of zcashd-compat sidecars. The mempool never bans,
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
+
+    /// Signalled after each transaction download and verify task finishes.
+    /// Shared with every downloader, and kept across mempool resets.
+    verification_finished: Arc<Notify>,
 }
 
 impl Mempool {
@@ -661,6 +669,7 @@ impl Mempool {
                 .into_iter()
                 .map(|ip| ip.to_canonical())
                 .collect(),
+            verification_finished: Arc::new(Notify::new()),
         };
 
         // Make sure `is_enabled` is accurate.
@@ -668,6 +677,13 @@ impl Mempool {
         service.update_state(None, service.is_caught_up_to_start());
 
         (service, transaction_subscriber)
+    }
+
+    /// Returns the signal that fires after each transaction verification finishes.
+    ///
+    /// A mempool request sent after this signal adds the verified transaction.
+    pub(crate) fn verification_finished(&self) -> Arc<Notify> {
+        self.verification_finished.clone()
     }
 
     /// Is the mempool enabled by a debug config option?
@@ -745,6 +761,7 @@ impl Mempool {
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
             self.peer_cooldowns.clone(),
+            self.verification_finished.clone(),
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),

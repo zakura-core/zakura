@@ -4,12 +4,25 @@
 //! zakura-sim record --sim <name> --input <file> --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable>]
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
-//! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe]
+//! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
+//! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
+//! zakura-sim versions --sim <name>
+//! zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]
+//!     [--quarantine <dir>] [--report <file>]
+//! zakura-sim suite [--out <file>] [--frozen]
+//! zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>
+//!     [--against <confirmation.json>]
+//! zakura-sim properties --sim <name>
+//! zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...
+//! zakura-sim verify-archive <dir>
+//! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! ```
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
-//! `cargo xtask record` and `cargo xtask replay` build and run it with that
-//! flag.
+//! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
+//! `cargo xtask sim-versions`, `cargo xtask sim-seeds`, `cargo xtask sim-suite`,
+//! `cargo xtask sim-triage`, `cargo xtask sim-verify-archive` and
+//! `cargo xtask sim-campaign` build and run it with that flag.
 
 /// Prints that this build has no simulator, and exits with code 2.
 #[cfg(not(zakura_sim))]
@@ -38,14 +51,33 @@ fn main() {
 }
 
 #[cfg(zakura_sim)]
+#[path = "zakura-sim/campaign.rs"]
+mod campaign;
+
+#[cfg(zakura_sim)]
 mod cli {
-    use std::{fmt::Write, path::PathBuf};
+    use std::{
+        fmt::Write,
+        fs::File,
+        io::Read,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use serde_json::{json, Value};
     use zakura_sim::{
+        explore::triage::{
+            self, Minimization, PinnedBinary, SimChildren, SimMinimize, TriageOptions,
+            MINIMIZED_FILE, TRIAGE_FILE,
+        },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
-        trace::{self, ReplayOptions, TraceReader},
+        seed::{self, Failed, SeedReport},
+        suite,
+        trace::{
+            self, shrink::REPORT_FILE, ConfirmStatus, Confirmation, ReplayOptions, ShrinkBudget,
+            TraceReader, CONFIRMATION_FILE, MAX_INPUT_BYTES,
+        },
         witness::Expect,
     };
 
@@ -64,7 +96,22 @@ mod cli {
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable>]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n  \
-             zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe]\n\n\
+             zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
+             zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
+             zakura-sim versions --sim <name>\n  \
+             zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]\n      \
+             [--quarantine <dir>] [--report <file>]\n  \
+             zakura-sim suite [--out <file>] [--frozen]\n  \
+             zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
+             [--against <confirmation.json>]\n  \
+             zakura-sim properties --sim <name>\n  \
+             zakura-sim triage --sim <name> --out <dir> [--child-secs <s>]\n      \
+             [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
+             zakura-sim verify-archive <dir>\n",
+        );
+        text.push_str(super::campaign::USAGE);
+        text.push_str(
+            "\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
@@ -73,9 +120,50 @@ mod cli {
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
              `--prefix` replays a trace without its end record to its last step.\n\
-             `--observe` writes the full observation log to observations.jsonl.\n\n\
-             Harnesses:\n",
+             `--observe` writes the full observation log to observations.jsonl.\n\
+             `--explain` prints each step with its task name, draws and observations,\n\
+             and marks every non-default pick and draw with `*`.\n\
+             `shrink` reduces a trace that ends in a violation to fewer non-default\n\
+             picks, and writes the reduced trace, the original and a reduction log to\n\
+             --out. It stops after --candidates candidates (default 2000) or\n\
+             --wall-secs seconds (default 600), and exits 1 if the re-record fails.\n\
+             `versions` prints the versions that fix what the harness's fuzz input means,\n\
+             as KEY=VALUE lines.\n\
+             `seeds` validates the committed seeds in each --fixtures directory (default\n\
+             crates/zakura-sim/tests/fixtures) against the current generators, and lists\n\
+             each seed as admitted, quarantined or rejected. With --sim, it checks only\n\
+             that harness's seeds, and --out writes each admitted seed's full fuzz input\n\
+             there, named by its SHA-256. --quarantine writes each quarantined seed there\n\
+             with its reason. --report writes the result as JSON. It exits 1 if any\n\
+             required seed is rejected.\n\
+             `suite` builds the full-suite manifest from qa/suite.toml, the harness\n\
+             registry, the coverage manifest, the planted cases, the seeds, the fuzz\n\
+             targets and the test sources, and prints its counts. --out writes it as\n\
+             JSON. It exits 1 and lists every problem if the manifest doesn't cover the\n\
+             suite, and with --frozen also if the build or the checkout is dirty, or\n\
+             the checkout isn't at the build's commit.\n\
+             `confirm` checks that a full fuzz input violates the property alone, through\n\
+             its trigger history, records its trace under --out and replays it Exact. It\n\
+             writes confirmation.json to --out, and exits 0 only if the input is confirmed.\n\
+             `--against` also holds the input to an earlier confirmation's harness,\n\
+             generator, build, assumptions and cleanup.\n\
+             `properties` prints the ID of each property the harness registers, one\n\
+             per line.\n\
+             `triage` records each input twice, each time in a fresh process killed after\n\
+             --child-secs seconds (default 60), replays the first trace Exact in a third,\n\
+             and archives the input with its runs under --out. It exits 1 only if an input\n\
+             couldn't be archived. Each harness, generator and build gets its own\n\
+             directory under --out. With --target, it also runs `cargo xtask sim-minimize`\n\
+             with --runs, --wall-secs, --child-secs and --sanitizer on each confirmed\n\
+             Active failure, and archives the accepted candidate in a bundle beside the\n\
+             failure's bundle, named after it with `.minimized`.\n\
+             `verify-archive` checks every bundle under a triage archive against its\n\
+             SHA256SUMS, and each minimized bundle against its failure's bundle, counts\n\
+             the bundles under each harness, provenance and signature, and exits 1 if any\n\
+             bundle doesn't match.\n",
         );
+        text.push_str(super::campaign::HELP);
+        text.push_str("\nHarnesses:\n");
         for entry in HARNESSES {
             let _ = writeln!(
                 text,
@@ -93,6 +181,15 @@ mod cli {
         match args.next().as_deref() {
             Some("record") => record(args.collect()),
             Some("replay") => replay(args.collect()),
+            Some("shrink") => shrink(args.collect()),
+            Some("versions") => versions(args.collect()),
+            Some("seeds") => seeds(args.collect()),
+            Some("suite") => suite(args.collect()),
+            Some("confirm") => confirm(args.collect()),
+            Some("properties") => properties(args.collect()),
+            Some("triage") => triage(args.collect()),
+            Some("verify-archive") => verify_archive(args.collect()),
+            Some("campaign") => super::campaign::run(args.collect()),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 Ok(())
@@ -241,11 +338,13 @@ mod cli {
     fn replay(args: Vec<String>) -> Result<(), Error> {
         let mut dir = None;
         let mut options = ReplayOptions::default();
+        let mut explain = false;
         for arg in args {
             let flag = match arg.as_str() {
                 "--allow-build-mismatch" => &mut options.allow_build_mismatch,
                 "--prefix" => &mut options.prefix,
                 "--observe" => &mut options.observe,
+                "--explain" => &mut explain,
                 _ if arg.starts_with('-') => {
                     return Err(Error::Usage(format!("unknown flag `{arg}`")))
                 }
@@ -272,8 +371,14 @@ mod cli {
         let trace = read.map_err(|error| {
             Error::Failed(format!("reading the trace in {}: {error}", dir.display()))
         })?;
-        let report =
-            trace::replay(&trace, options).map_err(|error| Error::Failed(error.to_string()))?;
+        let report = if explain {
+            let (report, text) = trace::replay_explained(&trace, options)
+                .map_err(|error| Error::Failed(error.to_string()))?;
+            print!("{text}");
+            report
+        } else {
+            trace::replay(&trace, options).map_err(|error| Error::Failed(error.to_string()))?
+        };
         let ran = report.end.as_ref().map_or_else(
             || format!("{} steps", trace.steps.len()),
             |end| format!("{} after {} steps", outcome(end), end.steps),
@@ -318,6 +423,646 @@ mod cli {
             );
         }
         Ok(())
+    }
+
+    /// `shrink`: reduces a trace, and prints what the shrink did. Fails if
+    /// the shrink couldn't start or the re-record failed.
+    #[allow(clippy::print_stdout)]
+    fn shrink(args: Vec<String>) -> Result<(), Error> {
+        let mut dir = None;
+        let mut out = None;
+        let mut budget = ShrinkBudget::default();
+        let mut seen = Vec::new();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if !arg.starts_with('-') {
+                if dir.replace(PathBuf::from(arg)).is_some() {
+                    return Err(Error::Usage(
+                        "`shrink` takes one trace directory".to_owned(),
+                    ));
+                }
+                continue;
+            }
+            if seen.contains(&arg) {
+                return Err(Error::Usage(format!("{arg} given twice")));
+            }
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{arg} needs a value")))?;
+            let number = || {
+                value
+                    .parse::<u32>()
+                    .map_err(|error| Error::Usage(format!("{arg}: {error}")))
+            };
+            match arg.as_str() {
+                "--out" => out = Some(PathBuf::from(&value)),
+                "--candidates" => budget.candidates = number()?,
+                "--wall-secs" => budget.wall = Duration::from_secs(number()?.into()),
+                _ => return Err(Error::Usage(format!("unknown flag `{arg}`"))),
+            }
+            seen.push(arg);
+        }
+        let dir = dir.ok_or_else(|| Error::Usage("`shrink` needs a trace directory".to_owned()))?;
+        let out = out.ok_or_else(|| Error::Usage("`shrink` needs --out".to_owned()))?;
+        let trace = TraceReader::open(&dir).map_err(|error| {
+            Error::Failed(format!("reading the trace in {}: {error}", dir.display()))
+        })?;
+        let report = trace::shrink(&trace, budget, &out)
+            .map_err(|error| Error::Failed(error.to_string()))?;
+        let stopped = match report.stopped {
+            None => "pass 4 reached a fixed point".to_owned(),
+            Some(stop) => format!("{stop} stopped it before pass 4 reached a fixed point"),
+        };
+        println!(
+            "shrank trace {} for {}: {} of {} candidates accepted; {stopped}",
+            report.original, report.property, report.accepted, report.candidates
+        );
+        println!(
+            "before: {} non-default picks and draws, {} events",
+            report.before.non_default, report.before.events
+        );
+        match (&report.reduced, report.after, &report.rerecord_failure) {
+            (Some(reduced), Some(after), _) => {
+                println!(
+                    "after: {} non-default picks and draws, {} events, in trace {reduced}",
+                    after.non_default, after.events
+                );
+                println!("report in {}", out.join(REPORT_FILE).display());
+                Ok(())
+            }
+            (_, _, failure) => Err(Error::Failed(format!(
+                "the re-record failed: {}. The original and the best plan are in {}",
+                failure.as_deref().unwrap_or("unknown"),
+                out.display()
+            ))),
+        }
+    }
+
+    /// `versions`: prints [`seed::versions`] for one harness.
+    #[allow(clippy::print_stdout)]
+    fn versions(args: Vec<String>) -> Result<(), Error> {
+        let sim = match args.as_slice() {
+            [flag, sim] if flag == "--sim" => sim,
+            _ => return Err(Error::Usage("`versions` takes --sim <name>".to_owned())),
+        };
+        let entry = harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
+        for (key, value) in seed::versions(entry) {
+            println!("{key}={value}");
+        }
+        Ok(())
+    }
+
+    /// The flags `seeds` takes, as given.
+    #[derive(Default)]
+    struct SeedArgs {
+        sim: Option<String>,
+        fixtures: Vec<PathBuf>,
+        out: Option<PathBuf>,
+        quarantine: Option<PathBuf>,
+        report: Option<PathBuf>,
+    }
+
+    /// `seeds`: validates the committed seeds, prints each one's result,
+    /// and writes the admitted and quarantined ones and the report where
+    /// the flags say. Fails if any required seed is rejected.
+    #[allow(clippy::print_stdout)]
+    fn seeds(args: Vec<String>) -> Result<(), Error> {
+        let mut flags = SeedArgs::default();
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{flag} needs a value")))?;
+            let slot_taken = match flag.as_str() {
+                "--sim" => flags.sim.replace(value).is_some(),
+                "--fixtures" => {
+                    flags.fixtures.push(value.into());
+                    false
+                }
+                "--out" => flags.out.replace(value.into()).is_some(),
+                "--quarantine" => flags.quarantine.replace(value.into()).is_some(),
+                "--report" => flags.report.replace(value.into()).is_some(),
+                _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
+            };
+            if slot_taken {
+                return Err(Error::Usage(format!("{flag} given twice")));
+            }
+        }
+        if flags.sim.is_none() && (flags.out.is_some() || flags.quarantine.is_some()) {
+            return Err(Error::Usage(
+                "--out and --quarantine hold one harness's seeds, so they need --sim".to_owned(),
+            ));
+        }
+        if let Some(sim) = &flags.sim {
+            harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
+        }
+        if flags.fixtures.is_empty() {
+            flags
+                .fixtures
+                .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
+        }
+        let report = seed::load(&flags.fixtures, flags.sim.as_deref())
+            .map_err(|error| Error::Failed(format!("listing the fixtures: {error}")))?;
+        if let Some(out) = &flags.out {
+            create(out)?;
+            for seed in &report.admitted {
+                write(&out.join(seed.input_sha256()), &seed.input)?;
+            }
+        }
+        if let Some(quarantine) = &flags.quarantine {
+            create(quarantine)?;
+            for failed in &report.quarantined {
+                quarantine_seed(quarantine, failed)?;
+            }
+        }
+        for seed in &report.admitted {
+            println!(
+                "admitted {} ({}, generator {}): {}",
+                seed.path.display(),
+                seed.sidecar.harness,
+                seed.sidecar.generator,
+                seed.input_sha256()
+            );
+        }
+        for failed in &report.quarantined {
+            println!("quarantined {}: {}", failed.path.display(), failed.error);
+        }
+        for failed in &report.rejected {
+            println!("rejected {}: {}", failed.path.display(), failed.error);
+        }
+        println!(
+            "{} admitted, {} quarantined, {} rejected, {} for other harnesses",
+            report.admitted.len(),
+            report.quarantined.len(),
+            report.rejected.len(),
+            report.other_harnesses
+        );
+        if let Some(path) = &flags.report {
+            let json = report_json(&report, flags.sim.as_deref(), &flags.fixtures)?;
+            write(path, json.as_bytes())?;
+        }
+        match report.rejected.len() {
+            0 => Ok(()),
+            rejected => Err(Error::Failed(format!(
+                "{rejected} required seeds failed validation"
+            ))),
+        }
+    }
+
+    /// `confirm`: confirms that a full fuzz input violates one property,
+    /// and writes the [`Confirmation`] to `--out`. Fails unless the input is
+    /// confirmed.
+    #[allow(clippy::print_stdout)]
+    fn confirm(args: Vec<String>) -> Result<(), Error> {
+        let mut flags = [None, None, None, None, None];
+        let names = ["--sim", "--input", "--property", "--out", "--against"];
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let slot = names
+                .iter()
+                .position(|name| *name == flag)
+                .ok_or_else(|| Error::Usage(format!("unknown flag `{flag}`")))?;
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{flag} needs a value")))?;
+            if flags[slot].replace(value).is_some() {
+                return Err(Error::Usage(format!("{flag} given twice")));
+            }
+        }
+        let [sim, input, property, out, against] = flags;
+        let need = |value: Option<String>, flag: &str| {
+            value.ok_or_else(|| Error::Usage(format!("`confirm` needs {flag}")))
+        };
+        let (sim, input, property, out) = (
+            need(sim, "--sim")?,
+            PathBuf::from(need(input, "--input")?),
+            need(property, "--property")?,
+            PathBuf::from(need(out, "--out")?),
+        );
+        let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
+        if entry.status(&property).is_none() {
+            return Err(Error::Usage(format!("{sim} doesn't register {property}")));
+        }
+        let read = |path: &PathBuf| {
+            std::fs::read(path)
+                .map_err(|error| Error::Failed(format!("reading {}: {error}", path.display())))
+        };
+        let against = match against {
+            None => None,
+            Some(path) => {
+                let path = PathBuf::from(path);
+                let original: Confirmation =
+                    serde_json::from_slice(&read(&path)?).map_err(|error| {
+                        Error::Failed(format!("reading {}: {error}", path.display()))
+                    })?;
+                Some(original)
+            }
+        };
+        let bytes = read(&input)?;
+        let mut confirmation = trace::confirm(entry, &bytes, &property, &out)
+            .map_err(|error| Error::Failed(error.to_string()))?;
+        if let Some(original) = &against {
+            confirmation = confirmation.against(original);
+        }
+        std::fs::create_dir_all(&out)
+            .map_err(|error| Error::Failed(format!("creating {}: {error}", out.display())))?;
+        let file = out.join(CONFIRMATION_FILE);
+        let text = serde_json::to_string_pretty(&confirmation)
+            .map_err(|error| Error::Failed(format!("writing {CONFIRMATION_FILE}: {error}")))?;
+        std::fs::write(&file, format!("{text}\n"))
+            .map_err(|error| Error::Failed(format!("writing {}: {error}", file.display())))?;
+        let detail = confirmation
+            .detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(": {detail}"));
+        match confirmation.status {
+            ConfirmStatus::Confirmed => {
+                println!(
+                    "confirmed {property} on {sim}: trace {} in {}",
+                    confirmation.trace_id.as_deref().unwrap_or_default(),
+                    file.display()
+                );
+                Ok(())
+            }
+            status => Err(Error::Failed(format!(
+                "{property} on {sim}: {status}{detail}; see {}",
+                file.display()
+            ))),
+        }
+    }
+
+    /// Writes the quarantined seed's file, its sidecar and its reason into
+    /// `dir` as `<name>.bin`, `<name>.toml` and `<name>.reason`. `<name>` is
+    /// the SHA-256 of the file's SHA-256 and the sidecar's, in hex, so two
+    /// seeds with the same bytes and different sidecars, such as two `plan`
+    /// seeds with different prefixes, keep separate records.
+    ///
+    /// A seed can be quarantined before [`seed::load`] reads its file, such
+    /// as for a stale generator, so nothing has bounded the file yet. A file
+    /// over [`MAX_INPUT_BYTES`], the largest fuzz input a trace holds, isn't
+    /// read in full or copied. Its length and path stand in for its SHA-256
+    /// in `<name>`, and the reason names the limit.
+    fn quarantine_seed(dir: &Path, failed: &Failed) -> Result<(), Error> {
+        let sidecar_path = failed.path.with_extension(seed::SIDECAR_EXTENSION);
+        let bytes = read_capped(&failed.path)?;
+        let sidecar = read_capped(&sidecar_path)?;
+        let mut reason = format!("{}: {}\n", failed.path.display(), failed.error);
+        let mut digests = String::new();
+        for (path, read) in [(&failed.path, &bytes), (&sidecar_path, &sidecar)] {
+            match read {
+                Ok(bytes) => digests.push_str(&seed::sha256(bytes)),
+                Err(len) => {
+                    // A hex digest holds no `:`, so this can't match one.
+                    let _ = write!(digests, "{len}:{}:", path.display());
+                    let _ = writeln!(
+                        reason,
+                        "{} is {len} bytes, over the {MAX_INPUT_BYTES}-byte MAX_INPUT_BYTES \
+                         limit, so the quarantine holds no copy of it",
+                        path.display()
+                    );
+                }
+            }
+        }
+        let name = seed::sha256(digests.as_bytes());
+        if let Ok(bytes) = &bytes {
+            write(&dir.join(format!("{name}.{}", seed::SEED_EXTENSION)), bytes)?;
+        }
+        if let Ok(sidecar) = &sidecar {
+            write(
+                &dir.join(format!("{name}.{}", seed::SIDECAR_EXTENSION)),
+                sidecar,
+            )?;
+        }
+        write(&dir.join(format!("{name}.reason")), reason.as_bytes())
+    }
+
+    /// The file at `path` if it holds at most [`MAX_INPUT_BYTES`], or its
+    /// length if it holds more. It reads at most one byte past the limit.
+    fn read_capped(path: &Path) -> Result<Result<Vec<u8>, u64>, Error> {
+        let failed =
+            |error: std::io::Error| Error::Failed(format!("reading {}: {error}", path.display()));
+        let file = File::open(path).map_err(failed)?;
+        let mut bytes = Vec::new();
+        (&file)
+            .take(MAX_INPUT_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(failed)?;
+        // A usize always fits in a u64 on supported targets.
+        if bytes.len() as u64 <= MAX_INPUT_BYTES {
+            return Ok(Ok(bytes));
+        }
+        let len = file.metadata().map_err(failed)?.len();
+        Ok(Err(len.max(bytes.len() as u64)))
+    }
+
+    /// `seeds --report`'s JSON: [`SeedReport::rows`]. It serializes
+    /// structs rather than a `Value`, so its key order doesn't depend on
+    /// `serde_json`'s `preserve_order`.
+    fn report_json(
+        report: &SeedReport,
+        sim: Option<&str>,
+        fixtures: &[PathBuf],
+    ) -> Result<String, Error> {
+        serde_json::to_string_pretty(&report.rows(sim, fixtures))
+            .map(|json| json + "\n")
+            .map_err(|error| Error::Failed(format!("serializing the report: {error}")))
+    }
+
+    /// `suite`: builds the full-suite manifest, prints its counts, and
+    /// writes it where `--out` says. Fails with every problem if the
+    /// manifest doesn't cover the suite, or with `--frozen` if the build or
+    /// the checkout is dirty, or the checkout isn't at the build's commit.
+    #[allow(clippy::print_stdout)]
+    fn suite(args: Vec<String>) -> Result<(), Error> {
+        let mut out = None;
+        let mut frozen = false;
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--frozen" if !frozen => frozen = true,
+                "--out" if out.is_none() => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| Error::Usage("--out needs a value".to_owned()))?;
+                    out = Some(PathBuf::from(value));
+                }
+                "--frozen" | "--out" => return Err(Error::Usage(format!("{flag} given twice"))),
+                _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
+            }
+        }
+        let root = seed::repo_root();
+        let dir = std::env::current_dir()
+            .map_err(|error| Error::Failed(format!("reading the working directory: {error}")))?;
+        if let Some(why) = suite::other_checkout(&root, &dir) {
+            return Err(Error::Failed(format!(
+                "{why}; build it in this checkout, or run `cargo xtask sim-suite`"
+            )));
+        }
+        let manifest = suite::manifest(&root).map_err(|problems| {
+            Error::Failed(format!(
+                "{} problems keep the manifest from covering the suite:\n{problems}",
+                problems.0.len()
+            ))
+        })?;
+        if let Some(why) = frozen
+            .then(|| suite::unfrozen(&root, &manifest.build))
+            .flatten()
+        {
+            return Err(Error::Failed(format!(
+                "--frozen needs a clean checkout at the build's commit: {why}"
+            )));
+        }
+        let counts = serde_json::to_string_pretty(&manifest.counts)
+            .map_err(|error| Error::Failed(format!("serializing the counts: {error}")))?;
+        println!(
+            "manifest of {}{}: {counts}",
+            manifest.build.git,
+            if manifest.build.dirty { " (dirty)" } else { "" }
+        );
+        if let Some(out) = out {
+            let json = serde_json::to_string_pretty(&manifest)
+                .map_err(|error| Error::Failed(format!("serializing the manifest: {error}")))?;
+            write(&out, format!("{json}\n").as_bytes())?;
+            println!("wrote {}", out.display());
+        }
+        Ok(())
+    }
+
+    /// Creates `dir` and its parents.
+    fn create(dir: &Path) -> Result<(), Error> {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| Error::Failed(format!("creating {}: {error}", dir.display())))
+    }
+
+    /// Writes `bytes` to a temporary file beside `path`, then renames it
+    /// to `path`, so an interrupted write never leaves a partial file under
+    /// a seed's digest.
+    fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let partial = path.with_file_name(format!(".{name}.{}.partial", std::process::id()));
+        std::fs::write(&partial, bytes)
+            .and_then(|()| std::fs::rename(&partial, path))
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&partial);
+                Error::Failed(format!("writing {}: {error}", path.display()))
+            })
+    }
+
+    /// `properties`: prints the ID of each property `--sim` registers, one
+    /// per line, in report order.
+    #[allow(clippy::print_stdout)]
+    fn properties(args: Vec<String>) -> Result<(), Error> {
+        let sim = match <[String; 2]>::try_from(args) {
+            Ok([flag, sim]) if flag == "--sim" => sim,
+            _ => return Err(Error::Usage("`properties` takes --sim <name>".to_owned())),
+        };
+        let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
+        for property in (entry.properties)() {
+            println!("{}", property.id);
+        }
+        Ok(())
+    }
+
+    /// `triage`: confirms each input's failure in fresh processes and
+    /// archives it, and with `--target` minimizes each confirmed `Active`
+    /// failure. Fails only if an input couldn't be archived.
+    #[allow(clippy::print_stdout, clippy::print_stderr)]
+    fn triage(args: Vec<String>) -> Result<(), Error> {
+        let mut sim = None;
+        let mut out = None;
+        let mut options = TriageOptions::default();
+        let mut target = None;
+        let mut runs = None;
+        let mut wall = None;
+        let mut sanitizer = None;
+        let mut inputs = Vec::new();
+        let mut seen = Vec::new();
+        let positive = |arg: &str, value: &str| {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| Error::Usage(format!("{arg}: expected a positive whole number")))
+        };
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if !arg.starts_with('-') {
+                inputs.push(PathBuf::from(arg));
+                continue;
+            }
+            if seen.contains(&arg) {
+                return Err(Error::Usage(format!("{arg} given twice")));
+            }
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{arg} needs a value")))?;
+            match arg.as_str() {
+                "--sim" => sim = Some(value),
+                "--out" => out = Some(PathBuf::from(value)),
+                "--child-secs" => {
+                    options.child_timeout = Duration::from_secs(u64::from(positive(&arg, &value)?));
+                }
+                "--target" => target = Some(value),
+                "--runs" => runs = Some(positive(&arg, &value)?),
+                "--wall-secs" => {
+                    wall = Some(Duration::from_secs(u64::from(positive(&arg, &value)?)))
+                }
+                "--sanitizer" if ["address", "none"].contains(&value.as_str()) => {
+                    sanitizer = Some(value);
+                }
+                "--sanitizer" => {
+                    return Err(Error::Usage(format!(
+                        "--sanitizer is address or none, not {value}"
+                    )))
+                }
+                _ => return Err(Error::Usage(format!("unknown flag `{arg}`"))),
+            }
+            seen.push(arg);
+        }
+        let sim = sim.ok_or_else(|| Error::Usage("`triage` needs --sim".to_owned()))?;
+        let out = out.ok_or_else(|| Error::Usage("`triage` needs --out".to_owned()))?;
+        if inputs.is_empty() {
+            return Err(Error::Usage("`triage` needs at least one input".to_owned()));
+        }
+        // `cargo xtask sim-minimize` takes every budget explicitly.
+        let minimize = match (target, runs, wall) {
+            (None, None, None) if sanitizer.is_none() => None,
+            (Some(target), Some(runs), Some(wall)) => Some(SimMinimize {
+                // The workspace this binary was built from, so the
+                // minimizer builds the same source.
+                workspace: Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".."),
+                target,
+                runs,
+                wall,
+                child: options.child_timeout,
+                sanitizer,
+            }),
+            _ => {
+                return Err(Error::Usage(
+                    "--target, --runs and --wall-secs go together, and --sanitizer needs them"
+                        .to_owned(),
+                ))
+            }
+        };
+        let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
+        // Every input's children run one copy of this binary, even after
+        // the minimizer rebuilds it.
+        let pinned = PinnedBinary::new(&out)
+            .map_err(|error| Error::Failed(format!("pinning this binary: {error}")))?;
+        let children = SimChildren {
+            exe: pinned.exe().to_owned(),
+            harness: sim,
+            minimize,
+        };
+        let mut failed = 0;
+        for input in &inputs {
+            match triage::triage(entry, &children, input, &out, options) {
+                Ok(triaged) => {
+                    let class = match (&triaged.bucket, &triaged.signature) {
+                        (Some(bucket), Some(signature)) => {
+                            format!(" in {}: {signature}", bucket.name())
+                        }
+                        _ => String::new(),
+                    };
+                    let kept = |archived| {
+                        if archived {
+                            "archived in"
+                        } else {
+                            "already archived in"
+                        }
+                    };
+                    println!(
+                        "{}: {}{class}; {} {}",
+                        input.display(),
+                        triaged.status.name(),
+                        kept(triaged.archived),
+                        triaged.bundle.display()
+                    );
+                    match &triaged.minimization {
+                        None => {}
+                        Some(Minimization::Kept { bundle, archived }) => println!(
+                            "{}: minimized; {} {}",
+                            input.display(),
+                            kept(*archived),
+                            bundle.display()
+                        ),
+                        Some(Minimization::NotKept { reason, staging }) => println!(
+                            "{}: not minimized: {reason}; the minimizer's output is in {}",
+                            input.display(),
+                            staging.display()
+                        ),
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    eprintln!("{}: not archived: {error}", input.display());
+                }
+            }
+        }
+        match failed {
+            0 => Ok(()),
+            failed => Err(Error::Failed(format!(
+                "{failed} of {} inputs weren't archived",
+                inputs.len()
+            ))),
+        }
+    }
+
+    /// `verify-archive`: checks every bundle under a triage archive, and
+    /// prints how many bundles each harness, provenance and signature has.
+    /// Fails if any bundle doesn't match its checksums.
+    #[allow(clippy::print_stdout, clippy::print_stderr)]
+    fn verify_archive(args: Vec<String>) -> Result<(), Error> {
+        let [dir] = <[String; 1]>::try_from(args)
+            .map_err(|_| Error::Usage("`verify-archive` takes one archive directory".to_owned()))?;
+        let dir = PathBuf::from(dir);
+        let read = |error: std::io::Error| {
+            Error::Failed(format!("reading the archive in {}: {error}", dir.display()))
+        };
+        let bundles = triage::bundles(&dir).map_err(read)?;
+        let mut bad = 0;
+        let mut groups: std::collections::BTreeMap<(PathBuf, bool), (usize, String)> =
+            std::collections::BTreeMap::new();
+        for bundle in &bundles {
+            let problems = triage::verify(bundle).map_err(read)?;
+            for problem in &problems {
+                eprintln!("{}: {problem}", bundle.display());
+            }
+            bad += usize::from(!problems.is_empty());
+            let minimized = triage::is_minimized(bundle);
+            let file = if minimized {
+                MINIMIZED_FILE
+            } else {
+                TRIAGE_FILE
+            };
+            let report: Value = std::fs::read(bundle.join(file))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(Value::Null);
+            let mut name = report["signature"]
+                .as_str()
+                .or(report["status"].as_str())
+                .map_or_else(|| format!("unreadable {file}"), str::to_owned);
+            if minimized {
+                name.push_str(", minimized");
+            }
+            let group = bundle.parent().unwrap_or(&dir).to_owned();
+            groups.entry((group, minimized)).or_insert((0, name)).0 += 1;
+        }
+        for ((group, _), (count, name)) in &groups {
+            let group = group.strip_prefix(&dir).unwrap_or(group);
+            println!("{count} {}: {name}", group.display());
+        }
+        match bad {
+            0 => {
+                println!("{} bundles match their checksums", bundles.len());
+                Ok(())
+            }
+            bad => Err(Error::Failed(format!(
+                "{bad} of {} bundles don't match their checksums",
+                bundles.len()
+            ))),
+        }
     }
 
     /// Reads `record`'s flags. Each takes one value and may appear once.

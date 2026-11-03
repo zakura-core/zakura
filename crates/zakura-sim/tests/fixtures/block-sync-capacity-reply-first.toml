@@ -1,0 +1,10 @@
+# The committed fuzz input `block-sync-capacity-reply-first.bin`: the
+# harness that runs it, the generator version it was built for, and its
+# SHA-256. Its first two bytes, `ff 08`, pick the capacity-release scenario.
+# Its plan has block sync handle the detached commit's reply before its tip,
+# so the freed room wakes the waiting body.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "d4c200d4dbce4f9c68f34c674d96d7e475926dc38af62d5381fcb8dc575510c5"
+scenario_sha256 = "2600bcc1b48cc63528b37dc6c2fff869c756f9551e11e8a43e0117d5ee19157d"
+source = "crates/zakura-sim/tests/block_semantic_properties.rs"

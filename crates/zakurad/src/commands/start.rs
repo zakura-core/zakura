@@ -566,7 +566,7 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
-        let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
+        let (peer_set, address_book, misbehavior_sender, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
                 config.network.clone(),
                 inbound,
@@ -682,6 +682,7 @@ impl StartCmd {
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
         );
+        let mempool_verification_finished = mempool.verification_finished();
         let mempool = spawn_buffer(
             BoxService::new(mempool),
             mempool::downloads::MAX_INBOUND_CONCURRENCY,
@@ -835,7 +836,7 @@ impl StartCmd {
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change.clone(),
-                peer_set.clone(),
+                block_adverts,
                 Some(submit_block_channel.receiver()),
             )
             .in_current_span(),
@@ -843,7 +844,8 @@ impl StartCmd {
         node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+        let mempool_queue_checker_task_handle =
+            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
         node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");

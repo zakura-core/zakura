@@ -178,7 +178,7 @@ fn prepare_sprout_block(
                     outputs: Vec::new(),
                     lock_time: LockTime::min_lock_time_timestamp(),
                     expiry_height: Height(0),
-                    joinsplit_data,
+                    joinsplit_data: joinsplit_data.map(Box::new),
                     sapling_shielded_data: None,
                 }))
         });

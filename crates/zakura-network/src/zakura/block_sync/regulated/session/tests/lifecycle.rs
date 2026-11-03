@@ -47,6 +47,7 @@ fn compact_session_lifecycle_peak() {
                     let (send, mut output) = framed_channel(4);
                     let mut session = serving.session(
                         &peer,
+                        SessionKey::default(),
                         send,
                         cancel.clone(),
                         CancellationToken::new(),
@@ -100,6 +101,7 @@ fn compact_session_lifecycle_peak() {
                     let (send, output) = framed_channel(4);
                     let mut session = serving.session(
                         &peer,
+                        SessionKey::default(),
                         send,
                         cancel.clone(),
                         CancellationToken::new(),

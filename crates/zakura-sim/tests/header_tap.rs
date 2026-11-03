@@ -836,6 +836,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Started { .. } => "started",
                 ReactorFact::Retired { .. } => "retired",
                 ReactorFact::OfferWaiting { .. } => "offer-waiting",
+                ReactorFact::Misbehavior { .. } => "misbehavior",
             }),
             _ => None,
         })

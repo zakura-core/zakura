@@ -1334,7 +1334,7 @@ fn source_id(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
 }
 
 #[cfg(test)]
-mod engine_comparison;
+pub(crate) mod engine_comparison;
 
 #[cfg(test)]
 mod tests {

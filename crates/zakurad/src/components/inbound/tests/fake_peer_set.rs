@@ -6,7 +6,12 @@ use std::{collections::HashSet, iter, net::SocketAddr, str::FromStr, sync::Arc, 
 
 use futures::FutureExt;
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    builder::ServiceBuilder,
+    util::{BoxCloneSyncService, BoxService},
+    Service, ServiceExt,
+};
 use tracing::{Instrument, Span};
 
 use zakura_chain::{
@@ -63,6 +68,35 @@ async fn wait_for_gossip() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn empty_mempool_requests_return_empty_inventory() {
+    let (
+        inbound_service,
+        _mempool_guard,
+        _committed_blocks,
+        _added_transactions,
+        _mock_tx_verifier,
+        mut peer_set,
+        _state_guard,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let response = timeout(
+        Duration::from_secs(1),
+        inbound_service.oneshot(Request::MempoolTransactionIds),
+    )
+    .await
+    .expect("the empty mempool must answer promptly")
+    .expect("the initialized mempool answers transaction ID requests");
+    // A nil response sends nothing on the wire and leaves the peer waiting for its timeout.
+    assert_eq!(response, Response::TransactionIds(Vec::new()));
+    peer_set.expect_no_requests().await;
+    sync_gossip_task_handle.abort();
+    tx_gossip_task_handle.abort();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mempool_requests_for_transactions() {
     let (
         inbound_service,
@@ -89,17 +123,11 @@ async fn mempool_requests_for_transactions() {
         .clone()
         .oneshot(Request::MempoolTransactionIds)
         .await;
+    // Even an empty mempool must produce an inventory reply, not leave the peer waiting.
     match response {
         Ok(Response::TransactionIds(response)) => assert_eq!(response, added_transaction_ids),
-        Ok(Response::Nil) => assert!(
-            added_transaction_ids.is_empty(),
-            "`MempoolTransactionIds` request should match added_transaction_ids {added_transaction_ids:?}, got Ok(Nil)"
-        ),
-        _ => unreachable!(
-            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`, got {:?}",
-            response
-        ),
-    };
+        response => panic!("Mempool requests must return transaction IDs, got {response:?}"),
+    }
 
     // Test `Request::TransactionsById`
     let hash_set = added_transaction_ids
@@ -209,7 +237,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![test_transaction_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Make sure there is an additional request broadcasting the
@@ -481,7 +509,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![test_transaction_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Make sure there is an additional request broadcasting the
@@ -669,7 +697,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![tx1_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Add a new block to the state (make the chain tip advance)
@@ -732,18 +760,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         .oneshot(Request::MempoolTransactionIds)
         .await;
 
-    match request {
-        Ok(Response::TransactionIds(response)) => {
-            assert_eq!(response, vec![tx1_id])
-        }
-        Ok(Response::Nil) => panic!(
-            "response to `MempoolTransactionIds` request should match {:?}",
-            vec![tx1_id]
-        ),
-        _ => unreachable!(
-            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`"
-        ),
-    };
+    assert_eq!(
+        request.expect("the initialized mempool answers transaction ID requests"),
+        Response::TransactionIds(vec![tx1_id]),
+    );
 
     // As our test transaction will expire at a block height greater or equal to 3 we need to push block 3.
     let block_three: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
@@ -810,7 +830,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![tx2_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
+        "Mempool requests should always return transaction IDs, including an empty list",
     );
 
     // Check if tx1 was added to the rejected list as well
@@ -878,18 +898,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .await;
 
         // tx2 is still in the mempool as the blockchain progress because the zero expiration height
-        match request {
-            Ok(Response::TransactionIds(response)) => {
-                assert_eq!(response, vec![tx2_id])
-            }
-            Ok(Response::Nil) => panic!(
-                "response to `MempoolTransactionIds` request should match {:?}",
-                vec![tx2_id]
-            ),
-            _ => unreachable!(
-                "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`"
-            ),
-        };
+        assert_eq!(
+            request.expect("the initialized mempool answers transaction ID requests"),
+            Response::TransactionIds(vec![tx2_id]),
+        );
     }
 
     // All commits and expected gossip are done, so the quiet check can use virtual time.
@@ -1019,6 +1031,88 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         .respond(Response::Blocks(vec![Available((canonical, None))]));
 
     tx_verifier.expect_no_requests().await;
+
+    Ok(())
+}
+
+/// Test that a poisoned parent recovery scores its supplying peer without re-requesting the parent.
+///
+/// A re-request would be an ordinary download, outside the recovery bounds.
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result<(), crate::BoxError>
+{
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        _tx_verifier,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        _sync_gossip_task_handle,
+        _tx_gossip_task_handle,
+        mut misbehavior_rx,
+    ) = setup_with_misbehavior_receiver(false).await;
+
+    // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
+    // the tip child.
+    let parent: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
+    let child_hash = child.hash();
+    let parent_hash = parent.hash();
+    let poisoned_parent = poison_coinbase_height(&parent, Height(1));
+
+    let advertiser_addr: PeerSocketAddr = "127.0.0.1:8233".parse()?;
+    let source = zakura_network::PeerSource::LegacySocket(advertiser_addr);
+
+    let _request = inbound_service
+        .clone()
+        .oneshot(Request::AdvertiseBlock(child_hash, Some(source.clone())))
+        .await?;
+
+    peer_set
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: iter::once(child_hash).collect(),
+            source: source.clone(),
+        })
+        .await
+        .respond(Response::Blocks(vec![Available((
+            child,
+            Some(advertiser_addr),
+        ))]));
+
+    peer_set
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: iter::once(parent_hash).collect(),
+            source,
+        })
+        .await
+        .respond(Response::Blocks(vec![Available((
+            poisoned_parent,
+            Some(advertiser_addr),
+        ))]));
+
+    // The score is sent from `Inbound::poll_ready`, so drive it until the report lands.
+    let mut report = None;
+    for _ in 0..50 {
+        let _ = inbound_service
+            .clone()
+            .oneshot(Request::MempoolTransactionIds)
+            .await;
+
+        if let Ok(received) = timeout(Duration::from_millis(100), misbehavior_rx.recv()).await {
+            report = Some(received);
+            break;
+        }
+    }
+    assert_eq!(
+        report.expect("a poisoned parent recovery must score its supplier"),
+        Some((advertiser_addr, 100)),
+    );
+
+    peer_set.expect_no_requests().await;
 
     Ok(())
 }
@@ -1178,8 +1272,9 @@ async fn caches_getaddr_response() {
 
         let peer_set = MockService::build()
             .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
-            .for_unit_tests();
-        let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+            .for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>();
+        let buffered_peer_set =
+            BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
         let buffered_mempool_service =
             Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 10);
@@ -1361,7 +1456,8 @@ async fn setup_with_misbehavior_receiver(
     let mut peer_set = MockService::build()
         .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
         .for_unit_tests();
-    let buffered_peer_set = Buffer::new(BoxService::new(peer_set.clone()), 10);
+    let buffered_peer_set =
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 10));
 
     let mock_tx_verifier = MockService::build().for_unit_tests();
     let buffered_tx_verifier = Buffer::new(BoxService::new(mock_tx_verifier.clone()), 10);

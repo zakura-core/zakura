@@ -7,13 +7,13 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use zakura_scheduler::{
-    CleanupReport, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
+    At, CleanupReport, ObjectId, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
 };
 
 use crate::{
@@ -66,6 +66,19 @@ impl Default for RunConfig {
     }
 }
 
+/// A harness rule that keeps ready tasks out of the enabled set, so a run
+/// can pause a task at a chosen point, as a busy thread would pause it.
+///
+/// A held task sits out only while something else is enabled. When only
+/// held tasks are ready, the clock can still move, as it would for a slow
+/// thread. When nothing else is enabled at all, every held task is enabled
+/// again, so a hold never ends a run.
+pub trait TaskHold {
+    /// True if `task`, which resumes at `at`, sits out the next pick. The
+    /// run asks after each step's observations, once per ready task.
+    fn holds(&self, task: TaskId, at: &At) -> bool;
+}
+
 /// One step's pick, for tests and reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pick {
@@ -96,6 +109,14 @@ pub struct RunReport {
     pub resolved: Plan,
 }
 
+impl RunReport {
+    /// The `end` record the run wrote, or would have written to a sink that
+    /// keeps records.
+    pub(crate) fn end_record(&self) -> EndRecord {
+        end_record(&self.end, &self.properties, self.cleanup, &self.picks)
+    }
+}
+
 /// One simulated run.
 pub struct Sim {
     /// `None` once shut down.
@@ -110,6 +131,8 @@ pub struct Sim {
     /// This run's ID, unique within the process.
     run_id: u64,
     config: RunConfig,
+    /// The harness's task holds.
+    holds: Vec<Box<dyn TaskHold>>,
 }
 
 impl Sim {
@@ -134,7 +157,14 @@ impl Sim {
             evidence: Vec::new(),
             run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             config,
+            holds: Vec::new(),
         }
+    }
+
+    /// Keeps the ready tasks `hold` names out of each step's enabled set,
+    /// as [`TaskHold`] describes. A trace replays only with the same holds.
+    pub fn hold_tasks(&mut self, hold: Box<dyn TaskHold>) {
+        self.holds.push(hold);
     }
 
     /// The run's scheduler, for setup such as spawning the tasks under test.
@@ -179,7 +209,9 @@ impl Sim {
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
     /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
-    /// each step, then `end`.
+    /// each step, then `end`. A sink that doesn't want steps
+    /// ([`RecordSink::wants_steps`]) gets only `init` and `end`, and the run
+    /// skips each step's `obs` digest.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
         state.log.set_run(self.run_id);
@@ -307,6 +339,8 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
+        // Read once, so a run never emits only some of its steps.
+        let record_steps = sink.wants_steps();
         if let Err(failure) = self.observe_sources(st) {
             return st.end_harness(failure);
         }
@@ -340,12 +374,34 @@ impl Sim {
             if let Some(failure) = self.failure.take() {
                 return st.end_harness(failure);
             }
+            // Held tasks sit out, unless nothing else is enabled. With only
+            // held tasks ready, the clock can move, as for a slow thread.
+            let free: Option<Vec<(Identity, TaskId)>> = (!st.held.is_empty()).then(|| {
+                ready
+                    .iter()
+                    .filter(|(_, task)| !st.held.contains(task))
+                    .cloned()
+                    .collect()
+            });
             let enabled = match enabled_set(&EnabledInputs {
                 phase,
                 now,
-                ready: &ready,
+                ready: free.as_deref().unwrap_or(&ready),
                 next_deadline: self.sched().next_deadline(),
                 offers: &offers,
+            })
+            .and_then(|enabled| {
+                if enabled.is_empty() && free.is_some() {
+                    enabled_set(&EnabledInputs {
+                        phase,
+                        now,
+                        ready: &ready,
+                        next_deadline: self.sched().next_deadline(),
+                        offers: &offers,
+                    })
+                } else {
+                    Ok(enabled)
+                }
             }) {
                 Ok(enabled) => enabled,
                 Err(identity) => {
@@ -411,16 +467,18 @@ impl Sim {
             };
 
             let next = self.ready(st);
-            sink.record(Record::Step(StepRecord {
-                step: st.step,
-                pick: chosen.identity.to_string(),
-                key: None,
-                options: enabled.len(),
-                by: decision.by,
-                offset: decision.offset,
-                draws,
-                obs: Some(digest(st.log.of_step(st.step))),
-            }));
+            if record_steps {
+                sink.record(Record::Step(StepRecord {
+                    step: st.step,
+                    pick: chosen.identity.to_string(),
+                    key: None,
+                    options: enabled.len(),
+                    by: decision.by,
+                    offset: decision.offset,
+                    draws,
+                    obs: Some(digest(st.log.of_step(st.step))),
+                }));
+            }
             if let Some(failure) = self.failure.take() {
                 return st.end_harness(failure);
             }
@@ -620,6 +678,7 @@ impl Sim {
                     RunOutcome::Reached(at) => Observation::TaskReached {
                         task: name,
                         at: at.to_string(),
+                        object: at.object.map(|object| self.object_name(st, object)),
                         site: at.site.map(|s| format!("{}:{}", s.file(), s.line())),
                     },
                     RunOutcome::Waiting => Observation::TaskWaiting { task: name },
@@ -643,12 +702,33 @@ impl Sim {
         Ok(())
     }
 
+    /// `object` as `<creator>:object#<n>`. The creator is the creating task's
+    /// name, or `setup` outside any task. A name survives unrelated code
+    /// changes, and a `TaskId` doesn't.
+    fn object_name(&self, st: &State, object: ObjectId) -> String {
+        let creator = match object.creator {
+            // A task makes objects only while it runs, so it was offered and
+            // named first.
+            Some(task) => st
+                .names
+                .get(&task)
+                .cloned()
+                .unwrap_or_else(|| self.sched().task_name(task)),
+            None => "setup".to_owned(),
+        };
+        format!("{creator}:object#{}", object.ordinal)
+    }
+
     /// The scheduler's ready tasks with their identities. Records each task
-    /// seen for the first time as spawned.
+    /// seen for the first time as spawned, and which ones the harness holds.
     fn ready(&self, st: &mut State) -> Result<Vec<(Identity, TaskId)>, HarnessFailure> {
         let ready = self.sched().ready();
         let mut out = Vec::with_capacity(ready.len());
+        st.held.clear();
         for r in ready {
+            if self.holds.iter().any(|hold| hold.holds(r.task, &r.at)) {
+                st.held.insert(r.task);
+            }
             let name = match st.names.get(&r.task) {
                 Some(name) => name.clone(),
                 None => {
@@ -673,6 +753,8 @@ impl Sim {
 struct State {
     step: u64,
     names: BTreeMap<TaskId, String>,
+    /// The ready tasks the harness holds this step.
+    held: BTreeSet<TaskId>,
     log: ObservationLog,
     picks: Vec<Pick>,
 }

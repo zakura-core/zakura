@@ -1378,7 +1378,7 @@ fn transaction_v4_with_joinsplit_data(
         outputs: Vec::new(),
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
-        joinsplit_data,
+        joinsplit_data: joinsplit_data.map(Box::new),
         sapling_shielded_data: None,
     }
 }
@@ -1447,7 +1447,7 @@ fn transaction_v4_with_sapling_shielded_data(
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
         joinsplit_data: None,
-        sapling_shielded_data,
+        sapling_shielded_data: sapling_shielded_data.map(Box::new),
     }
 }
 
@@ -1488,7 +1488,7 @@ fn transaction_v5_with_orchard_shielded_data(
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
         sapling_shielded_data: None,
-        orchard_shielded_data,
+        orchard_shielded_data: orchard_shielded_data.map(Box::new),
     }
 }
 

@@ -460,10 +460,8 @@ pub(super) struct SequencerPayloads {
     entries: std::collections::BTreeMap<super::reorder::BodyId, BufferedBlockBody>,
     next_id: u64,
     /// The last raw payload the pool refused for capacity, with its admission
-    /// and the capacity version read before the attempt. Decoding it again
-    /// before capacity changes would only repeat the refusal. A release or a
-    /// rollback during the attempt changes the version, so the next pass
-    /// retries.
+    /// and its decoded size. Decoding it again before the pool has room for
+    /// that size would only repeat the refusal.
     capacity_refused: Option<(super::reorder::BodyId, Admission, u64)>,
 }
 
@@ -530,15 +528,15 @@ impl SequencerPayloads {
     }
 
     /// Decode the payload `id` under `admission` when it is still raw, and borrow
-    /// its charged block for a submission. `capacity_version` is the pool's
-    /// version, read before this call.
+    /// its charged block for a submission. A payload the pool refused for
+    /// capacity is not decoded again until the pool has room for its decoded
+    /// size, so the caller reads the pool's capacity version before this call.
     #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
     pub(super) fn materialize(
         &mut self,
         id: super::reorder::BodyId,
         pool: &DecodedBlockPool,
         admission: Admission,
-        capacity_version: u64,
     ) -> Result<MaterializedBody, AdmissionFailure> {
         let body = self
             .entries
@@ -551,15 +549,24 @@ impl SequencerPayloads {
             ),
             _ => None,
         };
-        let attempt = (id, admission, capacity_version);
-        if newly_decoded_wire_bytes.is_some() && self.capacity_refused == Some(attempt) {
-            return Err(AdmissionFailure::Capacity);
-        }
-        let block = body.decoded_block(pool, admission).inspect_err(|failure| {
-            if *failure == AdmissionFailure::Capacity {
-                self.capacity_refused = Some(attempt);
+        if let Some((refused, refused_admission, decoded_bytes)) = self.capacity_refused {
+            if newly_decoded_wire_bytes.is_some()
+                && (refused, refused_admission) == (id, admission)
+                && !pool.is_closed()
+                && !pool.has_room_for(decoded_bytes, admission)
+            {
+                return Err(AdmissionFailure::Capacity);
             }
-        })?;
+        }
+        let block = match body.decoded_block(pool, admission) {
+            Ok(block) => block,
+            Err(refusal) => {
+                if refusal.reason == AdmissionFailure::Capacity {
+                    self.capacity_refused = Some((id, admission, refusal.decoded_bytes));
+                }
+                return Err(refusal.reason);
+            }
+        };
         Ok(MaterializedBody {
             block,
             decoded_bytes: body.decoded_attributed_memory_size_bytes(),
@@ -992,7 +999,6 @@ impl SequencerIO {
                 submission.id,
                 &self.decoded_pool,
                 submission.admission,
-                capacity_version,
             ) {
                 Ok(materialized) => materialized,
                 Err(AdmissionFailure::Capacity) => {

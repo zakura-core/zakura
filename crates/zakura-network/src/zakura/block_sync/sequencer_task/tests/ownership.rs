@@ -398,47 +398,47 @@ fn runtime_payload(
     (policy, payloads, weak)
 }
 
-/// A raw body the pool refuses for capacity is decoded again only after the
-/// capacity version or its admission changes.
+/// A raw body the pool refuses for capacity keeps its decoded size, and is
+/// refused without decoding until the pool has room for that size.
 #[test]
-fn capacity_refused_payload_waits_for_a_capacity_change() {
+fn capacity_refused_payload_waits_for_room_for_its_size() {
     let decode = |bytes: &[u8]| -> block::Block { bytes.zcash_deserialize_into().unwrap() };
     let (_policy, mut payloads, _) = runtime_payload(
         block::Height(2),
         Arc::new(decode(BLOCK_MAINNET_2_BYTES.as_slice())),
     );
     let id = payloads.retained_ids().next().unwrap();
-    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(4).unwrap(), 1);
-    let holder = pool
-        .try_admit(
-            decode(BLOCK_MAINNET_3_BYTES.as_slice()),
-            Admission::PipelineExempt,
-        )
-        .unwrap();
-    let full = pool.capacity_version();
+    let size = decode(BLOCK_MAINNET_2_BYTES.as_slice()).attributed_memory_size_bytes();
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(4).unwrap(), size);
+    let hold = |bytes: &[u8]| {
+        pool.try_admit(decode(bytes), Admission::PipelineExempt)
+            .unwrap()
+    };
+    let (first, second) = (
+        hold(BLOCK_MAINNET_3_BYTES.as_slice()),
+        hold(BLOCK_MAINNET_5_BYTES.as_slice()),
+    );
 
-    let refused = payloads.materialize(id, &pool, Admission::WithinLimit, full);
+    let refused = payloads.materialize(id, &pool, Admission::WithinLimit);
     assert!(matches!(refused, Err(AdmissionFailure::Capacity)));
     assert_eq!(
         payloads.capacity_refused,
-        Some((id, Admission::WithinLimit, full))
+        Some((id, Admission::WithinLimit, size)),
+        "the refusal keeps the decoded size"
     );
-    let skipped = payloads.materialize(id, &pool, Admission::WithinLimit, full);
+
+    first.leave_pipeline();
+    assert!(
+        !pool.has_room_for(size, Admission::WithinLimit),
+        "the release leaves too little room"
+    );
+    let skipped = payloads.materialize(id, &pool, Admission::WithinLimit);
     assert!(matches!(skipped, Err(AdmissionFailure::Capacity)));
 
-    holder.leave_pipeline();
-    let released = pool.capacity_version();
-    assert_ne!(released, full, "a release changes capacity");
-    let retried = payloads.materialize(id, &pool, Admission::WithinLimit, released);
-    assert!(matches!(retried, Err(AdmissionFailure::Capacity)));
-    assert_eq!(
-        payloads.capacity_refused,
-        Some((id, Admission::WithinLimit, released)),
-        "the retry decoded and recorded its own refusal"
-    );
-
-    let exempt = payloads.materialize(id, &pool, Admission::PipelineExempt, released);
-    assert!(exempt.is_ok(), "another admission is a new attempt");
+    second.leave_pipeline();
+    assert!(pool.has_room_for(size, Admission::WithinLimit));
+    let admitted = payloads.materialize(id, &pool, Admission::WithinLimit);
+    assert_eq!(admitted.unwrap().decoded_bytes, size);
 }
 
 #[test]
@@ -470,7 +470,6 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
             facts.id,
             &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
             Admission::WithinLimit,
-            0,
         )
         .unwrap();
     policy
@@ -821,7 +820,8 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
 
     assert_eq!(
         body.decoded_block(&pool, Admission::WithinLimit)
-            .unwrap_err(),
+            .unwrap_err()
+            .reason,
         AdmissionFailure::Capacity
     );
     assert!(!body.is_decoded(), "refusal keeps the raw fallback");

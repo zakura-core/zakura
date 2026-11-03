@@ -115,7 +115,21 @@ pub async fn handle_rpc_call<S: RpcServiceT>(
     max_batch_entries: usize,
     max_response_body_size: usize,
 ) -> MethodResponse {
-    match Body::parse(body, is_single, max_batch_entries) {
+    handle_parsed_rpc_call(
+        Body::parse(body, is_single, max_batch_entries),
+        service,
+        max_response_body_size,
+    )
+    .await
+}
+
+/// Dispatches an already-decoded message while the HTTP service holds its request permit.
+pub(super) async fn handle_parsed_rpc_call<S: RpcServiceT>(
+    body: Body<'_>,
+    service: &S,
+    max_response_body_size: usize,
+) -> MethodResponse {
+    match body {
         Body::Call(request) => service.call(request).await,
         Body::Notification(notification) => service.notification(notification).await,
         Body::Error(response) => response,

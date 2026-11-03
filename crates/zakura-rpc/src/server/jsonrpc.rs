@@ -12,6 +12,8 @@ use serde::{
 };
 use serde_json::value::RawValue;
 
+pub(super) mod compatibility;
+
 /// The result of an RPC method.
 pub type RpcResult<T> = Result<T, ErrorObject>;
 

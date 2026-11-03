@@ -17,8 +17,12 @@ use tokio::sync::Semaphore;
 use tower::{BoxError, Service};
 
 use super::{
-    jsonrpc::{ErrorCode, ErrorObject, Id, MethodResponse},
-    rpc_service::{handle_rpc_call, RpcServiceT},
+    http_request_compatibility::CollectedRequestBody,
+    jsonrpc::{
+        compatibility::{prepare, response_format, PreparationError},
+        ErrorCode, ErrorObject, Id, MethodResponse,
+    },
+    rpc_service::{handle_parsed_rpc_call, handle_rpc_call, RpcServiceT},
 };
 
 /// The body of HTTP requests passed to [`JsonRpcHttpService`], and of its responses.
@@ -118,7 +122,52 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
             );
         }
 
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
+        if let Some(CollectedRequestBody(bytes)) = parts.extensions.remove() {
+            if content_length(&parts.headers) > MAX_REQUEST_BODY_SIZE {
+                return json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    response_format(&bytes)
+                        .format_response(MethodResponse::too_large_request(MAX_REQUEST_BODY_SIZE)),
+                );
+            }
+            // The request permit acquired by `call` remains held through preparation,
+            // method execution and legacy response formatting.
+            let prepared = match prepare(
+                &bytes,
+                self.max_batch_entries,
+                usize::try_from(MAX_REQUEST_BODY_SIZE)
+                    .expect("the u32 body limit fits on supported platforms"),
+            ) {
+                Ok(prepared) => prepared,
+                Err(PreparationError::MalformedBody) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        MethodResponse::error(Id::Null, ErrorCode::ParseError.into()),
+                    );
+                }
+                Err(PreparationError::InnerBodyTooLarge(format)) => {
+                    return json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format.format_response(MethodResponse::error(
+                            Id::Null,
+                            ErrorCode::InternalError.into(),
+                        )),
+                    );
+                }
+            };
+            let response = handle_parsed_rpc_call(
+                prepared.message,
+                &self.rpc_service,
+                self.max_response_body_size,
+            )
+            .await;
+            return json_response(
+                StatusCode::OK,
+                prepared.response_format.format_response(response),
+            );
+        }
+
         let (body, is_single) = match read_body(&parts.headers, body, MAX_REQUEST_BODY_SIZE).await {
             Ok(body) => body,
             Err(ReadBodyError::TooLarge) => {
@@ -192,11 +241,7 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
 {
-    let content_length = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
+    let content_length = content_length(headers);
     if content_length > max_body_size {
         return Err(ReadBodyError::TooLarge);
     }
@@ -245,6 +290,15 @@ where
     }
 }
 
+/// The declared body length, using the existing fallback for missing or invalid headers.
+fn content_length(headers: &header::HeaderMap) -> u32 {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// Returns a response with `status` and a JSON-RPC `response` body.
 fn json_response(status: StatusCode, response: MethodResponse) -> HttpResponse {
     response_with_body(
@@ -280,3 +334,6 @@ fn response_with_body(
     );
     response
 }
+
+#[cfg(test)]
+mod tests;

@@ -74,6 +74,10 @@ pub mod rpc_tracing;
 #[cfg(test)]
 mod tests;
 
+/// The largest RPC request is a full block encoded as hex plus its JSON-RPC wrapper.
+// The maximum block size fits in usize on all supported platforms.
+const MAX_RPC_REQUEST_BODY_SIZE: usize = (MAX_BLOCK_BYTES as usize) * 2 + 1024;
+
 /// Zebra RPC Server
 #[derive(Clone)]
 pub struct RpcServer {
@@ -261,17 +265,13 @@ impl RpcServer {
         let rpc = rpc.with_rpc_surface(surface);
         let enabled_methods = enabled_rpc_methods(registered_methods(&rpc), surface)?;
 
-        // The largest RPC request is submitblock, which sends a full block
-        // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
-        let max_request_body_size = (MAX_BLOCK_BYTES as usize) * 2 + 1024;
-
         let http_middleware_layer = if conf.enable_cookie_auth {
             let cookie = Cookie::default();
             cookie::write_to_disk(&cookie, &conf.cookie_dir, Some(&conf.cookie_file_name))
                 .expect("Zakura must be able to write the auth cookie to the disk");
-            HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
+            HttpRequestMiddlewareLayer::new(Some(cookie), MAX_RPC_REQUEST_BODY_SIZE)
         } else {
-            HttpRequestMiddlewareLayer::new(None, max_request_body_size)
+            HttpRequestMiddlewareLayer::new(None, MAX_RPC_REQUEST_BODY_SIZE)
         };
 
         let max_response_body_size = conf.max_response_body_size;

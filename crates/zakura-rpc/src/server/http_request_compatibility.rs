@@ -1,16 +1,14 @@
-//! Compatibility fixes for JSON-RPC HTTP requests.
+//! Authentication, compatible content types and bounded HTTP body collection.
 //!
-//! These fixes are applied at the HTTP level, before the RPC request is parsed.
+//! JSON compatibility processing belongs to the admitted RPC decoder.
 
-use std::{borrow::Cow, future::Future};
+use std::future::Future;
 
 use std::pin::Pin;
 
 use futures::{future, FutureExt};
 use http_body_util::{BodyExt, Limited};
 use hyper::header;
-use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use tower::BoxError;
 use tower::Service;
 
@@ -22,37 +20,9 @@ use super::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-/// HTTP [`HttpRequestMiddleware`] with compatibility workarounds.
-///
-/// This middleware makes the following changes to HTTP requests:
-///
-/// ### Remove `jsonrpc` field in JSON RPC 1.0
-///
-/// Removes "jsonrpc: 1.0" fields from requests,
-/// because the "jsonrpc" field was only added in JSON-RPC 2.0.
-///
-/// <http://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0>
-///
-/// ### Add missing `content-type` HTTP header
-///
-/// Some RPC clients don't include a `content-type` HTTP header.
-/// But unlike web browsers, the RPC server does not do content sniffing.
-///
-/// If there is no `content-type` header, we assume the content is JSON,
-/// and let the parser error if we are incorrect.
-///
-/// ### Authenticate incoming requests
-///
-/// If the cookie-based RPC authentication is enabled, check that the incoming request contains the
-/// authentication cookie.
-///
-/// This enables compatibility with `zcash-cli`.
-///
-/// ## Security
-///
-/// Any user-specified data in RPC requests is hex or base58check encoded.
-/// We assume lightwalletd validates data encodings before sending it on to Zebra.
-/// So any fixes Zebra performs won't change user-specified data.
+/// HTTP boundary that checks credentials, fixes supported content-type headers and
+/// collects a bounded body without interpreting JSON. The inner RPC service admits the
+/// request before decoding its version, normalizing parameters or formatting a response.
 #[derive(Clone, Debug)]
 pub struct HttpRequestMiddleware<S> {
     service: S,
@@ -125,66 +95,22 @@ impl<S> HttpRequestMiddleware<S> {
         }
     }
 
-    /// Maps whatever JSON-RPC version the client is using to JSON-RPC 2.0.
-    async fn request_to_json_rpc_2<B>(
+    /// Collects a request under the HTTP boundary's body-size limit.
+    async fn collect_request<B>(
         request: HttpRequest<B>,
         max_request_body_size: usize,
-    ) -> Result<(JsonRpcVersion, HttpRequest<HttpBody>), BoxError>
+    ) -> Result<HttpRequest<HttpBody>, BoxError>
     where
         B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
         B::Error: Into<BoxError>,
     {
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let bytes = Limited::new(body, max_request_body_size)
             .collect()
             .await?
             .to_bytes();
-        if can_forward_json_rpc_2_call_unchanged(&bytes) {
-            return Ok((
-                JsonRpcVersion::TwoPointZero,
-                HttpRequest::from_parts(parts, HttpBody::from(bytes)),
-            ));
-        }
-        let (version, bytes) =
-            if let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(bytes.as_ref()) {
-                let version = request.version();
-                if matches!(version, JsonRpcVersion::Unknown) {
-                    (version, bytes)
-                } else {
-                    (
-                        version,
-                        serde_json::to_vec(&request.into_2()).expect("valid").into(),
-                    )
-                }
-            } else {
-                (JsonRpcVersion::Unknown, bytes)
-            };
-        Ok((
-            version,
-            HttpRequest::from_parts(parts, HttpBody::from(bytes)),
-        ))
-    }
-    /// Maps JSON-2.0 to whatever JSON-RPC version the client is using.
-    async fn response_from_json_rpc_2(
-        version: JsonRpcVersion,
-        response: HttpResponse<HttpBody>,
-    ) -> Result<HttpResponse<HttpBody>, BoxError> {
-        if matches!(version, JsonRpcVersion::TwoPointZero) {
-            // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
-            return Ok(response);
-        }
-
-        let (parts, body) = response.into_parts();
-        let bytes = body.collect().await?.to_bytes();
-        let bytes =
-            if let Ok(response) = serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref()) {
-                serde_json::to_vec(&response.into_version(version))
-                    .expect("valid")
-                    .into()
-            } else {
-                bytes
-            };
-        Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes)))
+        parts.extensions.insert(CollectedRequestBody(bytes.clone()));
+        Ok(HttpRequest::from_parts(parts, HttpBody::from(bytes)))
     }
 }
 
@@ -248,169 +174,15 @@ where
         let max_request_body_size = self.max_request_body_size;
 
         async move {
-            let (version, request) =
-                Self::request_to_json_rpc_2(request, max_request_body_size).await?;
-            let response = service.call(request).await.map_err(Into::into)?;
-            Self::response_from_json_rpc_2(version, response).await
+            let request = Self::collect_request(request, max_request_body_size).await?;
+            service.call(request).await.map_err(Into::into)
         }
         .boxed()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum JsonRpcVersion {
-    /// bitcoind used a mishmash of 1.0, 1.1, and 2.0 for its JSON-RPC.
-    Bitcoind,
-    /// lightwalletd uses the above mishmash, but also breaks spec to include a
-    /// `"jsonrpc": "1.0"` key.
-    Lightwalletd,
-    /// The client is indicating strict 2.0 handling.
-    TwoPointZero,
-    /// On parse errors we don't modify anything, and let the JSON-RPC server handle it.
-    Unknown,
-}
-
-/// Returns whether `body` is a JSON-RPC 2.0 call that [`JsonRpcRequest::into_2`] would only
-/// re-encode, so the server can read it as sent.
+/// A bounded body collected by the HTTP wrapper, before JSON interpretation.
 ///
-/// The server reads a few things differently from their re-encoded form: whitespace inside
-/// positional parameters, duplicate or reordered named parameters, leading whitespace, a `null`
-/// ID (which re-encoding drops) and unknown fields (which re-encoding drops). So this accepts
-/// only a body that starts with `{`, has no other fields, has a non-`null` ID or none, and has
-/// no parameters, an empty array, or one unescaped string argument. This avoids copying and
-/// re-encoding a block's hex in `submitblock` without inspecting each array element.
-fn can_forward_json_rpc_2_call_unchanged(body: &[u8]) -> bool {
-    if body.first() != Some(&b'{') {
-        return false;
-    }
-
-    let Ok(call) = serde_json::from_slice::<'_, PlainJsonRpc2Call<'_>>(body) else {
-        return false;
-    };
-
-    if call.jsonrpc != "2.0" {
-        return false;
-    }
-
-    let id_is_absent_or_string_or_number = call.id.is_none_or(|id| {
-        // RawValue is valid JSON; the first byte distinguishes strings and numbers.
-        matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9'))
-    });
-
-    id_is_absent_or_string_or_number && call.params.is_none_or(params_can_pass_through_unchanged)
-}
-
-/// Returns whether parameters are `[]` or one compact, unescaped string argument.
-///
-/// `RawValue` already contains valid JSON. Checking its delimiters and string contents avoids
-/// allocating per argument or parsing and serializing values before falling back to conversion.
-fn params_can_pass_through_unchanged(params: &RawValue) -> bool {
-    let json = params.get();
-
-    if json == "[]" {
-        return true;
-    }
-
-    let Some(value) = json
-        .strip_prefix("[\"")
-        .and_then(|value| value.strip_suffix("\"]"))
-    else {
-        return false;
-    };
-
-    !value.bytes().any(|byte| matches!(byte, b'"' | b'\\'))
-}
-
-/// A JSON-RPC 2.0 call with only the standard fields, borrowed from the request body.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlainJsonRpc2Call<'a> {
-    #[serde(borrow)]
-    jsonrpc: Cow<'a, str>,
-    /// Required, so that a call without a method isn't treated as a plain call.
-    #[serde(borrow, rename = "method")]
-    _method: Cow<'a, str>,
-    #[serde(borrow, default)]
-    params: Option<&'a RawValue>,
-    /// `Some` whenever the field is present, including `null`.
-    #[serde(borrow, default, deserialize_with = "present")]
-    id: Option<&'a RawValue>,
-}
-
-/// Deserializes a field that is present, even if it is `null`, as `Some`.
-fn present<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<&'de RawValue>, D::Error> {
-    <&RawValue>::deserialize(deserializer).map(Some)
-}
-
-/// A version-agnostic JSON-RPC request.
-#[derive(Debug, Deserialize, Serialize)]
-struct JsonRpcRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    jsonrpc: Option<String>,
-    method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<serde_json::Value>,
-}
-
-impl JsonRpcRequest {
-    fn version(&self) -> JsonRpcVersion {
-        match (self.jsonrpc.as_deref(), &self.params, &self.id) {
-            (
-                Some("2.0"),
-                _,
-                None
-                | Some(
-                    serde_json::Value::Null
-                    | serde_json::Value::String(_)
-                    | serde_json::Value::Number(_),
-                ),
-            ) => JsonRpcVersion::TwoPointZero,
-            (Some("1.0"), Some(_), Some(_)) => JsonRpcVersion::Lightwalletd,
-            (None, Some(_), Some(_)) => JsonRpcVersion::Bitcoind,
-            _ => JsonRpcVersion::Unknown,
-        }
-    }
-
-    fn into_2(mut self) -> Self {
-        self.jsonrpc = Some("2.0".into());
-        self
-    }
-}
-/// A version-agnostic JSON-RPC response.
-#[derive(Debug, Deserialize, Serialize)]
-struct JsonRpcResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    jsonrpc: Option<String>,
-    id: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Box<serde_json::value::RawValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<serde_json::Value>,
-}
-
-impl JsonRpcResponse {
-    fn into_version(mut self, version: JsonRpcVersion) -> Self {
-        match version {
-            JsonRpcVersion::Bitcoind => {
-                self.jsonrpc = None;
-                self.result = self
-                    .result
-                    .or_else(|| serde_json::value::to_raw_value(&()).ok());
-                self.error = self.error.or(Some(serde_json::Value::Null));
-            }
-            JsonRpcVersion::Lightwalletd => {
-                self.jsonrpc = Some("1.0".into());
-                self.result = self
-                    .result
-                    .or_else(|| serde_json::value::to_raw_value(&()).ok());
-                self.error = self.error.or(Some(serde_json::Value::Null));
-            }
-            JsonRpcVersion::TwoPointZero | JsonRpcVersion::Unknown => (),
-        }
-        self
-    }
-}
+/// The inner service consumes this private extension only after acquiring its request permit.
+#[derive(Clone)]
+pub(super) struct CollectedRequestBody(pub hyper::body::Bytes);

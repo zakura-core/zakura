@@ -680,7 +680,8 @@ impl NonFinalizedState {
                 finalized_state.ironwood_tree_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
-            );
+            )
+            .skipping_transparent_address_index(finalized_state.skips_transparent_indexes());
             Arc::new(chain)
         } else {
             // The parent is not the finalized_tip and still exist in the NonFinalizedState
@@ -765,7 +766,8 @@ impl NonFinalizedState {
                 finalized_state.ironwood_tree_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
-            ))
+            )
+            .skipping_transparent_address_index(finalized_state.skips_transparent_indexes()))
         })();
         contextual_metrics.record_duration(
             "state.contextual.chain_new.duration_seconds",

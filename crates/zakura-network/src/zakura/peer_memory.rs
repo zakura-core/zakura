@@ -1,13 +1,14 @@
 //! The node-wide budget for native peers' transport credit.
 //!
 //! Each live native QUIC connection, from its handshake until it closes, can
-//! make this node hold [`zakura_quic::connection_memory_bytes`] in QUIC
-//! buffers (zakura-quic CTRL-26). Regulation pauses reads on purpose, so that
+//! make this node hold [`native_connection_memory_bytes`] in QUIC buffers: its
+//! windows (zakura-quic CTRL-26), plus the receive share of each stream kind it
+//! negotiates, which raises its window once. Regulation pauses reads on purpose, so that
 //! credit is where backpressure lands, and QUIC can't take it back. Each bound
 //! socket can also queue [`zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES`] of
 //! datagrams, however many connections it serves. The budget therefore
 //! reserves one socket queue per bound socket and funds what is left divided
-//! by `connection_memory_bytes` live connections.
+//! by `native_connection_memory_bytes` live connections.
 //!
 //! The transport caps those live connections, admitted or not (ADM-12).
 //! `max_pending_handshakes` of them are headroom for handshakes not yet
@@ -28,14 +29,52 @@ use thiserror::Error;
 use zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES;
 
 use super::{
-    discovery::effective_discovery_connection_headroom, DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-    DEFAULT_ZAKURA_RECEIVE_WINDOW, DEFAULT_ZAKURA_SEND_WINDOW,
+    discovery::effective_discovery_connection_headroom, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES, DEFAULT_ZAKURA_RECEIVE_WINDOW,
+    DEFAULT_ZAKURA_SEND_WINDOW, DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
 };
 
+/// The native stream kinds a connection may negotiate: legacy gossip, legacy
+/// requests, discovery, header sync and block sync. Each raises the
+/// connection's receive window by its receive share.
+pub const ZAKURA_NATIVE_STREAM_KINDS: u64 = 5;
+
+/// Returns what one live native connection can make this node hold when each
+/// of the [`ZAKURA_NATIVE_STREAM_KINDS`] keeps a stream window of
+/// `stream_receive_window_bytes` as its receive share: the handshake window
+/// `receive_window_bytes`, every kind's share, and the send window.
+pub const fn native_connection_memory_bytes(
+    receive_window_bytes: u32,
+    stream_receive_window_bytes: u32,
+    send_window_bytes: u64,
+) -> u64 {
+    // Widening u32 to u64 is lossless.
+    let shares = (stream_receive_window_bytes as u64).saturating_mul(ZAKURA_NATIVE_STREAM_KINDS);
+    zakura_quic::connection_memory_bytes(receive_window_bytes, send_window_bytes)
+        .saturating_add(shares)
+}
+
+/// [`native_connection_memory_bytes`] at the default windows: 32 MiB of
+/// handshake window, five 16 MiB shares and 32 MiB of send window, 144 MiB.
+pub const DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES: u64 = native_connection_memory_bytes(
+    DEFAULT_ZAKURA_RECEIVE_WINDOW,
+    DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
+    DEFAULT_ZAKURA_SEND_WINDOW,
+);
+
 /// Default budget for native QUIC connections' flow-control credit and the
-/// bound sockets' datagram queues: 8 GiB. CTRL-26 in the zakura-quic spec lists
-/// what it leaves out.
-pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// bound sockets' datagram queues. CTRL-26 in the zakura-quic spec lists what
+/// it leaves out.
+///
+/// It funds what admission charges for [`DEFAULT_ZAKURA_MAX_CONNECTIONS`] on
+/// the one socket the default `listen_addr` binds: one socket queue, and
+/// every live connection, admitted or in its handshake, at
+/// [`DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES`]. That is
+/// 256 MiB + (92 + 32) × 144 MiB = 18,112 MiB.
+// Widening usize to u64 is lossless on supported targets.
+pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = SOCKET_DATAGRAM_QUEUE_BYTES
+    + (DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES) as u64
+        * DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES;
 
 /// Fewest connections a peer memory budget must admit, whatever the bootstrap
 /// list (see [`min_budgeted_connections`]).
@@ -69,8 +108,14 @@ pub const ZAKURA_CLOSING_CONNECTIONS_PER_LIVE: usize = 2;
 pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = max_connections_for_budget(
     DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     1,
-    zakura_quic::connection_memory_bytes(DEFAULT_ZAKURA_RECEIVE_WINDOW, DEFAULT_ZAKURA_SEND_WINDOW),
+    DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES,
 ) - DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES;
+
+// The default budget funds the default connection count.
+const _: () = assert!(
+    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS >= DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    "the default peer memory budget funds the default connection count"
+);
 
 /// Returns how many connections of `connection_bytes` each fit in
 /// `budget_bytes` after reserving one socket datagram queue for each of
@@ -115,7 +160,8 @@ pub fn budget_admitted_connections(
 #[error(
     "invalid [network.zakura] peer_memory_budget_bytes: {budget_bytes} bytes funds \
      {funded} live connections of {connection_bytes} bytes each (the \
-     [network.zakura.quic] receive_window_bytes plus send_window_bytes) after \
+     [network.zakura.quic] receive_window_bytes and send_window_bytes, plus \
+     stream_receive_window_bytes for each native stream kind) after \
      reserving {socket_queue_bytes} bytes for the bound sockets' datagram queues, \
      and {headroom} of them are max_pending_handshakes headroom, which admits \
      {admitted}; raise peer_memory_budget_bytes or lower those windows or \
@@ -186,13 +232,15 @@ mod tests {
     /// A budget that admits exactly `connections` at the default windows on
     /// one socket, after the default 32 slots of handshake headroom.
     fn budget_for(connections: u64) -> u64 {
-        256 * MIB + (connections + 32) * 64 * MIB
+        256 * MIB + (connections + 32) * 144 * MIB
     }
 
     #[test]
     fn the_default_connection_cap_fits_the_default_budget() {
-        let connection_bytes = QuicConfig::default().connection_memory_bytes();
-        assert_eq!(connection_bytes, 64 * MIB);
+        let connection_bytes = ZakuraConfig::default().connection_memory_bytes();
+        assert_eq!(QuicConfig::default().connection_memory_bytes(), 64 * MIB);
+        assert_eq!(connection_bytes, 144 * MIB);
+        assert_eq!(connection_bytes, DEFAULT_ZAKURA_CONNECTION_MEMORY_BYTES);
         assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 92);
         assert_eq!(
             DEFAULT_ZAKURA_MAX_CONNECTIONS,
@@ -223,13 +271,13 @@ mod tests {
         assert_eq!(config.budgeted_max_connections(), Ok(92));
 
         // Without `listen_addr` the endpoint binds IPv4 and IPv6 loopback, so it
-        // reserves two socket queues: (8192 - 512) / 64 - 32.
+        // reserves two socket queues: (18112 - 512) / 144 - 32.
         let config = ZakuraConfig {
             max_connections: 256,
             listen_addr: None,
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections(), Ok(88));
+        assert_eq!(config.budgeted_max_connections(), Ok(90));
 
         // Raising the windows lowers the cap instead of the throughput.
         let config = ZakuraConfig {
@@ -239,8 +287,8 @@ mod tests {
             },
             ..ZakuraConfig::default()
         };
-        // (8 GiB - 256 MiB) / (64 + 32) MiB - 32.
-        assert_eq!(config.budgeted_max_connections(), Ok(50));
+        // (18112 - 256) MiB / (64 + 80 + 32) MiB - 32.
+        assert_eq!(config.budgeted_max_connections(), Ok(69));
 
         // So does raising the handshake headroom: 124 - 64.
         let config = ZakuraConfig {
@@ -373,8 +421,8 @@ mod tests {
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections().unwrap_err();
-        // (8 GiB - 256 MiB) / (1024 + 32) MiB, less 32 of headroom.
-        assert_eq!((error.funded, error.headroom, error.admitted), (7, 32, 0));
+        // (18112 - 256) MiB / (1024 + 80 + 32) MiB, less 32 of headroom.
+        assert_eq!((error.funded, error.headroom, error.admitted), (15, 32, 0));
         // Mainnet's 9 bootstrap peers, counting one as possibly this node.
         assert_eq!(error.required, 17);
         assert!(error

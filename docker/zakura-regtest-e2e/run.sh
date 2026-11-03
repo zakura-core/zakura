@@ -158,7 +158,7 @@ GENERATE_BLOCKS="${GENERATE_BLOCKS:-${DEFAULT_GENERATE_BLOCKS}}"
 CATCHUP_BLOCKS="${CATCHUP_BLOCKS:-${DEFAULT_CATCHUP_BLOCKS}}"
 READY_TIMEOUT="${READY_TIMEOUT:-120}"
 # Zakura's application idle reaper retires a hard-stopped QUIC peer after 150 seconds.
-# This timeout also includes the JSONL writer's approximately 17-second flush interval.
+# This timeout also covers the CSV writer's one-second sync interval.
 NODE4_DISCONNECT_TIMEOUT="${NODE4_DISCONNECT_TIMEOUT:-210}"
 # Propagation to the Zakura peer can take a little while: the dual-stack tries
 # the (empty) legacy peer set first, and the legacy->Zakura upgrade re-dials a
@@ -174,14 +174,8 @@ PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-${DEFAULT_PROPAGATE_TIMEOUT}}"
 # READY_TIMEOUT used for the (fast) startup assertions is too tight here. This
 # ceiling only matters on failure: the waits exit as soon as catch-up starts.
 CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-${DEFAULT_CATCHUP_TIMEOUT}}"
-# The Zakura JSONL trace writer (zakura-jsonl-trace) only flushes to disk every
-# DEFAULT_FILE_FLUSH_INTERVAL (~17s) or after DEFAULT_BUFFER_FLUSH_BYTES (256
-# KiB), and production zakurad uses JsonlTracer::spawn (no guard / no shutdown
-# flush), so stopping the nodes does not flush the tail. The oracle reads the
-# trace files, so it must wait for the final commit_finish rows to be flushed
-# before running, or it sees commit_start rows with no matching finish. This
-# ceiling only needs to exceed the writer's flush interval; it exits as soon as
-# every commit_start has a matching commit_finish.
+# The CSV writer batches events before append and syncs files every second.
+# Wait for each commit_start to have a matching commit_finish before the invariant checks run.
 TRACE_FLUSH_TIMEOUT="${TRACE_FLUSH_TIMEOUT:-45}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-${DEFAULT_CHECKPOINT_INTERVAL}}"
 RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-${ZAKURA_E2E_MODE}}"
@@ -193,7 +187,7 @@ export ZAKURA_NODE2_STATE_VOLUME
 
 command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
-command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
+command -v python3 >/dev/null || fail "python3 is required to check trace invariants"
 
 # Ensure a container-compatible zakurad binary exists. Docker Desktop runs Linux
 # containers on macOS, so its bind-mounted executable must be Linux too.
@@ -220,14 +214,22 @@ docker run --rm \
   /usr/local/bin/zakurad --version >/dev/null 2>&1 \
   || fail "zakurad binary is not executable in the Linux container: ${ZAKURAD_BIN}"
 export ZAKURAD_BIN
-ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces-${RUN_LABEL}}"
+ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-${TMPDIR:-${HOME}/.tmp}/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
+ZAKURA_TRACE_CAPTURE_RUN="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+export ZAKURA_TRACE_CAPTURE_RUN
+if [[ -d "${ZAKURA_E2E_TRACE_DIR}" ]] && [[ -n "$(find "${ZAKURA_E2E_TRACE_DIR}" -mindepth 1 -print -quit)" ]]; then
+  fail "trace directory must be empty for this run: ${ZAKURA_E2E_TRACE_DIR}"
+fi
 mkdir -p \
   "${ZAKURA_E2E_TRACE_DIR}/node1" \
   "${ZAKURA_E2E_TRACE_DIR}/node2" \
   "${ZAKURA_E2E_TRACE_DIR}/node3" \
   "${ZAKURA_E2E_TRACE_DIR}/node4"
-TIMELINE_FILE="${ZAKURA_E2E_TRACE_DIR}/timeline.jsonl"
+TIMELINE_FILE="${ZAKURA_E2E_TRACE_DIR}/timeline.csv"
+if [[ ! -s "${TIMELINE_FILE}" ]]; then
+  printf '%s\n' 'phase,mode,seconds,node,rpc_height,best_header_tip,verified_body_tip,active_zakura_peers,legacy_peer_count,block_sync_request_sent,block_sync_body_received,block_sync_body_served,budget_reserved_bytes,reorder_buffered_bytes,applying,outstanding' >> "${TIMELINE_FILE}"
+fi
 CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zakura-regtest-e2e-configs.XXXXXX")"
 for node in 1 2 3 4; do
   cp "${SCRIPT_DIR}/node${node}.toml" "${CONFIG_DIR}/node${node}.toml"
@@ -259,26 +261,26 @@ log "run mode: ${ZAKURA_E2E_MODE} (${RUN_LABEL})"
 log "using zakurad binary: ${ZAKURAD_BIN}"
 log "writing Zakura traces under: ${ZAKURA_E2E_TRACE_DIR}"
 
-ORACLE_RAN=0
+INVARIANTS_CHECKED=0
 OPTIONAL_NODE4_QUIESCED=0
 
-trace_dir_has_jsonl() {
+trace_dir_has_csv() {
   [[ -d "${ZAKURA_E2E_TRACE_DIR}" ]] \
-    && find "${ZAKURA_E2E_TRACE_DIR}"/node* -maxdepth 1 -type f -name '*.jsonl' -print -quit 2>/dev/null | grep -q .
+    && find "${ZAKURA_E2E_TRACE_DIR}"/node* -maxdepth 1 -type f -name '*.csv' -print -quit 2>/dev/null | grep -q .
 }
 
 assert_trace_layout() {
   local missing=0
   for file in \
-    node1/commit_state.jsonl \
-    node1/block_sync.jsonl \
-    node1/header_sync.jsonl \
-    node2/commit_state.jsonl \
-    node2/block_sync.jsonl \
-    node2/header_sync.jsonl \
-    node4/commit_state.jsonl \
-    node4/block_sync.jsonl \
-    node4/header_sync.jsonl
+    node1/commit_state.csv \
+    node1/block_sync.csv \
+    node1/header_sync.csv \
+    node2/commit_state.csv \
+    node2/block_sync.csv \
+    node2/header_sync.csv \
+    node4/commit_state.csv \
+    node4/block_sync.csv \
+    node4/header_sync.csv
   do
     if [[ ! -s "${ZAKURA_E2E_TRACE_DIR}/${file}" ]]; then
       printf '  missing expected trace file: %s\n' "${ZAKURA_E2E_TRACE_DIR}/${file}" >&2
@@ -292,41 +294,43 @@ assert_trace_layout() {
   fi
 }
 
-# Wait until each node's traces are fully flushed to disk before the oracle reads
-# them. The writer (zakura-jsonl-trace) flushes on a ~17s timer / 256 KiB, and
-# production zakurad never flushes on shutdown, so a trace read right after the
-# final commits has a buffered tail. We require two things to be on disk:
-#   1. commit_state.jsonl: every commit_start has a matching commit_finish
+# Wait until each node's traces are fully flushed to disk before the invariant checks read
+# them. A read immediately after the final commit can miss queued events.
+# We require two things to be on disk:
+#   1. commit_state.csv: every commit_start has a matching commit_finish
 #      (guards commit_start_has_finish / checkpoint_to_full_handoff_observed).
-#   2. block_sync.jsonl: the last block_sync_state row is drained, i.e.
+#   2. block_sync.csv: the last block_sync_state row is drained, i.e.
 #      applying+budget_reserved+reorder+outstanding == 0 (guards
 #      final_block_sync_state_has_no_leaks). The reactor emits these release
 #      rows just after the commit_finish rows, so they flush a cycle later.
-# Best-effort: on timeout we log and run the oracle anyway so a genuine stall or
+# Best-effort: on timeout we log and check invariants anyway so a genuine stall or
 # real leak still surfaces.
 wait_for_trace_flush() {
-  trace_dir_has_jsonl || return 0
-  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) node file starts finishes pending last leak
-  log "waiting for Zakura traces to flush before the oracle"
+  trace_dir_has_csv || return 0
+  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) node file pending last leak
+  log "waiting for Zakura traces to flush before checking invariants"
   while (( SECONDS < deadline )); do
     pending=0
     for node in node1 node2 node4; do
-      file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.jsonl"
+      file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
       if [[ -s "${file}" ]]; then
-        starts=$(grep -c 'commit_start' "${file}" 2>/dev/null || true)
-        finishes=$(grep -c 'commit_finish' "${file}" 2>/dev/null || true)
-        if (( finishes < starts )); then
-          printf '  %s commit_state starts=%s finishes=%s (waiting for flush)\n' \
-            "${node}" "${starts}" "${finishes}"
+        if ! python3 "${SCRIPT_DIR}/sync_invariants.py" --check-commit-balance "${file}"; then
+          printf '  %s commit_state has unmatched or malformed records (waiting for flush)\n' "${node}"
           pending=1
         fi
       fi
-      file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.jsonl"
+      file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.csv"
       if [[ -s "${file}" ]]; then
-        last=$(grep 'block_sync_state' "${file}" 2>/dev/null | tail -1)
+        # Per-commit pipeline rows keep applying/budget/reorder current; only
+        # the periodic block_sync_state rows carry outstanding.
+        last=$( (trace_rows_after "${file}" 0 || true) \
+          | jq -sc '[.[] | select(.event == "block_sync_state" or .event == "block_sync_pipeline_state")] as $rows
+              | if ($rows | length) == 0 then empty else
+                  {pipeline: $rows[-1], state: ([$rows[] | select(.event == "block_sync_state")] | last)}
+                end' 2>/dev/null || true)
         if [[ -n "${last}" ]]; then
           leak=$(printf '%s' "${last}" \
-            | jq -r '[(.applying//0),(.budget_reserved//0),(.reorder//0),(.outstanding//0)]|add' \
+            | jq -r '[(.pipeline.applying//0),(.pipeline.budget_reserved//0),(.pipeline.reorder//0),(.state.outstanding//0)]|add' \
             2>/dev/null || printf '1')
           if [[ "${leak}" != "0" ]]; then
             printf '  %s block_sync_state not yet drained (applying+budget+reorder+outstanding=%s, waiting for flush)\n' \
@@ -339,55 +343,79 @@ wait_for_trace_flush() {
     (( pending == 0 )) && { log "traces flushed"; return 0; }
     sleep 3
   done
-  log "trace flush wait timed out after ${TRACE_FLUSH_TIMEOUT}s; running oracle anyway"
+  log "trace flush wait timed out after ${TRACE_FLUSH_TIMEOUT}s; checking invariants anyway"
 }
 
 wait_for_commit_trace_balance() {
   local node="$1" label="$2"
-  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.jsonl"
-  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) starts finishes
+  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
+  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
 
   [[ -s "${file}" ]] || fail "${label} commit trace is missing"
   log "waiting for ${label} commit trace to flush before reset"
   while (( SECONDS < deadline )); do
-    starts=$(grep -c 'commit_start' "${file}" 2>/dev/null || true)
-    finishes=$(grep -c 'commit_finish' "${file}" 2>/dev/null || true)
-    printf '  %s commit_state starts=%s finishes=%s\n' \
-      "${label}" "${starts}" "${finishes}"
-    (( starts == finishes )) && return 0
+    python3 "${SCRIPT_DIR}/sync_invariants.py" --check-commit-balance "${file}" && return 0
+    printf '  %s commit_state has unmatched or malformed records\n' "${label}"
     sleep 3
   done
   fail "${label} commit trace did not balance within ${TRACE_FLUSH_TIMEOUT}s"
 }
 
-run_trace_oracle() {
-  trace_dir_has_jsonl || return 0
-  ORACLE_RAN=1
+seal_trace_capture() {
+  local directory="$1" deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
+  python3 "${SCRIPT_DIR}/sync_invariants.py" --seal-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}" \
+    || { printf 'could not request trace capture seal\n' >&2; return 1; }
+  while ! python3 "${SCRIPT_DIR}/sync_invariants.py" --check-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}"; do
+    if (( SECONDS >= deadline )); then
+      printf 'trace capture did not seal completely: %s\n' "${directory}" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+check_trace_invariants() {
+  trace_dir_has_csv || return 0
+  INVARIANTS_CHECKED=1
   wait_for_trace_flush
-  log "running Zakura trace oracle"
-  local oracle_args=(
-    "--commit-elapsed-ms" "${ZAKURA_E2E_ORACLE_COMMIT_ELAPSED_MS:-1800000}"
-    "--persistent-lag-seconds" "${ZAKURA_E2E_ORACLE_PERSISTENT_LAG_SECONDS:-180}"
-    "--handoff-stall-seconds" "${ZAKURA_E2E_ORACLE_HANDOFF_STALL_SECONDS:-180}"
+  log "checking Zakura sync invariants"
+  local invariant_args=(
+    "--commit-elapsed-ms" "${ZAKURA_E2E_INVARIANT_COMMIT_ELAPSED_MS:-1800000}"
+    "--persistent-lag-seconds" "${ZAKURA_E2E_INVARIANT_PERSISTENT_LAG_SECONDS:-180}"
+    "--handoff-stall-seconds" "${ZAKURA_E2E_INVARIANT_HANDOFF_STALL_SECONDS:-180}"
+    "--require-commit-node" "node2"
+    "--require-commit-node" "node4"
+    "--require-sync-node" "node1"
+    "--require-sync-node" "node2"
+    "--require-sync-node" "node4"
+    "--capture-run-id" "${ZAKURA_TRACE_CAPTURE_RUN}"
   )
   if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
-    oracle_args+=("--require-handoff-boundary")
+    invariant_args+=("--require-handoff-boundary")
   fi
   if [[ "${ZAKURA_E2E_REQUIRE_V7_IDS}" == "1" ]]; then
-    oracle_args+=("--require-v7-request-ids")
+    invariant_args+=("--require-v7-request-ids")
   fi
   if ! strict_upgrade; then
-    oracle_args+=("--optional-lag-node" "node4")
+    invariant_args+=("--optional-lag-node" "node4")
   fi
-  python3 "${SCRIPT_DIR}/trace_oracle.py" "${oracle_args[@]}" "${ZAKURA_E2E_TRACE_DIR}"
+  local sealed=0
+  if ! seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}"; then
+    # A crashed node cannot seal. Still print the invariant diagnostics; the
+    # missing seal already makes the capture INCOMPLETE.
+    log "trace capture was not sealed; checking invariants for diagnostics"
+    sealed=1
+  fi
+  python3 "${SCRIPT_DIR}/sync_invariants.py" "${invariant_args[@]}" "${ZAKURA_E2E_TRACE_DIR}" || return
+  return "${sealed}"
 }
 
 cleanup() {
   local status=$?
   set +e
   snapshot_timeline "cleanup" || true
-  if [[ "${ORACLE_RAN}" != "1" ]]; then
-    run_trace_oracle
+  if [[ "${INVARIANTS_CHECKED}" != "1" ]]; then
+    check_trace_invariants
   fi
   log "node logs (tail)"
   docker compose -f "${COMPOSE_FILE}" logs --tail=30 || true
@@ -472,7 +500,7 @@ timeline_node_snapshot() {
   applying=$(metric "${metrics_port}" sync_block_applying)
   outstanding=$(metric "${metrics_port}" sync_block_outstanding)
 
-  jq -n -c \
+  jq -n -r \
     --arg phase "${phase}" \
     --arg mode "${ZAKURA_E2E_MODE}" \
     --arg node "${node}" \
@@ -506,7 +534,7 @@ timeline_node_snapshot() {
       reorder_buffered_bytes: $reorder_buffered_bytes,
       applying: $applying,
       outstanding: $outstanding
-    }' >> "${TIMELINE_FILE}"
+    } | [.phase, .mode, .seconds, .node, .rpc_height, .best_header_tip, .verified_body_tip, .active_zakura_peers, .legacy_peer_count, .block_sync_request_sent, .block_sync_body_received, .block_sync_body_served, .budget_reserved_bytes, .reorder_buffered_bytes, .applying, .outstanding] | @csv' >> "${TIMELINE_FILE}"
 }
 
 snapshot_timeline() {
@@ -548,7 +576,7 @@ wait_metric_at_least() {
 trace_line_count() {
   local file="$1"
   if [[ -f "${file}" ]]; then
-    wc -l < "${file}"
+    trace_rows_after "${file}" 0 | wc -l
   else
     printf '0\n'
   fi
@@ -557,7 +585,7 @@ trace_line_count() {
 trace_rows_after() {
   local file="$1" lines_before="$2"
   [[ -f "${file}" ]] || return 0
-  awk -v lines_before="${lines_before}" 'NR > lines_before' "${file}"
+  python3 "${SCRIPT_DIR}/sync_invariants.py" --dump-csv "${file}" --after "${lines_before}"
 }
 
 # A reorg reaches block sync as a destructive reset of its body pipeline, traced
@@ -565,7 +593,7 @@ trace_rows_after() {
 # `sync.block.reorg.reset`, which then counts only a reset at process startup.
 wait_for_block_sync_reset() {
   local node="$1" height="$2" lines_before="$3" timeout="${4:-${READY_TIMEOUT}}"
-  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.jsonl"
+  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.csv"
   local deadline=$((SECONDS + timeout)) resets
 
   while (( SECONDS < deadline )); do
@@ -588,7 +616,7 @@ wait_for_block_sync_reset() {
 # legacy trace from this restart and validate the exact durable handoff boundary.
 wait_for_genesis_handoff() {
   local expected_height="$1" lines_before="$2" timeout="$3"
-  local file="${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.jsonl"
+  local file="${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.csv"
   local deadline=$((SECONDS + timeout)) summary verified_height handoff_count
   local handoff_row legacy_summary
 
@@ -675,8 +703,8 @@ wait_for_genesis_handoff() {
 wait_for_native_suffix_coverage() {
   local suffix_start="$1" suffix_end="$2" block_lines_before="$3"
   local header_lines_before="$4" timeout="$5"
-  local block_file="${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl"
-  local header_file="${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl"
+  local block_file="${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.csv"
+  local header_file="${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.csv"
   local deadline=$((SECONDS + timeout)) request_summary covered=0
   local first_request_ts lifecycle_count apply_summary apply_ready=0
 
@@ -879,6 +907,7 @@ wait_ready() {
 
 stop_node2_for_reset() {
   local label="$1"
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}/node2"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
     || fail "could not stop node2 for ${label}"
   if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
@@ -917,6 +946,7 @@ reset_node2_from_scratch() {
 
 restart_node2_preserving_state() {
   local label="$1"
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}/node2"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
     || fail "could not stop node2 for ${label}"
   docker compose -f "${COMPOSE_FILE}" start zakura-node-2 \
@@ -1018,7 +1048,7 @@ configure_node2_debug_stop() {
 
   # debug_stop_at_height exits from the state writer before the ordinary
   # block-sync driver can emit commit_finish. Preserve those intentional-stop
-  # traces as raw evidence, but keep them out of node2's strict-oracle stream.
+  # traces as raw evidence, but keep them out of node2's strict invariant input.
   rewrite_mounted_config_in_place \
     "s|^trace_dir = \"/traces/node2\"$|trace_dir = \"${debug_trace_dir}\"|; /^ephemeral = false$/a\\
 debug_stop_at_height = ${height}" \
@@ -1123,11 +1153,11 @@ quiesce_optional_node4_before_extended_work() {
   wait_for_commit_trace_balance node4 "node4 pre-extended"
   wait_for_trace_flush
 
-  local file="${ZAKURA_E2E_TRACE_DIR}/node4/block_sync.jsonl" last leak
-  local header_file="${ZAKURA_E2E_TRACE_DIR}/node1/header_sync.jsonl"
+  local file="${ZAKURA_E2E_TRACE_DIR}/node4/block_sync.csv" last leak
+  local header_file="${ZAKURA_E2E_TRACE_DIR}/node1/header_sync.csv"
   local active_sessions_before connections_before connections_after
   local disconnects_before disconnects_after deadline node2_connections
-  last=$(grep 'block_sync_state' "${file}" 2>/dev/null | tail -1 || true)
+  last=$(trace_rows_after "${file}" 0 | jq -c 'select(.event == "block_sync_state")' | tail -1 || true)
   [[ -n "${last}" ]] || fail "node4 pre-extended block-sync trace is missing"
   leak=$(printf '%s' "${last}" \
     | jq -er '[(.applying//0),(.budget_reserved//0),(.reorder//0),(.outstanding//0)]|add') \
@@ -1139,28 +1169,29 @@ quiesce_optional_node4_before_extended_work() {
   if ! awk "BEGIN{exit !(${connections_before} == 2)}"; then
     fail "node1 expected exactly node2 and node4 before optional-peer quiescence, found ${connections_before} active Zakura peers"
   fi
-  active_sessions_before=$(jq -sc '
+  active_sessions_before=$(trace_rows_after "${header_file}" 0 | jq -sc '
     ([.[] | select(.event == "header_peer_connected") | .session_id]
       - [.[] | select(.event == "header_peer_disconnected") | .session_id])
     | unique
-  ' "${header_file}") \
+  ') \
     || fail "could not read node1 active header sessions before stopping node4"
   [[ "$(printf '%s' "${active_sessions_before}" | jq -r 'length')" == "2" ]] \
     || fail "node1 trace did not contain exactly two active header sessions before stopping node4"
-  disconnects_before=$(grep -c '"event":"header_peer_disconnected"' "${header_file}" 2>/dev/null || true)
+  disconnects_before=$(trace_rows_after "${header_file}" 0 | jq -sc '[.[] | select(.event == "header_peer_disconnected")] | length' || true)
 
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}/node4"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-4 \
     || fail "could not stop optional node4 before extended work"
 
   deadline=$((SECONDS + NODE4_DISCONNECT_TIMEOUT))
   while (( SECONDS < deadline )); do
     connections_after=$(metric 19001 zakura_p2p_conn_active)
-    disconnects_after=$(grep -c '"event":"header_peer_disconnected"' "${header_file}" 2>/dev/null || true)
+    disconnects_after=$(trace_rows_after "${header_file}" 0 | jq -sc '[.[] | select(.event == "header_peer_disconnected")] | length' || true)
     printf '  node1 post-node4-quiesce active=%s disconnect_rows=%s (want <=1 and >%s)\n' \
       "${connections_after}" "${disconnects_after}" "${disconnects_before}"
     if awk "BEGIN{exit !(${connections_after} <= 1)}" \
       && (( disconnects_after > disconnects_before )); then
-      last=$(grep '"event":"header_peer_disconnected"' "${header_file}" | tail -1)
+      last=$(trace_rows_after "${header_file}" 0 | jq -c 'select(.event == "header_peer_disconnected")' | tail -1)
       printf '%s' "${last}" \
         | jq -e --argjson active "${active_sessions_before}" '
             .session_id as $session
@@ -1621,9 +1652,9 @@ else
   log "chain too short (tip ${catchup_target}, interval ${CHECKPOINT_INTERVAL}); node2 catches up with the genesis-only checkpoint list"
 fi
 
-node2_legacy_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.jsonl")
-node2_block_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl")
-node2_header_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl")
+node2_legacy_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.csv")
+node2_block_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.csv")
+node2_header_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.csv")
 start_node2_after_reset "post-reset catch-up"
 snapshot_timeline "post-reset-catch-up-started"
 
@@ -1675,8 +1706,8 @@ fi
 log "asserting non-finalized reorg survival with no block-sync budget leak"
 old_tip_hash=$(block_hash 18232 "${target}")
 [[ -n "${old_tip_hash}" ]] || fail "could not read old tip hash at height ${target}"
-node1_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node1/block_sync.jsonl")
-node2_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl")
+node1_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node1/block_sync.csv")
+node2_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.csv")
 invalidate_block_if_present 18232 "${target}" "${old_tip_hash}" node1
 invalidate_block_if_present 18332 "${target}" "${old_tip_hash}" node2
 invalidate_block_if_present 18432 "${target}" "${old_tip_hash}" node3
@@ -1726,6 +1757,6 @@ if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
 fi
 
 assert_trace_layout
-run_trace_oracle
+check_trace_invariants
 
 log "PASS (${RUN_LABEL}): Zakura body frontier, peer serving, reorg survival, and legacy compatibility verified"

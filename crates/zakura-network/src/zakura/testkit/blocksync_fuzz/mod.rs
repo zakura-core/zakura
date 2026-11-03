@@ -4,7 +4,7 @@
 //! Phase 1 (this module): a real-time, scenario-scripted harness that drives the
 //! real `spawn_block_sync_reactor` through synthetic peers (`SyntheticBlockSyncPeers`,
 //! the same `service::add_peer` → real `PeerRoutine` seam production uses) and a
-//! mock commit pipeline (`MockApplyFrontier`), emitting the standard JSONL traces so
+//! mock commit pipeline (`MockApplyFrontier`), emitting the standard CSV traces so
 //! the existing analysis scripts work unchanged. Nothing here reimplements reactor
 //! logic — the node side is the real WorkQueue / ByteBudget / per-peer routine /
 //! Sequencer path.

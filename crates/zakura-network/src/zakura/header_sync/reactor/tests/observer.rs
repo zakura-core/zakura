@@ -1028,7 +1028,7 @@ fn trace_rows(reader: &TraceReader) -> Vec<serde_json::Value> {
         .map(|row| {
             let mut row = row.clone();
             let fields = row.as_object_mut().expect("a trace row is an object");
-            for envelope in ["ts", "node", "process_trace_id"] {
+            for envelope in ["ts", "wall_ts", "node", "process_trace_id"] {
                 fields.remove(envelope);
             }
             row

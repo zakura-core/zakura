@@ -424,21 +424,24 @@ impl HostilePeer {
     pub async fn oversize_frame_declared_len(&self, stream_kind: u16) -> Result<(), BoxError> {
         self.send_frame_header_with_declared_payload_len(
             stream_kind,
+            1,
             self.limits.max_frame_bytes.saturating_add(1),
         )
         .await
     }
 
-    /// Send a frame header with an explicit declared payload length and no payload.
+    /// Send a frame header with an explicit message type and declared payload length, and no
+    /// payload.
     pub async fn send_frame_header_with_declared_payload_len(
         &self,
         stream_kind: u16,
+        message_type: u16,
         declared_payload_len: u32,
     ) -> Result<(), BoxError> {
         let (mut send, _recv) = self.connection.open_bi().await?;
         self.write_prelude(&mut send, stream_kind).await?;
         let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
-        WriteBytesExt::write_u16::<LittleEndian>(&mut header, 1)?;
+        WriteBytesExt::write_u16::<LittleEndian>(&mut header, message_type)?;
         WriteBytesExt::write_u16::<LittleEndian>(&mut header, 0)?;
         WriteBytesExt::write_u32::<LittleEndian>(&mut header, declared_payload_len)?;
         send.write_all(&header).await?;

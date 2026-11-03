@@ -339,9 +339,9 @@ static PARENT_INPUT_READ_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::n
 ///
 /// The check keeps this map while the block's transaction checks run, on top of the copies those
 /// checks already make, so it is kept small. A full 2 MB block of standard 25-byte scripts keeps
-/// at most about 1.2 MB. A block over this limit, valid or not, gets
+/// at most about 1.2 MB. A block whose inputs all exist but pass this limit, valid or not, gets
 /// [`ParentInputs::Inconclusive`], so its transactions look their inputs up one by one, as they
-/// did before the check returned outputs.
+/// did before the check returned outputs. A missing input still gets [`ParentInputs::Missing`].
 const MAX_KEPT_PARENT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The result of reading one input in [`read_parent_inputs`].

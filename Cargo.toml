@@ -144,7 +144,9 @@ tokio-stream = "0.1.17"
 tokio-util = "0.7.14"
 # Production code only parses TOML; tests that serialize it enable `display`.
 toml = { version = "1.0", default-features = false, features = ["parse", "serde", "std"] }
-tonic = { version = "0.14", features = ["tls-ring"] }
+# No `router`: the indexer serves its one gRPC service directly, and axum's
+# routing code would add about 97 KB to zakurad's .text.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "tls-ring", "transport"] }
 tonic-prost = "0.14"
 # `cleanup-markdown` only rewrites doc comments, and pulls in pulldown-cmark,
 # pulldown-cmark-to-cmark and unicase; xtask does not need it.

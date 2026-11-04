@@ -258,21 +258,22 @@ fn a_relink_replaces_the_session_and_its_held_prepare_stays_inert() {
 }
 
 /// Both witnesses' session facts and full logs depend only on scenario and
-/// plan: plan A twice, with plan B between, gives A's both times, and B's
-/// differ.
+/// plan: plan A twice in a row, then B, then A again, gives A's every time,
+/// and B's log differs.
 #[test]
 fn the_session_witnesses_repeat_a_a_and_a_b_a() {
     let plans = inputs(3, 256);
     for scenario in [close_witness(), relink_witness()] {
-        let runs: Vec<(String, Vec<SessionFact>)> = [&plans[1], &plans[2], &plans[1]]
+        let runs: Vec<(String, Vec<SessionFact>)> = [&plans[1], &plans[1], &plans[2], &plans[1]]
             .into_iter()
             .map(|input| {
                 let (report, facts) = run(&scenario, input.clone());
                 (format!("{:?}", report.log.entries()), facts)
             })
             .collect();
-        assert_eq!(runs[0], runs[2], "plan A, then B, then A");
-        assert_ne!(runs[0].0, runs[1].0, "plan B's log differs");
+        assert_eq!(runs[0], runs[1], "plan A, then A");
+        assert_eq!(runs[0], runs[3], "plan A, then B, then A");
+        assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
     }
 }
 

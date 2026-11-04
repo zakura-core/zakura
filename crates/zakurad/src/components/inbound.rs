@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
@@ -684,13 +684,18 @@ impl Service<zn::Request> for Inbound {
                             break;
                         }
 
-                        let block = block_by_hash_or_pending(
+                        let block = match block_by_hash_or_pending(
                             state.clone(),
                             pending_blocks.clone(),
                             hash,
                         )
-                        .await?;
-                        if let Some(block) = &block {
+                        .await
+                        {
+                            Ok(block) => Some(block),
+                            Err(error) if is_read_capacity_refusal(&*error) => None,
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(Some(block)) = &block {
                             state_lookup_bytes = state_lookup_bytes
                                 .saturating_add(block.zcash_serialized_size());
                         }
@@ -706,6 +711,12 @@ impl Service<zn::Request> for Inbound {
                         //
                         // If there was a database error, return the error,
                         // and stop processing further chunks.
+                        let Some(block) = block else {
+                            // The state refused the read for lack of capacity. Peers cannot
+                            // rely on `notfound`, but it lets them retry elsewhere sooner.
+                            blocks.push(Missing(hash));
+                            continue;
+                        };
                         match block {
                             Some(block) => {
                                 // If checking the serialized size of the block performs badly,

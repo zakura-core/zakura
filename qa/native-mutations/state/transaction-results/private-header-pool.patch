@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -199,7 +199,7 @@ impl ZakuraDb {
+             return Ok(None);
+         };
+         // A header has a fixed size, so the reservation is exact.
+-        let reservation = self.read_capacity.memory.try_reserve(header_bytes())?;
++        let reservation = zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX).try_reserve(header_bytes())?;
+         let Some(header) = self
+             .db
+             .zs_get::<_, _, block::Header>(&block_header_by_height, &height)

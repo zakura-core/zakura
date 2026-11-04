@@ -870,9 +870,17 @@ where
                         .clone()
                         .oneshot(zs::Request::UnspentBestChainUtxo(*outpoint));
 
-                    let zakura_state::Response::UnspentBestChainUtxo(utxo) = query
-                        .await
-                        .map_err(|_| TransactionError::TransparentInputNotFound)?
+                    // A lookup failure other than a timeout, such as a read capacity
+                    // refusal, is not a verdict on the transaction.
+                    let zakura_state::Response::UnspentBestChainUtxo(utxo) =
+                        query.await.map_err(|boxed_error| {
+                            match boxed_error.downcast::<Elapsed>() {
+                                Ok(_) => TransactionError::TransparentInputNotFound,
+                                Err(boxed_error) => {
+                                    TransactionError::StateUnavailable(boxed_error.to_string())
+                                }
+                            }
+                        })?
                     else {
                         unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
                     };

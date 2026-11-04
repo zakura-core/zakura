@@ -1,7 +1,7 @@
 //! Iterators for blocks in the non-finalized and finalized state.
 
 use std::{marker::PhantomData, sync::Arc};
-use zakura_node_services::block_memory::{BlockHandle, HeaderHandle};
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle, HeaderHandle};
 
 use zakura_chain::block::{self, Block, Height};
 
@@ -124,10 +124,10 @@ pub(crate) trait ChainItem {
 // Block iteration
 
 impl ChainItem for Block {
-    type Type = BlockHandle;
+    type Type = Result<BlockHandle, AdmissionFailure>;
 
     fn read(chain: Option<&Arc<Chain>>, db: &ZakuraDb, height: Height) -> Option<Self::Type> {
-        read::block(chain, db, height.into())
+        read::block(chain, db, height.into()).transpose()
     }
 }
 

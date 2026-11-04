@@ -852,7 +852,7 @@ pub fn export_frontier_grid_to(
     // of the commitment counts to find. Either way, a target past `last` is a partial cell and
     // is not published.
     while let Some(target) = next_grid_target(spacing, next, last, &mut accrued_cost, |height| {
-        match db.block(height.into()) {
+        match db.stored_block(height.into()) {
             Some(block) => {
                 block.sapling_note_commitments().count()
                     + block.orchard_note_commitments().count()

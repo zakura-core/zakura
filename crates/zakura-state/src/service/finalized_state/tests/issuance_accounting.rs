@@ -153,13 +153,13 @@ pub(super) fn start_block(
 }
 
 /// Commits `block` to the finalized state as a checkpoint-verified block.
-pub(super) fn commit(
+pub(super) fn commit<B: Clone + Into<zakura_node_services::block_memory::BlockHandle>>(
     state: &mut FinalizedState,
-    block: &Arc<Block>,
+    block: &B,
 ) -> Result<(), CommitBlockError> {
     state
         .commit_finalized_direct(
-            CheckpointVerifiedBlock::from(block.clone()).into(),
+            CheckpointVerifiedBlock::from(block.clone().into()).into(),
             None,
             None,
             "NSM value balance test",

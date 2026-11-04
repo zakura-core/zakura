@@ -1,0 +1,11 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -789,7 +789,7 @@
+ 
+ impl From<OwnedTransaction> for TransactionHandle {
+     fn from(transaction: OwnedTransaction) -> Self {
+-        Self::Standalone(transaction)
++        Self::Shared(Arc::new((*transaction).clone()))
+     }
+ }
+ 

@@ -4,6 +4,7 @@ pub use zakura_chain::parameters::checkpoint::constants;
 pub mod block_memory;
 pub mod header_chain;
 pub mod mempool;
+pub mod prune_cadence;
 pub mod service_traits;
 pub mod sync_lifecycle;
 pub mod task;

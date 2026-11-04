@@ -162,7 +162,7 @@ fn max_money_commit_rejection_is_atomic_across_activation_and_recovery() {
         );
         assert_eq!(state.db.finalized_tip_hash(), parent.hash());
         assert_eq!(state.db.finalized_value_pool(), before);
-        assert!(state.db.block(rejected.hash().into()).is_none());
+        assert!(state.db.block(rejected.hash().into()).unwrap().is_none());
         assert!(state.db.block_info(height.into()).is_none());
         assert!(state
             .db

@@ -149,6 +149,7 @@ cache_dir = "cache_dir"
 debug_skip_non_finalized_state_backup_task = false
 delete_old_database = true
 ephemeral = false
+read_concurrency_limit = 64
 should_backup_non_finalized_state = true
 storage_mode = "archive"
 

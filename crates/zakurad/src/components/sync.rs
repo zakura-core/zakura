@@ -746,6 +746,90 @@ pub struct Config {
     pub debug_blocksync_throughput_target_height: Option<u32>,
 }
 
+/// The most block verifications that every sync and gossip path can submit together.
+///
+/// The verifier router has no admission of its own, so its callers hold the shared bound
+/// as a static partition. This allowance keeps a configured limit from turning the
+/// partition into an unbounded backlog.
+pub const MAX_BACKEND_BLOCK_VERIFICATIONS: usize = 100_000;
+
+/// Why configured verification limits do not fit the node's shared allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BackendExecutionError {
+    /// The limits overflow when the partition scales or adds them.
+    #[error("block verification concurrency limits overflow")]
+    Overflow,
+    /// The sum of the limits exceeds [`MAX_BACKEND_BLOCK_VERIFICATIONS`].
+    #[error(
+        "block verification concurrency limits total {total}, \
+         above the {MAX_BACKEND_BLOCK_VERIFICATIONS} node allowance"
+    )]
+    AboveAllowance {
+        /// Configured sum.
+        total: usize,
+    },
+}
+
+impl Config {
+    /// Check that the sync and gossip paths fit one verifier allowance, then return
+    /// the block verifications they can hold together on `network`.
+    ///
+    /// The verifier router is one backend. Legacy sync, native block sync, and gossip each
+    /// hold their own limit. Each term is the effective limit at runtime: the configured
+    /// limit raised to its minimum, then scaled by the largest lookahead multiplier of any
+    /// network upgrade.
+    pub fn backend_verification_total(
+        &self,
+        network: &Network,
+    ) -> Result<usize, BackendExecutionError> {
+        let multiplier = network
+            .activation_list()
+            .into_keys()
+            .map(|height| lookahead_limit_multiplier(network, height))
+            .max()
+            .unwrap_or(1);
+        let checkpoint = self
+            .checkpoint_verify_concurrency_limit
+            .max(MIN_CHECKPOINT_CONCURRENCY_LIMIT);
+        let legacy_checkpoint = checkpoint
+            .checked_mul(multiplier)
+            .and_then(|limit| limit.checked_mul(VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1))
+            .ok_or(BackendExecutionError::Overflow)?;
+        let legacy_full = self
+            .full_verify_concurrency_limit
+            .max(MIN_CONCURRENCY_LIMIT)
+            .checked_mul(multiplier)
+            .ok_or(BackendExecutionError::Overflow)?;
+        // The native driver keeps room for two complete checkpoint ranges.
+        let native_applies = self
+            .zakura_block_apply_concurrency_limit
+            .max(MIN_CONCURRENCY_LIMIT)
+            .max(
+                2 * self.checkpoint_verify_concurrency_limit.clamp(
+                    MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+                    zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+                ),
+            );
+        let total = [
+            // Legacy sync's checkpoint verifications, including its pipeline scaling.
+            legacy_checkpoint,
+            // Legacy sync's full verifications.
+            legacy_full,
+            // Native block sync's combined applies.
+            native_applies,
+            // Gossiped block downloads that can reach verification.
+            crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(BackendExecutionError::Overflow)?;
+        if total > MAX_BACKEND_BLOCK_VERIFICATIONS {
+            return Err(BackendExecutionError::AboveAllowance { total });
+        }
+        Ok(total)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {

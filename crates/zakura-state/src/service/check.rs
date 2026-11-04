@@ -1,7 +1,7 @@
 //! Consensus critical contextual checks
 
 use std::borrow::Borrow;
-use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle};
 
 use zakura_chain::{
     amount::{NegativeAllowed, NonNegative},
@@ -499,12 +499,18 @@ pub(crate) fn legacy_chain<I>(
     max_legacy_chain_blocks: usize,
 ) -> Result<(), BoxError>
 where
-    I: Iterator<Item = BlockHandle>,
+    I: Iterator<Item = Result<BlockHandle, AdmissionFailure>>,
 {
     let mut ancestors = ancestors.peekable();
-    let tip_height = ancestors.peek().and_then(|block| block.coinbase_height());
+    let tip_height = ancestors.peek().and_then(|block| {
+        block
+            .as_ref()
+            .ok()
+            .and_then(|block| block.coinbase_height())
+    });
 
     for (index, block) in ancestors.enumerate() {
+        let block = block?;
         // Stop checking if the chain reaches Canopy. We won't find any more V5 transactions,
         // so the rest of our checks are useless.
         //

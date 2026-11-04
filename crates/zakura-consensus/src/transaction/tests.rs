@@ -1319,6 +1319,49 @@ async fn mempool_request_with_missing_input_is_rejected() {
     }
 }
 
+/// Only a lookup timeout reports a missing input. A state refusal reports the state as
+/// unavailable, so a mempool caller cannot mistake lost capacity for missing data.
+#[tokio::test]
+async fn mempool_lookup_refusal_stays_distinct_from_a_missing_input() {
+    let net = Network::Mainnet;
+    // The mempool rejects an unsupported version before it looks up any input.
+    let (height, tx) = transactions_from_blocks(net.block_iter())
+        .find(|(_, tx)| {
+            tx.version() >= 4
+                && !tx.is_coinbase()
+                && !tx.inputs().is_empty()
+                && !tx.lock_time_is_time()
+        })
+        .expect(
+            "test vectors include a supported non-coinbase transaction with transparent inputs and no time lock",
+        );
+
+    for elapsed in [false, true] {
+        let state = service_fn(move |_: zakura_state::Request| async move {
+            Err::<zakura_state::Response, BoxError>(if elapsed {
+                tower::timeout::error::Elapsed::new().into()
+            } else {
+                zakura_node_services::block_memory::AdmissionFailure::Capacity.into()
+            })
+        });
+        let error = Verifier::new_for_tests(&net, state)
+            .oneshot(Request::Mempool {
+                transaction: tx.clone().into(),
+                height,
+            })
+            .await
+            .unwrap_err();
+        if elapsed {
+            assert_eq!(error, TransactionError::TransparentInputNotFound);
+        } else {
+            assert!(
+                matches!(error, TransactionError::StateUnavailable(_)),
+                "{error}"
+            );
+        }
+    }
+}
+
 /// A present transparent input with an unlocked lock time is accepted.
 #[tokio::test]
 async fn mempool_request_with_present_input_is_accepted() {

@@ -1733,7 +1733,7 @@ fn update_latest_chain_channels(
 
 fn update_channels_after_operator_change(
     non_finalized_state: &NonFinalizedState,
-    finalized_state: &FinalizedState,
+    finalized_tip: Option<ChainTipBlock>,
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
     backup_dir_path: Option<&Path>,
@@ -1743,13 +1743,7 @@ fn update_channels_after_operator_change(
             non_finalized_state.write_to_backup(backup_dir_path);
         }
         non_finalized_state.publish(non_finalized_state_sender);
-        chain_tip_sender.clear_best_non_finalized_tip(
-            finalized_state
-                .db
-                .tip_block()
-                .map(CheckpointVerifiedBlock::from)
-                .map(ChainTipBlock::from),
-        );
+        chain_tip_sender.clear_best_non_finalized_tip(finalized_tip);
     } else {
         update_latest_chain_channels(
             non_finalized_state,
@@ -3094,6 +3088,14 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
+                        }
+                    };
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
                         staged.invalidate_block(hash).and_then(|result| {
@@ -3109,7 +3111,7 @@ impl WriteBlockWorkerTask {
                     if result.is_ok() {
                         update_channels_after_operator_change(
                             non_finalized_state,
-                            finalized_state,
+                            finalized_tip,
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
@@ -3157,7 +3159,7 @@ impl WriteBlockWorkerTask {
                             }
                             update_channels_after_operator_change(
                                 non_finalized_state,
-                                finalized_state,
+                                None,
                                 chain_tip_sender,
                                 non_finalized_state_sender,
                                 backup_dir_path.as_deref(),
@@ -3173,6 +3175,14 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
+                        }
+                    };
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
                         staged
@@ -3201,7 +3211,7 @@ impl WriteBlockWorkerTask {
                             .evicted_blocks(non_finalized_state);
                         update_channels_after_operator_change(
                             non_finalized_state,
-                            finalized_state,
+                            finalized_tip,
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),

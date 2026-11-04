@@ -369,6 +369,14 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
+        let backend_verifications = config
+            .sync
+            .backend_verification_total(&config.network.network)
+            .map_err(|error| eyre!(error))?;
+        info!(
+            backend_verifications,
+            "checked the backend verification bound"
+        );
 
         if config.zcashd_compat.enabled {
             zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;
@@ -1364,7 +1372,7 @@ impl StartCmd {
     ///
     /// Returns the node's error after logging it.
     pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
-        let runtime = new_runtime();
+        let runtime = new_runtime(config.mirrored_state_config().read_worker_count());
 
         info!("Starting zakurad");
 

@@ -12,7 +12,7 @@ use super::{
         state::{DeliverySnapshot, OutstandingBlockRange, RequestKey, WriteOutcome},
         ZakuraBlockSyncConfig,
     },
-    PeerState,
+    PeerState, UncreditedTimeout,
 };
 
 /// Why a routine rejects a body whose hash isn't the one its outstanding
@@ -336,15 +336,26 @@ impl PeerState {
     ) -> bool {
         self.window.note_block_progress(now, liveness_timeout);
         self.forget_timeouts_through(download_floor);
-        let Some(&(_, request)) = self
+        let Some(&UncreditedTimeout {
+            request,
+            span: (first, last),
+            ..
+        }) = self
             .uncredited_timeouts
             .get(&height)
-            .filter(|(requested, _)| *requested == hash)
+            .filter(|timeout| timeout.hash == hash)
         else {
             return false;
         };
-        self.uncredited_timeouts
-            .retain(|_, (_, timed_out)| *timed_out != request);
+        let credited: Vec<_> = self
+            .uncredited_timeouts
+            .range(first..=last)
+            .filter(|(_, timeout)| timeout.request == request)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in credited {
+            self.uncredited_timeouts.remove(&height);
+        }
         self.window.credit_late_delivery();
         true
     }
@@ -472,14 +483,24 @@ impl PeerState {
             self.forget_timeouts_through(download_floor);
             self.uncredited_timeouts
                 .extend(timed_out.iter().flat_map(|(key, range)| {
-                    range
-                        .request
-                        .expected_blocks
+                    let blocks = &range.request.expected_blocks;
+                    let span = (
+                        blocks.first().map_or(download_floor, |block| block.height),
+                        blocks.last().map_or(download_floor, |block| block.height),
+                    );
+                    blocks
                         .iter()
                         .filter(|expected| {
                             expected.height > download_floor && !range.has_received(expected.height)
                         })
-                        .map(|expected| (expected.height, (expected.hash, *key)))
+                        .map(move |expected| {
+                            let timeout = UncreditedTimeout {
+                                hash: expected.hash,
+                                request: *key,
+                                span,
+                            };
+                            (expected.height, timeout)
+                        })
                 }));
         }
         let timed_out = timed_out.into_iter().map(|(_, range)| range).collect();

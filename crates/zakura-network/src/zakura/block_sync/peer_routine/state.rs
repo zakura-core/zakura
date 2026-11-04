@@ -32,6 +32,17 @@ pub(super) use requests::{
 };
 pub(super) use status::StatusUpdate;
 
+/// One unreceived body of a request that timed out on this session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct UncreditedTimeout {
+    /// The hash the request asked for at this height.
+    pub(super) hash: block::Hash,
+    /// The timed-out request.
+    pub(super) request: RequestKey,
+    /// The request's first and last heights, which hold all its entries.
+    pub(super) span: (block::Height, block::Height),
+}
+
 /// One block-sync session's download, status, and liveness facts.
 ///
 /// `PeerState` holds no runtime handles. The routine passes in time and
@@ -48,10 +59,10 @@ pub(super) struct PeerState {
     /// itself — the peer-local retry bias. Pruned on expiry each fill pass.
     pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
     /// Unreceived bodies of requests that timed out on this session and whose
-    /// timeout no late body has offset yet, by height, with the requested hash
-    /// and the timed-out request. Heights at or below the download floor leave,
-    /// so the download window above the floor bounds this map.
-    pub(super) uncredited_timeouts: BTreeMap<block::Height, (block::Hash, RequestKey)>,
+    /// timeout no late body has offset yet, by height. Heights at or below the
+    /// download floor leave, so the download window above the floor bounds
+    /// this map.
+    pub(super) uncredited_timeouts: BTreeMap<block::Height, UncreditedTimeout>,
     /// Whether the last fill stopped because the node-wide request pool was
     /// empty, so the routine waits for a pool entry.
     pub(super) request_pool_waiting: bool,

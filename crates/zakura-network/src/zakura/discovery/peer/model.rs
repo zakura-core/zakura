@@ -181,7 +181,9 @@ impl Model {
                 }
             }
             (Line::Refresh, PeerInput::Refreshed { sent }) => {
-                if sent {
+                // A timed-out exchange gets one refresh interval to complete.
+                let stalled = self.continued == Some(true) && !self.complete();
+                if sent && !stalled {
                     (Line::Owners, then(PeerOutput::CheckSoleOwner))
                 } else {
                     (Line::Done, self.settle_open())

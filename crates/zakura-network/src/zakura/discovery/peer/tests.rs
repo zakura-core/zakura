@@ -169,6 +169,27 @@ fn a_late_completion_settles_a_timed_out_session_as_a_success() {
     );
 }
 
+/// A timed-out exchange that is still incomplete one refresh interval later
+/// ends its session with a failure charge, even while another service keeps
+/// the connection.
+#[test]
+fn a_timed_out_exchange_still_incomplete_after_a_refresh_ends_charged() {
+    let mut state = waiting_session();
+    state.record_answer(&admitted(QueryKind::Peers));
+    assert_eq!(
+        settle_initial(&mut state, InitialWait::TimedOut),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Shared)),
+        then(REFRESH)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Refreshed { sent: true }),
+        charged(SessionCharge::Fail, END_OPEN)
+    );
+}
+
 /// An exchange that the close's answer wait finishes closes as complete, not
 /// as timed out. A connection another service keeps settles it as a success.
 #[test]

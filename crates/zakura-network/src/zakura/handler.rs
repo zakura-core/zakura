@@ -661,7 +661,10 @@ impl ZakuraLocalLimits {
     /// These limits with `shares`, and the QUIC windows that carry them: the
     /// connection window starts at the handshake share, and the stream window
     /// holds the largest receive share.
-    pub fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
+    ///
+    /// The connection cap stays, so only [`Self::from_config`] calls this, with
+    /// the shares that the cap was budgeted from.
+    fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
         self.quic.receive_window_bytes =
             u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX);
         self.quic.stream_receive_window_bytes =

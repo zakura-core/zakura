@@ -46,7 +46,7 @@ pub(super) fn vct_repair_predecessor(
         RepairPolicyState::Ready { context }
         | RepairPolicyState::LocalBackoff { context, .. }
         | RepairPolicyState::StateBlocked { context, .. }
-        | RepairPolicyState::Assigned { context } => context,
+        | RepairPolicyState::Assigned { context, .. } => context,
         RepairPolicyState::NeedsContext
         | RepairPolicyState::QueryingContext { .. }
         | RepairPolicyState::ContextBackoff { .. }
@@ -75,10 +75,13 @@ impl HeaderSyncReactor {
                     && source_id_from_peer(peer) == source
             })
             .map(|(peer, _)| peer.clone());
-        let retry_session_is_current = peer.is_some();
         if let Some(peer) = peer {
             self.state.clear_request_deadline(&peer);
         }
+        let supplier_connected = self
+            .sessions
+            .keys()
+            .any(|peer| source_id_from_peer(peer) == source);
         if retry.attribution == VctRepairRetryAttribution::Stale {
             if let Some(task) = self.state.vct_repair.remove(owner) {
                 self.emit_vct_repair_state(&task, "terminal", Some("stale_episode"));
@@ -89,7 +92,7 @@ impl HeaderSyncReactor {
         let now = Instant::now();
         if !self
             .state
-            .schedule_repair_retry(owner, retry, retry_session_is_current, now)
+            .schedule_repair_retry(owner, retry, supplier_connected, now)
         {
             return;
         }
@@ -437,9 +440,10 @@ impl HeaderSyncReactor {
         let RepairCandidate {
             peer,
             source,
-            mut status,
+            status: advertised,
             request_count,
         } = candidate;
+        let mut status = advertised.clone();
         if self.peer_work_queue.awaiting_target(&peer).is_some() {
             // Preemption returns the ordinary offer even if reserving or sending repair fails.
             self.defer_ordinary_target(&peer);
@@ -516,7 +520,7 @@ impl HeaderSyncReactor {
         if self
             .state
             .vct_repair
-            .assign(task.owner, wire_owner, selected_context.clone())
+            .assign(task.owner, wire_owner, selected_context.clone(), advertised)
             .is_err()
         {
             self.close_subscription(&peer);

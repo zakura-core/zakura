@@ -1914,6 +1914,7 @@ async fn active_repair_status_flood_cost() {
             },
             RepairPolicyState::Assigned {
                 context: context.clone(),
+                advertised: status_for(&snapshot, snapshot.frontiers.header_best.hash),
             },
             RepairPolicyState::Completed,
         ];

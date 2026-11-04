@@ -468,7 +468,7 @@ impl Harness {
                 let replaced = self.state.admit_session(&peer_id(peer));
                 if replaced {
                     self.state
-                        .requeue_supplier(source_id_from_peer(&peer_id(peer)));
+                        .rotate_supplier(source_id_from_peer(&peer_id(peer)));
                 }
                 self.model.next_session += 1;
                 let previous = self.model.sessions.insert(
@@ -1292,7 +1292,8 @@ proptest! {
             }
             if supplier.waiting {
                 let owner = task.owner;
-                task.assign(owner, context.clone()).expect("the repair is ready");
+                task.assign(owner, context.clone(), supplier.status.clone())
+                    .expect("the repair is ready");
                 task.wait_for_supplier_status(source).expect("the repair is assigned");
             }
         }

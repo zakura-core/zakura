@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "12.0.0"
+version = "13.0.0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -48,6 +48,8 @@ sync-metrics = []
 
 # Testing features that activate extra dependencies
 header-fuzz = []
+# Exposes the P2P machine fuzz entry points to `qa/fuzz/p2p`.
+p2p-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 

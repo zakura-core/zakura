@@ -43,6 +43,7 @@ impl Collect for Everything {
             Category::Storage => 3,
             Category::Peer => 4,
             Category::Time => 5,
+            Category::Machine => 6,
         };
         map.hit(Feature::new(256 + category));
         for _ in cx.observations() {

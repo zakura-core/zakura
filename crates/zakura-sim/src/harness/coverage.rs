@@ -219,6 +219,22 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("locator-call-settles-without-removal"),
     },
     Coverage {
+        property: "block/work-funding",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_funding_records_and_replays_retained_runtime_owners",
+        ),
+        bypass: Bypass::Planted("lost-reservation-release"),
+    },
+    Coverage {
+        property: "block/work-ownership",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("missing-published-charge"),
+    },
+    Coverage {
         property: super::NO_TASK_PANIC,
         passing: passes("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
         bypass: Bypass::Test(sim_test(

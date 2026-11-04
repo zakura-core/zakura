@@ -293,7 +293,8 @@ impl BlockScenario {
     /// `M` is `10·B` and the look-ahead limit `L` is `2.5·B`, more than the
     /// 400 bodies the commit window retains. Once the window's heights
     /// arrive, the node requests heights above it until its estimates spend
-    /// `L`.
+    /// `L`. The first request above the window comes at about step 323,000, so
+    /// the run stops at 350,000 steps.
     pub fn above_window() -> Self {
         BlockScenario {
             blocks: 420,
@@ -308,7 +309,7 @@ impl BlockScenario {
             max_inflight_block_bytes: Some(20_000_000),
             max_reorder_lookahead_bytes: Some(5_000_000),
             max_response_bytes: Some(2_000_000),
-            steps: Some(300_000),
+            steps: Some(350_000),
             ..BlockScenario::default()
         }
     }

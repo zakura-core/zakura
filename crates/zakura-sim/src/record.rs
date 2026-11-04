@@ -38,8 +38,9 @@ use crate::{
 /// block-sync body. Version 18 added the decoded size of the block a
 /// submission carries. Version 19 added the runtime object a task's point
 /// touches. Version 20 adds causal inputs and independent state views for
-/// machine steps, tagged by kind. Other pure-reactor lanes hold versions 21 and
-/// 22. Version 23 is the header-owner lane's: the reactor's refused and joined
+/// machine steps, tagged by kind. Another pure-reactor lane holds version 21.
+/// Version 22 adds block ownership and runtime queue funding evidence.
+/// Version 23 is the header-owner lane's: the reactor's refused and joined
 /// storage calls and `dropped` call ends, the `call` that submitted a header
 /// `submitted` fact, the `callers_alive` of a header `shut-down` fact, and the
 /// repair stall and unproductive requests of a header reactor machine step.

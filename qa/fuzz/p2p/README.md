@@ -5,11 +5,16 @@ target drives one pure P2P machine from fuzz bytes and checks it against an
 independent model after every input. A target panics with the property ID that
 the machine broke. The targets do not start QUIC or the simulator step loop.
 
-The package has no target yet. Each owning PR adds its targets as `[[bin]]`
-entries, with a row in the table below.
+Each owning PR adds its targets as `[[bin]]` entries, with a row in the table
+below.
 
 | Target | Property | Decoder |
 | --- | --- | --- |
+| `block_peer_registry` | `block/peer-registry` | 1 |
+| `block_retry_authority` | `block/retry-authority` | 1 |
+
+`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` model through
+trace and replay, so it needs no target here.
 
 The input decoding, the model and the checks live in `zakura-network` behind the
 `p2p-fuzz` feature, so the machine types stay private to the crate.

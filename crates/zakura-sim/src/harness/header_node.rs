@@ -345,10 +345,12 @@ impl ActionSource for PolicySource {
             predicates.record_link(LinkEffect::Linked, &link.peer);
         }
         self.linked = links.len();
-        // A connection closes once, whoever cancels it and however often.
+        // A connection closes once, whoever cancels it and however often. A
+        // service's own cancellation reaches the session view here.
         for link in links.iter() {
             if link.is_closed() && self.closed.insert(link.conn_id) {
                 predicates.record_link(LinkEffect::Closed, &link.peer);
+                link.record_closed();
             }
         }
         let grown = self.effects.grown.borrow();
@@ -503,11 +505,17 @@ impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
-        if let Some(sessions) = &self.sessions {
-            sessions.link_closed(self.conn_id);
-        }
+        self.record_closed();
         for token in &self.tokens {
             token.cancel();
+        }
+    }
+
+    /// Tells the node under test's session view that this link closed. It
+    /// keeps only the first notice.
+    fn record_closed(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.link_closed(self.conn_id);
         }
     }
 
@@ -664,11 +672,16 @@ impl Topology {
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
         let peer = if dialer == 0 { listener } else { dialer };
+        let origin = SessionOrigin {
+            connection: id,
+            quic_stream: None,
+            generation: id,
+        };
         if let Some(sessions) = &self.sessions {
             sessions.link_opened(
                 &self.nodes[peer].id,
                 &self.nodes[peer].name,
-                id,
+                origin,
                 id,
                 &self.nodes[dialer].name,
                 if dialer == 0 {
@@ -678,11 +691,6 @@ impl Topology {
                 },
             );
         }
-        let origin = SessionOrigin {
-            connection: id,
-            quic_stream: None,
-            generation: id,
-        };
         let sides = [
             (
                 dialer,

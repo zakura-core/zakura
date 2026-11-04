@@ -8,7 +8,10 @@ use zakura_header_chain::{
     BodyWorkAuthority, BodyWorkEpoch, BranchId, HeaderGeneration, HeaderWorkAuthority,
     VerifiedGeneration,
 };
-use zakura_network::zakura::{observe::RequestRef, HeaderTargetPurpose};
+use zakura_network::zakura::{
+    observe::{HeaderRequestTerminal, HeaderTargetPhase, RequestRef},
+    HeaderTargetPurpose,
+};
 
 use super::*;
 
@@ -108,7 +111,7 @@ fn linked(links: &[u64]) -> SessionEvidence {
         view.link_opened(
             &mirror(),
             "mirror-0",
-            *id,
+            origin(*id).expect("a link has an origin"),
             *id,
             "mirror-0",
             ServicePeerDirection::Inbound,
@@ -167,9 +170,9 @@ fn an_admission_joins_its_link() {
     );
 }
 
-/// An admission with no origin, an origin naming no link or the wrong
-/// generation, a wrong session ID, peer or direction, and a second admission
-/// of one link each break the join.
+/// An admission with no origin, an origin naming no link, the wrong
+/// generation or a QUIC stream, a wrong session ID, peer or direction, and a
+/// second admission of one link each break the join.
 #[test]
 fn every_join_mismatch_breaks() {
     let other = ZakuraPeerId::new(vec![3; 32]).expect("32 bytes is a valid peer ID");
@@ -192,13 +195,19 @@ fn every_join_mismatch_breaks() {
         quic_stream: None,
         generation: 2,
     });
+    let with_stream = Some(SessionOrigin {
+        connection: 1,
+        quic_stream: Some(99),
+        generation: 1,
+    });
     for (events, expected) in [
         (vec![admitted(1, None, None)], "with no origin"),
         (vec![admitted(1, None, origin(9))], "names no link"),
         (
             vec![admitted(1, None, wrong_generation)],
-            "its link has generation 1",
+            "its link has origin",
         ),
+        (vec![admitted(1, None, with_stream)], "its link has origin"),
         (vec![admitted(2, None, origin(1))], "its link has session 1"),
         (vec![wrong_peer], "its link has peer mirror-0"),
         (vec![outbound], "its link has direction Inbound"),
@@ -261,40 +270,46 @@ fn departed_session_work_breaks() {
     }
 }
 
-/// A repair whose prepare was dispatched before its session left may still
-/// apply. One prepared only afterwards may not, and neither may a repair
-/// that never prepared.
+/// The retirement of `owner`'s request.
+fn retired(owner: HeaderSyncWorkOwner) -> ReactorEvent {
+    let ReactorEvent::Started { request, purpose } = started(owner) else {
+        unreachable!("`started` builds a start");
+    };
+    ReactorEvent::Retired {
+        request,
+        phase: HeaderTargetPhase::Applying,
+        purpose,
+        reason: HeaderRequestTerminal::SessionReplaced,
+    }
+}
+
+/// A repair that was preparing when its session left may apply once. One
+/// prepared only afterwards may not, nor one that never prepared, nor one
+/// that retired or was already applying before its session left.
 #[test]
-fn a_kept_repair_may_apply() {
-    let left = ReactorEvent::SessionEnded {
+fn a_kept_repair_may_apply_once() {
+    let left = || ReactorEvent::SessionEnded {
         peer: mirror(),
         session_id: 1,
         reason: "test",
     };
     let first = || admitted(1, None, origin(1));
+    let prepare = || dispatched(false, repair(1));
+    let apply = || dispatched(true, repair(1));
     for (events, legal) in [
+        (vec![first(), prepare(), left(), apply()], true),
+        (vec![first(), prepare(), left(), apply(), apply()], false),
+        (vec![first(), left(), prepare(), apply()], false),
+        (vec![first(), left(), apply()], false),
         (
-            vec![
-                first(),
-                dispatched(false, repair(1)),
-                left.clone(),
-                dispatched(true, repair(1)),
-            ],
-            true,
-        ),
-        (
-            vec![
-                first(),
-                left.clone(),
-                dispatched(false, repair(1)),
-                dispatched(true, repair(1)),
-            ],
+            vec![first(), prepare(), retired(repair(1)), left(), apply()],
             false,
         ),
         (
-            vec![first(), left.clone(), dispatched(true, repair(1))],
+            vec![first(), prepare(), left(), retired(repair(1)), apply()],
             false,
         ),
+        (vec![first(), prepare(), apply(), left(), apply()], false),
     ] {
         assert_eq!(
             broken(&linked(&[1]), &events).is_none(),

@@ -6,21 +6,25 @@
 //! expectation: [`SessionFact::LinkOpened`] when it makes a link, and
 //! [`SessionFact::LinkClosed`] when it closes one. The reactor tap records the
 //! reactor's side: [`SessionFact::SessionAdmitted`] and
-//! [`SessionFact::SessionEnded`]. A [`SessionEvidence`] keeps both in the
-//! order they happened and checks two rules as facts arrive.
+//! [`SessionFact::SessionEnded`]. A link a service closes itself, such as a
+//! replacement retiring an unfinished exchange, is recorded at the next
+//! observation, when the harness's closure count sees it. A
+//! [`SessionEvidence`] keeps both sides in the order they happened and checks
+//! two rules as facts arrive.
 //!
 //! - **Join.** Once the links report here ([`SessionEvidence::expect_links`]),
 //!   every admission matches exactly one opened link by its origin's
-//!   connection and generation. It must agree with that link on peer,
-//!   direction and session ID, so a wrong session ID fails even when the
-//!   origin is right. A link is admitted at most once. A refused link has no
+//!   connection, and carries that link's whole origin. It must agree with
+//!   that link on peer, direction and session ID, so a wrong session ID fails
+//!   even when the origin is right. A link is admitted at most once. A refused link has no
 //!   admission, so the reverse isn't required.
 //! - **Departed sessions stay inert.** A session leaves the reactor's view when
 //!   another replaces it or when its disconnect ends it. After that, no
 //!   `Started` and no ordinary `Dispatched { Apply }` names it. A late
-//!   completion of a call it already started is still legal. So is the apply
-//!   of a selected auxiliary repair whose prepare was dispatched before the
-//!   session left, which the reactor keeps until its held operation ends.
+//!   completion of a call it already started is still legal. So is one apply
+//!   of a selected auxiliary repair that was preparing when the session left,
+//!   which the reactor keeps until its held operation ends. A repair that was
+//!   already applying, or that retired, may not apply again.
 //!
 //! The facts stay out of the observation log, so pinned Plans keep their
 //! format. A test reads them from the run's
@@ -29,13 +33,13 @@
 //! [`Topology::link`]: super::Topology::link
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner};
 use zakura_network::zakura::{
-    observe::{PortCall, ReactorEvent},
+    observe::{PortCall, ReactorEvent, RequestRef},
     ServicePeerDirection, SessionOrigin, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
@@ -55,7 +59,9 @@ pub enum SessionFact {
         /// The node that dialed.
         dialer: String,
     },
-    /// The harness closed the link on `connection`, the first time it did.
+    /// The link on `connection` closed, the first time it did: when the
+    /// harness closed it, or at the next observation after a service
+    /// cancelled its connection.
     LinkClosed {
         /// The node at the other end.
         peer: String,
@@ -109,14 +115,14 @@ struct SessionLedger {
     facts: Vec<SessionFact>,
     /// Each link by connection.
     links: HashMap<u64, Link>,
-    /// Each session that left the reactor's view, by peer and session ID,
-    /// with the reactor event count when it left.
-    departed: HashMap<(ZakuraPeerId, u64), u64>,
-    /// Each auxiliary repair whose prepare was dispatched, with the reactor
-    /// event count then.
-    repairs: HashMap<BodyWorkOwner, u64>,
-    /// Reactor events fed so far.
-    events: u64,
+    /// Each session that left the reactor's view, by peer and session ID.
+    departed: HashSet<(ZakuraPeerId, u64)>,
+    /// Each live auxiliary repair with a dispatched call: its peer, and
+    /// whether that call is its apply.
+    repairs: HashMap<BodyWorkOwner, (ZakuraPeerId, bool)>,
+    /// The repairs that were preparing when their session left, each allowed
+    /// one apply.
+    kept: HashSet<BodyWorkOwner>,
     /// The first rule the run broke.
     broken: Option<String>,
 }
@@ -125,6 +131,8 @@ struct SessionLedger {
 struct Link {
     peer: ZakuraPeerId,
     name: String,
+    /// The origin both sides' peers carry.
+    origin: SessionOrigin,
     session_id: u64,
     /// The node under test's side of it.
     direction: ServicePeerDirection,
@@ -159,17 +167,18 @@ impl SessionEvidence {
     }
 
     /// Records that the harness linked the node under test to `peer`, named
-    /// `name`, on `connection` with `session_id`. `dialer` names the node
-    /// that dialed, and `direction` is the node under test's side.
+    /// `name`, with `session_id`, handing both sides `origin`. `dialer` names
+    /// the node that dialed, and `direction` is the node under test's side.
     pub(crate) fn link_opened(
         &self,
         peer: &ZakuraPeerId,
         name: &str,
-        connection: u64,
+        origin: SessionOrigin,
         session_id: u64,
         dialer: &str,
         direction: ServicePeerDirection,
     ) {
+        let connection = origin.connection;
         let mut ledger = self.ledger();
         ledger.facts.push(SessionFact::LinkOpened {
             peer: name.to_owned(),
@@ -180,6 +189,7 @@ impl SessionEvidence {
         let link = Link {
             peer: peer.clone(),
             name: name.to_owned(),
+            origin,
             session_id,
             direction,
             admitted: false,
@@ -192,8 +202,7 @@ impl SessionEvidence {
         }
     }
 
-    /// Records that the harness closed the link on `connection`, unless it
-    /// already did.
+    /// Records that the link on `connection` closed, unless it already did.
     pub(crate) fn link_closed(&self, connection: u64) {
         let mut ledger = self.ledger();
         let Some(link) = ledger.links.get_mut(&connection) else {
@@ -239,23 +248,25 @@ impl SessionLedger {
             .map_or_else(|| super::tap::peer(peer), |link| link.name.clone())
     }
 
-    /// Records `peer`'s session `session_id` as gone from the reactor's view.
+    /// Records `peer`'s session `session_id` as gone from the reactor's view,
+    /// keeping one apply for each of its repairs that was preparing.
     fn depart(&mut self, peer: &ZakuraPeerId, session_id: u64) {
-        self.departed
-            .entry((peer.clone(), session_id))
-            .or_insert(self.events);
+        if !self.departed.insert((peer.clone(), session_id)) {
+            return;
+        }
+        let preparing = self
+            .repairs
+            .iter()
+            .filter(|(owner, (of, applying))| {
+                owner.session_id() == session_id && of == peer && !applying
+            })
+            .map(|(owner, _)| *owner);
+        self.kept.extend(preparing);
     }
 
-    /// Whether work of `peer`'s session `session_id` can't start or apply
-    /// now: the session left the view, and the work isn't `repair`, an
-    /// auxiliary repair whose prepare was dispatched before it left.
-    fn stale(&self, peer: &ZakuraPeerId, session_id: u64, repair: Option<BodyWorkOwner>) -> bool {
-        let Some(left) = self.departed.get(&(peer.clone(), session_id)) else {
-            return false;
-        };
-        !repair
-            .and_then(|owner| self.repairs.get(&owner))
-            .is_some_and(|prepared| prepared < left)
+    /// Whether `peer`'s session `session_id` left the reactor's view.
+    fn departed(&self, peer: &ZakuraPeerId, session_id: u64) -> bool {
+        self.departed.contains(&(peer.clone(), session_id))
     }
 
     /// Checks `admitted`'s session against the link its origin names.
@@ -278,8 +289,8 @@ impl SessionLedger {
                  {origin:?}, which names no link"
             ));
         };
-        let mismatch = if link.session_id != origin.generation {
-            Some(format!("generation {}", link.session_id))
+        let mismatch = if link.origin != origin {
+            Some(format!("origin {:?}", link.origin))
         } else if link.peer != *peer {
             Some(format!("peer {}", link.name))
         } else if link.direction != direction {
@@ -306,7 +317,6 @@ impl SessionLedger {
 
     /// Records `event`'s session fact, if it has one, and checks it.
     fn reactor(&mut self, event: &ReactorEvent) {
-        self.events += 1;
         match event {
             ReactorEvent::SessionAdmitted {
                 peer,
@@ -344,7 +354,7 @@ impl SessionLedger {
                 self.depart(peer, *session_id);
             }
             ReactorEvent::Started { request, .. } => {
-                if self.stale(&request.peer, request.session_id, None) {
+                if self.departed(&request.peer, request.session_id) {
                     let why = format!(
                         "DepartedSessionWork: request {} started for {}'s session {}, after it \
                          left the reactor's view",
@@ -355,25 +365,40 @@ impl SessionLedger {
                     self.break_rule(why);
                 }
             }
-            ReactorEvent::Dispatched {
-                op:
-                    PortCall::Prepare {
+            ReactorEvent::Retired {
+                request:
+                    RequestRef {
                         owner: HeaderSyncWorkOwner::BodyRepair(repair),
                         ..
                     },
                 ..
             } => {
-                self.repairs.entry(*repair).or_insert(self.events);
+                self.repairs.remove(repair);
+                self.kept.remove(repair);
+            }
+            ReactorEvent::Dispatched {
+                op:
+                    PortCall::Prepare {
+                        peer,
+                        owner: HeaderSyncWorkOwner::BodyRepair(repair),
+                        ..
+                    },
+                ..
+            } => {
+                self.repairs.insert(*repair, (peer.clone(), false));
             }
             ReactorEvent::Dispatched {
                 call,
                 op: PortCall::Apply { peer, owner, .. },
             } => {
-                let repair = match owner {
-                    HeaderSyncWorkOwner::Header(_) => None,
-                    HeaderSyncWorkOwner::BodyRepair(repair) => Some(*repair),
+                let kept = match owner {
+                    HeaderSyncWorkOwner::Header(_) => false,
+                    HeaderSyncWorkOwner::BodyRepair(repair) => {
+                        self.repairs.insert(*repair, (peer.clone(), true));
+                        self.kept.remove(repair)
+                    }
                 };
-                if self.stale(peer, owner.session_id(), repair) {
+                if !kept && self.departed(peer, owner.session_id()) {
                     let why = format!(
                         "DepartedSessionWork: call {call} applies {}'s session {}, after it left \
                          the reactor's view",

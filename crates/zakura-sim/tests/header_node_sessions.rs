@@ -203,21 +203,29 @@ fn completed(report: &RunReport, op: u64) -> bool {
 }
 
 /// A relink without a close: the second link's admission replaces the first
-/// session while the first link stays open, and releases the old session's
-/// held prepare. The prepare still completes, and since the run passes, its
-/// completion started and applied nothing under the replaced session.
+/// session and releases the old session's held prepare. The prepare still
+/// completes, and since the run passes, its completion started and applied
+/// nothing under the replaced session. The harness never closes the first
+/// link, but the replacement's service tears its connection down under some
+/// plans, and the view records that close too.
 #[test]
 fn a_relink_replaces_the_session_and_its_held_prepare_stays_inert() {
     let scenario = relink_witness();
+    let closed = SessionFact::LinkClosed {
+        peer: "mirror-0".to_owned(),
+        connection: 1,
+    };
+    let mut torn_down = 0;
     for input in inputs(16, 256) {
         let (report, facts) = run(&scenario, input);
+        let sessions: Vec<_> = facts.iter().filter(|fact| **fact != closed).collect();
         assert_eq!(
-            facts[..4],
+            sessions[..4],
             [
-                opened(1),
-                admitted(1, None),
-                opened(2),
-                admitted(2, Some(1))
+                &opened(1),
+                &admitted(1, None),
+                &opened(2),
+                &admitted(2, Some(1))
             ],
             "{facts:#?}"
         );
@@ -232,7 +240,15 @@ fn a_relink_replaces_the_session_and_its_held_prepare_stays_inert() {
             completed(&report, prepare),
             "the admission releases the prepare"
         );
+        if let Some(at) = position(&facts, &closed) {
+            assert!(
+                at > position(&facts, &opened(2)).expect("it was found above"),
+                "only the relink closes the first link: {facts:#?}"
+            );
+            torn_down += 1;
+        }
     }
+    assert!(torn_down > 0, "no plan's service closed the first link");
 }
 
 /// Both witnesses' session facts and full logs depend only on scenario and

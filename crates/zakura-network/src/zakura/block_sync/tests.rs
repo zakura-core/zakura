@@ -1031,6 +1031,69 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     reactor_task.abort();
 }
 
+/// A full routine channel can drop `StatusReceived` after the routine wrote
+/// the supplier's status to the registry. The next re-query still restarts
+/// the persistent body alarm for that supplier.
+#[tokio::test]
+async fn dropped_status_received_still_restarts_body_alarm_on_requery() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
+    let (_snapshot_tx, snapshot_rx) =
+        watch::channel(Some(committed_view(alarmed_committed_snapshot(header), 0)));
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    startup.frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(9),
+        verified_block_tip: block::Height(9),
+        verified_block_hash: block::Hash([0x50; 32]),
+    };
+    startup.best_header_tip = (header.height, header.hash);
+    startup.committed_views = Some(snapshot_rx);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+
+    // The routine's registry write lands, but its `StatusReceived` is lost.
+    let supplier = peer(0x56);
+    let generation = wiring
+        .registry
+        .admit_session(
+            &supplier,
+            ServicePeerDirection::Outbound,
+            &wiring.config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    wiring.registry.upsert_status(
+        &supplier,
+        generation,
+        BlockSyncStatus {
+            servable_low: header.height,
+            servable_high: header.height,
+            ..BlockSyncStatus::default()
+        },
+    );
+    wiring
+        .routine_to_reactor
+        .send(super::events::RoutineToReactor::RequeryNeeded)
+        .await
+        .expect("the re-query queues");
+
+    let discovery = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::RestartBodyAvailability { discovery, .. } => break discovery,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before supplier restart: {action:?}"),
+        }
+    };
+    assert_eq!(discovery.hash, header.hash);
+    assert_eq!(discovery.availability.suppliers, 1);
+
+    reactor_task.abort();
+}
+
 #[test]
 fn persistent_body_alarm_metrics_expose_every_required_dimension() {
     let reactor = include_str!("reactor.rs");

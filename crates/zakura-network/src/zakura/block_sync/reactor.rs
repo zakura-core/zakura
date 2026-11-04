@@ -537,6 +537,7 @@ impl ReactorIO {
                     }
                 }
                 _ = metrics_ticks.tick() => {
+                    self.restart_body_alarm_for_new_supplier();
                     self.query_needed_blocks().await;
                     self.publish_metrics();
                     self.refresh_throughput();
@@ -1242,6 +1243,9 @@ impl ReactorIO {
                 self.handle_status_received(peer, send_reply);
             }
             RoutineToReactor::RequeryNeeded => {
+                // A full channel can drop `StatusReceived`, so the re-query
+                // also checks the alarm for a new supplier.
+                self.restart_body_alarm_for_new_supplier();
                 self.query_needed_blocks().await;
             }
             RoutineToReactor::Misbehavior { peer, reason } => {

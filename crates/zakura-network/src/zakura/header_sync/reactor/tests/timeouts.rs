@@ -12,6 +12,7 @@ use zakura_node_services::header_chain as port;
 use super::super::dispatch::StorageDispatch;
 use super::super::repair::vct_send_retry_attribution;
 use super::*;
+use crate::zakura::header_sync::scheduler::repair::MAX_TARGET_REFUSALS_PER_SUPPLIER;
 use crate::zakura::{
     header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, testkit::TraceCapture,
 };
@@ -1548,14 +1549,14 @@ async fn unselected_supplier_waits_for_status_without_a_retry_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn unselected_supplier_retries_on_a_changed_status_without_waiting() {
+async fn unselected_supplier_retries_on_a_changed_status_until_its_refusal_cap() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, _outbounds) = fixture.connect(&[0x71], 7);
     let peer = &peers[0];
     fixture.schedule();
     fixture.advertise(&peers, 7);
 
-    for _ in 0..3 {
+    for _ in 1..MAX_TARGET_REFUSALS_PER_SUPPLIER {
         let first = fixture
             .reactor
             .peer_work_queue
@@ -1578,6 +1579,16 @@ async fn unselected_supplier_retries_on_a_changed_status_without_waiting() {
         assert_eq!(retry.owner.session_id(), first.owner.session_id());
         assert_ne!(retry.request_id, first.request_id);
     }
+
+    fixture.reply_not_selected(peer);
+    fixture.change_status();
+    fixture.advertise(&peers, 7);
+    assert!(
+        fixture.reactor.peer_work_queue.active(peer).is_none(),
+        "a supplier at its refusal cap draws no more requests in this episode"
+    );
+    let task = fixture.reactor.state.vct_repair.current().unwrap();
+    assert!(task.tried_sources.contains(&source_id_from_peer(peer)));
 }
 
 #[test]

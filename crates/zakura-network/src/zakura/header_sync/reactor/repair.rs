@@ -75,13 +75,15 @@ impl HeaderSyncReactor {
                     && source_id_from_peer(peer) == source
             })
             .map(|(peer, _)| peer.clone());
+        // A replacement session keeps the supplier connected under a new session id.
+        let supplier_connected = peer.is_some()
+            || self
+                .sessions
+                .keys()
+                .any(|peer| source_id_from_peer(peer) == source);
         if let Some(peer) = peer {
             self.state.clear_request_deadline(&peer);
         }
-        let supplier_connected = self
-            .sessions
-            .keys()
-            .any(|peer| source_id_from_peer(peer) == source);
         if retry.attribution == VctRepairRetryAttribution::Stale {
             if let Some(task) = self.state.vct_repair.remove(owner) {
                 self.emit_vct_repair_state(&task, "terminal", Some("stale_episode"));

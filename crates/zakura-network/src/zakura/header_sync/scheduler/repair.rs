@@ -10,6 +10,14 @@ use zakura_rt::{
 
 use super::super::Status;
 
+/// `TargetNotSelected` answers one supplier may give in one repair episode before the
+/// episode stops offering it the target.
+///
+/// A peer chooses its status freely, so a changed status alone does not show that the
+/// supplier now selects the target. The cap bounds the requests one supplier can draw by
+/// refusing and re-advertising.
+pub(in crate::zakura::header_sync) const MAX_TARGET_REFUSALS_PER_SUPPLIER: u8 = 3;
+
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) enum RepairPolicyState {
@@ -94,6 +102,9 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     /// Only a status that differs from the stored one makes the supplier eligible again.
     /// Live peer admission limits bound this map.
     busy_sources: HashMap<SourceId, Status>,
+    /// `TargetNotSelected` answers per supplier in this episode, up to
+    /// [`MAX_TARGET_REFUSALS_PER_SUPPLIER`]. Live peer admission limits bound this map.
+    target_refusals: HashMap<SourceId, u8>,
 }
 
 impl RepairRequirement {
@@ -108,6 +119,7 @@ impl RepairRequirement {
             tried_sources: HashSet::new(),
             excluded_input_sources: HashSet::new(),
             busy_sources: HashMap::new(),
+            target_refusals: HashMap::new(),
         }
     }
 
@@ -207,12 +219,18 @@ impl RepairRequirement {
     /// from, without blocking other suppliers.
     ///
     /// The supplier did not select the target under that status, so the same status cannot
-    /// make it select the target.
+    /// make it select the target. The [`MAX_TARGET_REFUSALS_PER_SUPPLIER`]th refusal in this
+    /// episode charges the supplier as [`Self::retry`] does.
     pub fn wait_for_supplier_status(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
         let RepairPolicyState::Assigned { advertised, .. } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
         let advertised = advertised.clone();
+        let refusals = self.target_refusals.entry(source).or_default();
+        *refusals = refusals.saturating_add(1);
+        if *refusals >= MAX_TARGET_REFUSALS_PER_SUPPLIER {
+            return self.retry(source);
+        }
         self.requeue(source)?;
         self.busy_sources.insert(source, advertised);
         Ok(())
@@ -274,6 +292,7 @@ impl RepairRequirement {
         self.tried_sources.remove(&source);
         self.excluded_input_sources.remove(&source);
         self.busy_sources.remove(&source);
+        self.target_refusals.remove(&source);
     }
 
     /// Forget supplier identities that no longer have a live session.
@@ -286,6 +305,8 @@ impl RepairRequirement {
         self.excluded_input_sources
             .retain(|source| connected_sources.contains(source));
         self.busy_sources
+            .retain(|source, _| connected_sources.contains(source));
+        self.target_refusals
             .retain(|source, _| connected_sources.contains(source));
     }
 
@@ -588,7 +609,7 @@ mod tests {
         task.exclude_input(excluded)
             .expect("semantic input is excluded");
 
-        for tip in 2..5 {
+        for tip in 2..=MAX_TARGET_REFUSALS_PER_SUPPLIER {
             let refused = advertised(tip);
             task.assign(task.owner, context.clone(), refused.clone())
                 .expect("the unselected supplier is assigned");
@@ -615,9 +636,15 @@ mod tests {
         task.assign(task.owner, context, advertised(1))
             .expect("the supplier can be assigned again");
         task.wait_for_supplier_status(source)
-            .expect("a later refusal restores the wait");
+            .expect("the capped refusal returns the work");
+        assert!(
+            task.tried_sources.contains(&source),
+            "the capped refusal charges the supplier for the episode"
+        );
+        assert!(!task.supplier_is_waiting_for_status(source));
         task.retain_connected_sources(&[excluded].into_iter().collect());
         assert!(task.busy_sources.is_empty());
+        assert!(task.target_refusals.is_empty());
         assert!(task.excluded_input_sources.contains(&excluded));
     }
 

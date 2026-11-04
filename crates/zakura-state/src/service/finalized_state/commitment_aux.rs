@@ -106,8 +106,8 @@ pub enum FinalFrontiersGenerationError {
     /// Sprout frontier is not the Sprout frontier at the requested height.
     #[error(
         "cannot produce final frontiers at height {height:?}: Sprout note commitments were \
-         appended at {last_change:?}, below finalized tip {tip:?}; retry once the requested \
-         height passes that block"
+         appended at {last_change:?}, below finalized tip {tip:?}; a verified historical \
+         frontier could not be reconstructed"
     )]
     SproutChangedAboveRequestedHeight {
         /// The highest block above `height` that appended Sprout note commitments.
@@ -131,6 +131,15 @@ pub enum FinalFrontiersGenerationError {
         /// The finalized database tip height.
         tip: block::Height,
     },
+}
+
+/// Internal replay diagnostics. Keep the published generation error enum exhaustive
+/// and unchanged so existing callers can continue matching all of its variants.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+enum SproutReplayError {
+    /// An existing database read failed.
+    #[error(transparent)]
+    Frontier(#[from] FinalFrontiersGenerationError),
 
     /// The retained chain does not contain the reviewed replay checkpoint.
     #[error("Sprout replay checkpoint {height:?} does not match the finalized database")]
@@ -152,6 +161,21 @@ pub enum FinalFrontiersGenerationError {
         /// The block whose commitment could not be appended.
         height: block::Height,
     },
+}
+
+impl SproutReplayError {
+    /// Preserve existing database errors and report failed recovery through the
+    /// existing public error for a Sprout change above the requested height.
+    fn into_generation_error(
+        self,
+        unavailable: FinalFrontiersGenerationError,
+    ) -> FinalFrontiersGenerationError {
+        tracing::error!(error = %self, "historical Sprout frontier replay failed");
+        match self {
+            Self::Frontier(error) => error,
+            _ => unavailable,
+        }
+    }
 }
 
 /// Errors parsing [`FinalFrontiers`] from the embedded/frontier-file byte format.
@@ -661,26 +685,28 @@ pub(super) fn produce_settled_final_frontiers(
         }
     }
     let historical_sprout = if let Some(last_change) = last_change {
+        let unavailable = FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight {
+            last_change,
+            height,
+            tip,
+        };
         let network = db.network();
         let checkpoint = super::vct::embedded_final_frontiers(&network)
             .filter(|checkpoint| checkpoint.height <= height)
-            .ok_or(
-                FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight {
-                    last_change,
-                    height,
-                    tip,
-                },
-            )?;
+            .ok_or_else(|| unavailable.clone())?;
         let checkpoint_hash = network
             .checkpoint_list()
             .hash(checkpoint.height)
             .expect("the embedded frontier is verified against its network checkpoint");
-        Some(replay_sprout_frontier(
-            db,
-            height,
-            tip,
-            (checkpoint.height, checkpoint_hash, checkpoint.sprout),
-        )?)
+        Some(
+            replay_sprout_frontier(
+                db,
+                height,
+                tip,
+                (checkpoint.height, checkpoint_hash, checkpoint.sprout),
+            )
+            .map_err(|error| error.into_generation_error(unavailable))?,
+        )
     } else {
         None
     };
@@ -706,14 +732,12 @@ fn replay_sprout_frontier(
         block::Hash,
         Arc<sprout::tree::NoteCommitmentTree>,
     ),
-) -> Result<Arc<sprout::tree::NoteCommitmentTree>, FinalFrontiersGenerationError> {
+) -> Result<Arc<sprout::tree::NoteCommitmentTree>, SproutReplayError> {
     let (checkpoint_height, checkpoint_hash, mut replayed) = checkpoint;
     if db.hash(checkpoint_height) != Some(checkpoint_hash) {
-        return Err(
-            FinalFrontiersGenerationError::SproutReplayCheckpointMismatch {
-                height: checkpoint_height,
-            },
-        );
+        return Err(SproutReplayError::SproutReplayCheckpointMismatch {
+            height: checkpoint_height,
+        });
     }
 
     let mut historical = (checkpoint_height == height).then(|| replayed.clone());
@@ -729,7 +753,7 @@ fn replay_sprout_frontier(
         for commitment in block.sprout_note_commitments() {
             Arc::make_mut(&mut replayed)
                 .append(*commitment)
-                .map_err(|_| FinalFrontiersGenerationError::SproutReplayTreeFull {
+                .map_err(|_| SproutReplayError::SproutReplayTreeFull {
                     height: replay_height,
                 })?;
         }
@@ -742,7 +766,7 @@ fn replay_sprout_frontier(
         .sprout_tree_for_tip()
         .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;
     if replayed.root() != stored_tip.root() {
-        return Err(FinalFrontiersGenerationError::SproutReplayTipMismatch { tip });
+        return Err(SproutReplayError::SproutReplayTipMismatch { tip });
     }
     Ok(
         historical
@@ -1454,7 +1478,7 @@ mod tests {
                 ),
             )
             .expect_err("a foreign checkpoint must not seed replay"),
-            FinalFrontiersGenerationError::SproutReplayCheckpointMismatch {
+            SproutReplayError::SproutReplayCheckpointMismatch {
                 height: block::Height(395)
             }
         );
@@ -1472,7 +1496,7 @@ mod tests {
                 (block::Height(395), hash, Arc::new(sprout_tree_with_note(1))),
             )
             .expect_err("a wrong seed must fail the stored tip comparison"),
-            FinalFrontiersGenerationError::SproutReplayTipMismatch {
+            SproutReplayError::SproutReplayTipMismatch {
                 tip: block::Height(396)
             }
         );
@@ -1490,11 +1514,49 @@ mod tests {
                 (block::Height(395), hash, Arc::new(Default::default())),
             )
             .expect_err("missing commitments must not be treated as an empty block"),
-            FinalFrontiersGenerationError::MissingBlockInSproutWindow {
-                missing: block::Height(396),
+            SproutReplayError::Frontier(
+                FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+                    missing: block::Height(396),
+                    height: block::Height(395),
+                    tip: block::Height(396)
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn sprout_replay_preserves_public_generation_errors() {
+        let unavailable = FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight {
+            last_change: block::Height(396),
+            height: block::Height(395),
+            tip: block::Height(396),
+        };
+        for error in [
+            SproutReplayError::SproutReplayCheckpointMismatch {
                 height: block::Height(395),
-                tip: block::Height(396)
-            }
+            },
+            SproutReplayError::SproutReplayTipMismatch {
+                tip: block::Height(396),
+            },
+            SproutReplayError::SproutReplayTreeFull {
+                height: block::Height(396),
+            },
+        ] {
+            assert_eq!(
+                error.into_generation_error(unavailable.clone()),
+                unavailable,
+                "failed recovery preserves the existing public Sprout error"
+            );
+        }
+        let missing = FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+            missing: block::Height(396),
+            height: block::Height(395),
+            tip: block::Height(396),
+        };
+        assert_eq!(
+            SproutReplayError::Frontier(missing.clone()).into_generation_error(unavailable),
+            missing,
+            "database errors retain their original details"
         );
     }
 

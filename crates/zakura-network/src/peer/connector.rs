@@ -8,7 +8,7 @@ use std::{
 use futures::prelude::*;
 use tokio::net::TcpStream;
 use tower::{Service, ServiceExt};
-use tracing::Instrument;
+use tracing::{debug, Instrument};
 
 use zakura_chain::chain_tip::{ChainTip, NoChainTip};
 
@@ -102,6 +102,7 @@ where
         // Any code outside this future does not have a timeout.
         async move {
             let tcp_stream = TcpStream::connect(*addr).await?;
+            disable_nagle(&tcp_stream);
             let client = hs
                 .oneshot(HandshakeRequest::<TcpStream> {
                     data_stream: tcp_stream,
@@ -113,5 +114,22 @@ where
         }
         .instrument(connector_span)
         .boxed()
+    }
+}
+
+/// Turns off Nagle's algorithm on a legacy peer connection, so each message is sent as soon as it
+/// is written.
+///
+/// With Nagle's algorithm on, a message written while the peer has not acknowledged earlier data
+/// waits for that acknowledgement, and the peer can delay it by about 40 ms. Peers send requests
+/// and replies in both directions, so block announcements, block requests and their replies would
+/// often wait. The connection flushes each message as a whole, so turning it off does not split
+/// messages into extra packets. A failure only costs latency, so the connection is kept.
+pub(crate) fn disable_nagle(tcp_stream: &TcpStream) {
+    if let Err(error) = tcp_stream.set_nodelay(true) {
+        debug!(
+            ?error,
+            "could not turn off Nagle's algorithm on a peer connection"
+        );
     }
 }

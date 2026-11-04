@@ -83,8 +83,8 @@ impl Graph {
         State {
             graph: self,
             personal: *personal,
-            bytes: Vec::new(),
-            refs: Vec::new(),
+            bytes: Vec::with_capacity(256),
+            refs: Vec::with_capacity(4),
         }
     }
     fn evaluate(self, roots: &[Node], simd: bool) -> Vec<Hash> {
@@ -152,7 +152,7 @@ fn update_serialized<T: ZcashSerialize>(state: &mut State<'_>, value: &T) {
 }
 pub(crate) fn txids(txs: &[&Transaction], simd: bool) -> Vec<Hash> {
     let graph = Graph {
-        specs: RefCell::new(Vec::new()),
+        specs: RefCell::new(Vec::with_capacity(txs.len() * 12)),
     };
     let roots: Vec<_> = txs
         .iter()

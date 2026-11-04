@@ -322,8 +322,8 @@ impl DiscoveryState {
     /// Admits `session` in `direction`.
     ///
     /// A peer's admitted session is replaced only by a later
-    /// `(connection, session)`. A new peer is admitted while its direction has
-    /// a free slot.
+    /// `(connection, session)`. A new peer, or a replacement that changes
+    /// direction, is admitted only while its direction has a free slot.
     pub(super) fn admit_session(
         &mut self,
         session: DiscoverySessionKey,
@@ -334,20 +334,27 @@ impl DiscoveryState {
             session_id: session.session_id,
             direction,
         };
-        if let Some(peer) = self.admitted_peers.get_mut(&session.peer_id) {
-            if (session.conn_id, session.session_id) <= (peer.conn_id, peer.session_id) {
+        let current_direction = match self.admitted_peers.get(&session.peer_id) {
+            Some(peer)
+                if (session.conn_id, session.session_id) <= (peer.conn_id, peer.session_id) =>
+            {
                 return ServiceAdmissionDecision::RejectNotUseful;
             }
-            *peer = admitted;
-            return ServiceAdmissionDecision::Admit;
-        }
-
-        let cap = match direction {
-            ServicePeerDirection::Inbound => self.config.peer_limits.max_inbound_peers,
-            ServicePeerDirection::Outbound => self.config.peer_limits.max_outbound_peers,
+            Some(peer) => Some(peer.direction),
+            None => None,
         };
-        if self.admitted_in(direction) >= cap {
-            return ServiceAdmissionDecision::RejectFull;
+
+        // A same-direction replacement keeps its slot. A new peer, or a
+        // replacement that changes direction, needs a free slot in the
+        // destination pool. A rejected replacement leaves the current session.
+        if current_direction != Some(direction) {
+            let cap = match direction {
+                ServicePeerDirection::Inbound => self.config.peer_limits.max_inbound_peers,
+                ServicePeerDirection::Outbound => self.config.peer_limits.max_outbound_peers,
+            };
+            if self.admitted_in(direction) >= cap {
+                return ServiceAdmissionDecision::RejectFull;
+            }
         }
         self.admitted_peers.insert(session.peer_id, admitted);
         ServiceAdmissionDecision::Admit

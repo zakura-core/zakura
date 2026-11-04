@@ -636,7 +636,10 @@ where
     /// Receives block adverts independently of the current request's response.
     pub(super) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
 
-    /// When the loop first saw the block advert now waiting in its queue.
+    /// When the loop first saw a block advert waiting in a queue that has not drained since.
+    ///
+    /// Adverts queued behind one that became due are written in the turns right after it, so a
+    /// burst of adverts to one connection does not wait the delay once each.
     advert_waiting_since: Option<tokio::time::Instant>,
 
     /// Live authorization, rechecked immediately before advert writes.
@@ -1141,7 +1144,9 @@ where
     }
 
     /// Notes a block advert waiting in its queue, from the first turn of the loop that could
-    /// have sent it, so a message handled meanwhile counts towards its wait.
+    /// have sent it, so a message handled meanwhile counts towards its wait. The wait ends only
+    /// when the queue is empty: an advert written or skipped leaves the ones behind it as overdue
+    /// as it was.
     fn note_waiting_advert(&mut self) {
         if self.block_advert_rx.is_empty() {
             self.advert_waiting_since = None;
@@ -1173,10 +1178,6 @@ where
             .increment(1);
             return;
         }
-
-        // An advert the advertiser gave up on was skipped, not written, so the next waiting one
-        // is as overdue as this one was.
-        self.advert_waiting_since = None;
 
         metrics::counter!(
             "zakura.net.out.requests",

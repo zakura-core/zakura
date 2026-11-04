@@ -2278,7 +2278,8 @@ async fn getblocks_response_precedes_ready_block_advert() {
 
 /// A peer that always has a message ready cannot keep a queued block advert from being written:
 /// once its messages have kept the advert waiting for the priority delay, the advert goes before
-/// the next one. Until then, and again for a later advert, its messages go first.
+/// the next one, and so do the adverts queued behind it. Until then, and again for a later
+/// advert, its messages go first.
 #[tokio::test(start_paused = true)]
 async fn block_advert_is_written_during_a_run_of_peer_messages() {
     use crate::peer::connection::WAITING_ADVERT_PRIORITY_DELAY;
@@ -2341,6 +2342,47 @@ async fn block_advert_is_written_during_a_run_of_peer_messages() {
                 "the advert goes before the next peer message once the delay has passed",
             );
         }
+        delivery.await.unwrap().unwrap();
+    }
+
+    // A burst of adverts queued within one delay is written in consecutive turns once the first
+    // is due, so the last one is not kept waiting past the advertiser's budget.
+    let burst = [
+        block::Hash([8; 32]),
+        block::Hash([9; 32]),
+        block::Hash([10; 32]),
+    ];
+    let mut deliveries = Vec::new();
+    for advert_hash in burst {
+        let (advert, delivery) = block_advert(advert_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        deliveries.push(delivery);
+    }
+    for _ in 0..PEER_MESSAGES_FIRST {
+        assert!(
+            matches!(peer_outbound_messages.next().await, Some(Message::Pong(_))),
+            "peer messages go first until the burst has waited the priority delay",
+        );
+    }
+    tokio::time::advance(WAITING_ADVERT_PRIORITY_DELAY).await;
+    let mut pongs_after_delay = 0;
+    let mut written = Vec::new();
+    while written.len() < burst.len() {
+        match peer_outbound_messages.next().await {
+            Some(Message::Pong(_)) => pongs_after_delay += 1,
+            Some(Message::Inv(inv)) => written.push(inv),
+            other => panic!("unexpected message to the peer: {other:?}"),
+        }
+        assert!(
+            pongs_after_delay <= 1,
+            "no peer message goes between the adverts of a burst once the first is due",
+        );
+    }
+    assert_eq!(
+        written,
+        burst.map(|hash| vec![InventoryHash::Block(hash)]).to_vec()
+    );
+    for delivery in deliveries {
         delivery.await.unwrap().unwrap();
     }
     assert!(shared_error_slot.try_get_error().is_none());

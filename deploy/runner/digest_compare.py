@@ -132,7 +132,7 @@ def summarize(rows, control, revisions, profiles):
     attempts = {}
     for row in rows:
         if row.get("event") == "resource":
-            if row.get("lost_segments"):
+            if row.get("lost_segments") or row.get("coverage_failed"):
                 # An evicted cursor can span process restarts; do not guess which PID lost rows.
                 lost_nodes.add(row["node"])
             continue
@@ -292,6 +292,7 @@ def collect(manifest_path, output, helper):
                     pid_maps[node][str(result["pid"])] = result["binary_sha256"]
                     rows = result.pop("rows")
                     coverage = trace_coverage(cursors.get(node, {}).get("coverage", {}), rows, result["lost_segments"], time.time())
+                    result["coverage_failed"] = coverage["failed"]
                     for row in rows:
                         row.update(node=node, binary_sha256=pid_maps[node].get(str(row.get("pid"))))
                         loggers[node].info(json.dumps(row, separators=(",", ":")))

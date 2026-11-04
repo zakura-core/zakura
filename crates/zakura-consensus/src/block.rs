@@ -55,6 +55,27 @@ const AUTH_DATA_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The smallest transaction count that repays parallel hashing overhead in measured block mixes.
+const PARALLEL_TRANSACTION_HASHES_MIN: usize = 64;
+
+/// Compute transaction IDs in block order, avoiding worker coordination for small blocks.
+fn transaction_hashes(block: &block::BlockRef) -> Arc<[transaction::Hash]> {
+    if block.transactions().len() < PARALLEL_TRANSACTION_HASHES_MIN
+        || rayon::current_num_threads() == 1
+    {
+        block
+            .transactions()
+            .map(|transaction| transaction.hash())
+            .collect()
+    } else {
+        block
+            .parallel_transactions()
+            .map(|transaction| transaction.hash())
+            .collect::<Vec<_>>()
+            .into()
+    }
+}
+
 /// Asynchronous semantic block verification.
 #[derive(Debug)]
 pub struct SemanticBlockVerifier<S, V> {
@@ -561,14 +582,8 @@ where
                 // Next, check the Merkle root validity, to ensure that
                 // the header binds to the transactions in the blocks.
 
-                // Precomputing this avoids duplicating transaction hash computations. Each hash
-                // is independent, so a large block's hashes are split across threads.
-                let transaction_hashes: Arc<[_]> = block
-                    .view()
-                    .parallel_transactions()
-                    .map(|t| t.hash())
-                    .collect::<Vec<_>>()
-                    .into();
+                // Precomputing this avoids duplicating transaction hash computations.
+                let transaction_hashes = transaction_hashes(block.view());
 
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 

@@ -362,8 +362,13 @@ type VerifierService = Cached<BatchFallbackService>;
 /// verifier here, each era also gets its own cache, which is what binds a remembered result to the
 /// `vk` it was produced under. `verifier_name` is the era's `verifier` metrics label, so each
 /// era's cache reports its own hit rate.
-fn batch_verifier(vk: &'static ItemVerifyingKey, verifier_name: &'static str) -> VerifierService {
+fn batch_verifier(
+    vk: &'static ItemVerifyingKey,
+    verifier_name: &'static str,
+    flush_verifier: super::flush::Verifier,
+) -> VerifierService {
     Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, verifier_name)
+        .with_flush(flush_verifier)
 }
 
 /// Builds the uncached batching-and-fallback stack for `vk`.
@@ -387,8 +392,13 @@ fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackServic
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_PRE_NU6_2: LazyLock<VerifierService> =
-    LazyLock::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2, "halo2_pre_nu6_2"));
+pub static VERIFIER_PRE_NU6_2: LazyLock<VerifierService> = LazyLock::new(|| {
+    batch_verifier(
+        &VERIFYING_KEY_PRE_NU6_2,
+        "halo2_pre_nu6_2",
+        super::flush::Verifier::Halo2PreNu6_2,
+    )
+});
 
 /// Global batch verification context for **NU6.2-until-NU6.3** Halo2 Action proofs.
 ///
@@ -398,8 +408,13 @@ pub static VERIFIER_PRE_NU6_2: LazyLock<VerifierService> =
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_NU6_2: LazyLock<VerifierService> =
-    LazyLock::new(|| batch_verifier(&VERIFYING_KEY_NU6_2, "halo2_nu6_2"));
+pub static VERIFIER_NU6_2: LazyLock<VerifierService> = LazyLock::new(|| {
+    batch_verifier(
+        &VERIFYING_KEY_NU6_2,
+        "halo2_nu6_2",
+        super::flush::Verifier::Halo2Nu6_2,
+    )
+});
 
 /// Global batch verification context for **NU6.3-onward** Halo2 Action proofs.
 ///
@@ -411,8 +426,13 @@ pub static VERIFIER_NU6_2: LazyLock<VerifierService> =
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_NU6_3_ONWARD: LazyLock<VerifierService> =
-    LazyLock::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD, "halo2_nu6_3_onward"));
+pub static VERIFIER_NU6_3_ONWARD: LazyLock<VerifierService> = LazyLock::new(|| {
+    batch_verifier(
+        &VERIFYING_KEY_NU6_3_ONWARD,
+        "halo2_nu6_3_onward",
+        super::flush::Verifier::Halo2Nu6_3Onward,
+    )
+});
 
 /// Selects the lazily initialized Halo2 verifier for `network_upgrade`.
 ///

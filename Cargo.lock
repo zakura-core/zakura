@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2791,9 +2791,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3538611.0"
+version = "0.3539011.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d15b564246c4d1fdbde86dfba76d1760630432c882e89151328f598599e04ebb"
+checksum = "c5515bd2439452aebad7d7e904412f58b49112e5ae3d560b10131426445bbfd2"
 
 [[package]]
 name = "zakura-bellman"
@@ -3315,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "14.0.1"
+version = "14.1.0"
 dependencies = [
  "anyhow",
  "async-trait",

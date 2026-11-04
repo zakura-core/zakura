@@ -709,6 +709,59 @@ impl ContextuallyVerifiedBlock {
             receipt_order,
         })
     }
+
+    /// The contextual verification of a solved block, taken from the proposal it was mined from.
+    ///
+    /// A proposal and the block mined from it have the same transactions, so the outputs they
+    /// create and spend, their transaction IDs, and their effect on the chain value pools are
+    /// the same, and are shared rather than worked out again. Only the block itself, its hash,
+    /// and its arrival order come from the solved block.
+    ///
+    /// Call only with a `proposal` whose transactions equal `solved`'s, which is what
+    /// `PreparedProposal::for_solved_block` establishes.
+    ///
+    /// # Panics
+    ///
+    /// If the two blocks are at different heights, which equal transactions rule out, because
+    /// the height is read from the coinbase transaction.
+    pub(crate) fn from_solved_proposal(
+        solved: SemanticallyVerifiedBlock,
+        proposal: &ContextuallyVerifiedBlock,
+    ) -> Self {
+        assert_eq!(
+            solved.height, proposal.height,
+            "a solved block and its proposal share a coinbase transaction, and so a height",
+        );
+
+        // Every field of `solved` is named here, with no `..`, so adding one is a compile error
+        // until its author decides whether it comes from the solved block or the proposal.
+        let SemanticallyVerifiedBlock {
+            block,
+            hash,
+            receipt_order,
+            height: _,
+            // The proposal created the same outputs from the same transactions, and worked out
+            // the same transaction IDs, so those are shared instead of being built again.
+            new_outputs: _,
+            transaction_hashes: _,
+            // Already folded into the proposal's chain value pool change.
+            deferred_pool_balance_change: _,
+            // Not part of a contextual verification: the commitment check reads the block.
+            auth_data_root: _,
+        } = solved;
+
+        Self {
+            header: Arc::new(*block.header()),
+            block,
+            hash,
+            height: proposal.height,
+            new_outputs: Arc::clone(&proposal.new_outputs),
+            spent_outputs: Arc::clone(&proposal.spent_outputs),
+            transaction_hashes: Arc::clone(&proposal.transaction_hashes),
+            chain_value_pool_change: proposal.chain_value_pool_change,
+            receipt_order,
+        }
+    }
 }
 
 impl CheckpointVerifiedBlock {

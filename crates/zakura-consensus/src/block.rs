@@ -469,6 +469,7 @@ where
                 };
                 // Check that this block is actually a new block.
                 tracing::trace!("checking that block is not already in state");
+                let known_block_timer = perf_context.stage(Stage::Parent);
                 let pending_commit_deadline =
                     tokio::time::Instant::now() + PENDING_COMMIT_WAIT_LIMIT;
                 loop {
@@ -501,6 +502,7 @@ where
                     }
                 }
 
+                drop(known_block_timer);
                 tracing::trace!("performing block checks");
                 let height = block
                     .coinbase_height()
@@ -610,6 +612,7 @@ where
                 // a proposal whose parent has not committed is rejected immediately.
                 let nsm_value_balance =
                     if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
+                        let _parent_timer = perf_context.stage(Stage::Parent);
                         let parent_hash = block.header().previous_block_hash;
                         let parent_request = if request.is_proposal() {
                             zs::Request::BlockInfo(parent_hash)

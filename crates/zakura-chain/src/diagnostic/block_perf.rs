@@ -16,6 +16,8 @@ use std::{
 
 use crate::block::{BlockRef, Hash};
 
+mod writer;
+
 const STAGES: usize = 10;
 const OPERATIONS: usize = 8;
 static BLOCKS: LazyLock<Mutex<HashMap<Hash, Weak<Data>>>> = LazyLock::new(Default::default);
@@ -147,6 +149,11 @@ impl Context {
     /// Stage to preserve when forwarding work onto another thread.
     pub fn current_stage() -> Option<Stage> {
         CURRENT.with(|current| current.borrow().as_ref().map(|(_, stage)| *stage))
+    }
+
+    /// Record a checkpoint observation outside semantic verification's counters.
+    pub fn checkpoint(hash: Hash) {
+        writer::emit("checkpoint", format!("{{\"hash\":\"{hash}\"}}"));
     }
 
     /// Number of completed operations in this attempt, useful for checking actual call paths.
@@ -293,7 +300,7 @@ impl Drop for Timer {
             if !matches!(stage, Stage::Finalized | Stage::Writer) {
                 context.0.active.fetch_sub(1, Ordering::AcqRel);
             } else if matches!(self.operation, Operation::Wall) {
-                tracing::info!(target: "zakura_block_perf", payload = %context.phase_payload(*stage, self.start.elapsed()), "block_perf_phase");
+                writer::emit("phase", context.phase_payload(*stage, self.start.elapsed()));
             }
         }
     }
@@ -387,7 +394,10 @@ impl Session {
             outcome: "abandoned",
             semantic_ns: None,
         };
-        tracing::info!(target: "zakura_block_perf", hash = %hash, route, "block_perf_start");
+        writer::emit(
+            "start",
+            format!("{{\"hash\":\"{hash}\",\"route\":\"{route}\"}}"),
+        );
         session
     }
 
@@ -467,7 +477,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        tracing::info!(target: "zakura_block_perf", payload = %self.payload(), "block_perf_finish");
+        writer::emit("finish", self.payload());
         let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         if blocks
             .get(&self.context.0.hash)

@@ -28,7 +28,8 @@ pub(in super::super) enum LivenessDecision {
 impl PeerState {
     /// Track the current interval in which this peer's outbound queue stayed
     /// full. A peer that stopped reading keeps the queue full until the
-    /// interval reaches `request_timeout`, and then it loses its grace.
+    /// interval reaches `request_timeout`, and then it loses its grace. A free
+    /// slot starts a new interval but does not restore a grace already spent.
     pub(in super::super) fn note_outbound_capacity(&mut self, has_capacity: bool, now: Instant) {
         if has_capacity {
             self.outbound_full_since = None;
@@ -38,8 +39,8 @@ impl PeerState {
     }
 
     /// Check block liveness at `now`. A deadline that falls during brief
-    /// outbound write congestion gets one bounded delay; see
-    /// [`liveness_grace_allowed`].
+    /// outbound write congestion gets one bounded delay per no-progress
+    /// episode; see [`liveness_grace_allowed`].
     pub(in super::super) fn check_block_liveness(
         &mut self,
         now: Instant,
@@ -53,16 +54,18 @@ impl PeerState {
                 LivenessDecision::Continue
             }
             LivenessOutcome::Park
-                if liveness_grace_allowed(
-                    outbound_full,
-                    self.outbound_full_since,
-                    now,
-                    request_timeout,
-                ) =>
+                if self.window.liveness_grace_available()
+                    && liveness_grace_allowed(
+                        outbound_full,
+                        self.outbound_full_since,
+                        now,
+                        request_timeout,
+                    ) =>
             {
                 // Outbound full but *only just* filled (< one `request_timeout` of
                 // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. Grant one short, BOUNDED grace. This is the *only* liveness
+                // a dead peer. Grant one short, BOUNDED grace per no-progress episode, so a
+                // peer cannot renew it by briefly draining the queue. This is the *only* liveness
                 // extension: a peer that stopped reading holds outbound full past
                 // `request_timeout`, falls through to the park arm, and is parked at the
                 // liveness deadline — it cannot dodge the timer.

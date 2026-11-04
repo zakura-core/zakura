@@ -474,43 +474,62 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     block
 }
 
-/// An invalid header time is rejected before the transaction Merkle root or transaction checks.
+/// A future header time is rejected before any transaction is verified. Proposals fail on it at
+/// once; a committed block first checks that the delivered body is the header's, so a tampered
+/// body under a future-timed header is still reported as a payload mismatch.
 #[tokio::test]
-async fn quick_header_time_failure_precedes_bad_merkle_root() {
+async fn quick_header_time_failure_keeps_committed_merkle_binding() {
+    use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+
     let _init_guard = zakura_test::init();
     let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
     let mut block = nu5_prepared_test_block(&network, None);
-    let header = Arc::make_mut(&mut block.header);
-    header.time = Utc::now()
+    Arc::make_mut(&mut block.header).time = Utc::now()
         .checked_add_signed(chrono::Duration::hours(3))
         .expect("three hours fits in the supported time range");
-    header.merkle_root.0[0] ^= 1;
-    let block = Arc::new(block);
 
-    for proposal in [false, true] {
-        let state = service_fn(|request: zs::Request| async move {
-            match request {
-                zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
-                _ => panic!("invalid header time needs no contextual or binding check"),
+    for matching_root in [false, true] {
+        let mut block = block.clone();
+        if !matching_root {
+            Arc::make_mut(&mut block.header).merkle_root.0[0] ^= 1;
+        }
+        let block = Arc::new(block);
+        for proposal in [false, true] {
+            let state = service_fn(|request: zs::Request| async move {
+                match request {
+                    zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+                    _ => panic!("a future header time needs no contextual or binding check"),
+                }
+            });
+            let transaction =
+                service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+                    panic!("a future header time must precede transaction verification");
+                });
+            let request = if proposal {
+                Request::CheckProposal(block.clone().into())
+            } else {
+                Request::Commit(block.clone().into())
+            };
+            let error = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            )
+            .oneshot(request)
+            .await
+            .expect_err("a future header time is rejected");
+            if !proposal && !matching_root {
+                assert_eq!(
+                    error.body_verification_class(),
+                    BodyVerificationClass::PayloadMismatch(
+                        BodyCommitmentKind::TransactionMerkleRoot
+                    ),
+                    "{error:?}"
+                );
+            } else {
+                assert!(matches!(error, VerifyBlockError::Time(_)), "{error:?}");
             }
-        });
-        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
-            panic!("invalid header time must precede transaction verification");
-        });
-        let request = if proposal {
-            Request::CheckProposal(block.clone().into())
-        } else {
-            Request::Commit(block.clone().into())
-        };
-        let error = SemanticBlockVerifier::new(
-            &network,
-            crate::transaction::boxed_state(state),
-            crate::transaction::boxed_transaction_verifier(transaction),
-        )
-        .oneshot(request)
-        .await
-        .expect_err("a future header time is rejected");
-        assert!(matches!(error, VerifyBlockError::Time(_)), "{error:?}");
+        }
     }
 }
 

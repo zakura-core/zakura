@@ -561,15 +561,16 @@ where
                     return Ok(hash);
                 }
 
-                // Reject invalid header times before hashing transaction data.
+                // Run the inexpensive header-time and body rules before hashing any
+                // transaction data. Proposals are local, so they return their first failure
+                // immediately. A committed block establishes the transaction Merkle binding
+                // first: a time failure is retryable and a body failure is attributed to the
+                // header only once the delivered body is known to be the header's, so a peer
+                // that tampers with a body still receives a payload-mismatch verdict.
                 let now = Utc::now();
-                check::time_is_valid_at(block.header(), now, &height, &hash)
-                    .map_err(VerifyBlockError::Time)?;
-
-                // Check inexpensive body rules first. Proposals can return their first
-                // failure immediately; committed blocks must establish the transaction
-                // Merkle binding before a delivered body's failure can invalidate a header.
-                let body_checks: Result<_, VerifyBlockError> = (|| {
+                let quick_checks: Result<_, VerifyBlockError> = (|| {
+                    check::time_is_valid_at(block.header(), now, &height, &hash)
+                        .map_err(VerifyBlockError::Time)?;
                     let coinbase_tx = check::coinbase_is_first(&block)?;
                     check::shielded_action_limits_are_valid(
                         block.view().transactions(),
@@ -578,7 +579,7 @@ where
                     )?;
                     Ok(coinbase_tx)
                 })();
-                let body_checks = match body_checks {
+                let quick_checks = match quick_checks {
                     Err(error) if request.is_proposal() => return Err(error),
                     result => result,
                 };
@@ -590,7 +591,7 @@ where
                 let transaction_hashes = transaction_digests.hashes.clone();
 
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
-                let coinbase_tx = body_checks?;
+                let coinbase_tx = quick_checks?;
 
                 // ZIP 234 derives the block subsidy from the NSM value balance after the parent
                 // block, so a block at or above the start height needs its parent's chain

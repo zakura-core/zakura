@@ -572,7 +572,7 @@ where
             .legacy_p2p()
             .then(|| BoxCloneService::new(block_advertiser)),
         native: zakura_supervisor_and_trace.map(|(supervisor, _trace)| {
-            BoxCloneService::new(crate::zakura::LegacyGossipAdapter::new(supervisor))
+            BoxCloneService::new(crate::zakura::ZakuraBlockAdvertiser::new(supervisor))
         }),
     };
 

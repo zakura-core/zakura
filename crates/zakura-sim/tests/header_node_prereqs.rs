@@ -239,6 +239,37 @@ fn a_control_step_waits_for_a_reservation() {
     }
 }
 
+/// A round longer than one fair share reserves again when it continues: with
+/// `mirror-0` at A300, past the 250-header share, a close waiting for the
+/// node's second reservation for it is taken.
+#[test]
+fn a_continuation_counts_as_another_reservation() {
+    let scenario = StorageScenario {
+        mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
+            chain: Chain::main(300),
+            dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+        }],
+        ..scenario(
+            Vec::new(),
+            vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Trigger::Count(
+                    2,
+                    Box::new(Trigger::ReservationOpened("mirror-0".to_owned())),
+                ),
+            )],
+        )
+    };
+    for input in inputs(4, 256) {
+        let report = run(&scenario, input);
+        assert!(
+            picked(&report, "peer:mirror-0:close").is_some(),
+            "the node reserves twice"
+        );
+    }
+}
+
 /// The relink witness: the node's first prepare is held until the node
 /// admits `mirror-0`'s `admissions`th session, and `mirror-0` relinks once
 /// the prepare is submitted.

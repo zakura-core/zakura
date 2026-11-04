@@ -26,7 +26,7 @@ use zakura_chain::{
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction::{
         arbitrary::{transaction_to_fake_v5, v5_transactions},
-        LockTime, Transaction,
+        LockTime, Transaction, UnminedTxId,
     },
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
@@ -37,41 +37,6 @@ use crate::{block::check::subsidy_is_valid, transaction};
 use super::*;
 
 mod nsm_fees;
-
-#[test]
-fn transaction_hashes_preserve_block_order_across_parallel_cutoff() {
-    let blocks: Vec<_> = [
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
-    ]
-    .into_iter()
-    .map(|bytes| Block::zcash_deserialize(bytes).expect("the block fixture deserializes"))
-    .collect();
-    let transactions: Vec<_> = blocks
-        .iter()
-        .flat_map(|block| block.transactions.iter().cloned())
-        .collect();
-
-    for threads in [1, 4] {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("the test thread pool starts");
-
-        for count in [0, 1, 63, 64, 65, 129] {
-            let mut block = blocks[0].clone();
-            block.transactions = transactions.iter().cycle().take(count).cloned().collect();
-            let expected: Arc<[_]> = block.transactions().map(|tx| tx.hash()).collect();
-            let actual = pool.install(|| transaction_hashes(&block));
-
-            assert_eq!(
-                actual, expected,
-                "{count} transactions with {threads} workers"
-            );
-        }
-    }
-}
 
 fn prepared_test_verifier(
     network: &Network,
@@ -466,6 +431,89 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     }
     Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
     block
+}
+
+/// The block verifier hashes each transaction's ZIP-244 tree once, and hands the results to the
+/// transaction verifier and the state instead of letting each recompute them.
+#[tokio::test]
+async fn verifier_passes_precomputed_transaction_ids_and_auth_data_root() {
+    use std::sync::Mutex;
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+    assert!(block.transactions.iter().all(|tx| tx.version() == 5));
+
+    let proposed = Arc::new(Mutex::new(None));
+    let state = {
+        let proposed = proposed.clone();
+        service_fn(move |request: zs::Request| {
+            let proposed = proposed.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckParentInputs { .. } => {
+                        zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                    }
+                    zs::Request::CheckBlockProposalValidity(block) => {
+                        *proposed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+                        zs::Response::ValidBlockProposal
+                    }
+                    _ => panic!("unexpected state request: {request:?}"),
+                };
+                Ok::<_, BoxError>(response)
+            }
+        })
+    };
+    let requested_ids = Arc::new(Mutex::new(Vec::new()));
+    let transaction = {
+        let requested_ids = requested_ids.clone();
+        service_fn(move |request: tx::Request| {
+            let requested_ids = requested_ids.clone();
+            async move {
+                let tx::Request::Block {
+                    transaction_id,
+                    ref transaction,
+                    ..
+                } = request
+                else {
+                    panic!("block verification sends block transaction requests");
+                };
+                requested_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((transaction_id, transaction.unmined_id()));
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            }
+        })
+    };
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
+
+    prepare_for_test(&mut verifier, block.clone()).await;
+
+    let requested_ids = requested_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(requested_ids.len(), block.transactions.len());
+    for (supplied, recomputed) in requested_ids.iter() {
+        assert!(matches!(supplied, UnminedTxId::Witnessed(_)));
+        assert_eq!(supplied, recomputed);
+    }
+    let proposed = proposed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the verifier sends the block to state");
+    assert_eq!(proposed.auth_data_root, Some(block.auth_data_root()));
 }
 
 #[test]

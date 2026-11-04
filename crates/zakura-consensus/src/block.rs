@@ -19,7 +19,6 @@ use zakura_node_services::block_memory::BlockHandle;
 use chrono::Utc;
 use futures::stream::FuturesUnordered;
 use futures_util::FutureExt;
-use rayon::prelude::*;
 use thiserror::Error;
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
@@ -54,27 +53,6 @@ const AUTH_DATA_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// The smallest transaction count that repays parallel hashing overhead in measured block mixes.
-const PARALLEL_TRANSACTION_HASHES_MIN: usize = 64;
-
-/// Compute transaction IDs in block order, avoiding worker coordination for small blocks.
-fn transaction_hashes(block: &block::BlockRef) -> Arc<[transaction::Hash]> {
-    if block.transactions().len() < PARALLEL_TRANSACTION_HASHES_MIN
-        || rayon::current_num_threads() == 1
-    {
-        block
-            .transactions()
-            .map(|transaction| transaction.hash())
-            .collect()
-    } else {
-        block
-            .parallel_transactions()
-            .map(|transaction| transaction.hash())
-            .collect::<Vec<_>>()
-            .into()
-    }
-}
 
 /// Asynchronous semantic block verification.
 #[derive(Debug)]
@@ -582,8 +560,10 @@ where
                 // Next, check the Merkle root validity, to ensure that
                 // the header binds to the transactions in the blocks.
 
-                // Precomputing this avoids duplicating transaction hash computations.
-                let transaction_hashes = transaction_hashes(block.view());
+                // Hash each transaction's ID and authorizing-data digest once, for the Merkle
+                // root, the transaction requests and the state's authorizing-data check.
+                let transaction_digests = block.view().transaction_digests();
+                let transaction_hashes = transaction_digests.hashes.clone();
 
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 
@@ -704,8 +684,8 @@ where
                 // Dispatch shielded transactions first: their proof batches are the longest
                 // checks, so starting them before the transparent checks shortens the block's
                 // critical path.
-                let (shielded, transparent): (Vec<_>, Vec<_>) = transaction_hashes
-                    .iter()
+                let (shielded, transparent): (Vec<_>, Vec<_>) = transaction_digests
+                    .unmined_ids()
                     .zip(block.transactions())
                     .partition(|(_, tx)| tx.has_shielded_data());
 
@@ -717,13 +697,13 @@ where
                     primitives::flush::BlockFlush::register(&known_outpoint_hashes, shielded.len())
                 });
 
-                for (&transaction_hash, transaction) in shielded.into_iter().chain(transparent) {
+                for (transaction_id, transaction) in shielded.into_iter().chain(transparent) {
                     let rsp = transaction_verifier
                         .ready()
                         .await
                         .expect("transaction verifier is always ready")
                         .call(tx::Request::Block {
-                            transaction_hash,
+                            transaction_id,
                             transaction,
                             known_outpoint_hashes: known_outpoint_hashes.clone(),
                             known_utxos: known_utxos.clone(),
@@ -864,7 +844,7 @@ where
                     new_outputs: known_utxos,
                     transaction_hashes,
                     deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                    auth_data_root: None,
+                    auth_data_root: Some(transaction_digests.auth_data_root),
                     receipt_order,
                 };
 

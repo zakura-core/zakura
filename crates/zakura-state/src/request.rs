@@ -17,11 +17,7 @@ use zakura_node_services::block_memory::BlockHandle;
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::{
-        self,
-        merkle::{AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
-        Block, HeightDiff,
-    },
+    block::{self, merkle::AuthDataRoot, Block, HeightDiff},
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
     ironwood, orchard,
@@ -913,19 +909,8 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
 fn transaction_hashes_and_auth_data_root(
     block: &block::BlockRef,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
-    use rayon::prelude::*;
-
-    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
-        .parallel_transactions()
-        .map(|transaction| transaction.txid_and_auth_digest())
-        .unzip();
-
-    let auth_data_root = auth_digests
-        .into_iter()
-        .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
-        .collect();
-
-    (transaction_hashes.into(), auth_data_root)
+    let digests = block.transaction_digests();
+    (digests.hashes, digests.auth_data_root)
 }
 
 #[cfg(test)]

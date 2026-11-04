@@ -821,3 +821,58 @@ fn time_check_fixed() {
         node_time_check(now, block_header_time).expect("the inverse comparison should be valid");
     }
 }
+
+#[test]
+fn transaction_digests_match_separate_computation_across_parallel_cutoff() {
+    let _init_guard = zakura_test::init();
+
+    // Pre-v5 (genesis, Sapling era) and NU5 blocks, so both auth digest branches are covered.
+    let blocks: Vec<Block> = [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .map(|bytes| {
+        bytes
+            .zcash_deserialize_into()
+            .expect("block fixture deserializes")
+    })
+    .collect();
+    let transactions: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter().cloned())
+        .collect();
+    assert!(
+        transactions.iter().any(|tx| tx.version() >= 5),
+        "fixtures include v5 transactions"
+    );
+
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("the test thread pool starts");
+
+        for count in [1, 63, 64, 65, 129] {
+            let mut block = blocks[0].clone();
+            block.transactions = transactions.iter().cycle().take(count).cloned().collect();
+
+            let digests = pool.install(|| block.transaction_digests());
+
+            let expected_hashes: Vec<_> = block.transactions().map(|tx| tx.hash()).collect();
+            let expected_auth: Vec<_> = block.transactions().map(|tx| tx.auth_digest()).collect();
+            let expected_ids: Vec<_> = block.transactions().map(|tx| tx.unmined_id()).collect();
+            let context = format!("{count} transactions with {threads} workers");
+
+            assert_eq!(digests.hashes.as_ref(), expected_hashes, "{context}");
+            assert_eq!(digests.auth_digests, expected_auth, "{context}");
+            assert_eq!(
+                digests.unmined_ids().collect::<Vec<_>>(),
+                expected_ids,
+                "{context}"
+            );
+            assert_eq!(digests.auth_data_root, block.auth_data_root(), "{context}");
+        }
+    }
+}

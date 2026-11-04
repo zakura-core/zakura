@@ -275,7 +275,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (_tip, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),

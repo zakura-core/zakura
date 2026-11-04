@@ -1013,6 +1013,38 @@ pub struct WorkOwnershipFailure {
     pub message: String,
 }
 
+impl WorkOwnershipFailure {
+    /// A panic of a driver or of the checker that names `property`.
+    pub(crate) fn from_panic(
+        payload: &(dyn std::any::Any + Send),
+        phase: WorkOwnershipPhase,
+        property: &str,
+    ) -> Self {
+        let message = panic_text(payload);
+        Self {
+            property_failure: message == property
+                || message.starts_with(&format!("{property}:"))
+                || (message.starts_with("assertion")
+                    && message.contains(&format!("failed: {property}"))),
+            phase,
+            message,
+        }
+    }
+}
+
+/// A panic payload's text.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
 /// Semantic evidence from one operation in a decoder-v1 history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkOwnershipStep {
@@ -1118,25 +1150,8 @@ fn trace_with(
                        step: usize,
                        phase: WorkOwnershipPhase,
                        failure: Option<&(dyn std::any::Any + Send)>| {
-        let failure = failure.map(|payload| {
-            let message = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| {
-                    payload
-                        .downcast_ref::<&str>()
-                        .map(|text| (*text).to_owned())
-                })
-                .unwrap_or_else(|| "non-string panic payload".to_owned());
-            WorkOwnershipFailure {
-                property_failure: message == PROPERTY
-                    || message.starts_with(&format!("{PROPERTY}:"))
-                    || (message.starts_with("assertion")
-                        && message.contains(&format!("failed: {PROPERTY}"))),
-                phase,
-                message,
-            }
-        });
+        let failure =
+            failure.map(|payload| WorkOwnershipFailure::from_panic(payload, phase, PROPERTY));
         steps.push(WorkOwnershipStep {
             step,
             input: input[(step - 1) * 4..(step * 4).min(input.len())].to_vec(),

@@ -993,11 +993,7 @@ pub fn trace_work_funding_bytes(data: &[u8]) -> WorkFundingHistory {
             Err(payload) => Some(WorkOwnershipFailure {
                 property_failure: false,
                 phase: WorkOwnershipPhase::Transition,
-                message: payload
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                    .unwrap_or_else(|| "non-string panic payload".into()),
+                message: panic_text(payload.as_ref()),
             }),
         };
         let failed = failure.is_some();

@@ -12,7 +12,7 @@ use support::inputs;
 use zakura_sim::{
     domain::block_sync_semantic::{
         CAPACITY_RELEASE_WAKES, DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND,
-        STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
+        REACTOR_QUERY_LIFECYCLE, STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
     },
     harness::{
         block_node::{
@@ -167,6 +167,22 @@ fn the_reset_mid_flight_input_holds_submit_only_requested() {
         model.credited_elsewhere > 0,
         "no first-completion-wins credit"
     );
+}
+
+/// The reset-mid-flight input's reset supersedes the reactor's query state,
+/// and storage takes each accepted query under its exact identity. This input
+/// isn't known to fill or close the action channel, so the test makes no claim
+/// about refusals.
+#[test]
+fn the_reset_mid_flight_input_holds_reactor_query_lifecycle() {
+    let ports = witnessed(
+        committed(RESET_MID_FLIGHT_INPUT),
+        REACTOR_QUERY_LIFECYCLE,
+        Expect::Holds,
+    );
+    let view = ports.view.borrow();
+    let model = view.semantic.borrow();
+    assert!(model.reactor_queries.saw_query_at_storage);
 }
 
 /// The stale-beside-current input's stale verdict releases only its own

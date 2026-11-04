@@ -1471,8 +1471,43 @@ pub enum BlockSyncFact {
         /// Each submission the driver can still retain.
         submissions: Vec<BlockSyncSubmission>,
     },
+    /// The reactor completed a view, reset, or query transition.
+    Reactor {
+        /// The transition.
+        transition: crate::record::machine::ReactorAction,
+        /// The reactor's logical state after it.
+        state: BlockSyncReactorState,
+    },
     /// The sequencer task is dropping and takes no more bodies.
     SequencerClosed,
+}
+
+/// The reactor's logical state after a transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockSyncReactorState {
+    /// The accepted query awaiting a reply.
+    pub pending: Option<crate::record::machine::ReactorQuery>,
+    /// The next accepted query's ID.
+    pub next_query_id: Option<u64>,
+    /// Whether a retry deadline is armed.
+    pub retry_armed: bool,
+    /// Whether the next proposal owes a refused or failed query's force.
+    pub retry_forced: bool,
+    /// Whether the action channel reported closed.
+    pub dispatch_closed: bool,
+    /// The committed body-work authority, if the reactor has one.
+    pub scope: Option<crate::record::machine::BodyAuthority>,
+    /// Verified-tip mirror.
+    pub verified_tip: u32,
+    /// Query and scheduling floor.
+    pub request_floor: u32,
+    /// Header-tip mirror.
+    pub header_tip: u32,
+    /// Last `reset_epoch` the reactor reacted to.
+    pub reset_epoch: u64,
+    /// Last `reaction_epoch` the reactor reacted to.
+    pub reaction_epoch: u64,
 }
 
 /// A body one or more sequencer holders retain.

@@ -34,12 +34,6 @@
       "rpcUrl": "http://159.203.38.10:8232/"
     }
   ],
-  "reference": {
-    "name": "zcashd-compat",
-    "rpcUrl": "http://159.203.113.196:8097/",
-    "expectedBuild": "v6.20.0-44f29cd",
-    "minimumProtocolVersion": 170190
-  },
   "capabilities": {
     "faucet": null,
     "snapshot": null

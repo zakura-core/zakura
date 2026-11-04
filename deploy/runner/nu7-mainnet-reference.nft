@@ -1,8 +1,0 @@
-table inet nu7_mainnet_reference {
-    chain input {
-        type filter hook input priority -5; policy accept;
-        tcp dport 8097 iifname "lo" accept
-        ip saddr 167.99.103.111 tcp dport 8097 accept
-        tcp dport 8097 reject with tcp reset
-    }
-}

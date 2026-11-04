@@ -17,9 +17,8 @@ use super::{
         DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
         DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
-        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
-        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
+        MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
@@ -1046,6 +1045,69 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     reactor_task.abort();
 }
 
+/// A full routine channel can drop `StatusReceived` after the routine wrote
+/// the supplier's status to the registry. The next re-query still restarts
+/// the persistent body alarm for that supplier.
+#[tokio::test]
+async fn dropped_status_received_still_restarts_body_alarm_on_requery() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
+    let (_snapshot_tx, snapshot_rx) =
+        watch::channel(Some(committed_view(alarmed_committed_snapshot(header), 0)));
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    startup.frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(9),
+        verified_block_tip: block::Height(9),
+        verified_block_hash: block::Hash([0x50; 32]),
+    };
+    startup.best_header_tip = (header.height, header.hash);
+    startup.committed_views = Some(snapshot_rx);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+
+    // The routine's registry write lands, but its `StatusReceived` is lost.
+    let supplier = peer(0x56);
+    let generation = wiring
+        .registry
+        .admit_session(
+            &supplier,
+            ServicePeerDirection::Outbound,
+            &wiring.config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    wiring.registry.upsert_status(
+        &supplier,
+        generation,
+        BlockSyncStatus {
+            servable_low: header.height,
+            servable_high: header.height,
+            ..BlockSyncStatus::default()
+        },
+    );
+    wiring
+        .routine_to_reactor
+        .send(super::events::RoutineToReactor::RequeryNeeded)
+        .await
+        .expect("the re-query queues");
+
+    let discovery = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::RestartBodyAvailability { discovery, .. } => break discovery,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before supplier restart: {action:?}"),
+        }
+    };
+    assert_eq!(discovery.hash, header.hash);
+    assert_eq!(discovery.availability.suppliers, 1);
+
+    reactor_task.abort();
+}
+
 #[test]
 fn persistent_body_alarm_metrics_expose_every_required_dimension() {
     let reactor = include_str!("reactor.rs");
@@ -1804,7 +1866,7 @@ fn block_sync_config_defaults_and_round_trips() {
     );
     assert_eq!(
         default.floor_request_byte_reservation(),
-        u64::from(DEFAULT_BS_MAX_RESPONSE_BYTES)
+        BS_PER_BLOCK_WORST_CASE_BYTES
     );
     assert_eq!(
         default.effective_floor_peer_avoid_cooldown(),
@@ -2021,25 +2083,45 @@ fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
 #[test]
 fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
     // A stored config whose request budget cannot cover one floor request
-    // (e.g. an old 16 MiB value) loads clamped to just above the floor instead
-    // of failing `validate`'s one-floor-request lower bound, so older nodes
-    // keep starting.
+    // loads clamped to just above the floor instead of failing `validate`'s
+    // one-floor-request lower bound, so older nodes keep starting.
     let config: crate::Config = toml::from_str(
         r#"
         [zakura.block_sync]
-        max_inflight_block_bytes = 16777216
+        max_inflight_block_bytes = 1000000
         "#,
     )
     .expect("a sub-floor-request max_inflight_block_bytes config still loads");
     let request_floor = config.zakura.block_sync.floor_request_byte_reservation();
     assert!(
-        16_777_216 <= request_floor,
+        1_000_000 <= request_floor,
         "test premise: the stored value is at or below one floor request"
     );
     assert_eq!(
         config.zakura.block_sync.max_inflight_block_bytes,
         request_floor + 1
     );
+}
+
+#[test]
+fn a_budget_above_one_block_is_kept() {
+    // One floor request reserves at most one worst-case block, so a 16 MiB
+    // budget already covers it and loads unchanged.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 16777216
+        "#,
+    )
+    .expect("a budget above one block loads");
+    const {
+        assert!(16_777_216 > BS_PER_BLOCK_WORST_CASE_BYTES);
+    }
+    assert_eq!(
+        config.zakura.block_sync.max_inflight_block_bytes,
+        16_777_216
+    );
+    assert_eq!(config.zakura.block_sync.validate(), Ok(()));
 }
 
 #[test]

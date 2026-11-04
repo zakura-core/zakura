@@ -6,6 +6,7 @@ use crate::{amount::*, value_balance::*};
 
 proptest! {
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_blance_add(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>())
@@ -18,10 +19,11 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
+        let tachyon = value_balance1.tachyon + value_balance2.tachyon;
         let nsm_value_balance = value_balance1.nsm_value_balance + value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance, tachyon) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance), Ok(tachyon)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -30,7 +32,8 @@ proptest! {
                     orchard,
                     deferred,
                     ironwood,
-                    nsm_value_balance
+                    nsm_value_balance,
+                    tachyon
                 })
             ),
             _ => prop_assert!(
@@ -42,12 +45,14 @@ proptest! {
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::NsmValueBalance(_))
+                        | ValueBalanceError::NsmValueBalance(_)
+                        | ValueBalanceError::Tachyon(_))
                 )
             ),
         }
     }
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_sub(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>())
@@ -60,10 +65,11 @@ proptest! {
         let orchard = value_balance1.orchard - value_balance2.orchard;
         let deferred = value_balance1.deferred - value_balance2.deferred;
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
+        let tachyon = value_balance1.tachyon - value_balance2.tachyon;
         let nsm_value_balance = value_balance1.nsm_value_balance - value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance, tachyon) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance), Ok(tachyon)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -72,7 +78,8 @@ proptest! {
                     orchard,
                     deferred,
                     ironwood,
-                    nsm_value_balance
+                    nsm_value_balance,
+                    tachyon
                 })
             ),
             _ => prop_assert!(matches!(
@@ -83,12 +90,14 @@ proptest! {
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::NsmValueBalance(_))
+                        | ValueBalanceError::NsmValueBalance(_)
+                        | ValueBalanceError::Tachyon(_))
                 )),
         }
     }
 
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_sum(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>(),
@@ -103,10 +112,11 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
+        let tachyon = value_balance1.tachyon + value_balance2.tachyon;
         let nsm_value_balance = value_balance1.nsm_value_balance + value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance, tachyon) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance), Ok(tachyon)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
@@ -115,7 +125,8 @@ proptest! {
                     orchard,
                     deferred,
                     ironwood,
-                    nsm_value_balance
+                    nsm_value_balance,
+                    tachyon
                 })
             ),
             _ => prop_assert!(matches!(
@@ -126,7 +137,8 @@ proptest! {
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::NsmValueBalance(_))
+                        | ValueBalanceError::NsmValueBalance(_)
+                        | ValueBalanceError::Tachyon(_))
                  ))
         }
     }
@@ -145,7 +157,7 @@ proptest! {
         let _init_guard = zakura_test::init();
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
-            prop_assert_eq!(bytes, deserialized.to_bytes());
+            prop_assert_eq!(bytes, &deserialized.to_bytes()[..56]);
         }
     }
 
@@ -158,7 +170,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 56];
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
             extended_bytes[..32].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
@@ -174,8 +186,22 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 56];
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
             extended_bytes[..40].copy_from_slice(&bytes);
+            prop_assert_eq!(extended_bytes, deserialized);
+        }
+    }
+
+    /// The pre-Tachyon value balance was a 56-byte prefix of the current format.
+    #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn pre_tachyon_value_balance_deserialization(bytes in any::<[u8; 56]>()) {
+        let _init_guard = zakura_test::init();
+
+        if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
+            let deserialized = deserialized.to_bytes();
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
+            extended_bytes[..56].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
     }
@@ -201,6 +227,8 @@ proptest! {
             transparent: amounts[0], sprout: amounts[1], sapling: amounts[2],
             orchard: amounts[3], deferred: amounts[4], ironwood: amounts[5],
             nsm_value_balance: Amount::try_from(nsm).unwrap(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: Amount::zero(),
         };
         prop_assert_eq!(i64::from(pools.total().unwrap()), MAX_MONEY);
         prop_assert_eq!(pools.add_chain_value_pool_change(ValueBalance::zero()), Ok(pools));

@@ -77,6 +77,14 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
             }
         }
 
+        // Discovery must expose exactly the methods compiled into the server.
+        for attr in method
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg"))
+        {
+            writeln!(output, "{}", attr.to_token_stream())?;
+        }
         writeln!(output, "({name:?}, openrpc::RpcMethod {{")?;
         writeln!(output, "    description: {description:?},")?;
         writeln!(output, "    params: |_g| vec![")?;

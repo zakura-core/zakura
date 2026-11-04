@@ -263,6 +263,8 @@ impl PrecomputedTxData {
             zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
                 Some(tx.digest(zp_tx::txid::TxIdDigester))
             }
+            #[cfg(zcash_unstable = "nutachyon")]
+            zp_tx::TxVersion::V7 => Some(tx.digest(zp_tx::txid::TxIdDigester)),
         };
 
         let f_transparent = MapTransparent {

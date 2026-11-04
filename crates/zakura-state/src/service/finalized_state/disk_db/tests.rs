@@ -13,6 +13,171 @@ use crate::{
     Config,
 };
 
+#[test]
+fn automatic_major_database_reuse_validates_source_and_preserves_data() {
+    let _init_guard = zakura_test::init();
+    for version_file in [Some("1.0.0"), Some("0.0"), None] {
+        let cache = tempfile::tempdir().expect("temporary directory exists");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ..Config::default()
+        };
+        let network = Network::Mainnet;
+        let old_version = Version::new(1, 0, 0);
+        let new_version = Version::new(2, 0, 0);
+        let old_path = config.db_path("state", 1, &network);
+        let new_path = config.db_path("state", 2, &network);
+        {
+            let db = DiskDb::new(
+                &config,
+                "state",
+                &old_version,
+                &network,
+                ["test".to_owned()],
+                false,
+            )
+            .expect("fixture database opens");
+            let cf = db.cf_handle("test").expect("fixture column family exists");
+            db.put_cf(cf, b"key", b"value")
+                .expect("fixture value is written");
+            crate::write_database_format_version_to_disk(
+                &config,
+                "state",
+                1,
+                &old_version,
+                &network,
+            )
+            .expect("fixture version is written");
+        }
+        crate::write_database_format_version_to_disk(
+            &config,
+            "state",
+            1,
+            &Version::new(3, 0, 0),
+            &network,
+        )
+        .expect("fixture models a newer database in the old directory");
+        assert_eq!(
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
+                &[2],
+                &new_version,
+                &config,
+                "state",
+                &network
+            ),
+            None
+        );
+        assert!(old_path.exists());
+        assert!(!new_path.exists());
+        let version_path = config.version_file_path("state", 1, &network);
+        if let Some(version_file) = version_file {
+            std::fs::write(&version_path, version_file)
+                .expect("fixture restores the compatible format");
+        } else {
+            std::fs::remove_file(&version_path)
+                .expect("fixture models a database without a version file");
+        }
+        assert_eq!(
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
+                &[2],
+                &new_version,
+                &config,
+                "state",
+                &network
+            ),
+            Some(old_version)
+        );
+        assert!(!old_path.exists());
+        let db = DiskDb::new(
+            &config,
+            "state",
+            &new_version,
+            &network,
+            ["test".to_owned()],
+            false,
+        )
+        .expect("reused database opens");
+        let cf = db.cf_handle("test").expect("reused column family exists");
+        assert_eq!(
+            db.get_cf(cf, b"key").expect("reused value is readable"),
+            Some(b"value".to_vec())
+        );
+    }
+}
+
+#[test]
+fn automatic_major_database_reuse_resumes_interrupted_upgrade() {
+    let _init_guard = zakura_test::init();
+    let cache = tempfile::tempdir().expect("temporary directory exists");
+    let config = Config {
+        cache_dir: cache.path().to_owned(),
+        ..Config::default()
+    };
+    let network = Network::Mainnet;
+    let recorded = Version::new(1, 2, 3);
+    let db = DiskDb::new(
+        &config,
+        "state",
+        &recorded,
+        &network,
+        ["test".to_owned()],
+        false,
+    )
+    .expect("fixture database opens");
+    db.put_cf(db.cf_handle("test").unwrap(), b"key", b"value")
+        .unwrap();
+    crate::write_database_format_version_to_disk(&config, "state", 1, &recorded, &network).unwrap();
+    drop(db);
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[2],
+            &Version::new(2, 0, 0),
+            &config,
+            "state",
+            &network
+        ),
+        Some(recorded.clone())
+    );
+    // No migration ran after the first rename.
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[3],
+            &Version::new(3, 0, 0),
+            &config,
+            "state",
+            &network
+        ),
+        None
+    );
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[2, 3],
+            &Version::new(3, 0, 0),
+            &config,
+            "state",
+            &network
+        ),
+        Some(recorded.clone())
+    );
+    assert_eq!(
+        crate::database_format_version_on_disk(&config, "state", 3, &network).unwrap(),
+        Some(recorded)
+    );
+    let db = DiskDb::new(
+        &config,
+        "state",
+        &Version::new(3, 0, 0),
+        &network,
+        ["test".to_owned()],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_cf(db.cf_handle("test").unwrap(), b"key").unwrap(),
+        Some(b"value".to_vec())
+    );
+}
+
 // Enable older test code to automatically access the inner database via Deref coercion.
 impl Deref for DiskDb {
     type Target = DB;

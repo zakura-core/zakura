@@ -13,6 +13,8 @@ const U32_SIZE: usize = 4;
 const V1_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE + U32_SIZE * 4 + HISTORY_HASH_SIZE * 3;
 const V2_EXTRA_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE * 2;
 const V3_EXTRA_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE * 2;
+#[cfg(zcash_unstable = "nutachyon")]
+const V4_EXTRA_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE * 2;
 
 /// Test the MMR tree using the activation block of a network upgrade
 /// and its next block.
@@ -57,6 +59,8 @@ fn tree_for_network_upgrade(network: &Network, network_upgrade: NetworkUpgrade) 
         &sapling_root0,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
 
     // Compute root hash of the MMR tree, which will be included in the next block
@@ -87,6 +91,8 @@ fn tree_for_network_upgrade(network: &Network, network_upgrade: NetworkUpgrade) 
             &sapling_root1,
             &Default::default(),
             &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            &Default::default(),
         )
         .unwrap();
 
@@ -113,6 +119,8 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     );
     let v1_non_default = <V1 as ZebraHistoryVersion>::block_to_history_node(
         block.clone(),
@@ -120,6 +128,8 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &non_default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     );
 
     assert_eq!(
@@ -137,6 +147,8 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     );
     let v2_non_default = <V2 as ZebraHistoryVersion>::block_to_history_node(
         block,
@@ -144,6 +156,8 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &non_default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     );
 
     assert_eq!(
@@ -172,6 +186,8 @@ fn v3_history_node_hash_input_has_exact_serialized_size() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     );
 
     assert_eq!(node_data.start_ironwood_root, ironwood_root_bytes);
@@ -185,7 +201,44 @@ fn v3_history_node_hash_input_has_exact_serialized_size() -> Result<()> {
     // value in a V3 node.
     assert_eq!(encoded.len(), serialized_v3_node_data_size(&node_data));
     assert_eq!(encoded.last(), Some(&1));
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(::zakura_mmr_tree::MAX_NODE_DATA_SIZE, 390);
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     assert_eq!(::zakura_mmr_tree::MAX_NODE_DATA_SIZE, 317);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(zcash_unstable = "nutachyon")]
+fn v4_history_node_commits_to_tachyon_state() -> Result<()> {
+    let network = Network::Mainnet;
+    let (block, sapling_root) = block_and_sapling_root(&network, NetworkUpgrade::Canopy)?;
+    let orchard_root = orchard::tree::Root::default();
+    let ironwood_root = non_default_ironwood_root();
+    let tachyon_anchor = crate::tachyon::Anchor([1; 32]);
+
+    let mut node_data = <V4 as ZebraHistoryVersion>::block_to_history_node(
+        block,
+        &network,
+        &sapling_root,
+        &orchard_root,
+        &ironwood_root,
+        &tachyon_anchor,
+    );
+
+    assert_eq!(node_data.start_tachyon_anchor, tachyon_anchor.0);
+    assert_eq!(node_data.end_tachyon_anchor, tachyon_anchor.0);
+
+    let without_tachyon_transaction = <V4 as ZcashHistoryVersion>::hash(&node_data);
+    node_data.tachyon_tx = 1;
+    let with_tachyon_transaction = <V4 as ZcashHistoryVersion>::hash(&node_data);
+    assert_ne!(without_tachyon_transaction, with_tachyon_transaction);
+
+    let encoded = <V4 as ZcashHistoryVersion>::to_bytes(&node_data);
+    assert_eq!(encoded.len(), serialized_v4_node_data_size(&node_data));
+    assert_eq!(encoded.last(), Some(&1));
+    assert_eq!(::zakura_mmr_tree::MAX_NODE_DATA_SIZE, 390);
 
     Ok(())
 }
@@ -228,6 +281,13 @@ fn serialized_v3_node_data_size(data: &::zakura_mmr_tree::NodeDataV3) -> usize {
     serialized_v2_node_data_size(&data.v2)
         + V3_EXTRA_FIXED_NODE_DATA_SIZE
         + compact_size(data.ironwood_tx)
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+fn serialized_v4_node_data_size(data: &::zakura_mmr_tree::NodeDataV4) -> usize {
+    serialized_v3_node_data_size(&data.v3)
+        + V4_EXTRA_FIXED_NODE_DATA_SIZE
+        + compact_size(data.tachyon_tx)
 }
 
 fn serialized_v2_node_data_size(data: &::zakura_mmr_tree::NodeDataV2) -> usize {
@@ -275,17 +335,27 @@ fn constructors_reject_missing_branch_ids() {
     let sapling_root = sapling::tree::NoteCommitmentTree::default().root();
     let orchard_root = orchard::tree::NoteCommitmentTree::default().root();
     let ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
+    #[cfg(zcash_unstable = "nutachyon")]
+    let tachyon_anchor = Default::default();
     let error = Tree::<V3>::new_from_block(
         &network,
         block.clone(),
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &tachyon_anchor,
     )
     .expect_err("a branchless upgrade must fail before building a leaf");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    let parts =
-        HistoryTreeBlockParts::from_block(&block, &sapling_root, &orchard_root, &ironwood_root);
+    let parts = HistoryTreeBlockParts::from_block(
+        &block,
+        &sapling_root,
+        &orchard_root,
+        &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &tachyon_anchor,
+    );
     let error = Tree::<V3>::new_from_parts(&network, parts)
         .expect_err("a branchless upgrade must fail before building a leaf from parts");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

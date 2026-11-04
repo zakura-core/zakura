@@ -247,6 +247,7 @@ pub(crate) fn verify_supplied_ironwood_root_below_nu6_3(
 pub(crate) fn verify_commitment_roots<I>(
     network: &Network,
     mut history_tree: HistoryTree,
+    #[cfg(zcash_unstable = "nutachyon")] mut tachyon_anchor: zakura_chain::tachyon::Anchor,
     blocks_to_verify: I,
 ) -> Result<HistoryTree, CommitmentRootVerificationError>
 where
@@ -296,6 +297,14 @@ where
                     auth_data_root,
                 )
                 .map_err(|error| match error {
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    SuppliedRootsError::TachyonDataUnavailable => {
+                        ValidateContextError::HistoryTreeError(Arc::new(
+                            zakura_chain::history_tree::HistoryTreeError::InvalidCachedTree {
+                                reason: "Tachyon history commitments require block bodies",
+                            },
+                        ))
+                    }
                     SuppliedRootsError::InvalidHeaderCommitment(error) => {
                         ValidateContextError::InvalidBlockCommitment(error)
                     }
@@ -329,6 +338,15 @@ where
         verify_supplied_ironwood_root_below_nu6_3(network, height, &ironwood_root)
             .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
 
+        #[cfg(zcash_unstable = "nutachyon")]
+        if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
+            tachyon_anchor = tachyon_anchor
+                .advance_with_block(pool_height, &block)
+                .map_err(ValidateContextError::from)
+                .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?
+                .post_block;
+        }
+
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
         history_tree
@@ -338,6 +356,8 @@ where
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                &tachyon_anchor,
             )
             .map_err(Arc::new)
             .map_err(ValidateContextError::from)
@@ -373,6 +393,8 @@ mod tests {
             genesis,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         )
         .expect("empty history tree for a pre-Heartwood block")
@@ -717,8 +739,14 @@ mod tests {
                 Some(next_block.auth_data_root()),
             ),
         ];
-        verify_commitment_roots(&Mainnet, empty_history_tree(), ok_items)
-            .expect("real roots verify against the headers");
+        verify_commitment_roots(
+            &Mainnet,
+            empty_history_tree(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
+            ok_items,
+        )
+        .expect("real roots verify against the headers");
 
         // Negative + lag: a wrong root at the activation height (here, the next
         // block's root, which is a valid but different root) is only caught when the
@@ -732,8 +760,14 @@ mod tests {
                 Some(next_block.auth_data_root()),
             ),
         ];
-        let failure = verify_commitment_roots(&Mainnet, empty_history_tree(), bad_items)
-            .expect_err("a wrong root must be rejected");
+        let failure = verify_commitment_roots(
+            &Mainnet,
+            empty_history_tree(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
+            bad_items,
+        )
+        .expect_err("a wrong root must be rejected");
         assert_eq!(
             failure.height().0,
             activation + 1,
@@ -840,8 +874,14 @@ mod tests {
         let items: Vec<_> = (start..=end + 1).map(item_at).collect();
 
         // Positive: every supplied root in the range is confirmed by the V2 headers.
-        verify_commitment_roots(&Mainnet, seed.clone(), items.clone())
-            .expect("real NU5 roots verify against the headers");
+        verify_commitment_roots(
+            &Mainnet,
+            seed.clone(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
+            items.clone(),
+        )
+        .expect("real NU5 roots verify against the headers");
         eprintln!("VCT NU5 positive: {} blocks verified", items.len());
 
         // Negative + lag: corrupt one root mid-range with a distinct valid root (the
@@ -864,8 +904,14 @@ mod tests {
             .as_mut()
             .expect("test verification item has roots")
             .0 = wrong_root;
-        let failure = verify_commitment_roots(&Mainnet, seed, bad_items)
-            .expect_err("a wrong NU5 root must be rejected");
+        let failure = verify_commitment_roots(
+            &Mainnet,
+            seed,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
+            bad_items,
+        )
+        .expect_err("a wrong NU5 root must be rejected");
         assert_eq!(
             failure.height().0,
             bad_height + 1,
@@ -1079,15 +1125,20 @@ mod tests {
             .0;
         for &(start, end) in ranges.iter().filter(|(start, _)| *start < heartwood) {
             let items = (start..=end).map(|height| verification_item_at(Height(height)));
-            verify_commitment_roots(&Mainnet, empty_history_tree(), items).unwrap_or_else(
-                |failure| {
-                    panic!(
-                        "pre-Heartwood roots failed at {:?}: {}",
-                        failure.height(),
-                        failure.error()
-                    )
-                },
-            );
+            verify_commitment_roots(
+                &Mainnet,
+                empty_history_tree(),
+                #[cfg(zcash_unstable = "nutachyon")]
+                Default::default(),
+                items,
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "pre-Heartwood roots failed at {:?}: {}",
+                    failure.height(),
+                    failure.error()
+                )
+            });
             eprintln!("validated direct pre-Heartwood commitments for {start}..={end}");
         }
 
@@ -1124,6 +1175,8 @@ mod tests {
                     &sapling_root,
                     &orchard_root,
                     &ironwood_root,
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    &Default::default(),
                 ),
             )
             .expect("network-upgrade activation starts a history-tree epoch");
@@ -1133,7 +1186,14 @@ mod tests {
             let items =
                 (activation + 1..=confirm_end).map(|height| verification_item_at(Height(height)));
 
-            verify_commitment_roots(&Mainnet, history_tree, items).unwrap_or_else(|failure| {
+            verify_commitment_roots(
+                &Mainnet,
+                history_tree,
+                #[cfg(zcash_unstable = "nutachyon")]
+                Default::default(),
+                items,
+            )
+            .unwrap_or_else(|failure| {
                 panic!(
                     "{upgrade:?} MMR linkage failed at {:?} while validating through \
                      {confirm_end}: {}",

@@ -210,6 +210,8 @@ impl BlockFixture {
                     &sapling::tree::NoteCommitmentTree::default().root(),
                     &orchard::tree::NoteCommitmentTree::default().root(),
                     &ironwood::tree::NoteCommitmentTree::default().root(),
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    &Default::default(),
                 )
                 .expect("a fixture block extends its history");
         };

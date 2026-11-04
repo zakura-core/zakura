@@ -28,6 +28,23 @@ use crate::{
 };
 
 #[test]
+fn construct_empty() {
+    let _init_guard = zakura_test::init();
+    let _chain = Chain::new(
+        &Network::Mainnet,
+        Height(0),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Default::default(),
+        Default::default(),
+        ValueBalance::zero(),
+    );
+}
+
+#[test]
 fn construct_single() -> Result<()> {
     let _init_guard = zakura_test::init();
     let block: Arc<Block> =
@@ -39,6 +56,8 @@ fn construct_single() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
@@ -75,6 +94,8 @@ fn construct_many() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
     );
@@ -103,6 +124,8 @@ fn ord_matches_work() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
     );
@@ -114,6 +137,8 @@ fn ord_matches_work() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         Default::default(),
         Default::default(),
         ValueBalance::zero(),
@@ -225,6 +250,8 @@ fn finalize_drops_empty_side_chain_for_network(network: Network) -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
@@ -973,6 +1000,8 @@ fn history_tree_is_updated_for_network_upgrade(
         &chain.sapling_note_commitment_tree_for_tip().root(),
         &chain.orchard_note_commitment_tree_for_tip().root(),
         &chain.ironwood_note_commitment_tree_for_tip().root(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )
     .unwrap();
 
@@ -1053,6 +1082,8 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
         &chain.sapling_note_commitment_tree_for_tip().root(),
         &chain.orchard_note_commitment_tree_for_tip().root(),
         &chain.ironwood_note_commitment_tree_for_tip().root(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )
     .unwrap();
 
@@ -1158,6 +1189,8 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),

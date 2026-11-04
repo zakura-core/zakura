@@ -396,6 +396,8 @@ impl Block {
             let mut sapling_tree = sapling::tree::NoteCommitmentTree::default();
             let mut orchard_tree = orchard::tree::NoteCommitmentTree::default();
             let mut ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
+            #[cfg(zcash_unstable = "nutachyon")]
+            let mut tachyon_anchor = crate::tachyon::Anchor::default();
             // The history tree usually takes care of "creating itself". But this
             // only works when blocks are pushed into it starting from genesis
             // (or at least pre-Heartwood, where the tree is not required).
@@ -446,6 +448,16 @@ impl Block {
 
                 // delete invalid transactions
                 block.transactions = new_transactions;
+
+                #[cfg(zcash_unstable = "nutachyon")]
+                if let Some(pool_height) =
+                    crate::tachyon::pool_height(&current.network, block.coinbase_height().unwrap())
+                {
+                    tachyon_anchor = tachyon_anchor
+                        .advance_with_block(pool_height, block)
+                        .expect("generated Tachyon stamps have valid anchor transitions")
+                        .post_block;
+                }
 
                 // fix commitment (must be done after finishing changing the block)
                 if generate_valid_commitments {
@@ -503,6 +515,8 @@ impl Block {
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
                                 &ironwood_tree.root(),
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                &tachyon_anchor,
                             )
                             .unwrap();
                     } else {
@@ -513,6 +527,8 @@ impl Block {
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
                                 &ironwood_tree.root(),
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                &tachyon_anchor,
                             )
                             .unwrap(),
                         );
@@ -572,6 +588,11 @@ where
                 ..
             } => *sapling_shielded_data = None,
             Transaction::V6 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data,
                 ..
             } => *sapling_shielded_data = None,

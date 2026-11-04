@@ -16,6 +16,9 @@ use crate::{
     serialization::ZcashDeserializeInto,
 };
 
+#[cfg(zcash_unstable = "nutachyon")]
+const DEFAULT_TACHYON_ANCHOR: crate::tachyon::Anchor = crate::tachyon::Anchor([0; 32]);
+
 use eyre::Result;
 
 /// Test the history tree using the activation block of a network upgrade
@@ -68,6 +71,8 @@ fn push_and_prune_for_network_upgrade(
         &first_sapling_root,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
 
     assert_eq!(tree.size(), 1);
@@ -100,6 +105,8 @@ fn push_and_prune_for_network_upgrade(
         second_block,
         &second_sapling_root,
         &Default::default(),
+        &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     )
     .unwrap();
@@ -175,6 +182,8 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     parts_tree.push_from_parts(
         &network,
@@ -182,6 +191,8 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
             &genesis_block,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         ),
     )?;
@@ -195,6 +206,8 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
         &first_sapling_root,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     parts_tree.push_from_parts(
         &network,
@@ -202,6 +215,8 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
             &first_block,
             &first_sapling_root,
             &Default::default(),
+            &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         ),
     )?;
@@ -225,6 +240,8 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
         &second_sapling_root,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     parts_tree.push_from_parts(
         &network,
@@ -232,6 +249,8 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
             &second_block,
             &second_sapling_root,
             &Default::default(),
+            &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         ),
     )?;
@@ -277,9 +296,13 @@ fn from_cache_preserves_ironwood_history_version() -> Result<()> {
                 sapling_root: &Default::default(),
                 orchard_root: &Default::default(),
                 ironwood_root: &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor: &DEFAULT_TACHYON_ANCHOR,
                 sapling_tx: 0,
                 orchard_tx: 0,
                 ironwood_tx: 1,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_tx: 0,
             },
         )?;
         // Decoding the same peaks as V2 succeeds, because the serialized V3
@@ -360,6 +383,8 @@ fn from_block_delegation_preserves_all_history_versions() -> Result<()> {
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &Default::default(),
         )?;
         let parts_tree = NonEmptyHistoryTree::from_parts(
             &network,
@@ -369,9 +394,13 @@ fn from_block_delegation_preserves_all_history_versions() -> Result<()> {
                 sapling_root: &sapling_root,
                 orchard_root: &orchard_root,
                 ironwood_root: &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor: &DEFAULT_TACHYON_ANCHOR,
                 sapling_tx: block.sapling_transactions_count(),
                 orchard_tx: block.orchard_transactions_count(),
                 ironwood_tx: block.ironwood_transactions_count(),
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_tx: block.tachyon_transactions_count(),
             },
         )?;
 
@@ -430,9 +459,13 @@ fn from_parts_selects_epoch_version_and_ignores_future_fields() -> Result<()> {
         sapling_root: &sapling_root,
         orchard_root,
         ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_anchor: &DEFAULT_TACHYON_ANCHOR,
         sapling_tx: 1,
         orchard_tx,
         ironwood_tx,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_tx: 0,
     };
 
     assert_eq!(
@@ -550,6 +583,8 @@ fn push_wrapper_matches_parts_across_nu6_3_activation() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     let mut parts_tree = NonEmptyHistoryTree::from_parts(
         &network,
@@ -558,6 +593,8 @@ fn push_wrapper_matches_parts_across_nu6_3_activation() -> Result<()> {
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &Default::default(),
         ),
     )?;
 
@@ -566,12 +603,16 @@ fn push_wrapper_matches_parts_across_nu6_3_activation() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     parts_tree.push_from_parts(HistoryTreeBlockParts::from_block(
         &activation_block,
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     ))?;
     let activation_tree = NonEmptyHistoryTree::from_block(
         &network,
@@ -579,12 +620,16 @@ fn push_wrapper_matches_parts_across_nu6_3_activation() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     let activation_without_ironwood = NonEmptyHistoryTree::from_block(
         &network,
         activation_block,
         &sapling_root,
         &orchard_root,
+        &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     )?;
 
@@ -663,9 +708,13 @@ fn push_from_parts_routes_each_history_version() -> Result<()> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchor: &DEFAULT_TACHYON_ANCHOR,
             sapling_tx: 1,
             orchard_tx,
             ironwood_tx,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_tx: 0,
         }
     }
     let two_leaf_tree = |network: &Network,
@@ -764,18 +813,24 @@ fn try_extend_forwards_ironwood_roots_in_order() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &first_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     sequential.push(
         second_block.clone(),
         &sapling_root,
         &orchard_root,
         &second_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     sequential.push(
         third_block.clone(),
         &sapling_root,
         &orchard_root,
         &third_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
 
     let mut extended = NonEmptyHistoryTree::from_block(
@@ -784,7 +839,27 @@ fn try_extend_forwards_ironwood_roots_in_order() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &first_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
+    #[cfg(zcash_unstable = "nutachyon")]
+    extended.try_extend([
+        (
+            second_block.clone(),
+            &sapling_root,
+            &orchard_root,
+            &second_ironwood_root,
+            &DEFAULT_TACHYON_ANCHOR,
+        ),
+        (
+            third_block.clone(),
+            &sapling_root,
+            &orchard_root,
+            &third_ironwood_root,
+            &DEFAULT_TACHYON_ANCHOR,
+        ),
+    ])?;
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     extended.try_extend([
         (
             second_block.clone(),
@@ -806,7 +881,27 @@ fn try_extend_forwards_ironwood_roots_in_order() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &first_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
+    #[cfg(zcash_unstable = "nutachyon")]
+    wrong_last_root.try_extend([
+        (
+            second_block,
+            &sapling_root,
+            &orchard_root,
+            &second_ironwood_root,
+            &DEFAULT_TACHYON_ANCHOR,
+        ),
+        (
+            third_block,
+            &sapling_root,
+            &orchard_root,
+            &Default::default(),
+            &DEFAULT_TACHYON_ANCHOR,
+        ),
+    ])?;
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     wrong_last_root.try_extend([
         (
             second_block,
@@ -872,9 +967,13 @@ fn v3_pruning_and_hash_dispatch_match_unpruned_tree() -> Result<()> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchor: &DEFAULT_TACHYON_ANCHOR,
             sapling_tx: u64::from(height),
             orchard_tx: u64::from(height + 1),
             ironwood_tx: u64::from(height + 2),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_tx: 0,
         }
     }
 
@@ -986,14 +1085,25 @@ fn v3_clone_preserves_root_and_future_append() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &first_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     original.push(
         block(2),
         &sapling_root,
         &orchard_root,
         &second_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
-    original.push(block(3), &sapling_root, &orchard_root, &third_ironwood_root)?;
+    original.push(
+        block(3),
+        &sapling_root,
+        &orchard_root,
+        &third_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
+    )?;
     assert_eq!(original.peaks().len(), 2, "three leaves have two MMR peaks");
 
     let mut cloned = original.clone();
@@ -1012,12 +1122,16 @@ fn v3_clone_preserves_root_and_future_append() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &fourth_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     cloned.push(
         fourth_block,
         &sapling_root,
         &orchard_root,
         &fourth_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
 
     assert_eq!(cloned.hash(), original.hash());
@@ -1073,10 +1187,19 @@ fn history_tree_from_block_matches_parts_across_history_versions() -> Result<()>
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &Default::default(),
         )?;
         let parts_tree = HistoryTree::from_parts(
             &network,
-            HistoryTreeBlockParts::from_block(&block, &sapling_root, &orchard_root, &ironwood_root),
+            HistoryTreeBlockParts::from_block(
+                &block,
+                &sapling_root,
+                &orchard_root,
+                &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                &Default::default(),
+            ),
         )?;
 
         assert_eq!(block_tree.is_some(), should_exist);
@@ -1130,6 +1253,8 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     parts_tree.push_from_parts(
         &network,
@@ -1138,6 +1263,8 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &Default::default(),
         ),
     )?;
     assert_eq!(block_tree.hash(), parts_tree.hash());
@@ -1148,6 +1275,8 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     parts_tree.push_from_parts(
         &network,
@@ -1156,6 +1285,8 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &Default::default(),
         ),
     )?;
     let activation_tree = HistoryTree::from_block(
@@ -1164,12 +1295,16 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
     let activation_without_ironwood = HistoryTree::from_block(
         &network,
         activation_block,
         &sapling_root,
         &orchard_root,
+        &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     )?;
 
@@ -1225,6 +1360,8 @@ fn upgrade_for_network_upgrade(network: Network, network_upgrade: NetworkUpgrade
         &sapling_root_prev,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )?;
 
     assert_eq!(tree.size(), 1);
@@ -1251,6 +1388,8 @@ fn upgrade_for_network_upgrade(network: Network, network_upgrade: NetworkUpgrade
         activation_block,
         &activation_sapling_root,
         &Default::default(),
+        &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     )
     .unwrap();

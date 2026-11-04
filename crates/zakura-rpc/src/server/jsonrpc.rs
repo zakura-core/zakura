@@ -841,6 +841,7 @@ macro_rules! rpc_trait {
         $(#[doc = $trait_doc:literal])*
         pub trait $trait:ident {
             $(
+                $(#[cfg($cfg:meta)])*
                 $(#[doc = $doc:literal])*
                 #[method(name = $name:literal)]
                 $(#[doc = $doc_after:literal])*
@@ -853,6 +854,7 @@ macro_rules! rpc_trait {
         #[::async_trait::async_trait]
         pub trait $trait {
             $(
+                $(#[cfg($cfg)])*
                 $(#[doc = $doc])*
                 $(#[doc = $doc_after])*
                 $(async $($async)?)? fn $method(&self $(, $arg: $ty)*) -> $ret;
@@ -863,7 +865,7 @@ macro_rules! rpc_trait {
         where
             T: $trait + Clone + Send + Sync + 'static,
         {
-            const METHOD_NAMES: &'static [&'static str] = &[$($name),*];
+            const METHOD_NAMES: &'static [&'static str] = &[$($(#[cfg($cfg)])* $name),*];
 
             fn call<'a>(
                 &'a self,
@@ -882,6 +884,7 @@ macro_rules! rpc_trait {
             > {
                 match method {
                     $(
+                        $(#[cfg($cfg)])*
                         $name => Some(Box::pin(async move {
                             let result = match $crate::server::jsonrpc::rpc_trait!(
                                 @decode params; $($arg: $ty),*
@@ -916,7 +919,7 @@ macro_rules! rpc_trait {
 
         #[cfg(feature = "fuzz-impl")]
         impl $crate::server::rpc_service::RpcMethods for DecodeParamsOnly {
-            const METHOD_NAMES: &'static [&'static str] = &[$($name),*];
+            const METHOD_NAMES: &'static [&'static str] = &[$($(#[cfg($cfg)])* $name),*];
 
             fn call<'a>(
                 &'a self,
@@ -935,6 +938,7 @@ macro_rules! rpc_trait {
             > {
                 match method {
                     $(
+                        $(#[cfg($cfg)])*
                         $name => Some(Box::pin(async move {
                             let result = $crate::server::jsonrpc::rpc_trait!(
                                 @decode params; $($arg: $ty),*

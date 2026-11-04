@@ -101,8 +101,8 @@ jobs:
           cargo hack check --workspace
           cargo hack check --workspace --no-default-features
         env:
-          # Treat warnings as errors, preserving the old `features` job behavior.
-          RUSTFLAGS: -D warnings
+          # Treat warnings as errors while preserving the workspace NuTachyon cfg.
+          RUSTFLAGS: '--cfg zcash_unstable="nutachyon" -D warnings'
 
       - name: Check publishable crate packaging
         run: ./scripts/check-crate-packaging.sh

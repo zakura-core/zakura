@@ -31,6 +31,8 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
         Height(0),
         Default::default(),
         Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Default::default(),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -137,6 +139,8 @@ fn skipped_transparent_address_index_stays_empty_through_commit_and_revert() {
             Default::default(),
             Default::default(),
             Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
             ValueBalance::<NonNegative>::zero(),
         )
         .skipping_transparent_address_index(skip);
@@ -230,6 +234,8 @@ fn compare_address_index_clone() {
         &Network::Mainnet,
         Height(0),
         Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         Default::default(),
         Default::default(),
         Default::default(),

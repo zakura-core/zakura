@@ -27,6 +27,11 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
+
+#[cfg(zcash_unstable = "nutachyon")]
+use crate::service::finalized_state::disk_format::shielded::TachyonEpoch;
 use crate::{
     config::state_database_format_version_on_disk,
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
@@ -244,6 +249,11 @@ pub enum RollbackFinalizedStateError {
     /// Rebuilding the history tree failed.
     #[error("failed to rebuild history tree")]
     HistoryTree(#[from] HistoryTreeError),
+
+    /// Rebuilding the Tachyon anchor failed.
+    #[error("failed to rebuild the Tachyon anchor")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAnchor(#[from] zcash_tachyon::AnchorError),
 
     /// Computing a block subsidy failed.
     #[error("failed to compute block subsidy")]
@@ -545,6 +555,8 @@ fn prepare_rollback(
         options.target_height,
         &target_treestate.retained_sprout_roots,
     );
+    #[cfg(zcash_unstable = "nutachyon")]
+    reset_tachyon_indexes(db, &mut batch, network, options.target_height)?;
     clear_header_chain_engine(db, &mut batch)?;
 
     Ok(PreparedRollback {
@@ -646,12 +658,34 @@ fn rebuild_history_tree_from_upgrade_activation(
 
     let (block, sapling_root, orchard_root, ironwood_root) =
         history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree =
-        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+    #[cfg(zcash_unstable = "nutachyon")]
+    let mut tachyon_anchor = zakura_chain::tachyon::Anchor::default();
+    #[cfg(zcash_unstable = "nutachyon")]
+    if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, start_height) {
+        tachyon_anchor = tachyon_anchor
+            .advance_with_block(pool_height, &block)?
+            .post_block;
+    }
+    let mut history_tree = HistoryTree::from_block(
+        network,
+        block,
+        &sapling_root,
+        &orchard_root,
+        &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &tachyon_anchor,
+    )?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
         let (block, sapling_root, orchard_root, ironwood_root) =
             history_rebuild_inputs_at_height(db, height)?;
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
+            tachyon_anchor = tachyon_anchor
+                .advance_with_block(pool_height, &block)?
+                .post_block;
+        }
 
         history_tree.push(
             network,
@@ -659,6 +693,8 @@ fn rebuild_history_tree_from_upgrade_activation(
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &tachyon_anchor,
         )?;
     }
 
@@ -725,6 +761,14 @@ fn rebuild_treestate_to_height(
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
         note_commitment_trees.update_trees_parallel(&block)?;
+        #[cfg(zcash_unstable = "nutachyon")]
+        if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
+            let advance = note_commitment_trees
+                .tachyon_anchor
+                .advance_with_block(pool_height, &block)?;
+            note_commitment_trees.tachyon_anchor = advance.post_block;
+            note_commitment_trees.tachyon_epoch_anchor = advance.epoch_boundary;
+        }
         retained_sprout_roots.insert(note_commitment_trees.sprout.root());
 
         let sapling_root = note_commitment_trees.sapling.root();
@@ -736,6 +780,8 @@ fn rebuild_treestate_to_height(
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &note_commitment_trees.tachyon_anchor,
         )?;
     }
 
@@ -1218,6 +1264,90 @@ fn prune_fast_commitment_anchors_from_index(
     );
 }
 
+/// Returns the heights whose tachygrams and anchors the Tachyon indexes hold at
+/// `target_height`, or `None` before activation.
+///
+/// Each epoch start prunes entries from before the previous epoch (see
+/// `prepare_tachyon_tachygram_batch`).
+#[cfg(zcash_unstable = "nutachyon")]
+fn tachyon_scan_window(
+    network: &Network,
+    target_height: Height,
+) -> Option<std::ops::RangeInclusive<Height>> {
+    let pool_height = tachyon::pool_height(network, target_height)?;
+    let activation_height = Height(target_height.0 - pool_height);
+    let epoch_start = Height(target_height.0 - pool_height % tachyon::EPOCH_LENGTH);
+    let cutoff = Height(epoch_start.0.saturating_sub(tachyon::EPOCH_LENGTH));
+
+    Some(cutoff.max(activation_height)..=target_height)
+}
+
+/// Rolls the Tachyon indexes back to `target_height`.
+#[cfg(zcash_unstable = "nutachyon")]
+fn reset_tachyon_indexes(
+    db: &ZakuraDb,
+    batch: &mut DiskWriteBatch,
+    network: &Network,
+    target_height: Height,
+) -> Result<(), RollbackFinalizedStateError> {
+    let anchors_by_height = db.db.cf_handle("tachyon_anchor_by_height").unwrap();
+    let epoch_anchors = db.db.cf_handle("tachyon_epoch_anchor_by_epoch").unwrap();
+    let tachygrams = db.db.cf_handle("tachyon_tachygrams").unwrap();
+    let anchors = db.db.cf_handle("tachyon_anchors").unwrap();
+
+    batch.zs_delete_range(
+        &anchors_by_height,
+        &Height(target_height.0 + 1),
+        &Height::MAX,
+    );
+    let first_removed_epoch = tachyon::epoch(network, target_height).map_or(0, |epoch| epoch + 1);
+    batch.zs_delete_range(
+        &epoch_anchors,
+        &TachyonEpoch(first_removed_epoch),
+        &TachyonEpoch(u32::MAX),
+    );
+
+    // These indexes hold one height per key and only the scan window, and blocks above the
+    // target may have pruned or overwritten entries the target's window holds, so rebuild
+    // them rather than truncate.
+    for (tachygram, _) in db
+        .db
+        .zs_forward_range_iter::<_, tachyon::Tachygram, Height, _>(&tachygrams, ..)
+    {
+        batch.zs_delete(&tachygrams, tachygram);
+    }
+    for (anchor, _) in db
+        .db
+        .zs_forward_range_iter::<_, tachyon::Anchor, Height, _>(&anchors, ..)
+    {
+        batch.zs_delete(&anchors, anchor);
+    }
+
+    let Some(window) = tachyon_scan_window(network, target_height) else {
+        return Ok(());
+    };
+    for height in (window.start().0..=window.end().0).map(Height) {
+        let block = db
+            .block(height.into())
+            .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
+        for tachygram in block
+            .transactions
+            .iter()
+            .flat_map(|transaction| transaction.tachyon_tachygrams())
+        {
+            batch.zs_insert(&tachygrams, tachygram, height);
+        }
+    }
+    for (height, anchor) in db
+        .db
+        .zs_forward_range_iter::<_, Height, tachyon::Anchor, _>(&anchors_by_height, window)
+    {
+        batch.zs_insert(&anchors, anchor, height);
+    }
+
+    Ok(())
+}
+
 fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {}
@@ -1445,6 +1575,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Height(1), Height(2)],
             "rollback truncates the serving index above the target"
+        );
+    }
+
+    #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn tachyon_scan_window_follows_the_last_epoch_start() {
+        use zakura_chain::{
+            parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+            tachyon::EPOCH_LENGTH,
+        };
+
+        let activation = 2;
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(activation),
+                nu_tachyon: Some(activation),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let window = |target: u32| tachyon_scan_window(&network, Height(target));
+
+        assert_eq!(window(activation - 1), None);
+        assert_eq!(
+            window(activation),
+            Some(Height(activation)..=Height(activation))
+        );
+        assert_eq!(
+            window(activation + EPOCH_LENGTH - 1),
+            Some(Height(activation)..=Height(activation + EPOCH_LENGTH - 1))
+        );
+        assert_eq!(
+            window(activation + EPOCH_LENGTH),
+            Some(Height(activation)..=Height(activation + EPOCH_LENGTH))
+        );
+        assert_eq!(
+            window(activation + 2 * EPOCH_LENGTH + 5),
+            Some(Height(activation + EPOCH_LENGTH)..=Height(activation + 2 * EPOCH_LENGTH + 5))
         );
     }
 

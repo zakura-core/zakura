@@ -16,17 +16,14 @@
 //!
 //! Nothing shares a `quinn-proto` object, so no lock guards one.
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, StreamId, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    counter, mpsc, oneshot, watch, Notify,
+};
 
 use crate::{
     error::{ReadError, WriteError},
@@ -85,19 +82,26 @@ pub(crate) enum ConnCmd {
         /// The most bytes to take from quinn-proto, capped at
         /// [`READ_BATCH_BYTES`].
         max: usize,
+        /// Receive credit the stream's reader holds since its last command,
+        /// which the connection takes from its window before this read.
+        hold: u64,
         reply: oneshot::Sender<ReadReply>,
     },
     Stop {
         id: StreamId,
         code: VarInt,
+        /// As in [`ConnCmd::Read`].
+        hold: u64,
     },
     /// A send handle dropped without finishing or resetting: finish it.
     DropSend {
         id: StreamId,
     },
-    /// A receive handle dropped before the stream ended: stop it.
+    /// A receive handle dropped: stop the stream unless it ended.
     DropRecv {
         id: StreamId,
+        /// As in [`ConnCmd::Read`].
+        hold: u64,
     },
     Close {
         code: VarInt,
@@ -129,22 +133,50 @@ pub(crate) struct ConnShared {
     /// Datagram bytes the endpoint queued that the task hasn't handled yet.
     pub(crate) queued_datagram_bytes: AtomicUsize,
     /// Datagrams the endpoint dropped because the queue was full.
-    pub(crate) queue_drops: AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
     /// The queued datagram bytes of every connection on this socket.
     pub(crate) socket_queued_bytes: Arc<AtomicUsize>,
+    /// Receive credit that dropped holds returned and the task hasn't added
+    /// back to the window yet.
+    released_credit: AtomicU64,
+    /// Wakes the task when `released_credit` leaves zero.
+    credit_released: Notify,
 }
 
 impl ConnShared {
     fn new(remote: SocketAddr, socket_queued_bytes: Arc<AtomicUsize>) -> Arc<Self> {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        // A trace ID, so a metrics atomic. It's process-wide, so two runs in
+        // one process number their connections differently.
+        static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
-            queue_drops: AtomicU64::new(0),
+            queue_drops: counter::AtomicU64::new(0),
             socket_queued_bytes,
+            released_credit: AtomicU64::new(0),
+            credit_released: Notify::new(),
         })
+    }
+
+    /// Returns `bytes` of a dropped hold to the connection's window. Only the
+    /// release that finds nothing pending wakes the task, which adds back
+    /// every release since its last drive at once.
+    pub(crate) fn release_credit(&self, bytes: u64) {
+        if bytes > 0 && self.released_credit.fetch_add(bytes, Ordering::AcqRel) == 0 {
+            self.credit_released.notify_one();
+        }
+    }
+
+    /// Takes the credit released since the last call.
+    pub(crate) fn take_released_credit(&self) -> u64 {
+        self.released_credit.swap(0, Ordering::AcqRel)
+    }
+
+    /// Resolves after a release that found nothing pending.
+    pub(crate) async fn credit_released(&self) {
+        self.credit_released.notified().await;
     }
 
     /// Records the close reason unless one is already set.

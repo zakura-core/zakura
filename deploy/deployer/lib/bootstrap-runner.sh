@@ -122,7 +122,16 @@ apt-get -qq install -y --no-install-recommends \
     tar
 
 if ! command -v cargo >/dev/null 2>&1; then
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    # Pinned rustup bootstrap: the archived installer plus a recorded sha256,
+    # instead of `sh.rustup.rs | sh`, which runs whatever the redirect serves.
+    rustup_version=1.29.2
+    rustup_sha256=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4
+    curl -fsSLo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${rustup_version}/x86_64-unknown-linux-gnu/rustup-init"
+    echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c --quiet -
+    chmod +x /tmp/rustup-init
+    /tmp/rustup-init -y --profile minimal --default-toolchain stable
+    rm -f /tmp/rustup-init
 fi
 
 if [ -f "$HOME/.cargo/env" ]; then

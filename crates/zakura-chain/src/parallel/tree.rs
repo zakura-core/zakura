@@ -7,7 +7,6 @@ use thiserror::Error;
 #[cfg(zcash_unstable = "nutachyon")]
 use crate::tachyon;
 use crate::{
-    block::Block,
     ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
 };
@@ -76,9 +75,8 @@ impl NoteCommitmentTrees {
     #[allow(clippy::unwrap_in_result)]
     pub fn update_trees_parallel(
         &mut self,
-        block: &Arc<Block>,
+        block: &crate::block::BlockRef,
     ) -> Result<(), NoteCommitmentTreeError> {
-        let block = block.clone();
         let height = block
             .coinbase_height()
             .expect("height was already validated");
@@ -129,7 +127,7 @@ impl NoteCommitmentTrees {
             }
         });
 
-        self.update_sprout_tree(&block)?;
+        self.update_sprout_tree(block)?;
 
         if let Some(sapling_result) = sapling_result {
             let (sapling, subtree_root) = sapling_result?;
@@ -159,7 +157,10 @@ impl NoteCommitmentTrees {
     ///
     /// Returns immediately without cloning or recalculating the root when the block has
     /// no Sprout note commitments.
-    pub fn update_sprout_tree(&mut self, block: &Block) -> Result<(), NoteCommitmentTreeError> {
+    pub fn update_sprout_tree(
+        &mut self,
+        block: &crate::block::BlockRef,
+    ) -> Result<(), NoteCommitmentTreeError> {
         let sprout_note_commitments: Vec<_> = block.sprout_note_commitments().cloned().collect();
         if sprout_note_commitments.is_empty() {
             return Ok(());
@@ -293,7 +294,7 @@ mod tests {
     use halo2::pasta::pallas;
 
     use crate::{
-        block::{Header, Height},
+        block::{Block, Header, Height},
         parameters::{Network, NetworkUpgrade::Nu6_3},
         serialization::ZcashDeserializeInto,
         transaction::{arbitrary::v5_transactions, LockTime, Transaction},
@@ -375,7 +376,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     sapling_shielded_data: None,
-                    orchard_shielded_data: Some(orchard_shielded_data),
+                    orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
                     ironwood_shielded_data: Some(ironwood_shielded_data),
                 })
             };

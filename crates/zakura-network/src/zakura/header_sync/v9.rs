@@ -3,6 +3,8 @@
 //!
 //! This module holds the wire codec, the message table, the publisher, and the
 //! subscriber. The service runs one publisher and one subscriber per session.
+//! The codec and the message table are public, so simulator peers can build
+//! and read every version 9 message.
 
 mod publisher;
 mod subscriber;
@@ -21,7 +23,10 @@ use crate::zakura::{
     Frame,
 };
 pub(crate) use wire::*;
-pub use wire::{Headers, HeadersOutcome, HeadersOutcomeCode, Status};
+pub use wire::{
+    budget, layout, rows, CommonMessage, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode,
+    Message, Operation, RegtestMessage, Status, SubscribeHeaders, HEADER_SYNC_BUDGET,
+};
 
 /// Page reads that may run at once across the node. Each read holds a
 /// retained-path lease in state, which bounds its own capacity, so this keeps
@@ -33,18 +38,70 @@ const NODE_EXECUTION: usize = 8;
 /// time.
 const PEER_EXECUTION: usize = 2;
 
-/// The production serving capacity for published pages: [`NODE_EXECUTION`]
-/// and [`PEER_EXECUTION`] page reads, and output sized for the largest page.
-pub(crate) fn serving_capacity() -> ServeCapacity {
-    // The largest page is about 2 MiB, so it fits u64.
-    let largest = largest_page(COMMON_HEADER_BYTES) as u64;
-    let limits = ServeLimits {
+/// The toolkit's serving defaults for responses of the largest page across
+/// `peers` header-sync sessions.
+const fn default_limits(peers: usize) -> ServeLimits {
+    // The largest page is about 2 MiB, so widening it to u64 is lossless.
+    sizing::serve_limits(
+        largest_page(COMMON_HEADER_BYTES) as u64,
+        sizing::TARGET_RTT,
+        peers,
+    )
+}
+
+// A full window of one-header pages fits the per-peer response slots, so only
+// output bytes can make a publisher at full credit wait.
+const _: () = assert!(
+    // Widening u32 to usize is lossless on every supported target.
+    default_limits(1).peer_output_responses >= MAX_HS_PUSH_CREDIT_HEADERS as usize,
+    "a full window of pages fits the per-peer response slots"
+);
+
+/// Unsent pages one peer may hold in production: the toolkit's default,
+/// 64 MiB.
+///
+/// Output is keyed by peer ID, so a replacement session that overlaps its
+/// predecessor ([`PEER_EXECUTION`]) shares this budget. The default holds
+/// [`PEER_EXECUTION`] × [`Message::BUDGET`]'s output share on every network.
+pub(crate) const SERVE_PEER_OUTPUT_BYTES: u64 = default_limits(1).peer_output_bytes;
+
+// Widening usize to u64 is lossless on every supported target.
+const _: () = assert!(
+    SERVE_PEER_OUTPUT_BYTES >= PEER_EXECUTION as u64 * CommonMessage::BUDGET.output
+        && SERVE_PEER_OUTPUT_BYTES >= PEER_EXECUTION as u64 * RegtestMessage::BUDGET.output,
+    "every overlapping session of one peer holds a full output share"
+);
+
+/// Serving limits for published pages: [`NODE_EXECUTION`] and
+/// [`PEER_EXECUTION`] page reads, `peer_output_bytes` of unsent pages per
+/// peer, and the toolkit's defaults across `peers` sessions for the rest.
+/// `node_output_bytes` replaces the node output budget when set.
+///
+/// [`Message::BUDGET`]'s output share is the derived value of
+/// `peer_output_bytes`.
+pub(crate) fn serving_limits(
+    peer_output_bytes: u64,
+    peers: usize,
+    node_output_bytes: Option<u64>,
+) -> ServeLimits {
+    let derived = ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
-        ..sizing::serve_limits(largest, sizing::TARGET_RTT)
+        peer_output_bytes,
+        ..default_limits(peers)
     };
-    ServeCapacity::new("header-sync", &SUBSCRIBE_HEADERS, limits)
-        .expect("the header-sync serving limits are positive")
+    sizing::with_node_output_bytes(derived, node_output_bytes)
+}
+
+/// The production serving capacity for published pages, with
+/// [`SERVE_PEER_OUTPUT_BYTES`] per peer.
+pub(crate) fn serving_capacity(peers: usize, node_output_bytes: Option<u64>) -> ServeCapacity {
+    ServeCapacity::new(
+        "header-sync",
+        &SUBSCRIBE_HEADERS,
+        serving_limits(SERVE_PEER_OUTPUT_BYTES, peers, node_output_bytes),
+    )
+    .expect("the header-sync serving limits are positive")
 }
 
 impl Status {
@@ -117,3 +174,9 @@ fn replay<M: WireMessage<Error = WireError>>(frame: &Frame) -> bool {
     );
     true
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use publisher::{
+    trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView,
+};

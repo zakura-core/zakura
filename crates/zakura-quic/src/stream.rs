@@ -6,15 +6,20 @@
 //! one read in flight. A cancelled operation's reply stays in the handle, and
 //! the next call waits for it first, so cancelling a call never reorders or
 //! loses stream data.
+//!
+//! A reader can hold receive credit for bytes it keeps after reading them
+//! (API-10). The hold rides in the stream's next command, and the connection
+//! takes it out of its receive window before that command's read, so the
+//! peer gets the credit back only when the [`CreditHold`] drops.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem, sync::Arc};
 
 use bytes::{Buf as _, Bytes};
 use quinn_proto::{StreamId, VarInt};
-use tokio::sync::oneshot::{self, error::TryRecvError};
+use zakura_rt::sync::oneshot::{self, error::TryRecvError};
 
 use crate::{
-    driver::{ConnCmd, ConnRef, ReadReply},
+    driver::{ConnCmd, ConnRef, ConnShared, ReadReply},
     error::{ClosedStream, ReadError, ReadExactError, ReadToEndError, WriteError},
 };
 
@@ -61,6 +66,11 @@ impl SendStream {
             pending: VecDeque::new(),
             pending_bytes: 0,
         }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
     }
 
     /// Writes all of `buf`. Returns once at most [`WRITE_AHEAD_BYTES`] of this
@@ -188,6 +198,8 @@ pub struct RecvStream {
     finished: bool,
     stopped: bool,
     pending: Option<oneshot::Receiver<ReadReply>>,
+    /// Credit held since the last command, which the next one carries.
+    unsent_hold: u64,
 }
 
 impl RecvStream {
@@ -199,7 +211,29 @@ impl RecvStream {
             finished: false,
             stopped: false,
             pending: None,
+            unsent_hold: 0,
         }
+    }
+
+    /// Keeps `bytes` of the connection's receive window from the peer until
+    /// the returned hold drops (API-10).
+    ///
+    /// The connection takes the bytes out of its window before this stream's
+    /// next read, so the bytes that read takes return no credit while the
+    /// caller holds them. Bytes this handle already buffered returned their
+    /// credit when it read them, so the hold covers as many later bytes
+    /// instead. Dropping the hold, from any task, grants the credit back.
+    pub fn hold_credit(&mut self, bytes: u64) -> CreditHold {
+        self.unsent_hold = self.unsent_hold.saturating_add(bytes);
+        CreditHold {
+            shared: self.conn.shared.clone(),
+            bytes,
+        }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
     }
 
     /// Waits until data is buffered; returns `false` at the end of the stream.
@@ -225,6 +259,7 @@ impl RecvStream {
                     .send(ConnCmd::Read {
                         id: self.id,
                         max,
+                        hold: mem::take(&mut self.unsent_hold),
                         reply,
                     })
                     .map_err(ReadError::ConnectionLost)?;
@@ -335,15 +370,47 @@ impl RecvStream {
         self.stopped = true;
         self.buffered.clear();
         self.pending = None;
-        let _ = self.conn.send(ConnCmd::Stop { id: self.id, code });
+        let _ = self.conn.send(ConnCmd::Stop {
+            id: self.id,
+            code,
+            hold: mem::take(&mut self.unsent_hold),
+        });
         Ok(())
     }
 }
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if !self.stopped && !self.finished {
-            let _ = self.conn.send(ConnCmd::DropRecv { id: self.id });
+        // An unsent hold still goes out, so its release can't grow the window.
+        if (!self.stopped && !self.finished) || self.unsent_hold > 0 {
+            let _ = self.conn.send(ConnCmd::DropRecv {
+                id: self.id,
+                hold: self.unsent_hold,
+            });
         }
+    }
+}
+
+/// Receive credit a reader keeps from its peer (API-10).
+///
+/// [`RecvStream::hold_credit`] creates it. Dropping it grants the credit back
+/// to the peer. It doesn't keep the connection open.
+#[derive(Debug)]
+#[must_use = "dropping a credit hold grants its bytes back to the peer"]
+pub struct CreditHold {
+    shared: Arc<ConnShared>,
+    bytes: u64,
+}
+
+impl CreditHold {
+    /// The bytes this hold keeps.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for CreditHold {
+    fn drop(&mut self) {
+        self.shared.release_credit(self.bytes);
     }
 }

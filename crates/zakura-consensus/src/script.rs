@@ -1,8 +1,8 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 
 use tracing::Instrument;
 
-use zakura_chain::transparent;
+use zakura_chain::{transaction::Transaction, transparent};
 use zakura_script::CachedFfiTransaction;
 
 use crate::{primitives::spawn_fifo_and_convert, BoxError};
@@ -26,16 +26,18 @@ pub struct Verifier;
 
 /// A script verification request.
 #[derive(Debug)]
-pub struct Request {
+pub struct Request<T = Arc<Transaction>> {
     /// A cached transaction, in the format required by the script verifier FFI interface.
-    pub cached_ffi_transaction: Arc<CachedFfiTransaction>,
+    pub cached_ffi_transaction: Arc<CachedFfiTransaction<T>>,
     /// The index of an input in `cached_ffi_transaction`, used for verifying this request
     ///
     /// Coinbase inputs are rejected by the script verifier, because they do not spend a UTXO.
     pub input_index: usize,
 }
 
-impl tower::Service<Request> for Verifier {
+impl<T: Deref<Target = Transaction> + Send + Sync + 'static> tower::Service<Request<T>>
+    for Verifier
+{
     type Response = ();
     type Error = BoxError;
     type Future =
@@ -48,7 +50,7 @@ impl tower::Service<Request> for Verifier {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&mut self, req: Request<T>) -> Self::Future {
         use futures_util::FutureExt;
 
         let Request {

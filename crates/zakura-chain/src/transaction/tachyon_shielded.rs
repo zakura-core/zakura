@@ -20,7 +20,8 @@ impl TachyonShieldedData {
         }
     }
 
-    /// Returns the bundle's value balance.
+    /// Returns the signed balance, which reserves the maximum fee.
+    /// Add the selected stamp fee to obtain the net value released by the pool.
     pub fn value_balance(&self) -> zcash_tachyon::value::Balance {
         match &self.0 {
             TachyonBundle::NoBundle => zcash_tachyon::value::Balance::ZERO,

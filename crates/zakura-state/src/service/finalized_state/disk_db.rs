@@ -1617,6 +1617,12 @@ impl DiskDb {
         None
     }
 
+    /// The fewest RocksDB background flush and compaction jobs to run.
+    const MIN_BACKGROUND_JOBS: usize = 2;
+
+    /// The most RocksDB background flush and compaction jobs to run.
+    const MAX_BACKGROUND_JOBS: usize = 16;
+
     /// Returns the database options for the finalized state database.
     fn options() -> rocksdb::Options {
         let mut opts = rocksdb::Options::default();
@@ -1642,6 +1648,19 @@ impl DiskDb {
         //
         // This improves Zebra's initial sync speed slightly, as of April 2022.
         opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
+
+        // Let flushes and compactions use the machine's cores. RocksDB defaults to
+        // two background jobs, which lets compaction debt build up during sync
+        // until writes stall.
+        let background_jobs = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(Self::MIN_BACKGROUND_JOBS)
+            .clamp(Self::MIN_BACKGROUND_JOBS, Self::MAX_BACKGROUND_JOBS);
+        let background_jobs = i32::try_from(background_jobs)
+            .expect("background job count is clamped to MAX_BACKGROUND_JOBS, which fits in i32");
+        opts.increase_parallelism(background_jobs);
+        opts.set_max_background_jobs(background_jobs);
+        opts.set_max_subcompactions(4);
 
         // Bound WAL growth so heavy sync cannot accumulate tens of GiB of logs
         // that must be replayed before Zebra can restart.

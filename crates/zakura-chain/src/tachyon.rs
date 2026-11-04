@@ -5,7 +5,7 @@ use std::{fmt, io};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    block::Block,
+    block::BlockRef,
     parameters::{Network, NetworkUpgrade},
     serialization::{
         ReadZcashExt, SerializationError, ZcashDeserialize, ZcashReader, ZcashSerialize,
@@ -156,7 +156,7 @@ impl Anchor {
     pub fn advance_with_block(
         &self,
         pool_height: u32,
-        block: &Block,
+        block: &BlockRef,
     ) -> Result<AnchorAdvance, zcash_tachyon::AnchorError> {
         use zcash_tachyon::TachyonBundle;
 
@@ -175,7 +175,7 @@ impl Anchor {
             None
         };
 
-        for transaction in &block.transactions {
+        for transaction in block.transactions() {
             let Some(shielded_data) = transaction.tachyon_shielded_data() else {
                 continue;
             };

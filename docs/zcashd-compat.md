@@ -91,10 +91,10 @@ See `install-zakura.sh --help` for the full list, including `--dry-run`.
 
 Use the sidecar `zcashd` build from
 [valargroup/zcashd](https://github.com/valargroup/zcashd). Zakura's embedded
-download pins the [v1.3.0 release](https://github.com/valargroup/zcashd/releases/tag/v1.3.0)'s
+download pins the [v1.3.1 release](https://github.com/valargroup/zcashd/releases/tag/v1.3.1)'s
 standalone `zcashd` executable by SHA256. The
 split-container mode uses the
-[zakuracore/zcashd v1.3.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd v1.3.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 This release schedules Mainnet NU7 at height 3,543,405, matching
 Zakura. The v1.2.0 sidecar supports NU7 on Testnet but leaves Mainnet NU7
 unscheduled; sidecars before v1.2.0 do not support NU7 on either network.

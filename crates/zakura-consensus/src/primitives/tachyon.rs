@@ -13,14 +13,24 @@ pub async fn verify_proof_stamp(aggregate: AggregateCoverage) -> Result<(), Bloc
             .flat_map(|adjunct| adjunct.descriptors())
             .collect();
 
-        let covered_descriptors = aggregate
+        let adjunct_fees: Vec<_> = aggregate
+            .adjuncts
+            .iter()
+            .map(|bundle| bundle.fee_descriptor())
+            .collect();
+        let (covered_descriptors, covered_fees) = aggregate
             .bundle
-            .verify_coverage(&adjunct_descriptors)
+            .verify_coverage(&adjunct_descriptors, &adjunct_fees)
             .map_err(|error| BlockError::TachyonProofInvalid(error.to_string()))?;
 
         let covered_digests = covered_descriptors
             .iter()
             .map(zcash_tachyon::action::Descriptor::digest)
+            .chain(
+                covered_fees
+                    .iter()
+                    .map(zcash_tachyon::fee::Descriptor::digest),
+            )
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| BlockError::TachyonProofInvalid(error.to_string()))?;
 

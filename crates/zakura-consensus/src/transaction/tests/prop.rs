@@ -544,8 +544,9 @@ fn validate(
             .clone()
             .oneshot(transaction::Request::Block {
                 transaction_hash,
-                transaction: Arc::new(transaction),
+                transaction: Arc::new(transaction).into(),
                 known_utxos: Arc::new(known_utxos),
+                parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
                 height,
                 time: block_time,

@@ -3,10 +3,10 @@
 use arbitrary::v5_transactions;
 use chrono::DateTime;
 use eyre::{Result, WrapErr};
-use lazy_static::lazy_static;
 use rand_10::{rng as thread_rng, seq::IteratorRandom};
 use std::io::ErrorKind;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::LazyLock;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
@@ -25,17 +25,15 @@ use zakura_test::{
 
 use super::super::*;
 use super::ironwood_v6_tx_hash;
-lazy_static! {
-    pub static ref EMPTY_V5_TX: Transaction = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: block::Height(0),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-    };
-}
+pub static EMPTY_V5_TX: LazyLock<Transaction> = LazyLock::new(|| Transaction::V5 {
+    network_upgrade: NetworkUpgrade::Nu5,
+    lock_time: LockTime::min_lock_time_timestamp(),
+    expiry_height: block::Height(0),
+    inputs: Vec::new(),
+    outputs: Vec::new(),
+    sapling_shielded_data: None,
+    orchard_shielded_data: None,
+});
 
 #[test]
 fn attributed_memory_size_counts_orchard_proof_capacity() {
@@ -75,6 +73,87 @@ fn attributed_memory_size_counts_orchard_proof_capacity() {
             .attributed_memory_size_bytes()
             .saturating_sub(compact.attributed_memory_size_bytes()),
         u64::try_from(proof_capacity(&reserved) - proof_capacity(&compact)).unwrap()
+    );
+}
+
+#[test]
+fn transaction_inline_size_excludes_sprout_sapling_and_orchard_bundles() {
+    // Allow the inline Ironwood bundle, but keep the other pools from
+    // enlarging every transparent or Ironwood-only transaction.
+    assert!(
+        std::mem::size_of::<Transaction>() <= 256,
+        "size_of::<Transaction>() is {} bytes",
+        std::mem::size_of::<Transaction>()
+    );
+}
+
+#[test]
+fn attributed_memory_size_counts_boxed_sprout_sapling_and_orchard_bundles() {
+    fn bundle_bytes<T: AttributedMemorySize>(bundle: &T) -> u64 {
+        u64::try_from(std::mem::size_of::<T>()).unwrap() + bundle.attributed_memory_size_bytes()
+    }
+
+    let mut seen = [false; 5];
+    for (_, transaction) in
+        Network::iter().flat_map(|network| arbitrary::test_transactions(&network))
+    {
+        let mut without_bundles = transaction.as_ref().clone();
+        // Cloning can shrink vector capacities, so compare the same clone
+        // before and after removing its bundles.
+        let original_bytes = without_bundles.attributed_memory_size_bytes();
+        let removed_bytes = match &mut without_bundles {
+            Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
+                seen[0] |= joinsplit_data.is_some();
+                joinsplit_data.take().as_deref().map_or(0, bundle_bytes)
+            }
+            Transaction::V4 {
+                joinsplit_data,
+                sapling_shielded_data,
+                ..
+            } => {
+                seen[1] |= joinsplit_data.is_some();
+                seen[2] |= sapling_shielded_data.is_some();
+                joinsplit_data.take().as_deref().map_or(0, bundle_bytes)
+                    + sapling_shielded_data
+                        .take()
+                        .as_deref()
+                        .map_or(0, bundle_bytes)
+            }
+            Transaction::V5 {
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            }
+            | Transaction::V6 {
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            } => {
+                seen[3] |= sapling_shielded_data.is_some();
+                seen[4] |= orchard_shielded_data.is_some();
+                sapling_shielded_data
+                    .take()
+                    .as_deref()
+                    .map_or(0, bundle_bytes)
+                    + orchard_shielded_data
+                        .take()
+                        .as_deref()
+                        .map_or(0, bundle_bytes)
+            }
+            _ => continue,
+        };
+
+        assert_eq!(
+            original_bytes - without_bundles.attributed_memory_size_bytes(),
+            removed_bytes,
+        );
+        if seen.into_iter().all(|present| present) {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, [true; 5],
+        "vectors cover both Sprout proofs, both Sapling anchors, and Orchard"
     );
 }
 
@@ -303,7 +382,7 @@ fn v6_orchard_cross_address_flag_fails_serialization_and_deserialization() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
         ironwood_shielded_data: None,
     };
 
@@ -1963,7 +2042,7 @@ fn v6_sighasher_preserves_distinct_orchard_and_ironwood_bundle_slots() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_data),
+        orchard_shielded_data: Some(Box::new(orchard_data)),
         ironwood_shielded_data: Some(ironwood_data),
     };
 
@@ -2184,7 +2263,7 @@ fn v5_orchard_proof_size_is_always_enforced_during_deserialization() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
     };
 
     let network_upgrades = [
@@ -2248,7 +2327,7 @@ fn v6_noncanonical_orchard_proof_is_rejected_during_deserialization() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
         ironwood_shielded_data: None,
     };
 
@@ -2419,7 +2498,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         inputs: vec![],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
     };
 
     let v5_tx_bytes = v5_tx
@@ -2457,21 +2536,22 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
 }
 
 /// Lazy Sapling `cv` / `ephemeral_key` deserialization stays consensus-safe:
-/// deferring the not-small-order check is caught later by librustzcash.
+/// the not-small-order check is deferred to semantic verification, and neither
+/// Zakura's parser nor librustzcash's rejects a small-order point at read.
 ///
-/// Every untrusted transaction is converted via `to_librustzcash` before it is
-/// accepted, and librustzcash enforces the same rules the deferred check would:
+/// - Zakura's semantic verifier and mempool reject both in
+///   `Transaction::sapling_point_encodings_are_valid`, before any proof work.
+/// - librustzcash keeps `cv` as bytes when it parses, so `to_librustzcash`
+///   accepts a small-order `cv`. Its Sapling verifier rejects it when it
+///   recovers the point with `ValueCommitment::try_point`.
+/// - librustzcash rejects a small-order `epk` at verify: `check_output` checks
+///   `epk.is_small_order()`.
 ///
-/// - `cv` is rejected at *read* — `read_value_commitment` uses
-///   `ValueCommitment::from_bytes_not_small_order`, so a small-order `cv` fails
-///   the conversion.
-/// - `epk` is rejected at *verify* — `check_output` checks `epk.is_small_order()`.
-///
-/// So this test asserts both the deferral (deserialization now accepts a
-/// small-order `cv`/`epk`) and the safety net (`to_librustzcash` rejects the
-/// small-order `cv`; the small-order `epk` is flagged by the verifier's check).
+/// The library verifier's rejection of a converted bundle with an invalid `cv`
+/// is pinned end to end by zakura-consensus's
+/// `library_verifier_rejects_invalid_value_commitments_that_now_convert`.
 #[test]
-fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
+fn sapling_small_order_cv_epk_deferred_to_semantic_checks() {
     use group::Group;
 
     use crate::{
@@ -2499,14 +2579,14 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
     // not-small-order check must reject it.
     let small_order_bytes = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
 
-    // The exact library functions the semantic/mempool path uses must detect it.
+    // The exact library functions the verifiers use must detect it.
     assert!(
         bool::from(
-            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&small_order_bytes)
+            sapling_crypto::value::ValueCommitment::from_bytes_unvalidated(small_order_bytes)
+                .try_point()
                 .is_none()
         ),
-        "from_bytes_not_small_order (used by librustzcash read_value_commitment) must reject \
-         the small-order cv",
+        "try_point (used by the librustzcash Sapling verifier) must reject the small-order cv",
     );
     assert!(
         bool::from(
@@ -2530,8 +2610,8 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
 
     // Build a minimal V5 transaction with one Sapling output using the given cv
     // and ephemeral_key bytes, round-trip it through the lazy deserializer, and
-    // return whether `to_librustzcash` accepts it.
-    let build_and_convert = |cv_bytes: [u8; 32], epk_bytes: [u8; 32]| -> bool {
+    // return it with the result of `to_librustzcash`.
+    let build_and_convert = |cv_bytes: [u8; 32], epk_bytes: [u8; 32]| {
         let output = Output {
             cv: ValueCommitment(cv_bytes),
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
@@ -2555,7 +2635,7 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(shielded_data),
+            sapling_shielded_data: Some(Box::new(shielded_data)),
             orchard_shielded_data: None,
         };
 
@@ -2568,14 +2648,28 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
             .zcash_deserialize_into()
             .expect("lazy deserialization accepts a small-order cv/epk; validation is deferred");
 
-        tx.to_librustzcash(NetworkUpgrade::Nu5).is_ok()
+        let converted = tx.to_librustzcash(NetworkUpgrade::Nu5);
+        (tx, converted)
     };
 
-    // cv is enforced at *read*: `read_value_commitment` uses
-    // `from_bytes_not_small_order`, so `to_librustzcash` rejects a small-order cv.
+    // cv is enforced at *verify*, not read: Zakura's semantic check rejects it,
+    // `to_librustzcash` keeps the bytes, and the library verifier's `try_point`
+    // rejects the converted commitment.
+    let (tx, converted) = build_and_convert(small_order_bytes, valid_cv_bytes);
     assert!(
-        !build_and_convert(small_order_bytes, valid_cv_bytes),
-        "to_librustzcash must reject a small-order Sapling cv at read",
+        !tx.sapling_point_encodings_are_valid(),
+        "the semantic point check must reject a small-order Sapling cv",
+    );
+    let converted = converted
+        .expect("to_librustzcash keeps a small-order cv as bytes; it is checked at verify");
+    let output = &converted
+        .sapling_bundle()
+        .expect("the converted transaction keeps its Sapling bundle")
+        .shielded_outputs()[0];
+    assert_eq!(output.cv().to_bytes(), small_order_bytes);
+    assert!(
+        bool::from(output.cv().try_point().is_none()),
+        "the library verifier must reject the converted small-order cv",
     );
 
     // epk is enforced at *verify*, not read: a small-order epk (with a valid cv)
@@ -2586,16 +2680,22 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
     // the SigHash and binding signature, and the output proof can't be forged, so
     // the rejection would be confounded. The `is_small_order` assertion above
     // covers the exact librustzcash code path that rejects it.
+    let (tx, converted) = build_and_convert(valid_cv_bytes, small_order_bytes);
     assert!(
-        build_and_convert(valid_cv_bytes, small_order_bytes),
+        !tx.sapling_point_encodings_are_valid(),
+        "the semantic point check must reject a small-order epk",
+    );
+    assert!(
+        converted.is_ok(),
         "to_librustzcash must accept a small-order epk (it is enforced at verify, not read)",
     );
 }
 
 /// Edge cases for lazy Sapling `cv` / `ephemeral_key` deserialization. Beyond the
 /// small-order case, this checks that:
-/// - an off-curve `cv` is also rejected by `to_librustzcash`, so the safety net
-///   covers every invalid encoding, not just small-order points;
+/// - an off-curve `cv` also fails the semantic point check and, after
+///   `to_librustzcash` keeps its bytes, the library verifier's `try_point`, so
+///   both layers cover every invalid encoding, not just small-order points;
 /// - the lazy types round-trip byte-for-byte through serialize/deserialize — the
 ///   txid and merkle root hash these bytes, so any change would break consensus;
 /// - `cv.commitment()` decompresses a valid encoding back to the same point;
@@ -2650,29 +2750,43 @@ fn sapling_lazy_cv_epk_edge_cases() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+            sapling_shielded_data: Some(Box::new(ShieldedData::<sapling::SharedAnchor> {
                 value_balance: Amount::try_from(0).expect("zero is a valid amount"),
                 transfers: TransferData::JustOutputs {
                     outputs: at_least_one![output],
                 },
                 binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            })),
             orchard_shielded_data: None,
         }
     };
 
-    // An off-curve cv is rejected by to_librustzcash, covering invalid encodings
-    // beyond small-order points.
+    // An off-curve cv fails the semantic point check, and the library verifier
+    // rejects it after conversion, covering invalid encodings beyond small-order
+    // points.
     let tx_off_curve_cv: Transaction = make_v5(off_curve, valid_cv)
         .zcash_serialize_to_vec()
         .expect("serializes")
         .zcash_deserialize_into()
         .expect("lazy deserialization accepts an off-curve cv");
     assert!(
-        tx_off_curve_cv
-            .to_librustzcash(NetworkUpgrade::Nu5)
-            .is_err(),
-        "to_librustzcash must reject an off-curve cv",
+        !tx_off_curve_cv.sapling_point_encodings_are_valid(),
+        "the semantic point check must reject an off-curve cv",
+    );
+    let converted = tx_off_curve_cv
+        .to_librustzcash(NetworkUpgrade::Nu5)
+        .expect("to_librustzcash keeps an off-curve cv as bytes; it is checked at verify");
+    assert!(
+        bool::from(
+            converted
+                .sapling_bundle()
+                .expect("the converted transaction keeps its Sapling bundle")
+                .shielded_outputs()[0]
+                .cv()
+                .try_point()
+                .is_none()
+        ),
+        "the library verifier must reject the converted off-curve cv",
     );
 
     // Byte-identity: even non-canonical cv/epk bytes survive a
@@ -2727,8 +2841,9 @@ fn sapling_lazy_cv_epk_edge_cases() {
 ///
 /// Checkpoint hashing and pre-verification mempool IDs are computed before
 /// semantic point validation. An off-curve Sapling commitment must therefore
-/// still produce a deterministic V5/V6 `UnminedTx` ID, while the later
-/// librustzcash conversion remains fail-closed.
+/// still produce a deterministic V5/V6 `UnminedTx` ID, while the semantic point
+/// check remains fail-closed. librustzcash keeps the bytes too, so its
+/// conversion succeeds and its txid matches the native one.
 #[test]
 fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() {
     use group::Group;
@@ -2790,7 +2905,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 expiry_height: Height(0),
                 inputs: vec![],
                 outputs: vec![],
-                sapling_shielded_data: Some(shielded_data(cv)),
+                sapling_shielded_data: Some(Box::new(shielded_data(cv))),
                 orchard_shielded_data: None,
             },
             Transaction::V6 {
@@ -2799,7 +2914,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 expiry_height: Height(0),
                 inputs: vec![],
                 outputs: vec![],
-                sapling_shielded_data: Some(shielded_data(cv)),
+                sapling_shielded_data: Some(Box::new(shielded_data(cv))),
                 orchard_shielded_data: None,
                 ironwood_shielded_data: None,
             },
@@ -2828,15 +2943,19 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
             !parsed.sapling_point_encodings_are_valid(),
             "off-curve Sapling cv must fail deferred semantic validation",
         );
-        assert!(
-            parsed.to_librustzcash(network_upgrade).is_err(),
-            "off-curve Sapling cv must fail librustzcash conversion",
-        );
+        let converted = parsed
+            .to_librustzcash(network_upgrade)
+            .expect("librustzcash keeps an off-curve Sapling cv as bytes; it is checked at verify");
 
         let unmined = UnminedTx::from(parsed.clone());
         let (txid, auth_digest) = parsed.txid_and_auth_digest();
         assert_eq!(unmined.id().mined_id(), txid);
         assert_eq!(unmined.id().auth_digest(), auth_digest);
+        assert_eq!(
+            txid,
+            crate::transaction::Hash(*converted.txid().as_ref()),
+            "librustzcash must hash the same raw Sapling cv bytes as the native txid",
+        );
         assert_ne!(
             txid,
             changed_parsed.hash(),
@@ -2990,7 +3109,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            sapling_shielded_data: Some(Box::new(make_shielded_data(cv, epk))),
             orchard_shielded_data: None,
         }
     };
@@ -3035,7 +3154,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            sapling_shielded_data: Some(Box::new(make_shielded_data(cv, epk))),
             orchard_shielded_data: None,
             ironwood_shielded_data: None,
         }
@@ -3092,7 +3211,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
             inputs: vec![],
             outputs: vec![],
             joinsplit_data: None,
-            sapling_shielded_data: Some(ShieldedData::<sapling::PerSpendAnchor> {
+            sapling_shielded_data: Some(Box::new(ShieldedData::<sapling::PerSpendAnchor> {
                 value_balance: Amount::try_from(0).expect("zero is a valid amount"),
                 transfers: TransferData::SpendsAndMaybeOutputs {
                     shared_anchor: sapling::FieldNotPresent,
@@ -3100,7 +3219,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
                     maybe_outputs: vec![],
                 },
                 binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            })),
         }
     };
 
@@ -3123,8 +3242,9 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
 /// chain split. This pins each Zebra predicate against the library predicate over
 /// a corpus covering both verdicts:
 ///
-/// - `cv`: `read_value_commitment` accepts a `cv` iff `from_bytes_not_small_order`
-///   returns a point.
+/// - `cv`: the Sapling verifier accepts a `cv` iff `ValueCommitment::try_point`
+///   returns a point. (librustzcash's parser keeps `cv` as bytes, so this is
+///   now enforced at verify rather than at read.)
 /// - `epk`: sapling-crypto decodes `epk` as an `ExtendedPoint` and `check_output`
 ///   rejects it when `epk.is_small_order()`. Zebra decodes as an `AffinePoint`, so
 ///   this also guards that the two decoders agree.
@@ -3136,10 +3256,12 @@ fn sapling_point_checks_match_librustzcash_predicates() {
 
     let _init_guard = zakura_test::init();
 
-    // The exact predicate librustzcash applies to a `cv` at read.
+    // The exact predicate the librustzcash Sapling verifier applies to a `cv`.
     let librustzcash_cv_valid = |bytes: [u8; 32]| -> bool {
         bool::from(
-            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&bytes).is_some(),
+            sapling_crypto::value::ValueCommitment::from_bytes_unvalidated(bytes)
+                .try_point()
+                .is_some(),
         )
     };
 
@@ -3190,8 +3312,8 @@ fn sapling_point_checks_match_librustzcash_predicates() {
         assert_eq!(
             ValueCommitment(bytes).is_valid_not_small_order(),
             librustzcash_cv_valid(bytes),
-            "ValueCommitment::is_valid_not_small_order must match librustzcash \
-             read_value_commitment for {bytes:02x?}",
+            "ValueCommitment::is_valid_not_small_order must match the librustzcash \
+             Sapling verifier's try_point for {bytes:02x?}",
         );
         assert_eq!(
             EphemeralPublicKey(bytes).is_valid_not_small_order(),

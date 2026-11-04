@@ -167,6 +167,11 @@ pub enum TransactionError {
     #[error("could not convert an asynchronous verification error: {0}")]
     InternalDowncastError(String),
 
+    /// The state service could not answer an input lookup. This says nothing about the
+    /// transaction, so callers retry it instead of rejecting it.
+    #[error("the state service could not answer an input lookup: {0}")]
+    StateUnavailable(String),
+
     #[error("either vpub_old or vpub_new must be zero")]
     BothVPubsNonZero,
 
@@ -470,7 +475,7 @@ impl TransactionError {
             Self::Ed25519(_) => consensus("transaction.ed25519"),
             Self::RedJubjub(_) => consensus("transaction.redjubjub"),
             Self::RedPallas(_) => consensus("transaction.redpallas"),
-            Self::InternalDowncastError(_) => {
+            Self::InternalDowncastError(_) | Self::StateUnavailable(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::BothVPubsNonZero => consensus("transaction.both_vpubs_nonzero"),
@@ -793,6 +798,11 @@ pub enum BlockError {
     #[error("action descriptors covered by a Tachyon proof stamp must be distinct")]
     #[cfg(zcash_unstable = "nutachyon")]
     TachyonDuplicateAction,
+
+    /// A fee descriptor is covered more than once in a Tachyon aggregate.
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[error("duplicate Tachyon fee descriptor")]
+    TachyonDuplicateFee,
 
     #[error("a Tachyon proof stamp must publish exactly two Tachygrams per covered action")]
     #[cfg(zcash_unstable = "nutachyon")]

@@ -1,0 +1,11 @@
+# The committed fuzz input `discovery-wait-complete.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256.
+harness = "discovery/wait-complete"
+generator = 1
+sha256 = "1993c08e29c3d65d67d52856bbd0b5531918a2b66edf71a00eb73a6e5e58cba2"
+scenario_sha256 = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+source = "crates/zakura-sim/tests/witness.rs"
+
+[[witness]]
+property = "discovery/wait-complete-wakes"
+expect = "holds"

@@ -1,8 +1,12 @@
 use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
+use zakura_node_services::block_memory::{
+    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, OwnedBlock,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReorderBuffer {
     blocks: BTreeMap<block::Height, BufferedBlock>,
+    released: Vec<BodyId>,
     buffered_bytes: u64,
     decoded_attributed_memory_bytes: u64,
 }
@@ -11,13 +15,28 @@ impl ReorderBuffer {
     pub(super) fn new() -> Self {
         Self {
             blocks: BTreeMap::new(),
+            released: Vec::new(),
             buffered_bytes: 0,
             decoded_attributed_memory_bytes: 0,
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn retained_ids(&self) -> impl Iterator<Item = BodyId> + '_ {
+        self.blocks.values().map(|entry| entry.body.id)
+    }
+
+    pub(super) fn take_released(&mut self) -> Vec<BodyId> {
+        std::mem::take(&mut self.released)
+    }
+
     pub(super) fn buffered_bytes(&self) -> u64 {
         self.buffered_bytes
+    }
+
+    /// Update the buffered-byte total.
+    fn set_buffered_bytes(&mut self, bytes: u64) {
+        self.buffered_bytes = bytes;
     }
 
     pub(super) fn decoded_attributed_memory_bytes(&self) -> u64 {
@@ -34,6 +53,28 @@ impl ReorderBuffer {
 
     pub(super) fn len(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Each buffered body, read from the map.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn ownership(
+        &self,
+        payloads: &BTreeMap<BodyId, BufferedBlockBody>,
+    ) -> Vec<RetainedBody> {
+        self.blocks
+            .iter()
+            .map(|(height, buffered)| RetainedBody {
+                payload_id: buffered.body.id.0,
+                policy_decoded_bytes: buffered.body.decoded_bytes,
+                height: *height,
+                owner: buffered.owner,
+                bytes: buffered.bytes,
+                admitted_estimate_bytes: buffered.admitted_estimate_bytes,
+                allocation: payloads[&buffered.body.id].allocation(),
+                decoded_attributed_memory_bytes: payloads[&buffered.body.id]
+                    .measured_decoded_attributed_memory_bytes(),
+            })
+            .collect()
     }
 
     pub(super) fn contains(&self, height: block::Height) -> bool {
@@ -67,8 +108,13 @@ impl ReorderBuffer {
             height,
             block.hash(),
             previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, None),
+            BodyFacts {
+                id: BodyId(u64::from(height.0) + 1),
+                decoded_bytes: block.attributed_memory_size_bytes(),
+                raw_wire_bytes: None,
+            },
             bytes,
+            None,
             source_peer,
         )
     }
@@ -83,8 +129,9 @@ impl ReorderBuffer {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        body: BufferedBlockBody,
+        body: BodyFacts,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         source_peer: ZakuraPeerId,
     ) -> ReorderInsertResult {
         if self.blocks.contains_key(&height) {
@@ -101,10 +148,11 @@ impl ReorderBuffer {
                 previous_block_hash,
                 body,
                 bytes,
+                admitted_estimate_bytes,
                 source_peer,
             },
         );
-        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.set_buffered_bytes(self.buffered_bytes.saturating_add(bytes));
         self.decoded_attributed_memory_bytes = self
             .decoded_attributed_memory_bytes
             .saturating_add(decoded_attributed_memory_size_bytes);
@@ -122,7 +170,7 @@ impl ReorderBuffer {
         };
 
         while let Some(buffered) = self.blocks.remove(&next) {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+            self.set_buffered_bytes(self.buffered_bytes.saturating_sub(buffered.bytes));
             self.decoded_attributed_memory_bytes = self
                 .decoded_attributed_memory_bytes
                 .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
@@ -134,6 +182,7 @@ impl ReorderBuffer {
                 previous_block_hash: buffered.previous_block_hash,
                 body: buffered.body,
                 bytes: buffered.bytes,
+                admitted_estimate_bytes: buffered.admitted_estimate_bytes,
                 source_peer: buffered.source_peer,
             });
             let Some(after) = next_height(next) else {
@@ -161,7 +210,8 @@ impl ReorderBuffer {
         let mut released = 0u64;
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.released.push(buffered.body.id);
+                self.set_buffered_bytes(self.buffered_bytes.saturating_sub(buffered.bytes));
                 self.decoded_attributed_memory_bytes = self
                     .decoded_attributed_memory_bytes
                     .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
@@ -181,7 +231,8 @@ impl ReorderBuffer {
         let mut released = 0u64;
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.released.push(buffered.body.id);
+                self.set_buffered_bytes(self.buffered_bytes.saturating_sub(buffered.bytes));
                 self.decoded_attributed_memory_bytes = self
                     .decoded_attributed_memory_bytes
                     .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
@@ -208,9 +259,36 @@ pub(super) struct DrainedBlock {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) previous_block_hash: block::Hash,
-    pub(super) body: BufferedBlockBody,
+    pub(super) body: BodyFacts,
     pub(super) bytes: u64,
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) source_peer: ZakuraPeerId,
+}
+
+/// One retained body, as the owner snapshots read it.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RetainedBody {
+    /// Runtime identity of this body.
+    pub payload_id: u64,
+    /// Decoded size recorded by policy at its last materialization or demotion.
+    pub policy_decoded_bytes: u64,
+    /// The body's height.
+    pub height: block::Height,
+    /// The request the body answered.
+    pub owner: zakura_header_chain::BodyWorkOwner,
+    /// Wire bytes.
+    pub bytes: u64,
+    /// The size estimate the body's request reserved at admission. `None` for
+    /// a body admitted on its wire size with no request estimate.
+    pub admitted_estimate_bytes: Option<u64>,
+    /// The address of the allocation that identifies the body: its raw frame
+    /// payload when one is kept, else its decoded block. Two holders that
+    /// share one allocation report the same address.
+    pub allocation: usize,
+    /// The attributed size of the decoded block the body holds, measured
+    /// from the block. 0 for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -219,46 +297,80 @@ struct BufferedBlock {
     source: zakura_header_chain::SourceId,
     hash: block::Hash,
     previous_block_hash: block::Hash,
-    body: BufferedBlockBody,
+    body: BodyFacts,
     bytes: u64,
+    /// The size estimate the body's request reserved at admission. `None` for a
+    /// body admitted on its wire size with no request estimate. Wire bytes minus
+    /// this is the hint's error, which the look-ahead bound accounts for.
+    admitted_estimate_bytes: Option<u64>,
     /// The peer that delivered this body, so an apply rejection can be attributed
     /// back to it for misbehavior scoring.
     source_peer: ZakuraPeerId,
 }
 
+/// Identity of one payload retained by sequencer IO.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) struct BodyId(pub(super) u64);
+
+/// Value-only body facts used by sequencing decisions.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BodyFacts {
+    pub(super) id: BodyId,
+    pub(super) decoded_bytes: u64,
+    pub(super) raw_wire_bytes: Option<usize>,
+}
+
+impl BodyFacts {
+    pub(super) fn decoded_attributed_memory_size_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+
+    pub(super) fn is_decoded(&self) -> bool {
+        self.decoded_bytes > 0
+    }
+
+    /// Decide whether IO must discard a decoded copy while keeping raw bytes.
+    pub(super) fn retain_for_backlog_in_place(&mut self) -> bool {
+        if self.raw_wire_bytes.is_some() && self.decoded_bytes > 0 {
+            self.decoded_bytes = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A payload effect that IO applies after a completed policy transition.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PayloadChange {
+    KeepRaw(BodyId),
+    Release(BodyId),
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
+    // Only tests hand the sequencer a decoded body without its raw bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
     Decoded {
-        block: Arc<block::Block>,
+        block: BlockHandle,
         decoded_attributed_memory_size_bytes: u64,
     },
     DecodedWithRawFramePayload {
-        block: Arc<block::Block>,
+        block: BlockHandle,
         raw_frame_payload: Arc<[u8]>,
         decoded_attributed_memory_size_bytes: u64,
     },
 }
 
 impl BufferedBlockBody {
-    #[cfg(any(test, feature = "internal-bench"))]
+    #[cfg(test)]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
         raw_frame_payload: Option<Arc<[u8]>>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
-        Self::from_measured_decoded_block(
-            block,
-            raw_frame_payload,
-            decoded_attributed_memory_size_bytes,
-        )
-    }
-
-    pub(super) fn from_measured_decoded_block(
-        block: Arc<block::Block>,
-        raw_frame_payload: Option<Arc<[u8]>>,
-        decoded_attributed_memory_size_bytes: u64,
-    ) -> Self {
+        let block = block.into();
         match raw_frame_payload {
             Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
@@ -269,6 +381,24 @@ impl BufferedBlockBody {
                 block,
                 decoded_attributed_memory_size_bytes,
             },
+        }
+    }
+
+    /// The body a peer routine hands the sequencer for `block`, which it decoded
+    /// from `raw_frame_payload`. The caller holds a
+    /// [`charge_decoded_handoff`](super::sequencer_task::charge_decoded_handoff)
+    /// charge, so the block fits under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
+    /// A routine without that charge hands over the raw frame payload alone, and
+    /// the sequencer decodes it when it submits it (#1522).
+    ///
+    /// One cap holds at every height, because the input queue is not the
+    /// checkpoint window.
+    pub(super) fn for_handoff(block: OwnedBlock, raw_frame_payload: Arc<[u8]>) -> Self {
+        let decoded_attributed_memory_size_bytes = block.decoded_bytes();
+        BufferedBlockBody::DecodedWithRawFramePayload {
+            block: BlockHandle::Owned(block),
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
         }
     }
 
@@ -286,22 +416,7 @@ impl BufferedBlockBody {
         }
     }
 
-    // Drop the decoded body for the backlog.
-    // This is used to save memory when the body is not the next block in the sequence.
-    // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
-    // so we retain just the raw frame payload.
-    pub(super) fn retain_for_backlog(self) -> Self {
-        match self {
-            BufferedBlockBody::DecodedWithRawFramePayload {
-                raw_frame_payload, ..
-            } => BufferedBlockBody::RawFramePayload(raw_frame_payload),
-            body => body,
-        }
-    }
-
-    /// In-place [`Self::retain_for_backlog`]: drop the decoded copy when raw
-    /// bytes are retained, so a body leaving the bounded decode window releases
-    /// its decoded heap footprint.
+    /// Drop the decoded copy when raw bytes remain available for later decoding.
     pub(super) fn retain_for_backlog_in_place(&mut self) {
         if let BufferedBlockBody::DecodedWithRawFramePayload {
             raw_frame_payload, ..
@@ -311,7 +426,39 @@ impl BufferedBlockBody {
         }
     }
 
+    /// The address of the allocation that identifies this body: its raw frame
+    /// payload when one is kept, else its decoded block. Demoting a body to its
+    /// raw payload, or caching a decode, keeps the address, and two holders
+    /// that share one allocation report the same address.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn allocation(&self) -> usize {
+        match self {
+            BufferedBlockBody::RawFramePayload(raw_frame_payload)
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                raw_frame_payload, ..
+            } => Arc::as_ptr(raw_frame_payload).cast::<u8>().addr(),
+            BufferedBlockBody::Decoded { block, .. } => match block {
+                BlockHandle::Shared(block) => Arc::as_ptr(block).addr(),
+                BlockHandle::Owned(_) => std::ptr::from_ref(block.header()).addr(),
+            },
+        }
+    }
+
+    /// The attributed size of the decoded block this body holds, measured
+    /// from the block rather than read from the stored size. 0 for raw bytes.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn measured_decoded_attributed_memory_bytes(&self) -> u64 {
+        match self {
+            BufferedBlockBody::RawFramePayload(_) => 0,
+            BufferedBlockBody::Decoded { block, .. }
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => {
+                block.attributed_memory_size_bytes()
+            }
+        }
+    }
+
     /// Whether this body currently holds a decoded block.
+    #[cfg(test)]
     pub(super) fn is_decoded(&self) -> bool {
         !matches!(self, BufferedBlockBody::RawFramePayload(_))
     }
@@ -319,43 +466,46 @@ impl BufferedBlockBody {
     /// Return the decoded block, decoding from the retained raw bytes if needed
     /// and caching the decoded copy in place (the entry enters the decode
     /// window; `retain_for_backlog_in_place` is the matching downgrade).
-    pub(super) fn decoded_block(&mut self) -> Arc<block::Block> {
+    /// A refused decode keeps the raw bytes for a later attempt.
+    pub(super) fn decoded_block(
+        &mut self,
+        pool: &DecodedBlockPool,
+        admission: Admission,
+    ) -> Result<BlockHandle, DecodeRefusal> {
         match self {
             BufferedBlockBody::Decoded { block, .. }
-            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => Ok(block.clone()),
             BufferedBlockBody::RawFramePayload(payload) => {
-                let block = decode_raw_frame_payload(payload);
-                let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
-                let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
-                // Metrics accepts f64 samples; these lossy conversions are observability-only.
-                metrics::histogram!(
-                    "sync.block.body.decoded.attributed_memory_size_bytes",
-                    "stage" => "reorder"
-                )
-                .record(decoded_attributed_memory_size_bytes as f64);
-                if serialized_bytes > 0 {
-                    metrics::histogram!(
-                        "sync.block.body.decoded.to_serialized_ratio",
-                        "stage" => "reorder"
-                    )
-                    .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
-                }
+                let block = pool
+                    .try_admit(decode_raw_frame_payload(payload), admission)
+                    .map_err(|rejected| DecodeRefusal {
+                        reason: rejected.reason,
+                        decoded_bytes: rejected.decoded_bytes,
+                    })?;
+                let decoded_attributed_memory_size_bytes = block.decoded_bytes();
+                let block = BlockHandle::Owned(block);
                 *self = BufferedBlockBody::DecodedWithRawFramePayload {
                     block: block.clone(),
                     raw_frame_payload: payload.clone(),
                     decoded_attributed_memory_size_bytes,
                 };
-                block
+                Ok(block)
             }
         }
     }
 }
 
-fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {
+/// Why the pool refused a body's decoded block, and the block's measured size.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct DecodeRefusal {
+    pub(super) reason: AdmissionFailure,
+    /// Attributed bytes of the refused decoded block.
+    pub(super) decoded_bytes: u64,
+}
+
+fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> block::Block {
     let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    Arc::new(
-        block::Block::zcash_deserialize_from_slice(&mut reader).expect(
-            "raw block bytes deserialize because the peer routine decoded them before buffering",
-        ),
+    block::Block::zcash_deserialize_from_slice(&mut reader).expect(
+        "raw block bytes deserialize because the peer routine decoded them before buffering",
     )
 }

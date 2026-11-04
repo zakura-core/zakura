@@ -35,8 +35,8 @@ use crate::{
     error::VctCommitFailure,
     service::{
         finalized_state::{
-            FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
-            VctAuxiliaryWindow, VctSuccessorWitness,
+            header_chain::select_vct_auxiliary_delivery, FinalizedState, VctAuthenticationProof,
+            VctAuxiliaryFailureAttribution, VctAuxiliaryWindow, VctSuccessorWitness,
         },
         write::{
             vct_failure_repair_trigger,
@@ -469,10 +469,82 @@ fn authenticate_alternative_pair(
             return None;
         }
     };
+    authenticate_boundary_pairs(writer, network, history_tree, &windows, header_generation)
+}
+
+/// Exhausts retained pairs for the next body commit without running the ahead-of-body sweep.
+///
+/// The delivery cap bounds this search. No elapsed-time check can interrupt it before an
+/// available pair verifies. The committer still verifies the selected delivery on retry.
+/// Returns true only when verification changes the selected delivery or authenticates it.
+pub(super) fn recover_commit_boundary(
+    finalized_state: &FinalizedState,
+    writer: &HeaderChainWriter,
+    frontier: Frontier,
+) -> Result<bool, crate::BoxError> {
+    let Some((tip_height, tip_hash)) = finalized_state.db.tip() else {
+        return Ok(false);
+    };
+    if tip_height.next().ok() != Some(frontier.height)
+        || !finalized_state.vct_requires_exact_roots(frontier.height)
+    {
+        return Ok(false);
+    }
+    let selected_window = writer
+        .runtime
+        .selected_auxiliary_window(frontier.height, frontier.hash)?;
+    let Some(window) = selected_window.as_ref() else {
+        return Ok(false);
+    };
+    if window.delivery_header.header_node.parent_hash != tip_hash {
+        return Ok(false);
+    }
+    let Some(selected_delivery) =
+        select_vct_auxiliary_delivery(window.delivery_header.auxiliary_deliveries.clone())
+    else {
+        return Ok(false);
+    };
+    let generation = window.engine_snapshot.header_generation;
+    let windows = HeaderChainWriter::vct_boundary_alternatives(selected_window)?;
+    if windows.is_empty() {
+        return Ok(false);
+    }
+    let network = finalized_state.network();
+    let history_tree = finalized_state.db.try_history_tree()?;
+    if !history_tree_accepts_height(&network, frontier.height, &history_tree) {
+        return Err(zakura_header_chain::StoreError::Incoherent(
+            "VCT boundary recovery history tree does not precede the blocked height",
+        )
+        .into());
+    }
+    if authenticate_boundary_pairs(writer, &network, &history_tree, &windows, generation).is_none()
+    {
+        return Ok(false);
+    }
+    let VctAuxiliaryWindowRead::Ready(recovered) =
+        writer.vct_auxiliary_window(frontier.height, frontier.hash)?
+    else {
+        return Ok(false);
+    };
+    // A successful but idempotent verification must not spin the commit loop.
+    Ok(
+        recovered.delivery.delivery_id != selected_delivery.delivery_id
+            || (!selected_delivery.is_authenticated() && recovered.delivery.is_authenticated()),
+    )
+}
+
+/// Verifies bounded candidate pairs shared by the idle sweep and blocked commit recovery.
+fn authenticate_boundary_pairs(
+    writer: &HeaderChainWriter,
+    network: &Network,
+    history_tree: &HistoryTree,
+    windows: &[VctAuxiliaryWindow],
+    header_generation: HeaderGeneration,
+) -> Option<HistoryTree> {
     metrics::counter!("state.vct.aux.sweep.alternative_search.count").increment(1);
     // Each window shares its current delivery with its neighbors, so one fold serves the group.
     let mut current_fold: Option<(EvidenceId, Option<HistoryTree>)> = None;
-    for window in &windows {
+    for window in windows {
         if window.engine_snapshot.header_generation != header_generation {
             return None;
         }

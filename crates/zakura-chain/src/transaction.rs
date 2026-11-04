@@ -48,7 +48,7 @@ use crate::parameters::TX_V7_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, ironwood,
-    memory::{vec_capacity_bytes, AttributedMemorySize},
+    memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
     parameters::{
         Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
@@ -77,6 +77,10 @@ use crate::{
 /// Zcash has a number of different transaction formats. They are represented
 /// internally by different enum variants. Because we checkpoint on Canopy
 /// activation, we do not validate any pre-Sapling transaction types.
+///
+/// Sprout, Sapling, and Orchard bundles are boxed so their inline storage does
+/// not enlarge every transaction. Ironwood bundles remain inline for the common
+/// shielded transaction path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub enum Transaction {
@@ -100,7 +104,7 @@ pub enum Transaction {
         /// chain.
         lock_time: LockTime,
         /// The JoinSplit data for this transaction, if any.
-        joinsplit_data: Option<JoinSplitData<Bctv14Proof>>,
+        joinsplit_data: Option<Box<JoinSplitData<Bctv14Proof>>>,
     },
     /// An Overwinter transaction (`version = 3`).
     V3 {
@@ -114,7 +118,7 @@ pub enum Transaction {
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
         /// The JoinSplit data for this transaction, if any.
-        joinsplit_data: Option<JoinSplitData<Bctv14Proof>>,
+        joinsplit_data: Option<Box<JoinSplitData<Bctv14Proof>>>,
     },
     /// A Sapling transaction (`version = 4`).
     V4 {
@@ -128,9 +132,9 @@ pub enum Transaction {
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
         /// The JoinSplit data for this transaction, if any.
-        joinsplit_data: Option<JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<Box<JoinSplitData<Groth16Proof>>>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::PerSpendAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::PerSpendAnchor>>>,
     },
     /// A `version = 5` transaction , which supports Orchard, Sapling, and transparent, but not Sprout.
     V5 {
@@ -148,9 +152,9 @@ pub enum Transaction {
         /// The transparent outputs from the transaction.
         outputs: Vec<transparent::Output>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::SharedAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
-        orchard_shielded_data: Option<orchard::ShieldedData>,
+        orchard_shielded_data: Option<Box<orchard::ShieldedData>>,
     },
     /// A `version = 6` transaction, which supports Sapling, Orchard, transparent,
     /// and Ironwood.
@@ -169,9 +173,9 @@ pub enum Transaction {
         /// The transparent outputs from the transaction.
         outputs: Vec<transparent::Output>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::SharedAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
-        orchard_shielded_data: Option<orchard::ShieldedData>,
+        orchard_shielded_data: Option<Box<orchard::ShieldedData>>,
         /// The Ironwood data for this transaction, if any.
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
     },
@@ -193,14 +197,30 @@ pub enum Transaction {
         /// The transparent outputs from the transaction.
         outputs: Vec<transparent::Output>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::SharedAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
-        orchard_shielded_data: Option<orchard::ShieldedData>,
+        orchard_shielded_data: Option<Box<orchard::ShieldedData>>,
         /// The Ironwood data for this transaction, if any.
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
         /// The Tachyon data for this transaction, if any.
-        tachyon_shielded_data: Option<TachyonShieldedData>,
+        tachyon_shielded_data: Option<Box<TachyonShieldedData>>,
     },
+}
+
+impl AsRef<Transaction> for Transaction {
+    fn as_ref(&self) -> &Transaction {
+        self
+    }
+}
+
+impl Transaction {
+    /// Returns the bytes this transaction's inline value and heap allocations occupy.
+    ///
+    /// This is deterministic accounting, not an exact process RSS measurement.
+    pub fn retained_memory_size_bytes(&self) -> u64 {
+        crate::memory::inline_size_bytes::<Self>()
+            .saturating_add(AttributedMemorySize::attributed_memory_size_bytes(self))
+    }
 }
 
 impl AttributedMemorySize for Transaction {
@@ -418,6 +438,14 @@ impl ShieldedActionCounts {
 }
 
 impl Transaction {
+    /// Measure this decoded transaction's inline value and nested allocations.
+    ///
+    /// This is deterministic attribution, not exact process memory. It excludes
+    /// allocator overhead and `Arc` control blocks.
+    pub fn decoded_memory_size_bytes(&self) -> u64 {
+        inline_size_bytes::<Self>().saturating_add(self.attributed_memory_size_bytes())
+    }
+
     // identifiers and hashes
 
     /// Compute the hash (mined transaction ID) of this transaction.
@@ -1135,16 +1163,16 @@ impl Transaction {
             Transaction::V5 {
                 sapling_shielded_data,
                 ..
-            } => sapling_shielded_data.as_ref(),
+            } => sapling_shielded_data.as_deref(),
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
-            } => sapling_shielded_data.as_ref(),
+            } => sapling_shielded_data.as_deref(),
             #[cfg(zcash_unstable = "nutachyon")]
             Transaction::V7 {
                 sapling_shielded_data,
                 ..
-            } => sapling_shielded_data.as_ref(),
+            } => sapling_shielded_data.as_deref(),
             _ => None,
         }
     }
@@ -1464,16 +1492,16 @@ impl Transaction {
             Transaction::V5 {
                 orchard_shielded_data,
                 ..
-            } => orchard_shielded_data.as_ref(),
+            } => orchard_shielded_data.as_deref(),
             Transaction::V6 {
                 orchard_shielded_data,
                 ..
-            } => orchard_shielded_data.as_ref(),
+            } => orchard_shielded_data.as_deref(),
             #[cfg(zcash_unstable = "nutachyon")]
             Transaction::V7 {
                 orchard_shielded_data,
                 ..
-            } => orchard_shielded_data.as_ref(),
+            } => orchard_shielded_data.as_deref(),
 
             // No Orchard shielded data
             Transaction::V1 { .. }
@@ -1604,7 +1632,7 @@ impl Transaction {
             Transaction::V7 {
                 tachyon_shielded_data,
                 ..
-            } => tachyon_shielded_data.as_ref(),
+            } => tachyon_shielded_data.as_deref(),
             _ => None,
         }
     }
@@ -2040,24 +2068,30 @@ impl Transaction {
         ValueBalance::from_ironwood_amount(ironwood_value_balance)
     }
 
-    /// Return the Tachyon value balance, the change in the transaction value pool due to
-    /// Tachyon actions.
+    /// Returns the net value released by Tachyon, including the fee chosen in the stamp.
+    ///
+    /// The signed balance reserves the maximum fee; fee change remains in the pool.
     #[cfg(zcash_unstable = "nutachyon")]
-    pub fn tachyon_value_balance(&self) -> ValueBalance<NegativeAllowed> {
-        let tachyon_value_balance = self
+    pub fn tachyon_value_balance(
+        &self,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        let Some(bundle) = self
             .tachyon_shielded_data()
-            .map(|shielded_data| {
-                Amount::try_from(i64::from(shielded_data.value_balance()))
-                    .expect("Tachyon value balances are range-checked when the bundle is parsed")
-            })
-            .unwrap_or_else(Amount::zero);
-
-        ValueBalance::from_tachyon_amount(tachyon_value_balance)
+            .and_then(|data| data.0.as_dyn())
+        else {
+            return Ok(ValueBalance::zero());
+        };
+        let balance = Amount::<NegativeAllowed>::try_from(i64::from(bundle.value_balance))
+            .map_err(ValueBalanceError::Tachyon)?;
+        let fee = Amount::<NegativeAllowed>::try_from(i64::from(bundle.stamp.fee()))
+            .map_err(ValueBalanceError::Tachyon)?;
+        let net_balance = (balance + fee).map_err(ValueBalanceError::Tachyon)?;
+        Ok(ValueBalance::from_tachyon_amount(net_balance))
     }
 
     #[cfg(not(zcash_unstable = "nutachyon"))]
-    fn tachyon_value_balance(&self) -> ValueBalance<NegativeAllowed> {
-        ValueBalance::zero()
+    fn tachyon_value_balance(&self) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        Ok(ValueBalance::zero())
     }
 
     /// Returns the value balances for this transaction using the provided transparent outputs.
@@ -2071,7 +2105,7 @@ impl Transaction {
             + self.sapling_value_balance()
             + self.orchard_value_balance()
             + self.ironwood_value_balance()
-            + self.tachyon_value_balance()
+            + self.tachyon_value_balance()?
     }
 
     /// Returns the value balances for this transaction.
@@ -2130,7 +2164,7 @@ impl Transaction {
             + self.sapling_value_balance()
             + self.orchard_value_balance()
             + self.ironwood_value_balance()
-            + self.tachyon_value_balance()
+            + self.tachyon_value_balance()?
     }
 
     /// Converts [`Transaction`] to [`zcash_primitives::transaction::Transaction`].
@@ -2142,6 +2176,36 @@ impl Transaction {
         &self,
         nu: NetworkUpgrade,
     ) -> Result<zcash_primitives::transaction::Transaction, crate::Error> {
+        let branch_id = self.librustzcash_branch_id(nu)?;
+        Ok(zcash_primitives::transaction::Transaction::read(
+            &self.zcash_serialize_to_vec()?[..],
+            branch_id,
+        )?)
+    }
+
+    /// Converts [`Transaction`] to the data of a
+    /// [`zcash_primitives::transaction::Transaction`], without computing its transaction ID.
+    ///
+    /// Checks `nu` as [`Self::to_librustzcash`] does.
+    pub(crate) fn to_librustzcash_data(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<
+        zcash_primitives::transaction::TransactionData<zcash_primitives::transaction::Authorized>,
+        crate::Error,
+    > {
+        let branch_id = self.librustzcash_branch_id(nu)?;
+        Ok(zcash_primitives::transaction::TransactionData::read(
+            &self.zcash_serialize_to_vec()?[..],
+            branch_id,
+        )?)
+    }
+
+    /// Returns `nu`'s consensus branch ID, if this transaction can belong to `nu`.
+    fn librustzcash_branch_id(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<consensus::BranchId, crate::Error> {
         if self.network_upgrade().is_some_and(|tx_nu| tx_nu != nu) {
             return Err(crate::Error::InvalidConsensusBranchId);
         }
@@ -2150,14 +2214,7 @@ impl Transaction {
             return Err(crate::Error::InvalidConsensusBranchId);
         };
 
-        let Ok(branch_id) = consensus::BranchId::try_from(branch_id) else {
-            return Err(crate::Error::InvalidConsensusBranchId);
-        };
-
-        Ok(zcash_primitives::transaction::Transaction::read(
-            &self.zcash_serialize_to_vec()?[..],
-            branch_id,
-        )?)
+        consensus::BranchId::try_from(branch_id).map_err(|_| crate::Error::InvalidConsensusBranchId)
     }
 
     // Common Sapling & Orchard Properties

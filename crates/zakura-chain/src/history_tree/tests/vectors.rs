@@ -178,7 +178,7 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
     // both APIs, leaving the trees empty.
     block_tree.push(
         &network,
-        genesis_block.clone(),
+        &genesis_block,
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -202,7 +202,7 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
 
     block_tree.push(
         &network,
-        first_block.clone(),
+        &first_block,
         &first_sapling_root,
         &Default::default(),
         &Default::default(),
@@ -236,7 +236,7 @@ fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
 
     block_tree.push(
         &network,
-        second_block.clone(),
+        &second_block,
         &second_sapling_root,
         &Default::default(),
         &Default::default(),
@@ -1249,7 +1249,7 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
     let mut parts_tree = HistoryTree::default();
     block_tree.push(
         &network,
-        first_block.clone(),
+        &first_block,
         &sapling_root,
         &orchard_root,
         &ironwood_root,
@@ -1271,7 +1271,7 @@ fn history_tree_push_wrapper_matches_parts_across_nu6_3_activation() -> Result<(
 
     block_tree.push(
         &network,
-        activation_block.clone(),
+        &activation_block,
         &sapling_root,
         &orchard_root,
         &ironwood_root,

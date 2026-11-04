@@ -19,8 +19,8 @@ use crate::{
     },
     zakura::{
         ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNECTIONS,
-        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
 };
@@ -747,6 +747,28 @@ fn zakura_nat_traversal_fails_and_names_the_transport_spec() {
     assert!(!config.zakura.nat_traversal);
 }
 
+/// Each native stream kind receives one stream window, so a window below a
+/// block-sync frame fails config validation instead of the endpoint's startup.
+#[test]
+fn zakura_stream_window_below_the_largest_native_frame_fails_for_v2_stacks() {
+    let _init_guard = zakura_test::init();
+    let largest = crate::zakura::MAX_BS_FRAME_BYTES;
+    let config = |stack: &str, window: u32| {
+        format!("p2p_stack = \"{stack}\"\n[zakura.quic]\nstream_receive_window_bytes = {window}\n")
+    };
+
+    let error = toml::from_str::<Config>(&config("dual", largest - 1))
+        .expect_err("a stream window below a block-sync frame must fail at startup")
+        .to_string();
+    assert!(error.contains("stream_receive_window_bytes"), "{error}");
+    assert!(error.contains(&largest.to_string()), "{error}");
+
+    toml::from_str::<Config>(&config("dual", largest))
+        .expect("a stream window that holds a block-sync frame is valid");
+    toml::from_str::<Config>(&config("legacy", 64 * 1024))
+        .expect("a legacy-only node creates no QUIC endpoint, so its stream window is unused");
+}
+
 #[test]
 fn zakura_quic_out_of_range_value_fails_and_names_the_key() {
     let _init_guard = zakura_test::init();
@@ -862,25 +884,28 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     .unwrap();
     assert_eq!(config.zakura.max_connections, 256);
     assert_eq!(
-        config.zakura.budgeted_max_connections(),
-        Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+        config.zakura.budgeted_max_connections(&config.network),
+        Ok(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS)
     );
     assert_eq!(
         ZakuraLocalLimits::from_config(&config).max_connections,
-        DEFAULT_ZAKURA_MAX_CONNECTIONS
+        DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
     );
 
     let config: Config = toml::from_str(
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 19595788288
+        peer_memory_budget_bytes = 38751881472
         "#,
     )
     .unwrap();
-    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
-    // admitted and 32 of headroom.
-    assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
+    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
+    // connections of 141,937,353 bytes.
+    assert_eq!(
+        config.zakura.budgeted_max_connections(&config.network),
+        Ok(256)
+    );
 
     // The transport holds the admitted connections and the headroom, half of
     // it kept for dials (zakura-quic ADM-12), and two closing connections per
@@ -904,8 +929,8 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         (124, 16, 248)
     );
 
-    // A 1 GiB receive window leaves the default budget room for 7 QUIC
-    // connections, less than its headroom alone.
+    // With a 1 GiB receive window, the handshake headroom alone exceeds the
+    // default budget.
     let error = toml::from_str::<Config>(
         r#"
         p2p_stack = "dual"
@@ -1650,5 +1675,93 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
             .expect_err("unfundable session slots must not load")
             .to_string();
         assert!(error.contains("at most 3,633"), "unexpected error: {error}");
+    }
+}
+
+/// The TCP ingress partition follows the connection limit and cannot overflow.
+#[test]
+fn tcp_ingress_bound_follows_the_connection_limit() {
+    let config = Config::default();
+    assert_eq!(
+        config.tcp_ingress_bound_bytes(),
+        config.peerset_total_connection_limit() as u64
+            * crate::protocol::external::MAX_INCOMPLETE_MESSAGE_BYTES as u64,
+    );
+    assert!(config.tcp_ingress_bound_bytes() > 0);
+}
+
+#[test]
+fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str("").expect("empty config parses");
+    assert_eq!(config.advert_window_min, 32);
+    assert_eq!(config.advert_window_max, 64);
+    assert_eq!(config.advert_window_small_size_bytes, 102_400);
+    assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
+
+    let config: Config = toml::from_str(
+        "advert_window_min = 2\n\
+         advert_window_max = 16\n\
+         advert_window_small_size_bytes = 100\n\
+         advert_window_full_size_bytes = 1000\n",
+    )
+    .expect("configured fan-out parses");
+    assert_eq!(config.advert_window_min, 2);
+    assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_small_size_bytes, 100);
+    assert_eq!(config.advert_window_full_size_bytes, 1000);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip, config);
+
+    // Equal bounds are a fixed window.
+    let config: Config = toml::from_str("advert_window_min = 64").expect("equal bounds parse");
+    assert_eq!(config.advert_window_min, config.advert_window_max);
+
+    let config: Config = toml::from_str("advert_window_small_size_bytes = 0")
+        .expect("a zero small-size boundary parses");
+    assert_eq!(config.advert_window_small_size_bytes, 0);
+}
+
+#[test]
+fn invalid_advert_fanout_config_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    for (config, field) in [
+        ("advert_window_min = 0", "advert_window_min"),
+        (
+            "advert_window_min = 10\nadvert_window_max = 9",
+            "advert_window_min",
+        ),
+        // The default maximum of 64 is below this minimum, and the reverse.
+        ("advert_window_min = 65", "advert_window_min"),
+        ("advert_window_max = 31", "advert_window_max"),
+        (
+            "advert_window_full_size_bytes = 0",
+            "advert_window_full_size_bytes",
+        ),
+        (
+            "advert_window_small_size_bytes = 1572864",
+            "advert_window_small_size_bytes",
+        ),
+        (
+            "advert_window_small_size_bytes = 1572865",
+            "advert_window_small_size_bytes",
+        ),
+        (
+            "advert_window_full_size_bytes = 102400",
+            "advert_window_full_size_bytes",
+        ),
+        // Removed settings.
+        ("advert_target_secs = 1.0", "advert_target_secs"),
+        ("advert_window_initial = 32", "advert_window_initial"),
+        ("advert_window_fixed = 8", "advert_window_fixed"),
+    ] {
+        let error = toml::from_str::<Config>(config)
+            .expect_err("invalid fan-out config is rejected")
+            .to_string();
+        assert!(error.contains(field), "{config:?} gave {error}");
     }
 }

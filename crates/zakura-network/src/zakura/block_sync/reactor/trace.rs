@@ -1,6 +1,43 @@
+use serde::Serialize;
+use zakura_jsonl_trace::JsonlTraceEvent;
+use zakura_rt::sync::atomic::Ordering;
+
 use super::*;
 
-impl BlockSyncReactor {
+/// One reactor transition with the state it left behind.
+#[derive(Serialize)]
+struct BlockReactorTransitionEvent {
+    event: &'static str,
+    #[serde(flatten)]
+    transition: ReactorTransition,
+    #[serde(flatten)]
+    state: ReactorSnapshot,
+}
+
+impl JsonlTraceEvent for BlockReactorTransitionEvent {
+    const TABLE: zakura_jsonl_trace::JsonlTraceTable = crate::zakura::trace::BLOCK_SYNC_TABLE;
+}
+
+impl ReactorIO {
+    /// Report a completed transition to the trace and to an installed observer,
+    /// with the state it left behind. Neither takes a lock or yields.
+    pub(super) fn report_transition(&self, transition: ReactorTransition) {
+        self.startup
+            .trace
+            .emit_event(|| BlockReactorTransitionEvent {
+                event: "reactor_transition",
+                transition,
+                state: self.state.snapshot(),
+            });
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observer) = &self.startup.observer.0 {
+            observer.observe(super::block_sync_observe::BlockEvent::Reactor {
+                transition,
+                state: Box::new(self.state.snapshot()),
+            });
+        }
+    }
+
     pub(super) fn emit_block(
         &self,
         event: &'static str,
@@ -27,10 +64,10 @@ impl BlockSyncReactor {
             row.released_count = Some(released.released_count);
             row.missing_count = Some(released.missing_count);
             row.pending_after = Some(u64::from(
-                self.state.work_queue.pending_contains(claim.height),
+                self.resources.work_queue.pending_contains(claim.height),
             ));
             row.in_flight_after = Some(u64::from(
-                self.state.work_queue.in_flight_contains(claim.height),
+                self.resources.work_queue.in_flight_contains(claim.height),
             ));
         });
     }
@@ -49,7 +86,7 @@ impl BlockSyncReactor {
         // The received (download) meter is shared with the routines (they record
         // on receipt); only the reactor samples it. The committed (commit) rate is
         // sampled by the Sequencer task and read from the latest view snapshot.
-        if let Ok(mut meter) = self.state.received_throughput.lock() {
+        if let Ok(mut meter) = self.resources.received_throughput.lock() {
             meter.sample(now);
         }
     }
@@ -64,18 +101,18 @@ impl BlockSyncReactor {
             let slots = include_diagnostics.then(|| self.registry.slot_summary());
             let counts = include_diagnostics.then(|| self.registry.direction_status_counts());
             let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
-            let view = self.last_view;
+            let view = self.state.progress.last_view;
             let submitted_applies = view.in_flight_submission_count;
             let (received_bytes_per_sec, received_blocks_per_sec) = self
-                .state
+                .resources
                 .received_throughput
                 .lock()
                 .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
                 .unwrap_or((0, 0));
-            row.request_floor = Some(height(self.request_floor));
+            row.request_floor = Some(height(self.state.progress.request_floor));
             row.body_download_floor = Some(height(view.download_floor));
             row.verified_block_tip = Some(height(view.verified_tip));
-            row.best_header_tip = Some(height(self.state.best_header_tip));
+            row.best_header_tip = Some(height(self.state.progress.best_header_tip));
             row.body_lag = Some(u64::from(self.body_lag()));
             row.applying = Some(view.applying_len);
             row.submitted_applies = Some(submitted_applies);
@@ -93,14 +130,12 @@ impl BlockSyncReactor {
                 row.floor_gap_oldest_outstanding_ms = floor_gap.oldest_outstanding_ms;
                 row.floor_gap_next_deadline_ms = floor_gap.next_deadline_ms;
             }
-            row.budget_available = Some(self.state.budget.available());
-            row.budget_reserved = Some(self.state.budget.reserved());
-            let sequencer_input_queued_bytes = self
-                .sequencer_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+            row.budget_available = Some(self.resources.work_queue.budget().available());
+            row.budget_reserved = Some(self.resources.work_queue.budget().reserved());
+            let sequencer_input_queued_bytes = self.sequencer_input_bytes.load(Ordering::Relaxed);
             let sequencer_input_decoded_attributed_memory_bytes = self
                 .sequencer_input_decoded_attributed_memory_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+                .load(Ordering::Relaxed);
             let sequencer_input_max_capacity = self.sequencer_input.max_capacity();
             let sequencer_input_capacity = self.sequencer_input.capacity();
             let sequencer_input_queued_blocks =
@@ -121,6 +156,7 @@ impl BlockSyncReactor {
                 Some(saturating_usize(sequencer_input_queued_blocks));
             row.sequencer_input_capacity = Some(saturating_usize(sequencer_input_capacity));
             row.sequencer_input_max_capacity = Some(saturating_usize(sequencer_input_max_capacity));
+            row.accounting_closed = Some(view.accounting_closed);
             row.reorder_buffered_bytes = Some(view.reorder_buffered_bytes);
             row.applying_buffered_bytes = Some(view.applying_buffered_bytes);
             row.unsubmitted_applying_count = Some(view.unsubmitted_applying_count);
@@ -133,7 +169,7 @@ impl BlockSyncReactor {
                 }
                 .wire_bytes(),
             );
-            row.peers = Some(saturating_usize(self.state.peers.len()));
+            row.peers = Some(saturating_usize(self.resources.peers.len()));
             if let Some(peers_with_status) = peers_with_status {
                 row.peers_with_status = Some(saturating_usize(peers_with_status));
             }
@@ -146,7 +182,8 @@ impl BlockSyncReactor {
                 let peers_wanting_slots = peers_with_status.saturating_sub(slots.saturated_peers);
                 let download_blocked_on_budget = u64::from(
                     peers_wanting_slots > 0
-                        && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
+                        && self.resources.work_queue.budget().available()
+                            < BS_PER_BLOCK_WORST_CASE_BYTES,
                 );
                 row.peers_wanting_slots = Some(saturating_usize(peers_wanting_slots));
                 row.download_blocked_on_budget = Some(download_blocked_on_budget);
@@ -176,15 +213,18 @@ impl BlockSyncReactor {
                     row.needed_min = Some(height(*min));
                 }
                 row.needed_count = Some(saturating_usize(self.state.needed_heights.len()));
-                row.queue_len = Some(saturating_usize(self.state.work_queue.pending_run_count()));
-                row.queue_blocks = Some(saturating_usize(self.state.work_queue.pending_len()));
-                if let Some(start) = self.state.work_queue.min_pending() {
+                row.queue_len = Some(saturating_usize(
+                    self.resources.work_queue.pending_run_count(),
+                ));
+                row.queue_blocks = Some(saturating_usize(self.resources.work_queue.pending_len()));
+                if let Some(start) = self.resources.work_queue.min_pending() {
                     row.queue_min_start = Some(height(start));
                 }
-                row.assigned_len = Some(saturating_usize(self.state.work_queue.in_flight_len()));
+                row.assigned_len =
+                    Some(saturating_usize(self.resources.work_queue.in_flight_len()));
                 row.local_body_work = Some(saturating_usize(self.local_body_work_blocks()));
                 row.refill_low_water = Some(saturating_usize(self.refill_low_water_blocks()));
-                if let Some(end) = self.state.work_queue.max_in_flight() {
+                if let Some(end) = self.resources.work_queue.max_in_flight() {
                     row.covered_max_end = Some(height(end));
                 }
             }
@@ -311,7 +351,7 @@ impl BlockSyncReactor {
         }
         self.emit_block(bs_trace::BLOCK_WORK_EXTENDED, |row| {
             row.range_count = Some(saturating_usize(inserted));
-            row.queue_blocks = Some(saturating_usize(self.state.work_queue.pending_len()));
+            row.queue_blocks = Some(saturating_usize(self.resources.work_queue.pending_len()));
         });
     }
 
@@ -319,7 +359,7 @@ impl BlockSyncReactor {
     pub(super) fn trace_frontiers_changed(&self, verified_block_tip: block::Height) {
         self.emit_block(bs_trace::BLOCK_FRONTIERS_CHANGED, |row| {
             row.verified_block_tip = Some(height(verified_block_tip));
-            row.best_header_tip = Some(height(self.state.best_header_tip));
+            row.best_header_tip = Some(height(self.state.progress.best_header_tip));
         });
     }
 
@@ -327,5 +367,145 @@ impl BlockSyncReactor {
         self.emit_block(bs_trace::BLOCK_CHAIN_TIP_RESET, |row| {
             row.verified_block_tip = Some(height(verified_block_tip));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use zakura_header_chain::{
+        BodyWorkAuthority, BodyWorkEpoch, BranchId, HeaderGeneration, HeaderWorkAuthority,
+        VerifiedGeneration,
+    };
+
+    use super::*;
+
+    /// Pins the trace fields that `zakura-bench-digest.py` and readers of a
+    /// `reactor_transition` line depend on.
+    #[test]
+    fn reactor_transition_event_keeps_its_trace_fields() {
+        let scope = BodyWorkAuthority {
+            header: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(7),
+                branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+            },
+            verified_generation: VerifiedGeneration::new(1),
+            body_work_epoch: BodyWorkEpoch::default(),
+        };
+        let query = PendingNeededQuery {
+            query_id: NonZeroU64::new(3).expect("3 is nonzero"),
+            scope,
+            from: block::Height(10),
+            limit: 8,
+            best_header_tip: block::Height(100),
+            best_header_hash: block::Hash([2; 32]),
+            hint_revision: None,
+            forced: true,
+        };
+        let state = ReactorSnapshot {
+            pending: Some(query),
+            next_query_id: NonZeroU64::new(4),
+            retry_armed: true,
+            retry_forced: false,
+            dispatch_closed: false,
+            scope: Some(scope),
+            verified_block_tip: block::Height(9),
+            request_floor: block::Height(9),
+            best_header_tip: block::Height(100),
+            last_reset_epoch: 1,
+            last_reaction_epoch: 2,
+        };
+        let event = |transition| {
+            serde_json::to_value(BlockReactorTransitionEvent {
+                event: "reactor_transition",
+                transition,
+                state,
+            })
+            .expect("the event serializes")
+        };
+        let state_fields = json!({
+            "event": "reactor_transition",
+            "pending_query_id": 3,
+            "next_query_id": 4,
+            "retry_armed": true,
+            "retry_forced": false,
+            "dispatch_closed": false,
+            "verified_tip": 9,
+            "request_floor": 9,
+            "best_header_tip": 100,
+            "reset_epoch": 1,
+            "reaction_epoch": 2,
+        });
+        let cases = [
+            (
+                ReactorTransition::QueryRefused {
+                    query,
+                    refusal: ActionRefusal::ControlReserve,
+                },
+                json!({
+                    "transition": "query_refused",
+                    "query_id": 3,
+                    "range_start": 10,
+                    "range_count": 8,
+                    "forced": true,
+                    "header_generation": 7,
+                    "refusal": "control_reserve",
+                }),
+            ),
+            (
+                ReactorTransition::QueryAccepted(query),
+                json!({
+                    "transition": "query_accepted",
+                    "query_id": 3,
+                    "range_start": 10,
+                    "range_count": 8,
+                    "forced": true,
+                    "header_generation": 7,
+                }),
+            ),
+            (
+                ReactorTransition::QueryReply {
+                    query_id: query.query_id,
+                    scope,
+                    outcome: QueryReplyOutcome::StaleAuthority,
+                },
+                json!({
+                    "transition": "query_reply",
+                    "query_id": 3,
+                    "header_generation": 7,
+                    "outcome": "stale_authority",
+                }),
+            ),
+            (
+                ReactorTransition::AuthorityChanged {
+                    authority: scope,
+                    epoch_changed: true,
+                },
+                json!({
+                    "transition": "authority_changed",
+                    "header_generation": 7,
+                    "epoch_changed": true,
+                }),
+            ),
+            (
+                ReactorTransition::TipReset {
+                    tip: block::Height(5),
+                },
+                json!({ "transition": "tip_reset", "tip": 5 }),
+            ),
+        ];
+        for (transition, fields) in cases {
+            let mut expected = state_fields.clone();
+            expected
+                .as_object_mut()
+                .expect("the state fields are an object")
+                .extend(
+                    fields
+                        .as_object()
+                        .expect("the fields are an object")
+                        .clone(),
+                );
+            assert_eq!(event(transition), expected);
+        }
     }
 }

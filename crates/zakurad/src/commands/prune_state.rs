@@ -19,10 +19,8 @@ pub struct PruneStateCmd {
 
     /// Path to Zebra's cached state.
     ///
-    /// The `zakurad prune-state` subcommand defaults to `state.cache_dir` from the loaded
-    /// `zakura.toml`, while the standalone `zakura-prune-state` binary defaults to
-    /// `zakura_state::Config::default()`. Pass `--cache-dir` to be explicit and avoid pruning the
-    /// wrong (or an empty) state directory.
+    /// Defaults to `state.cache_dir` from the loaded `zakura.toml`. Pass `--cache-dir` to be
+    /// explicit and avoid pruning the wrong (or an empty) state directory.
     #[clap(long, short, help = "path to directory with the Zakura chain state")]
     cache_dir: Option<PathBuf>,
 

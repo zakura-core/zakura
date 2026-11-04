@@ -1,8 +1,7 @@
 //! Exact generation- and branch-keyed completed header targets.
 
-use std::collections::HashSet;
-
 use zakura_header_chain::{BranchId, Frontier, HeaderGeneration};
+use zakura_rt::collections::HashSet;
 
 /// Exact selected-header generation and completed branch identity.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]

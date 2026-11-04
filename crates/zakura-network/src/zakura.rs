@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::sync::CancellationToken;
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -26,9 +26,10 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod node_envelope;
 mod peer_memory;
 mod regulation;
-#[cfg(any(test, feature = "zakura-testkit"))]
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
 pub mod testkit;
 mod trace;
 pub mod transport;
@@ -42,6 +43,8 @@ pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
 pub use peer_memory::*;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use regulation::{replay_cadence_bytes, CadenceReplaySummary};
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
@@ -408,6 +411,9 @@ impl ZakuraHandshakeConnector {
     /// Only meaningful for outbound connections, where `book_addr` is the
     /// dialable remote address the crawler would otherwise reconnect to. Does
     /// nothing without a live endpoint.
+    ///
+    /// `address_book_updater` belongs to the legacy address book. Legacy code
+    /// stays on tokio, so it's tokio's sender in both builds.
     pub(crate) fn spawn_legacy_liveness_keeper(
         &self,
         peer_id: ZakuraPeerId,
@@ -420,12 +426,15 @@ impl ZakuraHandshakeConnector {
         let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
             return;
         };
-        spawn_erased(run_legacy_liveness_keeper(
-            book_addr,
-            address_book_updater,
-            dial_lifetime,
-            ZAKURA_LIVENESS_REFRESH_INTERVAL,
-        ));
+        spawn_erased_named(
+            "legacy_liveness_keeper",
+            run_legacy_liveness_keeper(
+                book_addr,
+                address_book_updater,
+                dial_lifetime,
+                ZAKURA_LIVENESS_REFRESH_INTERVAL,
+            ),
+        );
     }
 
     /// Returns the deterministic upgrade outcome injected for handshake routing
@@ -508,7 +517,7 @@ async fn run_legacy_liveness_keeper(
     loop {
         // Refresh the peer's `Responded` liveness so the crawler treats it as a
         // live (Zakura) peer instead of re-dialing it over legacy TCP.
-        let sent = tokio::select! {
+        let sent = zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => return,
             sent = address_book_updater.send(MetaAddr::new_responded(book_addr, None)) => sent,
@@ -518,14 +527,36 @@ async fn run_legacy_liveness_keeper(
             break;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => break,
-            _ = tokio::time::sleep(refresh_interval) => {}
+            _ = zakura_rt::time::sleep(refresh_interval) => {}
         }
     }
 }
 
+/// Resumes a task's panic on the caller, and otherwise returns its result.
+///
+/// A cancelled task stays an `Err`. This is `zakura_chain`'s
+/// `check_for_panics_with(false)` for `zakura_rt`'s `JoinError`, which
+/// `zakura-chain` can't name.
+fn resume_task_panic<T>(
+    result: Result<T, zakura_rt::task::JoinError>,
+) -> Result<T, zakura_rt::task::JoinError> {
+    result.map_err(|error| match error.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(error) => error,
+    })
+}
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use header_sync::{
+    trace_header_publisher_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
+    HeaderMachinePhase, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView, HeaderReactorHistory,
+    HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
+    HeaderReactorView,
+};
 #[cfg(test)]
 mod tests {
     use super::*;

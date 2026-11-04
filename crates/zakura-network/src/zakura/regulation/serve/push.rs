@@ -123,7 +123,7 @@ impl PushSend<'_> {
 
 /// Await `acquire`, counting a delay if it is not ready at once.
 async fn wait<T>(acquire: impl std::future::Future<Output = T>, delayed: impl FnOnce()) -> T {
-    tokio::pin!(acquire);
+    zakura_rt::pin!(acquire);
     if let Some(ready) = futures::FutureExt::now_or_never(&mut acquire) {
         return ready;
     }

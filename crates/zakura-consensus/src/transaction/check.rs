@@ -1,6 +1,6 @@
 //! Transaction checks.
 //!
-//! Code in this file can freely assume that no pre-V4 transactions are present.
+//! After [`version_has_a_verifier`], checks can assume that no pre-V4 transactions are present.
 
 use std::{
     borrow::Cow,
@@ -27,6 +27,17 @@ use zcash_script::{
 };
 
 use crate::error::TransactionError;
+
+/// Rejects v1 to v3 transactions, which have no verifier in this node.
+///
+/// This runs first among the quick checks so that the mempool's unconditional ban
+/// for the wrong version is never replaced by a tip-dependent chain error.
+pub fn version_has_a_verifier(tx: &Transaction) -> Result<(), TransactionError> {
+    if tx.version() < 4 {
+        return Err(TransactionError::WrongVersion);
+    }
+    Ok(())
+}
 
 /// Checks if the transaction's lock time allows this transaction to be included in a block.
 ///
@@ -674,11 +685,12 @@ fn validate_expiry_height_mined(
 /// valid for the block height, or a [`Err(TransactionError)`](TransactionError)
 pub fn tx_transparent_coinbase_spends_maturity(
     network: &Network,
-    tx: Arc<Transaction>,
+    tx: impl AsRef<Transaction>,
     height: Height,
     block_new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
     spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
 ) -> Result<(), TransactionError> {
+    let tx = tx.as_ref();
     for spend in tx.spent_outpoints() {
         let utxo = block_new_outputs
             .get(&spend)
@@ -949,12 +961,19 @@ pub fn consensus_branch_id(
     Ok(())
 }
 
-/// Checks that no Tachyon action's value commitment or verification key is the identity point.
+/// Checks that Tachyon action and fee descriptors contain no identity points.
 #[cfg(zcash_unstable = "nutachyon")]
 pub fn tachyon_actions_have_valid_digests(tx: &Transaction) -> Result<(), TransactionError> {
     let Some(tachyon_shielded_data) = tx.tachyon_shielded_data() else {
         return Ok(());
     };
+
+    if let Some(bundle) = tachyon_shielded_data.0.as_dyn() {
+        bundle
+            .fee_descriptor()
+            .digest()
+            .map_err(|error| TransactionError::TachyonIdentityAction(error.to_string()))?;
+    }
 
     for action in tachyon_shielded_data.actions() {
         action

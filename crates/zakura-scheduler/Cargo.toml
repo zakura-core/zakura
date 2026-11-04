@@ -1,0 +1,39 @@
+[package]
+name = "zakura-scheduler"
+version = "0.1.0"
+authors.workspace = true
+description = "Deterministic coroutine scheduler for Zakura's P2P simulator. Internal test crate, not published"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["development-tools::testing"]
+# Only the simulator depends on it, and no published crate does.
+publish = false
+
+[features]
+# Tells AddressSanitizer about each coroutine stack switch. Only for
+# `-Zsanitizer=address` builds, since it links against the ASan runtime.
+sanitizer = ["corosensei/sanitizer"]
+
+[dependencies]
+corosensei = { workspace = true }
+
+# Only the simulator build, `RUSTFLAGS="--cfg zakura_sim"`, implements
+# `zakura_rt::sim::Executor`.
+[target.'cfg(zakura_sim)'.dependencies]
+zakura-rt = { path = "../zakura-rt" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(zakura_sim)'.dev-dependencies]
+# The real `FuturesUnordered`, for the child-waker tests.
+futures = { workspace = true }
+rand_10 = { workspace = true }
+# Paused-clock tokio, the reference the sim `interval` is compared against.
+tokio = { workspace = true, features = ["rt", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

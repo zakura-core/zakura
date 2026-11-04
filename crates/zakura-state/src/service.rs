@@ -36,7 +36,7 @@ use tracing::{instrument, Instrument, Span};
 use tower::buffer::Buffer;
 
 use zakura_chain::{
-    block::{self, CountedHeader, HeightDiff},
+    block::{self, HeightDiff},
     diagnostic::CodeTimer,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
@@ -52,8 +52,8 @@ use crate::{
         MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{
-        AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
-        PreciousError, ReconsiderError,
+        AwaitBlockInfoError, BlockHeaderNotFound, CommitBlockError, CommitCheckpointVerifiedError,
+        InvalidateError, PreciousError, ReconsiderError,
     },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
@@ -106,15 +106,23 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
-fn finalized_chain_tip(db: &ZakuraDb) -> Option<ChainTipBlock> {
-    let (height, hash) = db.tip()?;
-    if let Some(block) = db.tip_block() {
-        return Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(block)));
+fn finalized_chain_tip(
+    db: &ZakuraDb,
+) -> Result<Option<ChainTipBlock>, zakura_node_services::block_memory::AdmissionFailure> {
+    let Some((height, hash)) = db.tip() else {
+        return Ok(None);
+    };
+    if let Some(block) = db.chain_tip_block()? {
+        return Ok(Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(
+            block,
+        ))));
     }
 
-    let header = db.block_header(height.into())?;
-    (header.hash() == hash)
-        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header))
+    let Some(header) = db.block_header(height.into()) else {
+        return Ok(None);
+    };
+    Ok((header.hash() == hash)
+        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header)))
 }
 
 /// A read-write service for Zebra's cached blockchain state.
@@ -476,7 +484,7 @@ impl StateService {
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
-                let finalized_tip = finalized_chain_tip(&finalized_state.db);
+                let finalized_tip = finalized_chain_tip(&finalized_state.db)?;
                 let historical_trees = load_historical_frontier_artifact(
                     &network,
                     &config,
@@ -659,6 +667,11 @@ impl StateService {
                 &state.network,
                 MAX_LEGACY_CHAIN_BLOCKS,
             ) {
+                if let Some(admission) =
+                    error.downcast_ref::<zakura_node_services::block_memory::AdmissionFailure>()
+                {
+                    return Err(StateInitError::BlockAdmission(*admission));
+                }
                 let legacy_db_path = state.read_service.db.path().to_path_buf();
                 panic!(
                     "Cached state contains a legacy chain.\n\
@@ -704,7 +717,7 @@ impl StateService {
         // This method must not block, access the database, or perform CPU-intensive tasks,
         // because it is called directly from the tokio executor's Future threads.
 
-        let queued_prev_hash = checkpoint_verified.block.header.previous_block_hash;
+        let queued_prev_hash = checkpoint_verified.block.header().previous_block_hash;
         let queued_height = checkpoint_verified.height;
 
         // If we're close to the final checkpoint, make the block's UTXOs available for
@@ -1020,7 +1033,7 @@ impl StateService {
             self.non_finalized_block_write_sent_hashes
                 .can_fork_chain_at_hashes = true;
             // Send blocks from non-finalized queue
-            self.send_ready_non_finalized_queued(self.finalized_block_write_last_sent_hash);
+            self.send_ready_non_finalized(self.finalized_block_write_last_sent_hash, None);
             // We've finished committing checkpoint verified blocks to finalized state, so drop any repeated queued blocks.
             self.clear_finalized_block_queue(CommitBlockError::new_duplicate(
                 None,
@@ -1060,7 +1073,7 @@ impl StateService {
         admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
-        let parent_hash = semantically_verified.block.header.previous_block_hash;
+        let parent_hash = semantically_verified.block.header().previous_block_hash;
         let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
@@ -1115,6 +1128,10 @@ impl StateService {
             return Self::respond_now(admission, CommitBlockError::MissingMinedParent);
         }
 
+        // A block whose parent the write task can already build on goes straight to the write
+        // task, so it skips the orphan queue's indexes, which would be removed again right away.
+        let mut ready = None;
+
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
@@ -1148,12 +1165,15 @@ impl StateService {
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let attempt = write::start_block_write(&self.block_commit_sender, hash);
-            self.non_finalized_state_queued_blocks.queue((
-                semantically_verified,
-                rsp_tx,
-                admission,
-                attempt,
-            ));
+            let queued = (semantically_verified, rsp_tx, admission, attempt);
+            if self.block_write_sender.finalized.is_none()
+                && self.block_write_sender.non_finalized.is_some()
+                && self.can_fork_chain_at(&parent_hash)
+            {
+                ready = Some(queued);
+            } else {
+                self.non_finalized_state_queued_blocks.queue(queued);
+            }
             rsp_rx
         };
 
@@ -1161,27 +1181,36 @@ impl StateService {
         // semantically verified blocks. This usually already happened in `poll_ready()` once the
         // final checkpoint write became durable, but we also check here in case this block is what
         // completes the handoff condition.
-        if self.try_handoff_to_non_finalized_write() {
+        if let Some(ready) = ready {
+            // The checkpoint handoff already happened, so only this block and any queued
+            // descendants of its parent need sending.
+            self.send_ready_non_finalized(parent_hash, Some(ready));
+            self.prune_non_finalized_queues();
+        } else if self.try_handoff_to_non_finalized_write() {
             // The handoff happened on this call: the queued children, including the block just
             // queued above, were sent to the non-finalized write task.
         } else if !self.can_fork_chain_at(&parent_hash) {
             tracing::trace!("unready to verify, returning early");
         } else if self.block_write_sender.finalized.is_none() {
             // Wait until block commit task is ready to write non-finalized blocks before dequeuing them
-            self.send_ready_non_finalized_queued(parent_hash);
-
-            let finalized_tip_height = self.read_service.db.finalized_tip_height().expect(
-                "Finalized state must have at least one block before committing non-finalized state",
-            );
-
-            self.non_finalized_state_queued_blocks
-                .prune_by_height(finalized_tip_height);
-
-            self.non_finalized_block_write_sent_hashes
-                .prune_by_height(finalized_tip_height);
+            self.send_ready_non_finalized(parent_hash, None);
+            self.prune_non_finalized_queues();
         }
 
         rsp_rx
+    }
+
+    /// Drops queued and sent blocks at or below the finalized tip.
+    fn prune_non_finalized_queues(&mut self) {
+        let finalized_tip_height = self.read_service.db.finalized_tip_height().expect(
+            "Finalized state must have at least one block before committing non-finalized state",
+        );
+
+        self.non_finalized_state_queued_blocks
+            .prune_by_height(finalized_tip_height);
+
+        self.non_finalized_block_write_sent_hashes
+            .prune_by_height(finalized_tip_height);
     }
 
     /// Returns whether queueing a block with this parent lets the rest of this call drain it
@@ -1192,7 +1221,7 @@ impl StateService {
     /// parents that pass a liveness check but that nothing goes on to drain.
     fn drains_the_non_finalized_queue_now(&self, parent_hash: &block::Hash) -> bool {
         if self.block_write_sender.finalized.is_some() {
-            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
+            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized`
             // does not run for this parent and only the handoff empties the queue. The handoff
             // needs the last hash we sent to be durably written and the configured boundary to
             // be reached. Only an unbounded configuration can hand off based on a child alone.
@@ -1205,7 +1234,7 @@ impl StateService {
                 && self.checkpoint_handoff_is_ready(true);
         }
 
-        // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
+        // The queue is live: `send_ready_non_finalized` walks forward from this parent
         // later in this same call.
         self.can_fork_chain_at(parent_hash)
     }
@@ -1265,10 +1294,15 @@ impl StateService {
         queued_height >= self.full_verifier_utxo_lookahead
     }
 
-    /// Sends all queued blocks whose parents have recently arrived starting from `new_parent`
-    /// in breadth-first ordering to the block write task which will attempt to validate and commit them
-    #[tracing::instrument(level = "debug", skip(self, new_parent))]
-    fn send_ready_non_finalized_queued(&mut self, new_parent: block::Hash) {
+    /// Sends `ready`, a child of `new_parent` that was never queued, and then all queued blocks
+    /// whose parents have recently arrived starting from `new_parent`, to the block write task
+    /// which will attempt to validate and commit them.
+    #[tracing::instrument(level = "debug", skip(self, new_parent, ready))]
+    fn send_ready_non_finalized(
+        &mut self,
+        new_parent: block::Hash,
+        mut ready: Option<QueuedSemanticallyVerified>,
+    ) {
         use tokio::sync::mpsc::error::SendError;
         if let Some(non_finalized_block_write_sender) = &self.block_write_sender.non_finalized {
             let mut new_parents: Vec<block::Hash> = vec![new_parent];
@@ -1278,7 +1312,7 @@ impl StateService {
                     .non_finalized_state_queued_blocks
                     .dequeue_children(parent_hash);
 
-                for queued_child in queued_children {
+                for queued_child in ready.take().into_iter().chain(queued_children) {
                     let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned()
                     else {
                         Self::send_semantically_verified_block_error(
@@ -1293,7 +1327,7 @@ impl StateService {
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
                     let admission = queued_child.2.clone();
-                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let candidate_parent = queued_child.0.block.header().previous_block_hash;
                     let optimistic_relay_still_authorized = self
                         .optimistic_relay_still_authorized(admission.as_ref(), candidate_parent);
                     let send_result =
@@ -1867,7 +1901,7 @@ impl Service<Request> for StateService {
         poll
     }
 
-    #[instrument(name = "state", skip(self, req))]
+    #[instrument(name = "state", level = "debug", skip(self, req))]
     fn call(&mut self, req: Request) -> Self::Future {
         req.count_metric();
         let span = Span::current();
@@ -2227,6 +2261,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
             | Request::CheckPreparedMinedRelayEligibility(_)
+            | Request::CheckAuthDataCommitment(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
@@ -2745,7 +2780,7 @@ where
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
-            finalized_state::serve_block_roots(db, height..=height)
+            finalized_state::serve_block_roots(db, height..=height)?
                 .into_iter()
                 .next()
         } else if let Some(chain) = chain
@@ -2866,7 +2901,7 @@ impl Service<ReadRequest> for ReadStateService {
         Poll::Ready(Ok(()))
     }
 
-    #[instrument(name = "read_state", skip(self, req))]
+    #[instrument(name = "read_state", level = "debug", skip(self, req))]
     fn call(&mut self, req: ReadRequest) -> Self::Future {
         req.count_metric();
         let timer = CodeTimer::start_desc(req.variant_name());
@@ -2890,6 +2925,14 @@ impl Service<ReadRequest> for ReadStateService {
             .boxed();
         };
 
+        let workers = match &req {
+            ReadRequest::Tip
+            | ReadRequest::FinalizedTip
+            | ReadRequest::Depth(_)
+            | ReadRequest::BestChainNextMedianTimePast => self.db.control_read_worker_capacity(),
+            _ => self.db.read_worker_capacity(),
+        };
+
         if let ReadRequest::AcquireRetainedHeaderPath {
             peer,
             session_id,
@@ -2907,7 +2950,7 @@ impl Service<ReadRequest> for ReadStateService {
                 }
                 .boxed();
             };
-            let acquisition = timed_span.spawn_blocking(move || {
+            let acquisition = timed_span.spawn_blocking(workers, move || {
                 let outcome = reader.acquire_retained_path(
                     peer,
                     session_id,
@@ -3024,7 +3067,7 @@ impl Service<ReadRequest> for ReadStateService {
                     for height_value in (start.0 + 1)..=end.0 {
                         let height = block::Height(height_value);
                         if let Some(block) =
-                            read::block(best_chain.clone(), &state.db, height.into())
+                            read::block(best_chain.clone(), &state.db, height.into())?
                         {
                             blocks.insert(height, block);
                         }
@@ -3091,17 +3134,17 @@ impl Service<ReadRequest> for ReadStateService {
                 state.latest_best_chain(),
                 &state.db,
                 hash_or_height,
-            ))),
+            )?)),
 
             ReadRequest::AnyChainBlock(hash_or_height) => Ok(ReadResponse::Block(read::any_block(
                 state.latest_non_finalized_state().chain_iter(),
                 &state.db,
                 hash_or_height,
-            ))),
+            )?)),
 
             // Used by the get_block (raw) RPC and the StateService.
             ReadRequest::BlockAndSize(hash_or_height) => Ok(ReadResponse::BlockAndSize(
-                read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height),
+                read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height)?,
             )),
 
             // Used by the get_block (verbose) RPC and the StateService.
@@ -3112,20 +3155,20 @@ impl Service<ReadRequest> for ReadStateService {
                     .height_or_else(|hash| {
                         read::find::height_by_hash(best_chain.clone(), &state.db, hash)
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 let hash = hash_or_height
                     .hash_or_else(|height| {
                         read::find::hash_by_height(best_chain.clone(), &state.db, height)
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 let next_height = height.next()?;
                 let next_block_hash =
                     read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
 
-                let header = read::block_header(best_chain, &state.db, height.into())
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                let header = read::block_header_result(best_chain, &state.db, height.into())?
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 Ok(ReadResponse::BlockHeader {
                     header,
@@ -3137,7 +3180,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_raw_transaction RPC and the StateService.
             ReadRequest::Transaction(hash) => Ok(ReadResponse::Transaction(
-                read::mined_transaction(state.latest_best_chain(), &state.db, hash),
+                read::mined_transaction(state.latest_best_chain(), &state.db, hash)?,
             )),
 
             ReadRequest::AnyChainTransaction(hash) => {
@@ -3145,7 +3188,7 @@ impl Service<ReadRequest> for ReadStateService {
                     state.latest_non_finalized_state().chain_iter(),
                     &state.db,
                     hash,
-                )))
+                )?))
             }
 
             // Used by the getblock (verbose) RPC.
@@ -3221,18 +3264,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // Used by the StateService.
-            ReadRequest::FindBlockHeaders { known_blocks, stop } => Ok(ReadResponse::BlockHeaders(
-                read::find_chain_headers(
+            ReadRequest::FindBlockHeaders { known_blocks, stop } => {
+                Ok(ReadResponse::BlockHeaders(read::find_chain_headers(
                     state.latest_best_chain(),
                     &state.db,
                     known_blocks,
                     stop,
                     MAX_FIND_BLOCK_HEADERS_RESULTS,
-                )
-                .into_iter()
-                .map(|header| CountedHeader { header })
-                .collect(),
-            )),
+                )?))
+            }
 
             ReadRequest::HeaderLocator { permit: _permit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
@@ -3384,19 +3424,16 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::BlocksByHeightRange { start, count } => {
                 let snapshot = state.block_range_snapshot()?;
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                snapshot
-                                    .block_and_size(&state.db, height)
-                                    .map(|(block, size)| (height, block, size))
-                            })
-                    })
-                    .collect();
+                let mut blocks = Vec::new();
+                for offset in 0..count {
+                    let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+                        break;
+                    };
+                    let Some((block, size)) = snapshot.block_and_size(&state.db, height)? else {
+                        break;
+                    };
+                    blocks.push((height, block, size));
+                }
 
                 Ok(ReadResponse::Blocks(blocks))
             }
@@ -3404,20 +3441,18 @@ impl Service<ReadRequest> for ReadStateService {
             // Used by the indexer gRPC server.
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { start, count } => {
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                state
-                                    .db
-                                    .raw_block_bytes(height.into())
-                                    .map(|bytes| (height, bytes))
-                            })
-                    })
-                    .collect();
+                // A short response means the chain ended, so capacity refusal
+                // fails the whole read instead of returning a prefix.
+                let mut blocks = Vec::new();
+                for offset in 0..count {
+                    let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+                        break;
+                    };
+                    let Some(bytes) = state.db.raw_block_result(height.into())? else {
+                        break;
+                    };
+                    blocks.push((height, bytes));
+                }
 
                 Ok(ReadResponse::RawBlocks(blocks))
             }
@@ -3669,6 +3704,19 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::PreparedMinedRelayEligibility(eligibility))
             }
 
+            ReadRequest::CheckAuthDataCommitment(commitment) => {
+                let latest_non_finalized_state = state.latest_non_finalized_state();
+                Ok(ReadResponse::AuthDataCommitment(
+                    check::auth_data_commitment(
+                        &state.network,
+                        &latest_non_finalized_state,
+                        &state.db,
+                        commitment.block,
+                        commitment.auth_data_root,
+                    ),
+                ))
+            }
+
             // Used by the get_block and get_block_hash RPCs.
             ReadRequest::BestChainBlockHash(height) => Ok(ReadResponse::BlockHash(
                 read::hash_by_height(state.latest_best_chain(), &state.db, height),
@@ -3750,7 +3798,7 @@ impl Service<ReadRequest> for ReadStateService {
                     );
                 };
 
-                if semantically_verified.block.header.previous_block_hash != best_tip_hash {
+                if semantically_verified.block.header().previous_block_hash != best_tip_hash {
                     return Err("proposal is not based on the current best chain tip: \
                                     previous block hash must be the best chain tip"
                         .into());
@@ -3762,6 +3810,7 @@ impl Service<ReadRequest> for ReadStateService {
                 //
                 // TODO: Convert `CommitSemanticallyVerifiedError` to a new `ValidateProposalError`?
                 latest_non_finalized_state.disable_metrics();
+                latest_non_finalized_state.record_proposal_results();
 
                 write::validate_and_commit_non_finalized(
                     &state.db,
@@ -3773,23 +3822,18 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::TipBlockSize => {
-                // Respond with the length of the obtained block if any.
-                Ok(ReadResponse::TipBlockSize(
-                    state
-                        .best_tip()
-                        .and_then(|(tip_height, _)| {
-                            read::block_info(
-                                state.latest_best_chain(),
-                                &state.db,
-                                tip_height.into(),
-                            )
-                        })
-                        .map(|info| info.size().try_into().expect("u32 should fit in usize"))
-                        .or_else(|| {
-                            find::tip_block(state.latest_best_chain(), &state.db)
-                                .map(|b| b.zcash_serialized_size())
-                        }),
-                ))
+                let size = state
+                    .best_tip()
+                    .and_then(|(height, _)| {
+                        read::block_info(state.latest_best_chain(), &state.db, height.into())
+                    })
+                    .map(|info| usize::try_from(info.size()).expect("u32 fits in usize"));
+                let size = match size {
+                    Some(size) => Some(size),
+                    None => find::tip_block(state.latest_best_chain(), &state.db)?
+                        .map(|block| block.zcash_serialized_size()),
+                };
+                Ok(ReadResponse::TipBlockSize(size))
             }
 
             // Used by the getchaintips RPC.
@@ -3835,7 +3879,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
         };
 
-        timed_span.spawn_blocking(request_handler)
+        timed_span.spawn_blocking(workers, request_handler)
     }
 }
 
@@ -3845,7 +3889,7 @@ fn check_prepared_mined_relay_eligibility_for_state(
     db: &ZakuraDb,
     commitment: BlockCommitmentData,
 ) -> Result<PreparedMinedRelayEligibility, BoxError> {
-    let parent_hash = commitment.block.header.previous_block_hash;
+    let parent_hash = commitment.block.header().previous_block_hash;
     let parent_chain =
         non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
     let history_tree = read::tree::history_tree(parent_chain, db, parent_hash.into());

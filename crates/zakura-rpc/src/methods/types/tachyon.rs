@@ -80,7 +80,7 @@ impl GetTachyonBlockResponse {
         };
 
         let mut stamps = Vec::new();
-        for (transaction_index, transaction) in data.block.transactions.iter().enumerate() {
+        for (transaction_index, transaction) in data.block.transactions().enumerate() {
             let Some(shielded) = transaction.tachyon_shielded_data() else {
                 continue;
             };
@@ -114,7 +114,7 @@ impl GetTachyonBlockResponse {
 
         Ok(Self {
             hash: data.block.hash(),
-            previous_block_hash: data.block.header.previous_block_hash,
+            previous_block_hash: data.block.header().previous_block_hash,
             height: data.height,
             activation_height: data.activation_height,
             pool_height,

@@ -167,11 +167,11 @@ impl Eq for RetainedHeaderPath {}
 /// State registers the signal while it holds the capacity lock. A release remains
 /// observable even when the reactor receives the refusal after the release.
 #[derive(Clone, Debug)]
-pub struct ServingCapacitySignal(tokio::sync::watch::Sender<bool>);
+pub struct ServingCapacitySignal(zakura_rt::sync::watch::Sender<bool>);
 
 impl Default for ServingCapacitySignal {
     fn default() -> Self {
-        Self(tokio::sync::watch::channel(false).0)
+        Self(zakura_rt::sync::watch::channel(false).0)
     }
 }
 
@@ -444,11 +444,11 @@ pub enum ApplyHeaderTargetOutcome {
 /// Clones share one permit. Adapters must move a clone into accepted work before
 /// awaiting it, so dropping a timed-out caller cannot release that work's capacity.
 #[derive(Clone, Debug)]
-pub struct LocatorReadPermit(Arc<tokio::sync::OwnedSemaphorePermit>);
+pub struct LocatorReadPermit(Arc<zakura_rt::sync::OwnedSemaphorePermit>);
 
 impl LocatorReadPermit {
     /// Wrap a permit acquired by the locator scheduler.
-    pub fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+    pub fn new(permit: zakura_rt::sync::OwnedSemaphorePermit) -> Self {
         Self(Arc::new(permit))
     }
 }
@@ -531,8 +531,8 @@ pub trait Port: Send + Sync + 'static {
     /// first commit. It changes after each committed transition, so a change
     /// wakes work that follows the selected tip. The default never changes,
     /// for a port without durable header-chain state.
-    fn selected_chain(&self) -> tokio::sync::watch::Receiver<Option<EngineSnapshot>> {
-        tokio::sync::watch::channel(None).1
+    fn selected_chain(&self) -> zakura_rt::sync::watch::Receiver<Option<EngineSnapshot>> {
+        zakura_rt::sync::watch::channel(None).1
     }
 
     /// Report whether the selected chain contains the header `hash`.

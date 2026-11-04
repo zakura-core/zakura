@@ -1,16 +1,17 @@
+use zakura_rt::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
+
 use super::{
     config::*, events::*, peer_registry::SessionAdmission, regulated::status_sender::StatusSend,
     wire::*, *,
 };
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
-    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
-    ZakuraPeerId, FRAME_HEADER_BYTES,
-};
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    handle_pipe_exit, spawn_supervised_pipe, BudgetError, FramedRecv, FramedSend, LocalRole,
+    OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service, ServicePeerSnapshot,
+    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamQueueDepths,
+    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
@@ -36,7 +37,7 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
 /// regulation needs (`minimum_ordered_queue_capacity`).
 const BLOCK_SYNC_INBOUND_QUEUE_DEPTH: usize = 8;
 
-const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
+pub(crate) const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
     version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
@@ -51,10 +52,80 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     ..Stream::PERSISTENT
 }];
 
-/// The block-sync stream layout.
-#[cfg(test)]
-pub(crate) fn block_sync_streams() -> &'static [Stream] {
+/// The bytes one block-sync connection may hold, for a requester whose byte
+/// cwnd stops at `max_cwnd_bytes` and whose floor rescue may take
+/// `floor_bypass_slots` extra blocks.
+///
+/// - `receive` is what the peer may send us. The table's [`LocalRole::Responder`]
+///   bound covers the peer's GetBlocks requests and status announcements. Our
+///   own requests' responses do not end their exchange, so the table cannot
+///   bound them. The requester's cap bounds them instead: `max_cwnd_bytes`
+///   plus `floor_bypass_slots + 1` frames of `MAX_BS_FRAME_BYTES`, one per
+///   floor-bypass block and one for the frame in decode.
+/// - `output` is what we may queue for the peer: the largest response we
+///   serve (`LARGEST_SERVED_RESPONSE`) plus the send
+///   share of the bandwidth-delay product. That share is `max_cwnd_bytes`,
+///   since the same 1 Gbps × 250 ms product sizes the cwnd cap.
+///
+/// The receive share always holds one frame, because it counts at least one
+/// `MAX_BS_FRAME_BYTES`.
+///
+/// # Errors
+///
+/// [`BudgetError::Overflow`] if a term overflows `u64`, or the table's error
+/// from [`Stream::receive_bound`].
+pub const fn block_sync_reactor_budget(
+    max_cwnd_bytes: u64,
+    floor_bypass_slots: u32,
+) -> Result<ReactorBudget, BudgetError> {
+    const OVERFLOW: BudgetError = BudgetError::Overflow {
+        // A u8 discriminator always fits in u16.
+        message_type: MSG_BS_BLOCK as u16,
+    };
+    let table = match Stream::receive_bound(&BLOCK_SYNC_SERVICE_STREAMS, LocalRole::Responder) {
+        Ok(table) => table,
+        Err(error) => return Err(error),
+    };
+    // Widening u32 to u64 is lossless.
+    let frames = floor_bypass_slots as u64 + 1;
+    let Some(frame_bytes) = frames.checked_mul(MAX_BS_FRAME_BYTES as u64) else {
+        return Err(OVERFLOW);
+    };
+    let Some(receive) = table.checked_add(max_cwnd_bytes) else {
+        return Err(OVERFLOW);
+    };
+    let Some(receive) = receive.checked_add(frame_bytes) else {
+        return Err(OVERFLOW);
+    };
+    let largest = super::regulated::wire::LARGEST_SERVED_RESPONSE.output_bytes();
+    let Some(output) = largest.checked_add(max_cwnd_bytes) else {
+        return Err(OVERFLOW);
+    };
+    Ok(ReactorBudget { receive, output })
+}
+
+/// [`block_sync_reactor_budget`] at the default cwnd cap
+/// (`DEFAULT_BS_BBR_MAX_CWND_BYTES`) and floor bypass
+/// (`DEFAULT_BS_FLOOR_BYPASS_SLOTS`): 43,287,718 receive bytes and
+/// 35,554,458 output bytes.
+pub const BLOCK_SYNC_REACTOR_BUDGET: ReactorBudget =
+    match block_sync_reactor_budget(DEFAULT_BS_BBR_MAX_CWND_BYTES, DEFAULT_BS_FLOOR_BYPASS_SLOTS) {
+        Ok(budget) => budget.assert_frame_cap(MAX_BS_FRAME_BYTES),
+        Err(error) => panic!("{}", error.rule()),
+    };
+
+/// The block-sync stream layout, for the simulator's generated table checks.
+#[cfg(any(test, zakura_sim))]
+pub fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
+}
+
+/// The request limit a node running `config` enforces and advertises on
+/// each block-sync connection from the connection's start, for the
+/// simulator's role models.
+#[cfg(any(test, zakura_sim))]
+pub fn block_sync_serving_limit(config: &ZakuraBlockSyncConfig) -> u32 {
+    super::regulated::session::serving_max_inflight_requests(config)
 }
 
 /// Cloneable typed stream-6 sender.
@@ -182,9 +253,9 @@ impl BlockSyncPeerSession {
                     Instant::now() + Duration::from_millis(100)
                 }
             };
-            tokio::select! {
+            zakura_rt::select! {
                 () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
-                () = tokio::time::sleep_until(retry_at.into()) => {},
+                () = zakura_rt::time::sleep_until(retry_at) => {},
             }
         }
     }
@@ -215,7 +286,7 @@ impl BlockSyncPeerSession {
 
 /// Native stream-6 block-sync service scaffold.
 #[derive(Debug)]
-pub(crate) struct BlockSyncService {
+pub struct BlockSyncService {
     inner: Arc<BlockSyncServiceInner>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
@@ -322,11 +393,13 @@ impl BlockSyncServiceInner {
 
 impl BlockSyncService {
     pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
-        Self::new_with_startup(BlockSyncStartup::inert(config))
+        Self::new_with_startup(BlockSyncStartup::inert(config)?)
     }
 
-    /// Serve with a reactor that already validated its config.
-    pub(crate) fn new_with_handle(handle: BlockSyncHandle) -> Self {
+    /// Builds the service that admits block-sync sessions for the reactor
+    /// behind `handle`, which already validated its config, with no
+    /// sync-lifecycle gate.
+    pub fn new_with_handle(handle: BlockSyncHandle) -> Self {
         let config = handle
             .routine_wiring
             .as_ref()
@@ -373,6 +446,9 @@ impl BlockSyncService {
             },
             best_header_tip,
             header_tip,
+            config
+                .decoded_block_pool(0)
+                .map_err(BlockSyncStartError::InvalidConfig)?,
             config,
         );
         Self::new_with_startup(startup)
@@ -464,6 +540,7 @@ impl BlockSyncService {
         reserved: bool,
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
+            // Block sync still runs on std's clock.
             return SessionDemand::RetryAt(deadline);
         }
 
@@ -502,7 +579,7 @@ impl BlockSyncService {
                 let mut service_demand = self.service_demand.clone();
                 return SessionDemand::WaitForChange(Box::pin(async move {
                     if let Some(demand) = service_demand.as_mut() {
-                        tokio::select! {
+                        zakura_rt::select! {
                             changed = candidates.changed() => {
                                 if changed.is_err() {
                                     std::future::pending::<()>().await;
@@ -815,6 +892,19 @@ impl Service for BlockSyncService {
                 .lock()
                 .expect("block-sync gap-claim mutex is never poisoned")
                 .remove(&peer_id);
+            #[cfg(any(test, zakura_sim))]
+            if let Some((wiring, generation, _)) = &routine {
+                observe!(
+                    wiring.observer,
+                    super::block_sync_observe::BlockEvent::SessionAdmitted {
+                        peer: peer_id.clone(),
+                        conn_id,
+                        session_id,
+                        generation: *generation,
+                        direction: peer.direction,
+                    }
+                );
+            }
             // Queue the connect under the peer-map lock and before spawning. The
             // reactor then sees it after the disconnect of any session that ended
             // before this admission, and before this session's own disconnect.
@@ -860,6 +950,11 @@ impl Service for BlockSyncService {
                     Some((wiring, generation, fence)) => {
                         let serving = wiring.serving.session(
                             &peer_id,
+                            #[cfg(any(test, zakura_sim))]
+                            super::block_sync_observe::SessionKey {
+                                conn_id,
+                                generation,
+                            },
                             block_sync_session.request_sender(),
                             run_cancel.clone(),
                             connection_cancel_token.clone(),
@@ -881,7 +976,6 @@ impl Service for BlockSyncService {
                             wiring.config,
                             !re_admitted_after_no_progress,
                             generation,
-                            wiring.budget,
                             wiring.work,
                             wiring.registry,
                             wiring.received_throughput,
@@ -892,8 +986,11 @@ impl Service for BlockSyncService {
                             wiring.view,
                             run_cancel,
                             wiring.trace,
+                            wiring.decoded_pool.clone(),
                         );
-                        tokio::select! {
+                        #[cfg(any(test, zakura_sim))]
+                        let routine = routine.with_observer(wiring.observer);
+                        zakura_rt::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),
                             result = routine.run() => result,
@@ -907,6 +1004,7 @@ impl Service for BlockSyncService {
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
+            "block_sync_pipe",
             peer_id.clone(),
             service_cancel_token.clone(),
             on_teardown,
@@ -1035,7 +1133,7 @@ impl Service for BlockSyncService {
 /// exists to act on them.
 async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Result<(), SinkReject> {
     loop {
-        tokio::select! {
+        zakura_rt::select! {
             () = cancel.cancelled() => return Ok(()),
             frame = recv.recv() => {
                 if frame.is_none() {
@@ -1070,7 +1168,7 @@ mod requester_session_tests {
             with_session_slots(usize::MAX, usize::MAX),
         ] {
             assert!(matches!(
-                spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone())),
+                BlockSyncStartup::inert(config.clone()).and_then(spawn_block_sync_reactor),
                 Err(BlockSyncStartError::InvalidConfig(_))
             ));
             assert!(matches!(
@@ -1093,7 +1191,7 @@ mod requester_session_tests {
     async fn a_handle_serves_with_the_config_its_reactor_validated() {
         let config = with_session_slots(7, 9);
         let (handle, _actions, _task) =
-            spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()))
+            spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()).unwrap())
                 .expect("valid block-sync config");
         let service = BlockSyncService::new_with_handle(handle);
         assert_eq!(service.inner.config.peer_limits, config.peer_limits);
@@ -1323,6 +1421,7 @@ mod regulated_frame_tests {
     async fn an_older_connection_cannot_clear_a_newer_gap_claim() {
         let service = BlockSyncService::new_with_startup(
             BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .unwrap()
                 .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
@@ -1384,6 +1483,7 @@ mod regulated_frame_tests {
     async fn status_cadence_survives_session_replacement_and_ends_with_its_connection() {
         let service = BlockSyncService::new_with_startup(
             BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .unwrap()
                 .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
@@ -1465,6 +1565,7 @@ mod regulated_frame_tests {
     async fn reconnect_churn_returns_block_sync_maps_to_baseline() {
         let service = BlockSyncService::new_with_startup(
             BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .unwrap()
                 .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
@@ -1562,6 +1663,7 @@ mod regulated_frame_tests {
         let service = Arc::new(
             BlockSyncService::new_with_startup(
                 BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .unwrap()
                     .with_range_source(Arc::new(EmptySource)),
             )
             .expect("valid block-sync config"),
@@ -1593,6 +1695,7 @@ mod regulated_frame_tests {
         for (version, depth) in [(2, 2), (3, 1), (3, 2)] {
             let service = BlockSyncService::new_with_startup(
                 BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .unwrap()
                     .with_range_source(Arc::new(EmptySource)),
             )
             .expect("valid block-sync config");
@@ -1646,7 +1749,9 @@ mod regulated_frame_tests {
         config.peer_limits.max_outbound_peers = 1;
         config.peer_limits.max_pending_escalations = 2;
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(config).with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(config)
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![47; 32]).unwrap();
@@ -1703,5 +1808,55 @@ mod regulated_frame_tests {
         };
         assert_eq!(cadence.capacity, 22);
         assert_eq!(cadence.send_interval, Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod reactor_budget_tests {
+    use super::*;
+
+    /// The default budget, term by term: status cadence 22 × 53 B, the
+    /// protocol's 32,768 in-flight GetBlocks × 9 B, the 32 MiB cwnd cap and
+    /// three frames on receive; one 2 MB block response plus the cwnd cap on
+    /// output.
+    #[test]
+    fn the_default_block_sync_budget_counts_each_term() {
+        let table = 22 * 53 + 32_768 * 9;
+        let frame = 3 * 1024 * 1024 + 8;
+        assert_eq!(u64::from(MAX_BS_FRAME_BYTES), frame);
+        let response = 2_000_000 + 1 + 9 + 2 * 8;
+        assert_eq!(
+            BLOCK_SYNC_REACTOR_BUDGET,
+            ReactorBudget {
+                receive: table + 32 * 1024 * 1024 + 3 * frame,
+                output: response + 32 * 1024 * 1024,
+            }
+        );
+        assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.receive, 43_287_718);
+        assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.output, 35_554_458);
+        let config = ZakuraBlockSyncConfig::default();
+        assert_eq!(
+            block_sync_reactor_budget(config.bbr_max_cwnd_bytes, config.floor_bypass_slots),
+            Ok(BLOCK_SYNC_REACTOR_BUDGET)
+        );
+    }
+
+    /// Each extra floor-bypass slot adds one frame to receive, the cwnd cap adds
+    /// to both sides, and overflow is an error instead of a wrapped bound.
+    #[test]
+    fn the_block_sync_budget_follows_its_parameters() {
+        let zero = block_sync_reactor_budget(0, 0).unwrap();
+        assert!(zero.check_frame_cap(MAX_BS_FRAME_BYTES).is_ok());
+        let more = block_sync_reactor_budget(1000, 4).unwrap();
+        assert_eq!(
+            more.receive - zero.receive,
+            1000 + 4 * u64::from(MAX_BS_FRAME_BYTES)
+        );
+        assert_eq!(more.output - zero.output, 1000);
+        let overflow = BudgetError::Overflow {
+            message_type: u16::from(MSG_BS_BLOCK),
+        };
+        assert_eq!(block_sync_reactor_budget(u64::MAX, 0), Err(overflow));
+        assert_eq!(block_sync_reactor_budget(0, u32::MAX).map(|_| ()), Ok(()));
     }
 }

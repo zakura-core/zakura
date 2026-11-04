@@ -70,8 +70,8 @@ use crate::{
 };
 
 use constants::{
-    CAPABILITIES_FIELD, MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP, MUTABLE_FIELD,
-    NONCE_RANGE_FIELD, NOT_SYNCED_ERROR_CODE,
+    CAPABILITIES_FIELD, MAX_TIME_SINCE_CHAIN_TIP, MUTABLE_FIELD, NONCE_RANGE_FIELD,
+    NOT_SYNCED_ERROR_CODE,
 };
 pub use miner_address::MinerAddress;
 pub use parameters::{
@@ -816,6 +816,7 @@ where
     prepared_candidates: PreparedCandidateResolver,
 
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
+    #[allow(dead_code)]
     sync_status: SyncStatus,
 
     /// A channel to send successful block submissions to the block gossip task,
@@ -923,6 +924,7 @@ where
     }
 
     /// Returns the sync status.
+    #[allow(dead_code)]
     pub fn sync_status(&self) -> SyncStatus {
         self.sync_status.clone()
     }
@@ -1031,13 +1033,13 @@ pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcR
 }
 
 /// Validates a proposal, registering its work ID only after successful verification.
-pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
+pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip>(
     mut block_verifier_router: BlockVerifierRouter,
     block_proposal_bytes: Vec<u8>,
     net: &Network,
     latest_chain_tip: Tip,
-    sync_status: SyncStatus,
-    prepared_work: Option<(PreparedCandidateResolver, &str)>,
+    prepared_candidates: PreparedCandidateResolver,
+    work_id: Option<&str>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -1049,9 +1051,8 @@ where
         + Sync
         + 'static,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    check_synced_to_tip(net, latest_chain_tip, sync_status)?;
+    check_synced_to_tip(net, latest_chain_tip)?;
 
     let block: Block = match block_proposal_bytes.zcash_deserialize_into() {
         Ok(block) => block,
@@ -1075,19 +1076,24 @@ where
         .await
         .map_err(|error| ErrorObject::new(0, error.to_string()))?
         .call(zakura_consensus::Request::Prepare {
-            block: block.clone(),
+            block: block.clone().into(),
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;
 
     if block_verifier_router_response.is_ok() {
-        if let Some((prepared_candidates, work_id)) = prepared_work {
-            prepared_candidates.insert(
+        // Keep the proposal so that submitting it solved, by work ID or in full, reuses it.
+        match work_id {
+            Some(work_id) => prepared_candidates.insert(
                 block,
                 work_id,
                 zakura_consensus::PreparedCandidateSource::ClientProposal,
                 net,
-            );
+            ),
+            None => prepared_candidates.retain(
+                block,
+                zakura_consensus::PreparedCandidateSource::ClientProposal,
+            ),
         }
     }
 
@@ -1106,33 +1112,27 @@ where
 
 // - State and syncer checks
 
-/// Returns an error if Zebra is not synced to the consensus chain tip.
-/// Returns early with `Ok(())` if Proof-of-Work is disabled on the provided `network`.
+/// Returns an error if the local best tip's block time is more than
+/// [`MAX_TIME_SINCE_CHAIN_TIP`] older than the local clock.
+///
+/// Returns early with `Ok(())` on test networks.
 /// This error might be incorrect if the local clock is skewed.
-pub fn check_synced_to_tip<Tip, SyncStatus>(
-    network: &Network,
-    latest_chain_tip: Tip,
-    sync_status: SyncStatus,
-) -> RpcResult<()>
+pub fn check_synced_to_tip<Tip>(network: &Network, latest_chain_tip: Tip) -> RpcResult<()>
 where
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     if network.is_a_test_network() {
         return Ok(());
     }
 
-    // The tip estimate may not be the same as the one coming from the state
-    // but this is ok for an estimate
-    let (estimated_distance_to_chain_tip, local_tip_height) = latest_chain_tip
-        .estimate_distance_to_network_chain_tip(network)
+    let (local_tip_height, local_tip_time) = latest_chain_tip
+        .best_tip_height_and_block_time()
         .ok_or_misc_error("no chain tip available yet")?;
+    let time_since_tip = chrono::Utc::now() - local_tip_time;
 
-    if !sync_status.is_close_to_tip()
-        || estimated_distance_to_chain_tip > MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP
-    {
+    if time_since_tip > MAX_TIME_SINCE_CHAIN_TIP {
         tracing::info!(
-            ?estimated_distance_to_chain_tip,
+            ?time_since_tip,
             ?local_tip_height,
             "Zakura has not synced to the chain tip. \
              Hint: check your network connection, clock, and time zone settings."
@@ -1142,7 +1142,7 @@ where
             NOT_SYNCED_ERROR_CODE,
             format!(
                 "Zakura has not synced to the chain tip, \
-                 estimated distance: {estimated_distance_to_chain_tip:?}, \
+                 time since local tip: {time_since_tip}, \
                  local tip: {local_tip_height:?}. \
                  Hint: check your network connection, clock, and time zone settings."
             ),

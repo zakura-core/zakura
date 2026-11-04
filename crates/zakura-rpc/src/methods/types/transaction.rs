@@ -1,5 +1,6 @@
 //! Transaction-related types.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::methods::arrayhex;
@@ -1075,12 +1076,15 @@ pub struct OrchardAction {
 pub struct Tachyon {
     /// The Tachyon actions in wire order.
     actions: Vec<TachyonAction>,
-    /// The net value of Tachyon actions in ZEC.
+    /// The signed net value of Tachyon actions minus the maximum fee in ZEC.
     #[serde(rename = "valueBalance")]
     value_balance: f64,
-    /// The net value of Tachyon actions in zatoshis.
+    /// The signed net value of Tachyon actions minus the maximum fee in zatoshis.
     #[serde(rename = "valueBalanceZat")]
     value_balance_zat: i64,
+    /// The maximum-fee note value commitment.
+    #[serde(rename = "cvFeeMax", with = "hex")]
+    fee_max_commitment: [u8; 32],
     /// The bundle binding signature on the transaction sighash.
     #[serde(rename = "bindingSig", with = "hex")]
     binding_sig: [u8; 64],
@@ -1113,7 +1117,10 @@ pub struct TachyonAction {
 pub enum TachyonStamp {
     /// A proof stamp carried by an autonome or aggregate transaction.
     Proof {
-        /// Digest of the action descriptors covered by this proof.
+        /// The chosen fee in zatoshis.
+        #[serde(rename = "feeZat")]
+        fee_zat: u64,
+        /// Digest of the action and fee descriptors covered by this proof.
         #[serde(with = "hex")]
         coverage: [u8; 32],
         /// The historic Tachyon pool state for which this proof is valid.
@@ -1134,6 +1141,9 @@ pub enum TachyonStamp {
     },
     /// A pointer stamp carried by an adjunct transaction.
     Pointer {
+        /// The chosen fee in zatoshis.
+        #[serde(rename = "feeZat")]
+        fee_zat: u64,
         /// The witnessed transaction ID of the covering aggregate.
         #[serde(rename = "aggregateId", with = "hex")]
         aggregate_id: [u8; 64],
@@ -1259,6 +1269,7 @@ impl Tachyon {
                 .collect(),
             value_balance: Zec::from(value_balance).lossy_zec(),
             value_balance_zat,
+            fee_max_commitment: bundle.fee_max_commitment.into(),
             binding_sig,
             memo: bundle.memo.clone(),
             stamp,
@@ -1326,6 +1337,7 @@ impl TachyonStamp {
             .collect();
 
         Self::Proof {
+            fee_zat: u64::from(stamp.fee),
             coverage: stamp.coverage,
             anchor: anchor
                 .try_into()
@@ -1339,15 +1351,9 @@ impl TachyonStamp {
     }
 
     fn from_pointer(stamp: &zcash_tachyon::PointerStamp) -> Self {
-        let mut aggregate_id = Vec::new();
-        stamp
-            .write(&mut aggregate_id)
-            .expect("writing a validated Tachyon pointer stamp to memory cannot fail");
-
         Self::Pointer {
-            aggregate_id: aggregate_id
-                .try_into()
-                .expect("a Tachyon aggregate ID has a 64-byte encoding"),
+            fee_zat: u64::from(stamp.fee),
+            aggregate_id: stamp.wtxid.into(),
         }
     }
 }
@@ -1396,7 +1402,7 @@ impl TransactionObject {
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
     pub fn from_transaction(
-        tx: Arc<Transaction>,
+        tx: impl AsRef<Transaction>,
         height: Option<block::Height>,
         confirmations: Option<i64>,
         network: &Network,
@@ -1405,9 +1411,10 @@ impl TransactionObject {
         in_active_chain: Option<bool>,
         txid: transaction::Hash,
     ) -> Self {
+        let tx = tx.as_ref();
         let block_time = block_time.map(|bt| bt.timestamp());
         Self {
-            hex: tx.clone().into(),
+            hex: tx.into(),
             height: if in_active_chain.unwrap_or_default() {
                 height.map(|height| height.0 as i32)
             } else if block_hash.is_some() {
@@ -1804,11 +1811,16 @@ mod tests {
         let aggregate_id = [0xee; 64];
         let signed = signed_tachyon_bundle();
         let bundle = zcash_tachyon::Bundle {
+            fee_max_commitment: signed.fee_max_commitment,
             actions: signed.actions,
             value_balance: signed.value_balance,
             binding_sig: signed.binding_sig,
             memo: signed.memo,
-            stamp: PointerStamp::try_from(aggregate_id).expect("the aggregate ID is nonzero"),
+            stamp: PointerStamp {
+                wtxid: zcash_tachyon::AggregateId::try_from(aggregate_id)
+                    .expect("the aggregate ID is nonzero"),
+                fee: value::Positive::try_from(7u64).unwrap(),
+            },
         };
         let transaction_object = transaction_object_with_tachyon(TachyonBundle::Adjunct(bundle));
         let transaction_json = serde_json::to_value(&transaction_object)
@@ -1818,6 +1830,14 @@ mod tests {
             .tachyon
             .expect("Tachyon data should be present in verbose RPC output");
         assert_eq!(tachyon.actions.len(), 1);
+        assert_eq!(transaction_json["tachyon"]["stamp"]["feeZat"], 7);
+        assert_eq!(
+            transaction_json["tachyon"]["cvFeeMax"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         assert_eq!(tachyon.value_balance_zat, 100);
         assert_eq!(tachyon.value_balance, 0.000_001);
         assert_eq!(tachyon.memo, b"rpc-test");
@@ -1855,11 +1875,12 @@ mod tests {
         });
         let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
         let bundle = signed_tachyon_bundle().stamp(ProofStamp {
+            fee: value::Positive::try_from(7u64).unwrap(),
             coverage,
             anchor: zcash_tachyon::Anchor::default(),
             tachygram_set: tachygram_set.commit(),
             tachygrams: tachygrams.into_iter().collect(),
-            proof: Box::new(ragu::Proof::trivial()),
+            proof: Box::new(ragu::Proof::bootstrap()),
         });
         let transaction_object = transaction_object_with_tachyon(TachyonBundle::Proven(bundle));
         let transaction_json = serde_json::to_value(transaction_object)
@@ -1904,10 +1925,19 @@ mod tests {
             |alpha| ask.derive_action_private(&alpha).derive_action_public(),
         );
 
-        BundlePlan::new(vec![spend], Vec::new())
-            .with_memo(b"rpc-test".to_vec())
-            .sign(&mut rng, &[0u8; 32], &ask)
-            .expect("the test Tachyon bundle signs")
+        BundlePlan::new(
+            vec![spend],
+            Vec::new(),
+            Note {
+                pk: spending_key.derive_payment_key(),
+                value: value::Positive::ZERO,
+                psi: nullifier::Trapdoor::random(&mut rng),
+                rcm: CommitmentTrapdoor::random(&mut rng),
+            },
+        )
+        .with_memo(b"rpc-test".to_vec())
+        .sign(&mut rng, &[0u8; 32], &ask)
+        .expect("the test Tachyon bundle signs")
     }
 
     #[cfg(zcash_unstable = "nutachyon")]
@@ -1922,7 +1952,7 @@ mod tests {
             sapling_shielded_data: None,
             orchard_shielded_data: None,
             ironwood_shielded_data: None,
-            tachyon_shielded_data: Some(TachyonShieldedData(bundle)),
+            tachyon_shielded_data: Some(Box::new(TachyonShieldedData(bundle))),
         });
 
         TransactionObject::from_transaction(

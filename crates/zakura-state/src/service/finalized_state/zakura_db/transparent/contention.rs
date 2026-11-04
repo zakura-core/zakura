@@ -1,5 +1,6 @@
 //! Manual state-progress probe for blocks packed to the serialized size limit.
 
+use std::sync::Arc;
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},

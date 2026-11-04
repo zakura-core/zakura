@@ -43,9 +43,9 @@
 //! | A following frame is written only after its request started | `a_following_frame_needs_its_request_started` |
 //! | Retirement during a following frame's write closes the connection | `retirement_during_a_following_write_closes_the_connection` |
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
+use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, PoisonError};
 
 use crate::zakura::{
     transport::{FrameWriteClaim, GuardedFrameSlot},
@@ -117,7 +117,7 @@ impl WriterFence {
         }))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, FenceState> {
+    fn lock(&self) -> MutexGuard<'_, FenceState> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -155,12 +155,7 @@ impl WriterFence {
 
 impl ExchangeState {
     /// Lock the fence, then the phase.
-    fn lock(
-        &self,
-    ) -> (
-        std::sync::MutexGuard<'_, FenceState>,
-        std::sync::MutexGuard<'_, Phase>,
-    ) {
+    fn lock(&self) -> (MutexGuard<'_, FenceState>, MutexGuard<'_, Phase>) {
         let state = self.fence.lock();
         let phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         (state, phase)

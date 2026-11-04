@@ -24,7 +24,7 @@ use zakurad::components::sync::end_of_support::{
 
 /// The release supports this height and halts at the next block.
 fn last_supported_height() -> Height {
-    Height(3_640_098)
+    Height(3_643_309)
 }
 
 /// The number of blocks per day at the halt height, which is past the ZIP 259
@@ -134,18 +134,20 @@ fn end_of_support_date() {
     assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
 }
 
-/// Keep Mainnet EOS within one block before December 5, 2026.
+/// Keep Mainnet EOS within one target-spaced block of December 5, 2026.
 #[test]
-fn mainnet_end_of_support_precedes_december_5() {
+fn mainnet_end_of_support_targets_december_5() {
     let network = Network::Mainnet;
-    // Fixed projection anchor from the September 22 Mainnet release-state
-    // bundle's `mainnet-vct-manifest.json`. Keep this independent of release
-    // height bumps and later bundle imports so they cannot move the deadline.
+    // Fixed projection anchor: Mainnet block 3,539,449, hash
+    // 000000000038f877e08b47ee92a5d1d99856b160471d4697dad11344cdc712ba,
+    // read from Mainnet RPC on November 3, 2026 (KST). Keep its block timestamp
+    // independent of release height bumps and later bundle imports so they
+    // cannot move the deadline.
     let reference_time = Utc
-        .with_ymd_and_hms(2026, 9, 22, 5, 46, 39)
+        .with_ymd_and_hms(2026, 11, 2, 15, 49, 5)
         .single()
         .expect("the reference timestamp is valid");
-    let reference_height = Height(3_490_665);
+    let reference_height = Height(3_539_449);
     let deadline = Utc
         .with_ymd_and_hms(2026, 12, 5, 0, 0, 0)
         .single()
@@ -168,10 +170,10 @@ fn mainnet_end_of_support_precedes_december_5() {
         + chrono::Duration::seconds(post_nu7_blocks * i64::from(POST_NU7_POW_TARGET_SPACING));
 
     assert!(
-        estimated_halt < deadline
-            && deadline - estimated_halt
+        estimated_halt >= deadline
+            && estimated_halt - deadline
                 < chrono::Duration::seconds(i64::from(POST_NU7_POW_TARGET_SPACING)),
-        "Mainnet EOS must be within one block before {deadline}; estimated halt \
+        "Mainnet EOS must be within one target-spaced block after {deadline}; estimated halt \
          is {estimated_halt} at {first_unsupported_height:?}.",
     );
 }

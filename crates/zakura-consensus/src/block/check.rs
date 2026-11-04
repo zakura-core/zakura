@@ -1,6 +1,6 @@
 //! Consensus check functions
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 
@@ -8,7 +8,7 @@ use zakura_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
     },
-    block::{Block, Hash, Header, Height},
+    block::{BlockRef, Hash, Header, Height},
     parameters::{
         subsidy::{
             founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
@@ -58,22 +58,22 @@ impl UnmatchedCoinbaseOutputs {
 
 /// Checks if there is exactly one coinbase transaction in `Block`,
 /// and if that coinbase transaction is the first transaction in the block.
-/// Returns the coinbase transaction is successful.
+/// Returns a borrowed coinbase transaction on success.
 ///
 /// > A transaction that has a single transparent input with a null prevout field,
 /// > is called a coinbase transaction. Every block has a single coinbase
 /// > transaction as the first transaction in the block.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-pub fn coinbase_is_first(block: &Block) -> Result<Arc<transaction::Transaction>, BlockError> {
+pub fn coinbase_is_first(block: &BlockRef) -> Result<&transaction::Transaction, BlockError> {
     // # Consensus
     //
     // > A block MUST have at least one transaction
     //
     // <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     let first = block
-        .transactions
-        .first()
+        .transactions()
+        .next()
         .ok_or(BlockError::NoTransactions)?;
     // > The first transaction in a block MUST be a coinbase transaction,
     // > and subsequent transactions MUST NOT be coinbase transactions.
@@ -84,7 +84,7 @@ pub fn coinbase_is_first(block: &Block) -> Result<Arc<transaction::Transaction>,
     // > field, is called a coinbase transaction.
     //
     // <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-    let mut rest = block.transactions.iter().skip(1);
+    let mut rest = block.transactions().skip(1);
     if !first.is_coinbase() {
         Err(TransactionError::CoinbasePosition)?;
     }
@@ -95,7 +95,7 @@ pub fn coinbase_is_first(block: &Block) -> Result<Arc<transaction::Transaction>,
         Err(TransactionError::CoinbaseAfterFirst)?;
     }
 
-    Ok(first.clone())
+    Ok(first)
 }
 
 /// Returns `Ok(ExpandedDifficulty)` if the`difficulty_threshold` of `header` is at least as difficult as
@@ -171,12 +171,33 @@ pub fn equihash_solution_is_valid(
     PowPolicy::validating(network).validate_solution(header)
 }
 
+/// Returns `true` if `header` passes the context-free proof of work checks of the block verifier
+/// on `network`, or if `network` waives them.
+///
+/// This lets callers reject blocks that cost nothing to make before spending anything on them.
+/// It does not check the block's difficulty against the chain.
+pub fn proof_of_work_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> bool {
+    match PowPolicy::for_network(network) {
+        Ok(policy) if policy.is_authenticated_custom_waiver() => true,
+        Ok(_) => {
+            difficulty_is_valid(header, network, height, hash).is_ok()
+                && equihash_solution_is_valid(header, network).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
 /// subsidy in `block` is valid for `network`
 ///
 /// [3.9]: https://zips.z.cash/protocol/protocol.pdf#subsidyconcepts
 pub fn subsidy_is_valid(
-    block: &Block,
+    block: &BlockRef,
     net: &Network,
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<DeferredPoolBalanceChange, BlockError> {
@@ -188,8 +209,8 @@ pub fn subsidy_is_valid(
 
     let mut coinbase_outputs = UnmatchedCoinbaseOutputs::new(
         block
-            .transactions
-            .first()
+            .transactions()
+            .next()
             .ok_or(SubsidyError::NoCoinbase)?
             .outputs(),
     );
@@ -447,8 +468,8 @@ pub fn time_is_valid_at(
 /// ZIP 218 sets `SproutBlockJoinSplitLimit` to zero. Zakura rejects any
 /// JoinSplit at or after NU7, because ZIP 2003 disallows the only transaction
 /// versions that can carry one. See [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
-pub fn shielded_action_limits_are_valid<'a>(
-    transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
+pub fn shielded_action_limits_are_valid<T: AsRef<Transaction>>(
+    transactions: impl IntoIterator<Item = T>,
     height: Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
@@ -458,7 +479,7 @@ pub fn shielded_action_limits_are_valid<'a>(
 
     let totals = transactions
         .into_iter()
-        .map(|tx| tx.shielded_action_counts())
+        .map(|tx| tx.as_ref().shielded_action_counts())
         .fold(
             ShieldedActionCounts::default(),
             ShieldedActionCounts::saturating_add,
@@ -522,17 +543,17 @@ pub fn shielded_action_limits_are_valid<'a>(
 /// [7.6]: https://zips.z.cash/protocol/nu5.pdf#blockheader
 pub fn merkle_root_validity(
     network: &Network,
-    block: &Block,
+    block: &BlockRef,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
     // Check the header commitments first. The network upgrade check trusts the coinbase height,
     // which a peer can rewrite without changing a V5 block's hash.
     let merkle_root = transaction_hashes.iter().cloned().collect();
 
-    if block.header.merkle_root != merkle_root {
+    if block.header().merkle_root != merkle_root {
         return Err(BlockError::BadMerkleRoot {
             actual: merkle_root,
-            expected: block.header.merkle_root,
+            expected: block.header().merkle_root,
         });
     }
 

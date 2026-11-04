@@ -15,6 +15,7 @@ use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use semver::Version;
 
 use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
+use zakura_node_services::block_memory::{DecodedBlockPool, ReadMemoryBudget};
 
 use crate::{
     config::database_format_version_on_disk,
@@ -70,6 +71,47 @@ pub mod arbitrary;
 
 /// Wrapper struct to ensure high-level `zakura-state` database access goes through the correct API.
 ///
+/// Admission and memory limits for reads. Clones share every limit.
+///
+/// Worker slots bound transient parser memory: each worker reads one result at a time.
+/// One retained-byte budget bounds every result that leaves its worker.
+#[derive(Clone, Debug)]
+struct ReadCapacity {
+    /// Shared admission for blocking read-service jobs, including cancelled waiters' jobs.
+    workers: crate::request::ReadWorkerPool,
+
+    /// Admission reserved for bounded chain-tip and depth queries.
+    control_workers: crate::request::ReadWorkerPool,
+
+    /// Retained bytes of disk results until their final holders drop them.
+    memory: ReadMemoryBudget,
+
+    /// Disk blocks' final-holder ownership. Its count never refuses: `memory` bounds it.
+    blocks: DecodedBlockPool,
+
+    /// Chain-tip publication cannot spend ordinary callers' result capacity.
+    chain_tip_blocks: DecodedBlockPool,
+}
+
+impl ReadCapacity {
+    fn new(config: &Config) -> Self {
+        Self {
+            workers: crate::request::ReadWorkerPool::new(usize::from(
+                config.read_concurrency_limit.get(),
+            )),
+            control_workers: crate::request::ReadWorkerPool::new(
+                crate::constants::CONTROL_READ_CONCURRENCY,
+            ),
+            memory: ReadMemoryBudget::new(config.read_result_byte_limit()),
+            blocks: DecodedBlockPool::for_block_count(std::num::NonZeroU64::MAX),
+            chain_tip_blocks: DecodedBlockPool::for_block_count(
+                std::num::NonZeroU64::new(crate::constants::CHAIN_TIP_BLOCK_RETENTION)
+                    .expect("chain-tip retention has a nonzero fixed allowance"),
+            ),
+        }
+    }
+}
+
 /// `rocksdb` allows concurrent writes through a shared reference,
 /// so database instances are cloneable. When the final clone is dropped,
 /// the database is closed.
@@ -104,6 +146,9 @@ pub struct ZakuraDb {
     //
     // TODO: move the generic upgrade code and fields to DiskDb
     format_change_handle: Option<DbFormatChangeThreadHandle>,
+
+    /// Admission and memory limits for reads, shared by database clones.
+    read_capacity: ReadCapacity,
 
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
@@ -200,6 +245,20 @@ impl ZakuraDb {
             }
         }
 
+        // Format 31 contains pre-fee bundles and different Poseidon commitments. Never
+        // relabel those bytes as format 32, even though production format 30 is reusable.
+        #[cfg(zcash_unstable = "nutachyon")]
+        if !config.ephemeral && format_version_in_code.major == 32 {
+            let old_path = config.db_path(&db_kind, 31, network);
+            if disk_version
+                .as_ref()
+                .is_some_and(|version| version.major == 31)
+                || (disk_version.is_none() && old_path.exists())
+            {
+                return Err(StateInitError::TachyonResetRequired { path: old_path });
+            }
+        }
+
         let disk_version = if read_only {
             disk_version
         } else {
@@ -224,6 +283,10 @@ impl ZakuraDb {
             let db_path = config.db_path(&db_kind, format_version_in_code.major, network);
             return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
         }
+
+        // Reject read limits that cannot fund their workers before touching the disk.
+        let read_memory_bound = config.read_memory_bound()?;
+        tracing::info!(read_memory_bound, "checked the read memory bound");
 
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
@@ -271,6 +334,7 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
+            read_capacity: ReadCapacity::new(config),
             debug_skip_format_upgrades,
             format_change_handle: None,
             db: disk_db,
@@ -377,6 +441,16 @@ impl ZakuraDb {
     /// indicate that Zebra has finished applying any required db format upgrades.
     pub fn finished_format_upgrades(&self) -> bool {
         self.db.finished_format_upgrades()
+    }
+
+    /// Return the shared admission pool for blocking read-service jobs.
+    pub(crate) fn read_worker_capacity(&self) -> crate::request::ReadWorkerPool {
+        self.read_capacity.workers.clone()
+    }
+
+    /// Return the admission pool that bulk reads cannot occupy.
+    pub(crate) fn control_read_worker_capacity(&self) -> crate::request::ReadWorkerPool {
+        self.read_capacity.control_workers.clone()
     }
 
     /// Returns config for this database.

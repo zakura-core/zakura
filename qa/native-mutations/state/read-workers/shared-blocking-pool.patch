@@ -1,0 +1,11 @@
+--- a/crates/zakurad/src/components/tokio.rs
++++ b/crates/zakurad/src/components/tokio.rs
+@@ -26,7 +26,7 @@
+ /// idle read threads cost nothing.
+ pub(crate) fn new_runtime(read_workers: usize) -> Runtime {
+     tokio::runtime::Builder::new_multi_thread()
+-        .max_blocking_threads(DEFAULT_MAX_BLOCKING_THREADS.saturating_add(read_workers))
++        .max_blocking_threads(DEFAULT_MAX_BLOCKING_THREADS.max(read_workers))
+         .enable_all()
+         .build()
+         .expect("runtime building should not fail")

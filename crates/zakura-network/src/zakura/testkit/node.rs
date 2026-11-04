@@ -233,6 +233,9 @@ pub struct ZakuraTestNodeBuilder {
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
     block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
+    /// The observer the node's handler reports transport events to.
+    #[cfg(test)]
+    transport_observer: Option<Arc<dyn crate::zakura::TransportObserver>>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +295,8 @@ impl ZakuraTestNodeBuilder {
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
             block_range_source: None,
+            #[cfg(test)]
+            transport_observer: None,
         }
     }
 
@@ -403,6 +408,16 @@ impl ZakuraTestNodeBuilder {
         snapshots: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     ) -> Self {
         self.header_snapshot_override = Some(snapshots);
+        self
+    }
+
+    /// Report the node's transport events to `observer`.
+    #[cfg(test)]
+    pub(crate) fn transport_observer(
+        mut self,
+        observer: Arc<dyn crate::zakura::TransportObserver>,
+    ) -> Self {
+        self.transport_observer = Some(observer);
         self
     }
 
@@ -535,16 +550,24 @@ impl ZakuraTestNodeBuilder {
             header_sync_actions = Some((shutdown, actions));
             header_sync_handle = Some(handle.clone());
 
+            let block_frontiers = BlockSyncFrontiers {
+                finalized_height: frontiers.finalized_height,
+                verified_block_tip: frontiers.verified_block_tip,
+                verified_block_hash: verified_block_tip_hash,
+            };
+            let block_header_tip = best_header_tip.unwrap_or(anchor);
             let mut startup = BlockSyncStartup::new(
-                BlockSyncFrontiers {
-                    finalized_height: frontiers.finalized_height,
-                    verified_block_tip: frontiers.verified_block_tip,
-                    verified_block_hash: verified_block_tip_hash,
-                },
-                best_header_tip.unwrap_or(anchor),
+                block_frontiers,
+                block_header_tip,
                 handle.subscribe_tip(),
+                (self.block_sync_config.clone())
+                    .decoded_block_pool(10_000)
+                    .expect("fixture decoded allowance fits"),
                 self.block_sync_config.clone(),
             );
+            // Block sync schedules body work only under committed authority.
+            startup.committed_views =
+                Some(startup_committed_view(block_frontiers, block_header_tip));
             if let Some(source) = self.block_range_source {
                 startup = startup.with_range_source(source);
             }
@@ -601,6 +624,10 @@ impl ZakuraTestNodeBuilder {
         if let Some(supported_capabilities) = self.supported_capabilities {
             handler = handler.with_supported_capabilities(supported_capabilities);
         }
+        #[cfg(test)]
+        if let Some(observer) = self.transport_observer {
+            handler = handler.with_transport_observer(observer);
+        }
         let handler = handler.with_local_node_id(endpoint.local_id());
         endpoint.serve(handler.clone())?;
         let quic = endpoint;
@@ -646,6 +673,46 @@ impl Drop for ZakuraTestNode {
             }
         }
     }
+}
+
+/// A committed header view that owns body work from `frontiers` toward
+/// `best_header_tip`. A test node publishes it once at startup; its header-tip
+/// watch then moves the body-download target.
+pub(crate) fn startup_committed_view(
+    frontiers: BlockSyncFrontiers,
+    best_header_tip: (block::Height, block::Hash),
+) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>> {
+    let finalized = zakura_header_chain::Frontier::new(
+        frontiers.finalized_height,
+        frontiers.verified_block_hash,
+    );
+    let header_best = zakura_header_chain::Frontier::new(best_header_tip.0, best_header_tip.1);
+    let snapshot = zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::default(),
+        header_generation: zakura_header_chain::HeaderGeneration::new(0),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized,
+            header_best,
+            verified_best: zakura_header_chain::Frontier::new(
+                frontiers.verified_block_tip,
+                frontiers.verified_block_hash,
+            ),
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header_best.hash,
+        ),
+        oldest_retained_height: finalized.height,
+        alarms: Default::default(),
+    };
+    let (_views, views) =
+        tokio::sync::watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+            snapshot,
+            zakura_header_chain::BodyWorkEpoch::default(),
+        )));
+    views
 }
 
 #[cfg(test)]
@@ -792,7 +859,9 @@ mod tests {
     async fn outbound_dial_reports_the_admitted_ip_before_registration() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        use crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip;
+        use crate::zakura::handler::{
+            serve_reported_native_dial_connection, DialRegistration, DialReport,
+        };
 
         let peer = ZakuraTestNode::builder(9205)
             .spawn()
@@ -823,14 +892,19 @@ mod tests {
                 .expect("dialer spawns");
             let mut peer_set_rx = node.supervisor().subscribe();
             let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
+            let (registration_tx, registration_rx) = tokio::sync::oneshot::channel();
+            let report = DialReport {
+                admitted_ip: admitted_ip_tx,
+                registration: registration_tx,
+            };
             let endpoint = node.endpoint();
             let limits = node.limits().clone();
             let dial = tokio::spawn(async move {
-                serve_native_dial_connection_reporting_admitted_ip(
+                serve_reported_native_dial_connection(
                     &endpoint,
                     peer_addr,
                     &limits,
-                    Some(admitted_ip_tx),
+                    Some(report),
                     crate::zakura::handler::NativeDialKind::Maintained,
                 )
                 .await
@@ -847,6 +921,14 @@ mod tests {
                 admitted_ip_rx.try_recv().ok(),
                 Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 "dialer {seed} reports the loopback path its handshake won, before registration",
+            );
+            assert_eq!(
+                tokio::time::timeout(TEST_NET_TIMEOUT, registration_rx)
+                    .await
+                    .expect("the dial reports its registration before the timeout")
+                    .ok(),
+                Some(DialRegistration::Registered),
+                "dialer {seed} reports its own registration",
             );
 
             dial.abort();

@@ -1,6 +1,9 @@
 //! Fixed test vectors for state contextual validation checks.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Duration};
+use zakura_chain::block::Block;
 
 use zakura_chain::{
     block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
@@ -109,7 +112,7 @@ fn block_commitment_uses_the_precomputed_auth_data_root() {
     let child = child.set_block_commitment(block_commitment);
 
     block_commitment_is_valid_for_chain_history(
-        child.clone(),
+        child.clone().into(),
         &network,
         &history_tree,
         Some(auth_data_root),
@@ -122,7 +125,7 @@ fn block_commitment_uses_the_precomputed_auth_data_root() {
         "the forged root must differ from the block body root"
     );
     let error = block_commitment_is_valid_for_chain_history(
-        child,
+        child.into(),
         &network,
         &history_tree,
         Some(forged_auth_data_root),

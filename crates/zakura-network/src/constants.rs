@@ -5,9 +5,7 @@
 //! - peer connection limits, and
 //! - peer connection timeouts.
 
-use std::{collections::HashMap, time::Duration};
-
-use lazy_static::lazy_static;
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 // TODO: should these constants be split into protocol also?
 use crate::protocol::external::types::*;
@@ -84,6 +82,26 @@ pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 ///       to an IP based on the default configuration, but it will accept more inbound
 ///       connections to an IP.
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
+
+/// The default advert window of a block at or above the full size.
+///
+/// This will be used as `Config.advert_window_min` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
+
+/// The default advert window of a block at or below the small size.
+///
+/// This will be used as `Config.advert_window_max` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+
+/// The default block size that gets the maximum advert window, 100 KiB.
+///
+/// This will be used as `Config.advert_window_small_size_bytes` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES: u64 = 102_400;
+
+/// The default block size that gets the minimum advert window, 1.5 MiB.
+///
+/// This will be used as `Config.advert_window_full_size_bytes` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES: u64 = 1_572_864;
 
 /// The default peerset target size.
 ///
@@ -424,31 +442,39 @@ pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
 /// The maximum number of banned IP addresses to be stored in-memory at any time.
 pub const MAX_BANNED_IPS: usize = 20_000;
 
-lazy_static! {
-    /// The minimum network protocol version accepted by this crate for each network,
-    /// represented as a network upgrade.
-    ///
-    /// The minimum protocol version is used to check the protocol versions of our
-    /// peers during the initial block download. After the initial block download,
-    /// we use the current block height to select the minimum network protocol
-    /// version.
-    ///
-    /// If peer versions are too old, we will disconnect from them.
-    ///
-    /// The minimum network protocol version typically changes after Mainnet and
-    /// Testnet network upgrades.
-    // TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
-    // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
-    pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<NetworkKind, Version> = {
+/// The minimum network protocol version accepted by this crate for each network,
+/// represented as a network upgrade.
+///
+/// The minimum protocol version is used to check the protocol versions of our
+/// peers during the initial block download. After the initial block download,
+/// we use the current block height to select the minimum network protocol
+/// version.
+///
+/// If peer versions are too old, we will disconnect from them.
+///
+/// The minimum network protocol version typically changes after Mainnet and
+/// Testnet network upgrades.
+// TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
+// TODO: Move the value here to a field on `testnet::Parameters` (#8367)
+pub static INITIAL_MIN_NETWORK_PROTOCOL_VERSION: LazyLock<HashMap<NetworkKind, Version>> =
+    LazyLock::new(|| {
         let mut hash_map = HashMap::new();
 
-        hash_map.insert(NetworkKind::Mainnet, Version::min_specified_for_upgrade(&Mainnet, Nu6_2));
-        hash_map.insert(NetworkKind::Testnet, Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2));
-        hash_map.insert(NetworkKind::Regtest, Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2));
+        hash_map.insert(
+            NetworkKind::Mainnet,
+            Version::min_specified_for_upgrade(&Mainnet, Nu6_2),
+        );
+        hash_map.insert(
+            NetworkKind::Testnet,
+            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2),
+        );
+        hash_map.insert(
+            NetworkKind::Regtest,
+            Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2),
+        );
 
         hash_map
-    };
-}
+    });
 
 /// The timeout for DNS lookups.
 ///

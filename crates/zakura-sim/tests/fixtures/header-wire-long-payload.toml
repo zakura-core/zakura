@@ -1,0 +1,9 @@
+# The committed fuzz input `header-wire-long-payload.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `long-payload` scenario, and
+# `header-wire-long-payload.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "bddcf194282150062bf053a220a353eef271f01a36c978795cc9d48f914e56b4"
+scenario_sha256 = "9eda5e01716f4c5ea5d814c5b953f785fcd0b6f93409fa7798a68bbe4f0d038c"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

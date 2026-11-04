@@ -4,6 +4,9 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "prometheus")]
+mod prometheus;
+
 /// Starts the Prometheus metrics endpoint, if one is configured.
 ///
 /// # Panics
@@ -14,9 +17,7 @@ pub fn start_endpoint(config: &Config) {
     if let Some(addr) = config.endpoint_addr {
         info!("Trying to open metrics endpoint at {}...", addr);
 
-        let endpoint_result = metrics_exporter_prometheus::PrometheusBuilder::new()
-            .with_http_listener(addr)
-            .install();
+        let endpoint_result = prometheus::install(addr);
 
         match endpoint_result {
             Ok(()) => {
@@ -32,7 +33,7 @@ pub fn start_endpoint(config: &Config) {
                 info!("Opened metrics endpoint at {}", addr);
             }
             Err(e) => panic!(
-                "Opening metrics endpoint listener {addr:?} failed: {e:?}. \
+                "Opening metrics endpoint listener {addr:?} failed: {e}. \
                      Hint: Check if another zakurad or zcashd process is running. \
                      Try changing the metrics endpoint_addr in the Zakura config.",
             ),

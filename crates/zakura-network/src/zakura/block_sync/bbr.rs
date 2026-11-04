@@ -1,7 +1,6 @@
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Duration};
+
+use zakura_rt::time::Instant;
 
 use super::{
     config::{CwndUnit, ZakuraBlockSyncConfig},
@@ -128,6 +127,11 @@ struct BbrParams {
     /// Minimum / cold-start cwnd, in the active unit (`bbr_min_cwnd` blocks or
     /// `bbr_min_cwnd_bytes` bytes).
     min_cwnd: usize,
+    /// Hard ceiling on the cwnd in the active unit: `bbr_max_cwnd_bytes` (`C`)
+    /// under `Bytes`. Unbounded under `Blocks`, which counts requests; there the
+    /// work queue's owner cap bounds the reserved bytes. At least `min_cwnd`,
+    /// because config validation requires `C ≥ bbr_min_cwnd_bytes`.
+    max_cwnd: usize,
     startup_cwnd: usize,
     rtprop_window: Duration,
     delivery_rate_window: Duration,
@@ -151,7 +155,7 @@ struct BbrParams {
 
 impl BbrParams {
     fn from_config(config: &ZakuraBlockSyncConfig) -> Self {
-        let (min_cwnd, startup_cwnd) = match config.bbr_cwnd_unit {
+        let (min_cwnd, max_cwnd, startup_cwnd) = match config.bbr_cwnd_unit {
             CwndUnit::Blocks => {
                 let min = usize::try_from(config.bbr_min_cwnd).unwrap_or(1).max(1);
                 // Cold start opens at the configured initial window until the first
@@ -159,7 +163,7 @@ impl BbrParams {
                 let startup = usize::try_from(config.initial_inflight_requests)
                     .unwrap_or(min)
                     .max(min);
-                (min, startup)
+                (min, usize::MAX, startup)
             }
             CwndUnit::Bytes => {
                 // Byte denomination: the floor (and cold-start window) is the
@@ -169,13 +173,17 @@ impl BbrParams {
                 let min = usize::try_from(config.bbr_min_cwnd_bytes)
                     .unwrap_or(usize::MAX)
                     .max(1);
-                (min, min)
+                let max = usize::try_from(config.bbr_max_cwnd_bytes)
+                    .unwrap_or(usize::MAX)
+                    .max(min);
+                (min, max, min)
             }
         };
         Self {
             unit: config.bbr_cwnd_unit,
             cwnd_gain: f64::from(config.bbr_cwnd_gain_percent) / 100.0,
             min_cwnd,
+            max_cwnd,
             startup_cwnd,
             rtprop_window: config.bbr_rtprop_window,
             delivery_rate_window: config.bbr_delivery_rate_window,
@@ -544,6 +552,9 @@ impl BbrState {
             // failure mechanism must respect). `delay_cap` is unbounded until the gate binds.
             BbrPhase::ProbeBw => self.cwnd_cap.min(self.delay_cap).max(self.params.min_cwnd),
         };
+        // The hard cap `max_cwnd` binds after the floor: config validation keeps
+        // `min_cwnd ≤ max_cwnd`, so the clamp never lowers the floor.
+        let base = base.min(self.params.max_cwnd);
         // Fallback `0` (not `base`): if the arithmetic is non-finite, seal, don't open.
         rounded_usize(base as f64 * factor, 0)
     }
@@ -574,13 +585,14 @@ impl BbrState {
         }
     }
 
-    /// Target cwnd in the active unit = `max(min_cwnd, BDP × gain)`. `None` until a
-    /// delivery sample exists within the window, so the cwnd stays at the cold-start
-    /// value until then.
+    /// Target cwnd in the active unit = `max(min_cwnd, BDP × gain)`, at most
+    /// `max_cwnd`. `None` until a delivery sample exists within the window, so the
+    /// cwnd stays at the cold-start value until then. Capping the stored target keeps
+    /// the delay gate and the timeout dip working from the window actually applied.
     fn cwnd_target(&self, now: Instant) -> Option<usize> {
         let bdp = self.bdp(now)?;
         let cwnd = rounded_usize(bdp * self.params.cwnd_gain, self.params.min_cwnd);
-        Some(cwnd.max(self.params.min_cwnd))
+        Some(cwnd.max(self.params.min_cwnd).min(self.params.max_cwnd))
     }
 
     pub(super) fn has_fresh_bdp(&self, now: Instant) -> bool {
@@ -1089,7 +1101,6 @@ mod bbr_tests {
         let now = Instant::now();
         for _ in 0..n {
             window.outstanding.push(OutstandingBlockRange {
-                write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
                 request: BlockRangeRequest {
                     owner: super::super::test_work_owner(),
                     start_height: block::Height(0),
@@ -1195,7 +1206,6 @@ mod bbr_tests {
             // A `u32` index; the test count is tiny so the cast is safe.
             let height = block::Height(1 + i as u32);
             window.outstanding.push(OutstandingBlockRange {
-                write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
                 request: BlockRangeRequest {
                     owner: super::super::test_work_owner(),
                     start_height: height,
@@ -1619,5 +1629,145 @@ mod bbr_tests {
             recovered_window >= 3 * floor - floor / 10,
             "the window reaches the gain-3 target after the transient, got {recovered_window}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cwnd_cap_tests {
+    use proptest::prelude::*;
+
+    use zakura_chain::block;
+
+    use super::super::{
+        config::{DEFAULT_BS_BBR_MAX_CWND_BYTES, DEFAULT_BS_BBR_MIN_CWND_BYTES},
+        state::DownloadWindow,
+    };
+    use super::*;
+
+    fn byte_window(max_cwnd_bytes: u64) -> DownloadWindow {
+        DownloadWindow::new(&ZakuraBlockSyncConfig {
+            bbr_max_cwnd_bytes: max_cwnd_bytes,
+            ..Default::default()
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// Let time pass.
+        Wait { ms: u64 },
+        /// Remember a delivery snapshot, as a request send does.
+        Send,
+        /// Complete the oldest remembered request with one body.
+        Deliver { elapsed_ms: u64, bytes: u64 },
+        /// Expire requests without a body.
+        Timeout { count: usize },
+        /// A short response.
+        Short,
+        /// A body after its request timed out.
+        Late,
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            1 => (0..400u64).prop_map(|ms| Step::Wait { ms }),
+            3 => Just(Step::Send),
+            4 => (1..800u64, 1..=block::MAX_BLOCK_BYTES)
+                .prop_map(|(elapsed_ms, bytes)| Step::Deliver { elapsed_ms, bytes }),
+            1 => (1..4usize).prop_map(|count| Step::Timeout { count }),
+            1 => Just(Step::Short),
+            1 => Just(Step::Late),
+        ]
+    }
+
+    proptest! {
+        /// Under any delivery trace, the byte cwnd and the headroom it grants
+        /// without a floor bypass stay at or below `bbr_max_cwnd_bytes`. Caps
+        /// between the minimum cwnd and 4 × the default make the cap bind on
+        /// fast traces and stay slack on slow ones.
+        #[test]
+        fn the_byte_cwnd_never_exceeds_its_cap(
+            max_cwnd_bytes in DEFAULT_BS_BBR_MIN_CWND_BYTES..=4 * DEFAULT_BS_BBR_MAX_CWND_BYTES,
+            steps in proptest::collection::vec(step(), 1..200),
+        ) {
+            let mut window = byte_window(max_cwnd_bytes);
+            let mut now = Instant::now();
+            let mut sent = VecDeque::new();
+            for step in steps {
+                match step {
+                    Step::Wait { ms } => now += Duration::from_millis(ms),
+                    Step::Send => sent.push_back(window.delivery_snapshot(now)),
+                    Step::Deliver { elapsed_ms, bytes } => {
+                        let elapsed = Duration::from_millis(elapsed_ms);
+                        now += Duration::from_millis(1);
+                        let snapshot = sent
+                            .pop_front()
+                            .unwrap_or_else(|| window.delivery_snapshot(now - elapsed));
+                        window.record_delivery(now, elapsed, 1, bytes, snapshot);
+                    }
+                    Step::Timeout { count } => window.record_timeout(count),
+                    Step::Short => window.penalize_short_response(1),
+                    Step::Late => window.credit_late_delivery(),
+                }
+                let cwnd = window.bbr_effective_cwnd_bytes().expect("the default unit is bytes");
+                prop_assert!(cwnd <= max_cwnd_bytes, "cwnd {cwnd} > cap {max_cwnd_bytes}");
+                let headroom = window.cwnd_byte_headroom_at(0, now).expect("bytes unit");
+                prop_assert!(headroom <= max_cwnd_bytes);
+            }
+        }
+    }
+
+    /// Delivers `rate` bytes per second of 1 MB bodies at round trip `rtt` for
+    /// 25 seconds, and returns the byte cwnd. The first round trips poison the
+    /// delay gate's residual base (cold-start bandwidth is low), so the run
+    /// lasts past that 10-second window. It ends between ProbeRTT drains, which
+    /// fall at 10 s and 20 s.
+    fn settled_cwnd(max_cwnd_bytes: u64, rate: u64, rtt: Duration) -> u64 {
+        let mut window = byte_window(max_cwnd_bytes);
+        let body = 1_000_000u64;
+        let gap = Duration::from_nanos(body * 1_000_000_000 / rate);
+        let start = Instant::now();
+        let mut now = start;
+        let mut sent = VecDeque::new();
+        while now.saturating_duration_since(start) < Duration::from_secs(25) {
+            sent.push_back((now, window.delivery_snapshot(now)));
+            now += gap;
+            while let Some(&(at, snapshot)) = sent.front() {
+                if now.saturating_duration_since(at) < rtt {
+                    break;
+                }
+                sent.pop_front();
+                window.record_delivery(now, rtt, 1, body, snapshot);
+            }
+        }
+        assert_eq!(window.bbr_phase_code(), 0, "the run ends in ProbeBW");
+        window.bbr_effective_cwnd_bytes().unwrap()
+    }
+
+    /// At 1 Gbps and 250 ms the 3× gain asks for about 94 MB; the default cap
+    /// holds it at 32 MiB, still above the 31.25 MB the link needs in flight. A
+    /// 400 Mbps, 100 ms peer's 15 MB window is untouched.
+    #[test]
+    fn the_cap_binds_only_above_its_bandwidth_delay_product() {
+        let gigabit = 125_000_000;
+        let capped = settled_cwnd(
+            DEFAULT_BS_BBR_MAX_CWND_BYTES,
+            gigabit,
+            Duration::from_millis(250),
+        );
+        assert_eq!(capped, DEFAULT_BS_BBR_MAX_CWND_BYTES);
+        assert!(capped >= gigabit / 4);
+        let unbounded = settled_cwnd(u64::MAX, gigabit, Duration::from_millis(250));
+        assert!(unbounded > 90_000_000, "{unbounded}");
+        let slow = 50_000_000;
+        let uncapped = settled_cwnd(
+            DEFAULT_BS_BBR_MAX_CWND_BYTES,
+            slow,
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            uncapped,
+            settled_cwnd(u64::MAX, slow, Duration::from_millis(100))
+        );
+        assert!(uncapped < DEFAULT_BS_BBR_MAX_CWND_BYTES, "{uncapped}");
     }
 }

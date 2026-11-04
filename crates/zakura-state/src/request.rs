@@ -12,6 +12,7 @@ use std::{
 };
 
 use tokio::sync::watch;
+use zakura_node_services::block_memory::BlockHandle;
 
 use tower::{BoxError, Service, ServiceExt};
 #[cfg(zcash_unstable = "nutachyon")]
@@ -356,7 +357,11 @@ impl std::str::FromStr for HashOrHeight {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticallyVerifiedBlock {
     /// The block to commit to the state.
-    pub block: Arc<Block>,
+    ///
+    /// This struct owns the allocations derived from the block, `new_outputs` and
+    /// `transaction_hashes`, alongside the block's charge. They have no charge of
+    /// their own, because each has a size proportional to the decoded block.
+    pub block: BlockHandle,
     /// The hash of the block.
     pub hash: block::Hash,
     /// The height of the block.
@@ -373,7 +378,7 @@ pub struct SemanticallyVerifiedBlock {
     /// earlier transaction.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
     pub transaction_hashes: Arc<[transaction::Hash]>,
@@ -397,7 +402,7 @@ pub struct SemanticallyVerifiedBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockCommitmentData {
     /// The block whose header commits to the prepared body and parent history.
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
     /// The precomputed authorizing-data commitment root, when available.
     pub auth_data_root: Option<AuthDataRoot>,
 }
@@ -447,7 +452,12 @@ pub struct CheckpointVerifiedBlock(pub(crate) SemanticallyVerifiedBlock);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextuallyVerifiedBlock {
     /// The block to commit to the state.
-    pub(crate) block: Arc<Block>,
+    pub(crate) block: BlockHandle,
+
+    /// One copy of the block's header, made when the block enters the
+    /// non-finalized state. Header-chain records share it, so they neither
+    /// pin the block's body nor copy the header on every commit.
+    pub(crate) header: Arc<block::Header>,
 
     /// The hash of the block.
     pub(crate) hash: block::Hash,
@@ -552,7 +562,7 @@ pub enum FinalizableBlock {
 /// Note that it's the constructor's responsibility to ensure that all data is valid and verified.
 pub struct FinalizedBlock {
     /// The block to commit to the state.
-    pub(super) block: Arc<Block>,
+    pub(super) block: BlockHandle,
     /// The hash of the block.
     pub(super) hash: block::Hash,
     /// The height of the block.
@@ -589,7 +599,7 @@ impl FinalizedBlock {
             block: block.block,
             hash: block.hash,
             height: block.height,
-            new_outputs: block.new_outputs,
+            new_outputs: Arc::unwrap_or_clone(block.new_outputs),
             transaction_hashes: block.transaction_hashes,
             treestate,
             deferred_pool_balance_change: block.deferred_pool_balance_change,
@@ -608,7 +618,7 @@ impl FinalizableBlock {
 
     #[cfg(test)]
     /// Extract a [`Block`] from a [`FinalizableBlock`] variant.
-    pub fn inner_block(&self) -> Arc<Block> {
+    pub fn inner_block(&self) -> BlockHandle {
         match self {
             FinalizableBlock::Checkpoint {
                 checkpoint_verified,
@@ -629,8 +639,8 @@ impl From<CheckpointVerifiedBlock> for FinalizableBlock {
     }
 }
 
-impl From<Arc<Block>> for FinalizableBlock {
-    fn from(block: Arc<Block>) -> Self {
+impl From<BlockHandle> for FinalizableBlock {
+    fn from(block: BlockHandle) -> Self {
         Self::from(CheckpointVerifiedBlock::from(block))
     }
 }
@@ -664,6 +674,22 @@ impl ContextuallyVerifiedBlock {
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
+        Self::with_block_and_shared_spent_utxos(
+            network,
+            semantically_verified,
+            Arc::new(spent_outputs),
+        )
+    }
+
+    /// Like [`Self::with_block_and_spent_utxos`], but retains an already shared spent-output
+    /// map so proposal validation and the solved block can use the same allocation.
+    ///
+    /// The same input requirements and panic conditions apply.
+    pub(crate) fn with_block_and_shared_spent_utxos(
+        network: &Network,
+        semantically_verified: SemanticallyVerifiedBlock,
+        spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+    ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
             hash,
@@ -682,15 +708,69 @@ impl ContextuallyVerifiedBlock {
         )?;
 
         Ok(Self {
+            header: Arc::new(*block.header()),
             block,
             hash,
             height,
-            new_outputs: Arc::new(new_outputs),
-            spent_outputs: Arc::new(spent_outputs),
+            new_outputs,
+            spent_outputs,
             transaction_hashes,
             chain_value_pool_change,
             receipt_order,
         })
+    }
+
+    /// The contextual verification of a solved block, taken from the proposal it was mined from.
+    ///
+    /// A proposal and the block mined from it have the same transactions, so the outputs they
+    /// create and spend, their transaction IDs, and their effect on the chain value pools are
+    /// the same, and are shared rather than worked out again. Only the block itself, its hash,
+    /// and its arrival order come from the solved block.
+    ///
+    /// Call only with a `proposal` whose transactions equal `solved`'s, which is what
+    /// `PreparedProposal::for_solved_block` establishes.
+    ///
+    /// # Panics
+    ///
+    /// If the two blocks are at different heights, which equal transactions rule out, because
+    /// the height is read from the coinbase transaction.
+    pub(crate) fn from_solved_proposal(
+        solved: SemanticallyVerifiedBlock,
+        proposal: &ContextuallyVerifiedBlock,
+    ) -> Self {
+        assert_eq!(
+            solved.height, proposal.height,
+            "a solved block and its proposal share a coinbase transaction, and so a height",
+        );
+
+        // Every field of `solved` is named here, with no `..`, so adding one is a compile error
+        // until its author decides whether it comes from the solved block or the proposal.
+        let SemanticallyVerifiedBlock {
+            block,
+            hash,
+            receipt_order,
+            height: _,
+            // The proposal created the same outputs from the same transactions, and worked out
+            // the same transaction IDs, so those are shared instead of being built again.
+            new_outputs: _,
+            transaction_hashes: _,
+            // Already folded into the proposal's chain value pool change.
+            deferred_pool_balance_change: _,
+            // Not part of a contextual verification: the commitment check reads the block.
+            auth_data_root: _,
+        } = solved;
+
+        Self {
+            header: Arc::new(*block.header()),
+            block,
+            hash,
+            height: proposal.height,
+            new_outputs: Arc::clone(&proposal.new_outputs),
+            spent_outputs: Arc::clone(&proposal.spent_outputs),
+            transaction_hashes: Arc::clone(&proposal.transaction_hashes),
+            chain_value_pool_change: proposal.chain_value_pool_change,
+            receipt_order,
+        }
     }
 }
 
@@ -698,10 +778,11 @@ impl CheckpointVerifiedBlock {
     /// Creates a [`CheckpointVerifiedBlock`] from [`Block`] with optional deferred balance and
     /// optional pre-computed hash.
     pub fn new(
-        block: Arc<Block>,
+        block: impl Into<BlockHandle>,
         hash: Option<block::Hash>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Self {
+        let block = block.into();
         let mut block = Self::with_hash(block.clone(), hash.unwrap_or(block.hash()));
         block.0.deferred_pool_balance_change = deferred_pool_balance_change;
         block
@@ -711,12 +792,17 @@ impl CheckpointVerifiedBlock {
     ///
     /// Note: a [`CheckpointVerifiedBlock`] isn't actually finalized
     /// until [`Request::CommitCheckpointVerifiedBlock`] returns success.
-    pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
+    pub fn with_hash(block: impl Into<BlockHandle>, hash: block::Hash) -> Self {
+        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("checkpoint verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let transaction_hashes: Arc<[_]> =
+            block.view().transactions().map(|tx| tx.hash()).collect();
+        let new_outputs = Arc::new(transparent::new_ordered_outputs(
+            &block,
+            &transaction_hashes,
+        ));
 
         Self(SemanticallyVerifiedBlock {
             block,
@@ -751,12 +837,16 @@ impl CheckpointVerifiedBlock {
 
 impl SemanticallyVerifiedBlock {
     /// Creates [`SemanticallyVerifiedBlock`] from [`Block`] and [`block::Hash`].
-    pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
+    pub fn with_hash(block: impl Into<BlockHandle>, hash: block::Hash) -> Self {
+        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
         let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let new_outputs = Arc::new(transparent::new_ordered_outputs(
+            &block,
+            &transaction_hashes,
+        ));
 
         Self {
             block,
@@ -780,20 +870,41 @@ impl SemanticallyVerifiedBlock {
     }
 }
 
+impl From<Arc<Block>> for FinalizableBlock {
+    fn from(block: Arc<Block>) -> Self {
+        Self::from(BlockHandle::from(block))
+    }
+}
+
 impl From<Arc<Block>> for CheckpointVerifiedBlock {
     fn from(block: Arc<Block>) -> Self {
-        CheckpointVerifiedBlock(SemanticallyVerifiedBlock::from(block))
+        Self::from(BlockHandle::from(block))
     }
 }
 
 impl From<Arc<Block>> for SemanticallyVerifiedBlock {
     fn from(block: Arc<Block>) -> Self {
+        Self::from(BlockHandle::from(block))
+    }
+}
+
+impl From<BlockHandle> for CheckpointVerifiedBlock {
+    fn from(block: BlockHandle) -> Self {
+        CheckpointVerifiedBlock(SemanticallyVerifiedBlock::from(block))
+    }
+}
+
+impl From<BlockHandle> for SemanticallyVerifiedBlock {
+    fn from(block: BlockHandle) -> Self {
         let hash = block.hash();
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
         let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let new_outputs = Arc::new(transparent::new_ordered_outputs(
+            &block,
+            &transaction_hashes,
+        ));
 
         Self {
             block,
@@ -810,13 +921,12 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
 
 /// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
 fn transaction_hashes_and_auth_data_root(
-    block: &Block,
+    block: &block::BlockRef,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
     use rayon::prelude::*;
 
     let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
-        .transactions
-        .par_iter()
+        .parallel_transactions()
         .map(|transaction| transaction.txid_and_auth_digest())
         .unzip();
 
@@ -877,7 +987,7 @@ mod tests {
         ));
 
         let semantic = SemanticallyVerifiedBlock::from(cloned);
-        assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+        assert!(Arc::ptr_eq(&semantic.new_outputs, &contextual.new_outputs));
 
         let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
             &Network::Mainnet,
@@ -889,7 +999,7 @@ mod tests {
         let expected_outputs = unique.new_outputs.as_ref().clone();
 
         let semantic = SemanticallyVerifiedBlock::from(unique);
-        assert_eq!(semantic.new_outputs, expected_outputs);
+        assert_eq!(*semantic.new_outputs, expected_outputs);
     }
 
     #[test]
@@ -939,7 +1049,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: Arc::unwrap_or_clone(valid.new_outputs),
+            new_outputs: valid.new_outputs,
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
@@ -956,7 +1066,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             block: finalized.block,
             hash: finalized.hash,
             height: finalized.height,
-            new_outputs: finalized.new_outputs,
+            new_outputs: Arc::new(finalized.new_outputs),
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
             auth_data_root: None,
@@ -1354,7 +1464,8 @@ pub enum Request {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
-    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
+    /// their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {
@@ -1495,6 +1606,12 @@ pub enum Request {
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
+    /// Checks whether the block's header commits to the authorizing data in its body,
+    /// using the history tree of the block's parent.
+    ///
+    /// Returns [`Response::AuthDataCommitment`].
+    CheckAuthDataCommitment(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`Response::BestChainNextMedianTimePast`] when successful.
@@ -1591,6 +1708,7 @@ impl Request {
             Request::CheckPreparedMinedRelayEligibility(_) => {
                 "check_prepared_mined_relay_eligibility"
             }
+            Request::CheckAuthDataCommitment(_) => "check_auth_data_commitment",
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
@@ -1772,7 +1890,8 @@ pub enum ReadRequest {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
-    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
+    /// their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {
@@ -1978,7 +2097,7 @@ pub enum ReadRequest {
     ///
     /// Returns
     ///
-    /// [`ReadResponse::RawBlocks(Vec<(block::Height, Vec<u8>)>)`](crate::ReadResponse::RawBlocks).
+    /// [`ReadResponse::RawBlocks`](crate::ReadResponse::RawBlocks), or a capacity error.
     #[cfg(feature = "indexer")]
     RawBlocksByHeightRange {
         /// First height to read.
@@ -2100,6 +2219,12 @@ pub enum ReadRequest {
 
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
+    /// Checks whether the block's header commits to the authorizing data in its body,
+    /// using the history tree of the block's parent.
+    ///
+    /// Returns [`ReadResponse::AuthDataCommitment`].
+    CheckAuthDataCommitment(BlockCommitmentData),
 
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
@@ -2233,6 +2358,7 @@ impl ReadRequest {
             ReadRequest::CheckPreparedMinedRelayEligibility(_) => {
                 "check_prepared_mined_relay_eligibility"
             }
+            ReadRequest::CheckAuthDataCommitment(_) => "check_auth_data_commitment",
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]
@@ -2297,6 +2423,9 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckPreparedMinedRelayEligibility(block) => {
                 Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
             }
+            Request::CheckAuthDataCommitment(block) => {
+                Ok(ReadRequest::CheckAuthDataCommitment(block))
+            }
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }
@@ -2326,6 +2455,24 @@ impl TryFrom<Request> for ReadRequest {
     }
 }
 
+/// Worker slots for blocking reads. A slot follows its job until the job ends.
+///
+/// Callers wait for a slot without holding a lock or a memory charge, so the pool does
+/// not bound waiters: each caller's own request limit bounds them. Clones share the slots.
+#[derive(Clone, Debug)]
+pub struct ReadWorkerPool {
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl ReadWorkerPool {
+    /// Create a pool with `slots` concurrent jobs.
+    pub fn new(slots: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+        }
+    }
+}
+
 #[derive(Debug)]
 /// A convenience type for spawning blocking tokio tasks with
 /// a timer in the scope of a provided span.
@@ -2340,33 +2487,245 @@ impl TimedSpan {
         Self { timer, span }
     }
 
-    /// Spawns a blocking tokio task in scope of the `span` field.
+    /// Admit a blocking read before spawning it in this span.
+    ///
+    /// The worker owns its slot until execution ends, even if the caller drops
+    /// the returned future. An unadmitted read waits without spawning a worker.
+    /// Dropping that waiting future releases its request.
     #[track_caller]
     pub fn spawn_blocking<T: Send + 'static>(
         mut self,
+        workers: ReadWorkerPool,
         f: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
     ) -> Pin<Box<dyn futures::Future<Output = Result<T, BoxError>> + Send>> {
         let location = std::panic::Location::caller();
-        // # Performance
-        //
-        // Allow other async tasks to make progress while concurrently reading blocks from disk.
-
-        // The work is done in the future.
-        tokio::task::spawn_blocking(move || {
-            self.span.in_scope(move || {
-                let result = f();
-                self.timer
-                    .finish_inner(Some(location.file()), Some(location.line()), "");
-                result
+        let spawn = move |slot: tokio::sync::OwnedSemaphorePermit| {
+            tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                self.span.in_scope(move || {
+                    let result = f();
+                    self.timer
+                        .finish_inner(Some(location.file()), Some(location.line()), "");
+                    result
+                })
             })
-        })
-        .wait_for_panics()
+            .wait_for_panics()
+        };
+        match workers.slots.clone().try_acquire_owned() {
+            Ok(slot) => spawn(slot),
+            Err(_) => Box::pin(async move {
+                let slot = workers.slots.clone().acquire_owned().await?;
+                spawn(slot).await
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod derived_allocation_tests {
+    use super::*;
+    use std::mem::size_of_val;
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    /// The most derived bytes that one legal test block has per decoded byte.
+    const MAX_DERIVED_BYTES_PER_DECODED_BYTE: u64 = 8;
+
+    #[test]
+    fn derived_allocations_stay_proportional_to_their_block() {
+        for bytes in [
+            &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES[..],
+        ] {
+            let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+            let decoded = block.attributed_memory_size_bytes();
+            let verified = SemanticallyVerifiedBlock::from(block);
+
+            let (outpoint, ordered) = verified
+                .new_outputs
+                .iter()
+                .next()
+                .expect("every test block has a coinbase output");
+            let entry = size_of_val(outpoint) + size_of_val(ordered);
+            let table = verified.new_outputs.capacity().saturating_mul(entry);
+            let scripts: usize = verified
+                .new_outputs
+                .values()
+                .map(|ordered| ordered.utxo.output.lock_script.as_raw_bytes().len())
+                .sum();
+            let hashes = size_of_val(&*verified.transaction_hashes);
+            let derived = u64::try_from(table + scripts + hashes).unwrap();
+
+            assert!(
+                derived <= MAX_DERIVED_BYTES_PER_DECODED_BYTE * decoded,
+                "{derived} derived bytes for {decoded} decoded bytes"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod locator_capacity_tests {
     use super::*;
+
+    /// Spawn one blocking read on `workers`.
+    fn spawn_read<T: Send + 'static>(
+        workers: &ReadWorkerPool,
+        job: impl FnOnce() -> Result<T, BoxError> + Send + 'static,
+    ) -> impl futures::Future<Output = Result<T, BoxError>> {
+        TimedSpan::new(CodeTimer::start_desc("test_read"), tracing::Span::none())
+            .spawn_blocking(workers.clone(), job)
+    }
+
+    /// Cancelling delivery cannot make a live blocking job's slot available.
+    #[tokio::test]
+    async fn blocking_read_slot_survives_caller_drop_and_worker_panic() {
+        use std::{sync::atomic::AtomicUsize, time::Duration};
+        use tokio::time::timeout;
+
+        struct LiveJob(Arc<AtomicUsize>);
+        impl Drop for LiveJob {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        for panic in [false, true] {
+            let workers = ReadWorkerPool::new(1);
+            let active = Arc::new(AtomicUsize::new(0));
+            let running = active.clone();
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let result = spawn_read(&workers, move || {
+                running.fetch_add(1, Ordering::SeqCst);
+                let _job = LiveJob(running);
+                started.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(!panic, "test blocking read panic");
+                Ok(())
+            });
+            timeout(Duration::from_secs(10), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(result);
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                workers.slots.available_permits(),
+                0,
+                "the actual worker owns its slot"
+            );
+            release.send(()).unwrap();
+            let slot = timeout(
+                Duration::from_secs(10),
+                workers.slots.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                active.load(Ordering::SeqCst),
+                0,
+                "execution ends before slot release"
+            );
+            drop(slot);
+            assert_eq!(workers.slots.available_permits(), 1);
+        }
+    }
+
+    /// Dropping either an unpolled or a waiting read discards its work before admission.
+    #[tokio::test]
+    async fn blocking_read_waiter_cancellation_drops_unstarted_work() {
+        struct PendingInput(Arc<AtomicBool>);
+        impl Drop for PendingInput {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for poll in [false, true] {
+            let workers = ReadWorkerPool::new(1);
+            let occupied = workers.slots.clone().try_acquire_owned().unwrap();
+            let released = Arc::new(AtomicBool::new(false));
+            let input = PendingInput(released.clone());
+            let ran = Arc::new(AtomicBool::new(false));
+            let executed = ran.clone();
+            let mut pending = spawn_read(&workers, move || {
+                executed.store(true, Ordering::SeqCst);
+                drop(input);
+                Ok(())
+            });
+            if poll {
+                assert!(futures::poll!(&mut pending).is_pending());
+            }
+            drop(pending);
+            assert!(
+                released.load(Ordering::SeqCst),
+                "cancellation drops the waiting input"
+            );
+            assert!(!ran.load(Ordering::SeqCst), "unadmitted work never starts");
+            assert_eq!(workers.slots.available_permits(), 0);
+            drop(occupied);
+            let next = spawn_read(&workers, || Ok(7));
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), next)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                7
+            );
+            assert_eq!(workers.slots.available_permits(), 1);
+        }
+    }
+
+    /// An admitted job stays charged while Tokio queues it behind another blocking job.
+    #[test]
+    fn blocking_read_slot_covers_the_executor_queue() {
+        use std::time::Duration;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            tokio::time::timeout(Duration::from_secs(10), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let workers = ReadWorkerPool::new(1);
+            let ran = Arc::new(AtomicBool::new(false));
+            let executed = ran.clone();
+            let result = spawn_read(&workers, move || {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+            drop(result);
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(
+                workers.slots.available_permits(),
+                0,
+                "the queued job keeps its admission"
+            );
+            release.send(()).unwrap();
+            let slot = tokio::time::timeout(
+                Duration::from_secs(10),
+                workers.slots.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(ran.load(Ordering::SeqCst));
+            drop(slot);
+            blocker.await.unwrap();
+        });
+    }
 
     #[tokio::test]
     async fn accepted_locator_keeps_permit_after_caller_drop_until_exit_or_panic() {
@@ -2383,7 +2742,7 @@ mod locator_capacity_tests {
                 CodeTimer::start_desc("locator_capacity_test"),
                 tracing::Span::none(),
             )
-            .spawn_blocking(move || {
+            .spawn_blocking(ReadWorkerPool::new(1), move || {
                 let ReadRequest::HeaderLocator { permit: _permit } = request else {
                     unreachable!();
                 };

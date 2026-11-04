@@ -1,6 +1,6 @@
 //! Offline benchmark helper for the block-sync [`Sequencer`].
 //!
-//! Spawns the **real** [`SequencerTask`] — the
+//! Spawns the **real** [`SequencerIO`] — the
 //! body reorder + ordered-submit pipeline — with no peers and no reactor, and exposes
 //! a minimal handle (split into parts via [`BenchSequencerHandle::into_parts`]) to
 //! drive it from an offline benchmark:
@@ -17,35 +17,41 @@
 //! checkpoint verifier + state service as the `apply-verifier` rung. This is
 //! feature-gated (`internal-bench`) and is not part of the production API.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+mod work_queue;
+pub use work_queue::{
+    bench_work_request, BenchReceiptBatch, BenchWorkCapacity, BenchWorkChurn, WorkRequestEnd,
 };
 
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-};
 use zakura_chain::block::{self, Block};
 use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
+use zakura_node_services::block_memory::{Admission, BlockHandle, DecodedBlockPool};
+use zakura_rt::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, watch,
+    },
+    task::JoinHandle,
+    time::Instant,
+};
 
 use crate::zakura::{
     trace::block_sync_trace as bs_trace, transport::ByteBudget, ZakuraPeerId, ZakuraTrace,
 };
 
 use super::{
+    config::ZakuraBlockSyncConfig,
     events::{BlockApplyOutcome, BlockApplyToken, BlockSyncAction},
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
-        initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
+        charge_decoded_handoff, initial_view, SequencedBody, SequencerControlInput, SequencerIO,
+        SequencerView,
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
     trace::{height as trace_height, BlockTraceEvent},
+    wire::BlockSyncMessage,
     work_queue::WorkQueue,
 };
 
@@ -60,7 +66,7 @@ pub struct BenchSubmit {
     /// Submission token to echo back on commit.
     pub token: BlockApplyToken,
     /// The block to verify and commit (contiguous above the verified tip).
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
 }
 
 /// A read-only progress snapshot copied from the internal sequencer view.
@@ -76,7 +82,7 @@ pub struct SequencerProgress {
     pub committed_blocks_per_sec: u64,
 }
 
-/// Drives the real block-sync `SequencerTask` for an offline benchmark. Split into
+/// Drives the real block-sync `SequencerIO` for an offline benchmark. Split into
 /// independent parts via [`into_parts`](Self::into_parts) so the feed, submission
 /// drain, and commit feedback can run concurrently without borrow conflicts.
 pub struct BenchSequencerHandle {
@@ -88,10 +94,12 @@ pub struct BenchSequencerHandle {
 /// A cloneable handle for feeding bodies into the sequencer's reorder queue.
 #[derive(Clone)]
 pub struct BenchBodyFeeder {
+    decoded_pool: DecodedBlockPool,
     body_input: mpsc::Sender<SequencedBody>,
     body_input_bytes: Arc<AtomicU64>,
     body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     bench_peer: ZakuraPeerId,
+    view: watch::Receiver<SequencerView>,
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
 }
@@ -122,7 +130,7 @@ pub struct BenchCommitter {
     _join: JoinHandle<()>,
 }
 
-/// Spawns the real `SequencerTask` starting from `verified_block_tip` (typically
+/// Spawns the real `SequencerIO` starting from `verified_block_tip` (typically
 /// `start - 1`), with no peers and no reactor.
 ///
 /// `submit_in_flight_limit` caps blocks submitted-but-not-applied; `max_inflight_bytes`
@@ -178,7 +186,7 @@ pub fn spawn_bench_sequencer(
     let sequencer = Sequencer::new(verified_block_tip, limit);
     let throughput = ThroughputMeter::new(Instant::now());
     let budget = ByteBudget::new(max_inflight_bytes.max(1));
-    let work = Arc::new(WorkQueue::new(verified_block_tip));
+    let work = Arc::new(WorkQueue::new(verified_block_tip, budget.clone()));
 
     let (actions_tx, actions_rx) = mpsc::channel(limit + 128);
     let (body_input_tx, body_input_rx) = mpsc::channel(limit);
@@ -187,9 +195,14 @@ pub fn spawn_bench_sequencer(
     let body_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
 
-    let task = SequencerTask::new(
+    let decoded_pool = ZakuraBlockSyncConfig {
+        max_submitted_block_applies: limit,
+        ..ZakuraBlockSyncConfig::default()
+    }
+    .decoded_block_pool(10_000)
+    .expect("benchmark decoded allowance fits");
+    let task = SequencerIO::new(
         sequencer,
-        budget,
         work,
         Arc::new(super::peer_registry::PeerRegistry::new()),
         actions_tx,
@@ -197,6 +210,7 @@ pub fn spawn_bench_sequencer(
         frontiers,
         Some(owner.authority()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        Arc::new(super::BlockSyncClock),
         body_input_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -204,16 +218,19 @@ pub fn spawn_bench_sequencer(
         view_tx,
         BENCH_ACTION_SEND_TIMEOUT,
         trace.clone(),
+        decoded_pool.clone(),
     );
-    let join = tokio::spawn(task.run());
+    let join = zakura_rt::task::spawn(task.run());
 
     BenchSequencerHandle {
         feeder: BenchBodyFeeder {
+            decoded_pool,
             body_input: body_input_tx,
             body_input_bytes: body_input_bytes.clone(),
             body_input_decoded_attributed_memory_bytes: body_input_decoded_attributed_memory_bytes
                 .clone(),
             bench_peer: ZakuraPeerId::new(vec![0xB1; 32]).expect("32-byte bench peer id is valid"),
+            view: view_rx.clone(),
             owner,
             source,
         },
@@ -254,8 +271,31 @@ impl BenchBodyFeeder {
         bytes: u64,
     ) -> bool {
         let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_decoded_block(block, None);
-        let body = SequencedBody::new_queued(
+        // Hand the body over as a peer routine does.
+        let raw_frame_payload: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .expect("a chain block encodes within the block-sync message limits")
+            .into();
+        let admitted = Arc::try_unwrap(block).ok().and_then(|block| {
+            let charge = charge_decoded_handoff(
+                &self.body_input_decoded_attributed_memory_bytes,
+                &self.view,
+                block.attributed_memory_size_bytes(),
+            )?;
+            let block = self
+                .decoded_pool
+                .try_admit(block, Admission::WithinLimit)
+                .ok()?;
+            Some((block, charge))
+        });
+        let body = match admitted {
+            Some((block, charge)) => {
+                charge.hand_over();
+                BufferedBlockBody::for_handoff(block, raw_frame_payload)
+            }
+            None => BufferedBlockBody::RawFramePayload(raw_frame_payload),
+        };
+        let body = SequencedBody::new_handed_off(
             self.owner,
             self.source,
             height,
@@ -263,6 +303,7 @@ impl BenchBodyFeeder {
             previous_block_hash,
             body,
             bytes,
+            None,
             self.bench_peer.clone(),
             Instant::now(),
             self.body_input_bytes.clone(),
@@ -313,6 +354,7 @@ impl BenchCommitter {
             eligible_sources: std::collections::BTreeSet::new(),
             persisted_availability: None,
             semantic_completion: Some((self.owner, zakura_header_chain::StateVersion::default())),
+            committed_epoch: Some(self.owner.authority.body_work_epoch),
         });
         let _ = self.control.send(SequencerControlInput::FrontierAdvance {
             frontiers,

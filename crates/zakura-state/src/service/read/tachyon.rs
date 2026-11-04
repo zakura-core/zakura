@@ -33,7 +33,7 @@ pub(crate) fn block(
         .activation_height(&db.network())
         .filter(|activation| height >= *activation)
         .ok_or("NuTachyon is not active at the requested block")?;
-    let block = super::block(chain.as_ref(), db, hash.into())
+    let block = super::block(chain.as_ref(), db, hash.into())?
         .ok_or("Tachyon block data unavailable: body pruned or not retained; use an archive node or previously saved sync data")?;
 
     let anchor_at = |height| {

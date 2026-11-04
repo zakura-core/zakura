@@ -69,7 +69,8 @@ pub(super) unsafe fn reallocate(pointer: *mut u8, layout: Layout, size: usize) -
 
 /// Run exactly this test in a child process, with no other tests sharing its allocator.
 /// Pass the full libtest name, without the crate name. The child must finish in two minutes.
-/// A misspelled name fails instead of silently measuring zero tests.
+/// A misspelled name fails instead of silently measuring zero tests. The child runs the test
+/// even when it is `#[ignore]`d, because the parent only reaches this call if it was selected.
 #[allow(clippy::print_stderr)]
 pub fn in_isolated_process(test_name: &str, test: impl FnOnce()) {
     if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
@@ -78,7 +79,13 @@ pub fn in_isolated_process(test_name: &str, test: impl FnOnce()) {
     }
     let executable = std::env::current_exe().expect("the running test binary has a path");
     let output = Command::new(&executable)
-        .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            test_name,
+            "--exact",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD_TEST, test_name)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

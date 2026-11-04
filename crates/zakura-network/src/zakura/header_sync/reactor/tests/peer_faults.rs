@@ -51,7 +51,6 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;
     active.entries.clear();
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     reactor.deliver_page(
         peer.clone(),
@@ -248,7 +247,10 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
 
             assert_eq!(connection.is_cancelled(), faulted);
             assert_eq!(
-                reactor.unproductive_peer_cooldowns.contains_key(&peer),
+                reactor
+                    .state
+                    .unproductive_peer_cooldowns
+                    .contains_key(&peer),
                 faulted
             );
             if !faulted {
@@ -280,7 +282,10 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
     let failure = invalid_header_failure(source, owner);
     reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
-    assert!(!reactor.unproductive_peer_cooldowns.contains_key(&peer));
+    assert!(!reactor
+        .state
+        .unproductive_peer_cooldowns
+        .contains_key(&peer));
     assert!(
         !connection.is_cancelled(),
         "the replacement stays connected"
@@ -340,7 +345,6 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     active.phase = HeaderTargetPhase::Receiving;
     active.entries.clear();
     let returned_ancestor = active.common_ancestor.expect("the fixture has an ancestor");
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     let response = Headers {
         subscription_id: owner.request_id().get(),
@@ -376,7 +380,7 @@ async fn read_page(
 ) -> Result<(), SinkReject> {
     use crate::zakura::header_sync::{
         config::REGTEST_HEADER_BYTES,
-        pipe::run_peer,
+        peer::run_peer,
         v9::{LeaseOwner, Publisher},
     };
 
@@ -405,6 +409,7 @@ async fn read_page(
         },
         handle.page_limits,
         cancel.clone(),
+        None,
     );
     let page = encode_frame(&v9::RegtestMessage::Headers(Headers {
         subscription_id: open.subscription_id,

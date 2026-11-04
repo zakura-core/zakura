@@ -8,16 +8,32 @@
 //! events over a non-blocking control channel. The reactor learns committed
 //! progress back over a non-blocking `watch` ([`SequencerView`]).
 //!
-//! Each input handler owns one stage of the commit pipeline: the body-acceptance
-//! tail (`handle_accept_body`), the verified-tip frontier advance
-//! (`handle_frontier_advance`), the chain-tip reset (`handle_frontier_reset`), and
-//! the apply completion (`handle_apply_finished`). They mutate the `Sequencer`,
-//! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
-//! actions on the same channel the reactor uses.
+//! The task has two halves. [`SequencerState`] decides body acceptance, frontier
+//! advance and reset, apply-completion handling, body retry, submission retry, and
+//! required evidence, and returns each decision's shared-resource effects as
+//! [`SequencerOperation`]s. [`SequencerIO`] owns the input channels, the input-queue
+//! accounting, the work queue, the peer registry, the action
+//! channel, the committed throughput meter, the view `watch`, timers, and traces.
+//! It feeds each input to the state, runs the returned operations in order, and
+//! publishes the view.
+//!
+//! A body's ownership moves in three steps. A peer routine charges the input-queue
+//! counters when it queues a [`SequencedBody`]. IO releases that charge when it
+//! receives the body, then retains the payload in `SequencerPayloads`. State
+//! keeps the corresponding identity and size facts. IO applies the payload
+//! operations that state emits at frontier, reset, and completion boundaries.
+//! A submitted body also lives in the driver's `SubmitBlock` action, and
+//! the `Sequencer` keeps its in-flight charge until the exact completion arrives.
+
+use zakura_node_services::block_memory::{
+    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool,
+};
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     events::*,
     peer_registry::{retry_deadline_instant, PeerRegistry},
+    reactor::ActionClass,
     reorder::BufferedBlockBody,
     sequencer::*,
     state::*,
@@ -26,16 +42,26 @@ use super::{
 };
 use std::collections::BTreeSet;
 
+mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
+};
+
 mod trace;
 
-/// Delay before retrying a verifier submission that could not enter the shared
-/// action channel.
-const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+use state::{BodyAcceptance, ReceivedBody, SequencerOperation, SequencerState};
 
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
 /// control events that release budget and drive the next scheduling reaction.
+///
+/// The body keeps its decoded block only while the decoded budget had room
+/// for it at the handoff (see [`BufferedBlockBody::for_handoff`]). Otherwise
+/// it holds the raw frame payload, so a slow verifier can't fill the queue
+/// with `submitted_apply_limit` decoded block graphs (#1522).
 #[derive(Debug)]
 pub(super) struct SequencedBody {
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -45,12 +71,73 @@ pub(super) struct SequencedBody {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    /// The size estimate this body's request reserved at admission. `None` for
+    /// a body admitted on its wire size with no request estimate.
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
     queue_accounting: SequencerInputAccounting,
 }
 
+/// A handed-off body's decoded bytes, charged to the input queue before the body
+/// exists. Dropping it returns the charge. [`Self::hand_over`] moves the charge to
+/// the [`SequencedBody`] that holds the decoded block.
+#[derive(Debug)]
+#[must_use = "dropping the charge returns its room"]
+pub(super) struct DecodedHandoffCharge {
+    input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    decoded_bytes: u64,
+}
+
+impl DecodedHandoffCharge {
+    /// End this owner's release obligation, because a new [`SequencedBody`] takes it.
+    pub(super) fn hand_over(mut self) {
+        self.decoded_bytes = 0;
+    }
+}
+
+impl Drop for DecodedHandoffCharge {
+    fn drop(&mut self) {
+        release_atomic_bytes(
+            &self.input_decoded_attributed_memory_bytes,
+            self.decoded_bytes,
+        );
+    }
+}
+
+/// Charges a handed-off body's `decoded_bytes` to the input queue when the
+/// queue, `applying` and the body fit under
+/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns that charge.
+///
+/// The charge comes before the check, so routines that hand off at once each
+/// count the others' bodies, and no two take the same room. A routine whose
+/// check fails takes its charge back. Its body keeps only raw bytes and never
+/// enters the decoded pool, so a refusal fires no capacity wakeup.
+///
+/// The sequencer task publishes a body's decoded bytes in `applying` before it
+/// releases the body's input-queue charge, so a body that moves between the
+/// two is always counted.
+pub(super) fn charge_decoded_handoff(
+    input_decoded_attributed_memory_bytes: &Arc<AtomicU64>,
+    view: &watch::Receiver<SequencerView>,
+    decoded_bytes: u64,
+) -> Option<DecodedHandoffCharge> {
+    let queued = input_decoded_attributed_memory_bytes
+        .fetch_add(decoded_bytes, Ordering::AcqRel)
+        .saturating_add(decoded_bytes);
+    let charge = DecodedHandoffCharge {
+        input_decoded_attributed_memory_bytes: input_decoded_attributed_memory_bytes.clone(),
+        decoded_bytes,
+    };
+    (queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES)
+        .then_some(charge)
+}
+
 impl SequencedBody {
+    /// Queue `body`, charging its wire bytes and decoded bytes to the input
+    /// queue.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_queued(
         owner: zakura_header_chain::BodyWorkOwner,
@@ -60,10 +147,48 @@ impl SequencedBody {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         peer: ZakuraPeerId,
         received_at: Instant,
-        input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_bytes: Arc<AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        add_atomic_bytes(
+            &input_decoded_attributed_memory_bytes,
+            body.decoded_attributed_memory_size_bytes(),
+        );
+        Self::new_handed_off(
+            owner,
+            source,
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            bytes,
+            admitted_estimate_bytes,
+            peer,
+            received_at,
+            input_bytes,
+            input_decoded_attributed_memory_bytes,
+        )
+    }
+
+    /// Queue `body`, whose decoded bytes [`charge_decoded_handoff`] already
+    /// charged to the input queue, and charge its wire bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_handed_off(
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        previous_block_hash: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
+        peer: ZakuraPeerId,
+        received_at: Instant,
+        input_bytes: Arc<AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         Self {
@@ -74,6 +199,7 @@ impl SequencedBody {
             previous_block_hash,
             body,
             bytes,
+            admitted_estimate_bytes,
             peer,
             received_at,
             queue_accounting: SequencerInputAccounting::new(
@@ -86,32 +212,52 @@ impl SequencedBody {
     }
 
     /// Transfer this body out of queue ownership before processing it.
+    #[cfg(test)]
     pub(super) fn leave_queue(&mut self) {
         self.queue_accounting.release();
+    }
+
+    /// Move this body's input-queue charge out of it, so the caller releases
+    /// the charge once the body's next holder is published.
+    fn take_queue_charge(&mut self) -> SequencerInputAccounting {
+        self.queue_accounting.take()
+    }
+
+    /// The wire bytes this body charges to the input-queue counter: its size
+    /// while queued, zero once it left the queue.
+    #[cfg(test)]
+    pub(super) fn queued_bytes(&self) -> u64 {
+        if self.queue_accounting.active {
+            self.queue_accounting.bytes
+        } else {
+            0
+        }
     }
 }
 
 #[derive(Debug)]
 struct SequencerInputAccounting {
-    input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    input_bytes: Arc<AtomicU64>,
     bytes: u64,
-    input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     decoded_attributed_memory_size_bytes: u64,
     active: bool,
 }
 
 impl SequencerInputAccounting {
+    /// Charge `bytes` to the input queue's wire counter, and take over the
+    /// `decoded_attributed_memory_size_bytes` the caller already charged to its
+    /// decoded counter.
     fn new(
-        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_bytes: Arc<AtomicU64>,
         bytes: u64,
-        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
-        add_atomic_bytes(
-            &input_decoded_attributed_memory_bytes,
-            decoded_attributed_memory_size_bytes,
-        );
+        // Gauge increments commute, so concurrent charges and releases leave the
+        // gauge equal to the counter. This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").increment(bytes as f64);
         Self {
             input_bytes,
             bytes,
@@ -121,11 +267,26 @@ impl SequencerInputAccounting {
         }
     }
 
+    /// Move the charge into the returned value, leaving this one released.
+    fn take(&mut self) -> Self {
+        Self {
+            input_bytes: self.input_bytes.clone(),
+            bytes: self.bytes,
+            input_decoded_attributed_memory_bytes: self
+                .input_decoded_attributed_memory_bytes
+                .clone(),
+            decoded_attributed_memory_size_bytes: self.decoded_attributed_memory_size_bytes,
+            active: std::mem::take(&mut self.active),
+        }
+    }
+
     fn release(&mut self) {
         if !std::mem::take(&mut self.active) {
             return;
         }
         release_atomic_bytes(&self.input_bytes, self.bytes);
+        // This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").decrement(self.bytes as f64);
         release_atomic_bytes(
             &self.input_decoded_attributed_memory_bytes,
             self.decoded_attributed_memory_size_bytes,
@@ -194,6 +355,9 @@ pub(super) enum SequencerControlInput {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        /// The body-work epoch of the committed view that judged
+        /// `semantic_completion`.
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     },
 }
 
@@ -202,6 +366,8 @@ pub(super) enum SequencerControlInput {
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SequencerView {
+    /// Accounting drift has permanently closed this request-budget generation.
+    pub(super) accounting_closed: bool,
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
     pub(super) download_floor: block::Height,
@@ -236,6 +402,7 @@ pub(super) struct SequencerView {
 /// Build the initial view from the startup frontiers, before the task runs.
 pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     SequencerView {
+        accounting_closed: false,
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
         download_floor: frontiers.verified_block_tip,
@@ -258,60 +425,227 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     }
 }
 
-/// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
-/// `ByteBudget` clone, an `Arc<WorkQueue>` clone, an action sender clone, and the
-/// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
-/// `Misbehavior` on the same action channel the reactor uses.
-pub(super) struct SequencerTask {
-    sequencer: Sequencer,
-    retained_body_limit: u64,
-    budget: ByteBudget,
+impl state::SequencerEvidence {
+    /// The [`ActionClass`] of [`Self::into_action`]'s result.
+    fn class(&self) -> ActionClass {
+        match self {
+            Self::RecordBodyUnavailable { .. } | Self::RecordBodyInvalid { .. } => {
+                ActionClass::Required
+            }
+            Self::Misbehavior { .. } => ActionClass::Optional,
+        }
+    }
+
+    fn metric_label(&self) -> &'static str {
+        match self {
+            Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
+            Self::RecordBodyInvalid { .. } => "record_body_invalid",
+            Self::Misbehavior { .. } => "misbehavior",
+        }
+    }
+
+    fn into_action(self) -> BlockSyncAction {
+        match self {
+            Self::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            } => BlockSyncAction::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            },
+            Self::RecordBodyInvalid {
+                expected_version,
+                invalid,
+            } => BlockSyncAction::RecordBodyInvalid {
+                expected_version,
+                invalid,
+            },
+            Self::Misbehavior { peer, reason } => BlockSyncAction::Misbehavior { peer, reason },
+        }
+    }
+}
+
+/// Runtime payload storage. Policy receives only identities and measured facts.
+#[derive(Debug, Default)]
+pub(super) struct SequencerPayloads {
+    entries: std::collections::BTreeMap<super::reorder::BodyId, BufferedBlockBody>,
+    next_id: u64,
+    /// The last raw payload the pool refused for capacity, with its admission
+    /// and its decoded size. Decoding it again before the pool has room for
+    /// that size would only repeat the refusal.
+    capacity_refused: Option<(super::reorder::BodyId, Admission, u64)>,
+}
+
+pub(super) struct MaterializedBody {
+    pub(super) block: BlockHandle,
+    pub(super) decoded_bytes: u64,
+    pub(super) newly_decoded_wire_bytes: Option<usize>,
+}
+
+impl SequencerPayloads {
+    #[cfg(test)]
+    pub(super) fn retained_ids(&self) -> impl Iterator<Item = super::reorder::BodyId> + '_ {
+        self.entries.keys().copied()
+    }
+
+    pub(super) fn insert(&mut self, body: BufferedBlockBody) -> super::reorder::BodyFacts {
+        use super::reorder::{BodyFacts, BodyId};
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("sequencer payload identity exhausted");
+        let id = BodyId(self.next_id);
+        let raw_wire_bytes = match &body {
+            BufferedBlockBody::RawFramePayload(raw)
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                raw_frame_payload: raw,
+                ..
+            } => Some(
+                raw.len()
+                    .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+            ),
+            BufferedBlockBody::Decoded { .. } => None,
+        };
+        let facts = BodyFacts {
+            id,
+            decoded_bytes: body.decoded_attributed_memory_size_bytes(),
+            raw_wire_bytes,
+        };
+        assert!(
+            self.entries.insert(id, body).is_none(),
+            "payload identities never repeat"
+        );
+        facts
+    }
+
+    pub(super) fn release(&mut self, id: super::reorder::BodyId) {
+        self.entries
+            .remove(&id)
+            .expect("policy releases a retained payload exactly once");
+    }
+
+    pub(super) fn apply(&mut self, changes: Vec<super::reorder::PayloadChange>) {
+        use super::reorder::PayloadChange;
+        for change in changes {
+            match change {
+                PayloadChange::KeepRaw(id) => self
+                    .entries
+                    .get_mut(&id)
+                    .expect("policy downgrades a retained payload")
+                    .retain_for_backlog_in_place(),
+                PayloadChange::Release(id) => self.release(id),
+            }
+        }
+    }
+
+    /// Decode the payload `id` under `admission` when it is still raw, and borrow
+    /// its charged block for a submission. A payload the pool refused for
+    /// capacity is not decoded again until the pool has room for its decoded
+    /// size, so the caller reads the pool's capacity version before this call.
+    #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
+    pub(super) fn materialize(
+        &mut self,
+        id: super::reorder::BodyId,
+        pool: &DecodedBlockPool,
+        admission: Admission,
+    ) -> Result<MaterializedBody, AdmissionFailure> {
+        let body = self
+            .entries
+            .get_mut(&id)
+            .expect("policy names a retained payload");
+        let newly_decoded_wire_bytes = match body {
+            BufferedBlockBody::RawFramePayload(raw) => Some(
+                raw.len()
+                    .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+            ),
+            _ => None,
+        };
+        if let Some((refused, refused_admission, decoded_bytes)) = self.capacity_refused {
+            if newly_decoded_wire_bytes.is_some()
+                && (refused, refused_admission) == (id, admission)
+                && !pool.is_closed()
+                && !pool.has_room_for(decoded_bytes, admission)
+            {
+                return Err(AdmissionFailure::Capacity);
+            }
+        }
+        let block = match body.decoded_block(pool, admission) {
+            Ok(block) => block,
+            Err(refusal) => {
+                if refusal.reason == AdmissionFailure::Capacity {
+                    self.capacity_refused = Some((id, admission, refusal.decoded_bytes));
+                }
+                return Err(refusal.reason);
+            }
+        };
+        Ok(MaterializedBody {
+            block,
+            decoded_bytes: body.decoded_attributed_memory_size_bytes(),
+            newly_decoded_wire_bytes,
+        })
+    }
+}
+
+/// The serial commit-pipeline task's IO half. Owns [`SequencerState`], an
+/// `Arc<WorkQueue>` clone, the peer registry, an action
+/// sender clone, and the committed throughput meter. Runs the state's operations
+/// and emits `SubmitBlock` / `Misbehavior` on the same action channel the reactor
+/// uses. It settles request bytes only through the work queue.
+pub(super) struct SequencerIO {
+    state: SequencerState,
+    payloads: SequencerPayloads,
+    decoded_pool: DecodedBlockPool,
+    decoded_capacity_blocked: Option<u64>,
+    retry_clock: Arc<dyn zakura_header_chain::Clock>,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     actions: mpsc::Sender<BlockSyncAction>,
     committed_throughput: ThroughputMeter,
-    /// Tracks the finalized height so the published view carries it forward; the
-    /// reactor folds it into its `finalized_height` mirror with a `max`.
-    finalized_height: block::Height,
-    verified_block_hash: block::Hash,
-    reset_epoch: u64,
-    reaction_epoch: u64,
-    current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
-    /// Global CAS coordinate for synchronous alarm writes, never body-work authority.
-    current_state_version: Option<zakura_header_chain::StateVersion>,
-    body_retries: crate::zakura::header_sync::BodyRetryQueue,
-    retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
-    _body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    _body_input_bytes: Arc<AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
-    submission_retry_at: Option<time::Instant>,
-    submission_retry_started_at: Option<time::Instant>,
-    submission_retry_attempt: u64,
     trace: ZakuraTrace,
+    /// Receives holder changes and snapshots, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: super::block_sync_observe::ObserverSlot,
+    /// The holders last reported to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    observed_holders: Vec<(
+        super::block_sync_observe::Holder,
+        super::block_sync_observe::HeldBody,
+    )>,
 }
 
-impl Drop for SequencerTask {
+impl Drop for SequencerIO {
     fn drop(&mut self) {
+        #[cfg(any(test, zakura_sim))]
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::SequencerClosed
+        );
         self.body_input_rx.close();
+        #[cfg(any(test, zakura_sim))]
+        {
+            // Each body left in the input drops here, with no next holder.
+            while let Ok(body) = self.body_input_rx.try_recv() {
+                self.observe_dequeued(&body);
+            }
+            self.observe_holders();
+        }
         while self.body_input_rx.try_recv().is_ok() {}
-
-        self.view_tx.send_modify(|view| {
-            view.reorder_decoded_attributed_memory_bytes = 0;
-            view.applying_decoded_attributed_memory_bytes = 0;
-            view.sequencer_input_decoded_attributed_memory_bytes = 0;
-            view.active_pipeline_decoded_attributed_memory_bytes = 0;
-        });
+        self.payloads.entries.clear();
+        #[cfg(any(test, zakura_sim))]
+        self.observe_teardown();
     }
 }
 
-impl SequencerTask {
+impl SequencerIO {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         sequencer: Sequencer,
-        budget: ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
         actions: mpsc::Sender<BlockSyncAction>,
@@ -319,47 +653,137 @@ impl SequencerTask {
         frontiers: BlockSyncFrontiers,
         current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
         retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
+        retry_clock: Arc<dyn zakura_header_chain::Clock>,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
-        body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        body_input_bytes: Arc<AtomicU64>,
+        body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
+        decoded_pool: DecodedBlockPool,
     ) -> Self {
         Self {
-            sequencer,
-            retained_body_limit: ZakuraBlockSyncConfig::default()
-                .effective_max_reorder_lookahead_bytes(),
-            budget,
+            decoded_pool,
+            decoded_capacity_blocked: None,
+            state: SequencerState::new(sequencer, frontiers, current_scope, retry_jitter),
+            payloads: SequencerPayloads::default(),
+            retry_clock,
             work,
             registry,
             actions,
             committed_throughput,
-            finalized_height: frontiers.finalized_height,
-            verified_block_hash: frontiers.verified_block_hash,
-            reset_epoch: 0,
-            reaction_epoch: 0,
-            current_scope,
-            current_state_version: current_scope
-                .map(|_| zakura_header_chain::StateVersion::default()),
-            body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
-            retry_jitter,
             body_input_rx,
             control_input_rx,
             _body_input_bytes: body_input_bytes,
             body_input_decoded_attributed_memory_bytes,
             view_tx,
             action_send_timeout,
-            submission_retry_at: None,
-            submission_retry_started_at: None,
-            submission_retry_attempt: 0,
             trace,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
+            #[cfg(any(test, zakura_sim))]
+            observed_holders: Vec::new(),
         }
     }
 
+    /// This task, reporting to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Reports that `body` left the input queue.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_dequeued(&self, body: &SequencedBody) {
+        use super::block_sync_observe::{BlockEvent, HeldBody, Holder, HolderChange};
+        observe!(
+            self.observer,
+            BlockEvent::Holder {
+                body: HeldBody {
+                    height: body.height,
+                    owner: body.owner,
+                    bytes: body.bytes,
+                },
+                holder: Holder::Queued {
+                    allocation: body.body.allocation(),
+                    decoded_attributed_memory_bytes: body
+                        .body
+                        .measured_decoded_attributed_memory_bytes(),
+                },
+                change: HolderChange::Released,
+            }
+        );
+    }
+
+    /// Reports every holder change since the last report, then the
+    /// sequencer's snapshot. Called before each point where another task can
+    /// see the sequencer's bodies: an action send, and the end of an input.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_holders(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        let ownership = self
+            .state
+            .sequencer()
+            .ownership_snapshot(&self.payloads.entries);
+        let current = ownership.holders();
+        let released = self
+            .observed_holders
+            .iter()
+            .filter(|held| !current.contains(held))
+            .map(|held| (*held, HolderChange::Released));
+        let retained = current
+            .iter()
+            .filter(|held| !self.observed_holders.contains(held))
+            .map(|held| (*held, HolderChange::Retained));
+        for ((holder, body), change) in released.chain(retained) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change,
+                }
+            );
+        }
+        self.observed_holders = current;
+        observe!(self.observer, BlockEvent::Sequencer(ownership));
+    }
+
+    /// Reports releases after IO drops its payload storage. A driver that still runs a
+    /// submission keeps its own copy of the decoded block; the block service
+    /// reports that copy, not the sequencer.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_teardown(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        for (holder, body) in std::mem::take(&mut self.observed_holders) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change: HolderChange::Released,
+                }
+            );
+        }
+        observe!(
+            self.observer,
+            BlockEvent::Sequencer(super::block_sync_observe::SequencerOwnership::default())
+        );
+    }
+
     pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {
-        self.retained_body_limit = limit;
+        self.state.set_retained_body_limit(limit);
         self
     }
 
@@ -368,7 +792,7 @@ impl SequencerTask {
         mut self,
         state_version: Option<zakura_header_chain::StateVersion>,
     ) -> Self {
-        self.current_state_version = state_version.or(self.current_state_version);
+        self.state.seed_state_version(state_version);
         self
     }
 
@@ -378,31 +802,46 @@ impl SequencerTask {
         // top-of-loop guard breaks out before the last open channel is gated off.
         let mut control_open = true;
         let mut body_open = true;
+        let pool = self.decoded_pool.clone();
         loop {
-            if !control_open && !body_open && self.submission_retry_at.is_none() {
+            if pool.is_closed() {
+                self.publish_view();
                 break;
             }
-            let submission_retry_at = self.submission_retry_at;
-            tokio::select! {
+            let submission_retry_at = self.state.submission_retry_at();
+            if !control_open && !body_open && submission_retry_at.is_none() {
+                break;
+            }
+            let refused_version = self.decoded_capacity_blocked;
+            let capacity = async {
+                let changed = pool.capacity().notified();
+                if pool.is_closed() || Some(pool.capacity_version()) != refused_version {
+                    return;
+                }
+                changed.await;
+            };
+            zakura_rt::select! {
                 biased;
 
                 input = self.control_input_rx.recv(), if control_open => {
                     match input {
                         Some(input) => {
-                            let needs_reaction = self.handle_control_input(input).await;
-                            if needs_reaction {
-                                self.reaction_epoch = self.reaction_epoch.saturating_add(1);
-                            }
+                            self.handle_control_input(input).await;
                             self.publish_view();
                         }
                         None => control_open = false,
                     }
                 }
 
+                _ = capacity, if refused_version.is_some() => {
+                    self.submit_pending_blocks().await;
+                    self.publish_view();
+                }
+
                 _ = time::sleep_until(submission_retry_at.unwrap_or_else(time::Instant::now)),
                     if submission_retry_at.is_some() =>
                 {
-                    self.submission_retry_at = None;
+                    self.state.submission_retry_due();
                     self.submit_pending_blocks().await;
                     self.publish_view();
                 }
@@ -410,11 +849,20 @@ impl SequencerTask {
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
                         Some(mut body) => {
-                            body.leave_queue();
+                            // A routine's handoff room check reads the queue's charge,
+                            // then the view's `applying`. The charge outlives the view's
+                            // update, so the check never misses the body between them.
+                            let queue_charge = body.take_queue_charge();
+                            #[cfg(any(test, zakura_sim))]
+                            self.observe_dequeued(&body);
                             self.handle_accept_body(body);
+                            #[cfg(any(test, zakura_sim))]
+                            self.observe_holders();
                             // Publish the synchronous queue → reorder/applying ownership
                             // transfer before an action-channel send can await or time out.
                             // This updates observability without waking scheduling watchers.
+                            self.publish_decoded_ownership_view();
+                            drop(queue_charge);
                             self.publish_decoded_ownership_view();
                             self.submit_pending_blocks().await;
                             self.publish_view();
@@ -426,697 +874,239 @@ impl SequencerTask {
         }
     }
 
+    /// Feed one control input to the state and run its operations. Returns
+    /// whether the input needs the reactor's query and scheduling reaction.
     async fn handle_control_input(&mut self, input: SequencerControlInput) -> bool {
-        // Each handler reports whether it did work that needs the reactor's heavy
-        // serving/producer/schedule tail. Bumping `reaction_epoch` only then keeps
-        // the reactor from re-querying/-scheduling on a pure body buffer/submit or
-        // a no-op (stale/duplicate) apply completion.
-        match input {
-            SequencerControlInput::WorkAuthorityRefreshed { authority } => {
-                debug_assert!(self
-                    .current_scope
-                    .is_none_or(|old| { old.body_work_epoch == authority.body_work_epoch }));
-                self.current_scope = Some(authority);
-                self.registry.refresh_body_retry_scope(authority);
-                self.body_retries
-                    .refresh_scope(authority.header_generation, authority.branch);
-                false
-            }
-            SequencerControlInput::BodyWorkEpochChanged {
-                authority,
-                frontiers,
-            } => {
-                debug_assert!(self
-                    .current_scope
-                    .is_none_or(|old| { old.body_work_epoch != authority.body_work_epoch }));
-                self.current_scope = Some(authority);
-                self.registry.retain_body_retry_scope(Some(authority));
-                self.body_retries = crate::zakura::header_sync::BodyRetryQueue::default();
-                self.finalized_height = frontiers.finalized_height;
-                self.verified_block_hash = frontiers.verified_block_hash;
-                self.destructive_reset_to(frontiers.verified_block_tip, false);
-                self.work.refresh_authority(authority);
-                true
-            }
-            SequencerControlInput::StateVersionChanged(state_version) => {
-                self.current_state_version = Some(state_version);
-                false
-            }
-            SequencerControlInput::BodyAlarmCleared { scope, hash } => {
-                self.body_retries
-                    .remove(scope.header_generation, scope.branch, hash);
-                self.registry.clear_body_retry(scope, hash);
-                true
-            }
-            SequencerControlInput::FrontierAdvance {
-                frontiers,
-                release_applied,
-            } => {
-                self.handle_frontier_advance(frontiers, release_applied)
-                    .await;
-                true
-            }
-            SequencerControlInput::FrontierReset {
-                frontiers,
-                preserve_active_successors,
-                peer_has_successor_after,
-                peer_outstanding_conflicts_at_tip,
-            } => {
-                self.handle_frontier_reset(
-                    frontiers,
-                    preserve_active_successors,
-                    peer_has_successor_after,
-                    peer_outstanding_conflicts_at_tip,
-                )
-                .await;
-                true
-            }
-            SequencerControlInput::ApplyFinished {
-                owner,
-                source,
-                token,
-                height,
-                hash,
-                mut outcome,
-                eligible_sources,
-                persisted_availability,
-                semantic_completion,
-            } => {
-                let (needs_reaction, allow_submit) = self
-                    .handle_apply_finished(
-                        *owner,
-                        source,
-                        token,
-                        height,
-                        hash,
-                        &mut outcome,
-                        eligible_sources,
-                        persisted_availability,
-                        semantic_completion,
-                    )
-                    .await;
-                if allow_submit {
-                    self.submit_pending_blocks().await;
-                }
-                needs_reaction
-            }
-        }
+        let wall_now = self.retry_clock.now();
+        let outputs = self.state.on_control_input(input, wall_now);
+        self.apply_control_outputs(outputs).await
     }
 
-    /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
-    /// ready contiguous prefix into applying.
-    fn handle_accept_body(&mut self, mut body: SequencedBody) {
-        let scope_is_current = self.current_scope.is_some_and(|current| {
-            current.body_work_epoch == body.owner.authority().body_work_epoch
-        });
-        #[cfg(test)]
-        let scope_is_current = scope_is_current || self.current_scope.is_none();
-        if !scope_is_current {
-            self.trace_body_accepted(body.height, body.received_at.elapsed(), "stale_scope");
-            return;
+    /// Record one control transition's diagnostics and run its operations.
+    async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
+        self.payloads.apply(outputs.payload_changes);
+        self.publish_state_metrics();
+        if let Some(classified) = outputs.frontier_reset {
+            if classified.kind != state::FrontierResetKind::Growth {
+                metrics::counter!("sync.block.reorg.reset").increment(1);
+            }
+            self.trace_frontier_reset_classified(&classified);
         }
-        if !super::admission::retain_received_body(
-            self.retained_body_limit,
-            self.sequencer.verified_tip(),
-            self.sequencer
-                .reorder_buffered_bytes()
-                .saturating_add(self.sequencer.applying_buffered_bytes()),
-            u64::try_from(
-                self.sequencer
-                    .reorder_len()
-                    .saturating_add(self.sequencer.applying_len()),
-            )
-            .unwrap_or(u64::MAX),
-            body.height,
-            body.bytes,
-        ) && !self.sequencer.already_retains(body.height, body.hash)
-        {
-            self.work.defer_received_for_owner(
-                body.owner,
-                body.height,
-                body.hash,
-                body.bytes,
-                self.sequencer.verified_tip(),
-            );
-            metrics::counter!("sync.block.retention.deferred").increment(1);
-            self.trace_body_accepted(
-                body.height,
-                body.received_at.elapsed(),
-                "retention_deferred",
-            );
-            return;
+        if let Some(bytes) = outputs.committed_bytes {
+            self.committed_throughput.record(bytes);
+            #[cfg(feature = "sync-metrics")]
+            metrics::counter!("sync.block.payload.committed.bytes").increment(bytes);
         }
-        if let Some(current) = self.current_scope {
-            body.owner.authority = current;
-        }
+        self.execute(outputs.operations).await;
+        outputs.needs_reaction
+    }
+
+    /// Hand a received body, already out of queue ownership, to the state.
+    fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
-        let outcome = match self.sequencer.accept_buffered_body(
-            body.owner,
-            body.source,
-            body.height,
-            body.hash,
-            body.previous_block_hash,
-            body.body,
-            body.bytes,
-            body.peer,
-        ) {
-            AcceptOutcome::Buffered { .. } => "buffered",
-            AcceptOutcome::Redundant { .. } => "redundant",
-        };
-        self.trace_body_accepted(body.height, queued_elapsed, outcome);
-        let _ = self.sequencer.drain_ready_into_applying();
-    }
-
-    /// Reset the body pipeline and queued work above `tip` under one reset epoch.
-    fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
-        let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
-        let released = self.work.reset_above(tip);
-        self.budget.release(released);
-        self.reset_epoch = self.reset_epoch.saturating_add(1);
-    }
-
-    /// Apply a verified-tip frontier advance: fold finalized height forward, drop
-    /// stale updates, then advance the verified tip and floor and drain the newly
-    /// contiguous prefix.
-    async fn handle_frontier_advance(
-        &mut self,
-        frontiers: BlockSyncFrontiers,
-        release_applied: bool,
-    ) {
-        // Fold the finalized height forward unconditionally, then drop a stale
-        // update. The verified tip is monotonic: an advance whose target is below
-        // our verified tip must be a no-op, never a regression. Without this guard
-        // the second growth-reset path (`< floor`, which permits `< verified_tip`)
-        // would call `advance_verified_tip` with a lower tip and regress it.
-        self.finalized_height = self.finalized_height.max(frontiers.finalized_height);
-        if frontiers.verified_block_tip < self.sequencer.verified_tip() {
-            return;
-        }
-        self.verified_block_hash = frontiers.verified_block_hash;
-        let advance = self
-            .sequencer
-            .advance_verified_tip(frontiers.verified_block_tip, release_applied);
-        if advance.changed {
-            let released = self.work.advance_floor(frontiers.verified_block_tip);
-            self.budget.release(released);
-            self.release_contiguous_blocks().await;
-        }
-    }
-
-    /// Handle a chain-tip reset: classify it as growth (treat as an advance) or a
-    /// destructive reorg (pin tip/floor to the target, clear successor buffers, and
-    /// bump the reset epoch). The peer-outstanding clauses of the decision arrive as
-    /// the precomputed `peer_*` bools, since the reactor owns peer state.
-    async fn handle_frontier_reset(
-        &mut self,
-        frontiers: BlockSyncFrontiers,
-        preserve_active_successors: bool,
-        peer_has_successor_after: bool,
-        peer_outstanding_conflicts_at_tip: bool,
-    ) {
-        let reset_tip_matches_local_work = !self.reset_tip_conflicts_with_local_work(
-            &frontiers,
-            frontiers.verified_block_tip <= self.sequencer.floor(),
-            peer_outstanding_conflicts_at_tip,
-        );
-
-        // State can report a forward `Reset` while checkpoint commits advance
-        // under already-submitted or still-downloading successor bodies. Treat
-        // that as verified growth once it is inside our submitted/downloaded
-        // floor, or when we already have successor work in flight. Keep fork
-        // resets destructive when they are not anchored by active successor
-        // work.
-        if frontiers.verified_block_tip > self.sequencer.verified_tip()
-            && (frontiers.verified_block_tip <= self.sequencer.floor()
-                || self.has_active_successor_after(
-                    frontiers.verified_block_tip,
-                    peer_has_successor_after,
-                ))
-            && reset_tip_matches_local_work
-        {
-            self.trace_frontier_reset_classified(
-                "growth",
-                &frontiers,
-                preserve_active_successors,
-                peer_has_successor_after,
-                peer_outstanding_conflicts_at_tip,
-                reset_tip_matches_local_work,
-            );
-            // Growth-classified reset: treat it as a frontier advance, releasing
-            // applied bodies.
-            self.handle_frontier_advance(frontiers, true).await;
-            return;
-        }
-
-        metrics::counter!("sync.block.reorg.reset").increment(1);
-
-        // A `Reset` can also be a stale or coalesced state update for a tip
-        // already inside our contiguous submitted/downloaded body floor. Do not
-        // destructively clear successor bodies in that case: a stale reset
-        // snapshot can otherwise erase `applying`/covered state and re-request
-        // the same bodies while their first apply is still in flight.
-        if preserve_active_successors
-            && frontiers.verified_block_tip < self.sequencer.floor()
-            && reset_tip_matches_local_work
-            && self
-                .has_active_successor_after(frontiers.verified_block_tip, peer_has_successor_after)
-            && self.active_successor_links_to_anchor(
-                frontiers.verified_block_tip,
-                frontiers.verified_block_hash,
-            )
-        {
-            self.trace_frontier_reset_classified(
-                "preserved_stale",
-                &frontiers,
-                preserve_active_successors,
-                peer_has_successor_after,
-                peer_outstanding_conflicts_at_tip,
-                reset_tip_matches_local_work,
-            );
-            self.handle_frontier_advance(frontiers, true).await;
-            return;
-        }
-
-        self.trace_frontier_reset_classified(
-            "destructive",
-            &frontiers,
-            preserve_active_successors,
-            peer_has_successor_after,
-            peer_outstanding_conflicts_at_tip,
-            reset_tip_matches_local_work,
-        );
-        let remember_released_applies = frontiers.verified_block_tip > frontiers.finalized_height
-            && frontiers.verified_block_tip <= self.sequencer.floor();
-
-        self.finalized_height = frontiers.finalized_height;
-        self.verified_block_hash = frontiers.verified_block_hash;
-
-        self.destructive_reset_to(frontiers.verified_block_tip, remember_released_applies);
-    }
-
-    /// Handle a verifier apply completion.
-    /// Release the verifier slot.
-    /// After a rejection, move the floor below the bad block so peers can request its range again.
-    /// The authoritative snapshot watch supplies committed frontier changes.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_apply_finished(
-        &mut self,
-        owner: zakura_header_chain::BodyWorkOwner,
-        source: zakura_header_chain::SourceId,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-        outcome: &mut BlockApplyOutcome,
-        mut eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
-        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
-        semantic_completion: Option<(
-            zakura_header_chain::BodyWorkOwner,
-            zakura_header_chain::StateVersion,
-        )>,
-    ) -> (bool, bool) {
-        let result = outcome.result();
-        // Frontier updates can remove applying entries before their completions.
-        // Every committed exit below retires the exact submission, so a repeated
-        // completion cannot count its cached wire size again.
-        #[cfg(feature = "sync-metrics")]
-        if matches!(result, BlockApplyResult::Committed) {
-            if let Some(bytes) = self
-                .sequencer
-                .submission_bytes(owner, source, token, height, hash)
-            {
-                self.committed_throughput.record(bytes);
-                metrics::counter!("sync.block.payload.committed.bytes").increment(bytes);
-            }
-        }
-        // A stale completion (no live applying entry, or token/hash mismatch)
-        // releases only its exact token-aware in-flight-submission charge and
-        // returns; there is no query/schedule tail here, so it needs no reaction.
-        let Some((applying_owner, applying_source, applying_token, applying_hash)) =
-            self.sequencer.applying_identity(height)
-        else {
-            let released = self
-                .sequencer
-                .finish_submission(owner, source, token, height, hash);
-            let verified = matches!(
-                outcome.verification(),
-                zakura_header_chain::BodyVerificationOutcome::Verified(_)
-            );
-            return (false, released && verified && semantic_completion.is_some());
-        };
-        if applying_owner != owner
-            || applying_source != source
-            || applying_hash != hash
-            || applying_token != token
-        {
-            let released = self
-                .sequencer
-                .finish_submission(owner, source, token, height, hash);
-            // A scope transition can detach an older checkpoint submission and
-            // install a newer submission for the same height. When the newer
-            // request makes the old verifier call finish as a duplicate, the
-            // exact old token frees a submission slot without removing the
-            // current applying body. Refill that slot or the checkpoint window
-            // can shrink below the range needed to resolve the next checkpoint.
-            return (false, released);
-        }
-        let Some((semantic_owner, semantic_state_version)) = semantic_completion else {
-            let _ = self.sequencer.remove_applying(height);
-            self.sequencer
-                .finish_submission(owner, source, token, height, hash);
-            // Removing this submitted body can leave the decoded-cap window with
-            // nothing submitted, so wake its pending work (see
-            // `Sequencer::submission_admitted`). With nothing pending, a stale
-            // completion still schedules nothing.
-            return (
-                false,
-                self.sequencer.submission_window_idle_with_pending_work(),
-            );
-        };
-        let attribution_matches = outcome
-            .attributed_source()
-            .is_none_or(|attributed| attributed == source);
-        if attribution_matches {
-            if let zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(invalid) =
-                outcome.verification()
-            {
-                self.send_required_action(BlockSyncAction::RecordBodyInvalid {
-                    expected_version: semantic_state_version,
-                    invalid: invalid.clone(),
-                })
-                .await;
-            }
-        }
-        self.record_body_retry(
-            semantic_owner,
-            source,
-            zakura_header_chain::Frontier::new(height, hash),
-            outcome,
-            &mut eligible_sources,
-            persisted_availability,
-        );
-        if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
-            outcome.verification()
-        {
-            self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
-                expected_version: semantic_state_version,
-                failure: *failure,
-            })
-            .await;
-        }
-        if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
-            // Keep a duplicate attached until the committed snapshot includes its height.
-            // The driver already released its decoded copy.
-            // Release the token-aware decode-window charge now.
-            self.sequencer
-                .finish_attached_submission(owner, source, token, height, hash);
-            return (false, true);
-        }
-        let applying = self
-            .sequencer
-            .remove_applying(height)
-            .expect("applying entry exists because it was just checked");
-
-        // A `Committed` result is a body that newly extended the chain; count it
-        // toward commit throughput (the apply rate the download path is racing).
-        if !cfg!(feature = "sync-metrics") && matches!(result, BlockApplyResult::Committed) {
-            self.committed_throughput.record(applying.bytes);
-        }
-        self.sequencer
-            .finish_submission(owner, source, token, height, hash);
-        match result {
-            BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
-            BlockApplyResult::Rejected
-            | BlockApplyResult::Unavailable
-            | BlockApplyResult::TimedOut
-                if height > self.sequencer.verified_tip() =>
-            {
-                // Drop the failed body and every successor (in applying and
-                // reorder), roll the floor back below it, and drop the WorkQueue
-                // entries above the rolled-back floor so the heights are
-                // re-requestable (the reactor's `query_needed_blocks` re-fills).
-                let _ = self.sequencer.release_applying_blocks_from(height);
-                self.sequencer.reset_floor_below(height);
-                let released = self.work.reset_above(self.sequencer.floor());
-                self.budget.release(released);
-                let _ = self.sequencer.drop_reorder_from(height);
-                // A `Rejected` result identifies a bad body from a peer.
-                // Attribute it to the delivering peer.
-                // Do not score local `Unavailable` or `TimedOut` failures.
-                if matches!(result, BlockApplyResult::Rejected) && attribution_matches {
-                    let reason = match outcome.verification() {
-                        zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
-                            BlockSyncMisbehavior::BodyPayloadMismatch(*mismatch)
-                        }
-                        zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(invalid) => {
-                            BlockSyncMisbehavior::ConsensusBodyInvalid(invalid.clone())
-                        }
-                        zakura_header_chain::BodyVerificationOutcome::Verified(_)
-                        | zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {
-                            unreachable!("only rejected outcomes reach peer scoring")
-                        }
-                    };
-                    let disconnects = reason.proves_tampered_body();
-                    let action = BlockSyncAction::Misbehavior {
-                        peer: applying.source_peer.clone(),
-                        reason,
-                    };
-                    // The driver disconnects a proven tampering supplier, so that
-                    // record must not be dropped when the action channel is busy.
-                    if disconnects {
-                        self.send_required_action(action).await;
-                    } else {
-                        self.send_action(action).await;
-                    }
-                }
-            }
-            BlockApplyResult::Rejected
-            | BlockApplyResult::Unavailable
-            | BlockApplyResult::TimedOut => {}
-        }
-        self.release_contiguous_blocks().await;
-        (true, true)
-    }
-
-    fn record_body_retry(
-        &mut self,
-        owner: zakura_header_chain::BodyWorkOwner,
-        source: zakura_header_chain::SourceId,
-        header: zakura_header_chain::Frontier,
-        outcome: &mut BlockApplyOutcome,
-        eligible_sources: &mut BTreeSet<zakura_header_chain::SourceId>,
-        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
-    ) {
-        let hash = header.hash;
-        let Some(failure) = outcome.retryable_mut() else {
-            self.body_retries
-                .remove(owner.header_generation, owner.branch, hash);
-            self.registry.clear_body_retry(owner.authority(), hash);
-            return;
-        };
-        eligible_sources.insert(source);
-        if self
-            .body_retries
-            .get_mut(owner.header_generation, owner.branch, hash)
-            .is_none()
-        {
-            let episode = persisted_availability
-                .filter(|summary| summary.alarmed)
-                .map(|summary| {
-                    crate::zakura::header_sync::BodyRetryEpisode::restore(
-                        owner.branch,
-                        owner.header_generation,
-                        header,
-                        eligible_sources.clone(),
-                        summary,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    crate::zakura::header_sync::BodyRetryEpisode::new(
-                        owner.branch,
-                        owner.header_generation,
-                        header,
-                        eligible_sources.clone(),
-                        &zakura_header_chain::SystemClock,
-                    )
-                });
-            self.body_retries.insert(episode);
-        }
-        let episode = self
-            .body_retries
-            .get_mut(owner.header_generation, owner.branch, hash)
-            .expect("the exact retry episode exists because it was inserted above");
-        episode.refresh_suppliers(eligible_sources.clone());
-        let update = episode.record_failure(
-            source,
-            &zakura_header_chain::SystemClock,
-            &self.retry_jitter,
-        );
-        let deferred_sources = if episode.alarmed {
-            eligible_sources.clone()
-        } else {
-            episode.tried_suppliers.clone()
-        };
-        let retry_at = match update {
-            crate::zakura::header_sync::RetryUpdate::TooEarly => episode.next_probe_at,
-            crate::zakura::header_sync::RetryUpdate::RetryAt(retry_at)
-            | crate::zakura::header_sync::RetryUpdate::ProbeAt(retry_at) => retry_at,
-            crate::zakura::header_sync::RetryUpdate::Alarmed { probe_at } => probe_at,
-        };
-        failure.availability = episode.summary();
-        if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
-            if persisted.suppliers > failure.availability.suppliers {
-                failure.availability.suppliers = persisted.suppliers;
-                failure.availability.supplier_set_digest = persisted.supplier_set_digest;
-            }
-        }
-        self.registry.defer_body_retry(
-            deferred_sources,
-            owner.authority(),
+        let height = body.height;
+        let facts = self.payloads.insert(body.body);
+        let state::BodyAccepted {
+            acceptance,
+            payload_changes,
+        } = self.state.accept_body(ReceivedBody {
+            owner: body.owner,
+            source: body.source,
+            height,
+            hash: body.hash,
+            previous_block_hash: body.previous_block_hash,
+            body: facts,
+            bytes: body.bytes,
+            admitted_estimate_bytes: body.admitted_estimate_bytes,
+            peer: body.peer,
+        });
+        self.payloads.apply(payload_changes);
+        if let BodyAcceptance::RetentionDeferred {
+            owner,
+            height,
             hash,
-            retry_deadline_instant(retry_at),
-        );
+            bytes,
+            verified_tip,
+        } = acceptance
+        {
+            // A refused deferral means a reset or the floor already removed this
+            // exact attempt, so the height has another path to a body.
+            self.work
+                .defer_received_for_owner(owner, height, hash, bytes, verified_tip);
+            metrics::counter!("sync.block.retention.deferred").increment(1);
+        }
+        self.publish_state_metrics();
+        self.trace_body_accepted(height, queued_elapsed, acceptance.label());
     }
 
-    /// Drain the contiguous reorder prefix into applying, then submit it.
-    async fn release_contiguous_blocks(&mut self) {
-        let _ = self.sequencer.drain_ready_into_applying();
-        self.submit_pending_blocks().await;
+    /// Run one transition's operations in order.
+    async fn execute(&mut self, operations: Vec<SequencerOperation>) {
+        for operation in operations {
+            match operation {
+                SequencerOperation::RefreshWorkAuthority(authority) => {
+                    self.work.refresh_authority(authority);
+                }
+                SequencerOperation::ResetWorkAbove(height) => {
+                    self.work.reset_above(height);
+                }
+                SequencerOperation::AdvanceWorkFloor(height) => {
+                    self.work.advance_floor(height);
+                }
+                SequencerOperation::RefreshBodyRetryScope(authority) => {
+                    self.registry.refresh_body_retry_scope(authority);
+                }
+                SequencerOperation::RetainBodyRetryScope(authority) => {
+                    self.registry.retain_body_retry_scope(Some(authority));
+                }
+                SequencerOperation::ClearBodyRetry { scope, hash } => {
+                    self.registry.clear_body_retry(scope, hash);
+                }
+                SequencerOperation::DeferBodyRetry {
+                    sources,
+                    scope,
+                    hash,
+                    retry_at,
+                } => {
+                    self.registry.defer_body_retry(
+                        sources,
+                        scope,
+                        hash,
+                        retry_deadline_instant(retry_at, self.retry_clock.as_ref()),
+                    );
+                }
+                SequencerOperation::DeliverEvidence => self.deliver_required_evidence().await,
+                SequencerOperation::SendAction(evidence) => {
+                    self.send_replaceable_evidence(evidence).await;
+                }
+                SequencerOperation::SubmitPending => self.submit_pending_blocks().await,
+            }
+        }
     }
 
     async fn submit_pending_blocks(&mut self) {
-        let submittable_heights = self.sequencer.submittable_heights();
-        if submittable_heights.is_empty() {
-            if self.sequencer.unsubmitted_applying_count() == 0 {
-                self.submission_retry_at = None;
-                self.submission_retry_started_at = None;
-                self.submission_retry_attempt = 0;
-            } else if self.submission_retry_started_at.is_some()
-                && self.submission_retry_at.is_none()
-                && !self.actions.is_closed()
-            {
-                self.submission_retry_at = Some(time::Instant::now() + SUBMISSION_RETRY_DELAY);
-            }
+        self.decoded_capacity_blocked = None;
+        if self.decoded_pool.is_closed() {
             return;
         }
+        let Some(mut pass) = self
+            .state
+            .begin_submission_pass(time::Instant::now(), self.actions.is_closed())
+        else {
+            return;
+        };
 
-        self.submission_retry_at = None;
-        for height in submittable_heights {
-            // Each decode replaces an estimate with the measured size, so recheck
-            // the cap before every submission (see `submittable_heights`).
-            if !self.sequencer.submission_fits_decoded_window(height) {
+        while let Some(height) = self.state.next_submission_height(&mut pass) {
+            if self.decoded_pool.is_closed() {
                 break;
             }
-            let Some(item) = self.sequencer.prepare_submit(height) else {
+            let decode_charge = self.state.sequencer().submission_decode_charge_at(height);
+            if decode_charge > 0 {
+                self.publish_decoded_ownership_view_with(decode_charge);
+            }
+            let capacity_version = self.decoded_pool.capacity_version();
+            let Some(submission) = self.state.submission_body(height) else {
+                self.publish_decoded_ownership_view();
                 continue;
             };
-
-            metrics::counter!("sync.block.submit.sent").increment(1);
-            let queue_depth = self
-                .actions
-                .max_capacity()
-                .saturating_sub(self.actions.capacity());
-            // Metrics accepts f64 samples; this lossy conversion is observability-only.
-            metrics::histogram!(
-                "sync.block.action.queue.depth",
-                "action" => "submit_block"
-            )
-            .record(queue_depth as f64);
+            let materialized = match self.payloads.materialize(
+                submission.id,
+                &self.decoded_pool,
+                submission.admission,
+            ) {
+                Ok(materialized) => materialized,
+                Err(AdmissionFailure::Capacity) => {
+                    self.decoded_capacity_blocked = Some(capacity_version);
+                    self.publish_decoded_ownership_view();
+                    break;
+                }
+                Err(_) => {
+                    self.decoded_pool.close();
+                    self.publish_decoded_ownership_view();
+                    break;
+                }
+            };
+            let item = self
+                .state
+                .prepare_submit(height, submission.id, materialized.decoded_bytes)
+                .expect("materialization and submission run synchronously under one owner");
+            assert_eq!(
+                item.body_id, submission.id,
+                "submission names its materialized payload"
+            );
+            let decoded_bytes = item.decoded_bytes;
+            self.record_submission_metrics(decoded_bytes, materialized.newly_decoded_wire_bytes);
+            let (height, hash, token) = (item.height, item.hash, item.token);
             let send_started = time::Instant::now();
+            // Publish the decode before the send can wait on a slow verifier, so
+            // a routine's handoff room check counts it.
+            self.publish_decoded_ownership_view();
+            #[cfg(any(test, zakura_sim))]
+            self.observe_holders();
             let sent = self
                 .send_action(BlockSyncAction::SubmitBlock {
                     owner: item.owner,
                     source: item.source,
-                    token: item.token,
-                    block: item.block,
+                    token,
+                    block: materialized.block,
                 })
                 .await;
             metrics::histogram!("sync.block.submit.queue_wait_seconds")
                 .record(send_started.elapsed().as_secs_f64());
             if !sent {
-                self.sequencer.unsubmit(item.height, item.token);
-                if !self.actions.is_closed() {
-                    let now = time::Instant::now();
-                    self.submission_retry_started_at.get_or_insert(now);
-                    self.submission_retry_attempt = self.submission_retry_attempt.saturating_add(1);
-                    self.submission_retry_at = Some(now + SUBMISSION_RETRY_DELAY);
+                let refused = self.state.submission_refused(
+                    height,
+                    token,
+                    time::Instant::now(),
+                    self.actions.is_closed(),
+                );
+                if refused.retry_scheduled {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
-                    self.trace_submission_retry_scheduled(item.height);
+                    self.trace_submission_retry_scheduled(height);
                 }
+                self.payloads.apply(refused.payload_changes);
+                self.publish_state_metrics();
                 return;
             }
-            if let Some(started_at) = self.submission_retry_started_at.take() {
+            if let Some(started_at) = self.state.submission_accepted(height, hash, decoded_bytes) {
                 metrics::counter!("sync.block.submit.retry.succeeded").increment(1);
                 metrics::histogram!("sync.block.submit.retry.delay_seconds")
                     .record(started_at.elapsed().as_secs_f64());
-                self.submission_retry_attempt = 0;
             }
-            self.sequencer
-                .record_submitted_apply(item.height, item.hash);
-            self.trace_body_submitted(item.height, item.token);
+            self.trace_body_submitted(height, token);
         }
     }
 
-    /// `reset_tip_conflicts_with_local_work`'s Sequencer-internal predicates,
-    /// with the peer-outstanding clause supplied by the reactor.
-    fn reset_tip_conflicts_with_local_work(
+    fn record_submission_metrics(
         &self,
-        frontiers: &BlockSyncFrontiers,
-        ignore_non_material_conflicts: bool,
-        peer_outstanding_conflicts_at_tip: bool,
-    ) -> bool {
-        let height = frontiers.verified_block_tip;
-        let hash = frontiers.verified_block_hash;
-
-        if self
-            .sequencer
-            .reorder_hash(height)
-            .is_some_and(|buffered_hash| buffered_hash != hash)
-        {
-            return true;
+        decoded_bytes: u64,
+        newly_decoded_wire_bytes: Option<usize>,
+    ) {
+        if let Some(wire_bytes) = newly_decoded_wire_bytes {
+            // Metrics use f64; admission and collection totals remain integers.
+            metrics::histogram!(
+                "sync.block.body.decoded.attributed_memory_size_bytes",
+                "stage" => "reorder"
+            )
+            .record(decoded_bytes as f64);
+            if wire_bytes > 0 {
+                metrics::histogram!(
+                    "sync.block.body.decoded.to_serialized_ratio",
+                    "stage" => "reorder"
+                )
+                .record(decoded_bytes as f64 / wire_bytes as f64);
+            }
         }
-        if self
-            .sequencer
-            .applying_hash(height)
-            .is_some_and(|applying_hash| applying_hash != hash)
-        {
-            return true;
-        }
-        if !ignore_non_material_conflicts
-            && self.sequencer.submitted_has_only_other_hashes(height, hash)
-        {
-            return true;
-        }
-        if !ignore_non_material_conflicts && peer_outstanding_conflicts_at_tip {
-            return true;
-        }
-        false
-    }
-
-    fn has_active_successor_after(
-        &self,
-        height: block::Height,
-        peer_has_successor_after: bool,
-    ) -> bool {
-        let Some(next) = next_height(height) else {
-            return false;
-        };
-
-        self.sequencer.has_buffered_at_or_above(next) || peer_has_successor_after
-    }
-
-    fn active_successor_links_to_anchor(
-        &self,
-        height: block::Height,
-        anchor_hash: block::Hash,
-    ) -> bool {
-        let Some(next) = next_height(height) else {
-            return true;
-        };
-
-        direct_successor_links_to_anchor(
-            self.sequencer.applying_previous_block_hash(next),
-            anchor_hash,
+        metrics::counter!("sync.block.submit.sent").increment(1);
+        let queue_depth = self
+            .actions
+            .max_capacity()
+            .saturating_sub(self.actions.capacity());
+        // Metrics accepts f64 samples; this lossy conversion is observability-only.
+        metrics::histogram!(
+            "sync.block.action.queue.depth",
+            "action" => "submit_block"
         )
+        .record(queue_depth as f64);
     }
 
     async fn send_action(&self, action: BlockSyncAction) -> bool {
@@ -1139,75 +1129,105 @@ impl SequencerTask {
         }
     }
 
-    /// Retain a durability-relevant action until the driver accepts it.
-    ///
-    /// A bounded timeout is correct for replaceable submissions and telemetry.
-    /// It is not correct for deterministic invalidity or the latest retry state.
-    /// Waiting on the bounded channel gives this sender FIFO capacity ahead of
-    /// later peer-serving `try_send` calls. A closed receiver leaves this future
-    /// fail-closed with the exact action retained until subsystem supervision
-    /// cancels the task.
-    async fn send_required_action(&self, action: BlockSyncAction) {
-        let action_label = action.metric_label();
-        if let Err(error) = self.actions.send(action).await {
-            metrics::counter!(
-                "sync.block.action.required_receiver_closed",
-                "action" => action_label
-            )
-            .increment(1);
-            tracing::error!(
-                action = action_label,
-                "required block-sync action receiver closed"
-            );
-            let retained_action = error.0;
-            std::future::pending::<()>().await;
-            drop(retained_action);
+    /// Send a replaceable peer report or record, giving up after the bounded
+    /// action-send timeout.
+    async fn send_replaceable_evidence(&self, evidence: state::SequencerEvidence) {
+        let action_label = evidence.metric_label();
+        let deadline = time::Instant::now() + self.action_send_timeout;
+        match reserve_action(
+            &self.actions,
+            evidence.class(),
+            action_label,
+            Some(deadline),
+        )
+        .await
+        {
+            Some(mut permits) => send_reserved(&mut permits, evidence),
+            None if !self.actions.is_closed() => {
+                metrics::counter!(
+                    "sync.block.action.send_timeout",
+                    "action" => action_label
+                )
+                .increment(1);
+            }
+            None => {}
         }
     }
 
+    /// Deliver the oldest pending required action once the driver has capacity.
+    ///
+    /// A bounded timeout is correct for replaceable submissions and telemetry.
+    /// It is not correct for deterministic invalidity or the latest retry state.
+    /// The state keeps the action pending until a reserved permit guarantees
+    /// delivery. A closed receiver leaves this future fail-closed with the exact
+    /// action still pending in the state until subsystem supervision cancels the
+    /// task.
+    async fn deliver_required_evidence(&mut self) {
+        let Some((action_label, class)) = self
+            .state
+            .pending_evidence()
+            .map(|evidence| (evidence.metric_label(), evidence.class()))
+        else {
+            return;
+        };
+        match reserve_action(&self.actions, class, action_label, None).await {
+            Some(mut permits) => {
+                let evidence = self
+                    .state
+                    .take_pending_evidence()
+                    .expect("pending evidence exists because it was just observed");
+                send_reserved(&mut permits, evidence);
+            }
+            None => {
+                metrics::counter!(
+                    "sync.block.action.required_receiver_closed",
+                    "action" => action_label
+                )
+                .increment(1);
+                tracing::error!(
+                    action = action_label,
+                    "required block-sync action receiver closed"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Publish gauges after a completed state mutation, before IO can suspend.
+    fn publish_state_metrics(&self) {
+        let sequencer = self.state.sequencer();
+        // Metrics use f64; the sequencer keeps exact integer totals.
+        metrics::gauge!("sync.block.reorder.buffered_bytes")
+            .set(sequencer.reorder_buffered_bytes() as f64);
+        metrics::gauge!("sync.block.applying.buffered_bytes")
+            .set(sequencer.applying_buffered_bytes() as f64);
+        metrics::gauge!("sync.block.submission.in_flight_bytes")
+            .set(sequencer.in_flight_submission_bytes() as f64);
+    }
+
     fn publish_view(&mut self) {
+        self.publish_state_metrics();
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.observe_holders();
+            self.work.observe_items();
+        }
         #[cfg(feature = "sync-metrics")]
         self.committed_throughput
             .sample_at_interval(Instant::now(), Duration::from_secs(1));
         #[cfg(not(feature = "sync-metrics"))]
         self.committed_throughput.sample(Instant::now());
-        let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
-        let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let reorder_decoded_attributed_memory_bytes =
-            self.sequencer.reorder_decoded_attributed_memory_bytes();
-        let applying_decoded_attributed_memory_bytes =
-            self.sequencer.applying_decoded_attributed_memory_bytes();
-        let active_pipeline_decoded_attributed_memory_bytes =
-            sequencer_input_decoded_attributed_memory_bytes
-                .saturating_add(reorder_decoded_attributed_memory_bytes)
-                .saturating_add(applying_decoded_attributed_memory_bytes);
+            .load(Ordering::Relaxed);
         // Retained bodies do not charge the request budget.
-        self.budget
-            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
-        let next = SequencerView {
-            verified_tip: self.sequencer.verified_tip(),
-            verified_hash: self.verified_block_hash,
-            download_floor: self.sequencer.floor(),
-            finalized: self.finalized_height,
-            reset_epoch: self.reset_epoch,
-            reaction_epoch: self.reaction_epoch,
-            reorder_len: self.sequencer.reorder_len() as u64,
-            applying_len: self.sequencer.applying_len() as u64,
-            reorder_buffered_bytes,
-            applying_buffered_bytes,
+        let accounting_closed = !self.work.audit_funding() || self.decoded_pool.is_closed();
+        let mut next = self.state.view(
             sequencer_input_decoded_attributed_memory_bytes,
-            reorder_decoded_attributed_memory_bytes,
-            applying_decoded_attributed_memory_bytes,
-            active_pipeline_decoded_attributed_memory_bytes,
-            unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
-            in_flight_submission_count: self.sequencer.in_flight_submission_count() as u64,
-            in_flight_submission_bytes: self.sequencer.in_flight_submission_bytes(),
-            committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
-            committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
-        };
+            self.committed_throughput.bytes_per_sec(),
+            self.committed_throughput.blocks_per_sec(),
+        );
+        next.accounting_closed = accounting_closed;
         // Only wake watchers (the reactor + every per-peer routine) when a field
         // they schedule against actually changed. The two committed_*_per_sec rates
         // are observability-only; without this guard a stale or duplicate
@@ -1222,67 +1242,58 @@ impl SequencerTask {
     }
 
     fn publish_decoded_ownership_view(&self) {
+        self.publish_decoded_ownership_view_with(0);
+    }
+
+    /// [`Self::publish_decoded_ownership_view`], with `decoding_bytes` added to
+    /// `applying` for a body about to be decoded.
+    fn publish_decoded_ownership_view_with(&self, decoding_bytes: u64) {
+        self.publish_state_metrics();
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let reorder_decoded_attributed_memory_bytes =
-            self.sequencer.reorder_decoded_attributed_memory_bytes();
-        let applying_decoded_attributed_memory_bytes =
-            self.sequencer.applying_decoded_attributed_memory_bytes();
-        let active_pipeline_decoded_attributed_memory_bytes =
-            sequencer_input_decoded_attributed_memory_bytes
-                .saturating_add(reorder_decoded_attributed_memory_bytes)
-                .saturating_add(applying_decoded_attributed_memory_bytes);
+            .load(Ordering::Relaxed);
+        let next = self
+            .state
+            .view(sequencer_input_decoded_attributed_memory_bytes, 0, 0);
         self.view_tx.send_if_modified(|view| {
             view.sequencer_input_decoded_attributed_memory_bytes =
-                sequencer_input_decoded_attributed_memory_bytes;
-            view.reorder_decoded_attributed_memory_bytes = reorder_decoded_attributed_memory_bytes;
-            view.applying_decoded_attributed_memory_bytes =
-                applying_decoded_attributed_memory_bytes;
-            view.active_pipeline_decoded_attributed_memory_bytes =
-                active_pipeline_decoded_attributed_memory_bytes;
+                next.sequencer_input_decoded_attributed_memory_bytes;
+            view.reorder_decoded_attributed_memory_bytes =
+                next.reorder_decoded_attributed_memory_bytes;
+            view.applying_decoded_attributed_memory_bytes = next
+                .applying_decoded_attributed_memory_bytes
+                .saturating_add(decoding_bytes);
+            view.active_pipeline_decoded_attributed_memory_bytes = next
+                .active_pipeline_decoded_attributed_memory_bytes
+                .saturating_add(decoding_bytes);
             false
         });
     }
 }
 
-fn add_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+fn add_atomic_bytes(counter: &AtomicU64, bytes: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(bytes);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }
     }
 }
 
-fn release_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+/// Releases `bytes` from `counter`. The release orders after the caller's
+/// earlier writes, such as a published view, for a reader that loads
+/// `counter` with `Acquire`.
+fn release_atomic_bytes(counter: &AtomicU64, bytes: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_sub(bytes);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }
     }
-}
-
-fn direct_successor_links_to_anchor(
-    previous_block_hash: Option<block::Hash>,
-    anchor_hash: block::Hash,
-) -> bool {
-    previous_block_hash.is_some_and(|hash| hash == anchor_hash)
 }
 
 fn publish_sequencer_view(view_tx: &watch::Sender<SequencerView>, next: SequencerView) {
@@ -1311,33 +1322,78 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
     strip_rates(a) != strip_rates(b)
 }
 
+/// Reserve action-channel capacity under `class`'s rule. A required action
+/// waits in the channel's FIFO queue, ahead of later peer-serving `try_send`
+/// calls. An optional action polls every [`state::SUBMISSION_RETRY_DELAY`]
+/// instead: a queued reservation would hold the control reserve while it waited
+/// for its second permit. Each refused poll counts against `action_label`.
+/// Returns `None` once the driver closes the channel or `deadline` passes.
+async fn reserve_action<'a>(
+    actions: &'a mpsc::Sender<BlockSyncAction>,
+    class: ActionClass,
+    action_label: &'static str,
+    deadline: Option<time::Instant>,
+) -> Option<mpsc::PermitIterator<'a, BlockSyncAction>> {
+    if class == ActionClass::Required {
+        let reserve = actions.reserve_many(class.permits());
+        return match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(time::Instant::now());
+                time::timeout(remaining, reserve).await.ok()?.ok()
+            }
+            None => reserve.await.ok(),
+        };
+    }
+    loop {
+        match actions.try_reserve_many(class.permits()) {
+            Ok(permits) => return Some(permits),
+            Err(mpsc::error::TrySendError::Closed(())) => return None,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                metrics::counter!(
+                    "sync.block.action.control_capacity_reserved",
+                    "action" => action_label
+                )
+                .increment(1);
+            }
+        }
+        let retry_at = time::Instant::now() + state::SUBMISSION_RETRY_DELAY;
+        match deadline {
+            Some(deadline) if deadline <= time::Instant::now() => return None,
+            Some(deadline) => time::sleep_until(retry_at.min(deadline)).await,
+            None => time::sleep_until(retry_at).await,
+        }
+    }
+}
+
+/// Send `evidence` through one reserved permit. The other permits return to the
+/// channel when `permits` drops.
+fn send_reserved(
+    permits: &mut mpsc::PermitIterator<'_, BlockSyncAction>,
+    evidence: state::SequencerEvidence,
+) {
+    let class = evidence.class();
+    let action = evidence.into_action();
+    debug_assert_eq!(class, ActionClass::of(&action));
+    permits
+        .next()
+        .expect("a reservation holds at least one permit")
+        .send(action);
+}
+
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
+    mod ownership;
 
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
-    use super::super::tests::genesis_frontiers;
+    use super::super::{reactor::BS_ACTION_CONTROL_RESERVE, tests::genesis_frontiers};
     use super::*;
-
-    #[test]
-    fn missing_direct_successor_cannot_prove_reset_anchor() {
-        let anchor_hash = block::Hash([1; 32]);
-
-        assert!(direct_successor_links_to_anchor(
-            Some(anchor_hash),
-            anchor_hash
-        ));
-        assert!(!direct_successor_links_to_anchor(
-            Some(block::Hash([2; 32])),
-            anchor_hash
-        ));
-        assert!(!direct_successor_links_to_anchor(None, anchor_hash));
-    }
 
     fn test_view() -> SequencerView {
         SequencerView {
+            accounting_closed: false,
             verified_tip: block::Height(1),
             verified_hash: block::Hash([1; 32]),
             download_floor: block::Height(1),
@@ -1382,11 +1438,56 @@ mod tests {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             123,
+            None,
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
             Instant::now(),
             input_bytes,
             input_decoded_attributed_memory_bytes,
         )
+    }
+
+    /// Feed one apply completion through the state and run its operations.
+    ///
+    /// Returns whether it needs a reactor reaction and whether it may refill
+    /// submission slots.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_apply(
+        task: &mut SequencerIO,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        token: BlockApplyToken,
+        height: block::Height,
+        hash: block::Hash,
+        outcome: BlockApplyOutcome,
+        eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
+        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
+        semantic_completion: Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
+    ) -> (bool, bool) {
+        let outputs = task.state.on_control_input(
+            SequencerControlInput::ApplyFinished {
+                owner: Box::new(owner),
+                source,
+                token,
+                height,
+                hash,
+                outcome,
+                eligible_sources,
+                persisted_availability,
+                semantic_completion,
+                committed_epoch,
+            },
+            task.retry_clock.now(),
+        );
+        let allows_submit = outputs
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, SequencerOperation::SubmitPending));
+        let needs_reaction = task.apply_control_outputs(outputs).await;
+        (needs_reaction, allows_submit)
     }
 
     #[test]
@@ -1473,22 +1574,23 @@ mod tests {
         );
     }
 
-    fn retention_test_task(limit: u64) -> SequencerTask {
+    fn retention_test_task(limit: u64) -> SequencerIO {
         let frontiers = genesis_frontiers();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        SequencerTask::new(
+        let budget = ByteBudget::new(1_000_000);
+        SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1_000_000),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1496,12 +1598,12 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         )
         .with_retained_body_limit(limit)
     }
 
-    // Use a real serialized block. Only the scheduling height is synthetic.
-    fn received_test_body(task: &mut SequencerTask, height: u32, estimate: u64) -> SequencedBody {
+    fn received_test_block() -> (Arc<block::Block>, Arc<[u8]>) {
         use zakura_chain::serialization::ZcashSerialize;
         let block: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
@@ -1509,6 +1611,17 @@ mod tests {
                 .unwrap(),
         );
         let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+        (block, raw)
+    }
+
+    /// Wire size of every body [`received_test_body`] builds.
+    fn received_test_body_bytes() -> u64 {
+        u64::try_from(received_test_block().1.len()).unwrap()
+    }
+
+    // Use a real serialized block. Only the scheduling height is synthetic.
+    fn received_test_body(task: &mut SequencerIO, height: u32, estimate: u64) -> SequencedBody {
+        let (block, raw) = received_test_block();
         let bytes = u64::try_from(raw.len()).unwrap();
         let height = block::Height(height);
         task.work.extend(
@@ -1521,23 +1634,13 @@ mod tests {
                 ),
             )],
         );
-        let taken = task.work.take_for_request(
-            height,
-            height,
-            1,
-            estimate,
-            u64::from(height.0),
-            std::num::NonZeroU64::new(1).unwrap(),
-        );
-        let owner = taken[0].1.owner.unwrap();
-        let reserved = task.work.mark_reserved_for_owner(owner, [height]);
-        task.budget.charge(reserved);
-        assert_eq!(
+        let owner = task.work.publish_fixture(height.0..=height.0);
+        drop(
             task.work
-                .release_active_reserved_height_for_owner(owner, height),
-            Some(reserved)
+                .begin_receipt_for_owner(owner, height)
+                .unwrap()
+                .expect("the test published this owner's reservation"),
         );
-        task.budget.release(reserved);
         let mut body = SequencedBody::new_queued(
             owner,
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -1546,6 +1649,7 @@ mod tests {
             block.header.previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, Some(raw)),
             bytes,
+            None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
             Instant::now(),
             task._body_input_bytes.clone(),
@@ -1564,9 +1668,9 @@ mod tests {
         let owner = body.owner;
         let hash = body.hash;
         task.handle_accept_body(body);
-        assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
+        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), 0);
         assert_eq!(task.work.reserved_bytes(), 0);
-        assert_eq!(task.budget.reserved(), 0);
+        assert_eq!(task.work.budget().reserved(), 0);
         assert!(task.work.pending_contains(block::Height(500)));
         assert!(task
             .work
@@ -1580,7 +1684,7 @@ mod tests {
             block::Height(0)
         ));
         task.work.advance_floor(block::Height(1));
-        let retry = task.work.take_for_request(
+        let retry = task.work.take_request(
             block::Height(500),
             block::Height(500),
             1,
@@ -1588,7 +1692,7 @@ mod tests {
             99,
             std::num::NonZeroU64::new(2).unwrap(),
         );
-        assert_eq!(retry[0].1.estimated_bytes, bytes);
+        assert_eq!(retry.items()[0].1.estimated_bytes, bytes);
         assert!(!task.work.defer_received_for_owner(
             owner,
             block::Height(500),
@@ -1598,28 +1702,36 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn actual_retention_serializes_arrivals_and_preserves_checkpoint_progress() {
-        let mut task = retention_test_task(u64::MAX);
+    #[tokio::test]
+    async fn actual_retention_serializes_arrivals_and_preserves_checkpoint_progress() {
+        let bytes = received_test_body_bytes();
+        let mut task = retention_test_task(bytes);
         let first = received_test_body(&mut task, 500, 1_024);
-        let bytes = first.bytes;
-        task.retained_body_limit = bytes;
+        assert_eq!(first.bytes, bytes);
         let second = received_test_body(&mut task, 501, 1_024);
         // Both replies were issued before the first was retained.
         task.handle_accept_body(first);
         task.handle_accept_body(second);
-        assert_eq!(task.sequencer.reorder_buffered_bytes(), bytes);
-        assert_eq!(task.sequencer.reorder_len(), 1);
+        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), bytes);
+        assert_eq!(task.state.sequencer().reorder_len(), 1);
         assert!(task.work.pending_contains(block::Height(501)));
         // A full speculative backlog cannot prevent assembling the checkpoint.
         let checkpoint = received_test_body(&mut task, 401, 1_024);
         task.handle_accept_body(checkpoint);
-        assert_eq!(task.sequencer.reorder_buffered_bytes(), 2 * bytes);
-        task.destructive_reset_to(block::Height(0), false);
-        assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
+        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), 2 * bytes);
+        // A reset to the verified tip, with no successor work anchored, is destructive.
+        task.handle_control_input(SequencerControlInput::FrontierReset {
+            frontiers: genesis_frontiers(),
+            preserve_active_successors: false,
+            peer_has_successor_after: false,
+            peer_outstanding_conflicts_at_tip: false,
+        })
+        .await;
+        assert_eq!(task.state.reset_epoch(), 1);
+        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), 0);
         let after_reset = received_test_body(&mut task, 502, 1_024);
         task.handle_accept_body(after_reset);
-        assert_eq!(task.sequencer.reorder_buffered_bytes(), bytes);
+        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), bytes);
     }
 
     #[tokio::test]
@@ -1630,16 +1742,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(scope),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1647,6 +1760,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         assert!(
@@ -1657,9 +1771,9 @@ mod tests {
                 .await,
             "a CAS-coordinate refresh does not require a scheduling reaction"
         );
-        assert_eq!(task.current_scope, Some(scope));
+        assert_eq!(task.state.current_scope(), Some(scope));
         assert_eq!(
-            task.current_state_version,
+            task.state.current_state_version(),
             Some(zakura_header_chain::StateVersion::new(9))
         );
     }
@@ -1674,16 +1788,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(old_scope),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1691,6 +1806,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
         let mut advanced_scope = old_scope;
         advanced_scope.header.header_generation = zakura_header_chain::HeaderGeneration::new(8);
@@ -1705,22 +1821,22 @@ mod tests {
                 .await,
             "a same-target authority advance does not require a destructive reaction"
         );
-        assert_eq!(task.current_scope, Some(advanced_scope));
-        assert_eq!(task.reset_epoch, 0);
+        assert_eq!(task.state.current_scope(), Some(advanced_scope));
+        assert_eq!(task.state.reset_epoch(), 0);
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
         body.leave_queue();
         task.handle_accept_body(body);
 
-        assert_eq!(task.sequencer.applying_len(), 1);
-        assert_eq!(task.sequencer.reorder_len(), 0);
+        assert_eq!(task.state.sequencer().applying_len(), 1);
+        assert_eq!(task.state.sequencer().reorder_len(), 0);
     }
 
     #[tokio::test]
     async fn body_invalid_reselection_resets_block_pipeline() {
         let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
-        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX)));
         work.extend(
             old_authority,
             [(
@@ -1735,9 +1851,8 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
             work.clone(),
             Arc::new(PeerRegistry::new()),
             actions,
@@ -1745,6 +1860,7 @@ mod tests {
             frontiers,
             Some(old_authority),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1752,12 +1868,13 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
         body.leave_queue();
         task.handle_accept_body(body);
-        assert_eq!(task.sequencer.applying_len(), 1);
+        assert_eq!(task.state.sequencer().applying_len(), 1);
         assert_eq!(work.pending_len(), 1);
 
         let mut new_authority = old_authority;
@@ -1770,12 +1887,12 @@ mod tests {
             .await
         );
 
-        assert_eq!(task.sequencer.floor(), frontiers.verified_block_tip);
-        assert_eq!(task.sequencer.applying_len(), 0);
-        assert_eq!(task.sequencer.reorder_len(), 0);
+        assert_eq!(task.state.sequencer().floor(), frontiers.verified_block_tip);
+        assert_eq!(task.state.sequencer().applying_len(), 0);
+        assert_eq!(task.state.sequencer().reorder_len(), 0);
         assert_eq!(work.pending_len(), 0);
         assert_eq!(work.in_flight_len(), 0);
-        assert_eq!(task.reset_epoch, 1);
+        assert_eq!(task.state.reset_epoch(), 1);
     }
 
     #[tokio::test]
@@ -1787,16 +1904,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1804,6 +1922,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
@@ -1821,28 +1940,30 @@ mod tests {
         };
         let height = block.coinbase_height().expect("test block has height");
         let hash = block.hash();
-        let mut outcome = super::test_block_apply_outcome(BlockApplyResult::Unavailable);
+        let outcome = super::test_block_apply_outcome(BlockApplyResult::Unavailable);
 
         assert_eq!(
-            task.handle_apply_finished(
+            finish_apply(
+                &mut task,
                 owner,
                 source,
                 token,
                 height,
                 hash,
-                &mut outcome,
+                outcome,
                 BTreeSet::new(),
                 None,
                 None,
+                Some(owner.authority.body_work_epoch),
             )
             .await,
             (false, false),
             "a stale transient completion cannot trigger scheduling or reaction"
         );
-        assert!(!task.sequencer.applying_contains(height));
-        assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+        assert!(!task.state.sequencer().applying_contains(height));
+        assert_eq!(task.state.sequencer().in_flight_submission_count(), 0);
         assert!(
-            task.body_retries.is_empty(),
+            task.state.body_retries().is_empty(),
             "stale transient completion cannot create a retry episode"
         );
         assert!(
@@ -1860,13 +1981,13 @@ mod tests {
             })
             .await
         );
-        assert_eq!(task.sequencer.floor(), block::Height(0));
+        assert_eq!(task.state.sequencer().floor(), block::Height(0));
 
         let mut old_body = queued_test_body(input_bytes, input_decoded_bytes);
         old_body.leave_queue();
         task.handle_accept_body(old_body);
-        assert_eq!(task.sequencer.reorder_len(), 0);
-        assert_eq!(task.sequencer.applying_len(), 0);
+        assert_eq!(task.state.sequencer().reorder_len(), 0);
+        assert_eq!(task.state.sequencer().applying_len(), 0);
     }
 
     #[tokio::test]
@@ -1876,19 +1997,20 @@ mod tests {
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
-        let (actions, mut actions_rx) = mpsc::channel(1);
+        let (actions, mut actions_rx) = mpsc::channel(1 + BS_ACTION_CONTROL_RESERVE);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1896,6 +2018,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -1919,30 +2042,33 @@ mod tests {
             rule: zakura_header_chain::BodyRuleId::new("test.consensus_invalid"),
             source,
         };
-        let mut outcome = BlockApplyOutcome::consensus_invalid(invalid.clone());
+        let outcome = BlockApplyOutcome::consensus_invalid(invalid.clone());
 
-        action_sender
-            .send(BlockSyncAction::Misbehavior {
-                peer: ZakuraPeerId::new(vec![0xee; 32])
-                    .expect("the filler peer ID has the required length"),
-                reason: BlockSyncMisbehavior::InvalidBlock,
-            })
-            .await
-            .expect("the filler occupies the action channel");
+        for _ in 0..action_sender.max_capacity() {
+            action_sender
+                .send(BlockSyncAction::Misbehavior {
+                    peer: ZakuraPeerId::new(vec![0xee; 32])
+                        .expect("the filler peer ID has the required length"),
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                })
+                .await
+                .expect("the filler occupies the action channel");
+        }
         let completion = tokio::spawn(async move {
-            let result = task
-                .handle_apply_finished(
-                    owner,
-                    source,
-                    token,
-                    height,
-                    hash,
-                    &mut outcome,
-                    BTreeSet::new(),
-                    None,
-                    Some((owner, zakura_header_chain::StateVersion::new(7))),
-                )
-                .await;
+            let result = finish_apply(
+                &mut task,
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::new(7))),
+                Some(owner.authority.body_work_epoch),
+            )
+            .await;
             (task, result)
         });
 
@@ -1951,13 +2077,15 @@ mod tests {
             !completion.is_finished(),
             "invalidity must remain pending after the ordinary action timeout",
         );
-        assert!(matches!(
-            actions_rx.recv().await,
-            Some(BlockSyncAction::Misbehavior {
-                reason: BlockSyncMisbehavior::InvalidBlock,
-                ..
-            })
-        ));
+        for _ in 0..action_sender.max_capacity() {
+            assert!(matches!(
+                actions_rx.recv().await,
+                Some(BlockSyncAction::Misbehavior {
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                    ..
+                })
+            ));
+        }
         assert!(matches!(
             actions_rx.recv().await,
             Some(BlockSyncAction::RecordBodyInvalid {
@@ -1970,7 +2098,7 @@ mod tests {
         let (task, result) = completion.await.expect("the sequencer task does not panic");
         assert_eq!(result, (true, true));
         assert!(
-            !task.sequencer.applying_contains(height),
+            !task.state.sequencer().applying_contains(height),
             "the sequencer retires the body only after it hands off invalidity",
         );
         assert!(matches!(
@@ -1992,16 +2120,17 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -2009,6 +2138,7 @@ mod tests {
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2026,7 +2156,7 @@ mod tests {
         };
         let height = block.coinbase_height().expect("test block has height");
         let hash = block.hash();
-        let mut outcome = BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+        let outcome = BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
             hash,
             evidence: zakura_header_chain::EvidenceId::from_digest([0xa2; 32]),
             kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
@@ -2042,19 +2172,20 @@ mod tests {
             .await
             .expect("the filler occupies the action channel");
         let completion = tokio::spawn(async move {
-            let result = task
-                .handle_apply_finished(
-                    owner,
-                    source,
-                    token,
-                    height,
-                    hash,
-                    &mut outcome,
-                    BTreeSet::new(),
-                    None,
-                    Some((owner, zakura_header_chain::StateVersion::new(8))),
-                )
-                .await;
+            let result = finish_apply(
+                &mut task,
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::new(8))),
+                Some(owner.authority.body_work_epoch),
+            )
+            .await;
             (task, result)
         });
 
@@ -2086,51 +2217,178 @@ mod tests {
         let (task, result) = completion.await.expect("the sequencer task does not panic");
         assert_eq!(result, (true, true));
         assert!(
-            !task.sequencer.applying_contains(height),
+            !task.state.sequencer().applying_contains(height),
             "the sequencer retires the body only after it hands off retry state",
+        );
+    }
+
+    /// A wall clock a fixed offset from the host's, standing in for a
+    /// simulated run whose scenario UTC differs from the host.
+    struct OffsetClock(chrono::Duration);
+
+    impl zakura_header_chain::Clock for OffsetClock {
+        /// The host's UTC plus the offset.
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now() + self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_follows_the_sequencer_clock() {
+        let frontiers = genesis_frontiers();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let registry = Arc::new(PeerRegistry::new());
+        // A day ahead, so an episode or failure dated by the host clock lands a
+        // day early: the deadline collapses to now, or the episode alarms.
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
+            Sequencer::new(block::Height(0), 1),
+            Arc::new(WorkQueue::new(block::Height(0), budget)),
+            registry.clone(),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            Arc::new(OffsetClock(chrono::Duration::days(1))),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+            super::test_decoded_pool(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        let outcome = BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xa3; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+            availability: zakura_header_chain::BodyUnavailableSummary::default(),
+        });
+
+        let before = Instant::now();
+        finish_apply(
+            &mut task,
+            owner,
+            source,
+            token,
+            height,
+            hash,
+            outcome,
+            BTreeSet::new(),
+            None,
+            Some((owner, zakura_header_chain::StateVersion::new(8))),
+            Some(owner.authority.body_work_epoch),
+        )
+        .await;
+        let after = Instant::now();
+
+        // The first retry backs off one second, give or take 10% jitter.
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid");
+        let deadline = registry
+            .next_body_retry_deadline(&peer, before)
+            .expect("the failed supplier is deferred");
+        assert!(
+            deadline >= before + Duration::from_millis(900)
+                && deadline <= after + Duration::from_millis(1_100),
+            "the retry is one backoff out, not {:?} after the failure",
+            deadline.saturating_duration_since(before),
         );
     }
 
     #[tokio::test]
     async fn closed_action_receiver_retains_exact_required_evidence() {
         let frontiers = genesis_frontiers();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
-        let (actions, actions_rx) = mpsc::channel(1);
-        drop(actions_rx);
+        let (actions, mut actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
             view_tx,
             Duration::from_millis(20),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        drop(actions_rx);
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
 
         let rule: Arc<str> = Arc::from("test.retained_consensus_invalid");
         let retained_rule = Arc::downgrade(&rule);
-        let action = BlockSyncAction::RecordBodyInvalid {
-            expected_version: zakura_header_chain::StateVersion::new(9),
-            invalid: zakura_header_chain::ConsensusBodyInvalid {
-                hash: block::Hash([0xa3; 32]),
+        let outcome =
+            BlockApplyOutcome::consensus_invalid(zakura_header_chain::ConsensusBodyInvalid {
+                hash,
                 evidence: zakura_header_chain::EvidenceId::from_digest([0xa4; 32]),
                 rule: zakura_header_chain::BodyRuleId::new(rule),
-                source: zakura_header_chain::SourceId::from_digest([0xa5; 32]),
-            },
-        };
+                source,
+            });
         let mut handoff = tokio::spawn(async move {
-            task.send_required_action(action).await;
+            finish_apply(
+                &mut task,
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::new(9))),
+                Some(owner.authority.body_work_epoch),
+            )
+            .await;
         });
 
         assert!(
@@ -2171,16 +2429,17 @@ mod tests {
                 let (_control_tx, control_rx) = mpsc::unbounded_channel();
                 let (actions, mut actions_rx) = mpsc::channel(4);
                 let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-                let mut task = SequencerTask::new(
+                let budget = ByteBudget::new(123);
+                let mut task = SequencerIO::new(
                     Sequencer::new(block::Height(0), 1),
-                    ByteBudget::new(123),
-                    Arc::new(WorkQueue::new(block::Height(0))),
+                    Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                     Arc::new(PeerRegistry::new()),
                     actions,
                     ThroughputMeter::new(Instant::now()),
                     frontiers,
                     Some(super::test_work_scope()),
                     crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                    std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                     body_rx,
                     control_rx,
                     input_bytes.clone(),
@@ -2188,6 +2447,7 @@ mod tests {
                     view_tx,
                     Duration::from_secs(1),
                     ZakuraTrace::noop(),
+                    super::test_decoded_pool(),
                 );
 
                 let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2220,26 +2480,28 @@ mod tests {
                     kind,
                     source: attributed_source,
                 };
-                let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+                let outcome = BlockApplyOutcome::payload_mismatch(mismatch);
 
                 assert_eq!(
-                    task.handle_apply_finished(
+                    finish_apply(
+                        &mut task,
                         owner,
                         source,
                         token,
                         height,
                         hash,
-                        &mut outcome,
+                        outcome,
                         BTreeSet::new(),
                         None,
                         Some((owner, zakura_header_chain::StateVersion::default())),
+                        Some(owner.authority.body_work_epoch),
                     )
                     .await,
                     (true, true),
                     "a current mismatch retires the bad body and requests more work"
                 );
-                assert!(!task.sequencer.applying_contains(height));
-                assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+                assert!(!task.state.sequencer().applying_contains(height));
+                assert_eq!(task.state.sequencer().in_flight_submission_count(), 0);
 
                 if attribution_matches {
                     assert!(matches!(
@@ -2260,36 +2522,41 @@ mod tests {
         }
     }
 
-    /// A tampered body's record waits for a busy driver instead of timing out.
-    /// The height is still reset so another supplier can serve it.
+    /// The reactor can deliver a payload mismatch before the
+    /// `WorkAuthorityRefreshed` of a newer committed view. It judges the
+    /// completion against the authority it last sent here, so the mismatch
+    /// clears the retry state this task holds, and the refresh carries no
+    /// supplier suppression forward.
     #[tokio::test]
-    async fn tampered_body_misbehavior_waits_for_a_busy_driver() {
+    async fn mismatch_before_authority_refresh_leaves_no_supplier_suppressed() {
         let frontiers = genesis_frontiers();
+        let old_authority = super::test_work_scope();
+        let registry = Arc::new(PeerRegistry::new());
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
-        let (actions, mut actions_rx) = mpsc::channel(1);
+        let (actions, mut actions_rx) = mpsc::channel(4);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
-            Arc::new(PeerRegistry::new()),
-            actions.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(123))),
+            registry.clone(),
+            actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
-            Some(super::test_work_scope()),
+            Some(old_authority),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
             input_decoded_bytes.clone(),
             view_tx,
-            Duration::from_millis(20),
+            Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
-
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
         body.leave_queue();
         task.handle_accept_body(body);
@@ -2305,65 +2572,198 @@ mod tests {
         };
         let height = block.coinbase_height().expect("test block has height");
         let hash = block.hash();
-        let busy_peer = ZakuraPeerId::new(vec![7; 32]).expect("test peer ID is valid");
-        actions
-            .send(BlockSyncAction::Misbehavior {
-                peer: busy_peer,
-                reason: BlockSyncMisbehavior::StatusSpam,
-            })
-            .await
-            .expect("the filler action fills the channel");
+        // An earlier unavailable answer deferred another supplier under the old
+        // authority.
+        let deferred = ZakuraPeerId::new(vec![2; 32]).expect("test peer ID is valid");
+        let now = Instant::now();
+        registry.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest(
+                deferred.digest(),
+            )],
+            old_authority,
+            hash,
+            now + Duration::from_secs(60),
+        );
+        let mut refreshed = old_authority;
+        refreshed.header.header_generation = old_authority
+            .header
+            .header_generation
+            .checked_next()
+            .expect("the test generation has a successor");
+
         let mismatch = zakura_header_chain::BodyPayloadMismatch {
-            evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+            evidence: zakura_header_chain::EvidenceId::from_digest([0x82; 32]),
             requested: hash,
-            delivered: hash,
+            delivered: block::Hash([0x83; 32]),
             kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
             source,
         };
-        let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+        let outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+        let _ = finish_apply(
+            &mut task,
+            owner,
+            source,
+            token,
+            height,
+            hash,
+            outcome,
+            BTreeSet::new(),
+            None,
+            Some((owner, zakura_header_chain::StateVersion::default())),
+            Some(owner.authority.body_work_epoch),
+        )
+        .await;
+        let _ = task
+            .handle_control_input(SequencerControlInput::WorkAuthorityRefreshed {
+                authority: refreshed,
+            })
+            .await;
 
-        let finished = {
-            let finish = task.handle_apply_finished(
+        assert!(
+            !registry.is_body_retry_avoided(&deferred, refreshed, hash, now),
+            "the mismatch reopens the body to every supplier"
+        );
+    }
+
+    /// A Sequencer peer report leaves the control reserve to the reactor. With
+    /// only the reserve free, a tampered body's record waits for the driver and
+    /// a replaceable report times out. The height is still reset so another
+    /// supplier can serve it.
+    #[tokio::test]
+    async fn sequencer_misbehavior_leaves_the_control_reserve() {
+        for kind in [
+            zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+            zakura_header_chain::BodyCommitmentKind::HeaderHash,
+        ] {
+            let tampered = kind.proves_tampered_body();
+            let frontiers = genesis_frontiers();
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(2 + BS_ACTION_CONTROL_RESERVE);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let budget = ByteBudget::new(123);
+            let mut task = SequencerIO::new(
+                Sequencer::new(block::Height(0), 1),
+                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+                Arc::new(PeerRegistry::new()),
+                actions.clone(),
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_millis(20),
+                ZakuraTrace::noop(),
+                super::test_decoded_pool(),
+            );
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
                 owner,
                 source,
                 token,
-                height,
-                hash,
-                &mut outcome,
-                BTreeSet::new(),
-                None,
-                Some((owner, zakura_header_chain::StateVersion::default())),
-            );
-            tokio::pin!(finish);
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            // Fill the channel up to the control reserve.
+            let busy_peer = ZakuraPeerId::new(vec![7; 32]).expect("test peer ID is valid");
+            for _ in 0..2 {
+                actions
+                    .try_send(BlockSyncAction::Misbehavior {
+                        peer: busy_peer.clone(),
+                        reason: BlockSyncMisbehavior::StatusSpam,
+                    })
+                    .expect("the filler fits outside the control reserve");
+            }
+            let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+                requested: hash,
+                delivered: hash,
+                kind,
+                source,
+            };
+            let outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+
+            let finished = {
+                let finish = finish_apply(
+                    &mut task,
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    outcome,
+                    BTreeSet::new(),
+                    None,
+                    Some((owner, zakura_header_chain::StateVersion::default())),
+                    Some(owner.authority.body_work_epoch),
+                );
+                tokio::pin!(finish);
+                let early = tokio::time::timeout(Duration::from_millis(100), &mut finish).await;
+                assert_eq!(
+                    early.is_err(),
+                    tampered,
+                    "{kind:?}: only the tampering record outlasts the 20ms send timeout"
+                );
+                assert_eq!(
+                    actions.capacity(),
+                    BS_ACTION_CONTROL_RESERVE,
+                    "{kind:?}: the report left the control reserve free"
+                );
+                drop(
+                    actions
+                        .try_reserve_many(ActionClass::Required.permits())
+                        .expect("a reactor control action still fits"),
+                );
+                for _ in 0..2 {
+                    assert!(matches!(
+                        actions_rx.recv().await,
+                        Some(BlockSyncAction::Misbehavior {
+                            reason: BlockSyncMisbehavior::StatusSpam,
+                            ..
+                        })
+                    ));
+                }
+                match early {
+                    Ok(finished) => finished,
+                    Err(_) => finish.await,
+                }
+            };
+            assert_eq!(finished, (true, true));
+            if tampered {
+                assert!(matches!(
+                    actions_rx.recv().await,
+                    Some(BlockSyncAction::Misbehavior {
+                        peer,
+                        reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+                    }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
+                        && actual == mismatch
+                ));
+            }
             assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut finish)
-                    .await
-                    .is_err(),
-                "the record must outlast the 20ms bounded send timeout"
+                actions_rx.try_recv().is_err(),
+                "{kind:?}: a timed-out replaceable report is dropped"
             );
-            assert!(matches!(
-                actions_rx.recv().await,
-                Some(BlockSyncAction::Misbehavior {
-                    reason: BlockSyncMisbehavior::StatusSpam,
-                    ..
-                })
-            ));
-            finish.await
-        };
-        assert_eq!(finished, (true, true));
-        assert!(matches!(
-            actions_rx.recv().await,
-            Some(BlockSyncAction::Misbehavior {
-                peer,
-                reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
-            }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
-                && actual == mismatch
-        ));
-        assert!(!task.sequencer.applying_contains(height));
-        assert!(
-            task.sequencer.floor() < height,
-            "the height is requestable again"
-        );
+            assert!(!task.state.sequencer().applying_contains(height));
+            assert!(
+                task.state.sequencer().floor() < height,
+                "the height is requestable again"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2378,16 +2778,17 @@ mod tests {
             let (_control_tx, control_rx) = mpsc::unbounded_channel();
             let (actions, mut actions_rx) = mpsc::channel(4);
             let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-            let mut task = SequencerTask::new(
+            let budget = ByteBudget::new(123);
+            let mut task = SequencerIO::new(
                 Sequencer::new(block::Height(0), 1),
-                ByteBudget::new(123),
-                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions,
                 ThroughputMeter::new(Instant::now()),
                 frontiers,
                 Some(super::test_work_scope()),
                 crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                 body_rx,
                 control_rx,
                 input_bytes.clone(),
@@ -2395,6 +2796,7 @@ mod tests {
                 view_tx,
                 Duration::from_secs(1),
                 ZakuraTrace::noop(),
+                super::test_decoded_pool(),
             );
 
             let mut body = queued_test_body(input_bytes, input_decoded_bytes);
@@ -2423,7 +2825,7 @@ mod tests {
                 rule: zakura_header_chain::BodyRuleId::new("test.consensus_invalid"),
                 source: attributed_source,
             };
-            let mut outcome = BlockApplyOutcome::consensus_invalid(invalid.clone());
+            let outcome = BlockApplyOutcome::consensus_invalid(invalid.clone());
             let mut refreshed_authority = owner.authority();
             refreshed_authority.header.header_generation =
                 zakura_header_chain::HeaderGeneration::new(8);
@@ -2438,22 +2840,24 @@ mod tests {
             let semantic_owner = refreshed_authority.bind(owner.session_id(), owner.request_id());
 
             assert_eq!(
-                task.handle_apply_finished(
+                finish_apply(
+                    &mut task,
                     owner,
                     source,
                     token,
                     height,
                     hash,
-                    &mut outcome,
+                    outcome,
                     BTreeSet::new(),
                     None,
                     Some((semantic_owner, zakura_header_chain::StateVersion::default(),)),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await,
                 (true, true)
             );
-            assert!(!task.sequencer.applying_contains(height));
-            assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+            assert!(!task.state.sequencer().applying_contains(height));
+            assert_eq!(task.state.sequencer().in_flight_submission_count(), 0);
 
             if attribution_matches {
                 assert!(matches!(
@@ -2500,16 +2904,17 @@ mod tests {
             })
             .expect("test fills the action channel");
         let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
-        let task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -2517,6 +2922,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
         let task = tokio::spawn(task.run());
 
@@ -2558,6 +2964,25 @@ mod tests {
         task.abort();
     }
 
+    /// v12 F-313: two routines hand off at once into room for one body. The
+    /// second charge counts the first, so only one body keeps its decoded copy.
+    #[test]
+    fn simultaneous_handoffs_cannot_share_one_body_of_room() {
+        const BODY: u64 = 1_000;
+        let input_decoded = Arc::new(AtomicU64::new(0));
+        let mut view = initial_view(genesis_frontiers());
+        view.applying_decoded_attributed_memory_bytes =
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES - BODY;
+        let (_view_tx, view_rx) = watch::channel(view);
+
+        let first = charge_decoded_handoff(&input_decoded, &view_rx, BODY);
+        assert!(first.is_some());
+        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY).is_none());
+        assert_eq!(input_decoded.load(Ordering::Relaxed), BODY);
+        drop(first);
+        assert_eq!(input_decoded.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn handoff_publishes_applying_decoded_bytes_before_submission() {
         let frontiers = genesis_frontiers();
@@ -2572,16 +2997,17 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
-        let mut task = SequencerTask::new(
+        let budget = ByteBudget::new(123);
+        let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes,
@@ -2589,6 +3015,7 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         body.leave_queue();
@@ -2606,7 +3033,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
+    fn dropping_task_releases_queue_and_leaves_the_published_decoded_view() {
         let frontiers = genesis_frontiers();
         let (body_tx, body_rx) = mpsc::channel(1);
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2628,16 +3055,17 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(30);
         let (view_tx, view_rx) = watch::channel(initial);
-        let task = SequencerTask::new(
+        let budget = ByteBudget::new(1);
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -2645,6 +3073,7 @@ mod tests {
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
+            super::test_decoded_pool(),
         );
 
         drop(task);
@@ -2658,10 +3087,8 @@ mod tests {
             0
         );
         let terminal = *view_rx.borrow();
-        assert_eq!(terminal.sequencer_input_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 0);
-        assert_eq!(terminal.active_pipeline_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 10);
+        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 20);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2695,5 +3122,65 @@ mod tests {
             .await
             .expect("sequencer view sender is still live");
         assert_eq!(*view_rx.borrow(), schedulable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accounting_closure_is_published_and_wakes_view_watchers() {
+        let mut task = retention_test_task(u64::MAX);
+        let mut view = task.view_tx.subscribe();
+        assert!(!view.borrow_and_update().accounting_closed);
+        task.work.set_estimate_floor_for_tests(1);
+        task.work.extend(
+            super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                super::super::request::BlockSizeEstimate::Confirmed(100),
+            )],
+        );
+        let claim = task
+            .work
+            .take_request(
+                block::Height(1),
+                block::Height(1),
+                1,
+                100,
+                7,
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .admit(block::Height(0), zakura_rt::sync::CancellationToken::new())
+            .unwrap()
+            .publish(|_| {})
+            .unwrap();
+        let held = task.work.retain_funding_for_test(1);
+        assert!(!task.work.budget().is_closed());
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "the view must expose accounting closure"
+        );
+        time::timeout(Duration::from_secs(1), view.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(view.borrow_and_update().accounting_closed);
+        assert_eq!(task.work.budget().reserved(), 100);
+        drop(held);
+        drop(claim);
+        task.work.reset_above(block::Height(0));
+        task.publish_view();
+        assert!(
+            view.borrow().accounting_closed,
+            "reset does not reopen the generation"
+        );
+        assert_eq!(
+            task.work.budget().reserved(),
+            99,
+            "quarantine retains unmatched funding"
+        );
+        assert!(
+            !view.has_changed().unwrap(),
+            "unchanged closure does not create a wake loop"
+        );
     }
 }

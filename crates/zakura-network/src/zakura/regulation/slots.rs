@@ -1,9 +1,9 @@
 //! Owned permits for bounded collections of retained or active work.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use zakura_rt::sync::{downgrade, OwnedSemaphorePermit, Semaphore, Weak};
 
 /// A slot capacity cannot provide usable, representable permits.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
@@ -21,7 +21,7 @@ pub(crate) struct SlotBudgetCapacityError {
 /// admitted item makes ordinary drop and cancellation release capacity.
 #[derive(Clone, Debug)]
 pub(crate) struct SlotBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     capacity: usize,
     permits: Arc<Semaphore>,
 }
@@ -37,7 +37,7 @@ impl SlotBudget {
         }
 
         Ok(Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz"))]
             capacity,
             permits: Arc::new(Semaphore::new(capacity)),
         })
@@ -50,7 +50,7 @@ impl SlotBudget {
     }
 
     /// Return the number of currently owned slots.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(crate) fn reserved(&self) -> usize {
         self.capacity
             .saturating_sub(self.permits.available_permits())
@@ -65,9 +65,9 @@ impl SlotBudget {
     /// This does not change capacity or release any reserved slots.
     pub(super) fn downgrade(&self) -> WeakSlotBudget {
         WeakSlotBudget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz"))]
             capacity: self.capacity,
-            permits: Arc::downgrade(&self.permits),
+            permits: downgrade(&self.permits),
         }
     }
 
@@ -134,7 +134,6 @@ impl OutputByteBudget {
     }
 
     /// Bytes currently granted.
-    #[cfg(test)]
     pub(crate) fn granted(&self) -> u64 {
         // Widening usize to u64 is lossless on supported targets.
         self.capacity
@@ -157,7 +156,16 @@ impl OutputByteBudget {
             .acquire_many_owned(bytes)
             .await
             .expect("output budget semaphore stays open because this type never closes it");
-        OutputGrant { _permit: permit }
+        OutputGrant { permit }
+    }
+
+    /// Take `bytes` now, or nothing. Pass a value from [`Self::clamp`].
+    pub(crate) fn try_grant(&self, bytes: u32) -> Option<OutputGrant> {
+        self.bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .ok()
+            .map(|permit| OutputGrant { permit })
     }
 
     /// Take every free byte, up to 4 GiB.
@@ -168,13 +176,13 @@ impl OutputByteBudget {
             .clone()
             .try_acquire_many_owned(free)
             .ok()
-            .map(|permit| OutputGrant { _permit: permit })
+            .map(|permit| OutputGrant { permit })
     }
 
-    pub(super) fn downgrade(&self) -> WeakOutputByteBudget {
+    pub(crate) fn downgrade(&self) -> WeakOutputByteBudget {
         WeakOutputByteBudget {
             capacity: self.capacity,
-            bytes: Arc::downgrade(&self.bytes),
+            bytes: downgrade(&self.bytes),
         }
     }
 }
@@ -183,18 +191,27 @@ impl OutputByteBudget {
 #[derive(Debug)]
 #[must_use = "dropping an output grant releases its bytes"]
 pub(crate) struct OutputGrant {
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
+}
+
+impl OutputGrant {
+    /// Return every granted byte above `bytes`. A smaller grant stays as it is.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let keep = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let extra = self.permit.num_permits().saturating_sub(keep);
+        drop(self.permit.split(extra));
+    }
 }
 
 /// A registry handle to an output budget that does not keep it alive.
 #[derive(Debug)]
-pub(super) struct WeakOutputByteBudget {
+pub(crate) struct WeakOutputByteBudget {
     capacity: u64,
     bytes: Weak<Semaphore>,
 }
 
 impl WeakOutputByteBudget {
-    pub(super) fn upgrade(&self) -> Option<OutputByteBudget> {
+    pub(crate) fn upgrade(&self) -> Option<OutputByteBudget> {
         Some(OutputByteBudget {
             capacity: self.capacity,
             bytes: self.bytes.upgrade()?,
@@ -220,7 +237,7 @@ pub(crate) struct SlotPermit {
 /// can then remove the stale entry.
 #[derive(Debug)]
 pub(super) struct WeakSlotBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     capacity: usize,
     permits: Weak<Semaphore>,
 }
@@ -236,7 +253,7 @@ impl WeakSlotBudget {
     /// This never creates a new pool or resets its available capacity.
     pub(super) fn upgrade(&self) -> Option<SlotBudget> {
         Some(SlotBudget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz"))]
             capacity: self.capacity,
             permits: self.permits.upgrade()?,
         })

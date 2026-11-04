@@ -10,7 +10,10 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
-use super::{super::Chain, TransparentTransfers};
+use super::{
+    super::{Chain, RevertPosition, UpdateWith},
+    TransparentTransfers,
+};
 
 #[test]
 fn cloned_chain_keeps_transparent_address_history_isolated() {
@@ -69,6 +72,129 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
     assert!(history(&candidate).tx_ids.contains(&added));
     assert!(!history(&original).tx_ids.contains(&added));
     assert!(history(&original).tx_ids.contains(&existing));
+}
+
+/// Records a coinbase output paid to the address at `height`.
+fn receive_coinbase(
+    transfers: &mut TransparentTransfers,
+    height: u32,
+) -> (transparent::OutPoint, transparent::OrderedUtxo) {
+    let outpoint = transparent::OutPoint {
+        hash: transaction::Hash([u8::try_from(height).expect("test heights fit in u8"); 32]),
+        index: 0,
+    };
+    let output = transparent::Output::new(
+        zakura_chain::amount::Amount::try_from(1_000).expect("the amount is in range"),
+        transparent::Script::new(&[0x51; 25]),
+    );
+    let utxo = transparent::OrderedUtxo::new(output, Height(height), 0);
+    transfers
+        .update_chain_tip_with(&(&outpoint, &utxo))
+        .expect("a new output is accepted");
+    (outpoint, utxo)
+}
+
+#[test]
+fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
+    let mut original = TransparentTransfers::default();
+    for height in 1..=3 {
+        receive_coinbase(&mut original, height);
+    }
+
+    // A snapshot taken before the next block keeps the earlier outputs without copying them.
+    let mut appended = original.clone();
+    let (outpoint, utxo) = receive_coinbase(&mut appended, 4);
+
+    for height in 1..=3 {
+        assert!(Arc::ptr_eq(
+            &original.created_utxos[&Height(height)],
+            &appended.created_utxos[&Height(height)],
+        ));
+    }
+    assert_eq!(original.created_utxos().count(), 3);
+    assert_eq!(appended.created_utxos().count(), 4);
+    assert_eq!(appended.received(), 4_000);
+
+    // Outputs are listed in chain order across heights.
+    let heights: Vec<_> = appended
+        .created_utxos()
+        .map(|(location, _)| location.height())
+        .collect();
+    assert_eq!(heights, [Height(1), Height(2), Height(3), Height(4)]);
+
+    // Reverting the block removes its whole height and leaves no empty group behind.
+    appended.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
+    assert_eq!(appended, original);
+    assert!(!appended.created_utxos.contains_key(&Height(4)));
+}
+
+#[test]
+fn skipped_transparent_address_index_stays_empty_through_commit_and_revert() {
+    for skip in [false, true] {
+        let mut chain = Chain::new(
+            &Network::Mainnet,
+            Height(0),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
+            ValueBalance::<NonNegative>::zero(),
+        )
+        .skipping_transparent_address_index(skip);
+
+        // A pay-to-public-key-hash output, so it has an address to index.
+        let mut lock_script = vec![0x76, 0xa9, 0x14];
+        lock_script.extend([4; 20]);
+        lock_script.extend([0x88, 0xac]);
+        let output = transparent::Output::new(
+            zakura_chain::amount::Amount::try_from(1_000).expect("the amount is in range"),
+            transparent::Script::new(&lock_script),
+        );
+        assert!(output.address(&Network::Mainnet).is_some());
+
+        let creating_tx = transaction::Hash([5; 32]);
+        let outpoint = transparent::OutPoint {
+            hash: creating_tx,
+            index: 0,
+        };
+        let outputs = vec![output.clone()];
+        let created = HashMap::from([(
+            outpoint,
+            transparent::OrderedUtxo::new(output, Height(1), 1),
+        )]);
+
+        let spending_tx = transaction::Hash([6; 32]);
+        let inputs = vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: 0,
+        }];
+
+        chain
+            .update_chain_tip_with(&(&outputs, &creating_tx, &created))
+            .expect("a new output is accepted");
+        chain
+            .update_chain_tip_with(&(&inputs, &spending_tx, &created))
+            .expect("spending the new output is accepted");
+
+        // The chain's own UTXO set is maintained either way; only the address index is skipped.
+        assert!(chain.created_utxos.contains_key(&outpoint));
+        assert!(chain.spent_utxos.contains_key(&outpoint));
+        assert_eq!(
+            chain.partial_transparent_transfers.len(),
+            usize::from(!skip)
+        );
+
+        chain.revert_chain_with(&(&inputs, &spending_tx, &created), RevertPosition::Tip);
+        chain.revert_chain_with(&(&outputs, &creating_tx, &created), RevertPosition::Tip);
+
+        assert!(!chain.created_utxos.contains_key(&outpoint));
+        assert!(!chain.spent_utxos.contains_key(&outpoint));
+        assert_eq!(chain.partial_transparent_transfers.len(), 0);
+    }
 }
 
 #[test]

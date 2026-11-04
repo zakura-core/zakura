@@ -49,7 +49,7 @@ The installer can set up either standard Zakura or its
 You can run Zakura using our [Docker
 image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
 The zcashd-compatible split-container mode uses the
-[zakuracore/zcashd:v1.3.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd:v1.3.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 
 This command will run our latest release and sync it to the tip:
 
@@ -68,9 +68,8 @@ Testnet). For more information, see the image's
 
 ### Manual Install
 
-Building Zakura requires [Rust](https://www.rust-lang.org/tools/install),
-[libclang](https://clang.llvm.org/doxygen/group__CINDEX.html), and a C++
-compiler. Below are quick summaries for installing these dependencies.
+Building Zakura requires [Rust](https://www.rust-lang.org/tools/install) and a
+C++ compiler. Below are quick summaries for installing these dependencies.
 
 [//]: # "The empty lines in the `summary` tag below are required for correct Markdown rendering."
 
@@ -81,11 +80,8 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 1. Install [`cargo` and `rustc`](https://www.rust-lang.org/tools/install).
-2. Install Zakura's build dependencies:
-   - **libclang**, which is a library that comes under various names, typically
-     `libclang`, `libclang-dev`, `llvm`, or `llvm-dev`;
-   - **clang** or another C++ compiler (`g++`, which is for all platforms, or
-     `Xcode`, which is for macOS).
+2. Install a C++ compiler, such as `g++` or `clang` on Linux, Xcode on macOS,
+   or Visual Studio's MSVC on Windows.
 
 </details>
 
@@ -98,10 +94,8 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 ```sh
-sudo pacman -S rust clang
+sudo pacman -S rust gcc
 ```
-
-Note that the package `clang` includes `libclang` as well.
 
 </details>
 
@@ -114,22 +108,35 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.6.1 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.8.2 zakura
 ```
 
-Native x86-64 builds automatically use Pasta field assembly when the build
-CPU supports BMI2 and ADX. This selection happens at build time, so a local
-binary may not run on an older CPU. To build a binary for redistribution, use:
+Standard x86-64 builds enable Pasta field assembly through the default
+`x86_64-asm` Cargo feature. Both BMI2 and ADX CPU extensions are required;
+`RUSTFLAGS` is not needed:
+
+```sh
+cargo build --locked --release --package zakura
+```
+
+This selects assembly at build time, with no CPU detection in arithmetic calls.
+The node checks CPU compatibility once at startup and exits with a clear error
+when either extension is missing. Official release binaries and Docker images
+use the same default. AArch64 assembly selection is unchanged.
+
+For an older x86-64 CPU, enable the `portable` override:
 
 ```sh
 cargo build --locked --release --package zakura --features portable
 ```
 
-Official release binaries and Docker runtime images enable `portable` and do
-not require BMI2 or ADX for Pasta arithmetic. This feature does not override
-custom compiler flags such as `-C target-cpu=native`; avoid CPU-specific flags
-when building for other machines. Default local builds keep automatic assembly
-selection, including with `--release`.
+The `portable` feature wins when both Cargo features are enabled, including
+with `--all-features`. It only affects Pasta arithmetic: CPU-specific compiler
+flags such as `-C target-cpu=native` can still emit instructions elsewhere that
+require the build machine's CPU. Omit such flags when building a portable binary.
+
+Builds that disable default features can still select assembly explicitly with
+`--features x86_64-asm`, or through compiler target flags that enable BMI2 and ADX.
 
 You can start Zakura by running
 

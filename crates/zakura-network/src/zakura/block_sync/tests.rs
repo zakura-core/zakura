@@ -1,9 +1,12 @@
+pub(super) mod gauge_recorder;
+mod query_lifecycle;
 mod retention;
 
 use std::{
     collections::{BTreeSet, HashMap},
     future,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use proptest::{prop_assert, prop_assert_eq};
 
@@ -12,9 +15,8 @@ use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
         DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
-        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
+        DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
@@ -26,18 +28,21 @@ use super::{
     reorder::*,
     request::*,
     sequencer::*,
-    sequencer_task::{initial_view, SequencedBody, SequencerControlInput, SequencerTask},
+    sequencer_task::{
+        initial_view, SequencedBody, SequencerControlInput, SequencerIO, SequencerView,
+    },
     state::*,
     work_queue::WorkQueue,
 };
 use crate::zakura::{
     framed_channel,
-    testkit::{await_until, TraceCapture, TraceValue},
+    testkit::{await_until, startup_committed_view, TraceCapture, TraceValue},
     trace::BlockBodySource,
     wire_codec::WireError,
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
+use tokio::time;
 use zakura_chain::{
     fmt::HexDebug,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -184,6 +189,32 @@ pub(super) fn genesis_frontiers() -> BlockSyncFrontiers {
     }
 }
 
+/// Reactor startup driven by a header-tip watch, with the committed view that
+/// owns body work at startup.
+///
+/// The reactor schedules body work only under committed body-work authority.
+/// This startup supplies a view whose verified and header frontiers match
+/// `frontiers` and `best_header_tip`, so tests reach that authority through
+/// the same `committed_views` input production uses.
+fn header_tip_startup(
+    frontiers: BlockSyncFrontiers,
+    best_header_tip: (block::Height, block::Hash),
+    header_tip: watch::Receiver<(block::Height, block::Hash)>,
+    config: ZakuraBlockSyncConfig,
+) -> BlockSyncStartup {
+    let mut startup = BlockSyncStartup::new(
+        frontiers,
+        best_header_tip,
+        header_tip,
+        (config)
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config,
+    );
+    startup.committed_views = Some(startup_committed_view(frontiers, best_header_tip));
+    startup
+}
+
 /// A header-tip watch channel that starts at genesis.
 fn genesis_tip_channel() -> (
     watch::Sender<(block::Height, block::Hash)>,
@@ -197,7 +228,7 @@ fn genesis_startup(
     tip_rx: watch::Receiver<(block::Height, block::Hash)>,
     config: ZakuraBlockSyncConfig,
 ) -> BlockSyncStartup {
-    BlockSyncStartup::new(
+    header_tip_startup(
         genesis_frontiers(),
         (block::Height(0), block::Hash([0; 32])),
         tip_rx,
@@ -321,6 +352,9 @@ fn committed_block_sync_startup(
         frontiers,
         best_header_tip,
         committed_views,
+        (config)
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         config,
     );
 
@@ -520,6 +554,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
         legacy_frontiers,
         legacy_header,
         snapshot_rx,
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.header_tip.is_none());
@@ -608,6 +643,7 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         },
         (finalized.height, finalized.hash),
         snapshot_rx,
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -696,6 +732,7 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         },
         (header.height, header.hash),
         snapshot_rx,
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -767,7 +804,7 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (_snapshots, receiver) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.committed_views = Some(receiver);
     let (handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -799,7 +836,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -841,7 +878,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
             ServicePeerDirection::Outbound,
             &wiring.config,
             0,
-            std::time::Instant::now(),
+            Instant::now(),
         )
         .generation();
     wiring.registry.upsert_status(
@@ -929,7 +966,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
-    let mut startup = BlockSyncStartup::inert(config.clone());
+    let mut startup = BlockSyncStartup::inert(config.clone()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -1006,6 +1043,69 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .is_err(),
         "a duplicate status must not dispatch another restart"
     );
+
+    reactor_task.abort();
+}
+
+/// A full routine channel can drop `StatusReceived` after the routine wrote
+/// the supplier's status to the registry. The next re-query still restarts
+/// the persistent body alarm for that supplier.
+#[tokio::test]
+async fn dropped_status_received_still_restarts_body_alarm_on_requery() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
+    let (_snapshot_tx, snapshot_rx) =
+        watch::channel(Some(committed_view(alarmed_committed_snapshot(header), 0)));
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
+    startup.frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(9),
+        verified_block_tip: block::Height(9),
+        verified_block_hash: block::Hash([0x50; 32]),
+    };
+    startup.best_header_tip = (header.height, header.hash);
+    startup.committed_views = Some(snapshot_rx);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+
+    // The routine's registry write lands, but its `StatusReceived` is lost.
+    let supplier = peer(0x56);
+    let generation = wiring
+        .registry
+        .admit_session(
+            &supplier,
+            ServicePeerDirection::Outbound,
+            &wiring.config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    wiring.registry.upsert_status(
+        &supplier,
+        generation,
+        BlockSyncStatus {
+            servable_low: header.height,
+            servable_high: header.height,
+            ..BlockSyncStatus::default()
+        },
+    );
+    wiring
+        .routine_to_reactor
+        .send(super::events::RoutineToReactor::RequeryNeeded)
+        .await
+        .expect("the re-query queues");
+
+    let discovery = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::RestartBodyAvailability { discovery, .. } => break discovery,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before supplier restart: {action:?}"),
+        }
+    };
+    assert_eq!(discovery.hash, header.hash);
+    assert_eq!(discovery.availability.suppliers, 1);
 
     reactor_task.abort();
 }
@@ -1186,7 +1286,6 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1211,7 +1310,6 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -1628,15 +1726,14 @@ fn work_queue_returned_height_is_contestable_by_any_peer() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
 
     // A peer takes the floor height (it leaves `pending` → `in_flight`).
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
     assert!(queue.in_flight_contains(block::Height(1)));
     assert!(!queue.pending_contains(block::Height(1)));
 
     // Its request times out: the height returns to `pending`, where any servable
     // peer (not just the original holder) can take it again. No bias toward or
     // away from any particular peer exists in WorkQueue.
-    queue.return_items([block::Height(1)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
     assert!(queue.pending_contains(block::Height(1)));
     assert_eq!(
         queue
@@ -1717,7 +1814,7 @@ fn work_queue_with(
     floor: u32,
     items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
 ) -> super::work_queue::WorkQueue {
-    let queue = super::work_queue::WorkQueue::new(block::Height(floor));
+    let queue = super::work_queue::WorkQueue::new(block::Height(floor), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     queue.extend(test_work_scope(), items);
     queue
@@ -1737,9 +1834,10 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(default.max_blocks_per_response, None);
     assert_eq!(default.advertised_max_blocks_per_response(), 1);
     assert_eq!(default.max_inflight_requests, 32000);
+    assert_eq!(default.max_inflight_block_bytes, None);
     assert_eq!(
-        default.max_inflight_block_bytes,
-        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES
+        default.inflight_block_bytes(),
+        default.derived_max_inflight_block_bytes(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
     );
     assert_eq!(
         default.max_reorder_lookahead_bytes,
@@ -1771,7 +1869,7 @@ fn block_sync_config_defaults_and_round_trips() {
     );
     assert_eq!(
         default.floor_request_byte_reservation(),
-        u64::from(DEFAULT_BS_MAX_RESPONSE_BYTES)
+        BS_PER_BLOCK_WORST_CASE_BYTES
     );
     assert_eq!(
         default.effective_floor_peer_avoid_cooldown(),
@@ -1905,7 +2003,7 @@ fn ignored_max_blocks_per_response_warns_only_above_one() {
 #[test]
 fn config_validate_rejects_degenerate_values() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 0,
+        max_inflight_block_bytes: Some(0),
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -1920,13 +2018,13 @@ fn config_validate_rejects_degenerate_values() {
     // release their reservation at receipt, so the budget only has to exceed one
     // floor request (checked below the floor-request bound in `validate`).
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1),
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_ok());
 
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
         max_reorder_lookahead_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -1967,6 +2065,39 @@ fn config_validate_rejects_degenerate_values() {
 }
 
 #[test]
+fn config_without_inflight_block_bytes_derives_them_and_round_trips() {
+    // A config without the key, like every default config written before the
+    // budget was derived, loads unset and writes the key back out unset.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_requests = 32000
+        "#,
+    )
+    .expect("a config without max_inflight_block_bytes loads");
+    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, None);
+    let written = toml::to_string(&config).expect("the config serializes");
+    assert!(!written.contains("max_inflight_block_bytes"));
+
+    // An old config that wrote the former 6 GiB default keeps it.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 6442450944
+        "#,
+    )
+    .expect("a config with the old default loads");
+    let block_sync = config.zakura.block_sync.clone().for_node_connections(4);
+    assert_eq!(block_sync.inflight_block_bytes(), 6 << 30);
+    let written = toml::to_string(&config).expect("the config serializes");
+    let reread: crate::Config = toml::from_str(&written).expect("the config reloads");
+    assert_eq!(
+        reread.zakura.block_sync.max_inflight_block_bytes,
+        Some(6 << 30)
+    );
+}
+
+#[test]
 fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
     // An older config with a small `max_inflight_block_bytes` (e.g. the stored
     // `v4.5.0-zakura-blocksync.toml` 256 MiB value) loads unchanged: the request
@@ -1982,31 +2113,51 @@ fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
     const {
         assert!(268435456u64 < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
     }
-    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, 268435456);
+    assert_eq!(config.zakura.block_sync.inflight_block_bytes(), 268435456);
 }
 
 #[test]
 fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
     // A stored config whose request budget cannot cover one floor request
-    // (e.g. an old 16 MiB value) loads clamped to just above the floor instead
-    // of failing `validate`'s one-floor-request lower bound, so older nodes
-    // keep starting.
+    // loads clamped to just above the floor instead of failing `validate`'s
+    // one-floor-request lower bound, so older nodes keep starting.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 1000000
+        "#,
+    )
+    .expect("a sub-floor-request max_inflight_block_bytes config still loads");
+    let request_floor = config.zakura.block_sync.floor_request_byte_reservation();
+    assert!(
+        1_000_000 <= request_floor,
+        "test premise: the stored value is at or below one floor request"
+    );
+    assert_eq!(
+        config.zakura.block_sync.inflight_block_bytes(),
+        request_floor + 1
+    );
+}
+
+#[test]
+fn a_budget_above_one_block_is_kept() {
+    // One floor request reserves at most one worst-case block, so a 16 MiB
+    // budget already covers it and loads unchanged.
     let config: crate::Config = toml::from_str(
         r#"
         [zakura.block_sync]
         max_inflight_block_bytes = 16777216
         "#,
     )
-    .expect("a sub-floor-request max_inflight_block_bytes config still loads");
-    let request_floor = config.zakura.block_sync.floor_request_byte_reservation();
-    assert!(
-        16_777_216 <= request_floor,
-        "test premise: the stored value is at or below one floor request"
-    );
+    .expect("a budget above one block loads");
+    const {
+        assert!(16_777_216 > BS_PER_BLOCK_WORST_CASE_BYTES);
+    }
     assert_eq!(
         config.zakura.block_sync.max_inflight_block_bytes,
-        request_floor + 1
+        Some(16_777_216)
     );
+    assert_eq!(config.zakura.block_sync.validate(), Ok(()));
 }
 
 #[test]
@@ -2347,23 +2498,15 @@ fn work_queue_refreshes_queued_authority_and_preserves_registered_requests() {
         verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
         ..obsolete
     };
-    let queue = WorkQueue::new(block::Height(0));
+    let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     assert_eq!(
         queue.extend(obsolete, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.scope, obsolete);
-    let owner = obsolete.bind(
-        12,
-        std::num::NonZeroU64::new(13).expect("thirteen is nonzero"),
-    );
-    assert_eq!(
-        queue.mark_reserved_for_owner(owner, [block::Height(1)]),
-        100
-    );
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(owner.authority(), obsolete);
+    assert_eq!(queue.reserved_bytes(), 100);
     assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
 
     queue.refresh_authority(current);
@@ -2407,17 +2550,16 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
     assert_ne!(refreshed, scope);
     assert_eq!(refreshed.body_work_epoch, scope.body_work_epoch);
 
-    let owner = test_work_owner();
     let height = block::Height(1);
     let hash = block::Hash([1; 32]);
-    let queue = WorkQueue::new(block::Height(0));
+    let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     assert_eq!(
         queue.extend(scope, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
-    assert_eq!(queue.mark_reserved_for_owner(owner, [height]), 100);
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(queue.reserved_bytes(), 100);
 
     let config = ZakuraBlockSyncConfig::default();
     let registry = PeerRegistry::new();
@@ -2646,36 +2788,62 @@ fn work_queue_take_respects_servable_range_contiguity_and_max() {
     );
 }
 
+/// A provisional take with a byte cap, returned to `pending` when it drops.
+fn take_for_fixture(
+    queue: &Arc<WorkQueue>,
+    low: block::Height,
+    high: block::Height,
+    max_count: usize,
+    max_estimated_bytes: u64,
+) -> super::work_queue::TakenRequest {
+    queue.take_request(
+        low,
+        high,
+        max_count,
+        max_estimated_bytes,
+        1,
+        std::num::NonZeroU64::MIN,
+    )
+}
+
 #[test]
 fn work_queue_budgeted_take_respects_count_cap() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         (1..=4).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(4), 2, u64::MAX);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(4), 2, u64::MAX);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
 }
 
 #[test]
 fn work_queue_budgeted_take_respects_estimated_byte_cap() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(1, BlockSizeEstimate::Advertised(100)),
             needed(2, BlockSizeEstimate::Advertised(150)),
             needed(3, BlockSizeEstimate::Advertised(1)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(3), 3, 250);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(3), 3, 250);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
     assert!(queue.pending_contains(block::Height(3)));
@@ -2683,19 +2851,23 @@ fn work_queue_budgeted_take_respects_estimated_byte_cap() {
 
 #[test]
 fn work_queue_budgeted_take_stops_at_gaps() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(10, BlockSizeEstimate::Advertised(100)),
             needed(11, BlockSizeEstimate::Advertised(100)),
             needed(13, BlockSizeEstimate::Advertised(100)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(13), 3, u64::MAX);
+    let taken = take_for_fixture(&queue, block::Height(10), block::Height(13), 3, u64::MAX);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![10, 11]
     );
     assert!(queue.pending_contains(block::Height(13)));
@@ -2703,36 +2875,43 @@ fn work_queue_budgeted_take_stops_at_gaps() {
 
 #[test]
 fn work_queue_budgeted_take_takes_one_oversized_first_item_for_progress() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(1, BlockSizeEstimate::Advertised(500)),
             needed(2, BlockSizeEstimate::Advertised(1)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(2), 2, 100);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(2), 2, 100);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1]
     );
-    assert_eq!(taken[0].1.estimated_bytes, 500);
+    assert_eq!(taken.items()[0].1.estimated_bytes, 500);
     assert!(queue.pending_contains(block::Height(2)));
 }
 
 #[test]
 fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
-    let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(10, BlockSizeEstimate::Advertised(12_345))],
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.estimated_bytes, 12_345);
+    let taken = take_for_fixture(&queue, block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(taken.items().len(), 1);
+    assert_eq!(taken.items()[0].1.estimated_bytes, 12_345);
 
-    queue.return_items([block::Height(10)]);
-    let retaken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
-    assert_eq!(retaken.len(), 1);
-    assert_eq!(retaken[0].1.estimated_bytes, 12_345);
+    drop(taken);
+    let retaken = take_for_fixture(&queue, block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(retaken.items().len(), 1);
+    assert_eq!(retaken.items()[0].1.estimated_bytes, 12_345);
 }
 
 /// Test shorthand: the grant for an admitted take, or `None` on any refusal.
@@ -2753,7 +2932,7 @@ fn admit_grant(
 #[test]
 fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 40_000_000,
+        max_inflight_block_bytes: Some(40_000_000),
         max_reorder_lookahead_bytes: 500,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2820,7 +2999,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
 #[test]
 fn admission_counts_inflight_to_sequencer_bytes() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2856,7 +3035,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
 #[test]
 fn total_resident_plateaus_under_commit_stall() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2892,7 +3071,7 @@ fn total_resident_plateaus_under_commit_stall() {
 #[test]
 fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2945,7 +3124,7 @@ fn outstanding_reservations_are_charged_at_wire_size() {
     // at their wire size. Charging them nothing makes in-flight volume invisible to the
     // byte gate until it is already resident.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3010,7 +3189,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
     // once the resident-memory look-ahead budget is full, while the commit window stays
     // fundable so a pinned checkpoint range can assemble and commit can drain.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         // Large enough that the byte (memory) cap, not the block cap, is what bites here.
         ..ZakuraBlockSyncConfig::default()
@@ -3092,7 +3271,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     // resident gate, sized only by the in-flight budget. The clamp is structural
     // (gate-independent), so it holds whether or not the gate is full.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3168,7 +3347,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
     };
 
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
         max_reorder_lookahead_bytes: 1,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3231,23 +3410,23 @@ fn commit_window_stays_fundable_at_exact_floor() {
 #[test]
 fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
-    assert_eq!(budget.reserved(), 100);
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(queue.budget().reserved(), 100);
 
-    let watchdog_released = queue.release_and_return_items([block::Height(1)]);
-    budget.release(watchdog_released);
+    let watchdog_released = queue
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
+        .released_bytes;
+
     assert_eq!(watchdog_released, 100);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
-    let late_owner_released = queue.release_and_return_items([block::Height(1)]);
-    budget.release(late_owner_released);
+    let late_owner_released = queue
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
+        .released_bytes;
+
     assert_eq!(late_owner_released, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 }
 
@@ -3270,41 +3449,43 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     assert_eq!(queue.reserved_bytes(), 0);
     check("seed");
 
-    // take + mark_reserved: Released -> Reserved.
-    let taken = queue.take_in_range(block::Height(1), block::Height(6), 6);
-    assert_eq!(taken.len(), 6);
-    assert_eq!(queue.mark_reserved((1..=6).map(block::Height)), 600);
+    // publication: Released -> Reserved.
+    let owner = queue.publish_fixture(1..=6);
     assert_eq!(queue.reserved_bytes(), 600);
-    check("mark_reserved");
+    check("publish_fixture");
 
     // receipt: Reserved -> Released drops the reservation for height 1.
-    assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        Some(100),
-    );
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
     assert_eq!(queue.reserved_bytes(), 500);
-    check("release_active_reserved_height");
+    check("receive_fixture");
 
-    // claim_received: Reserved -> Released drops height 2's reservation.
-    assert_eq!(queue.claim_received(block::Height(2)), 100);
+    // claim_receipt_for_owner: Reserved -> Released drops height 2's reservation.
+    let claimed = queue
+        .claim_receipt_for_owner(owner, block::Height(2))
+        .expect("fixture funding matches the queue");
+    assert_eq!(claimed.bytes(), 100);
+    drop(claimed);
     assert_eq!(queue.reserved_bytes(), 400);
-    check("claim_received");
+    check("claim_receipt_for_owner");
 
-    // release_heights: Reserved -> Released for height 3.
-    queue.release_reserved_heights([block::Height(3)]);
+    // release_reserved_heights_for_owner: Reserved -> Released for height 3.
+    queue.release_reserved_heights_for_owner(owner, [block::Height(3)]);
     assert_eq!(queue.reserved_bytes(), 300);
-    check("release_heights");
+    check("release_reserved_heights_for_owner");
 
-    // release_reserved_and_return_items: only the still-reserved height 4 releases.
-    let released = queue.release_reserved_and_return_items([block::Height(4)]);
-    assert_eq!(released, 100);
+    // Return: only the still-reserved height 4 releases.
+    let returned =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(4)]);
+    assert_eq!(returned.released_bytes, 100);
     assert_eq!(queue.reserved_bytes(), 200);
-    check("release_reserved_and_return_items");
+    check("release_reserved_and_return_items_detailed_for_owner");
 
     // advance_floor drops the committed `<= floor` prefix. Heights 1 and 2
     // (received) and 3 (released) contribute no reservation. Only heights 5 and 6
     // remain reserved above the new floor.
-    let released = queue.advance_floor(block::Height(4));
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(4));
+    let released = before - queue.budget().reserved();
     assert_eq!(released, 0, "heights <= 4 owned no live reservation");
     assert!(!queue.pending_contains(block::Height(1)));
     assert!(!queue.in_flight_contains(block::Height(2)));
@@ -3313,7 +3494,9 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
 
     // reset_above drops the `> floor` suffix (heights 5 and 6), releasing their
     // reservations and zeroing the counter.
-    let released = queue.reset_above(block::Height(4));
+    let before = queue.budget().reserved();
+    queue.reset_above(block::Height(4));
+    let released = before - queue.budget().reserved();
     assert_eq!(released, 200);
     assert_eq!(queue.reserved_bytes(), 0);
     assert!(!queue.in_flight_contains(block::Height(5)));
@@ -3328,11 +3511,13 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
         (1..=10).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
     );
     // Reserve a contiguous run so we can see the reservation accounting on GC.
-    let _ = queue.take_in_range(block::Height(1), block::Height(10), 10);
-    assert_eq!(queue.mark_reserved((1..=10).map(block::Height)), 1000);
+    queue.publish_fixture(1..=10);
+    assert_eq!(queue.reserved_bytes(), 1000);
 
     // advance_floor to 4: drops heights 1..=4 (still reserved -> released), keeps 5..=10.
-    let released = queue.advance_floor(block::Height(4));
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(4));
+    let released = before - queue.budget().reserved();
     assert_eq!(released, 400, "reserved bytes for the dropped 1..=4 prefix");
     for h in 1..=4 {
         assert!(!queue.in_flight_contains(block::Height(h)));
@@ -3344,7 +3529,9 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
     assert_eq!(queue.reserved_bytes(), queue.reserved_bytes_scanned());
 
     // A lower floor is a no-op (floor only advances).
-    assert_eq!(queue.advance_floor(block::Height(2)), 0);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(2));
+    assert_eq!(queue.budget().reserved(), before);
     assert_eq!(queue.reserved_bytes(), 600);
 }
 
@@ -3353,20 +3540,13 @@ fn receipt_releases_wire_reservation_while_body_retained() {
     // Receipt ends the wire reservation: the estimate returns to the budget while
     // the caller still owns the body (the height stays claimed in `in_flight`).
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
     assert_eq!(queue.reserved_bytes(), 100);
 
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active reserved height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
-    budget.release(reserved_estimate);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
+
     assert_eq!(queue.reserved_bytes(), 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(
         queue.in_flight_contains(block::Height(1)),
         "the received height stays claimed; the body handoff owns it"
@@ -3378,21 +3558,16 @@ fn floor_watchdog_skips_received_heights() {
     // After receipt released the reservation, the watchdog must neither requeue
     // the height (the body handoff owns it) nor release a second time.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
 
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active reserved height releases at receipt");
-    budget.release(reserved_estimate);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    assert_eq!(queue.budget().reserved(), 0);
+
+    let outcome =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
     let watchdog_released = outcome.released_bytes;
-    budget.release(watchdog_released);
+
     assert_eq!(
         watchdog_released, 0,
         "watchdog must not release a received height owned by the sequencer handoff"
@@ -3405,13 +3580,14 @@ fn floor_watchdog_skips_received_heights() {
     assert_eq!(outcome.returned_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
-    assert_eq!(queue.advance_floor(block::Height(1)), 0);
+    assert_eq!(queue.budget().reserved(), 0);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(1));
+    assert_eq!(queue.budget().reserved(), before);
 }
 
 #[tokio::test]
 async fn floor_watchdog_only_avoids_requests_that_started_writing() {
-    use super::work_queue::RequestWrite;
     use crate::zakura::transport::FrameWriteClaim;
 
     #[derive(Clone, Copy, Debug)]
@@ -3455,7 +3631,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
                 BlockSizeEstimate::Confirmed(100),
             )],
         );
-        let items = wiring.work.take_for_request(
+        let taken = wiring.work.take_request(
             block::Height(1),
             block::Height(1),
             1,
@@ -3463,32 +3639,29 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
             generation,
             std::num::NonZeroU64::new(1).unwrap(),
         );
-        assert_eq!(items.len(), 1);
-        let owner = items[0].1.owner.unwrap();
-        assert!(wiring.budget.clone().try_reserve(100));
-        let write = RequestWrite::new(
-            owner,
-            items,
-            wiring.work.clone(),
-            wiring.budget.clone(),
-            CancellationToken::new(),
-        );
-        assert!(write.publish(|| {
-            wiring.registry.insert_outstanding(
-                &peer(1),
-                generation,
-                [(
-                    block::Height(1),
-                    OutstandingMeta {
-                        owner,
-                        hash: block::Hash([1; 32]),
-                        estimated_bytes: 100,
-                        queued_at: now,
-                        deadline: now,
-                    },
-                )],
-            );
-        }));
+        assert_eq!(taken.items().len(), 1);
+        let owner = taken.items()[0].1.owner.unwrap();
+        let write = taken
+            .admit(block::Height(0), CancellationToken::new())
+            .unwrap();
+        let write = write
+            .publish(|_| {
+                wiring.registry.insert_outstanding(
+                    &peer(1),
+                    generation,
+                    [(
+                        block::Height(1),
+                        OutstandingMeta {
+                            owner,
+                            hash: block::Hash([1; 32]),
+                            estimated_bytes: 100,
+                            queued_at: now,
+                            deadline: now,
+                        },
+                    )],
+                );
+            })
+            .unwrap();
         let started = matches!(write_state, WriteState::Started | WriteState::Written);
         if started {
             assert!(write.try_start());
@@ -3507,7 +3680,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         await_until(
             "watchdog settles the expired floor claim",
             Duration::from_secs(2),
-            || wiring.registry.total_unreceived() == 0 && wiring.budget.reserved() == 0,
+            || wiring.registry.total_unreceived() == 0 && wiring.work.budget().reserved() == 0,
         )
         .await
         .unwrap();
@@ -3529,56 +3702,95 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
 #[test]
 fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
 
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
-    let watchdog_released = outcome.released_bytes;
-    budget.release(watchdog_released);
+    let outcome =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+
     assert_eq!(outcome.returned_count, 1);
     assert_eq!(outcome.released_count, 0);
     assert_eq!(outcome.missing_count, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
-    let duplicate =
-        queue.release_reserved_and_return_items_detailed([block::Height(1), block::Height(2)]);
+    let duplicate = queue.release_reserved_and_return_items_detailed_for_owner(
+        owner,
+        [block::Height(1), block::Height(2)],
+    );
     assert_eq!(duplicate.already_pending_count, 1);
     assert_eq!(duplicate.missing_count, 1);
     assert_eq!(duplicate.min_height, Some(block::Height(1)));
     assert_eq!(duplicate.max_height, Some(block::Height(2)));
 
     assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
+        queue.receive_fixture(owner, block::Height(1)),
         None,
         "a late body cannot release a claim the watchdog already released"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
+}
+
+#[test]
+fn an_unmatched_receipt_takes_only_the_charge_it_looked_up() {
+    // A routine with no request for height 1 receives its body while another
+    // routine publishes height 1. The lookup and the transfer share one queue
+    // lock, so the receipt sees either pending work, which it leaves alone, or
+    // the published request, whose charge it takes.
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    assert!(queue
+        .begin_unmatched_receipt(block::Height(1), block::Hash([1; 32]))
+        .expect("fixture funding matches the queue")
+        .is_none());
+    assert!(queue.pending_contains(block::Height(1)));
+    assert_eq!(queue.budget().reserved(), 0);
+
+    let owner = queue.publish_fixture(1..=1);
+    assert!(
+        queue
+            .begin_unmatched_receipt(block::Height(1), block::Hash([0xee; 32]))
+            .expect("fixture funding matches the queue")
+            .is_none(),
+        "a body for another hash can't take the published request's charge"
+    );
+    assert_eq!(queue.budget().reserved(), 100);
+    let (ended_owner, ended) = queue
+        .begin_unmatched_receipt(block::Height(1), block::Hash([1; 32]))
+        .expect("fixture funding matches the queue")
+        .expect("the published request reserves height 1");
+    assert_eq!(ended_owner, owner);
+    assert_eq!(ended.charge, 100);
+    assert_eq!(ended.funding.bytes(), 100);
+    assert_eq!(
+        queue.receive_fixture(owner, block::Height(1)),
+        None,
+        "the owner's own body can't release the charge again"
+    );
+    drop(ended);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
 fn claim_received_does_not_orphan_a_charge() {
-    // An unmatched queued body claims its height without a new reservation, but
-    // any stale request reservation it still owned is handed back exactly once.
+    // An unmatched body claims its height without a new reservation, but any stale
+    // request reservation it still owned is handed back exactly once.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
 
-    let old_charge = queue.claim_received(block::Height(1));
-    budget.release(old_charge);
-    assert_eq!(old_charge, 100);
-    assert_eq!(budget.reserved(), 0);
+    let old_charge = queue
+        .claim_receipt_for_owner(owner, block::Height(1))
+        .expect("fixture funding matches the queue");
 
-    let released = queue.release_reserved_heights([block::Height(1)]);
-    budget.release(released);
-    assert_eq!(released, 0, "a received height owns no further charge");
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(old_charge.bytes(), 100);
+    drop(old_charge);
+    assert_eq!(queue.budget().reserved(), 0);
+
+    queue.release_reserved_heights_for_owner(owner, [block::Height(1)]);
+
+    assert_eq!(
+        queue.budget().reserved(),
+        0,
+        "a received height owns no further charge"
+    );
 }
 
 #[test]
@@ -3590,38 +3802,31 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(taken.len(), 2);
-    assert!(budget.try_reserve(200));
-    assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
-        200
-    );
+    let owner = queue.publish_fixture(1..=2);
+    assert_eq!(queue.reserved_bytes(), 200);
 
     // Height 1 is received: its whole estimate returns to the budget.
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
-    budget.release(reserved_estimate);
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
+
+    assert_eq!(queue.budget().reserved(), 100);
 
     // Floor GC releases only the still-reserved (unreceived) height 2.
-    let released = queue.advance_floor(block::Height(2));
-    budget.release(released);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(2));
+    let released = before - queue.budget().reserved();
+
     assert_eq!(
         released, 100,
         "WorkQueue releases only the still-reserved height; received bodies hold no charge"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
 fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
     // `stale_adjusted_disposition`, `finish_detached`) releases via
-    // `release_reserved_heights`. When a competing peer delivered a height late,
+    // `release_reserved_heights_for_owner`. When a competing peer delivered a height late,
     // its receipt ended that height's reservation in the shared queue; the owner
     // must release only the still-reserved estimates and leave the received body
     // to the winner (which releases the ended estimate after its forward) — never
@@ -3633,39 +3838,33 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(taken.len(), 2);
-    assert!(budget.try_reserve(200));
-    assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
-        200
-    );
+    let owner = queue.publish_fixture(1..=2);
+    assert_eq!(queue.reserved_bytes(), 200);
 
     // A competing peer's late body ends height 1's reservation; height 2 stays
     // reserved (never delivered). The winner releases the estimate after its
     // forward.
-    let estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("height 1 is reserved");
-    assert_eq!(estimate, 100);
-    budget.release(estimate);
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
+
+    assert_eq!(queue.budget().reserved(), 100);
 
     // GC both heights: only the still-reserved height 2 releases. The received
     // height 1 is skipped (its reservation already ended) and stays in `in_flight`.
-    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
-    budget.release(released);
+    queue.release_reserved_heights_for_owner(owner, [block::Height(1), block::Height(2)]);
+
     assert_eq!(
-        released, 100,
-        "release_reserved_heights frees only the still-reserved estimate, exactly once"
+        queue.reserved_bytes(),
+        0,
+        "release_reserved_heights_for_owner frees only the still-reserved estimate, exactly once"
     );
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 
     // Floor GC clears the bookkeeping; nothing drifts.
-    assert_eq!(queue.advance_floor(block::Height(2)), 0);
-    assert_eq!(budget.reserved(), 0);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(2));
+    assert_eq!(queue.budget().reserved(), before);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
@@ -3697,16 +3896,18 @@ fn work_queue_preserves_work_item_estimate_through_take_and_return() {
     // a height moves pending → in_flight → pending. Estimator overridden so the
     // clamp is wide enough to keep the hinted size.
     let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
-    let taken = queue.take_in_range(block::Height(10), block::Height(10), 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.estimated_bytes, 12_345);
-    assert_eq!(taken[0].1.hash, block::Hash([10; 32]));
+    let owner = queue.publish_fixture(10..=10);
+    let taken = queue
+        .item_for_height(block::Height(10))
+        .expect("the fixture keeps the height in flight");
+    assert_eq!(taken.estimated_bytes, 12_345);
+    assert_eq!(taken.hash, block::Hash([10; 32]));
 
-    queue.return_items([block::Height(10)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(10)]);
     let retaken = queue.take_in_range(block::Height(10), block::Height(10), 1);
     assert_eq!(
         retaken[0].1.estimated_bytes, 12_345,
-        "return_items must restore the stored WorkItem unchanged"
+        "a return must restore the stored WorkItem unchanged"
     );
 }
 
@@ -3748,9 +3949,9 @@ fn work_queue_height_is_in_exactly_one_set() {
     let h = block::Height(10);
 
     assert_eq!(in_one_set(h), 1, "pending only after extend");
-    queue.take_in_range(h, h, 1);
+    let owner = queue.publish_fixture(10..=10);
     assert_eq!(in_one_set(h), 1, "in_flight only after take");
-    queue.return_items([h]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [h]);
     assert_eq!(in_one_set(h), 1, "pending only after return");
     queue.take_in_range(h, h, 1);
     queue.advance_floor(h);
@@ -4196,7 +4397,7 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
@@ -4326,7 +4527,7 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, tip_rx) = genesis_tip_channel();
     let mut startup = genesis_startup(tip_rx, config.clone());
@@ -4440,7 +4641,7 @@ async fn check_cold_probe_deadline(expired: bool) {
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
     config.request_timeout = Duration::from_millis(300);
     config.floor_rescue_timeout = Duration::from_millis(120);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
@@ -4625,11 +4826,11 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
 
 #[test]
 fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
-    use super::work_queue::DEFAULT_BS_SIZE_FLOOR_BYTES;
+    use super::work_queue::state::DEFAULT_BS_SIZE_FLOOR_BYTES;
 
     // Default estimator: Unknown -> worst case; tiny hints clamp up to the floor;
     // huge hints clamp down to MAX_BLOCK_BYTES; ordinary hints pass through.
-    let queue = super::work_queue::WorkQueue::new(block::Height(0));
+    let queue = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.extend(
         test_work_scope(),
         [
@@ -4653,7 +4854,7 @@ fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
     assert_eq!(item(4), block::MAX_BLOCK_BYTES);
 
     // The test estimator override changes the floor clamp.
-    let tuned = super::work_queue::WorkQueue::new(block::Height(0));
+    let tuned = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     tuned.set_estimate_floor_for_tests(100);
     tuned.extend(
         test_work_scope(),
@@ -4721,7 +4922,7 @@ fn work_queue_diagnostics_report_runs_min_and_max() {
 fn work_queue_keeps_pending_ordered_by_height() {
     // A BTreeMap keeps the lowest needed height first regardless of extend order,
     // so a newly-needed lower height never sits behind later queued work.
-    let queue = super::work_queue::WorkQueue::new(block::Height(0));
+    let queue = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.extend(
         test_work_scope(),
         [needed(20, BlockSizeEstimate::Advertised(100))],
@@ -4819,8 +5020,126 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
 
 // ---- Sequencer commit pipeline ----
 
-fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {
-    Sequencer::new(block::Height(verified_tip), submitted_apply_limit)
+/// Drive the production payload owner beside the real sequencing policy.
+struct TestSequencer {
+    policy: Sequencer,
+    payloads: sequencer_task::SequencerPayloads,
+}
+
+struct TestSubmission {
+    intent: SubmitItem,
+    block: BlockHandle,
+}
+
+impl std::ops::Deref for TestSubmission {
+    type Target = SubmitItem;
+    fn deref(&self) -> &Self::Target {
+        &self.intent
+    }
+}
+
+impl std::ops::Deref for TestSequencer {
+    type Target = Sequencer;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
+impl TestSequencer {
+    fn settle_payloads(&mut self) {
+        self.payloads.apply(self.policy.take_payload_changes());
+        assert_eq!(
+            self.payloads.retained_ids().collect::<BTreeSet<_>>(),
+            self.policy.retained_ids().collect::<BTreeSet<_>>(),
+            "runtime payloads match every retained policy identity",
+        );
+    }
+
+    /// Run one policy mutation, then apply its payload changes and check the inventory.
+    fn settled<T>(&mut self, mutate: impl FnOnce(&mut Sequencer) -> T) -> T {
+        let result = mutate(&mut self.policy);
+        self.settle_payloads();
+        result
+    }
+
+    fn with_decoded_window_cap(mut self, height: block::Height, bytes: u64) -> Self {
+        self.policy = self.policy.with_decoded_window_cap(height, bytes);
+        self
+    }
+
+    fn accept_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        body: Arc<block::Block>,
+        bytes: u64,
+        peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        let previous = body.header.previous_block_hash;
+        self.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            hash,
+            previous,
+            BufferedBlockBody::from_decoded_block(body, None),
+            bytes,
+            None,
+            peer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_buffered_body(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        previous: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        estimate: Option<u64>,
+        peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        let facts = self.payloads.insert(body);
+        let result = self.policy.accept_buffered_body(
+            owner, source, height, hash, previous, facts, bytes, estimate, peer,
+        );
+        if matches!(result, AcceptOutcome::Redundant { .. }) {
+            self.payloads.release(facts.id);
+        }
+        self.settle_payloads();
+        result
+    }
+
+    fn prepare_submit(&mut self, height: block::Height) -> Option<TestSubmission> {
+        self.settle_payloads();
+        let facts = self.policy.submission_body(height)?;
+        let materialized = self
+            .payloads
+            .materialize(
+                facts.id,
+                &test_decoded_pool(),
+                admission::submission_decode_admission(self.policy.verified_tip(), height),
+            )
+            .unwrap();
+        let intent = self
+            .policy
+            .prepare_submit(height, facts.id, materialized.decoded_bytes)?;
+        self.settle_payloads();
+        Some(TestSubmission {
+            intent,
+            block: materialized.block,
+        })
+    }
+}
+
+fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> TestSequencer {
+    TestSequencer {
+        policy: Sequencer::new(block::Height(verified_tip), submitted_apply_limit),
+        payloads: Default::default(),
+    }
 }
 
 #[test]
@@ -4886,13 +5205,16 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
             block2.header.previous_block_hash,
             block2_body,
             200,
+            None,
             peer(0)
         ),
         AcceptOutcome::Buffered {
             covered: block::Height(2)
         }
     );
-    assert!(seq.drain_ready_into_applying().is_empty());
+    assert!(seq
+        .settled(|policy| policy.drain_ready_into_applying())
+        .is_empty());
     assert!(seq.reorder_contains(block::Height(2)));
     assert_eq!(seq.reorder_decoded_attributed_memory_bytes(), 0);
     assert_eq!(
@@ -4913,7 +5235,7 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         }
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2)]
     );
     assert_eq!(seq.applying_hash(block::Height(2)), Some(block2.hash()));
@@ -4961,6 +5283,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
                 block.header.previous_block_hash,
                 body,
                 100,
+                None,
                 peer(0)
             ),
             AcceptOutcome::Buffered { covered: height }
@@ -4968,7 +5291,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     }
 
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_len(), 3);
@@ -4986,7 +5309,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     assert_eq!(seq.decoded_applying_count(), limit);
 
     // Rolling a submission back also rolls its body out of the decode window.
-    seq.unsubmit(block::Height(1), 1);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), 1));
     assert_eq!(seq.decoded_applying_count(), limit - 1);
 }
 
@@ -4996,7 +5319,7 @@ fn capped_sequencer_with_blocks_1_to_3(
     max_checkpoint_height: u32,
     max_decoded_bytes: u64,
     wire_bytes: u64,
-) -> (Sequencer, Vec<Arc<block::Block>>) {
+) -> (TestSequencer, Vec<Arc<block::Block>>) {
     let mut seq = test_sequencer(0, 8)
         .with_decoded_window_cap(block::Height(max_checkpoint_height), max_decoded_bytes);
     let blocks = mainnet_blocks_1_to_3();
@@ -5012,17 +5335,18 @@ fn capped_sequencer_with_blocks_1_to_3(
             block.header.previous_block_hash,
             body,
             wire_bytes,
+            None,
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     (seq, blocks)
 }
 
 /// Submit every currently submittable height the way the sequencer task does,
 /// rechecking the measured decoded window before each one, and return the
 /// dispatch items.
-fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
+fn submit_all(seq: &mut TestSequencer) -> Vec<TestSubmission> {
     let mut items = Vec::new();
     for height in seq.submittable_heights() {
         if !seq.submission_fits_decoded_window(height) {
@@ -5034,9 +5358,15 @@ fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
 }
 
 /// Retire a submission the way a committed apply completion does.
-fn finish_committed(seq: &mut Sequencer, item: &SubmitItem) {
-    seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+fn finish_committed(seq: &mut TestSequencer, item: &TestSubmission) {
+    seq.settled(|policy| policy.remove_applying(item.height));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
 }
 
 #[test]
@@ -5171,7 +5501,7 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
         );
     }
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_buffered_bytes(), 600);
@@ -5191,36 +5521,36 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     check(&seq, "submit 1,2");
 
     // Roll back the submit for height 1.
-    seq.unsubmit(block::Height(1), item1.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item1.token));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     check(&seq, "unsubmit 1");
 
     // Detaching the still-submitted height 2 does not release the driver-owned
     // decoded body or its submission-window charge.
-    seq.remove_applying(block::Height(2));
+    seq.settled(|policy| policy.remove_applying(block::Height(2)));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     assert_eq!(seq.applying_buffered_bytes(), 400);
     check(&seq, "detach submitted 2");
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item2.owner,
         item2.source,
         item2.token,
         item2.height,
         item2.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "finish detached 2");
 
     // Commit through height 1: releases the applied body (height 1) from `applying`.
-    seq.advance_verified_tip(block::Height(1), true);
+    seq.settled(|policy| policy.advance_verified_tip(block::Height(1), true));
     assert_eq!(seq.applying_buffered_bytes(), 300);
     check(&seq, "advance_verified_tip");
 
     // Reset drops all applying state; there are no in-flight submissions left.
-    seq.reset_to(block::Height(0), false);
+    seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(seq.applying_buffered_bytes(), 0);
     assert_eq!(seq.applying_decoded_attributed_memory_bytes(), 0);
     assert_eq!(seq.in_flight_submission_count(), 0);
@@ -5240,6 +5570,17 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("403 test bodies fit in usize");
     assert_eq!(submission_limit, 401);
 
+    use zakura_node_services::block_memory::{Admission, BlockHandle};
+    const BACKEND_BLOCKS: u64 = 2;
+    let pool = ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(BACKEND_BLOCKS)
+        .unwrap();
+    let backend: Vec<_> = (0..BACKEND_BLOCKS)
+        .map(|_| {
+            let block = Arc::try_unwrap(mainnet_block(&BLOCK_MAINNET_1_BYTES)).unwrap();
+            BlockHandle::Owned(pool.try_admit(block, Admission::WithinLimit).unwrap())
+        })
+        .collect();
     let blocks = fake_sequential_blocks(BLOCK_COUNT);
     let frontiers = genesis_frontiers();
     let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5248,16 +5589,18 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
-    let task = SequencerTask::new(
-        Sequencer::new(block::Height(0), submission_limit),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
+    let budget = ByteBudget::new(1);
+    let task = SequencerIO::new(
+        Sequencer::new(block::Height(0), submission_limit)
+            .with_decoded_window_cap(block::Height(BLOCK_COUNT), 1),
+        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
         frontiers,
         Some(test_work_scope()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -5265,6 +5608,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
+        pool.clone(),
     );
     let task = tokio::spawn(task.run());
 
@@ -5278,11 +5622,9 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 height,
                 block.hash(),
                 block.header.previous_block_hash,
-                BufferedBlockBody::from_decoded_block(
-                    block.clone(),
-                    Some(raw_block_payload(block)),
-                ),
+                BufferedBlockBody::RawFramePayload(raw_block_payload(block)),
                 u64::from(block_size(block)),
+                None,
                 peer(1),
                 Instant::now(),
                 body_input_bytes.clone(),
@@ -5323,7 +5665,16 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             action => panic!("unexpected action before initial submissions complete: {action:?}"),
         }
     }
+    assert_eq!(
+        pool.reserved_blocks(),
+        BACKEND_BLOCKS + submission_limit_u64,
+        "backend retention must leave room for the complete checkpoint range"
+    );
     for (index, (_, block)) in initial_submissions.iter().enumerate() {
+        assert!(
+            matches!(block, BlockHandle::Owned(_)),
+            "raw checkpoint bodies acquire real retention ownership"
+        );
         assert_eq!(
             block.coinbase_height(),
             Some(block::Height(
@@ -5348,6 +5699,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 test_work_owner(),
                 zakura_header_chain::StateVersion::default(),
             )),
+            committed_epoch: Some(test_work_owner().authority.body_work_epoch),
         })
         .expect("height 1 completion queues");
 
@@ -5379,6 +5731,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                     test_work_owner(),
                     zakura_header_chain::StateVersion::default(),
                 )),
+                committed_epoch: Some(test_work_owner().authority.body_work_epoch),
             })
             .expect("stale checkpoint completion queues");
     }
@@ -5421,13 +5774,32 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     .expect("stale completions settle with a refilled checkpoint submission window");
 
     task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        pool.reserved_blocks(),
+        BACKEND_BLOCKS + submission_limit_u64 + 1,
+        "completed submissions stay charged while driver and backend handles remain"
+    );
+    let held_bytes: u64 = backend
+        .iter()
+        .chain(initial_submissions.iter().map(|(_, block)| block))
+        .chain(std::iter::once(&block_402))
+        .map(|block| block.attributed_memory_size_bytes())
+        .sum();
+    assert_eq!(pool.reserved_bytes(), held_bytes);
+    drop(initial_submissions);
+    drop(block_402);
+    assert_eq!(pool.reserved_blocks(), BACKEND_BLOCKS);
+    drop(backend);
+    assert_eq!(pool.reserved_blocks(), 0);
+    assert_eq!(pool.reserved_bytes(), 0);
 }
 
 /// Wait up to `timeout` for the next `SubmitBlock`, skipping other actions.
 async fn next_submission(
     actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
     timeout: Duration,
-) -> Option<(BlockApplyToken, Arc<block::Block>)> {
+) -> Option<(BlockApplyToken, BlockHandle)> {
     time::timeout(timeout, async {
         loop {
             let action = actions_rx
@@ -5468,17 +5840,18 @@ impl CappedSequencerTask {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(8);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let task = SequencerTask::new(
+        let budget = ByteBudget::new(1);
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions_tx,
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -5486,6 +5859,7 @@ impl CappedSequencerTask {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
+            test_decoded_pool(),
         );
         Self {
             body_tx,
@@ -5497,12 +5871,41 @@ impl CappedSequencerTask {
         }
     }
 
-    /// Queue `block` at `height` for `owner`, charged `wire_bytes`.
+    /// Queue `block` at `height` for `owner`, decoded and charged `wire_bytes`.
     async fn send_body(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: u32,
         block: &Arc<block::Block>,
+        wire_bytes: u64,
+    ) {
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        self.send_buffered_body(owner, height, block, body, wire_bytes)
+            .await;
+    }
+
+    /// Queue `block` at `height` for `owner` as raw bytes, charged `wire_bytes`.
+    async fn send_raw_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: u32,
+        block: &Arc<block::Block>,
+        wire_bytes: u64,
+    ) {
+        let body = BufferedBlockBody::RawFramePayload(raw_block_payload(block));
+        self.send_buffered_body(owner, height, block, body, wire_bytes)
+            .await;
+    }
+
+    /// Queue `body`, which holds `block`, at `height` for `owner`, charged
+    /// `wire_bytes`.
+    async fn send_buffered_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: u32,
+        block: &Arc<block::Block>,
+        body: BufferedBlockBody,
         wire_bytes: u64,
     ) {
         self.body_tx
@@ -5512,11 +5915,9 @@ impl CappedSequencerTask {
                 block::Height(height),
                 block.hash(),
                 block.header.previous_block_hash,
-                BufferedBlockBody::from_decoded_block(
-                    block.clone(),
-                    Some(raw_block_payload(block)),
-                ),
+                body,
                 wire_bytes,
+                None,
                 peer(1),
                 Instant::now(),
                 self.body_input_bytes.clone(),
@@ -5567,6 +5968,12 @@ impl CappedSequencerTask {
                 persisted_availability: None,
                 semantic_completion: semantic_completion
                     .map(|owner| (owner, zakura_header_chain::StateVersion::default())),
+                committed_epoch: Some(
+                    semantic_completion
+                        .unwrap_or(owner)
+                        .authority
+                        .body_work_epoch,
+                ),
             })
             .expect("apply completion queues");
     }
@@ -5606,7 +6013,7 @@ async fn decoded_cap_wakes_pending_work_after_superseded_owner_completion() {
 }
 
 #[tokio::test]
-async fn decoded_cap_detached_submissions_never_block_current_work() {
+async fn decoded_cap_detached_submissions_hold_their_bytes_until_completion() {
     let blocks = fake_sequential_blocks(2);
     let mut task = CappedSequencerTask::spawn(1);
     task.send_body(
@@ -5616,10 +6023,10 @@ async fn decoded_cap_detached_submissions_never_block_current_work() {
         u64::from(block_size(&blocks[0])),
     )
     .await;
-    task.expect_submission(1).await;
+    let token_1 = task.expect_submission(1).await;
 
-    // An epoch change detaches height 1, which stays charged and never
-    // completes here. The new epoch's height 2 must still be submitted.
+    // An epoch change detaches height 1, which keeps its decoded charge. The
+    // new epoch's height 2 doesn't fit beside it, so it waits.
     let mut changed_authority = test_work_scope();
     changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
     let changed_owner =
@@ -5641,26 +6048,47 @@ async fn decoded_cap_detached_submissions_never_block_current_work() {
         u64::from(block_size(&blocks[1])),
     )
     .await;
+    task.expect_no_submission("detached height 1 still holds the cap")
+        .await;
+
+    // Height 1 commits on the new epoch's chain. Its completion releases the
+    // decoded charge and empties the window, so height 2 goes.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::Committed,
+        Some(changed_owner),
+    );
     task.expect_submission(2).await;
     task.task.abort();
 }
 
 #[tokio::test]
-async fn decoded_cap_resubmits_failed_parent_while_successors_stay_detached() {
-    let blocks = fake_sequential_blocks(3);
-    // Heights 3 and 2 arrive first claiming one wire byte, so height 1 releases
-    // a batch. The cap fits height 1 plus height 2's estimate, so 1 and 2 are
-    // submitted and the measured recheck stops height 3.
+async fn decoded_cap_resubmits_failed_parent_beside_its_detached_successor() {
+    let blocks = fake_sequential_blocks(2);
     let decoded_1 = blocks[0].attributed_memory_size_bytes();
-    let mut task = CappedSequencerTask::spawn(decoded_1 + DESERIALIZED_MEM_FACTOR);
-    for height in [3, 2, 1] {
-        task.send_body(test_work_owner(), height, &blocks[height as usize - 1], 1)
-            .await;
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    assert!(
+        blocks[1].attributed_memory_size_bytes() <= wire_2 * DESERIALIZED_MEM_FACTOR,
+        "height 2's estimate covers its decoded size"
+    );
+    // Height 2 arrives first and stays raw, so height 1 releases both. The cap
+    // fits height 1 decoded plus height 2's estimate.
+    let mut task = CappedSequencerTask::spawn(decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
     }
     let token_1 = task.expect_submission(1).await;
     task.expect_submission(2).await;
-    task.expect_no_submission("the measured recheck holds height 3 back")
-        .await;
 
     // Height 1 times out. Height 2 is detached and keeps its charge, as a
     // successor waiting in state for its parent would, and never completes.
@@ -5672,11 +6100,166 @@ async fn decoded_cap_resubmits_failed_parent_while_successors_stay_detached() {
         BlockApplyResult::TimedOut,
         Some(test_work_owner()),
     );
-    // The retried parent's estimate alone exceeds the cap, but the window has
-    // nothing submitted, so it must be admitted.
-    task.send_body(test_work_owner(), 1, &blocks[0], 1_000_000)
+    // Height 1's completion returned its own charge, so the retried parent
+    // fits beside its detached successor.
+    task.send_body(
+        test_work_owner(),
+        1,
+        &blocks[0],
+        u64::from(block_size(&blocks[0])),
+    )
+    .await;
+    task.expect_submission(1).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_charges_a_retried_raw_parent_its_measured_size() {
+    let blocks = fake_sequential_blocks(2);
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    assert!(
+        blocks[1].attributed_memory_size_bytes() <= wire_2 * DESERIALIZED_MEM_FACTOR,
+        "height 2's estimate covers its decoded size"
+    );
+    // Height 2 arrives first and stays raw, so height 1 releases both. The cap
+    // fits height 1 decoded plus height 2's estimate.
+    let max_decoded_bytes = decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR;
+    let mut task = CappedSequencerTask::spawn(max_decoded_bytes);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+
+    // Height 1 times out. Height 2 is detached and keeps its charge, as a
+    // successor waiting in state for its parent would, and never completes.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::TimedOut,
+        Some(test_work_owner()),
+    );
+    // The retried parent arrives raw, and its raw estimate exceeds the room
+    // its detached successor leaves. Its first attempt measured its decoded
+    // size, which fits into the charge that attempt returned.
+    let retried_wire_bytes = 1_000_000;
+    assert!(
+        retried_wire_bytes * DESERIALIZED_MEM_FACTOR
+            > max_decoded_bytes - blocks[1].attributed_memory_size_bytes(),
+        "the raw estimate exceeds the room beside height 2"
+    );
+    task.send_raw_body(test_work_owner(), 1, &blocks[0], retried_wire_bytes)
         .await;
     task.expect_submission(1).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_keeps_a_measured_size_through_an_epoch_reset() {
+    let blocks = fake_sequential_blocks(2);
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    let max_decoded_bytes = decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR;
+    let mut task = CappedSequencerTask::spawn(max_decoded_bytes);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+
+    // An epoch change detaches both submissions. Height 2 keeps its charge
+    // and never completes. Height 1 times out, which returns its charge.
+    let mut changed_authority = test_work_scope();
+    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+    let changed_owner =
+        changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id);
+    task.control_tx
+        .send(SequencerControlInput::BodyWorkEpochChanged {
+            authority: changed_authority,
+            frontiers: genesis_frontiers(),
+        })
+        .expect("epoch change queues");
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::TimedOut,
+        None,
+    );
+
+    // The new epoch requests height 1 again, and it arrives raw with an
+    // estimate that exceeds the room beside height 2. The reset kept the size
+    // height 1's first submission measured, so it still fits.
+    let retried_wire_bytes = 1_000_000;
+    assert!(
+        retried_wire_bytes * DESERIALIZED_MEM_FACTOR
+            > max_decoded_bytes - blocks[1].attributed_memory_size_bytes(),
+        "the raw estimate exceeds the room beside height 2"
+    );
+    task.send_raw_body(changed_owner, 1, &blocks[0], retried_wire_bytes)
+        .await;
+    task.expect_submission(1).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_charges_a_raw_body_its_estimate_after_its_hash_is_rejected() {
+    let blocks = fake_sequential_blocks(2);
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    let max_decoded_bytes = decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR;
+    let mut task = CappedSequencerTask::spawn(max_decoded_bytes);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+
+    // State rejects height 1's body. Another body with the same hash can
+    // decode to a different size, so its measurement no longer applies.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::Rejected,
+        Some(test_work_owner()),
+    );
+    let retried_wire_bytes = 1_000_000;
+    assert!(
+        retried_wire_bytes * DESERIALIZED_MEM_FACTOR
+            > max_decoded_bytes - blocks[1].attributed_memory_size_bytes(),
+        "the raw estimate exceeds the room beside height 2"
+    );
+    task.send_raw_body(test_work_owner(), 1, &blocks[0], retried_wire_bytes)
+        .await;
+    task.expect_no_submission("a raw body whose hash was rejected is charged its estimate")
+        .await;
     task.task.abort();
 }
 
@@ -5720,16 +6303,17 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
-    let task = SequencerTask::new(
+    let budget = ByteBudget::new(1);
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
         frontiers,
         Some(test_work_scope()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -5737,6 +6321,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
+        test_decoded_pool(),
     );
     let task = tokio::spawn(task.run());
 
@@ -5755,6 +6340,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                     Some(raw_block_payload(block)),
                 ),
                 u64::from(block_size(block)),
+                None,
                 peer(1),
                 Instant::now(),
                 body_input_bytes.clone(),
@@ -5821,6 +6407,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                     Some(raw_block_payload(block)),
                 ),
                 u64::from(block_size(block)),
+                None,
                 peer(1),
                 Instant::now(),
                 body_input_bytes.clone(),
@@ -5860,6 +6447,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                 eligible_sources: BTreeSet::new(),
                 persisted_availability: None,
                 semantic_completion: None,
+                committed_epoch: Some(changed_authority.body_work_epoch),
             })
             .expect("detached duplicate completion queues");
     }
@@ -5902,6 +6490,305 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     task.abort();
 }
 
+/// A sequencer task whose full count window was submitted under body-work
+/// epoch 0 and then detached by an epoch change.
+struct DetachedWindow {
+    blocks: Vec<Arc<block::Block>>,
+    body_tx: mpsc::Sender<SequencedBody>,
+    control_tx: mpsc::UnboundedSender<SequencerControlInput>,
+    actions_rx: mpsc::Receiver<BlockSyncAction>,
+    view_rx: watch::Receiver<SequencerView>,
+    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// The epoch 0 submissions, by ascending height.
+    detached: Vec<(
+        zakura_header_chain::BodyWorkOwner,
+        zakura_header_chain::SourceId,
+        BlockApplyToken,
+        BlockHandle,
+    )>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DetachedWindow {
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    /// Spawn a sequencer task, fill its count window with epoch 0
+    /// submissions, and detach them with a change to `epoch`.
+    async fn spawn(epoch: u64) -> Self {
+        let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+        let block_count = u32::try_from(submission_limit).expect("401 fits in u32");
+        let frontiers = genesis_frontiers();
+        let (body_tx, body_rx) = mpsc::channel(submission_limit);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, actions_rx) = mpsc::channel(2 * submission_limit);
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let budget = ByteBudget::new(1);
+        let task = SequencerIO::new(
+            Sequencer::new(block::Height(0), submission_limit),
+            Arc::new(WorkQueue::new(block::Height(0), budget)),
+            Arc::new(PeerRegistry::new()),
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Self::CHANNEL_TIMEOUT,
+            ZakuraTrace::noop(),
+            test_decoded_pool(),
+        );
+        let mut window = Self {
+            blocks: fake_sequential_blocks(block_count),
+            body_tx,
+            control_tx,
+            actions_rx,
+            view_rx,
+            body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
+            detached: Vec::with_capacity(submission_limit),
+            task: tokio::spawn(task.run()),
+        };
+
+        for index in 0..window.blocks.len() {
+            window.send_body(test_work_owner(), index).await;
+        }
+        while window.detached.len() < submission_limit {
+            let action = time::timeout(Self::CHANNEL_TIMEOUT, window.actions_rx.recv())
+                .await
+                .expect("epoch 0 submission arrives")
+                .expect("sequencer action channel remains live");
+            match action {
+                BlockSyncAction::SubmitBlock {
+                    owner,
+                    source,
+                    token,
+                    block,
+                } => window.detached.push((owner, source, token, block)),
+                action => panic!("unexpected epoch 0 action: {action:?}"),
+            }
+        }
+        window.change_epoch(epoch);
+        window
+    }
+
+    /// The current owner for `epoch`.
+    fn owner(epoch: u64) -> zakura_header_chain::BodyWorkOwner {
+        Self::authority(epoch).bind(test_work_owner().session_id, test_work_owner().request_id)
+    }
+
+    fn authority(epoch: u64) -> zakura_header_chain::BodyWorkAuthority {
+        let mut authority = test_work_scope();
+        authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(epoch);
+        authority
+    }
+
+    async fn send_body(&self, owner: zakura_header_chain::BodyWorkOwner, index: usize) {
+        let block = &self.blocks[index];
+        self.body_tx
+            .send(SequencedBody::new_queued(
+                owner,
+                zakura_header_chain::SourceId::from_digest([1; 32]),
+                block.coinbase_height().expect("test block has height"),
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                u64::from(block_size(block)),
+                None,
+                peer(1),
+                Instant::now(),
+                self.body_input_bytes.clone(),
+                self.body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("bodies queue");
+    }
+
+    fn change_epoch(&self, epoch: u64) {
+        self.control_tx
+            .send(SequencerControlInput::BodyWorkEpochChanged {
+                authority: Self::authority(epoch),
+                frontiers: genesis_frontiers(),
+            })
+            .expect("epoch change queues");
+    }
+
+    /// Queue `epoch`'s bodies for heights 1 to `count`, and wait until they
+    /// wait in `applying` behind the detached window.
+    async fn queue_waiting(&mut self, epoch: u64, count: u32) {
+        for index in 0..count as usize {
+            self.send_body(Self::owner(epoch), index).await;
+        }
+        time::timeout(Self::CHANNEL_TIMEOUT, async {
+            loop {
+                let view = *self.view_rx.borrow_and_update();
+                if view.unsubmitted_applying_count == u64::from(count) {
+                    break;
+                }
+                self.view_rx
+                    .changed()
+                    .await
+                    .expect("sequencer view remains live");
+            }
+        })
+        .await
+        .expect("the bodies wait behind the detached window");
+        self.expect_no_submission("the detached submissions fill the count window")
+            .await;
+    }
+
+    /// Finish the `count` highest detached submissions, which no `applying`
+    /// entry holds, as stale completions judged against `committed_epoch`.
+    fn finish_highest_detached(&mut self, count: u32, committed_epoch: u64) {
+        for _ in 0..count {
+            let (owner, source, token, block) =
+                self.detached.pop().expect("a detached submission remains");
+            let height = block.coinbase_height().expect("test block has height");
+            assert!(
+                height.0 > count,
+                "no applying entry holds height {height:?}"
+            );
+            self.control_tx
+                .send(SequencerControlInput::ApplyFinished {
+                    owner: Box::new(owner),
+                    source,
+                    token,
+                    height,
+                    hash: block.hash(),
+                    outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+                    eligible_sources: BTreeSet::new(),
+                    persisted_availability: None,
+                    semantic_completion: None,
+                    committed_epoch: Some(zakura_header_chain::BodyWorkEpoch::new(committed_epoch)),
+                })
+                .expect("detached completion queues");
+        }
+    }
+
+    /// Wait for the submission of `height` and return its owner.
+    async fn expect_submission(&mut self, height: u32) -> zakura_header_chain::BodyWorkOwner {
+        time::timeout(Self::CHANNEL_TIMEOUT, async {
+            loop {
+                let action = self
+                    .actions_rx
+                    .recv()
+                    .await
+                    .expect("sequencer action channel remains live");
+                if let BlockSyncAction::SubmitBlock { owner, block, .. } = action {
+                    assert_eq!(block.coinbase_height(), Some(block::Height(height)));
+                    return owner;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("freed room wakes height {height}"))
+    }
+
+    async fn expect_no_submission(&mut self, reason: &str) {
+        assert!(
+            next_submission(&mut self.actions_rx, Self::MISSING_SUBMISSION_TIMEOUT)
+                .await
+                .is_none(),
+            "{reason}",
+        );
+    }
+}
+
+/// #1523: an epoch change detaches a full submission window. The new epoch's
+/// bodies for heights 1 to 3 wait in `applying`. Detached completions for
+/// heights 399 to 401, which no `applying` entry holds, each free a slot with
+/// no semantic owner. Each must wake one waiting body.
+#[tokio::test]
+async fn stale_completions_without_applying_entries_wake_waiting_work() {
+    const WAITING: u32 = 3;
+
+    let mut window = DetachedWindow::spawn(1).await;
+    window.queue_waiting(1, WAITING).await;
+
+    window.finish_highest_detached(WAITING, 1);
+    for height in 1..=WAITING {
+        window.expect_submission(height).await;
+    }
+
+    window.task.abort();
+}
+
+/// F-312: the reactor judges a completion against the latest committed view,
+/// but forwards that view's epoch change separately, so the completion can
+/// reach the sequencer first. Epoch 1's bodies wait behind the detached
+/// window when completions judged against epoch 2 free room. Epoch 1's work
+/// is already invalid, so none of it may be submitted. Epoch 2's change then
+/// resets it, and the freed room goes to epoch 2's bodies.
+#[tokio::test]
+async fn stale_completions_ahead_of_their_epoch_change_wake_no_invalid_work() {
+    const WAITING: u32 = 3;
+
+    let mut window = DetachedWindow::spawn(1).await;
+    window.queue_waiting(1, WAITING).await;
+
+    window.finish_highest_detached(WAITING, 2);
+    window
+        .expect_no_submission("the freed room waits for epoch 2's change")
+        .await;
+
+    window.change_epoch(2);
+    for index in 0..WAITING as usize {
+        window.send_body(DetachedWindow::owner(2), index).await;
+    }
+    for height in 1..=WAITING {
+        let owner = window.expect_submission(height).await;
+        assert_eq!(
+            owner.authority.body_work_epoch,
+            zakura_header_chain::BodyWorkEpoch::new(2),
+        );
+    }
+
+    window.task.abort();
+}
+
+/// v12 F-314: a raw body's decode estimate counts until `prepare_submit`
+/// replaces it with the measured size, so the sequencer task can publish the
+/// estimate before it decodes.
+#[test]
+fn a_raw_body_reports_its_decode_estimate_until_submitted() {
+    let blocks = fake_sequential_blocks(1);
+    let block = &blocks[0];
+    let mut sequencer = test_sequencer(0, 1);
+    sequencer.accept_buffered_body(
+        test_work_owner(),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        block::Height(1),
+        block.hash(),
+        block.header.previous_block_hash,
+        BufferedBlockBody::RawFramePayload(raw_block_payload(block)),
+        100,
+        None,
+        peer(0),
+    );
+    let _ = sequencer.settled(|policy| policy.drain_ready_into_applying());
+
+    assert_eq!(
+        sequencer.submission_decode_charge_at(block::Height(1)),
+        100 * DESERIALIZED_MEM_FACTOR
+    );
+    sequencer
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    assert_eq!(sequencer.submission_decode_charge_at(block::Height(1)), 0);
+}
+
 #[test]
 fn sequencer_accept_body_rejects_at_or_below_floor() {
     let mut seq = test_sequencer(5, 4);
@@ -5933,7 +6820,10 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     // Only the contiguous prefix above the floor (height 1) drains.
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying()),
+        vec![block::Height(1)]
+    );
     assert_eq!(seq.floor(), block::Height(1));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.applying_len(), 1);
@@ -5946,7 +6836,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.floor(), block::Height(3));
@@ -5961,7 +6851,11 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying())
+            .len(),
+        3
+    );
     // The submission window of 2 caps the eligible heights.
     assert_eq!(
         seq.submittable_heights(),
@@ -5974,7 +6868,7 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     // The window is now full, so nothing else is submittable.
     assert!(seq.submittable_heights().is_empty());
     // Rolling back a failed dispatch frees the slot and re-offers the height.
-    seq.unsubmit(block::Height(2), item2.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(2), item2.token));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
@@ -5995,28 +6889,29 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
             block.header.previous_block_hash,
             body,
             100,
+            None,
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert!(seq.submittable_heights().is_empty());
 
     // A duplicate completion can arrive before the frontier proving that block
     // advances. Keep its applying entry attached, but drop the decoded copy and
     // free the global submission slot because the driver released its Arc.
-    assert!(seq.finish_attached_submission(
+    assert!(seq.settled(|policy| policy.finish_attached_submission(
         item.owner,
         item.source,
         item.token,
         item.height,
         item.hash
-    ));
+    )));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.decoded_applying_count(), 0);
@@ -6030,15 +6925,21 @@ fn sequencer_records_and_decrements_submitted_applies() {
     let hash = block.hash();
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     seq.accept_body(block::Height(1), hash, block, 100, peer(0));
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
-    seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    seq.settled(|policy| policy.remove_applying(item.height));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
 }
@@ -6060,12 +6961,12 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert!(seq.submitted_contains(block::Height(1)));
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6076,7 +6977,10 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "submitted-apply window is full"
     );
 
-    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert_eq!(
+        seq.settled(|policy| policy.release_applied_through(block::Height(1))),
+        100
+    );
     assert!(!seq.submitted_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
@@ -6089,13 +6993,13 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "detached driver submission still occupies the decode window"
     );
 
-    assert!(!seq.finish_submission(
+    assert!(!seq.settled(|policy| policy.finish_submission(
         item.owner,
         item.source,
         item.token,
         item.height,
         block::Hash([99; 32])
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6106,16 +7010,28 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
             .expect("incremented test request ID is nonzero"),
         ..item.owner
     };
-    assert!(!seq.finish_submission(wrong_owner, item.source, item.token, item.height, item.hash));
-    assert!(!seq.finish_submission(
+    assert!(!seq.settled(|policy| policy.finish_submission(
+        wrong_owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
+    assert!(!seq.settled(|policy| policy.finish_submission(
         item.owner,
         zakura_header_chain::SourceId::from_digest([99; 32]),
         item.token,
         item.height,
         item.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6144,13 +7060,13 @@ fn sequencer_advance_verified_tip_releases_bytes_and_reports_change() {
     );
     // Advancing the verified tip drops buffered bodies at or below it and reports
     // their bytes for the reactor to release.
-    let advance = seq.advance_verified_tip(block::Height(2), false);
+    let advance = seq.settled(|policy| policy.advance_verified_tip(block::Height(2), false));
     assert!(advance.changed);
     assert_eq!(advance.release_bytes, 300);
     assert_eq!(seq.verified_tip(), block::Height(2));
     assert!(seq.floor() >= block::Height(2));
     // A no-op advance to the same tip frees nothing and reports unchanged.
-    let advance = seq.advance_verified_tip(block::Height(2), false);
+    let advance = seq.settled(|policy| policy.advance_verified_tip(block::Height(2), false));
     assert!(!advance.changed);
     assert_eq!(advance.release_bytes, 0);
 }
@@ -6166,7 +7082,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
         100,
         peer(0),
     );
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     seq.accept_body(
         block::Height(2),
         blocks[1].hash(),
@@ -6176,7 +7092,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
     );
     // Reset drops everything (one applying@100 + one reorder@200) and pins the
     // floor/tip to the reset target.
-    let released = seq.reset_to(block::Height(0), false);
+    let released = seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(released, 300);
     assert_eq!(seq.floor(), block::Height(0));
     assert_eq!(seq.verified_tip(), block::Height(0));
@@ -6197,14 +7113,16 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let old_items: Vec<_> = seq
         .submittable_heights()
         .into_iter()
         .map(|height| {
             let item = seq.prepare_submit(height).expect("height is applying");
-            seq.record_submitted_apply(item.height, item.hash);
+            seq.settled(|policy| {
+                policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes)
+            });
             item
         })
         .collect();
@@ -6212,7 +7130,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.in_flight_submission_count(), 2);
 
     // Keep `old_items` alive to model the driver's pending/in-flight Arc<Block>s.
-    seq.reset_to(block::Height(0), false);
+    seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(seq.applying_len(), 0);
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
@@ -6227,7 +7145,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, replacement.hash(), replacement, 100, peer(1));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     assert!(
         seq.submittable_heights().is_empty(),
         "replacement bodies must not exceed the live decode window"
@@ -6237,13 +7155,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
 
     let first = &old_items[0];
     assert!(
-        !seq.finish_submission(
+        !seq.settled(|policy| policy.finish_submission(
             first.owner,
             first.source,
             first.token,
             first.height,
             block::Hash([99; 32])
-        ),
+        )),
         "a mismatched completion must not release a detached charge"
     );
     assert_eq!(seq.in_flight_submission_count(), 2);
@@ -6251,13 +7169,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         seq.applying_decoded_attributed_memory_bytes(),
         decoded_attributed_memory_bytes_before_completion
     );
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         first.owner,
         first.source,
         first.token,
         first.height,
         first.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6267,13 +7185,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.submittable_heights().len(), 1);
 
     let second = &old_items[1];
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         second.owner,
         second.source,
         second.token,
         second.height,
         second.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6291,18 +7209,21 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     assert_eq!(seq.floor(), block::Height(3));
     // A reject at height 2 drops applying >= 2 (200 bytes) and rolls the floor
     // back below 2, never below the verified tip.
-    let released = seq.release_applying_blocks_from(block::Height(2));
+    let released = seq.settled(|policy| policy.release_applying_blocks_from(block::Height(2)));
     assert_eq!(released, 200);
     assert!(seq.applying_contains(block::Height(1)));
     assert!(!seq.applying_contains(block::Height(2)));
-    seq.reset_floor_below(block::Height(2));
+    seq.settled(|policy| policy.reset_floor_below(block::Height(2)));
     assert_eq!(seq.floor(), block::Height(1));
     // The committed prefix at or below height 1 is releasable.
-    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert_eq!(
+        seq.settled(|policy| policy.release_applied_through(block::Height(1))),
+        100
+    );
     assert_eq!(seq.applying_len(), 0);
 }
 
@@ -6320,7 +7241,7 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     // Submit heights 2 and 3 so the released prefix (>= 2) is all submitted work.
     let item2 = seq
         .prepare_submit(block::Height(2))
@@ -6331,7 +7252,7 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200 + 300);
 
-    let released = seq.release_applying_blocks_from(block::Height(2));
+    let released = seq.settled(|policy| policy.release_applying_blocks_from(block::Height(2)));
     assert_eq!(released, 500);
     assert_eq!(seq.applying_len(), 1);
     // Only unsubmitted height 1 survives in `applying`, but both decoded
@@ -6353,21 +7274,21 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
         seq.in_flight_submission_bytes_scanned()
     );
 
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item2.owner,
         item2.source,
         item2.token,
         item2.height,
         item2.hash
-    ));
+    )));
     assert_eq!(seq.submittable_heights(), vec![block::Height(1)]);
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item3.owner,
         item3.source,
         item3.token,
         item3.height,
         item3.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
 }
 
@@ -6379,7 +7300,7 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     seq.accept_body(block::Height(1), block.hash(), block.clone(), 100, peer(0));
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
@@ -6388,7 +7309,7 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
 
     // A rollback carrying a non-matching token is ignored: the submission and the
     // counters are untouched.
-    seq.unsubmit(block::Height(1), item.token + 1);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token + 1));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 100);
     assert_eq!(
@@ -6401,12 +7322,12 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     );
 
     // The matching rollback frees the slot exactly once.
-    seq.unsubmit(block::Height(1), item.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
 
     // Replaying the now-stale token must not decrement a second time.
-    seq.unsubmit(block::Height(1), item.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     assert_eq!(
@@ -6446,13 +7367,17 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
             block1.header.previous_block_hash,
             body,
             100,
+            None,
             peer(0)
         ),
         AcceptOutcome::Buffered {
             covered: block::Height(1)
         }
     );
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying()),
+        vec![block::Height(1)]
+    );
     // The drained body is inside the submission window, so the kept decoded
     // block is submitted directly, not a re-decode of the raw payload.
     let submitted = seq
@@ -6514,7 +7439,7 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
 /// time. Per-height size-estimate reservation used by the budget-accounting tests.
 const THREE_BLOCK_ESTIMATE: u64 = 1_000;
 
-fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRange {
+fn outstanding_three_block_range() -> OutstandingBlockRange {
     let request = BlockRangeRequest {
         owner: test_work_owner(),
         start_height: block::Height(1),
@@ -6541,10 +7466,8 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
             },
         ],
     };
-    assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request,
         queued_at: now,
         deadline: now,
@@ -6556,8 +7479,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
 
 #[test]
 fn outstanding_range_accumulates_delivered_bytes_for_bbr_sample() {
-    let mut budget = ByteBudget::new(THREE_BLOCK_ESTIMATE * 3);
-    let mut outstanding = outstanding_three_block_range(&mut budget);
+    let mut outstanding = outstanding_three_block_range();
 
     for (height, bytes) in [
         (block::Height(1), 700),
@@ -6588,70 +7510,48 @@ fn block_budget_ledger_releases_reserved_exactly_once() {
     assert_eq!(released.release_reserved(), 0);
 }
 
-#[test]
-fn budget_audit_catches_injected_drift() {
-    let mut budget = ByteBudget::new(1_000);
-    assert!(budget.try_reserve(400));
-    assert!(budget.audit(400, "test matching audit"));
-    // A budget excess is expected receipt-handoff skew (paired call sites drain
-    // the source ledger before releasing the budget), never drift.
-    assert!(budget.audit(300, "test transient handoff excess"));
-    // A budget shortfall cannot be produced by any healthy interleaving
-    // (a double release or lost charge): drift.
-    assert!(
-        !budget.audit(500, "test injected drift"),
-        "audit reports a budget shortfall as drift"
+#[tokio::test(start_paused = true)]
+async fn reactor_handle_observes_its_actual_request_budget_closing() {
+    let (_tip, handle, _actions, reactor) = spawn_genesis_reactor(ZakuraBlockSyncConfig::default());
+    let work = &handle.routine_wiring.as_ref().unwrap().work;
+    work.set_estimate_floor_for_tests(1);
+    work.extend(
+        test_work_scope(),
+        [(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Confirmed(100),
+        )],
     );
-    budget.release(400);
-    assert!(budget.audit(0, "test released audit"));
-}
-
-#[test]
-fn received_body_admission_ignores_request_budget() {
-    // A received body consumes no request budget, so a wire budget saturated by
-    // outstanding requests must not cause it to be dropped and re-downloaded:
-    // only the commit-window exemption and the resident gate apply.
-    let config = ZakuraBlockSyncConfig {
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(600),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
-        reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        // Outstanding requests have spent the entire in-flight budget.
-        budget_available: 0,
-    };
-    // In-window heights (<= verified_tip 10 + 401 = 411) stay exempt.
-    assert!(super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(411),
-        2_000_000,
-    ));
-    // Above the window the resident gate is the sole authority. The body is
-    // retained serialized, so one wire byte consumes one byte of headroom.
-    assert!(super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(602),
-        1_000,
-    ));
-    // A body larger than the remaining serialized headroom is refused.
-    assert!(!super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(602),
-        1_001,
-    ));
+    let claim = work
+        .take_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            100,
+            7,
+            std::num::NonZeroU64::new(1).unwrap(),
+        )
+        .admit(block::Height(0), CancellationToken::new())
+        .unwrap()
+        .publish(|_| {})
+        .unwrap();
+    let mut closed = Box::pin(handle.accounting_closed());
+    assert!(futures::poll!(&mut closed).is_pending());
+    let retained = work.retain_funding_for_test(1);
+    assert!(!work.audit_funding());
+    assert!(
+        futures::poll!(&mut closed).is_ready(),
+        "the real handle must read the queue's closed budget"
+    );
+    assert_eq!(
+        work.budget().reserved(),
+        100,
+        "signaling closure cannot erase held funding"
+    );
+    drop(claim);
+    drop(retained);
+    reactor.abort();
 }
 
 proptest::proptest! {
@@ -6673,7 +7573,7 @@ proptest::proptest! {
         reserved_blocks in 0u64..20,
     ) {
         let config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: 64_000_000,
+            max_inflight_block_bytes: Some(64_000_000),
             max_reorder_lookahead_bytes: 1_000,
             ..ZakuraBlockSyncConfig::default()
         };
@@ -6772,19 +7672,19 @@ proptest::proptest! {
         // Whichever terminal path runs first (receipt, or a timeout/watchdog
         // release) drains the mirrored budget to zero; any later path is a no-op.
         let mut ledger = BlockBudgetLedger::reserved(estimate);
-        let mut budget = ByteBudget::new(u64::MAX);
-        prop_assert!(budget.try_reserve(estimate));
+        let budget = ByteBudget::new(u64::MAX);
+        let mut funding = budget.reserve_owned(estimate).unwrap();
 
         if release_before_receipt {
-            budget.release(ledger.release_reserved());
+            drop(funding.split(ledger.release_reserved()).unwrap());
             prop_assert_eq!(budget.reserved(), 0);
             prop_assert!(!ledger.is_reserved());
         }
-        budget.release(ledger.release_reserved());
+        drop(funding.split(ledger.release_reserved()).unwrap());
         prop_assert_eq!(budget.reserved(), 0);
         prop_assert_eq!(ledger.reserved_charge(), 0);
         // A third release still yields nothing.
-        budget.release(ledger.release_reserved());
+        drop(funding.split(ledger.release_reserved()).unwrap());
         prop_assert_eq!(budget.reserved(), 0);
     }
 }
@@ -6799,9 +7699,10 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
 
     // Happy path: download -> release-on-receipt -> buffer (uncharged) -> commit.
     {
-        let mut budget = ByteBudget::new(max);
+        let budget = ByteBudget::new(max);
         let mut reorder = ReorderBuffer::new();
-        let mut outstanding = outstanding_three_block_range(&mut budget);
+        let mut outstanding = outstanding_three_block_range();
+        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), max);
         assert!(budget.reserved() <= budget.max_bytes_for_test());
 
@@ -6813,7 +7714,7 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
             .into_iter()
             .enumerate()
         {
-            budget.release(estimate);
+            drop(funding.split(estimate).unwrap());
             outstanding.mark_received(height);
             assert_eq!(
                 reorder.insert(height, block.clone(), actuals[index], peer(0)),
@@ -6845,17 +7746,18 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
     // Timeout / short-response path: the received height released its estimate at
     // receipt; the unreceived heights release theirs exactly once on timeout.
     {
-        let mut budget = ByteBudget::new(max);
-        let mut outstanding = outstanding_three_block_range(&mut budget);
+        let budget = ByteBudget::new(max);
+        let mut outstanding = outstanding_three_block_range();
+        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), estimate * 3);
         // A short response delivers only height 1; its estimate is released.
-        budget.release(estimate);
+        drop(funding.split(estimate).unwrap());
         outstanding.mark_received(block::Height(1));
         // The remaining two unreceived heights still reserve their estimate each.
         assert_eq!(outstanding.reserved_bytes(), estimate * 2);
         assert_eq!(budget.reserved(), estimate * 2);
         // On timeout the outstanding range releases its still-reserved estimates.
-        budget.release(outstanding.reserved_bytes());
+        drop(funding.split(outstanding.reserved_bytes()).unwrap());
         assert_eq!(budget.reserved(), 0);
     }
 
@@ -6924,7 +7826,7 @@ fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
 fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let hint = 1_000u64;
     // Budget holds several hint-sized shares: enough to reserve this body's hint.
-    let mut budget = ByteBudget::new(hint * 4);
+    let budget = ByteBudget::new(hint * 4);
     let mut reorder = ReorderBuffer::new();
 
     let request = BlockRangeRequest {
@@ -6940,10 +7842,9 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
             estimated_bytes: hint,
         }],
     };
-    assert!(budget.try_reserve(request.estimated_bytes));
+    let funding = budget.reserve_owned(request.estimated_bytes).unwrap();
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request,
         queued_at: now,
         deadline: now,
@@ -6962,7 +7863,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     // Receipt: release the reserved hint. The oversized body is retained at its
     // actual size by the reorder buffer, invisible to the request budget (the
     // resident look-ahead gate accounts for it instead).
-    budget.release(hint);
+    drop(funding);
     outstanding.mark_received(block::Height(1));
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     assert_eq!(
@@ -6974,7 +7875,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert_eq!(budget.reserved(), 0);
     assert_eq!(outstanding.reserved_bytes(), 0);
     assert!(
-        budget.try_reserve(hint),
+        budget.reserve_owned(hint).is_some(),
         "the freed reservation funds the next request immediately"
     );
     let dropped = reorder.drop_through(block::Height(1));
@@ -7052,9 +7953,10 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 /// reactor, where its sender would hold the session's reservation.
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()))
-            .expect("valid block-sync config");
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(
+        BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
+    )
+    .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -7484,6 +8386,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
+        accounting: ByteBudget::new(config.inflight_block_bytes()).reader(),
         events,
         lifecycle,
         needed_query_failures,
@@ -7570,7 +8473,7 @@ async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(1), blocks[0].hash()),
         tip_rx,
@@ -7868,7 +8771,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     let mut config = immediate_body_download_config();
     // One block's size hint of budget: size-based reservation now means one
     // advertised body fills the budget, throttling to one in-flight request.
-    config.max_inflight_block_bytes = u64::from(block1_size);
+    config.max_inflight_block_bytes = Some(u64::from(block1_size));
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(41);
@@ -8000,7 +8903,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 4;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 4);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(73);
@@ -8151,7 +9054,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     let mut config = immediate_body_download_config();
     // Budget holds exactly one worst-case share, so a hint-sized re-reservation
     // would have left no headroom for an underestimated body.
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
@@ -8384,10 +9287,10 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     let mut config = immediate_body_download_config();
     // One block's size hint of budget: size-based reservation now means one
     // advertised body fills the budget, throttling to one in-flight request.
-    config.max_inflight_block_bytes = u64::from(block1_size);
+    config.max_inflight_block_bytes = Some(u64::from(block1_size));
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -8611,7 +9514,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(43);
@@ -8782,7 +9685,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_bytes = block_size(&block);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(42);
@@ -9074,7 +9977,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // of that body releases the whole reservation and the routine must issue the
     // next GetBlocks without any external nudge.
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
     config.request_timeout = Duration::from_secs(300);
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
@@ -9259,7 +10162,7 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
     let budget_blocks = 3u32;
     let heights = 12u32;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES),
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -9321,7 +10224,7 @@ async fn reactor_tiny_estimates_fit_one_worst_case_budget_block() {
     // requests, because each reserves its size hint (clamped to the 1 KiB floor),
     // not a worst-case share. All 4 advertised heights are requested at once.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES),
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -9410,7 +10313,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     let mut config = fill_loop_mechanics_config();
     config.peer_limits.max_outbound_peers = 1;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(4), block::Hash([4; 32])),
         tip_rx,
@@ -9670,7 +10573,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     config.peer_limits.inbound_queue_depth = 1;
     // Hold the whole flood in flight at once so nothing pauses on the byte
     // budget; the inbound flood, not the budget, is what this test exercises.
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     // A dropped body must not be quietly re-requested and healed before the
     // deadline — that would hide the very regression this test guards.
     config.request_timeout = Duration::from_secs(300);
@@ -9804,7 +10707,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(3), blocks[2].hash()),
         tip_rx,
@@ -9990,7 +10893,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     };
 
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
     config.peer_limits.inbound_queue_depth = 128;
@@ -9999,7 +10902,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     config.peer_limits.outbound_queue_depth = 128;
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(BEST_HEADER_TIP), block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(800),
             verified_block_tip: block::Height(800),
@@ -10220,13 +11123,13 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 #[tokio::test]
 async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -10351,13 +11254,13 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_submitted_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -10477,13 +11380,13 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 async fn reactor_forward_reset_preserves_future_outstanding_body() {
     // Open the probe cap so heights 2 and 3 are both outstanding at the reset.
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -10572,13 +11475,13 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -10680,13 +11583,13 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
 #[tokio::test]
 async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_flight_apply() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -11084,13 +11987,13 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 #[tokio::test]
 async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -11237,7 +12140,7 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
 async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -11363,7 +12266,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
 #[tokio::test]
 async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11734,7 +12637,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
 async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity() {
     let request_bytes: u32 = 10_000;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
 
@@ -11855,7 +12758,7 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
     let mut config = immediate_body_download_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -12052,7 +12955,7 @@ async fn reactor_waits_for_a_deferred_status_without_reporting_queue_pressure() 
     let mut config = immediate_body_download_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let mut startup = BlockSyncStartup::new(
+    let mut startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -12121,7 +13024,7 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
     config.request_timeout = Duration::from_secs(300);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(2),
             verified_block_tip: block::Height(2),
@@ -12245,8 +13148,9 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     let blocks = mainnet_blocks_1_to_3();
     // Open the probe cap so all three heights are outstanding at the reanchor.
     let mut config = fill_loop_mechanics_config();
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -12324,6 +13228,88 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+
+    reactor_task.abort();
+}
+
+/// A late commit can move the verified tip off the selected chain to the
+/// selected tip's height, as when a fork with more work replaces the
+/// committed block's height. The body-work epoch changes, and block sync
+/// resets its floor to the replaced block. Only storage's needed-blocks
+/// answer names the common ancestor, so block sync must still ask once its
+/// floor reaches the selected tip, and then reset to the ancestor.
+#[tokio::test]
+async fn off_selected_commit_at_the_selected_height_requeries_the_anchor() {
+    let ancestor = (2, block::Hash([0x02; 32]));
+    let replaced = (3, block::Hash([0x33; 32]));
+    let fork_tip = (3, block::Hash([0x43; 32]));
+    let initial = test_committed_snapshot(1, 1, 1, (0, block::Hash([0; 32])), ancestor, fork_tip);
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let sequencer_view = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the test reactor exposes routine wiring")
+        .view
+        .clone();
+    let answer = |query_id, scope| BlockSyncEvent::ScopedNeededBlocks {
+        query_id,
+        scope,
+        body_anchor: zakura_header_chain::Frontier::new(block::Height(ancestor.0), ancestor.1),
+        blocks: vec![BlockSyncBlockMeta {
+            height: block::Height(fork_tip.0),
+            hash: fork_tip.1,
+            size: BlockSizeEstimate::Unknown,
+        }],
+    };
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup queries the needed blocks");
+    };
+    handle
+        .send(answer(query_id, scope))
+        .await
+        .expect("the startup answer queues");
+
+    // The replaced block commits after the fork took its height.
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(2, 1, 2, (0, block::Hash([0; 32])), replaced, fork_tip),
+            1,
+        )))
+        .expect("the committed snapshot receiver is live");
+    await_until(
+        "the epoch change resets the floor to the replaced block",
+        Duration::from_secs(1),
+        || sequencer_view.borrow().verified_tip == block::Height(replaced.0),
+    )
+    .await
+    .expect("the epoch change resets block sync");
+
+    // Storage answers every query with the common ancestor.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sequencer_view.borrow().verified_tip != block::Height(ancestor.0)
+        && Instant::now() < deadline
+    {
+        if let Ok(Some(BlockSyncAction::QueryNeededBlocks {
+            query_id, scope, ..
+        })) = tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
+        {
+            handle
+                .send(answer(query_id, scope))
+                .await
+                .expect("the answer queues");
+        }
+    }
+    assert_eq!(
+        sequencer_view.borrow().verified_tip,
+        block::Height(ancestor.0),
+        "block sync resets to the common ancestor"
+    );
 
     reactor_task.abort();
 }
@@ -12663,8 +13649,9 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     let blocks = mainnet_blocks_1_to_3();
     // Open the probe cap so all three heights are outstanding when height 1 commits.
     let mut config = fill_loop_mechanics_config();
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -12758,8 +13745,9 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for all three bodies.
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -12867,12 +13855,12 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
 async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     let blocks = fake_sequential_blocks(4);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     config.max_submitted_block_applies = 2;
     config.request_timeout = Duration::from_secs(300);
 
     let (_tip_tx, tip_rx) = genesis_tip_channel();
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(4), blocks[3].hash()),
         tip_rx,
@@ -12943,7 +13931,7 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
         max_inflight_requests: 1,
         ..ZakuraBlockSyncConfig::default()
     };
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([50; 32])),
         tip_rx,
@@ -12951,6 +13939,9 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
     );
     let (_handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    // Body work at genesis waits out the far-ahead header quiet period.
+    time::pause();
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD).await;
 
     assert!(matches!(
         next_action(&mut actions).await,
@@ -12969,7 +13960,7 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
 async fn selected_body_fork_reanchors_before_scheduling_successors() {
     let best_header_tip = block::Height(4);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(2),
@@ -13033,7 +14024,7 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
 async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
@@ -13118,7 +14109,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
 async fn failed_needed_block_query_retries_without_losing_newer_query_ownership() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
@@ -13177,7 +14168,7 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
 async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
@@ -13257,7 +14248,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         max_inflight_requests: 4,
         ..ZakuraBlockSyncConfig::default()
     };
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (best_header_tip, block::Hash([50; 32])),
         tip_rx,
@@ -13265,6 +14256,9 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
     );
     let (handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    // Body work at genesis waits out the far-ahead header quiet period.
+    time::pause();
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD).await;
 
     // Startup refill scans from the floor (queue empty → `max_claimed` is None).
     assert!(matches!(
@@ -13324,7 +14318,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
 #[tokio::test]
 async fn reactor_ignores_stale_non_reset_frontier_updates() {
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3600), block::Hash([36; 32])));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(3200),
             verified_block_tip: block::Height(3200),
@@ -13372,7 +14366,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -13444,7 +14438,7 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     // the wedge within the test window.
     config.request_timeout = Duration::from_secs(300);
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -13544,7 +14538,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
     let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
@@ -13615,7 +14609,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     };
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -13744,7 +14738,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     };
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -13982,7 +14976,7 @@ async fn testnet_fork_body_keeps_selected_body_despite_wrong_branch_hint() {
         let parent = block::Height(height.0 - 1);
         let parent_hash = selected.header.previous_block_hash;
         let (tip_tx, tip_rx) = watch::channel((parent, parent_hash));
-        let startup = BlockSyncStartup::new(
+        let startup = header_tip_startup(
             BlockSyncFrontiers {
                 finalized_height: block::Height(4_350_714),
                 verified_block_tip: parent,
@@ -14142,7 +15136,7 @@ async fn unsolicited_terminator_closes_the_connection() {
     let config = ZakuraBlockSyncConfig::default();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -14393,21 +15387,8 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
             needed(3, BlockSizeEstimate::Advertised(1_024)),
         ],
     );
-    let owner = queue.take_for_request(
-        block::Height(2),
-        block::Height(2),
-        1,
-        2_000_000,
-        1,
-        std::num::NonZeroU64::new(1).unwrap(),
-    )[0]
-    .1
-    .owner
-    .unwrap();
-    assert_eq!(
-        queue.mark_reserved_for_owner(owner, [block::Height(2)]),
-        2_000_000
-    );
+    let owner = queue.publish_fixture(2..=2);
+    assert_eq!(queue.reserved_bytes(), 2_000_000);
     queue.refresh_size_estimates(
         test_work_scope(),
         [
@@ -14431,19 +15412,9 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
         [3_146, 3_146]
     );
 
-    let owner = queue.take_for_request(
-        block::Height(3),
-        block::Height(3),
-        1,
-        1_024,
-        2,
-        std::num::NonZeroU64::new(1).unwrap(),
-    )[0]
-    .1
-    .owner
-    .unwrap();
-    queue.mark_reserved_for_owner(owner, [block::Height(3)]);
-    queue.release_active_reserved_height_for_owner(owner, block::Height(3));
+    let owner = queue.publish_fixture(3..=3);
+    drop(queue.begin_receipt_for_owner(owner, block::Height(3)));
+    assert_eq!(queue.budget().reserved(), 0);
     queue.refresh_size_estimates(
         test_work_scope(),
         [needed(3, BlockSizeEstimate::Advertised(7_000))],
@@ -14461,13 +15432,15 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
     );
     queue.refresh_size_estimates(test_work_scope(), [needed(3, BlockSizeEstimate::Unknown)]);
     queue.advance_floor(block::Height(1));
+    let retry = queue.publish_fixture(3..=3);
     assert_eq!(
-        queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
-            .1
+        queue
+            .item_for_height(block::Height(3))
+            .expect("the fixture keeps the height in flight")
             .estimated_bytes,
         5_000
     );
-    queue.return_items([block::Height(3)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(retry, [block::Height(3)]);
     assert_eq!(
         queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
             .1
@@ -14607,11 +15580,7 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         ],
     );
     // A missed correction must also reach the next retry of an issued body.
-    assert_eq!(
-        work.take_in_range(block::Height(2), block::Height(2), 1)
-            .len(),
-        1
-    );
+    let owner = work.publish_fixture(2..=2);
     changed_view.snapshot.state_version = zakura_header_chain::StateVersion::new(21);
     changed_view.body_size_hint_revision = 20;
     changed_view.body_size_hint_batches = Some(
@@ -14656,10 +15625,66 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
     tokio::time::timeout(Duration::from_secs(1), changed)
         .await
         .unwrap();
-    work.return_items([block::Height(2)]);
+    work.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(2)]);
     assert!(work
         .take_in_range(block::Height(2), block::Height(3), 2)
         .iter()
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
+}
+
+#[tokio::test]
+async fn sequencer_panic_closes_the_reactor_action_channel() {
+    use super::block_sync_observe::{BlockEvent, BlockSyncObserver, ObserverSlot};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct PanicOnce(AtomicBool);
+    impl BlockSyncObserver for PanicOnce {
+        fn observe(&self, event: BlockEvent) {
+            if matches!(event, BlockEvent::Sequencer(_)) && !self.0.swap(true, Ordering::SeqCst) {
+                panic!("injected sequencer task failure");
+            }
+        }
+    }
+
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32]));
+    let snapshot = committed_snapshot(1, 1, 1, frontier, frontier, frontier);
+    let (snapshots, mut startup) =
+        committed_block_sync_startup(snapshot.clone(), ZakuraBlockSyncConfig::default());
+    let fault = Arc::new(PanicOnce::default());
+    startup.observer = ObserverSlot(Some(fault.clone()));
+    let (mut handle, mut actions, reactor) = spawn_block_sync_reactor(startup).unwrap();
+    // This sender exists only in unit-test wiring. Remove its keepalive for the
+    // real action channel so only the production reactor and sequencer own it.
+    let (fixture_actions, _) = mpsc::channel(1);
+    handle.routine_wiring.as_mut().unwrap().actions = fixture_actions;
+    let mut changed = snapshot;
+    changed.state_version = zakura_header_chain::StateVersion::new(2);
+    snapshots.send_replace(Some(committed_view(changed, 0)));
+
+    tokio::time::timeout(Duration::from_secs(2), reactor)
+        .await
+        .expect("sequencer closure must stop the reactor")
+        .expect("the reactor must exit without panicking");
+    assert!(
+        fault.0.load(Ordering::SeqCst),
+        "the sequencer reached the fault"
+    );
+    assert!(
+        !handle.is_accounting_closed(),
+        "exit must not depend on an accounting fault"
+    );
+    assert!(handle
+        .routine_wiring
+        .as_ref()
+        .unwrap()
+        .sequencer_input
+        .is_closed());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while actions.recv().await.is_some() {}
+    })
+    .await
+    .expect("sequencer and reactor exit must close the driver action channel");
+    drop(handle);
 }

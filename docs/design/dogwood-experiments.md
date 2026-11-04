@@ -1,5 +1,11 @@
 # Dogwood experiment report
 
+> **Status: superseded draft.** This report covers the first draft's part masks,
+> grants, and byte-budgeted controller. The second revision of the
+> [spec](../specs/dogwood.md) replaced those mechanisms. The
+> [design](dogwood.md#current-evidence) summarizes the fleet results behind that
+> revision.
+
 The September 8–9, 2026 experiments test subscription allocation, proposer
 seeding, connected relay graphs, bounded fallback, and TCP delivery feedback.
 They do not establish production congestion control or sustained 50,000 TPS. The

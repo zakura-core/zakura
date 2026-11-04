@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "release_tag": "v1.3.0",
+  "release_tag": "v1.3.1",
   "artifacts": [
     {
       "target_triple": "x86_64-pc-linux-gnu",
-      "runtime_binary_url": "https://github.com/valargroup/zcashd/releases/download/v1.3.0/zcashd-zebra-compat-v1.3.0-linux-x86_64",
-      "runtime_binary_sha256": "d4c3de11575644fd8e965467f446b3a2d672d2360ce4a211adcad3781ccb5856"
+      "runtime_binary_url": "https://github.com/valargroup/zcashd/releases/download/v1.3.1/zcashd-zebra-compat-v1.3.1-linux-x86_64",
+      "runtime_binary_sha256": "a7deec605c7e531dc1d1d5e3cdfd15587977a464004b10ac7c9647389a1bdb6b"
     }
   ]
 }

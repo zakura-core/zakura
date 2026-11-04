@@ -4,22 +4,49 @@
 //! only the entries it touches, so filling or draining a window costs
 //! `O(N log N)` rather than `O(N²)`.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::OutstandingBlockRange;
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::block_sync::work_queue::RequestWritePhase;
 
 /// Identity of one outstanding request. Keys increase in issue order.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(in crate::zakura::block_sync) struct RequestKey(u64);
+pub struct RequestKey(u64);
 
 impl RequestKey {
     const MIN: Self = Self(0);
     const MAX: Self = Self(u64::MAX);
+}
+
+/// One outstanding request, as [`OutstandingRequests::ownership`] reads it.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestOwnership {
+    /// The request's key in its routine.
+    pub key: RequestKey,
+    /// The request.
+    pub owner: zakura_header_chain::BodyWorkOwner,
+    /// Where the request's frame write stands.
+    pub write: crate::zakura::block_sync::work_queue::RequestWritePhase,
+    /// Each requested height, in order.
+    pub heights: Vec<RequestedHeight>,
+}
+
+/// One height of an outstanding request.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RequestedHeight {
+    /// The height.
+    pub height: block::Height,
+    /// The size estimate the request reserved for this height at admission.
+    /// A received body's wire bytes minus this is the hint's error.
+    pub estimated_bytes: u64,
+    /// The body arrived, so the height no longer holds its estimate.
+    pub received: bool,
 }
 
 /// Outstanding requests in issue order with secondary indexes.
@@ -29,9 +56,6 @@ pub(in crate::zakura::block_sync) struct OutstandingRequests {
     by_start: BTreeSet<(block::Height, RequestKey)>,
     by_end: BTreeSet<(block::Height, RequestKey)>,
     by_deadline: BTreeSet<(Instant, RequestKey)>,
-    /// Requests whose frame write had not started when last checked. Transport
-    /// can skip only these requests.
-    unstarted: BTreeSet<RequestKey>,
     /// Requests that still count toward the no-progress probe streak.
     charged_for_liveness: BTreeSet<RequestKey>,
     /// Sum of the size estimates still reserved for unreceived heights.
@@ -56,6 +80,36 @@ impl OutstandingRequests {
         &self,
     ) -> impl Iterator<Item = &OutstandingBlockRange> + '_ {
         self.requests.values()
+    }
+
+    /// Every outstanding request with its owner, write phase, and each
+    /// height's admission estimate, read from the request map rather than
+    /// from `reserved_bytes`. `write_phase` reads the live write handle, which
+    /// the routine holds beside these records.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::block_sync) fn ownership(
+        &self,
+        write_phase: impl Fn(RequestKey) -> Option<RequestWritePhase>,
+    ) -> Vec<RequestOwnership> {
+        self.requests
+            .iter()
+            .map(|(key, outstanding)| RequestOwnership {
+                key: *key,
+                owner: outstanding.request.owner,
+                write: write_phase(*key)
+                    .expect("every outstanding request keeps its write handle until it settles"),
+                heights: outstanding
+                    .request
+                    .expected_blocks
+                    .iter()
+                    .map(|expected| RequestedHeight {
+                        height: expected.height,
+                        estimated_bytes: expected.estimated_bytes,
+                        received: outstanding.has_received(expected.height),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Keyed requests in issue order.
@@ -95,7 +149,6 @@ impl OutstandingRequests {
         self.by_start.insert((request.request.start_height, key));
         self.by_end.insert((request.request.end_height(), key));
         self.by_deadline.insert((request.deadline, key));
-        self.unstarted.insert(key);
         self.reserved_bytes = self.reserved_bytes.saturating_add(request.reserved_bytes());
         self.max_count = self.max_count.max(request.request.count);
         self.requests.insert(key, request);
@@ -110,21 +163,22 @@ impl OutstandingRequests {
         self.by_start.remove(&(request.request.start_height, key));
         self.by_end.remove(&(request.request.end_height(), key));
         self.by_deadline.remove(&(request.deadline, key));
-        self.unstarted.remove(&key);
         self.charged_for_liveness.remove(&key);
         self.reserved_bytes = self.reserved_bytes.saturating_sub(request.reserved_bytes());
         Some(request)
     }
 
     /// Remove every request, in issue order.
-    pub(in crate::zakura::block_sync) fn drain(&mut self) -> Vec<OutstandingBlockRange> {
+    pub(in crate::zakura::block_sync) fn drain(
+        &mut self,
+    ) -> Vec<(RequestKey, OutstandingBlockRange)> {
         let requests = std::mem::take(&mut self.requests);
         *self = Self {
             next_key: self.next_key,
             max_count: self.max_count,
             ..Self::default()
         };
-        requests.into_values().collect()
+        requests.into_iter().collect()
     }
 
     /// The oldest request covering `height`.
@@ -179,23 +233,6 @@ impl OutstandingRequests {
             .collect();
         keys.sort_unstable();
         keys
-    }
-
-    /// Requests whose frame transport skipped, in issue order. Forget requests
-    /// whose write has started, because transport can no longer skip them.
-    pub(in crate::zakura::block_sync) fn skipped(&mut self) -> Vec<RequestKey> {
-        let requests = &self.requests;
-        let mut skipped = Vec::new();
-        self.unstarted.retain(|key| {
-            let status = &requests[key].write_status;
-            if status.was_skipped() {
-                skipped.push(*key);
-                true
-            } else {
-                !status.has_started()
-            }
-        });
-        skipped
     }
 
     /// Record `height` as received. Return whether it was newly received.
@@ -281,7 +318,7 @@ impl OutstandingRequests {
     }
 
     /// Recompute every index and total from the requests themselves.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn assert_consistent(&self) {
         let reserved = self.requests.values().fold(0u64, |acc, request| {
             acc.saturating_add(request.reserved_bytes())
@@ -305,10 +342,6 @@ impl OutstandingRequests {
             .map(|(key, request)| (request.deadline, *key))
             .collect();
         assert_eq!(self.by_deadline, deadlines);
-        assert!(self
-            .unstarted
-            .iter()
-            .all(|key| self.requests.contains_key(key)));
         assert!(self
             .charged_for_liveness
             .iter()

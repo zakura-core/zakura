@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::{mem, sync::Arc};
+use zakura_node_services::block_memory::BlockHandle;
 
 use zakura_chain::{
     block::Block,
@@ -81,6 +82,35 @@ impl FakeChainHelper for Arc<Block> {
         let block = Arc::make_mut(&mut self);
         Arc::make_mut(&mut block.header).commitment_bytes = block_commitment.into();
         self
+    }
+}
+
+/// Copies fixture data so a test can mutate it before submitting a new block.
+pub fn copy_block_fixture(block: &zakura_chain::block::BlockRef) -> Arc<Block> {
+    Arc::new(Block {
+        header: Arc::new(*block.header()),
+        transactions: block
+            .transactions()
+            .map(|tx| Arc::new(tx.clone()))
+            .collect(),
+    })
+}
+
+impl FakeChainHelper for BlockHandle {
+    fn make_fake_child(&self) -> Arc<Block> {
+        copy_block_fixture(self).make_fake_child()
+    }
+
+    fn make_fake_siblings(&self, count: usize) -> Vec<Arc<Block>> {
+        copy_block_fixture(self).make_fake_siblings(count)
+    }
+
+    fn set_work(self, work: u128) -> Arc<Block> {
+        copy_block_fixture(&self).set_work(work)
+    }
+
+    fn set_block_commitment(self, commitment: [u8; 32]) -> Arc<Block> {
+        copy_block_fixture(&self).set_block_commitment(commitment)
     }
 }
 

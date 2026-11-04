@@ -411,6 +411,18 @@ a successful delivery as `Authenticated`. The sweep rejects an attributable deli
 disputes both deliveries when the boundary cannot identify which delivery is invalid. Either
 failure starts metadata repair immediately.
 
+Before a blocked commit waits for peer input, the writer exhausts local recovery at that
+commit's boundary. New failure evidence triggers an immediate retry because rejection can expose
+another selected delivery. When that retry makes no progress, the writer searches retained pairs
+at `H` and `H+1` against the committed history tree. The delivery cap bounds the complete search.
+Recovery does not use the idle sweep's elapsed-time budget or copy its selected projection.
+Authentication retries the commit only when the selected delivery or its authentication changes.
+The committer still verifies the delivery before committing the body.
+
+When local recovery is exhausted, both missing-root and missing-successor stalls wait on
+header-chain control messages. The writer processes resource-stall recovery and shutdown while
+waiting. The diagnostic deadline reports a stall without polling the blocked commit.
+
 Three properties keep the committer authoritative:
 
 - **The committer still verifies every committed delivery.** The sweep adds an early check.

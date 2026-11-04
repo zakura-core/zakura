@@ -64,10 +64,8 @@ use crate::service::{
 mod vct_authentication_sweep;
 mod vct_write_retry;
 
-use vct_authentication_sweep::VctAuthenticationSweeper;
-use vct_write_retry::{
-    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
-};
+use vct_authentication_sweep::{recover_commit_boundary, VctAuthenticationSweeper};
+use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
 /// Classifies durable failure evidence as a new repair episode or an idempotent observation.
@@ -105,10 +103,9 @@ fn missing_vct_successor_retry(
     current_height: Height,
 ) -> (Height, VctWriteRetryCause) {
     if let Some(successor_height) = successor_height {
-        // The successor header exists but carries no auxiliary record. The committer disputed
-        // nothing, so this poll continues the open repair episode instead of starting a new one.
-        // A new episode would retire the header-sync repair task and discard its supplier
-        // backoff on every poll.
+        // The successor header exists but carries no auxiliary record. This observation
+        // continues the open repair episode. A new episode would retire the header-sync
+        // repair task and discard its supplier backoff.
         return (
             successor_height,
             VctWriteRetryCause::MissingRoot {
@@ -506,20 +503,30 @@ impl HeaderChainWriter {
     /// Reads the untried delivery pairs at a selected VCT boundary, grouped by current delivery.
     ///
     /// Selection pairs the best row of each header. Once both headers hold disputed rows, that
-    /// pairing can hide the pair that verifies, so the sweep tries these pairs before it requests
+    /// pairing can hide the pair that verifies, so the writer tries these pairs before it waits for
     /// repair. Rows that share an observation already failed together, so the read skips them.
     pub(crate) fn vct_boundary_alternatives_at_projection_index(
         &self,
         projection_index: usize,
         expected_frontier: Frontier,
     ) -> Result<Vec<VctAuxiliaryWindow>, HeaderChainStoreError> {
+        Self::vct_boundary_alternatives(
+            self.runtime.selected_auxiliary_window_at_projection_index(
+                projection_index,
+                expected_frontier,
+            )?,
+        )
+    }
+
+    /// Builds untried pairs from one coherent selected boundary read.
+    fn vct_boundary_alternatives(
+        selected_window: Option<SelectedAuxiliaryWindow>,
+    ) -> Result<Vec<VctAuxiliaryWindow>, HeaderChainStoreError> {
         let Some(SelectedAuxiliaryWindow {
             engine_snapshot,
             delivery_header,
             successor_header: Some(successor_header),
-        }) = self
-            .runtime
-            .selected_auxiliary_window_at_projection_index(projection_index, expected_frontier)?
+        }) = selected_window
         else {
             return Ok(Vec::new());
         };
@@ -757,7 +764,7 @@ impl HeaderChainWriter {
                         "checkpoint full-state height does not extend the verified header frontier",
                     )
                 })?
-            || block.block.header.previous_block_hash != snapshot.frontiers.verified_best.hash
+            || block.block.header().previous_block_hash != snapshot.frontiers.verified_best.hash
         {
             return Err(HeaderChainStoreError::Incoherent(
                 "checkpoint full state does not extend the verified header frontier",
@@ -767,7 +774,7 @@ impl HeaderChainWriter {
         let path = vec![VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: Arc::new(*block.block.header()),
         }];
         let evidence = checkpoint_finality_evidence(snapshot.state_version, accepted);
         let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
@@ -1046,7 +1053,7 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: block.header.clone(),
         })
         .collect()
 }
@@ -1058,7 +1065,7 @@ fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: block.header.clone(),
         })
         .collect::<Vec<_>>();
     headers.sort_unstable_by_key(|header| (header.height, header.hash.0));
@@ -1090,7 +1097,7 @@ fn verified_side_paths(
                 .map(|block| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: block.block.header.clone(),
+                    header: block.header.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1172,7 +1179,7 @@ fn verified_path_through(
                 .map(|(_, block)| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: block.block.header.clone(),
+                    header: block.header.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1574,6 +1581,41 @@ pub(crate) fn validate_and_commit_non_finalized(
     )
 }
 
+/// Returns `error` if it belongs to the block, or the commitment mismatch if the body's
+/// authorizing data doesn't match its header.
+///
+/// Contextual rules can read authorizing data before the commitment check runs, such as v6
+/// anchors, so a consensus failure is only the block's if its header commits to that data (see
+/// `check::auth_data_commitment`, which `commitment` runs). Transaction IDs commit to spent
+/// outpoints and nullifiers (ZIP 244, and the whole v4 encoding), and the Merkle root was checked
+/// before this, so every body for the block repeats a duplicate spend or nullifier: that failure is
+/// the block's whatever the authorizing data says.
+fn attribute_contextual_failure(
+    error: ValidateContextError,
+    commitment: impl FnOnce() -> crate::AuthDataCommitment,
+) -> ValidateContextError {
+    if !matches!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+    ) || matches!(
+        error,
+        ValidateContextError::DuplicateTransparentSpend { .. }
+            | ValidateContextError::DuplicateSproutNullifier { .. }
+            | ValidateContextError::DuplicateSaplingNullifier { .. }
+            | ValidateContextError::DuplicateOrchardNullifier { .. }
+            | ValidateContextError::DuplicateIronwoodNullifier { .. }
+    ) {
+        return error;
+    }
+
+    match commitment() {
+        crate::AuthDataCommitment::Mismatch(mismatch) => {
+            ValidateContextError::InvalidBlockCommitment(mismatch)
+        }
+        crate::AuthDataCommitment::Bound | crate::AuthDataCommitment::Unavailable => error,
+    }
+}
+
 #[tracing::instrument(
     name = "validate_and_commit_non_finalized",
     level = "debug",
@@ -1591,6 +1633,8 @@ fn validate_and_commit_non_finalized_with_metrics(
     contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
     let total_start = Instant::now();
+    let block = prepared.block.clone();
+    let auth_data_root = prepared.auth_data_root;
     let initial_checks_start = Instant::now();
     let initial_checks =
         check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
@@ -1600,7 +1644,7 @@ fn validate_and_commit_non_finalized_with_metrics(
         initial_checks_start.elapsed(),
     );
     let result = initial_checks.and_then(|()| {
-        let parent_hash = prepared.block.header.previous_block_hash;
+        let parent_hash = prepared.block.header().previous_block_hash;
 
         if finalized_state.finalized_tip_hash() == parent_hash {
             non_finalized_state.commit_new_chain_with_metrics(
@@ -1615,6 +1659,17 @@ fn validate_and_commit_non_finalized_with_metrics(
                 contextual_metrics,
             )
         }
+    });
+    let result = result.map_err(|error| {
+        attribute_contextual_failure(error, || {
+            check::auth_data_commitment(
+                &non_finalized_state.network,
+                non_finalized_state,
+                finalized_state,
+                block,
+                auth_data_root,
+            )
+        })
     });
     contextual_metrics.record_duration(
         "state.contextual.total.duration_seconds",
@@ -1669,8 +1724,7 @@ fn update_latest_chain_channels(
         non_finalized_state.write_to_backup(backup_dir_path);
     }
 
-    // If the final receiver was just dropped, ignore the error.
-    let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+    non_finalized_state.publish(non_finalized_state_sender);
 
     chain_tip_sender.set_best_non_finalized_tip(tip_block);
 
@@ -1679,7 +1733,7 @@ fn update_latest_chain_channels(
 
 fn update_channels_after_operator_change(
     non_finalized_state: &NonFinalizedState,
-    finalized_state: &FinalizedState,
+    finalized_tip: Option<ChainTipBlock>,
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
     backup_dir_path: Option<&Path>,
@@ -1688,14 +1742,8 @@ fn update_channels_after_operator_change(
         if let Some(backup_dir_path) = backup_dir_path {
             non_finalized_state.write_to_backup(backup_dir_path);
         }
-        let _ = non_finalized_state_sender.send(non_finalized_state.clone());
-        chain_tip_sender.clear_best_non_finalized_tip(
-            finalized_state
-                .db
-                .tip_block()
-                .map(CheckpointVerifiedBlock::from)
-                .map(ChainTipBlock::from),
-        );
+        non_finalized_state.publish(non_finalized_state_sender);
+        chain_tip_sender.clear_best_non_finalized_tip(finalized_tip);
     } else {
         update_latest_chain_channels(
             non_finalized_state,
@@ -2274,6 +2322,7 @@ fn handle_header_chain_control_message(
 ///
 /// The diagnostic deadline remains active while no commit arrives.
 fn wait_for_vct_root_insert(
+    retry_cause: VctWriteRetryCause,
     receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
     header_chain: Option<&HeaderChainWriter>,
     deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
@@ -2289,9 +2338,7 @@ fn wait_for_vct_root_insert(
             {
                 Ok(message) => message,
                 Err(_) => {
-                    retry_manager.report_stall_if_due(VctWriteRetryCause::MissingRoot {
-                        trigger: VctRepairTrigger::MissingRootObserved,
-                    });
+                    retry_manager.report_stall_if_due(retry_cause);
                     continue;
                 }
             }
@@ -2311,7 +2358,7 @@ fn wait_for_vct_root_insert(
 
 /// Wait until one retry condition can change, or return the writer exit caused by the wait.
 fn wait_for_vct_retry(
-    wait: VctWriteRetryWait,
+    retry_cause: VctWriteRetryCause,
     receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
     header_chain: Option<&HeaderChainWriter>,
     deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
@@ -2319,20 +2366,15 @@ fn wait_for_vct_retry(
     retry_manager: &mut VctWriteRetryManager,
     last_resource_stall_recovery: &mut Option<StateVersion>,
 ) -> Option<BlockWriteTaskExit> {
-    let result = match wait {
-        VctWriteRetryWait::HeaderChainInsert => wait_for_vct_root_insert(
-            receiver,
-            header_chain,
-            deferred_messages,
-            deadline_runtime,
-            retry_manager,
-            last_resource_stall_recovery,
-        ),
-        VctWriteRetryWait::Delay(wait) => {
-            std::thread::park_timeout(wait);
-            Ok(true)
-        }
-    };
+    let result = wait_for_vct_root_insert(
+        retry_cause,
+        receiver,
+        header_chain,
+        deferred_messages,
+        deadline_runtime,
+        retry_manager,
+        last_resource_stall_recovery,
+    );
     match result {
         Ok(true) => None,
         Ok(false) => Some(BlockWriteTaskExit::Completed),
@@ -2556,15 +2598,16 @@ impl WriteBlockWorkerTask {
                         None
                     }
                     Ok(VctAuxiliaryWindowRead::Missing { height }) => {
-                        let wait = vct_write_retry_manager.on_retryable_error(
+                        let retry_cause = VctWriteRetryCause::MissingRoot {
+                            trigger: VctRepairTrigger::MissingRootObserved,
+                        };
+                        vct_write_retry_manager.on_retryable_error(
                             height,
-                            VctWriteRetryCause::MissingRoot {
-                                trigger: VctRepairTrigger::MissingRootObserved,
-                            },
+                            retry_cause,
                             ordered_block,
                         );
                         if let Some(exit) = wait_for_vct_retry(
-                            wait,
+                            retry_cause,
                             non_finalized_block_write_receiver,
                             header_chain.as_ref(),
                             &mut deferred_non_finalized_messages,
@@ -2640,13 +2683,9 @@ impl WriteBlockWorkerTask {
                         auxiliary_window.successor_height,
                         ordered_block.0.height,
                     );
-                    let wait = vct_write_retry_manager.on_retryable_error(
-                        height,
-                        retry_cause,
-                        ordered_block,
-                    );
+                    vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
                     if let Some(exit) = wait_for_vct_retry(
-                        wait,
+                        retry_cause,
                         non_finalized_block_write_receiver,
                         header_chain.as_ref(),
                         &mut deferred_non_finalized_messages,
@@ -2734,6 +2773,7 @@ impl WriteBlockWorkerTask {
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
+                    let mut failure_evidence_committed = false;
                     if let (Some(auxiliary_window), Some(failure)) = (
                         vct_auxiliary_window_for_outcome.as_ref(),
                         error.vct_failure(),
@@ -2764,6 +2804,8 @@ impl WriteBlockWorkerTask {
                                     apply_result @ (ApplyResult::Committed
                                     | ApplyResult::NoChange(_)),
                                 )) => {
+                                    failure_evidence_committed =
+                                        matches!(apply_result, ApplyResult::Committed);
                                     let trigger = vct_failure_repair_trigger(&apply_result)
                                         .expect("committed or idempotent evidence has a trigger");
                                     attributed_failure_repair = failure_attribution
@@ -2808,7 +2850,6 @@ impl WriteBlockWorkerTask {
                     // Header sync repairs the missing selected range.
                     // A completed header insertion wakes an absent-root stall.
                     // An await-successor stall waits only for state to store the next header.
-                    // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
                         let (repair_height, repair_trigger) = attributed_failure_repair
@@ -2822,13 +2863,33 @@ impl WriteBlockWorkerTask {
                         } else {
                             VctWriteRetryCause::MissingSuccessor
                         };
-                        let wait = vct_write_retry_manager.on_retryable_error(
+                        let frontier = Frontier::new(ordered_block.0.height, ordered_block.0.hash);
+                        vct_write_retry_manager.on_retryable_error(
                             repair_height,
                             retry_cause,
                             ordered_block,
                         );
+                        // New evidence can expose another selected delivery. Exhaust those
+                        // retries before searching retained pairs or waiting for peer input.
+                        if failure_evidence_committed {
+                            continue;
+                        }
+                        if let Some(writer) = header_chain.as_ref() {
+                            match recover_commit_boundary(finalized_state, writer, frontier) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                                        BlockWriteTaskFailure::runtime(
+                                            "VCT boundary recovery stopped the finalized writer",
+                                            error,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         if let Some(exit) = wait_for_vct_retry(
-                            wait,
+                            retry_cause,
                             non_finalized_block_write_receiver,
                             header_chain.as_ref(),
                             &mut deferred_non_finalized_messages,
@@ -3027,6 +3088,14 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
+                        }
+                    };
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
                         staged.invalidate_block(hash).and_then(|result| {
@@ -3042,7 +3111,7 @@ impl WriteBlockWorkerTask {
                     if result.is_ok() {
                         update_channels_after_operator_change(
                             non_finalized_state,
-                            finalized_state,
+                            finalized_tip,
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
@@ -3067,8 +3136,7 @@ impl WriteBlockWorkerTask {
                                 // Only the order of other tips changed, so the header chain's
                                 // verified path and the chain tip channel stay the same.
                                 *non_finalized_state = staged;
-                                let _ =
-                                    non_finalized_state_sender.send(non_finalized_state.clone());
+                                non_finalized_state.publish(non_finalized_state_sender);
                                 return Ok(());
                             }
                             let (height, tip_hash) = new_tip.expect(
@@ -3091,7 +3159,7 @@ impl WriteBlockWorkerTask {
                             }
                             update_channels_after_operator_change(
                                 non_finalized_state,
-                                finalized_state,
+                                None,
                                 chain_tip_sender,
                                 non_finalized_state_sender,
                                 backup_dir_path.as_deref(),
@@ -3107,6 +3175,14 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
+                        }
+                    };
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
                         staged
@@ -3135,7 +3211,7 @@ impl WriteBlockWorkerTask {
                             .evicted_blocks(non_finalized_state);
                         update_channels_after_operator_change(
                             non_finalized_state,
-                            finalized_state,
+                            finalized_tip,
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
@@ -3169,7 +3245,7 @@ impl WriteBlockWorkerTask {
                     .record(writer_queue_duration);
             }
             let child_hash = queued_child.hash;
-            let parent_hash = queued_child.block.header.previous_block_hash;
+            let parent_hash = queued_child.block.header().previous_block_hash;
             let child_height = queued_child.height;
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
 

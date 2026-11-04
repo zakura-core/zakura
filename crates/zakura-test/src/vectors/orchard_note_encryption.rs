@@ -1,5 +1,6 @@
 //! Contains test vectors for Orchard note encryptions.
-use lazy_static::lazy_static;
+
+use std::sync::LazyLock;
 
 #[allow(missing_docs)]
 pub struct TestVector {
@@ -24,11 +25,11 @@ pub struct TestVector {
     pub c_out: [u8; 80],
 }
 
-lazy_static! {
-    /// Array of Orchard note encryptions using an all-zero OVKs.
-    // From https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/orchard_note_encryption.py
-    // (edited with `sender_ovk = b'\0' * 32`)
-    pub static ref ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR: Vec<TestVector> = vec![
+/// Array of Orchard note encryptions using an all-zero OVKs.
+// From https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/orchard_note_encryption.py
+// (edited with `sender_ovk = b'\0' * 32`)
+pub static ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR: LazyLock<Vec<TestVector>> = LazyLock::new(|| {
+    vec![
         TestVector {
             incoming_viewing_key: [
                 0x31, 0xd6, 0xa6, 0x85, 0xbe, 0x57, 0x0f, 0x9f, 0xaf, 0x3c, 0xa8, 0xb0, 0x52, 0xe8,
@@ -2119,12 +2120,13 @@ lazy_static! {
                 0x8c, 0xb0, 0x5d, 0x94, 0xf2, 0xb8, 0xd3, 0xc6, 0x1b, 0x4e,
             ],
         },
-    ];
+    ]
+});
 
-
-    /// Array of random Orchard note encryptions.
-    // From https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/orchard_note_encryption.py
-    pub static ref ORCHARD_NOTE_ENCRYPTION_VECTOR: Vec<TestVector> = vec![
+/// Array of random Orchard note encryptions.
+// From https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/orchard_note_encryption.py
+pub static ORCHARD_NOTE_ENCRYPTION_VECTOR: LazyLock<Vec<TestVector>> = LazyLock::new(|| {
+    vec![
         TestVector {
             incoming_viewing_key: [
                 0x10, 0x39, 0xd8, 0xe6, 0x4a, 0x80, 0x90, 0x2e, 0x10, 0x59, 0x47, 0x81, 0x7d, 0xf3,
@@ -4215,5 +4217,5 @@ lazy_static! {
                 0xb5, 0x99, 0x17, 0x87, 0x49, 0xe9, 0xc4, 0x06, 0xaf, 0x26,
             ],
         },
-    ];
-}
+    ]
+});

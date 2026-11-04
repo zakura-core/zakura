@@ -10,7 +10,7 @@ use rand_10::rngs::ThreadRng;
 use tokio::time::timeout;
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     parameters::Network,
     tachyon,
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx, WtxId},
@@ -18,7 +18,7 @@ use zakura_chain::{
 use zakura_state::{ReadRequest, ReadResponse, TachyonMiningData};
 use zcash_tachyon::{
     stamp::proof::{pool::AnchorSpanSeed, PROOF_SYSTEM},
-    AnchorSetPoly, Bundle, EpochIndex, PointerStamp, ProofStamp, TachyonBundle,
+    AggregateId, AnchorSetPoly, Bundle, EpochIndex, ProofStamp, TachyonBundle,
 };
 
 const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -132,6 +132,7 @@ fn valid_for_candidate(
     mining_data: &TachyonMiningData,
 ) -> Vec<VerifiedUnminedTx> {
     let mut seen_descriptors = BTreeSet::new();
+    let mut seen_fees = BTreeSet::new();
     let mut seen_tachygrams = BTreeSet::new();
     let mut omitted_ids = HashSet::new();
     let mut valid = Vec::with_capacity(transactions.len());
@@ -163,7 +164,7 @@ fn valid_for_candidate(
             continue;
         };
 
-        if !bundle.is_autonome() || bundle.verify_coverage(&[]).is_err() {
+        if !bundle.is_autonome() || bundle.verify_coverage(&[], &[]).is_err() {
             omitted_ids.insert(mined_id);
             continue;
         }
@@ -183,9 +184,10 @@ fn valid_for_candidate(
             .iter()
             .map(|action| action.descriptor())
             .collect::<BTreeSet<_>>();
-        if descriptors
-            .iter()
-            .any(|item| seen_descriptors.contains(item))
+        if seen_fees.contains(&bundle.fee_descriptor())
+            || descriptors
+                .iter()
+                .any(|item| seen_descriptors.contains(item))
         {
             omitted_ids.insert(mined_id);
             continue;
@@ -208,6 +210,7 @@ fn valid_for_candidate(
         }
 
         seen_descriptors.extend(descriptors);
+        seen_fees.insert(bundle.fee_descriptor());
         seen_tachygrams.extend(tachygrams);
         valid.push(transaction);
     }
@@ -286,7 +289,7 @@ fn aggregate_with_data(
 fn aggregate_epoch_group(
     rng: &mut ThreadRng,
     transactions: &mut [VerifiedUnminedTx],
-    blocks: &BTreeMap<block::Height, Arc<Block>>,
+    blocks: &BTreeMap<block::Height, zakura_node_services::block_memory::BlockHandle>,
     epoch: EpochIndex,
     group: &[(usize, block::Height)],
 ) -> Result<(), String> {
@@ -326,8 +329,8 @@ fn aggregate_epoch_group(
                     .ok_or_else(|| format!("missing block at {height:?} for Tachyon lift"))?;
                 next_bundles.extend(
                     block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .filter_map(|transaction| proof_bundle(transaction)),
                 );
             }
@@ -357,25 +360,31 @@ fn aggregate_epoch_group(
                 .map_err(|error| format!("could not lift Tachyon proof stamp: {error}"))?;
         }
 
-        lifted_stamps.push((lifted_bundle.stamp, descriptors));
+        let fees = [lifted_bundle.fee_descriptor()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        lifted_stamps.push((lifted_bundle.stamp, descriptors, fees));
     }
 
     let mut lifted_stamps = lifted_stamps.into_iter();
-    let (mut merged_stamp, mut merged_descriptors) = lifted_stamps
+    let (mut merged_stamp, mut merged_descriptors, mut merged_fees) = lifted_stamps
         .next()
         .expect("non-empty aggregation groups have a first stamp");
-    for (stamp, descriptors) in lifted_stamps {
+    for (stamp, descriptors, fees) in lifted_stamps {
         let combined_descriptors = merged_descriptors
             .union(&descriptors)
             .copied()
             .collect::<BTreeSet<_>>();
-        merged_stamp = ProofStamp::merge(
-            rng,
-            (merged_stamp, merged_descriptors),
-            (stamp, descriptors),
-        )
-        .map_err(|error| format!("could not merge Tachyon proof stamps: {error}"))?;
+        let combined_fees = merged_fees.union(&fees).copied().collect();
+        merged_stamp = merged_stamp
+            .merge(
+                rng,
+                (merged_descriptors, merged_fees),
+                (stamp, descriptors, fees),
+            )
+            .map_err(|error| format!("could not merge Tachyon proof stamps: {error}"))?;
         merged_descriptors = combined_descriptors;
+        merged_fees = combined_fees;
     }
 
     let aggregate_index = group[0].0;
@@ -396,7 +405,7 @@ fn aggregate_epoch_group(
             .as_ref(),
     )
     .as_bytes();
-    let pointer = PointerStamp::try_from(aggregate_wtxid)
+    let pointer = AggregateId::try_from(aggregate_wtxid)
         .map_err(|error| format!("invalid Tachyon aggregate wtxid: {error}"))?;
 
     for &(index, _height) in &group[1..] {
@@ -432,7 +441,7 @@ fn replace_bundle(transaction: &mut VerifiedUnminedTx, bundle: TachyonBundle) {
     else {
         unreachable!("Tachyon bundles only appear in V7 transactions");
     };
-    *tachyon_shielded_data = Some(bundle.into());
+    *tachyon_shielded_data = Some(Box::new(bundle.into()));
     transaction.transaction = UnminedTx::from(Arc::new(mined_transaction));
 }
 
@@ -452,9 +461,7 @@ mod tests {
         entropy::ActionEntropy,
         keys::private,
         note::{CommitmentTrapdoor, Note},
-        nullifier,
-        stamp::StampState as _,
-        value, Anchor, TachygramSetPoly,
+        nullifier, value, Anchor,
     };
 
     use super::*;
@@ -523,7 +530,7 @@ mod tests {
                     (tachyon::Anchor::from(start_anchor), Height(10)),
                     (tachyon::Anchor::from(target_anchor), Height(11)),
                 ]),
-                blocks: BTreeMap::from([(Height(11), Arc::new(intervening_block))]),
+                blocks: BTreeMap::from([(Height(11), Arc::new(intervening_block).into())]),
                 revealed_tachygrams: HashSet::new(),
             };
 
@@ -642,10 +649,30 @@ mod tests {
         };
 
         assert!(aggregate.is_aggregate());
+        assert_eq!(u64::from(aggregate.stamp.fee), 2);
+        assert_eq!(u64::from(adjunct.stamp.fee), 2);
+        let (actions, fees) = aggregate
+            .verify_coverage(
+                &adjunct.descriptors().collect::<Vec<_>>(),
+                &[adjunct.fee_descriptor()],
+            )
+            .unwrap();
+        aggregate
+            .verify_tachygrams(actions.len(), fees.len())
+            .unwrap();
+        let digests = actions
+            .iter()
+            .map(zcash_tachyon::action::Descriptor::digest)
+            .chain(fees.iter().map(zcash_tachyon::fee::Descriptor::digest))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(aggregate
+            .verify_proof(&mut rand_10::rng(), &digests)
+            .unwrap());
         let adjunct_dyn: &Bundle<dyn zcash_tachyon::stamp::StampState> = adjunct;
         assert!(aggregate.is_covering(&[adjunct_dyn]));
         assert_eq!(
-            adjunct.stamp.stamp_digest(),
+            <[u8; 64]>::from(adjunct.stamp.wtxid),
             WtxId::from(aggregated[0].transaction.transaction().as_ref()).as_bytes(),
         );
     }
@@ -662,7 +689,7 @@ mod tests {
             sapling_shielded_data: None,
             orchard_shielded_data: None,
             ironwood_shielded_data: None,
-            tachyon_shielded_data: Some(TachyonBundle::Proven(bundle).into()),
+            tachyon_shielded_data: Some(Box::new(TachyonBundle::Proven(bundle).into())),
         };
 
         VerifiedUnminedTx::new(
@@ -714,62 +741,26 @@ mod tests {
     fn autonome_bundle_at(anchor: Anchor) -> Bundle<ProofStamp> {
         let mut rng = rand_10::rng();
         let spending_key = private::SpendingKey::random(&mut rng);
-        let note = Note {
+        let mut note = |amount| Note {
             pk: spending_key.derive_payment_key(),
-            value: value::Positive::try_from(100u64).expect("positive value"),
+            value: value::Positive::try_from(amount).expect("test value is in range"),
             psi: nullifier::Trapdoor::random(&mut rng),
             rcm: CommitmentTrapdoor::random(&mut rng),
         };
-        let padding_note = Note {
-            pk: spending_key.derive_payment_key(),
-            value: value::Positive::try_from(1u64).expect("positive value"),
-            psi: nullifier::Trapdoor::random(&mut rng),
-            rcm: CommitmentTrapdoor::random(&mut rng),
-        };
-        let tachygrams =
-            BTreeSet::from([note.commitment().into(), padding_note.commitment().into()]);
-        let ask = spending_key.derive_auth_private();
-        let theta = ActionEntropy::random(&mut rng);
-        let rcv = value::Trapdoor::random(&mut rng);
-        let spend = zcash_tachyon::action::Plan::spend(note, theta, rcv, |alpha| {
-            ask.derive_action_private(&alpha).derive_action_public()
-        });
-        let plan = zcash_tachyon::bundle::Plan::new(vec![spend], vec![]);
-        let bundle = plan
-            .sign(&mut rng, &[0u8; 32], &ask)
-            .expect("test bundle signs");
-        let coverage = action_descriptor_digest(&bundle.actions);
-        let tachygram_set = tachygrams
-            .iter()
-            .copied()
-            .collect::<TachygramSetPoly>()
-            .commit();
-
-        bundle.stamp(ProofStamp {
-            coverage,
-            anchor,
-            tachygram_set,
-            tachygrams,
-            proof: Box::new(ragu::Proof::trivial()),
-        })
-    }
-
-    fn action_descriptor_digest(actions: &[zcash_tachyon::Action]) -> [u8; 32] {
-        let mut descriptors: Vec<[u8; 64]> =
-            actions.iter().map(|action| action.descriptor()).collect();
-        descriptors.sort_unstable();
-
-        let mut state = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"Tachyon-Actions")
-            .to_state();
-        for descriptor in descriptors {
-            state.update(&descriptor);
-        }
-        state
-            .finalize()
-            .as_bytes()
-            .try_into()
-            .expect("hash length is 32")
+        let output = note(100u64);
+        let max_fee = note(7u64);
+        let output = zcash_tachyon::action::Plan::output(
+            output,
+            ActionEntropy::random(&mut rng),
+            value::Trapdoor::random(&mut rng),
+        );
+        let plan = zcash_tachyon::bundle::Plan::new(vec![], vec![output], max_fee);
+        let stamp = plan
+            .stamp_plan(anchor, value::Positive::try_from(2u64).unwrap())
+            .prove(&mut rng, &spending_key.derive_proof_private(), vec![])
+            .expect("output-only fixture needs no spend witness");
+        plan.sign(&mut rng, &[0u8; 32], &spending_key.derive_auth_private())
+            .expect("test bundle signs")
+            .stamp(stamp)
     }
 }

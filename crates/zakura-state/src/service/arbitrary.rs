@@ -168,15 +168,17 @@ impl Strategy for PreparedChain {
                 .new_tree(runner)?
                 .current();
             // Generate a history tree from the first block
-            let history_tree = HistoryTree::from_block(
+            let history_tree = HistoryTree::from_parts(
                 &network,
-                blocks[0].block.clone(),
-                // Dummy roots since this is only used for tests
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-                #[cfg(zcash_unstable = "nutachyon")]
-                &Default::default(),
+                zakura_chain::history_tree::HistoryTreeBlockParts::from_block(
+                    &blocks[0].block,
+                    // Dummy roots since this is only used for tests
+                    &Default::default(),
+                    &Default::default(),
+                    &Default::default(),
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    &Default::default(),
+                ),
             )
             .expect("history tree should be created");
             *chain = Some((

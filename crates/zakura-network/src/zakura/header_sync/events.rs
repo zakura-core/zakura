@@ -1,13 +1,10 @@
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::{fmt, sync::Arc, time::Duration};
 
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError},
+};
 
 use super::{
     v9::{Admitted, Ended, PageLimits},
@@ -62,6 +59,9 @@ pub struct HeaderSyncStartup {
     pub shutdown: CancellationToken,
     /// Private fatal notifications consumed by the node root.
     pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
+    /// Receives the reactor's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::observe::ObserverSlot,
 }
 
 impl HeaderSyncStartup {
@@ -97,6 +97,8 @@ impl HeaderSyncStartup {
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
             fatal_events: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: super::observe::ObserverSlot::default(),
         }
     }
 

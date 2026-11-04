@@ -11,13 +11,29 @@
 //! [`WriterFence`] skips a query that was never written, and closes the
 //! connection if a written query is still unanswered: no receiver remains for
 //! its answer.
+//!
+//! [`QueryState`] holds the logical side of each live query: what it asked
+//! and whether the queue accepted it. [`Queries`] applies its transitions
+//! under the one lock that also guards the reservations, so the transport
+//! precheck and the claim read one ledger. Only a claim mints an
+//! [`AdmittedAnswer`].
+//!
+//! A claim ends the query's protocol authority, not its resources. The
+//! [`ClaimedAnswer`] it returns keeps the query's pool entry and its kind
+//! through decode, verification, and import, so a session holds at most one
+//! answer of each kind from its query's first byte until that answer settles.
+//!
+//! A `Hello` holds no reservation and asks nothing of this ledger. The session
+//! counts one in verification beside its claimed answers, so a closing session
+//! waits for its own verdict on both.
 
-use std::{
+use std::sync::Arc;
+
+use serde::Serialize;
+use zakura_rt::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
 };
-
-use tokio_util::sync::CancellationToken;
 
 use super::{
     protocol::{
@@ -27,16 +43,17 @@ use super::{
 };
 use crate::zakura::{
     regulation::{
-        sizing, ClaimRefused, ReservationPool, Reservations, ResponseCap, ResponsePrecheck,
-        WriterFence,
+        sizing, ClaimRefused, PoolEntry, ReservationPool, Reservations, ResponseCap,
+        ResponsePrecheck, WriterFence,
     },
     wire_codec::{encode_frame, WireMessage},
     FrameRejection, FramedRecv, FramedSend,
 };
 
 /// A discovery query, keying its response's reservation.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-enum QueryKind {
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum QueryKind {
     Peers,
     Services,
 }
@@ -133,19 +150,224 @@ pub(super) enum QueryUnsent {
     Closed,
 }
 
-/// One session's reservations and what each live query asked. One lock
-/// guards both, so a claim reads what its own query asked.
+/// How far one live query got.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum QueryPhase {
+    /// Reserved, and not yet accepted by the queue. A failed write releases
+    /// it.
+    Unsent,
+    /// The queue accepted it. Only its answer or the session's retirement
+    /// ends it.
+    Queued,
+}
+
+/// One live query.
+#[derive(Debug)]
+struct LiveQuery {
+    asked: Asked,
+    phase: QueryPhase,
+}
+
+/// A query of this kind is already live.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct QueryLive;
+
+/// An answer that claimed its live query, exactly once.
+///
+/// Only [`QueryState::claim`] mints one, so holding one proves the claim.
+#[derive(Debug)]
+pub(super) struct AdmittedAnswer {
+    asked: Asked,
+}
+
+impl AdmittedAnswer {
+    /// The kind of query this answers.
+    pub(super) fn kind(&self) -> QueryKind {
+        self.asked.kind()
+    }
+
+    /// Checks the decoded answer against what its query asked.
+    pub(super) fn check(&self, answer: &DiscoveryMessage) -> Result<(), &'static str> {
+        self.asked.check(answer)
+    }
+}
+
+/// What each of one session's live queries asked, and how far it got.
+///
+/// A session holds at most one live query of each kind. A query is
+/// [`QueryPhase::Unsent`] from its reservation until the queue accepts it,
+/// then [`QueryPhase::Queued`]. Its answer's claim ends it in either phase,
+/// because the peer can answer before the writer learns that the queue
+/// accepted the query. Retiring the session drops every live query.
+#[derive(Debug, Default)]
+pub(super) struct QueryState {
+    live: HashMap<QueryKind, LiveQuery>,
+}
+
+impl QueryState {
+    /// Records `asked` as an unsent live query, before its first byte is
+    /// queued.
+    pub(super) fn reserve(&mut self, asked: Asked) -> Result<(), QueryLive> {
+        let kind = asked.kind();
+        if self.live.contains_key(&kind) {
+            return Err(QueryLive);
+        }
+        self.live.insert(
+            kind,
+            LiveQuery {
+                asked,
+                phase: QueryPhase::Unsent,
+            },
+        );
+        Ok(())
+    }
+
+    /// Records that the queue accepted the live `kind` query. Its answer may
+    /// have claimed it already.
+    pub(super) fn queued(&mut self, kind: QueryKind) {
+        if let Some(query) = self.live.get_mut(&kind) {
+            query.phase = QueryPhase::Queued;
+        }
+    }
+
+    /// Releases the unsent `kind` query. Returns whether one was released:
+    /// its answer may have claimed it already.
+    pub(super) fn release_unsent(&mut self, kind: QueryKind) -> bool {
+        let unsent = self
+            .live
+            .get(&kind)
+            .is_some_and(|query| query.phase == QueryPhase::Unsent);
+        if unsent {
+            self.live.remove(&kind);
+        }
+        unsent
+    }
+
+    /// Claims the live `kind` query for an answer of `payload_len` bytes.
+    /// Returns `None` if no query of `kind` is live.
+    ///
+    /// The claim ends the query even when the answer is larger than its
+    /// query allows, because that answer is a violation.
+    pub(super) fn claim(
+        &mut self,
+        kind: QueryKind,
+        payload_len: usize,
+    ) -> Option<Result<AdmittedAnswer, ClaimRefused>> {
+        let LiveQuery { asked, .. } = self.live.remove(&kind)?;
+        let cap = asked.cap().bytes;
+        // Widening usize to u64 is lossless on supported targets.
+        if payload_len as u64 > cap {
+            return Some(Err(ClaimRefused::OverBytes { bytes: cap }));
+        }
+        Some(Ok(AdmittedAnswer { asked }))
+    }
+
+    /// Live queries.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    fn len(&self) -> usize {
+        self.live.len()
+    }
+}
+
+/// What one session delivered and has not settled: its claimed answers of each
+/// kind, and each `Hello` in verification.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct Settling {
+    peers: usize,
+    services: usize,
+    hellos: usize,
+}
+
+impl Settling {
+    fn of(&mut self, held: Held) -> &mut usize {
+        match held {
+            Held::Answer(QueryKind::Peers) => &mut self.peers,
+            Held::Answer(QueryKind::Services) => &mut self.services,
+            Held::Hello => &mut self.hellos,
+        }
+    }
+
+    fn holds(mut self, kind: QueryKind) -> bool {
+        *self.of(Held::Answer(kind)) > 0
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// What one [`SettlingHold`] holds.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Held {
+    /// A claimed answer. It also holds its pool entry beside this hold.
+    Answer(QueryKind),
+    /// A `Hello` in verification. It holds a closing session's wait and nothing
+    /// else: no reservation, no pool entry, and no query kind.
+    Hello,
+}
+
+/// One answer or `Hello` that a session's reader has not settled.
+///
+/// The reader holds it through decode, verification, and import. Dropping it
+/// settles on every path, including a reader cancelled inside verification.
+/// Settlement needs no lock, so a destructor that runs at shutdown cannot
+/// contend with a paused lock holder.
+#[derive(Debug)]
+#[must_use = "dropping the hold settles what it holds"]
+pub(super) struct SettlingHold {
+    held: Held,
+    settling: Arc<watch::Sender<Settling>>,
+}
+
+impl SettlingHold {
+    fn new(held: Held, settling: &Arc<watch::Sender<Settling>>) -> Self {
+        settling.send_modify(|settling| *settling.of(held) += 1);
+        Self {
+            held,
+            settling: settling.clone(),
+        }
+    }
+}
+
+impl Drop for SettlingHold {
+    fn drop(&mut self) {
+        self.settling
+            .send_modify(|settling| *settling.of(self.held) -= 1);
+    }
+}
+
+/// The runtime owner of one claimed answer: its [`AdmittedAnswer`], the pool
+/// entry its query reserved, and its kind's place in the session.
+#[derive(Debug)]
+#[must_use = "dropping a claimed answer settles it"]
+pub(super) struct ClaimedAnswer {
+    admitted: AdmittedAnswer,
+    /// Frees before `_settling`, so a waiter that settlement wakes finds the
+    /// entry free.
+    _entry: PoolEntry,
+    _settling: SettlingHold,
+}
+
+impl ClaimedAnswer {
+    /// The evidence that this answer claimed its live query.
+    pub(super) fn admitted(&self) -> &AdmittedAnswer {
+        &self.admitted
+    }
+}
+
+/// One session's reservations and its live queries. One lock guards both,
+/// so a claim reads what its own query asked.
 #[derive(Debug)]
 struct LiveQueries {
     reservations: Reservations<QueryKind>,
-    asked: HashMap<QueryKind, Asked>,
+    state: QueryState,
 }
 
 impl LiveQueries {
     fn new() -> Self {
         Self {
             reservations: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
-            asked: HashMap::new(),
+            state: QueryState::default(),
         }
     }
 }
@@ -154,6 +376,8 @@ impl LiveQueries {
 #[derive(Clone, Debug)]
 pub(super) struct Queries {
     live: Arc<Mutex<LiveQueries>>,
+    /// The session's claimed answers that have not settled.
+    settling: Arc<watch::Sender<Settling>>,
     pool: ReservationPool,
     fence: WriterFence,
     send: FramedSend,
@@ -180,6 +404,7 @@ impl Queries {
         let transport_admits = recv.attach_precheck(Arc::new(QueriesPrecheck(live.clone())));
         Self {
             live,
+            settling: Arc::new(watch::Sender::new(Settling::default())),
             pool,
             fence,
             send,
@@ -219,56 +444,113 @@ impl Queries {
         let exchange = self.fence.open().ok_or(QueryUnsent::Closed)?;
         let writer = exchange.writer();
         let entry = self.pool.try_entry().ok_or(QueryUnsent::NotDue)?;
-        let kind = asked.kind();
+        let (kind, request_type, cap) = (asked.kind(), asked.request_type(), asked.cap());
         {
-            let mut live = self.lock();
-            live.reservations
-                .reserve_fenced(kind, asked.request_type(), asked.cap(), entry, exchange)
-                .map_err(|_| QueryUnsent::NotDue)?;
-            live.asked.insert(kind, asked);
+            let live = &mut *self.lock();
+            // The claim counts its answer under this lock, so this check and
+            // the reservation below read one ledger.
+            if self.settling.borrow().holds(kind) {
+                return Err(QueryUnsent::NotDue);
+            }
+            live.state
+                .reserve(asked)
+                .map_err(|QueryLive| QueryUnsent::NotDue)?;
+            if live
+                .reservations
+                .reserve_fenced(kind, request_type, cap, entry, exchange)
+                .is_err()
+            {
+                live.state.release_unsent(kind);
+                return Err(QueryUnsent::NotDue);
+            }
         }
 
-        let sent = tokio::select! {
+        let sent = zakura_rt::select! {
             biased;
             () = self.cancel.cancelled() => false,
             sent = self.send.send_fenced(frame, &writer) => sent.is_ok(),
         };
-        if !sent {
-            let mut live = self.lock();
-            live.reservations.retract(&kind);
-            live.asked.remove(&kind);
-            return Err(QueryUnsent::Closed);
+        let live = &mut *self.lock();
+        if sent {
+            live.state.queued(kind);
+            return Ok(());
         }
-        Ok(())
+        if live.state.release_unsent(kind) {
+            live.reservations.retract(&kind);
+        }
+        Err(QueryUnsent::Closed)
     }
 
     /// Claims the live query that a `message_type` frame of `payload_len`
-    /// bytes answers, before its payload is decoded. Returns what the query
-    /// asked, or `None` if the frame answers no query.
+    /// bytes answers, before its payload is decoded. Returns the claimed
+    /// answer, which keeps the query's resources until it drops, or `None` if
+    /// the frame answers no query.
     pub(super) fn claim(
         &self,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<Option<Asked>, ClaimRefused> {
+    ) -> Result<Option<ClaimedAnswer>, ClaimRefused> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
             return Ok(None);
         };
-        let mut live = self.lock();
+        self.claim_locked(&mut self.lock(), kind, message_type, payload_len)
+            .map(Some)
+    }
+
+    /// [`Self::claim`] of a `kind` answer, with the live queries already
+    /// locked. The claim takes the queued frame and counts its answer under
+    /// this one lock.
+    fn claim_locked(
+        &self,
+        live: &mut LiveQueries,
+        kind: QueryKind,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<ClaimedAnswer, ClaimRefused> {
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
-        live.reservations
-            .claim_end(&kind, message_type, payload_len)?;
-        let asked = live
-            .asked
-            .remove(&kind)
-            .expect("every live reservation records what its query asked");
-        let cap = asked.cap().bytes;
-        // Widening usize to u64 is lossless on supported targets.
-        if payload_len as u64 > cap {
-            return Err(ClaimRefused::OverBytes { bytes: cap });
+        let (_ended, entry) =
+            live.reservations
+                .claim_end_holding_entry(&kind, message_type, payload_len)?;
+        let admitted = live
+            .state
+            .claim(kind, payload_len)
+            .expect("every live reservation records its live query")?;
+        Ok(ClaimedAnswer {
+            admitted,
+            _entry: entry,
+            _settling: SettlingHold::new(Held::Answer(kind), &self.settling),
+        })
+    }
+
+    /// Counts one `Hello` in verification until the returned hold drops.
+    pub(super) fn verifying_hello(&self) -> SettlingHold {
+        SettlingHold::new(Held::Hello, &self.settling)
+    }
+
+    /// Resolves once this session holds nothing it read and has not processed:
+    /// no claimed answer, no `Hello` in verification, and no answer the transport
+    /// reader queued. An unanswered query does not hold it, so a silent peer
+    /// costs no wait. A `Hello` the reader has not reached holds no reservation,
+    /// so it does not hold this either.
+    pub(super) async fn answers_settled(&self) {
+        let mut settling = self.settling.subscribe();
+        loop {
+            let settled = {
+                let live = self.lock();
+                // A claim takes the queued frame and counts its answer under
+                // this lock, so the two reads see one ledger.
+                settling.borrow_and_update().is_empty() && !live.reservations.has_queued()
+            };
+            if settled {
+                return;
+            }
+            // The sender lives in `self`, so the wait cannot fail. A
+            // settlement or the reader's claim of the queued frame changes
+            // the count.
+            let _ = settling.changed().await;
         }
-        Ok(Some(asked))
     }
 
     /// Ends the session's queries: an unwritten query is skipped, and an
@@ -303,423 +585,13 @@ impl ResponsePrecheck for QueriesPrecheck {
     }
 }
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod model;
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::zakura::{
-        discovery::protocol::{
-            DiscoveryServiceSummary, ServiceSummaryEnvelope, Services, ZakuraServiceId,
-        },
-        framed_channel,
-        regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-        CloseCause,
-    };
+mod tests;
 
-    const PEERS: u16 = MSG_DISCOVERY_PEERS as u16;
-
-    fn get_peers(limit: u16) -> GetPeers {
-        GetPeers {
-            limit,
-            wanted_services: Vec::new(),
-            exclude_node_ids: Vec::new(),
-        }
-    }
-
-    /// The payload length of a `Peers` with `records` maximal records.
-    fn peers_len(records: u16) -> usize {
-        usize::try_from(peers_cap(records).bytes).expect("a small cap fits usize")
-    }
-
-    struct Session {
-        queries: Queries,
-        /// The peer's end of the stream that carries this node's queries.
-        written: FramedRecv,
-        connection: CancellationToken,
-        close_cause: CloseCause,
-        cancel: CancellationToken,
-    }
-
-    /// One session's queries, answered on `recv`.
-    fn session_with(pool: ReservationPool, recv: &FramedRecv) -> Session {
-        let (send, written) = framed_channel(4);
-        let connection = CancellationToken::new();
-        let close_cause = CloseCause::new();
-        let cancel = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), close_cause.clone());
-        Session {
-            queries: Queries::new(pool, fence, recv, send, cancel.clone()),
-            written,
-            connection,
-            close_cause,
-            cancel,
-        }
-    }
-
-    /// One session's queries on an in-process channel, which has no
-    /// transport reader.
-    fn session(pool: &ReservationPool) -> Session {
-        let (_send, recv) = framed_channel(1);
-        session_with(pool.clone(), &recv)
-    }
-
-    /// A query is sent only once its previous answer arrives, and each
-    /// answer claims its reservation exactly once.
-    #[tokio::test]
-    async fn one_get_peers_is_live_and_its_answer_claims_it_once() {
-        let Session {
-            queries,
-            mut written,
-            ..
-        } = session(&reservation_pool());
-
-        assert!(matches!(
-            queries.claim(PEERS, 2),
-            Err(ClaimRefused::Unsolicited { .. })
-        ));
-        queries
-            .send_get_peers(get_peers(3))
-            .await
-            .expect("the first query is sent");
-        assert!(matches!(
-            queries.send_get_peers(get_peers(3)).await,
-            Err(QueryUnsent::NotDue)
-        ));
-        written.recv().await.expect("the query was queued");
-
-        assert_eq!(
-            queries.claim(PEERS, peers_len(3)),
-            Ok(Some(Asked::Peers { limit: 3 }))
-        );
-        assert!(matches!(
-            queries.claim(PEERS, 2),
-            Err(ClaimRefused::Unsolicited { .. })
-        ));
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("an answered query frees its kind");
-        written.recv().await.expect("the query was queued");
-        assert!(matches!(
-            queries.claim(PEERS, peers_len(1) + 1),
-            Err(ClaimRefused::OverBytes { .. })
-        ));
-        assert_eq!(queries.claim(GET_PEERS.message_type, 2), Ok(None));
-    }
-
-    fn get_services(wanted_services: Vec<ZakuraServiceId>) -> GetServices {
-        GetServices { wanted_services }
-    }
-
-    /// The payload length of a `Services` with the most summaries that a
-    /// `GetServices` wanting `wanted_len` services allows.
-    fn services_len(wanted_len: usize) -> usize {
-        usize::try_from(services_cap(wanted_len).bytes).expect("a small cap fits usize")
-    }
-
-    const SERVICES: u16 = MSG_DISCOVERY_SERVICES as u16;
-
-    /// A `GetServices` reservation is independent of the `GetPeers` one. Its
-    /// answer claims it once, returns the query, and stays within
-    /// `42 + min(n, 8) × 294` bytes.
-    #[tokio::test]
-    async fn get_services_is_reserved_beside_get_peers_and_claimed_once() {
-        let Session {
-            queries,
-            mut written,
-            ..
-        } = session(&reservation_pool());
-        let wanted = get_services(vec![ZakuraServiceId::discovery()]);
-
-        assert!(matches!(
-            queries.claim(SERVICES, services_len(0)),
-            Err(ClaimRefused::Unsolicited { .. })
-        ));
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("GetPeers is sent");
-        queries
-            .send_get_services(wanted.clone())
-            .await
-            .expect("GetServices is sent beside GetPeers");
-        assert!(matches!(
-            queries.send_get_services(get_services(Vec::new())).await,
-            Err(QueryUnsent::NotDue)
-        ));
-        written.recv().await.expect("GetPeers was queued");
-        written.recv().await.expect("GetServices was queued");
-
-        assert_eq!(
-            queries.claim(SERVICES, services_len(1)),
-            Ok(Some(Asked::Services(wanted.clone())))
-        );
-        assert!(matches!(
-            queries.claim(SERVICES, services_len(1)),
-            Err(ClaimRefused::Unsolicited { .. })
-        ));
-        assert_eq!(
-            queries.claim(PEERS, peers_len(1)),
-            Ok(Some(Asked::Peers { limit: 1 }))
-        );
-
-        // One wanted service allows one summary, below the row's largest
-        // answer.
-        queries
-            .send_get_services(wanted)
-            .await
-            .expect("an answered query frees its kind");
-        written.recv().await.expect("GetServices was queued");
-        assert!(matches!(
-            queries.claim(SERVICES, services_len(1) + 1),
-            Err(ClaimRefused::OverBytes { .. })
-        ));
-
-        // An empty wanted list reserves the largest answer.
-        queries
-            .send_get_services(get_services(Vec::new()))
-            .await
-            .expect("an answered query frees its kind");
-        written.recv().await.expect("GetServices was queued");
-        assert_eq!(
-            queries.claim(SERVICES, services_len(0)),
-            Ok(Some(Asked::Services(get_services(Vec::new()))))
-        );
-    }
-
-    /// A wanted list bounds the answer's summaries, and an empty list allows
-    /// any service.
-    #[test]
-    fn a_services_answer_holds_only_wanted_summaries() -> Result<(), crate::BoxError> {
-        let summary = ServiceSummaryEnvelope::discovery(&DiscoveryServiceSummary {
-            peer_exchange_slots_free: 1,
-            max_records_per_response: 32,
-            expected_disconnect_after_exchange: false,
-        })?;
-        let services = |summaries| {
-            DiscoveryMessage::Services(Services {
-                node_id: zakura_quic::NodeSecretKey::from_bytes(&[1; 32]).public(),
-                expires_at_unix_secs: u64::MAX,
-                summaries,
-            })
-        };
-        let asked = |wanted| Asked::Services(get_services(wanted));
-
-        let discovery = vec![ZakuraServiceId::discovery()];
-        let header_sync = vec![ZakuraServiceId::header_sync()];
-        assert_eq!(
-            asked(Vec::new()).check(&services(vec![summary.clone()])),
-            Ok(())
-        );
-        assert_eq!(
-            asked(discovery).check(&services(vec![summary.clone()])),
-            Ok(())
-        );
-        assert!(asked(header_sync.clone())
-            .check(&services(vec![summary]))
-            .is_err());
-        assert_eq!(asked(header_sync).check(&services(Vec::new())), Ok(()));
-        Ok(())
-    }
-
-    /// The transport reader queues a `Services` only while a `GetServices`
-    /// is owed, and refuses one above its reservation. A live `GetPeers`
-    /// lends it no credit.
-    #[tokio::test]
-    async fn the_transport_reader_queues_only_owed_services() {
-        let slot = PrecheckSlot::default();
-        let (_send, recv) = framed_channel(1);
-        let recv = recv.with_precheck(slot.clone());
-        let Session {
-            queries,
-            mut written,
-            ..
-        } = session_with(reservation_pool(), &recv);
-        let precheck = slot.get().expect("the queries attach their precheck");
-
-        assert_eq!(
-            precheck.check(SERVICES, services_len(0)),
-            Err(FrameRejection::Unsolicited)
-        );
-        queries
-            .send_get_peers(get_peers(32))
-            .await
-            .expect("GetPeers is sent");
-        queries
-            .send_get_services(get_services(Vec::new()))
-            .await
-            .expect("the query is sent");
-        written.recv().await.expect("GetPeers was queued");
-        written.recv().await.expect("the query was queued");
-        assert!(matches!(
-            precheck.check(SERVICES, services_len(0) + 1),
-            Err(FrameRejection::AboveReservation { .. })
-        ));
-        precheck
-            .check(SERVICES, services_len(0))
-            .expect("the owed answer queues");
-        assert!(matches!(
-            precheck.check(SERVICES, services_len(0)),
-            Err(FrameRejection::AboveOwed { .. })
-        ));
-    }
-
-    /// The transport reader queues at most the one `Peers` this node is owed,
-    /// even while a `GetServices` is owed too. Its claim releases the queued
-    /// answer.
-    #[tokio::test]
-    async fn the_transport_reader_queues_at_most_the_owed_peers() {
-        let slot = PrecheckSlot::default();
-        let (_send, recv) = framed_channel(1);
-        let recv = recv.with_precheck(slot.clone());
-        let Session {
-            queries,
-            mut written,
-            ..
-        } = session_with(reservation_pool(), &recv);
-        let precheck = slot.get().expect("the queries attach their precheck");
-
-        assert_eq!(
-            precheck.check(PEERS, peers_len(1)),
-            Err(FrameRejection::Unsolicited)
-        );
-        queries
-            .send_get_services(get_services(Vec::new()))
-            .await
-            .expect("GetServices is sent");
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("the query is sent");
-        written.recv().await.expect("GetServices was queued");
-        written.recv().await.expect("the query was queued");
-
-        precheck
-            .check(PEERS, peers_len(1))
-            .expect("the owed answer queues");
-        assert!(matches!(
-            precheck.check(PEERS, peers_len(1)),
-            Err(FrameRejection::AboveOwed { .. })
-        ));
-        assert_eq!(
-            queries.claim(PEERS, peers_len(1)),
-            Ok(Some(Asked::Peers { limit: 1 }))
-        );
-        assert_eq!(
-            precheck.check(PEERS, peers_len(1)),
-            Err(FrameRejection::Unsolicited)
-        );
-
-        // The claim released the queued answer, so the next answer queues.
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("an answered query frees its kind");
-        written.recv().await.expect("the query was queued");
-        precheck
-            .check(PEERS, peers_len(1))
-            .expect("the next owed answer queues");
-    }
-
-    /// A query that is never written gives its reservation and pool entry
-    /// back, so the next exchange can send one.
-    #[tokio::test]
-    async fn an_unwritten_query_gives_its_reservation_back() {
-        let pool = reservation_pool();
-
-        let Session {
-            queries, cancel, ..
-        } = session(&pool);
-        cancel.cancel();
-        assert!(matches!(
-            queries.send_get_peers(get_peers(1)).await,
-            Err(QueryUnsent::Closed)
-        ));
-        assert_eq!(pool.held(), 0);
-        assert!(queries.lock().asked.is_empty());
-
-        let Session {
-            queries, written, ..
-        } = session(&pool);
-        drop(written);
-        assert!(matches!(
-            queries.send_get_peers(get_peers(1)).await,
-            Err(QueryUnsent::Closed)
-        ));
-        assert_eq!(pool.held(), 0);
-        assert!(queries.lock().asked.is_empty());
-    }
-
-    /// A full node-wide pool defers the query to the next exchange.
-    #[tokio::test]
-    async fn a_full_pool_defers_the_query() {
-        let pool = ReservationPool::new(1).expect("one entry is a valid pool");
-        let _held = pool.try_entry().expect("the pool has one entry");
-        let Session { queries, .. } = session(&pool);
-        assert!(matches!(
-            queries.send_get_peers(get_peers(1)).await,
-            Err(QueryUnsent::NotDue)
-        ));
-    }
-
-    /// Retiring the queries closes the connection only when a written query
-    /// is unanswered, and returns every reservation to the pool.
-    #[tokio::test]
-    async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
-        let pool = reservation_pool();
-
-        // Queued but never written: the transport skips it.
-        let Session {
-            queries,
-            mut written,
-            connection,
-            ..
-        } = session(&pool);
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("the query is queued");
-        queries.retire();
-        assert!(!connection.is_cancelled());
-        assert!(
-            written.try_recv().is_err(),
-            "a fenced query is never written"
-        );
-        assert_eq!(pool.held(), 0);
-
-        // Written and answered.
-        let Session {
-            queries,
-            mut written,
-            connection,
-            ..
-        } = session(&pool);
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("the query is queued");
-        written.recv().await.expect("the query is written");
-        queries
-            .claim(PEERS, 2)
-            .expect("the answer claims the query");
-        queries.retire();
-        assert!(!connection.is_cancelled());
-
-        // Written and unanswered.
-        let Session {
-            queries,
-            mut written,
-            connection,
-            close_cause,
-            ..
-        } = session(&pool);
-        queries
-            .send_get_peers(get_peers(1))
-            .await
-            .expect("the query is queued");
-        written.recv().await.expect("the query is written");
-        queries.retire();
-        assert!(connection.is_cancelled());
-        assert_eq!(close_cause.get_or("none"), UNFINISHED_EXCHANGE);
-        assert_eq!(pool.held(), 0, "retiring returns every reservation");
-    }
-}
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use model::{
+    replay_discovery_query_bytes, replay_discovery_settlement_bytes, DiscoveryQueryReplaySummary,
+    DiscoverySettlementReplaySummary,
+};

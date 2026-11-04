@@ -19,7 +19,7 @@ use zcash_tachyon::{
     entropy::ActionEntropy,
     keys::private,
     note::{CommitmentTrapdoor, Note},
-    nullifier, value, PointerStamp, ProofStamp, Tachygram, TachygramSetPoly, TachyonBundle,
+    nullifier, value, AggregateId, ProofStamp, Tachygram, TachygramSetPoly, TachyonBundle,
 };
 
 use crate::{
@@ -64,7 +64,7 @@ fn v7_transaction(
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: None,
-        tachyon_shielded_data: tachyon_bundle.map(Into::into),
+        tachyon_shielded_data: tachyon_bundle.map(|bundle| Box::new(bundle.into())),
     }
 }
 
@@ -78,31 +78,28 @@ fn mock_proof_stamp() -> ProofStamp {
     });
     let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
     ProofStamp {
+        fee: value::Positive::ZERO,
         coverage: [0u8; 32],
         tachygram_set: tachygram_set.commit(),
         tachygrams: tachygrams.into_iter().collect(),
         anchor: zcash_tachyon::Anchor::read(&[0u8; 64][..]).expect("zero anchor reads"),
-        proof: Box::new(ragu::Proof::trivial()),
+        proof: Box::new(ragu::Proof::bootstrap()),
     }
 }
 
-/// Computes the covered-actions digest used by a proof stamp.
-fn action_descriptor_digest(actions: &[zcash_tachyon::Action]) -> [u8; 32] {
-    let mut descriptors: Vec<[u8; 64]> = actions.iter().map(|action| action.descriptor()).collect();
-    descriptors.sort_unstable();
-
-    let mut state = blake2b_simd::Params::new()
-        .hash_length(32)
-        .personal(b"Tachyon-Actions")
-        .to_state();
-    for descriptor in descriptors {
-        state.update(&descriptor);
-    }
-    state
-        .finalize()
-        .as_bytes()
-        .try_into()
-        .expect("hash length is 32")
+/// Commits to both the action and fee descriptors covered by this stamp.
+fn coverage_digest(bundle: &zcash_tachyon::Bundle<zcash_tachyon::Unproven>) -> [u8; 32] {
+    use zcash_tachyon::digest::blake2b;
+    let mut actions: Vec<[u8; 64]> = bundle.descriptors().collect();
+    actions.sort_unstable();
+    let fee = zcash_tachyon::fee::Descriptor {
+        max_commitment: bundle.fee_max_commitment,
+        value: value::Positive::ZERO,
+    };
+    blake2b::stamp_coverage_digest(
+        &blake2b::action_descriptor_digest(&actions),
+        &blake2b::stamp_fees_digest(&[fee.into()]),
+    )
 }
 
 /// A random note worth `value` zatoshis, with its spending key.
@@ -133,7 +130,10 @@ fn spend_bundle_plan(value: u64) -> (bundle::Plan, private::SpendAuthorizingKey)
         ask.derive_action_private(&alpha).derive_action_public()
     });
 
-    (bundle::Plan::new(vec![spend_plan], vec![]), ask)
+    (
+        bundle::Plan::new(vec![spend_plan], vec![], random_note(&mut rng, 0).1),
+        ask,
+    )
 }
 
 /// A properly-signed spend-only bundle over its own transaction's sighash, in the unproven state.
@@ -190,8 +190,9 @@ async fn verify_block_transaction(
     verifier
         .oneshot(Request::Block {
             transaction_hash: tx.hash(),
-            transaction: Arc::new(tx),
+            transaction: Arc::new(tx).into(),
             known_utxos: Arc::new(HashMap::new()),
+            parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
             height,
             time: Utc::now(),
@@ -204,7 +205,7 @@ async fn verify_block_transaction(
 fn mempool_accepts_only_autonome_tachyon_transactions() {
     let bundle = signed_spend_bundle(100);
     let mut stamp = mock_proof_stamp();
-    stamp.coverage = action_descriptor_digest(&bundle.actions);
+    stamp.coverage = coverage_digest(&bundle);
     let autonome = bundle.stamp(stamp);
 
     let autonome_tx = v7_transaction(
@@ -227,7 +228,7 @@ fn mempool_accepts_only_autonome_tachyon_transactions() {
     let adjunct_tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Adjunct(autonome.strip(
-            PointerStamp::try_from([0xEE; 64]).expect("nonzero wtxid"),
+            AggregateId::try_from([0xEE; 64]).expect("nonzero wtxid"),
         ))),
     );
     assert_eq!(
@@ -259,7 +260,7 @@ async fn v7_sighash_commits_to_tachyon_bundle() {
         Some(TachyonBundle::Adjunct(
             bundle
                 .stamp(mock_proof_stamp())
-                .strip(PointerStamp::try_from([0xEEu8; 64]).expect("nonzero wtxid")),
+                .strip(AggregateId::try_from([0xEEu8; 64]).expect("nonzero wtxid")),
         )),
     ));
     let other_bundle_sighash = v7_sighash(&v7_transaction(
@@ -298,7 +299,7 @@ async fn v7_with_signed_tachyon_bundle_is_accepted() {
     // The sighash excludes the stamp, so stripping a signed bundle keeps its signatures valid.
     let adjunct = signed_spend_bundle(100)
         .stamp(mock_proof_stamp())
-        .strip(PointerStamp::try_from([0xEEu8; 64]).expect("nonzero wtxid"));
+        .strip(AggregateId::try_from([0xEEu8; 64]).expect("nonzero wtxid"));
     let tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Adjunct(adjunct)),
@@ -355,6 +356,8 @@ async fn v7_with_identity_cv_is_rejected() {
     };
 
     let bundle = zcash_tachyon::Bundle {
+        fee_max_commitment: value::Trapdoor::random(&mut rand_10::rng())
+            .commit(value::Positive::ZERO),
         actions: vec![action],
         value_balance: value::Balance::ZERO,
         binding_sig: bundle::Signature::read(&[0x02u8; 64][..]).expect("64 bytes"),
@@ -408,4 +411,18 @@ async fn v7_is_rejected_before_nu_tachyon() {
         matches!(result, Err(TransactionError::WrongConsensusBranchId)),
         "expected WrongConsensusBranchId, got: {result:?}",
     );
+}
+
+#[test]
+fn tachyon_identity_fee_commitment_is_rejected() {
+    let mut bundle = signed_spend_bundle(100).stamp(mock_proof_stamp());
+    bundle.fee_max_commitment = value::Commitment::default();
+    let tx = v7_transaction(
+        NetworkUpgrade::NuTachyon,
+        Some(TachyonBundle::Proven(bundle)),
+    );
+    assert!(matches!(
+        check::tachyon_actions_have_valid_digests(&tx),
+        Err(TransactionError::TachyonIdentityAction(_))
+    ));
 }

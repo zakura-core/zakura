@@ -32,7 +32,7 @@ use zakura_chain::{
 };
 
 use zakura_node_services::mempool;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_state as zs;
 
 use crate::{
@@ -94,15 +94,32 @@ where
 }
 
 /// Routes transaction-verifier reads around the serialized read-write state buffer.
-#[derive(Clone, Debug)]
+///
+/// The transaction verifier clones this router for every transaction, and most block
+/// transactions never read state through it. The read service is shared, so that clone stays
+/// cheap, and copied only for a read request. The mutex makes the shared service `Sync`
+/// without requiring it of the service itself; it is held only to copy the service.
+#[derive(Debug)]
 struct TransactionStateRouter<S, R> {
     state: S,
-    read_state: R,
+    read_state: Arc<std::sync::Mutex<R>>,
+}
+
+impl<S: Clone, R> Clone for TransactionStateRouter<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            read_state: Arc::clone(&self.read_state),
+        }
+    }
 }
 
 impl<S, R> TransactionStateRouter<S, R> {
     fn new(state: S, read_state: R) -> Self {
-        Self { state, read_state }
+        Self {
+            state,
+            read_state: Arc::new(std::sync::Mutex::new(read_state)),
+        }
     }
 }
 
@@ -141,7 +158,11 @@ where
             request => return self.state.clone().oneshot(request).boxed(),
         };
 
-        let read_state = self.read_state.clone();
+        let read_state = self
+            .read_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         async move {
             let response = read_state.oneshot(read_request).await?;
             response.try_into().map_err(BoxError::from)
@@ -362,7 +383,11 @@ where
         // V5+ transaction IDs authenticate the expiry height, but not the coinbase input height.
         // Check their agreement before a peer-controlled height selects the checkpoint verifier.
         if let Some(height) = block.coinbase_height() {
-            let coinbase = &block.transactions[0];
+            let coinbase = block
+                .view()
+                .transactions()
+                .next()
+                .expect("coinbase height requires a transaction");
             if coinbase.version() >= 5 {
                 if let Err(error) =
                     transaction::check::coinbase_height_matches_expiry(&height, coinbase)
@@ -370,13 +395,13 @@ where
                     // A rewritten expiry changes the coinbase transaction ID. That body fails
                     // its header commitment, so only the supplier is at fault.
                     let merkle_root: block::merkle::Root =
-                        block.transactions.iter().map(|tx| tx.hash()).collect();
-                    let error = if merkle_root == block.header.merkle_root {
+                        block.view().transactions().map(|tx| tx.hash()).collect();
+                    let error = if merkle_root == block.header().merkle_root {
                         VerifyBlockError::Transaction(error)
                     } else {
                         BlockError::BadMerkleRoot {
                             actual: merkle_root,
-                            expected: block.header.merkle_root,
+                            expected: block.header().merkle_root,
                         }
                         .into()
                     };
@@ -461,6 +486,9 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    // Keys are built off the async workers; nothing waits for them, so startup is not delayed.
+    let _key_preload = crate::primitives::halo2::spawn_key_preload();
+
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
 
@@ -547,7 +575,7 @@ where
     // transaction verification
 
     let transaction = transaction::Verifier::new(network, transaction_state, mempool);
-    let transaction = Buffer::new(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
+    let transaction = spawn_buffer(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
 
     // block verification
     let (list, max_checkpoint_height) = init_checkpoint_list(config, network);
@@ -583,7 +611,7 @@ where
         block,
     };
 
-    let router = Buffer::new(BoxService::new(router), VERIFIER_BUFFER_BOUND);
+    let router = spawn_buffer(BoxService::new(router), VERIFIER_BUFFER_BOUND);
 
     let task_handles = BackgroundTaskHandles {
         state_checkpoint_verify_handle,

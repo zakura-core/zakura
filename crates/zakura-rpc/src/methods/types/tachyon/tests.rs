@@ -33,18 +33,21 @@ fn transaction(bundle: TachyonBundle) -> Arc<Transaction> {
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: None,
-        tachyon_shielded_data: Some(TachyonShieldedData(bundle)),
+        tachyon_shielded_data: Some(Box::new(TachyonShieldedData(bundle))),
     })
 }
 
 fn proven(members: &[Tachygram]) -> TachyonBundle {
     // Signatures and actions are irrelevant to this already-validated state projection.
     TachyonBundle::Proven(Bundle {
+        fee_max_commitment: zcash_tachyon::value::Trapdoor::random(&mut rand_10::rng())
+            .commit(zcash_tachyon::value::Positive::ZERO),
         value_balance: 0i64.try_into().unwrap(),
         actions: vec![],
         binding_sig: Signature::read(&[0; 64][..]).unwrap(),
         memo: vec![],
         stamp: ProofStamp {
+            fee: zcash_tachyon::value::Positive::ZERO,
             coverage: [0; 32],
             anchor: Anchor::default(),
             tachygram_set: members
@@ -53,7 +56,7 @@ fn proven(members: &[Tachygram]) -> TachyonBundle {
                 .collect::<TachygramSetPoly>()
                 .commit(),
             tachygrams: members.iter().copied().collect(),
-            proof: Box::new(ragu::Proof::trivial()),
+            proof: Box::new(ragu::Proof::bootstrap()),
         },
     })
 }
@@ -73,7 +76,7 @@ fn data(
         .advance_with_block(pool_height, &block)
         .unwrap();
     zakura_state::TachyonBlock {
-        block: Arc::new(block),
+        block: Arc::new(block).into(),
         height: Height(10 + pool_height),
         activation_height: Height(10),
         finalized: true,
@@ -91,11 +94,16 @@ fn wire(data: zakura_state::TachyonBlock) -> GetTachyonBlockResponse {
 fn tachyon_sync_feed_preserves_stamp_order_and_empty_epoch_crossings() {
     let before = Anchor::default();
     let pointer = TachyonBundle::Adjunct(Bundle {
+        fee_max_commitment: zcash_tachyon::value::Trapdoor::random(&mut rand_10::rng())
+            .commit(zcash_tachyon::value::Positive::ZERO),
         value_balance: 0i64.try_into().unwrap(),
         actions: vec![],
         binding_sig: Signature::read(&[0; 64][..]).unwrap(),
         memo: vec![],
-        stamp: zcash_tachyon::PointerStamp::try_from([1; 64]).unwrap(),
+        stamp: zcash_tachyon::PointerStamp {
+            wtxid: zcash_tachyon::AggregateId::try_from([1; 64]).unwrap(),
+            fee: zcash_tachyon::value::Positive::ZERO,
+        },
     });
     let reply = wire(data(
         0,
@@ -199,7 +207,7 @@ fn tachyon_sync_feed_builds_and_composes_unspent_proofs() {
                 qr::QrBucketSeal,
                 witness::qr_bucket_seal((*intake.data(), ()), final_prev),
                 intake,
-                ragu::Proof::trivial().carry::<()>(()),
+                ragu::Proof::bootstrap().carry::<()>(()),
             )
             .unwrap();
         let (unspent, ()) = PROOF_SYSTEM
@@ -208,7 +216,7 @@ fn tachyon_sync_feed_builds_and_composes_unspent_proofs() {
                 qr::QrUnspentInit,
                 witness::qr_unspent_init((*bucket.data(), ()), nullifier, &members),
                 bucket,
-                ragu::Proof::trivial().carry::<()>(()),
+                ragu::Proof::bootstrap().carry::<()>(()),
             )
             .unwrap();
         proofs.push(unspent);

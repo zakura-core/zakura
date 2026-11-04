@@ -34,8 +34,8 @@ fn spent_utxos(
 
     block
         .block
-        .transactions
-        .iter()
+        .view()
+        .transactions()
         .flat_map(|transaction| transaction.inputs())
         .filter_map(transparent::Input::outpoint)
         .map(|outpoint| {
@@ -214,8 +214,8 @@ fn forked_equals_pushed_genesis() -> Result<()> {
                 prop_assert_eq!(
                     block
                         .block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .flat_map(|t| t.inputs())
                         .filter_map(|i| i.outpoint())
                         .count(),
@@ -740,6 +740,96 @@ fn different_blocks_different_chains() -> Result<()> {
                 );
             }
         }
+    });
+
+    Ok(())
+}
+
+/// Finishing a prepared chain with a solved block must produce exactly the chain that pushing
+/// the solved block onto the same parent produces.
+///
+/// A proposal and the block mined from it differ only in the header fields a solution sets, so
+/// [`Chain::finish_prepared_tip`] rebuilds the records that read the header and keeps everything
+/// the proposal derived from the parent and the transactions. This checks that choice against the
+/// only authority there is: an ordinary push of the same solved block. `eq_internal_state`
+/// compares every field of the chain, so a record left describing the proposal fails here.
+///
+/// These are Heartwood-onward chains, so each block also has a real history tree entry, which is
+/// the record that reads the most header data.
+#[test]
+fn finished_prepared_chain_equals_pushed_solved_block() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    proptest!(
+    ProptestConfig::with_cases(env::var("PROPTEST_CASES")
+                               .ok()
+                               .and_then(|v| v.parse().ok())
+                               .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
+    |((chain, count, network, finalized_tree) in PreparedChain::new_heartwood())| {
+        prop_assert!(finalized_tree.is_some());
+
+        // Skip the first block, which was used for the history tree. That skips transactions
+        // the value balances need, so this test zeroes every transparent input.
+        let chain = &chain[1..];
+        // Leave one block to propose and solve.
+        let count = std::cmp::min(count, chain.len() - 1);
+
+        let mut parent_chain = Chain::new(
+            &network,
+            Height(0),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
+            finalized_tree,
+            ValueBalance::zero(),
+        );
+        for block in chain
+            .iter()
+            .take(count)
+            .map(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change) {
+                parent_chain = parent_chain.push(block)?;
+            }
+        let parent_chain = Arc::new(parent_chain);
+        let parent_history_tree = parent_chain.history_block_commitment_tree();
+
+        // Validate the next block as a proposal, which keeps the chain its update produced.
+        let proposal = &chain[count];
+        let prepared_chain = Arc::unwrap_or_clone(parent_chain.clone())
+            .push(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change(proposal))?;
+        let proposal_history_root = prepared_chain.history_block_commitment_tree().hash();
+
+        // Solve it: mining sets the nonce and the solution, and may move the time on.
+        let mut solved = Block::clone(&crate::tests::copy_block_fixture(&proposal.block));
+        let header = Arc::make_mut(&mut solved.header);
+        header.nonce = [0x5a; 32].into();
+        header.time += chrono::Duration::seconds(1);
+        let solved: SemanticallyVerifiedBlock = Arc::new(solved).prepare();
+        prop_assert_ne!(solved.hash, proposal.hash);
+
+        let solved_contextual = ContextuallyVerifiedBlock::from_solved_proposal(
+            solved.clone(),
+            prepared_chain
+                .tip_block()
+                .expect("the proposal was pushed onto the chain"),
+        );
+        let finished = prepared_chain.finish_prepared_tip(solved_contextual, &parent_history_tree)?;
+
+        let pushed = Arc::unwrap_or_clone(parent_chain)
+            .push(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change(&solved))?;
+
+        prop_assert!(
+            finished.eq_internal_state(&pushed),
+            "finishing a prepared chain must build the same state as pushing the solved block",
+        );
+        prop_assert_eq!(finished.non_finalized_tip_hash(), solved.hash);
+        prop_assert_ne!(
+            finished.history_block_commitment_tree().hash(),
+            proposal_history_root,
+            "the solved header must change the chain history root, or this test proves nothing",
+        );
     });
 
     Ok(())

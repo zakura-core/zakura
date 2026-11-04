@@ -1,11 +1,9 @@
 //! Generation- and branch-owned auxiliary VCT repair work.
 
-use std::collections::HashSet;
-
 use thiserror::Error;
-use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
+use zakura_rt::{collections::HashSet, time::Instant};
 
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,6 +318,14 @@ impl RepairRequirement {
                 };
             }
             _ => {}
+        }
+    }
+
+    /// The selected request context, while a shared active target owns this repair.
+    pub fn assigned_context(&self) -> Option<&VctRepairContext> {
+        match &self.state {
+            RepairPolicyState::Assigned { context } => Some(context),
+            _ => None,
         }
     }
 

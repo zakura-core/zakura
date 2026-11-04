@@ -1,6 +1,7 @@
 //! Fixed test vectors for RPC methods.
 
 use std::{str::FromStr, sync::Arc};
+use zakura_node_services::block_memory::HeaderHandle;
 
 use futures::FutureExt;
 use tower::buffer::Buffer;
@@ -1083,6 +1084,49 @@ async fn rpc_getblock() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// A header read refused for lack of capacity reports a retryable error, not a missing
+/// block. Other state errors keep the `zcashd` missing-block error.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblockheader_reports_read_capacity_refusal_as_retryable() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 8),
+        NoChainTip,
+        rx,
+    );
+
+    for (state_error, code) in [
+        (
+            BoxError::from(zakura_node_services::block_memory::ReadMemoryExhausted),
+            crate::server::error::LegacyCode::OutOfMemory,
+        ),
+        (
+            BoxError::from("block is missing"),
+            crate::server::error::LegacyCode::InvalidParameter,
+        ),
+    ] {
+        let rpc = rpc.clone();
+        let header = tokio::spawn(async move { rpc.get_block_header("1".to_string(), None).await });
+        read_state
+            .expect_request(ReadRequest::BlockHeader(Height(1).into()))
+            .await
+            .respond(Err::<ReadResponse, _>(state_error));
+        let error = header
+            .await
+            .expect("the RPC task does not panic")
+            .expect_err("a failed header read fails the RPC");
+        assert_eq!(error.code(), ErrorCode::from(code).code());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
     let _init_guard = zakura_test::init();
@@ -1134,7 +1178,7 @@ async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
         .expect_request(ReadRequest::BlockHeader(hash_or_height))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1337,7 +1381,7 @@ async fn rpc_getblockheader_preserves_historical_tree_error() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1402,7 +1446,7 @@ async fn rpc_getblock_serves_pre_activation_empty_trees() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1506,7 +1550,7 @@ async fn rpc_getblock_preserves_historical_tree_error() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1596,9 +1640,14 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
         tokio::spawn(async move { rpc.z_get_treestate(height.0.to_string()).await });
 
     read_state
-        .expect_request(ReadRequest::Block(height.into()))
+        .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
-        .respond(ReadResponse::Block(Some(block)));
+        .respond(ReadResponse::BlockHeader {
+            header: HeaderHandle::Shared(block.header.clone()),
+            hash: block_hash,
+            height,
+            next_block_hash: None,
+        });
 
     read_state
         .expect_request(ReadRequest::SaplingTree(block_hash.into()))
@@ -1624,6 +1673,337 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
 
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
+}
+
+/// A pruned node must serve `z_gettreestate` below its prune height.
+///
+/// Pruning removes the block bodies. It keeps the headers, the hash index and the note
+/// commitment trees. Thus a pruned node must give the same treestate as an archive node. A
+/// wallet server asks for the treestate at the wallet birthday. This height is usually much
+/// lower than the prune height.
+///
+/// In this test, the checkpoint commits do not keep the bodies of the old blocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_serves_pruned_heights() {
+    let _init_guard = zakura_test::init();
+
+    // Sapling activates at height 2. Thus most test heights have a Sapling tree.
+    let network = Parameters::build()
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            sapling: Some(2),
+            nu5: Some(11),
+            ..Default::default()
+        })
+        .expect("failed to set activation heights")
+        .clear_funding_streams()
+        .with_network_name("pruned_treestate_testnet")
+        .expect("failed to set network name")
+        .to_network()
+        .expect("failed to build configured network");
+
+    let blocks: Vec<Arc<Block>> = network
+        .blockchain_iter()
+        .map(|(_, block_bytes)| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let tip_height = Height(u32::try_from(blocks.len() - 1).expect("test chain fits in a u32"));
+
+    // In pruned mode, a checkpoint commit does not keep the bodies of blocks below
+    // `max_checkpoint_height - tx_retention + 1`. This value puts that height at the test chain
+    // tip.
+    let max_checkpoint_height =
+        Height(zakura_state::PruningConfig::default().tx_retention + tip_height.0 - 1);
+    let (pruned_read_state, pruned_tip) =
+        pruned_state(&network, &blocks, max_checkpoint_height).await;
+
+    assert_pruned_node_serves_archive_treestates(&network, &blocks, pruned_read_state, pruned_tip)
+        .await;
+}
+
+/// A pruned node must serve the Orchard treestate below its prune height.
+///
+/// In this test, the node first keeps all the block bodies. Then the pruning batch deletes them.
+/// Online pruning and offline pruning write the same batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_serves_pruned_orchard_heights() {
+    let _init_guard = zakura_test::init();
+
+    // NU5 activates below the tip of this chain, and the blocks after NU5 have Orchard note
+    // commitments.
+    let chain = zakura_state::VctFastSyncedChain::generate();
+    let network = chain.network().clone();
+    let tip_height = chain.handoff_height();
+    let blocks: Vec<Arc<Block>> = (0..=tip_height.0)
+        .map(|height| chain.block(Height(height)))
+        .collect();
+
+    // The tip is below the retention window. Thus the commits keep all the block bodies.
+    let (pruned_read_state, pruned_tip) = pruned_state(&network, &blocks, tip_height).await;
+
+    // Delete the bodies from height 1 to the height below the tip.
+    let db = pruned_read_state.db();
+    let mut batch = zakura_state::DiskWriteBatch::new();
+    batch.prepare_prune_batch(db, Height(1), tip_height);
+    db.write_batch(batch).expect("the pruning batch writes");
+
+    let treestates = assert_pruned_node_serves_archive_treestates(
+        &network,
+        &blocks,
+        pruned_read_state,
+        pruned_tip,
+    )
+    .await;
+
+    assert!(
+        treestates.iter().any(|treestate| treestate
+            .orchard()
+            .commitments()
+            .final_state()
+            .is_some()),
+        "the test chain must have Orchard trees below the prune height"
+    );
+}
+
+/// Commits `blocks` to a new state service in pruned storage mode.
+///
+/// Returns the read service and the chain tip of the new state.
+async fn pruned_state(
+    network: &Network,
+    blocks: &[Arc<Block>],
+    max_checkpoint_height: Height,
+) -> (ReadStateService, zakura_state::LatestChainTip) {
+    let config = zakura_state::Config {
+        storage_mode: zakura_state::StorageMode::Pruned(zakura_state::PruningConfig::default()),
+        ..zakura_state::Config::ephemeral()
+    };
+    let (state, read_state, latest_chain_tip, _) =
+        zakura_state::init(config, network, max_checkpoint_height, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+    let state = Buffer::new(state, 1);
+
+    for block in blocks {
+        state
+            .clone()
+            .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                block.clone().into(),
+            ))
+            .await
+            .expect("test chain blocks are valid");
+    }
+
+    (read_state, latest_chain_tip)
+}
+
+/// Makes sure that a pruned node gives the same treestates as an archive node with `blocks`.
+///
+/// The pruned node must not have the bodies from height 1 to the height below the tip. The
+/// function examines these heights by height and by hash, and returns the archive treestates.
+async fn assert_pruned_node_serves_archive_treestates(
+    network: &Network,
+    blocks: &[Arc<Block>],
+    pruned_read_state: ReadStateService,
+    pruned_tip: zakura_state::LatestChainTip,
+) -> Vec<GetTreestateResponse> {
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    // Create an archive state service.
+    let (_, archive_read_state, archive_tip, _) =
+        zakura_state::populated_state(blocks.to_vec(), network).await;
+
+    // Make one RPC handler for each state service.
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (archive_rpc, archive_rpc_tx_queue) = mock_rpc(
+        network.clone(),
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(archive_read_state, 1),
+        archive_tip,
+        rx.clone(),
+    );
+    let (pruned_rpc, pruned_rpc_tx_queue) = mock_rpc(
+        network.clone(),
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(pruned_read_state.clone(), 1),
+        pruned_tip,
+        rx,
+    );
+
+    let mut treestates = Vec::new();
+
+    // Genesis and the tip keep their bodies. Thus examine only the heights between them.
+    for (i, block) in blocks.iter().enumerate().take(blocks.len() - 1).skip(1) {
+        let hash = block.hash();
+        let height = Height(u32::try_from(i).expect("test chain fits in a u32"));
+
+        let zakura_state::ReadResponse::Block(pruned_block) = pruned_read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::Block(height.into()))
+            .await
+            .expect("block read succeeds")
+        else {
+            panic!("unexpected response to Block request")
+        };
+        assert!(
+            pruned_block.is_none(),
+            "the pruned node must not have the body at height {height:?}"
+        );
+
+        for hash_or_height in [HashOrHeight::from(height), hash.into()] {
+            let expected_result = archive_rpc
+                .z_get_treestate(hash_or_height.to_string())
+                .await
+                .expect("an archive node has the treestate");
+
+            let treestate = pruned_rpc
+                .z_get_treestate(hash_or_height.to_string())
+                .await
+                .expect("a pruned node keeps the treestate below the prune height");
+
+            assert_eq!(treestate, expected_result);
+            treestates.push(expected_result);
+        }
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+
+    // The queue tasks must continue to run without errors or panics.
+    assert!(archive_rpc_tx_queue.now_or_never().is_none());
+    assert!(pruned_rpc_tx_queue.now_or_never().is_none());
+
+    treestates
+}
+
+/// A `z_gettreestate` for a block that is not in the best chain must return `-8`.
+///
+/// The header read returns [`zakura_state::BlockHeaderNotFound`] for this block. The RPC maps
+/// only this error to `InvalidParameter`, as `zcashd` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_missing_block_is_invalid_parameter() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1_000_000);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    let treestate_future =
+        tokio::spawn(async move { rpc.z_get_treestate(height.0.to_string()).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond_error(Box::new(zakura_state::BlockHeaderNotFound {
+            hash_or_height: height.into(),
+        }));
+
+    let treestate_response = treestate_future
+        .await
+        .expect("treestate future should not panic")
+        .expect_err("a missing block must be an error");
+
+    assert_eq!(treestate_response.code(), ErrorCode::ServerError(-8).code());
+    assert_eq!(
+        treestate_response.message(),
+        "the requested block is not in the main chain"
+    );
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue task must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `z_gettreestate` must not report a failure of the state service as a missing block.
+///
+/// Only [`zakura_state::BlockHeaderNotFound`] tells that the block is missing. All other errors
+/// from the header read are failures of the state service. The RPC returns them as `-1` with
+/// the original message. Thus the client knows that it can try the request again.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_state_failure_is_misc_error() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1_000_000);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx.clone(),
+    );
+
+    // The state service returns an error that is not `BlockHeaderNotFound`.
+    let treestate_future =
+        tokio::spawn(async move { rpc.z_get_treestate(height.0.to_string()).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond_error(BoxError::from("state read failed"));
+
+    let treestate_response = treestate_future
+        .await
+        .expect("treestate future should not panic")
+        .expect_err("a failed state read must be an error");
+
+    assert_eq!(treestate_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(treestate_response.message(), "state read failed");
+
+    // The buffer worker of the state service is closed, thus the request does not get to the
+    // state service.
+    let closed_read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (closed_read_state, worker) = Buffer::pair(closed_read_state, 1);
+    drop(worker);
+
+    let (closed_rpc, closed_rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        closed_read_state,
+        NoChainTip,
+        rx,
+    );
+
+    let treestate_response = closed_rpc
+        .z_get_treestate(height.0.to_string())
+        .await
+        .expect_err("a closed state service must be an error");
+
+    assert_eq!(treestate_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(
+        treestate_response.message(),
+        "buffer's worker closed unexpectedly"
+    );
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue tasks must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+    assert!(closed_rpc_tx_queue.now_or_never().is_none());
 }
 
 /// A `z_getsubtreesbyindex` inside a fast-synced node's absent band must fail loudly.
@@ -1783,7 +2163,7 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
         .expect_request(ReadRequest::BlockHeader(block_hash.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block_header,
+            header: HeaderHandle::Shared(block_header),
             hash: block_hash,
             height: zakura_chain::block::Height(0),
             next_block_hash: None,
@@ -1801,7 +2181,7 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
     read_state
         .expect_request_that(|req| matches!(req, ReadRequest::BlockAndSize(_)))
         .await
-        .respond(ReadResponse::BlockAndSize(Some((block, block_size))));
+        .respond(ReadResponse::BlockAndSize(Some((block.into(), block_size))));
     read_state
         .expect_request_that(|req| matches!(req, ReadRequest::OrchardTree(_)))
         .await
@@ -2697,6 +3077,7 @@ async fn rpc_getpeerinfo() {
             addr: outbound_mock_peer_address.addr(),
             user_agent: Arc::from("/Zakura:1.0.3/"),
             version: Version(170_160),
+            start_height: Height(3_500_000),
             is_inbound: false,
             rtt: None,
             ping_sent_at: None,
@@ -2705,6 +3086,7 @@ async fn rpc_getpeerinfo() {
             addr: inbound_mock_peer_address.addr(),
             user_agent: Arc::from("/MagicBean:2.1.1/"),
             version: Version(170_120),
+            start_height: Height(3_499_990),
             is_inbound: true,
             rtt: None,
             ping_sent_at: None,
@@ -3280,6 +3662,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
@@ -3412,7 +3795,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     assert!(rpc.mining_template_rejected(&work_id));
     assert!(!rpc.mining_template_rejected("newer-work"));
     let fallback = verifier.expect_request_that(|request| {
-        matches!(request, zakura_consensus::Request::Prepare { block, .. } if block.transactions.len() == 1)
+        matches!(request, zakura_consensus::Request::Prepare { block, .. } if block.view().transactions().len() == 1)
     }).await;
     assert!(
         !long_poll.is_finished(),
@@ -3445,6 +3828,19 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         .unwrap()
         .is_err());
     queue.abort();
+}
+
+#[test]
+fn test_networks_ignore_tip_age() {
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(Height(1));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now() - chrono::Duration::days(30));
+
+    crate::methods::types::get_block_template::check_synced_to_tip(
+        &Network::new_default_testnet(),
+        tip,
+    )
+    .expect("test networks serve templates regardless of tip age");
 }
 
 async fn gbt_with(net: Network, addr: ZcashAddress) {
@@ -3482,6 +3878,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     mock_tip_sender.send_best_tip_height(fake_tip_height);
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -3618,35 +4015,56 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         Amount::<NonNegative>::zero()
     );
 
-    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(200));
-    let get_block_template_sync_error = rpc
-        .get_block_template(None)
-        .await
-        .expect_err("needs an error when estimated distance to network chain tip is far");
+    // The gate compares the tip's block time with the local clock. Each case stays at least a
+    // minute away from the boundary, so time passing during the test can't change the result.
+    let request_template = |tip_age: Option<chrono::Duration>| {
+        mock_tip_sender.send_best_tip_block_time(tip_age.map(|age| chrono::Utc::now() - age));
+        async {
+            tokio::join!(
+                rpc.get_block_template(None),
+                make_mock_mempool_request_handler(vec![], fake_tip_hash),
+                make_mock_read_state_request_handler(),
+            )
+            .0
+        }
+    };
 
-    assert_eq!(
-        get_block_template_sync_error.code(),
-        ErrorCode::ServerError(-10).code()
-    );
+    request_template(Some(
+        chrono::Duration::hours(6) - chrono::Duration::minutes(1),
+    ))
+    .await
+    .expect("a tip just inside the tip-age window is accepted");
+
+    request_template(Some(-chrono::Duration::hours(1)))
+        .await
+        .expect("a tip with a block time ahead of the local clock is accepted");
 
     mock_sync_status.set_is_close_to_tip(false);
+    request_template(Some(chrono::Duration::zero()))
+        .await
+        .expect("a fresh tip is accepted regardless of other node state");
+    mock_sync_status.set_is_close_to_tip(true);
 
-    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(None);
     let get_block_template_sync_error = rpc
         .get_block_template(None)
         .await
-        .expect_err("needs an error when syncer is not close to tip");
+        .expect_err("needs an error when the tip has no block time");
 
-    assert_eq!(
-        get_block_template_sync_error.code(),
-        ErrorCode::ServerError(-10).code()
+    assert!(
+        get_block_template_sync_error
+            .message()
+            .contains("no chain tip available yet"),
+        "unexpected error: {get_block_template_sync_error:?}"
     );
 
-    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(200));
+    mock_tip_sender.send_best_tip_block_time(
+        chrono::Utc::now() - chrono::Duration::hours(6) - chrono::Duration::minutes(1),
+    );
     let get_block_template_sync_error = rpc
         .get_block_template(None)
         .await
-        .expect_err("needs an error when syncer is not close to tip or estimated distance to network chain tip is far");
+        .expect_err("needs an error when the tip is older than the tip-age window");
 
     assert_eq!(
         get_block_template_sync_error.code(),
@@ -3730,6 +4148,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     mock_sync_status.set_is_close_to_tip(true);
 
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let (get_block_template, ..) = tokio::join!(
         rpc.get_block_template(None),
@@ -4053,11 +4472,19 @@ async fn rpc_client_proposal_can_submit_solution() {
     let pending = match early_event {
         MinedBlockEvent::Early {
             hash,
+            size,
             pending,
             submission,
             ..
         } => {
             assert_eq!(hash, candidate_hash);
+            assert_eq!(
+                Some(size),
+                pending_blocks
+                    .get(candidate_hash)
+                    .map(|block| block.zcash_serialized_size()),
+                "the event carries the submitted block's size"
+            );
             assert_eq!(submission, MinedBlockSubmission::CompactHeader);
             pending
         }
@@ -4773,6 +5200,8 @@ async fn rpc_addnode() {
         [PeerInfo {
             addr,
             inbound: false,
+            // Address book peers have no handshake height.
+            startingheight: -1,
             // TODO: Fix this when mock address book provides other values
             pingtime: Some(0.1f64),
             pingwait: None,
@@ -5240,6 +5669,7 @@ async fn a_rejection_that_arrives_after_the_deadline_still_withdraws_the_templat
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let mempool = tower::service_fn(move |_| async move {
@@ -5362,6 +5792,7 @@ async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(first_parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
 
@@ -5466,6 +5897,7 @@ async fn a_timed_out_parent_is_not_speculated_on_again() {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let mempool = tower::service_fn(move |_| async move {

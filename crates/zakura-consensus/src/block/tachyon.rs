@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use zakura_chain::{block::Block, transaction::WtxId};
+use zakura_chain::{block::BlockRef, transaction::WtxId};
 use zcash_tachyon::{
-    stamp::StampState as _, Bundle, PointerStamp, ProofStamp, Tachygram, TachyonBundle,
-    VerifyCoverageError, VerifyTachygramsError,
+    Bundle, PointerStamp, ProofStamp, Tachygram, TachyonBundle, VerifyCoverageError,
+    VerifyTachygramsError,
 };
 
 use crate::error::BlockError;
@@ -21,13 +21,13 @@ pub(crate) struct AggregateCoverage {
 }
 
 /// Checks block-wide Tachygram distinctness and aggregate coverage coherence.
-pub(crate) fn coherence(block: &Block) -> Result<Vec<AggregateCoverage>, BlockError> {
+pub(crate) fn coherence(block: &BlockRef) -> Result<Vec<AggregateCoverage>, BlockError> {
     let mut seen_tachygrams = BTreeSet::<Tachygram>::new();
     let mut aggregates = Vec::<AggregateCoverage>::new();
     let mut aggregates_by_wtxid = HashMap::<[u8; 64], usize>::new();
     let mut adjuncts = Vec::<([u8; 64], Bundle<PointerStamp>)>::new();
 
-    for transaction in &block.transactions {
+    for transaction in block.transactions() {
         let Some(tachyon_shielded_data) = transaction.tachyon_shielded_data() else {
             continue;
         };
@@ -41,7 +41,7 @@ pub(crate) fn coherence(block: &Block) -> Result<Vec<AggregateCoverage>, BlockEr
                     }
                 }
 
-                let wtxid = WtxId::from(transaction.as_ref()).as_bytes();
+                let wtxid = WtxId::from(transaction).as_bytes();
                 aggregates_by_wtxid.insert(wtxid, aggregates.len());
                 aggregates.push(AggregateCoverage {
                     bundle: bundle.clone(),
@@ -49,7 +49,7 @@ pub(crate) fn coherence(block: &Block) -> Result<Vec<AggregateCoverage>, BlockEr
                 });
             }
             TachyonBundle::Adjunct(bundle) => {
-                adjuncts.push((bundle.stamp.stamp_digest(), bundle.clone()));
+                adjuncts.push((bundle.stamp.wtxid.into(), bundle.clone()));
             }
         }
     }
@@ -68,18 +68,24 @@ pub(crate) fn coherence(block: &Block) -> Result<Vec<AggregateCoverage>, BlockEr
             .flat_map(|adjunct| adjunct.descriptors())
             .collect();
 
-        let covered_descriptors = aggregate
+        let adjunct_fees: Vec<_> = aggregate
+            .adjuncts
+            .iter()
+            .map(|bundle| bundle.fee_descriptor())
+            .collect();
+        let (covered_descriptors, covered_fees) = aggregate
             .bundle
-            .verify_coverage(&adjunct_descriptors)
+            .verify_coverage(&adjunct_descriptors, &adjunct_fees)
             .map_err(|error| match error {
                 VerifyCoverageError::DuplicateActions => BlockError::TachyonDuplicateAction,
+                VerifyCoverageError::DuplicateFees => BlockError::TachyonDuplicateFee,
                 VerifyCoverageError::StampActionsMismatch => BlockError::TachyonCoverageMismatch,
                 error => BlockError::TachyonProofInvalid(error.to_string()),
             })?;
 
         aggregate
             .bundle
-            .verify_tachygrams(covered_descriptors.len())
+            .verify_tachygrams(covered_descriptors.len(), covered_fees.len())
             .map_err(|error| match error {
                 VerifyTachygramsError::WrongArity => BlockError::TachyonTachygramArityMismatch,
                 VerifyTachygramsError::WrongSet => BlockError::TachyonTachygramSetMismatch,

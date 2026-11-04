@@ -2,11 +2,12 @@
 //! tree roots.
 
 use std::{collections::HashMap, sync::Arc};
+use zakura_node_services::block_memory::BlockHandle;
 
 use rayon::prelude::*;
 
 use zakura_chain::{
-    block::{Block, Height},
+    block::Height,
     sprout,
     transaction::{Hash as TransactionHash, Transaction, UnminedTx},
 };
@@ -20,11 +21,11 @@ use crate::{
 ///
 /// This method checks for anchors computed from the final treestate of each block in
 /// the `parent_chain` or `finalized_state`.
-#[tracing::instrument(skip(finalized_state, parent_chain, transaction))]
+#[tracing::instrument(level = "trace", skip(finalized_state, parent_chain, transaction))]
 fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
     finalized_state: &ZakuraDb,
     parent_chain: Option<&Arc<Chain>>,
-    transaction: &Arc<Transaction>,
+    transaction: &Transaction,
     transaction_hash: TransactionHash,
     tx_index_in_block: Option<usize>,
     height: Option<Height>,
@@ -197,7 +198,10 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
 /// Sprout anchors may also refer to the interstitial output treestate of any prior
 /// `JoinSplit` _within the same transaction_; these are created on the fly
 /// in [`sprout_anchors_refer_to_treestates()`].
-#[tracing::instrument(skip(sprout_final_treestates, finalized_state, parent_chain, transaction))]
+#[tracing::instrument(
+    level = "trace",
+    skip(sprout_final_treestates, finalized_state, parent_chain, transaction)
+)]
 fn fetch_sprout_final_treestates(
     sprout_final_treestates: &mut HashMap<
         sprout::tree::Root,
@@ -205,7 +209,7 @@ fn fetch_sprout_final_treestates(
     >,
     finalized_state: &ZakuraDb,
     parent_chain: Option<&Arc<Chain>>,
-    transaction: &Arc<Transaction>,
+    transaction: &Transaction,
     tx_index_in_block: Option<usize>,
     height: Option<Height>,
 ) {
@@ -259,10 +263,10 @@ fn fetch_sprout_final_treestates(
 /// (which must be populated with all treestates pointed to in the `semantically_verified` block;
 /// see [`fetch_sprout_final_treestates()`]); or in the interstitial
 /// treestates which are computed on the fly in this function.
-#[tracing::instrument(skip(sprout_final_treestates, transaction))]
+#[tracing::instrument(level = "trace", skip(sprout_final_treestates, transaction))]
 fn sprout_anchors_refer_to_treestates(
     sprout_final_treestates: &HashMap<sprout::tree::Root, Arc<sprout::tree::NoteCommitmentTree>>,
-    transaction: &Arc<Transaction>,
+    transaction: &Transaction,
     transaction_hash: TransactionHash,
     tx_index_in_block: Option<usize>,
     height: Option<Height>,
@@ -390,8 +394,8 @@ pub(crate) fn block_sapling_orchard_ironwood_anchors_refer_to_final_treestates(
 ) -> Result<(), ValidateContextError> {
     semantically_verified
         .block
-        .transactions
-        .iter()
+        .view()
+        .transactions()
         .enumerate()
         .try_for_each(|(tx_index_in_block, transaction)| {
             sapling_orchard_ironwood_anchors_refer_to_final_treestates(
@@ -424,8 +428,11 @@ pub(crate) fn block_fetch_sprout_final_treestates(
 ) -> HashMap<sprout::tree::Root, Arc<sprout::tree::NoteCommitmentTree>> {
     let mut sprout_final_treestates = HashMap::new();
 
-    for (tx_index_in_block, transaction) in
-        semantically_verified.block.transactions.iter().enumerate()
+    for (tx_index_in_block, transaction) in semantically_verified
+        .block
+        .view()
+        .transactions()
+        .enumerate()
     {
         fetch_sprout_final_treestates(
             &mut sprout_final_treestates,
@@ -456,7 +463,7 @@ pub(crate) fn block_fetch_sprout_final_treestates(
 #[tracing::instrument(skip(sprout_final_treestates, block, transaction_hashes))]
 pub(crate) fn block_sprout_anchors_refer_to_treestates(
     sprout_final_treestates: HashMap<sprout::tree::Root, Arc<sprout::tree::NoteCommitmentTree>>,
-    block: Arc<Block>,
+    block: BlockHandle,
     // Only used for debugging
     transaction_hashes: Arc<[TransactionHash]>,
     height: Height,
@@ -486,14 +493,14 @@ pub(crate) fn block_sprout_anchors_refer_to_treestates(
     if sprout_final_treestates.is_empty() {
         // The block has no valid sprout anchors
         block
-            .transactions
-            .iter()
+            .view()
+            .transactions()
             .enumerate()
             .try_for_each(check_tx_sprout_anchors)
     } else {
         block
-            .transactions
-            .par_iter()
+            .view()
+            .parallel_transactions()
             .enumerate()
             .try_for_each(check_tx_sprout_anchors)
     }
@@ -505,7 +512,7 @@ pub(crate) fn block_sprout_anchors_refer_to_treestates(
 ///
 /// This method checks for anchors computed from the final treestate of each block in
 /// the `parent_chain` or `finalized_state`.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn tx_anchors_refer_to_final_treestates(
     finalized_state: &ZakuraDb,
     parent_chain: Option<&Arc<Chain>>,

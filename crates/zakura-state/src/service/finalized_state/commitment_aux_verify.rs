@@ -9,9 +9,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::{BlockHandle, HeaderHandle};
 
 use zakura_chain::{
-    block::{merkle::AuthDataRoot, Block, Header, Height},
+    block::{merkle::AuthDataRoot, Header, Height},
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::commitment_aux_verify::{
@@ -28,8 +29,8 @@ use crate::{service::check, ValidateContextError};
 /// One block-sized step in supplied commitment-root verification.
 #[derive(Clone, Debug)]
 pub(crate) struct CommitmentRootVerification {
-    pub(crate) block: Option<Arc<Block>>,
-    pub(crate) header: Arc<Header>,
+    pub(crate) block: Option<BlockHandle>,
+    pub(crate) header: HeaderHandle,
     pub(crate) height: Height,
     pub(crate) roots: Option<(
         sapling::tree::Root,
@@ -44,7 +45,7 @@ impl CommitmentRootVerification {
     /// Verify this block's parent-history commitment, then fold the supplied
     /// per-block roots into the running history tree for the next block.
     pub(crate) fn with_roots(
-        block: Arc<Block>,
+        block: BlockHandle,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
         ironwood_root: ironwood::tree::Root,
@@ -55,7 +56,7 @@ impl CommitmentRootVerification {
             .coinbase_height()
             .expect("checkpoint-verified blocks have a coinbase height");
         CommitmentRootVerification {
-            header: block.header.clone(),
+            header: block.retained_header(),
             height,
             block: Some(block),
             roots: Some((sapling_root, orchard_root, ironwood_root)),
@@ -75,7 +76,7 @@ impl CommitmentRootVerification {
     ) -> Self {
         CommitmentRootVerification {
             block: None,
-            header,
+            header: header.into(),
             height,
             roots: None,
             precomputed_auth_data_root,
@@ -145,7 +146,7 @@ impl CommitmentRootVerificationError {
 /// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the empty-tree root.
 pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     network: &Network,
-    block: &Block,
+    block: &zakura_chain::block::BlockRef,
     sapling_root: &sapling::tree::Root,
 ) -> Result<(), ValidateContextError> {
     let expected = match block.commitment(network)? {
@@ -351,7 +352,7 @@ where
         history_tree
             .push(
                 network,
-                block,
+                &block,
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
@@ -435,7 +436,7 @@ mod tests {
     }
 
     fn verification_item(
-        block: Arc<Block>,
+        block: BlockHandle,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
     ) -> CommitmentRootVerification {
@@ -457,18 +458,23 @@ mod tests {
         let ironwood_root = empty_ironwood_root();
 
         let with_roots = CommitmentRootVerification::with_roots(
-            block.clone(),
+            block.clone().into(),
             sapling_root,
             orchard_root,
             ironwood_root,
             None,
             true,
         );
-        assert!(Arc::ptr_eq(
-            with_roots.block.as_ref().expect("roots item has a block"),
-            &block
+        let BlockHandle::Shared(retained) =
+            with_roots.block.as_ref().expect("roots item has a block")
+        else {
+            panic!("the fixture supplies a shared block")
+        };
+        assert!(Arc::ptr_eq(retained, &block));
+        assert!(std::ptr::eq(
+            with_roots.header.as_ref(),
+            block.header.as_ref()
         ));
-        assert!(Arc::ptr_eq(&with_roots.header, &block.header));
         assert_eq!(with_roots.height, block.coinbase_height().unwrap());
         assert_eq!(
             with_roots.roots,
@@ -484,7 +490,10 @@ mod tests {
             Some(block.auth_data_root()),
         );
         assert!(header_only.block.is_none());
-        assert!(Arc::ptr_eq(&header_only.header, &block.header));
+        assert!(std::ptr::eq(
+            header_only.header.as_ref(),
+            block.header.as_ref()
+        ));
         assert_eq!(header_only.height, height);
         assert_eq!(header_only.roots, None);
         assert_eq!(
@@ -723,7 +732,7 @@ mod tests {
 
         // Positive: the real roots reconstruct a tree the next block's header commits to.
         let ok_items = vec![
-            verification_item(act_block.clone(), act_root, empty_orchard_root),
+            verification_item(act_block.clone().into(), act_root, empty_orchard_root),
             CommitmentRootVerification::header_only(
                 next_block.header.clone(),
                 Height(activation + 1),
@@ -744,7 +753,7 @@ mod tests {
         // following block's commitment is checked.
         assert_ne!(act_root, next_root, "test needs two distinct roots");
         let bad_items = vec![
-            verification_item(act_block, next_root, empty_orchard_root),
+            verification_item(act_block.into(), next_root, empty_orchard_root),
             CommitmentRootVerification::header_only(
                 next_block.header.clone(),
                 Height(activation + 1),
@@ -850,6 +859,7 @@ mod tests {
         let item_at = |h: u32| -> CommitmentRootVerification {
             let block = archive_db
                 .block(Height(h).into())
+                .unwrap()
                 .expect("archive fork has the block");
             let sapling_root = archive_db
                 .sapling_tree_by_height(&Height(h))
@@ -988,6 +998,7 @@ mod tests {
 
         let root_at = |height: Height| {
             serve_block_roots(&archive_db, height..=height)
+                .unwrap()
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| panic!("served root is missing at {height:?}"))
@@ -997,20 +1008,21 @@ mod tests {
             assert_eq!(roots.height, height, "served root height at {height:?}");
             let block = archive_db
                 .block(height.into())
+                .unwrap()
                 .unwrap_or_else(|| panic!("archive body is missing at {height:?}"));
             assert_eq!(
                 roots.sapling_tx,
-                block.sapling_transactions_count(),
+                block.view().sapling_transactions_count(),
                 "Sapling transaction count at {height:?}"
             );
             assert_eq!(
                 roots.orchard_tx,
-                block.orchard_transactions_count(),
+                block.view().orchard_transactions_count(),
                 "Orchard transaction count at {height:?}"
             );
             assert_eq!(
                 roots.ironwood_tx,
-                block.ironwood_transactions_count(),
+                block.view().ironwood_transactions_count(),
                 "Ironwood transaction count at {height:?}"
             );
             assert_eq!(
@@ -1031,7 +1043,7 @@ mod tests {
         let mut checked = 0usize;
         for &(start, end) in &ranges {
             let range = format!("{start}-{end}");
-            let roots = serve_block_roots(&archive_db, Height(start)..=Height(end));
+            let roots = serve_block_roots(&archive_db, Height(start)..=Height(end)).unwrap();
             let expected_len = usize::try_from(end - start + 1)
                 .expect("a u32 range length fits in usize on supported targets");
             assert_eq!(
@@ -1055,6 +1067,7 @@ mod tests {
 
                 let block = archive_db
                     .block(height.into())
+                    .unwrap()
                     .unwrap_or_else(|| panic!("archive body is missing at {height:?}"));
                 let sapling = archive_db
                     .sapling_tree_by_height(&height)
@@ -1080,17 +1093,17 @@ mod tests {
                 assert_eq!(roots.ironwood_root, ironwood, "Ironwood root at {height:?}");
                 assert_eq!(
                     roots.sapling_tx,
-                    block.sapling_transactions_count(),
+                    block.view().sapling_transactions_count(),
                     "Sapling transaction count at {height:?}"
                 );
                 assert_eq!(
                     roots.orchard_tx,
-                    block.orchard_transactions_count(),
+                    block.view().orchard_transactions_count(),
                     "Orchard transaction count at {height:?}"
                 );
                 assert_eq!(
                     roots.ironwood_tx,
-                    block.ironwood_transactions_count(),
+                    block.view().ironwood_transactions_count(),
                     "Ironwood transaction count at {height:?}"
                 );
                 assert_eq!(
@@ -1155,14 +1168,16 @@ mod tests {
             let (sapling_root, orchard_root, ironwood_root) = activation_item
                 .roots
                 .expect("served root verification items contain roots");
-            let history_tree = HistoryTree::from_block(
+            let history_tree = HistoryTree::from_parts(
                 &Mainnet,
-                activation_block,
-                &sapling_root,
-                &orchard_root,
-                &ironwood_root,
-                #[cfg(zcash_unstable = "nutachyon")]
-                &Default::default(),
+                zakura_chain::history_tree::HistoryTreeBlockParts::from_block(
+                    &activation_block,
+                    &sapling_root,
+                    &orchard_root,
+                    &ironwood_root,
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    &Default::default(),
+                ),
             )
             .expect("network-upgrade activation starts a history-tree epoch");
             let confirm_end = end

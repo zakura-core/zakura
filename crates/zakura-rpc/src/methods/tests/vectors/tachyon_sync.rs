@@ -60,7 +60,7 @@ async fn tachyon_sync_rpc_returns_empty_block_data_from_one_state_request() {
             .await
             .respond(ReadResponse::TachyonBlock(Some(
                 zakura_state::TachyonBlock {
-                    block,
+                    block: block.into(),
                     height: Height(10),
                     activation_height: Height(10),
                     finalized: false,

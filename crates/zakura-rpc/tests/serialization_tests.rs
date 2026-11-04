@@ -1500,11 +1500,13 @@ fn test_get_peer_info() -> Result<(), Box<dyn std::error::Error>> {
 [
   {
     "addr": "192.168.0.1:8233",
-    "inbound": false
+    "inbound": false,
+    "startingheight": -1
   },
   {
     "addr": "[2000:2000:2000:0000::]:8233",
-    "inbound": false
+    "inbound": false,
+    "startingheight": -1
   }
 ]
 "#;
@@ -1532,7 +1534,8 @@ fn test_get_peer_info_metadata_serialization() -> Result<(), Box<dyn std::error:
     "addr": "192.168.0.1:8233",
     "subver": "/Zakura:1.0.3/",
     "version": 170160,
-    "inbound": false
+    "inbound": false,
+    "startingheight": -1
   }
 ]
 "#;
@@ -1551,12 +1554,14 @@ fn test_get_peer_info_with_ping_values_serialization() -> Result<(), Box<dyn std
   {
     "addr": "192.168.0.1:8233",
     "inbound": false,
+    "startingheight": -1,
     "pingtime": 123,
     "pingwait": 45
   },
   {
     "addr": "[2000:2000:2000:0000::]:8233",
     "inbound": false,
+    "startingheight": -1,
     "pingtime": 67,
     "pingwait": 89
   }

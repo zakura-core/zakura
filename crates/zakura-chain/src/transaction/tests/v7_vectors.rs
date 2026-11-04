@@ -7,7 +7,8 @@ use group::{
 use halo2::pasta::pallas;
 use reddsa::{orchard::SpendAuth, SigningKey, VerificationKey};
 use zcash_tachyon::{
-    Action, Anchor, Bundle, PointerStamp, ProofStamp, Tachygram, TachygramSetPoly, TachyonBundle,
+    Action, AggregateId, Anchor, Bundle, PointerStamp, ProofStamp, Tachygram, TachygramSetPoly,
+    TachyonBundle,
 };
 
 use crate::{
@@ -43,7 +44,7 @@ fn action_with_seed(seed: u8, signature_byte: u8) -> Action {
 }
 
 fn default_anchor() -> Anchor {
-    Anchor::read(&[0; 64][..]).expect("64 zero bytes encode the default Tachyon anchor")
+    Anchor::read(&[0; 32][..]).expect("32 zero bytes encode the default Tachyon anchor")
 }
 
 fn tachygram(seed: u8) -> Tachygram {
@@ -52,7 +53,8 @@ fn tachygram(seed: u8) -> Tachygram {
 }
 
 fn transaction_with_tachyon_bundle(bundle: TachyonBundle) -> Transaction {
-    let tachyon_shielded_data = (!bundle.is_no_bundle()).then_some(TachyonShieldedData(bundle));
+    let tachyon_shielded_data =
+        (!bundle.is_no_bundle()).then_some(Box::new(TachyonShieldedData(bundle)));
 
     Transaction::V7 {
         network_upgrade: NetworkUpgrade::NuTachyon,
@@ -76,11 +78,15 @@ fn adjunct_transaction() -> Transaction {
     transaction_with_tachyon_bundle(TachyonBundle::Adjunct(Bundle {
         actions: vec![action_with_seed(0x42, 0x01)],
         value_balance: zcash_tachyon::value::Balance::ZERO,
+        fee_max_commitment: action_with_seed(0x44, 0x01).cv,
         binding_sig: zcash_tachyon::bundle::Signature::read(&[0x02; 64][..])
             .expect("test signature bytes are canonical"),
         memo: Vec::new(),
-        stamp: PointerStamp::try_from([0xEE; 64])
-            .expect("a 64-byte witnessed transaction ID is valid"),
+        stamp: PointerStamp {
+            wtxid: AggregateId::try_from([0xEE; 64])
+                .expect("a nonzero witnessed transaction ID is valid"),
+            fee: zcash_tachyon::value::Positive::try_from(7u64).expect("fee is in range"),
+        },
     }))
 }
 
@@ -91,10 +97,12 @@ fn proven_transaction() -> Transaction {
         actions: vec![action_with_seed(0x42, 0x01)],
         value_balance: zcash_tachyon::value::Balance::try_from(100i64)
             .expect("100 is a valid Tachyon value balance"),
+        fee_max_commitment: action_with_seed(0x44, 0x01).cv,
         binding_sig: zcash_tachyon::bundle::Signature::read(&[0x02; 64][..])
             .expect("test signature bytes are canonical"),
         memo: Vec::new(),
         stamp: ProofStamp {
+            fee: zcash_tachyon::value::Positive::try_from(7u64).expect("fee is in range"),
             coverage: [0; 32],
             tachygram_set: [tachygram]
                 .into_iter()
@@ -102,7 +110,7 @@ fn proven_transaction() -> Transaction {
                 .commit(),
             tachygrams: [tachygram].into_iter().collect(),
             anchor: default_anchor(),
-            proof: Box::new(ragu::Proof::trivial()),
+            proof: Box::new(ragu::Proof::bootstrap()),
         },
     }))
 }
@@ -114,10 +122,12 @@ fn multi_action_proven_transaction() -> Transaction {
         actions: vec![action_with_seed(0x42, 0x01), action_with_seed(0x43, 0x03)],
         value_balance: zcash_tachyon::value::Balance::try_from(300i64)
             .expect("300 is a valid Tachyon value balance"),
+        fee_max_commitment: action_with_seed(0x44, 0x01).cv,
         binding_sig: zcash_tachyon::bundle::Signature::read(&[0x02; 64][..])
             .expect("test signature bytes are canonical"),
         memo: Vec::new(),
         stamp: ProofStamp {
+            fee: zcash_tachyon::value::Positive::try_from(7u64).expect("fee is in range"),
             coverage: [0; 32],
             tachygram_set: tachygrams
                 .into_iter()
@@ -125,7 +135,7 @@ fn multi_action_proven_transaction() -> Transaction {
                 .commit(),
             tachygrams: tachygrams.into_iter().collect(),
             anchor: default_anchor(),
-            proof: Box::new(ragu::Proof::trivial()),
+            proof: Box::new(ragu::Proof::bootstrap()),
         },
     }))
 }
@@ -293,4 +303,42 @@ fn generate_v7_tachyon_serialization_vectors() {
         assert_eq!(decoded, transaction, "{name} round-trip mismatch");
         println!("{name}={}", hex::encode(bytes));
     }
+}
+
+#[test]
+fn v7_chosen_stamp_fee_is_included_in_net_value_balance() {
+    let mut transaction = adjunct_transaction();
+    let Transaction::V7 {
+        tachyon_shielded_data: Some(data),
+        ..
+    } = &mut transaction
+    else {
+        unreachable!()
+    };
+    let TachyonBundle::Adjunct(bundle) = &mut data.0 else {
+        unreachable!()
+    };
+    bundle.value_balance = zcash_tachyon::value::Balance::try_from(3i64).unwrap();
+    bundle.stamp.fee = zcash_tachyon::value::Positive::try_from(2u64).unwrap();
+    assert_eq!(
+        transaction
+            .tachyon_value_balance()
+            .unwrap()
+            .tachyon_amount(),
+        5
+    );
+
+    let Transaction::V7 {
+        tachyon_shielded_data: Some(data),
+        ..
+    } = &mut transaction
+    else {
+        unreachable!()
+    };
+    let TachyonBundle::Adjunct(bundle) = &mut data.0 else {
+        unreachable!()
+    };
+    bundle.value_balance =
+        zcash_tachyon::value::Balance::try_from(2_100_000_000_000_000i64).unwrap();
+    assert!(transaction.tachyon_value_balance().is_err());
 }

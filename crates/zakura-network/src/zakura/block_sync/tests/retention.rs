@@ -1,4 +1,5 @@
 use super::*;
+use tokio::time;
 
 struct RetentionHarness {
     retained: Option<watch::Sender<block::Height>>,
@@ -12,7 +13,7 @@ impl RetentionHarness {
     fn new(retained: u32) -> Self {
         Self::from_startup(
             retained,
-            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()),
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
         )
     }
 
@@ -159,6 +160,7 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
     }
 
     let startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+        .unwrap()
         .with_range_source(Arc::new(StatusOnlySource));
     let harness = RetentionHarness::from_startup(1, startup);
     let resources = harness
@@ -274,7 +276,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (_tip, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -321,7 +323,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
 async fn retention_deferred_status_applies_after_peer_goes_quiet() {
     let config = ZakuraBlockSyncConfig::default();
     let (handle, mut actions, task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()))
+        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()).unwrap())
             .expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let mut advertised = BlockSyncStatus {

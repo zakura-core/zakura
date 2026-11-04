@@ -107,14 +107,15 @@ const DATABASE_FORMAT_VERSION: u64 = RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VE
 
 /// Reserved for NuTachyon databases derived from production database format 30.
 ///
-/// This reservation prevents a future production format from giving version 31 a
+/// This reservation prevents a future production format from giving version 32 a
 /// different meaning while NuTachyon development remains out of tree.
-const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 31;
+const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 32;
 
 #[cfg(not(zcash_unstable = "nutachyon"))]
 const _: () = assert!(
-    DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
-    "production database format conflicts with reserved NuTachyon major version 31",
+    DATABASE_FORMAT_VERSION != 31
+        && DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
+    "production database format conflicts with reserved NuTachyon major versions 31 or 32",
 );
 
 /// The database format minor version, incremented each time the on-disk database format has a
@@ -125,8 +126,8 @@ const _: () = assert!(
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
-/// Version 31 adds Tachyon state and widens value balances and history entries.
-/// Earlier rows remain readable, so upgrading from format 30 needs no row migration.
+/// Version 32 stores fee-aware Tachyon bundles and the new Poseidon commitments.
+/// Production format 30 can be upgraded; experimental Tachyon format 31 requires a reset.
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
@@ -169,6 +170,14 @@ pub const MAX_FIND_BLOCK_HASHES_RESULTS: u32 = 500;
 
 /// The maximum number of block headers allowed in `getheaders` responses in the Zcash network protocol.
 pub const MAX_FIND_BLOCK_HEADERS_RESULTS: u32 = 160;
+
+/// Read-service slots reserved for bounded chain-tip and depth queries.
+/// Bulk reads cannot occupy this admission pool.
+pub(crate) const CONTROL_READ_CONCURRENCY: usize = 4;
+
+/// Full disk blocks retained by chain-tip publication, separate from ordinary results.
+/// Old tip subscribers keep their charge; exhaustion refuses operator changes before commit.
+pub(crate) const CHAIN_TIP_BLOCK_RETENTION: u64 = 4;
 
 /// The maximum number of headers returned by native Zakura header-sync range reads.
 ///

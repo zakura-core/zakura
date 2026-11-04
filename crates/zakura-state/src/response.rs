@@ -1,24 +1,23 @@
 //! State [`tower::Service`] response types.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
+use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
 
 use chrono::{DateTime, Utc};
 
 #[cfg(zcash_unstable = "nutachyon")]
-use std::collections::HashMap;
-#[cfg(zcash_unstable = "nutachyon")]
 use zakura_chain::tachyon;
 use zakura_chain::{
     amount::{Amount, NonNegative},
-    block::{self, Block, ChainHistoryMmrRootHash},
+    block::{self, ChainHistoryMmrRootHash},
     block_info::BlockInfo,
     ironwood, orchard, sapling,
     serialization::DateTime32,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
-    transaction::{self, Transaction},
+    transaction::{self},
     transparent,
     value_balance::ValueBalance,
 };
@@ -44,7 +43,7 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TachyonBlock {
     /// The complete block, from the selected best chain.
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
     /// The block's chain height.
     pub height: block::Height,
     /// NuTachyon activation height; epoch numbering starts here.
@@ -69,7 +68,7 @@ pub struct TachyonMiningData {
     pub anchor_heights: HashMap<tachyon::Anchor, block::Height>,
 
     /// Blocks needed to advance from each epoch's earliest requested anchor to its latest one.
-    pub blocks: BTreeMap<block::Height, Arc<Block>>,
+    pub blocks: BTreeMap<block::Height, BlockHandle>,
 
     /// Requested tachygrams already revealed in the candidate block's two-epoch window.
     pub revealed_tachygrams: HashSet<tachyon::Tachygram>,
@@ -83,6 +82,21 @@ pub enum PreparedMinedRelayEligibility {
     /// The block proves expected work but does not extend the selected tip.
     CommitFirst,
     /// State cannot prove expected work from the available context.
+    Unavailable,
+}
+
+/// Whether a block's header commits to the authorizing data in its body.
+///
+/// From NU5, the block hash commits to authorizing data only through `hashBlockCommitments`
+/// (ZIP 244), so a body can match its header's transaction IDs and still carry different
+/// signatures, proofs, or scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthDataCommitment {
+    /// The header commits to the body's authorizing data. Before NU5, transaction IDs do.
+    Bound,
+    /// The body's authorizing data does not match the header's commitment.
+    Mismatch(block::CommitmentError),
+    /// The parent's history tree is not available, so the binding is unknown.
     Unavailable,
 }
 
@@ -141,7 +155,7 @@ pub enum Response {
     ParentInputs(ParentInputs),
 
     /// Response to [`Request::Block`] with the specified block.
-    Block(Option<Arc<Block>>),
+    Block(Option<BlockHandle>),
 
     /// Response to [`Request::AwaitBlockInfo`] and [`Request::BlockInfo`] with the
     /// specified block's chain value pools.
@@ -150,7 +164,7 @@ pub enum Response {
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
-        header: Arc<block::Header>,
+        header: HeaderHandle,
         /// The hash of the requested block
         hash: block::Hash,
         /// The height of the requested block
@@ -167,7 +181,7 @@ pub enum Response {
     BlockHashes(Vec<block::Hash>),
 
     /// The response to a `FindBlockHeaders` request.
-    BlockHeaders(Vec<block::CountedHeader>),
+    BlockHeaders(Vec<zakura_node_services::block_memory::HeaderHandle>),
 
     /// Response to [`Request::CheckBestChainTipNullifiersAndAnchors`].
     ///
@@ -176,6 +190,9 @@ pub enum Response {
 
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
+
+    /// Response to [`Request::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
 
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -192,14 +209,22 @@ pub enum Response {
 }
 
 /// The result of checking a candidate block's external inputs against its parent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentInputs {
+    /// Every input is unspent at the parent, with the output each one spends.
+    ///
+    /// The block verifier hands these outputs to its transaction checks, so they are read once
+    /// per block. The map holds each output once while the block verifies, in addition to the
+    /// copies the transaction checks make of the outputs they spend. Its locking scripts are
+    /// capped per check, see `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
+    Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),
     /// The parent is neither in a non-finalized chain nor the finalized tip,
     /// so no chain can accept the candidate now.
     ParentUnavailable,
-    /// Every input is unspent at the parent, or the parent context changed during the read.
+    /// The state could not decide, for example because the parent context changed during the read,
+    /// or every input was found but their outputs were too large to keep.
     Inconclusive,
 }
 
@@ -240,10 +265,10 @@ pub enum AnyTx {
     /// A transaction in the best chain.
     Mined(MinedTx),
     /// A transaction in a side chain, and the hash of the block it is in.
-    Side((Arc<Transaction>, block::Hash)),
+    Side((TransactionHandle, block::Hash)),
 }
 
-impl From<AnyTx> for Arc<Transaction> {
+impl From<AnyTx> for TransactionHandle {
     fn from(any_tx: AnyTx) -> Self {
         match any_tx {
             AnyTx::Mined(mined_tx) => mined_tx.tx,
@@ -256,7 +281,7 @@ impl From<AnyTx> for Arc<Transaction> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MinedTx {
     /// The transaction.
-    pub tx: Arc<Transaction>,
+    pub tx: TransactionHandle,
 
     /// The transaction height.
     pub height: block::Height,
@@ -272,7 +297,7 @@ pub struct MinedTx {
 impl MinedTx {
     /// Creates a new [`MinedTx`]
     pub fn new(
-        tx: Arc<Transaction>,
+        tx: TransactionHandle,
         height: block::Height,
         confirmations: u32,
         block_time: DateTime<Utc>,
@@ -313,7 +338,7 @@ pub struct NonFinalizedBlock {
     /// Block hash.
     pub hash: block::Hash,
     /// Complete block.
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
     /// Process-local order, absent for restored blocks or older primaries.
     pub receipt_order: Option<u64>,
 }
@@ -537,16 +562,16 @@ pub enum ReadResponse {
     Depth(Option<u32>),
 
     /// Response to [`ReadRequest::Block`] with the specified block.
-    Block(Option<Arc<Block>>),
+    Block(Option<BlockHandle>),
 
     /// Response to [`ReadRequest::BlockAndSize`] with the specified block and
     /// serialized size.
-    BlockAndSize(Option<(Arc<Block>, usize)>),
+    BlockAndSize(Option<(BlockHandle, usize)>),
 
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
-        header: Arc<block::Header>,
+        header: HeaderHandle,
         /// The hash of the requested block
         hash: block::Hash,
         /// The height of the requested block
@@ -584,7 +609,7 @@ pub enum ReadResponse {
     BlockHashes(Vec<block::Hash>),
 
     /// The response to a `FindBlockHeaders` request.
-    BlockHeaders(Vec<block::CountedHeader>),
+    BlockHeaders(Vec<zakura_node_services::block_memory::HeaderHandle>),
 
     /// Response to [`ReadRequest::HeaderChainSnapshot`], absent before semantic handoff.
     HeaderChainSnapshot(Option<zakura_header_chain::EngineSnapshot>),
@@ -619,12 +644,17 @@ pub enum ReadResponse {
     MissingBlockBodyMetadata(BlockSyncBodyMetadata),
 
     /// Response to [`ReadRequest::BlocksByHeightRange`].
-    Blocks(Vec<(block::Height, Arc<Block>, usize)>),
+    Blocks(Vec<(block::Height, BlockHandle, usize)>),
 
     /// Response to [`ReadRequest::RawBlocksByHeightRange`], with each block's
     /// raw Zcash consensus serialization.
     #[cfg(feature = "indexer")]
-    RawBlocks(Vec<(block::Height, Vec<u8>)>),
+    RawBlocks(
+        Vec<(
+            block::Height,
+            zakura_node_services::block_memory::OwnedRawBlock,
+        )>,
+    ),
 
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.
@@ -690,6 +720,9 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
+
+    /// Response to [`ReadRequest::CheckAuthDataCommitment`].
+    AuthDataCommitment(AuthDataCommitment),
 
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -812,6 +845,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
             ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
+            }
+            ReadResponse::AuthDataCommitment(commitment) => {
+                Ok(Response::AuthDataCommitment(commitment))
             }
 
             ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),

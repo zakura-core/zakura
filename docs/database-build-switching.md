@@ -41,15 +41,20 @@ place; this change adds no downgrade migration.
 the database writable. This record helps explain a database's history. It does not establish
 compatibility, and software without that feature can leave the record stale.
 
-[PR #795](https://github.com/zakura-core/zakura/pull/795) selects major format 31 under
+[PR #795](https://github.com/zakura-core/zakura/pull/795) selects major format 32 under
 `zcash_unstable="nutachyon"` and format 30 otherwise. The existing versioned directories
 separate these builds without a Tachyon-specific path rule.
 
+Format 31 contains the earlier experimental Tachyon wire format and Poseidon commitments.
+Format 32 rejects that database rather than migrating it. Stop the test network, use a fresh
+state directory, and re-genesis it with matching clients. A production format-30 database has
+no Tachyon ledger data and remains eligible for the ordinary forward upgrade.
+
 ## Reserving the Tachyon format number
 
-[PR #795](https://github.com/zakura-core/zakura/pull/795) reserves major version 31 while
+[PR #795](https://github.com/zakura-core/zakura/pull/795) reserves major versions 31 and 32 while
 NuTachyon remains out of tree. Its compile-time assertion rejects an ordinary build that selects
-that number.
+either number.
 The reservation prevents two incompatible formats from sharing the same version.
 
 When integrating Tachyon, compile that assertion only when
@@ -60,8 +65,8 @@ The Tachyon constant uses the reservation constant so both refer to the same num
 | Build | Selected major | Compiler result |
 | --- | --- | --- |
 | Ordinary | 30 | Accept |
-| Ordinary with an accidental version collision | 31 | Reject |
-| Tachyon | 31 | Accept |
+| Ordinary with an accidental version collision | 31 or 32 | Reject |
+| Tachyon | 32 | Accept |
 
 The reservation controls which build may use a format number. The startup checks control
 whether a build may open an existing database. Both checks remain necessary.
@@ -86,7 +91,7 @@ scripts/test-tachyon-db-upgrade.sh
 
 The script creates a temporary v30 database with an ordinary build. It commits real Mainnet
 blocks and writes a non-finalized backup. The Tachyon build then upgrades that database to
-v31, reads the backup, commits another block, and reopens the database. The test also
+v32, reads the backup, commits another block, and reopens the database. The test also
 checks writer metadata and exchanges a serialized history snapshot between the builds.
 CI runs this script and the state tests with Tachyon disabled and enabled.
 

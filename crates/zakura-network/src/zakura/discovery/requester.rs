@@ -553,6 +553,14 @@ impl Queries {
         }
     }
 
+    /// Whether this session holds something it read and has not processed:
+    /// a claimed answer, a `Hello` in verification, or an answer the transport
+    /// reader queued. [`Self::answers_settled`] waits for the opposite.
+    pub(super) fn holds_unsettled(&self) -> bool {
+        let live = self.lock();
+        !self.settling.borrow().is_empty() || live.reservations.has_queued()
+    }
+
     /// Ends the session's queries: an unwritten query is skipped, and an
     /// unanswered written query closes the connection. The reservations
     /// return to the pool, even while the transport reader outlives the

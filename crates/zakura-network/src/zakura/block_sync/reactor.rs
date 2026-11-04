@@ -10,7 +10,7 @@ use crate::zakura::{
 use rand_10::Rng;
 use state::{
     admission_decision, block_sync_frontiers, body_completion_authority,
-    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
+    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired,
     AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply, QueryOpening,
     QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts, WorkReads,
 };
@@ -20,6 +20,7 @@ use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod state;
+pub(super) use state::ActionClass;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state::{
     replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
@@ -1791,11 +1792,7 @@ impl ReactorIO {
         // control capacity in one semaphore operation. The Sequencer sends
         // concurrently, so a separate capacity check has a race.
         let class = ActionClass::of(&action);
-        let permits = match class {
-            ActionClass::Required => 1,
-            ActionClass::Optional => BS_ACTION_CONTROL_RESERVE + 1,
-        };
-        let mut permits = match self.actions.try_reserve_many(permits) {
+        let mut permits = match self.actions.try_reserve_many(class.permits()) {
             Ok(permits) => permits,
             Err(mpsc::error::TrySendError::Full(())) => {
                 return Err(match class {

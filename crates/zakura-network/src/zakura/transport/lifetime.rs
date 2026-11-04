@@ -23,6 +23,7 @@
 //!   its connection's exchange gate. The requester holds it from before it
 //!   opens the stream until its decoder finishes, so a response's frames and
 //!   reassembly copies never wait on the gates of the connection's stream kinds.
+//!   The grant can outlive its connection, but not its requester's client slot.
 //!
 //! One connection's QUIC receive window is the handshake share plus the
 //! receive share of every kind it negotiated. Unread QUIC bytes and held raw
@@ -65,8 +66,12 @@ use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 /// `getdata` at about 1 MiB, so an honest peer never exceeds it.
 pub(crate) const COMPAT_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
 
-/// The most bytes one compatibility exchange may charge: its frames, plus the
-/// validator's and the decoder's reassembly copies of one object.
+/// The most bytes one compatibility exchange may charge: its serialized frames,
+/// plus the validator's and the decoder's reassembly copies of one object.
+///
+/// The charge lasts until the requester hands the decoded response to its caller.
+/// It counts serialized bytes, so a decoded object larger than its encoding is
+/// outside it.
 pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
     (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES + 2 * MAX_PROTOCOL_MESSAGE_LEN) as u64;
 
@@ -78,6 +83,11 @@ pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
 /// protocol's message limit charges three message lengths, so a connection can
 /// decode two of those while it fetches a third. A request writes its one frame
 /// straight to its stream, so the exchange queues no output.
+///
+/// A grant can outlive its connection while its requester decodes, so a
+/// replacement connection's gate runs beside it. The node bound therefore comes
+/// from the compatibility client's concurrent requests, which each hold at most
+/// one grant, not from the connection count.
 pub const COMPAT_EXCHANGE_BUDGET: ReactorBudget = ReactorBudget {
     receive: COMPAT_EXCHANGE_MAX_BYTES,
     output: 0,
@@ -154,9 +164,10 @@ pub(crate) struct TransportLimits {
     pub(crate) control_receive_bytes: u64,
     /// The shares of one connection that negotiated every registered kind.
     pub(crate) connection_shares: ReactorBudget,
-    /// The outbound compatibility exchange bytes one connection may hold:
-    /// [`COMPAT_EXCHANGE_BUDGET`]'s receive share on a node that registers the
-    /// legacy request kind, and zero otherwise.
+    /// The outbound compatibility exchange bytes the node may hold:
+    /// [`COMPAT_EXCHANGE_BUDGET`]'s receive share per concurrent request of its
+    /// compatibility client on a node that registers the legacy request kind, and
+    /// zero otherwise.
     pub(crate) compat_exchange_bytes: u64,
     /// The QUIC send window of one connection.
     pub(crate) send_window: u64,
@@ -187,8 +198,9 @@ impl ResourceEnvelope {
     /// Bounds for a node with these transport limits.
     ///
     /// A connection's budgets are the sums of its kinds' shares, and the node's
-    /// are the connections' sums. Admitted connections hold the full window,
-    /// and pending handshakes hold the handshake window.
+    /// are the connections' sums, except the compatibility exchange bytes, which
+    /// the limits give for the whole node. Admitted connections hold the full
+    /// window, and pending handshakes hold the handshake window.
     pub(crate) fn new(limits: TransportLimits) -> Self {
         let connections = limits.max_connections.max(1);
         // Widening usize to u64 or u128 is lossless on supported targets.
@@ -201,7 +213,7 @@ impl ResourceEnvelope {
             node_raw_bytes: node_bytes(shares.receive),
             connection_output_bytes: shares.output,
             node_output_bytes: node_bytes(shares.output),
-            compat_response_bytes: node_bytes(limits.compat_exchange_bytes),
+            compat_response_bytes: limits.compat_exchange_bytes,
             transport_credit_bytes: connections as u128
                 * window(limits.control_receive_bytes.saturating_add(shares.receive))
                 + limits.max_pending_handshakes as u128 * window(limits.control_receive_bytes),
@@ -225,6 +237,72 @@ impl ResourceEnvelope {
     pub(crate) fn transport_memory_bytes(&self) -> u128 {
         self.retained_frame_bytes() + self.transport_credit_bytes
     }
+}
+
+/// A stream kind's share that can't hold the kind's largest frame.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "stream kind {kind}'s {direction} share of {share} bytes must hold its largest frame of \
+     {frame} bytes"
+)]
+pub(crate) struct ShareBelowFrame {
+    kind: u16,
+    direction: &'static str,
+    share: u64,
+    frame: u64,
+}
+
+/// Refuses `shares` if any kind in `streams` has a receive or output share
+/// below its largest frame, where no frame exceeds `max_frame_bytes`.
+///
+/// A frame above its gate takes the whole gate, so it would be charged less
+/// than it holds. [`NodeResources::new`] asserts the same rule.
+pub(crate) fn check_reactor_shares(
+    shares: &ReactorShares,
+    streams: impl IntoIterator<Item = Stream>,
+    max_frame_bytes: u32,
+) -> Result<(), ShareBelowFrame> {
+    check_kind_shares(shares, &registered_kinds(streams, max_frame_bytes))
+}
+
+/// Each kind in `streams`, the capability bits of its streams, and its largest
+/// frame up to `max_frame_bytes`.
+fn registered_kinds(
+    streams: impl IntoIterator<Item = Stream>,
+    max_frame_bytes: u32,
+) -> Vec<(u16, u64, u64)> {
+    let mut kinds: Vec<(u16, u64, u64)> = Vec::new();
+    for stream in streams {
+        let frame = u64::from(stream.frame_cap.min(max_frame_bytes));
+        match kinds.iter_mut().find(|(kind, ..)| *kind == stream.kind) {
+            Some((_, capabilities, largest)) => {
+                *capabilities |= stream.capability;
+                *largest = (*largest).max(frame);
+            }
+            None => kinds.push((stream.kind, stream.capability, frame)),
+        }
+    }
+    kinds
+}
+
+fn check_kind_shares(
+    shares: &ReactorShares,
+    kinds: &[(u16, u64, u64)],
+) -> Result<(), ShareBelowFrame> {
+    for &(kind, _, frame) in kinds {
+        let ReactorBudget { receive, output } = shares.share(kind);
+        for (direction, share) in [("receive", receive), ("output", output)] {
+            if share < frame {
+                return Err(ShareBelowFrame {
+                    kind,
+                    direction,
+                    share,
+                    frame,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The node-wide owners of transport resources.
@@ -251,29 +329,9 @@ impl NodeResources {
         streams: impl IntoIterator<Item = Stream>,
         max_frame_bytes: u32,
     ) -> Self {
-        let mut kinds: Vec<(u16, u64, u64)> = Vec::new();
-        for stream in streams {
-            let frame = u64::from(stream.frame_cap.min(max_frame_bytes));
-            match kinds.iter_mut().find(|(kind, ..)| *kind == stream.kind) {
-                Some((_, capabilities, largest)) => {
-                    *capabilities |= stream.capability;
-                    *largest = (*largest).max(frame);
-                }
-                None => kinds.push((stream.kind, stream.capability, frame)),
-            }
-        }
-        for (kind, _, largest) in &kinds {
-            let ReactorBudget { receive, output } = shares.share(*kind);
-            assert!(
-                receive >= *largest,
-                "stream kind {kind}'s receive share of {receive} bytes must hold its \
-                 largest frame of {largest} bytes"
-            );
-            assert!(
-                output >= *largest,
-                "stream kind {kind}'s output share of {output} bytes must hold its \
-                 largest frame of {largest} bytes"
-            );
+        let kinds = registered_kinds(streams, max_frame_bytes);
+        if let Err(error) = check_kind_shares(&shares, &kinds) {
+            panic!("{error}");
         }
         Self {
             shares: Arc::new(shares),
@@ -386,6 +444,10 @@ impl ConnectionResources {
 
 /// The funding of one outbound compatibility exchange. Dropping it returns the
 /// exchange's bytes and ends its owner count.
+///
+/// The connection's exchange ends when its requester gives up, and the requester
+/// drops the grant once it decodes, so each grant lives within one request of the
+/// compatibility client, even after its connection closes.
 #[derive(Debug)]
 #[must_use = "dropping a compatibility grant releases its capacity"]
 pub(crate) struct CompatResponseGrant {
@@ -456,6 +518,11 @@ impl FrameGate {
         Self {
             budget: byte_budget(bytes),
         }
+    }
+
+    /// The bytes this gate can grant at once.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.budget.capacity()
     }
 
     /// Admit a frame of `bytes` without waiting, if the gate has room.

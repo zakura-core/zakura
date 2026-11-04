@@ -47,11 +47,14 @@ use std::sync::Arc;
 
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
-/// Decoded `block` and `tx` bytes that unsolicited TCP work may retain across this node.
+/// Decoded `block` and `tx` bytes that unsolicited TCP work may retain across this node,
+/// from decoding until the connection hands the payload to the inbound service or to
+/// its client.
 ///
-/// A connection handles one message at a time, so this bound applies only to a node
-/// whose connections all hold large transactions at once. This is an unmeasured choice,
-/// and it matches the compatibility partition.
+/// Later owners, such as mempool verification, keep the decoded payload outside this
+/// budget. A connection handles one message at a time, so this bound applies only to a
+/// node whose connections all hold large transactions at once. This is an unmeasured
+/// choice, and it matches the compatibility partition.
 pub(crate) const TCP_INBOUND_RETAINED_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The heap bytes of a vector's own allocation.

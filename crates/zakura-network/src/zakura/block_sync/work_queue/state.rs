@@ -734,18 +734,20 @@ impl WorkQueueState {
         Some(released)
     }
 
-    /// End the reservation of the published request that holds `height`,
-    /// recording that another attempt's body answered it. Returns that owner
-    /// and the bytes that left the ledger, or `None` when no published request
-    /// reserves `height`. Pending work has no owner, so it returns `None`.
+    /// End the reservation of the published request that holds `height` for
+    /// `hash`, recording that another attempt's body answered it. Returns that
+    /// owner and the bytes that left the ledger, or `None` when no published
+    /// request reserves `height` for `hash`. Pending work has no owner, so it
+    /// returns `None`. A request reissued for another hash keeps its reservation.
     pub(in crate::zakura::block_sync) fn end_competing_reservation_at_receipt(
         &mut self,
         height: block::Height,
+        hash: block::Hash,
     ) -> Option<(BodyWorkOwner, u64)> {
         let owner = self
             .in_flight
             .get(&height)
-            .filter(|item| !item.provisional)?
+            .filter(|item| !item.provisional && item.hash == hash)?
             .owner?;
         self.end_reservation_at_receipt(owner, height, true)
             .map(|charge| (owner, charge))

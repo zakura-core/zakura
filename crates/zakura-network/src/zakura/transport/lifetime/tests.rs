@@ -225,7 +225,11 @@ fn the_envelope_sums_the_shares_of_every_connection() {
     assert_eq!(envelope.connection_output_bytes, 96 * MIB);
     assert_eq!(envelope.node_raw_bytes, 256 * 48 * MIB);
     assert_eq!(envelope.node_output_bytes, 256 * 96 * MIB);
-    assert_eq!(envelope.compat_response_bytes, 256 * 20 * MIB);
+    assert_eq!(
+        envelope.compat_response_bytes,
+        20 * MIB,
+        "the limits give the exchange bytes for the whole node"
+    );
     assert_eq!(
         envelope.transport_credit_bytes,
         u128::from(256 * (32 + 48 + 16) * MIB + 32 * (32 + 16) * MIB)
@@ -310,7 +314,7 @@ fn compat_exchanges_use_their_connections_own_gate() {
 }
 
 /// One connection's exchange gate holds one worst-case exchange, and the
-/// envelope counts it once per admitted connection.
+/// envelope counts it once per concurrent request of the compatibility client.
 #[test]
 fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     assert_eq!(COMPAT_EXCHANGE_MAX_BYTES, 20 * MIB);
@@ -329,8 +333,10 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
         max_connections: 92,
         max_pending_handshakes: 32,
     };
-    let envelope = ResourceEnvelope::new(limits(COMPAT_EXCHANGE_BUDGET.receive));
-    assert_eq!(envelope.compat_response_bytes, 92 * 20 * MIB);
+    // Widening usize to u64 is lossless on supported targets.
+    let client_requests = crate::zakura::legacy_gossip::LEGACY_CLIENT_REQUEST_SLOTS as u64;
+    let envelope = ResourceEnvelope::new(limits(client_requests * COMPAT_EXCHANGE_MAX_BYTES));
+    assert_eq!(envelope.compat_response_bytes, 288 * 20 * MIB);
     assert_eq!(
         ResourceEnvelope::new(limits(0)).compat_response_bytes,
         0,

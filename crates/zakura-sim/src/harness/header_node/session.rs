@@ -218,7 +218,8 @@ impl SessionEvidence {
     }
 
     /// Feeds one of the reactor's events, keeping the session facts and
-    /// checking both rules.
+    /// checking both rules. Events neither rule reads are ignored, so a tap
+    /// feeds every event.
     pub(crate) fn reactor(&self, event: &ReactorEvent) {
         self.ledger().reactor(event);
     }

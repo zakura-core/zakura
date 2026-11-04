@@ -33,8 +33,8 @@
 //! them to its [`PolicySource`](super::PolicySource), whose triggers count
 //! them.
 //!
-//! Its session admissions and ends, with every start and dispatch, also feed
-//! the tap's [`SessionEvidence`], the reactor's session view. A rule that view
+//! Every event the reactor reports in the run also feeds the tap's
+//! [`SessionEvidence`], the reactor's session view. A rule that view
 //! breaks fails the run at the next drain, as a broken ownership rule does.
 //!
 //! Recording an event takes only std locks, which are never held across any
@@ -238,6 +238,11 @@ impl HeaderSyncObserver for TapObserver {
     fn observe(&self, event: ReactorEvent) {
         let state = &self.0;
         let in_run = zakura_rt::sim::run_id() == Some(state.run);
+        // The session view sees every event and picks what its rules read,
+        // so no second list here can drift from them.
+        if in_run {
+            state.sessions.reactor(&event);
+        }
         // Ownership, reservation and admission events stay out of the
         // observation log, whose format pinned Plans fix.
         if matches!(
@@ -258,17 +263,6 @@ impl HeaderSyncObserver for TapObserver {
             }
             _ => None,
         };
-        if in_run
-            && matches!(
-                event,
-                ReactorEvent::SessionAdmitted { .. }
-                    | ReactorEvent::SessionEnded { .. }
-                    | ReactorEvent::Started { .. }
-                    | ReactorEvent::Dispatched { .. }
-            )
-        {
-            state.sessions.reactor(&event);
-        }
         if let Some(effect) = effect {
             // Only a live reactor reserves or admits, so neither happens in
             // the run's own shutdown.

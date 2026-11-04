@@ -318,3 +318,48 @@ fn a_kept_repair_may_apply_once() {
         );
     }
 }
+
+/// The tap feeds the view every event, retirements included: a repair that
+/// retires before or after its session leaves loses its apply, and one that
+/// doesn't keeps it, when the events reach the view through a real tap.
+#[test]
+fn the_tap_feeds_retirements_to_the_view() {
+    let left = || ReactorEvent::SessionEnded {
+        peer: mirror(),
+        session_id: 1,
+        reason: "test",
+    };
+    let first = || admitted(1, None, origin(1));
+    let prepare = || dispatched(false, repair(1));
+    let apply = || dispatched(true, repair(1));
+    for (events, legal) in [
+        (vec![first(), prepare(), left(), apply()], true),
+        (
+            vec![first(), prepare(), retired(repair(1)), left(), apply()],
+            false,
+        ),
+        (
+            vec![first(), prepare(), left(), retired(repair(1)), apply()],
+            false,
+        ),
+    ] {
+        let mut sim = crate::Sim::new(
+            crate::harness::header_sync::storage_config(),
+            crate::PlanInput::Bytes(Vec::new()),
+        );
+        let port = Arc::new(zakura_storage::header::controlled::ControlledPort::new(
+            &zakura_storage::header::fixture::HeaderFixture::regtest(),
+        ));
+        let view = linked(&[1]);
+        let (observer, _tap) =
+            super::super::tap::ReactorTap::with_sessions(&mut sim, &port, "node", view.clone());
+        for event in &events {
+            observer.observe(event.clone());
+        }
+        let why = view.broken();
+        assert_eq!(why.is_none(), legal, "{why:?} after {events:?}");
+        if let Some(why) = why {
+            assert!(why.starts_with("DepartedSessionWork:"), "{why}");
+        }
+    }
+}

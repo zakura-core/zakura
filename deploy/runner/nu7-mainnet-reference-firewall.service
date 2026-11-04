@@ -1,0 +1,11 @@
+[Unit]
+Description=Restrict NU7 Mainnet reference port to collector and localhost
+Before=nu7-mainnet-reference.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/zakura/nu7-mainnet-reference.nft
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

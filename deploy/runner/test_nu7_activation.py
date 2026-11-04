@@ -484,6 +484,51 @@ class MainnetTransitionTests(unittest.TestCase):
         self.assertIsNone(payload["capabilities"]["faucet"])
         self.assertIn("mainnetReorgObservation", self.feed.state)
 
+    def test_checked_in_mainnet_artifacts_produce_complete_rules(self):
+        directory = Path(__file__).parent
+        settings = json.loads((directory / "nu7-mainnet-profile.json").read_text())
+        settings["protocolReferenceFile"] = str((directory / "nu7-mainnet-protocol-reference.json").resolve())
+        self.feed.config["mainnet"] = settings
+        self.feed.validate_config()
+        self.feed.mainnet_protocol_reference = self.feed.load_protocol_reference(settings["protocolReferenceFile"])
+        rules = self.feed.consolidated_rules({"height": 3543407, "url": "http://main0",
+            "consensus": {"chaintip": "77190ad9", "nextblock": "77190ad9"}}, "mainnet")
+        self.assertIsNotNone(rules)
+        self.assertEqual(rules["atTip"]["nsmReissuanceHeight"], 8939664)
+        self.assertEqual(rules["atTip"]["minimumProtocolVersion"], 170190)
+        self.assertEqual(rules["atTip"]["powLimit"], "0007ffff" + "0" * 56)
+        self.assertIsNone(rules["atTip"]["minimumDifficulty"]["thresholdSeconds"])
+        self.assertFalse(settings["armed"])
+
+    def test_mainnet_waits_through_activation_and_two_confirmations(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        for height in (199, 200, 201):
+            self.mainnet_height = height
+            for _ in range(3):
+                self.poll()
+            self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.mainnet_height = 202
+        self.poll(); self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "mainnet")
+
+    def test_two_mainnet_validators_and_reference_can_select_with_one_node_down(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        original_rpc = self.feed.rpc
+        def one_node_down(url, method, params=None):
+            if url == "http://main2":
+                raise OSError("one validator unavailable")
+            return original_rpc(url, method, params)
+        self.feed.rpc = one_node_down
+        for _ in range(3):
+            self.poll()
+        payload = self.feed.response()[1]
+        self.assertEqual(payload["selectedProfile"], "mainnet")
+        self.assertEqual(payload["status"]["observation"]["validatorsAgreeing"], 2)
+
     def test_wrong_network_or_missing_protocol_reference_prevents_switch(self):
         self.activate_testnet()
         self.feed.config["mainnet"]["armed"] = True

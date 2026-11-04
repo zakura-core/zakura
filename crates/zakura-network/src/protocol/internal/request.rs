@@ -48,23 +48,41 @@ pub struct AdvertisedBlock {
     /// The block's serialized size in bytes, if known. Legacy gossip sizes the broadcast's
     /// advert window from it.
     pub size: Option<u32>,
+    /// Set for a block this node submitted that the chain has not committed yet. The chain can
+    /// still reject it, so it is announced to the peers connected now but not kept for peers that
+    /// connect later.
+    pub submitted: bool,
 }
 
 impl AdvertisedBlock {
-    /// Returns an advertisement of the block with `hash` and serialized `size`.
+    /// Returns an advertisement of the committed block with `hash` and serialized `size`.
     pub fn new(hash: block::Hash, size: usize) -> Self {
         Self {
             hash,
             // A size that does not fit is unknown, rather than a misleadingly small block.
             size: u32::try_from(size).ok(),
+            submitted: false,
+        }
+    }
+
+    /// Returns an advertisement of the submitted, not yet committed, block with `hash` and
+    /// serialized `size`.
+    pub fn submitted(hash: block::Hash, size: usize) -> Self {
+        Self {
+            submitted: true,
+            ..Self::new(hash, size)
         }
     }
 }
 
 impl From<block::Hash> for AdvertisedBlock {
-    /// Returns an advertisement of the block with `hash` and unknown size.
+    /// Returns an advertisement of the committed block with `hash` and unknown size.
     fn from(hash: block::Hash) -> Self {
-        Self { hash, size: None }
+        Self {
+            hash,
+            size: None,
+            submitted: false,
+        }
     }
 }
 

@@ -127,8 +127,44 @@ where
         T::Error: Send + Sync,
         Request: Send + 'static,
     {
-        let (mut batch, worker) =
-            Self::pair(service, max_items_weight_in_batch, max_batches, max_latency);
+        Self::new_with_idle(
+            service,
+            max_items_weight_in_batch,
+            max_batches,
+            max_latency,
+            max_latency,
+        )
+    }
+
+    /// Like [`Batch::new`], but a partial batch waits for more items only when they are
+    /// expected before `max_latency`.
+    ///
+    /// Items that arrive at most `max_idle` apart are one burst, such as one caller's items.
+    /// When bursts are too far apart to reach the batch before `max_latency`, a partial batch
+    /// flushes once no item has arrived for `max_idle`, because waiting would not grow it.
+    /// When bursts arrive faster, it waits for them, flushing early only after several mean
+    /// burst gaps without an item.
+    pub fn new_with_idle(
+        service: T,
+        max_items_weight_in_batch: usize,
+        max_batches: impl Into<Option<usize>>,
+        max_latency: std::time::Duration,
+        max_idle: std::time::Duration,
+    ) -> Self
+    where
+        T: Send + 'static,
+        T::Future: Send,
+        T::Response: Send,
+        T::Error: Send + Sync,
+        Request: Send + 'static,
+    {
+        let (mut batch, worker) = Self::pair_with_idle(
+            service,
+            max_items_weight_in_batch,
+            max_batches,
+            max_latency,
+            max_idle,
+        );
 
         let span = info_span!("batch worker", kind = std::any::type_name::<T>());
 
@@ -149,6 +185,28 @@ where
         max_items_weight_in_batch: usize,
         max_batches: impl Into<Option<usize>>,
         max_latency: std::time::Duration,
+    ) -> (Self, Worker<T, Request>)
+    where
+        T: Send + 'static,
+        T::Error: Send + Sync,
+        Request: Send + 'static,
+    {
+        Self::pair_with_idle(
+            service,
+            max_items_weight_in_batch,
+            max_batches,
+            max_latency,
+            max_latency,
+        )
+    }
+
+    /// Like [`Batch::pair`], with the early flushes of [`Batch::new_with_idle`].
+    pub fn pair_with_idle(
+        service: T,
+        max_items_weight_in_batch: usize,
+        max_batches: impl Into<Option<usize>>,
+        max_latency: std::time::Duration,
+        max_idle: std::time::Duration,
     ) -> (Self, Worker<T, Request>)
     where
         T: Send + 'static,
@@ -189,6 +247,7 @@ where
             max_items_weight_in_batch,
             max_batches,
             max_latency,
+            max_idle,
             semaphore.clone(),
         );
 

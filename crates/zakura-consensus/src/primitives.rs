@@ -23,6 +23,11 @@ const MAX_BATCH_SIZE: usize = 64;
 /// The maximum latency bound for any of the batch verifiers.
 const MAX_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The longest gap between one caller's items in a batch verifier, and so how long a partial
+/// batch waits once its callers' items stop, when no other caller is expected before
+/// [`MAX_BATCH_LATENCY`]. See [`batch_control::Batch::new_with_idle`].
+const MAX_BATCH_IDLE: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Forgets every shielded bundle verification this process has cached.
 ///
 /// # Benchmarks only

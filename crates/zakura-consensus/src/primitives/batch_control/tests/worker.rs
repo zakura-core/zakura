@@ -432,3 +432,161 @@ async fn overflowing_request_weight_still_flushes() {
         .expect("heavy item response should complete")
         .expect("heavy item should verify");
 }
+
+/// A partial batch flushes once no item has arrived for the idle bound, long before its
+/// latency bound.
+#[tokio::test]
+async fn idle_partial_batch_flushes_before_its_latency() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<BatchControl<()>, ()>();
+    // A batch this large and slow only flushes early through the idle bound.
+    let (mut service, worker) = Batch::pair_with_idle(
+        service,
+        100,
+        1,
+        Duration::from_secs(1000),
+        Duration::from_millis(10),
+    );
+    tokio::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let response = service.call(());
+
+    let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("item should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Item(())));
+    send_item.send_response(());
+
+    let (request, send_flush) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("the idle bound should flush the partial batch")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Flush));
+    send_flush.send_response(());
+
+    timeout(Duration::from_secs(5), response)
+        .await
+        .expect("item response should complete")
+        .expect("item should verify");
+}
+
+/// Without an idle bound, a partial batch waits for its latency bound.
+#[tokio::test]
+async fn partial_batch_without_idle_bound_waits_for_its_latency() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<BatchControl<()>, ()>();
+    let (mut service, worker) = Batch::pair(service, 100, 1, Duration::from_secs(1000));
+    tokio::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let _response = service.call(());
+
+    let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("item should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Item(())));
+    send_item.send_response(());
+
+    assert!(
+        timeout(Duration::from_millis(200), handle.next_request())
+            .await
+            .is_err(),
+        "the batch must not flush before its latency bound"
+    );
+}
+
+/// Answers every request the inner service gets, and reports when each flush arrives and how
+/// many items its batch had.
+fn answer_all(
+    mut handle: mock::Handle<BatchControl<()>, ()>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(tokio::time::Instant, usize)> {
+    let (flushes, receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut items = 0;
+        while let Some((request, response)) = handle.next_request().await {
+            match request {
+                BatchControl::Item(()) => items += 1,
+                BatchControl::Flush => {
+                    let _ = flushes.send((tokio::time::Instant::now(), items));
+                    items = 0;
+                }
+            }
+            response.send_response(());
+        }
+    });
+    receiver
+}
+
+/// Callers that arrive steadily, but further apart than the idle bound, share batches instead
+/// of each flushing alone. Once they stall, the batch flushes without waiting for its latency
+/// bound, and after a long pause, a lone caller flushes after the idle bound.
+#[tokio::test(start_paused = true)]
+async fn steady_callers_share_batches_and_sparse_callers_flush_alone() {
+    use tokio::time::{sleep, Instant};
+    let _init_guard = zakura_test::init();
+
+    const IDLE: Duration = Duration::from_millis(5);
+    const CALLER_GAP: Duration = Duration::from_millis(10);
+
+    let (service, handle) = mock::pair::<BatchControl<()>, ()>();
+    let (mut service, worker) =
+        Batch::pair_with_idle(service, 1000, 1, Duration::from_millis(100), IDLE);
+    tokio::spawn(worker.run());
+    let mut flushes = answer_all(handle);
+    let mut responses = Vec::new();
+
+    let mut last_call = Instant::now();
+    for _ in 0..40 {
+        service.ready().await.unwrap();
+        responses.push(service.call(()));
+        last_call = Instant::now();
+        sleep(CALLER_GAP).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+
+    let mut batches = Vec::new();
+    while let Ok(flush) = flushes.try_recv() {
+        batches.push(flush);
+    }
+    let sizes: Vec<usize> = batches.iter().map(|(_, size)| *size).collect();
+    assert_eq!(
+        sizes.iter().sum::<usize>(),
+        40,
+        "every item is flushed: {sizes:?}"
+    );
+    // The first caller has no history to batch with, so it flushes alone.
+    assert_eq!(sizes[0], 1, "{sizes:?}");
+    let steady = &sizes[1..sizes.len() - 1];
+    assert!(
+        steady.iter().all(|&size| size >= 8),
+        "steady callers should fill batches until the latency bound: {sizes:?}",
+    );
+
+    let (last_flush, _) = *batches.last().expect("batches were flushed");
+    let stall = last_flush - last_call;
+    assert!(
+        stall <= 4 * CALLER_GAP,
+        "a stalled batch should flush after a few caller gaps, took {stall:?}",
+    );
+
+    sleep(Duration::from_secs(10)).await;
+    service.ready().await.unwrap();
+    let lone_call = Instant::now();
+    responses.push(service.call(()));
+    let (flushed_at, size) = flushes.recv().await.expect("the lone item is flushed");
+    assert_eq!(size, 1);
+    assert_eq!(flushed_at - lone_call, IDLE);
+
+    for response in responses {
+        response.await.expect("every item verifies");
+    }
+}

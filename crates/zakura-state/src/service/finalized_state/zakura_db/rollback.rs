@@ -1328,11 +1328,10 @@ fn reset_tachyon_indexes(
     };
     for height in (window.start().0..=window.end().0).map(Height) {
         let block = db
-            .block(height.into())
+            .stored_block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         for tachygram in block
-            .transactions
-            .iter()
+            .transactions()
             .flat_map(|transaction| transaction.tachyon_tachygrams())
         {
             batch.zs_insert(&tachygrams, tachygram, height);

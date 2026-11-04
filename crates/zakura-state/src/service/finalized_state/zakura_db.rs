@@ -245,20 +245,6 @@ impl ZakuraDb {
             }
         }
 
-        // Format 31 contains pre-fee bundles and different Poseidon commitments. Never
-        // relabel those bytes as format 32, even though production format 30 is reusable.
-        #[cfg(zcash_unstable = "nutachyon")]
-        if !config.ephemeral && format_version_in_code.major == 32 {
-            let old_path = config.db_path(&db_kind, 31, network);
-            if disk_version
-                .as_ref()
-                .is_some_and(|version| version.major == 31)
-                || (disk_version.is_none() && old_path.exists())
-            {
-                return Err(StateInitError::TachyonResetRequired { path: old_path });
-            }
-        }
-
         let disk_version = if read_only {
             disk_version
         } else {

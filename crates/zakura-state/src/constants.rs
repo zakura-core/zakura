@@ -107,15 +107,16 @@ const DATABASE_FORMAT_VERSION: u64 = RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VE
 
 /// Reserved for NuTachyon databases derived from production database format 30.
 ///
-/// This reservation prevents a future production format from giving version 32 a
+/// This reservation prevents a future production format from giving version 31 a
 /// different meaning while NuTachyon development remains out of tree.
-const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 32;
+/// This experimental format may change before release; incompatible updates require
+/// resetting the private testnet rather than migrating its ledger.
+const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 31;
 
 #[cfg(not(zcash_unstable = "nutachyon"))]
 const _: () = assert!(
-    DATABASE_FORMAT_VERSION != 31
-        && DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
-    "production database format conflicts with reserved NuTachyon major versions 31 or 32",
+    DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
+    "production database format conflicts with reserved NuTachyon major version 31",
 );
 
 /// The database format minor version, incremented each time the on-disk database format has a
@@ -126,8 +127,6 @@ const _: () = assert!(
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
-/// Version 32 stores fee-aware Tachyon bundles and the new Poseidon commitments.
-/// Production format 30 can be upgraded; experimental Tachyon format 31 requires a reset.
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a

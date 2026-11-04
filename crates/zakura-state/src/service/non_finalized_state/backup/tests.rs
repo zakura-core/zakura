@@ -29,7 +29,7 @@ fn cross_build_database_upgrade() {
     let network = Network::Mainnet;
     let backup_dir = config.non_finalized_state_backup_dir(&network).unwrap();
     let ordinary_path = config.db_path(STATE_DATABASE_KIND, 30, &network);
-    let tachyon_path = config.db_path(STATE_DATABASE_KIND, 32, &network);
+    let tachyon_path = config.db_path(STATE_DATABASE_KIND, 31, &network);
     let writer = DatabaseWriterMetadata::new(
         "Zakura",
         if cfg!(zcash_unstable = "nutachyon") {
@@ -106,7 +106,7 @@ fn cross_build_database_upgrade() {
         let mut state =
             FinalizedState::new_with_database_writer_metadata(&config, &network, writer.clone())
                 .unwrap();
-        assert_eq!(state_database_format_version_in_code().major, 32);
+        assert_eq!(state_database_format_version_in_code().major, 31);
         assert!(
             !ordinary_path.exists(),
             "upgrade reuses the ordinary database"
@@ -161,26 +161,4 @@ fn stored_balance_width(state: &FinalizedState) -> usize {
     let db = state.db.header_chain_disk_db();
     let cf = db.cf_handle("tip_chain_value_pool").unwrap();
     db.raw_get_cf(&cf, &[]).unwrap().unwrap().len()
-}
-
-#[cfg(zcash_unstable = "nutachyon")]
-#[test]
-fn old_tachyon_format_requires_reset_without_renaming_it() {
-    let _guard = zakura_test::init();
-    let directory = tempfile::tempdir().unwrap();
-    let config = Config {
-        cache_dir: directory.path().to_owned(),
-        ephemeral: false,
-        ..Config::default()
-    };
-    let network = Network::Mainnet;
-    let old_path = config.db_path(STATE_DATABASE_KIND, 31, &network);
-    std::fs::create_dir_all(&old_path).unwrap();
-    let result = FinalizedState::new(&config, &network);
-    assert!(matches!(
-        result,
-        Err(crate::error::StateInitError::TachyonResetRequired { .. })
-    ));
-    assert!(old_path.exists());
-    assert!(!config.db_path(STATE_DATABASE_KIND, 32, &network).exists());
 }

@@ -173,11 +173,6 @@ fn format_upgrades(
             "add Tachyon state and widen chain value balance and history entries",
             Version::new(31, 0, 0),
         )),
-        #[cfg(zcash_unstable = "nutachyon")]
-        Box::new(no_migration::NoMigration::new(
-            "use fee-aware Tachyon bundles and updated Poseidon domains",
-            Version::new(32, 0, 0),
-        )),
     ]
     .into_iter()
     .filter(move |upgrade| upgrade.version() > min_version())
@@ -1188,7 +1183,7 @@ fn vct_format_changes_include_root_auth_and_node_metadata_updates() {
     assert_eq!(
         upgrades.len(),
         if cfg!(zcash_unstable = "nutachyon") {
-            13
+            12
         } else {
             10
         }
@@ -1208,7 +1203,6 @@ fn vct_format_changes_include_root_auth_and_node_metadata_updates() {
         assert_eq!(upgrades[9].version(), Version::new(29, 1, 0));
         assert_eq!(upgrades[10].version(), Version::new(30, 0, 0));
         assert_eq!(upgrades[11].version(), Version::new(31, 0, 0));
-        assert_eq!(upgrades[12].version(), Version::new(32, 0, 0));
         assert!(upgrades[11].is_reusable_major_upgrade());
     }
     #[cfg(not(zcash_unstable = "nutachyon"))]

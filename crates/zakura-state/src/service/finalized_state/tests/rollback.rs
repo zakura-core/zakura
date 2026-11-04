@@ -658,23 +658,28 @@ fn tachyon_v7_tx(tachygram: zcash_tachyon::Tachygram) -> Arc<Transaction> {
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: None,
-        tachyon_shielded_data: Some(TachyonShieldedData(TachyonBundle::Proven(Bundle {
-            actions: Vec::new(),
-            value_balance: value::Balance::ZERO,
-            binding_sig: bundle::Signature::read(&[0x02; 64][..])
-                .expect("test signature bytes are canonical"),
-            memo: Vec::new(),
-            stamp: ProofStamp {
-                coverage: [0; 32],
-                tachygram_set: [tachygram]
-                    .into_iter()
-                    .collect::<TachygramSetPoly>()
-                    .commit(),
-                tachygrams: [tachygram].into_iter().collect(),
-                anchor: Anchor::read(&[0; 32][..]).expect("the zero anchor is canonical"),
-                proof: Box::new(ragu::Proof::trivial()),
+        tachyon_shielded_data: Some(Box::new(TachyonShieldedData(TachyonBundle::Proven(
+            Bundle {
+                actions: Vec::new(),
+                value_balance: value::Balance::ZERO,
+                fee_max_commitment: value::Trapdoor::random(&mut rand_10::rng())
+                    .commit(value::Positive::ZERO),
+                binding_sig: bundle::Signature::read(&[0x02; 64][..])
+                    .expect("test signature bytes are canonical"),
+                memo: Vec::new(),
+                stamp: ProofStamp {
+                    fee: value::Positive::ZERO,
+                    coverage: [0; 32],
+                    tachygram_set: [tachygram]
+                        .into_iter()
+                        .collect::<TachygramSetPoly>()
+                        .commit(),
+                    tachygrams: [tachygram].into_iter().collect(),
+                    anchor: Anchor::read(&[0; 32][..]).expect("the zero anchor is canonical"),
+                    proof: Box::new(ragu::Proof::bootstrap()),
+                },
             },
-        }))),
+        )))),
     })
 }
 

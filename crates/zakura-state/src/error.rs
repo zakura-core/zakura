@@ -305,14 +305,6 @@ pub enum StateInitError {
         running_version: semver::Version,
     },
 
-    /// Experimental Tachyon data predates the fee-aware bundle and commitment formats.
-    #[cfg(zcash_unstable = "nutachyon")]
-    #[error("incompatible experimental Tachyon database at {path:?}; format 31 cannot be upgraded to format 32. Start this test network from a fresh state directory and re-genesis it")]
-    TachyonResetRequired {
-        /// The incompatible database that must not be reused.
-        path: PathBuf,
-    },
-
     /// A database that stopped building transparent address indexes was opened in archive storage mode.
     ///
     /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot

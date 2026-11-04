@@ -74,6 +74,14 @@ class QualifyTests(unittest.TestCase):
         self.receipt("mainnet", "v6.20.0-44f29cd")
         self.assertEqual(json.dumps(self.config, sort_keys=True), before)
 
+    def test_explicit_source_pin_allows_an_independently_pinned_joining_build(self):
+        self.config["mainnet"]["manifest"]["nodeRevision"] = "c" * 40
+        self.config["mainnet"]["nodes"][0]["expectedRevision"] = "a" * 40
+        receipt = self.receipt("mainnet", "v6.20.0-44f29cd")
+        self.assertTrue(receipt["prepared"])
+        self.assertTrue(receipt["sourceRevisionsMatch"])
+        self.assertFalse(receipt["manifestRevisionMatches"])
+
 
 if __name__ == "__main__":
     unittest.main()

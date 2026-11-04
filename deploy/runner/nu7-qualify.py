@@ -55,9 +55,15 @@ def qualify(config, profile, expected_revision=None):
     receipt["activationReferencePrepared"] = bool(receipt["preparedChainAgreement"] and receipt["referenceNu7ScheduleVerified"])
     receipt["manifestRevisionMatches"] = bool(nodes) and all(
         revision[:9] in str(n.get("buildVersion", "")).lower() for n in nodes)
+    # A rolling release can legitimately differ from the published joining build.
+    # Explicit source pins retain build verification during that transition.
+    receipt["sourceRevisionsMatch"] = bool(nodes) and all(
+        re.fullmatch(r"[0-9a-f]{40}", source.get("expectedRevision", revision))
+        and source.get("expectedRevision", revision)[:9] in str(node.get("buildVersion", "")).lower()
+        for source, node in zip(settings["nodes"], nodes))
     receipt["prepared"] = bool(receipt["preparedChainAgreement"] and
         (not expected_revision or receipt["manifestRevisionMatches"]) and
-        (profile != "mainnet" or receipt["activationReferencePrepared"] and receipt["manifestRevisionMatches"]))
+        (profile != "mainnet" or receipt["activationReferencePrepared"] and receipt["sourceRevisionsMatch"]))
     return receipt
 
 

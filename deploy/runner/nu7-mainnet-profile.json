@@ -20,14 +20,17 @@
   "nodes": [
     {
       "name": "us-0",
+      "expectedRevision": "d7b2e2cc4379e80ba66005f6e8aac33c75d06514",
       "rpcUrl": "http://104.131.184.123:8232/"
     },
     {
       "name": "us-west-0",
+      "expectedRevision": "d7b2e2cc4379e80ba66005f6e8aac33c75d06514",
       "rpcUrl": "http://143.244.184.176:8232/"
     },
     {
       "name": "canada-0",
+      "expectedRevision": "bbe9e73d121423292be4534477b3f9e4fcc251ff",
       "rpcUrl": "http://159.203.38.10:8232/"
     }
   ],

@@ -319,8 +319,11 @@ python3 /opt/zakura-nu7-status/nu7-qualify.py --profile mainnet
 ```
 
 Repeat qualification after source progress. Require `prepared`,
-`activationReferencePrepared`, and `manifestRevisionMatches`, and verify the
-common height advances. Mainnet qualification checks the reference's pinned
+`activationReferencePrepared`, and `sourceRevisionsMatch`, and verify the
+common height advances. Each source's `expectedRevision` pins its deployed
+build separately from the joining manifest during rolling upgrades. Verify
+protocol compatibility before updating a source pin. `manifestRevisionMatches`
+continues to report whether all sources use the joining build. Mainnet qualification checks the reference's pinned
 build and minimum protocol version in the profile. It exits nonzero on a
 mismatch, while pending NU7 before activation is expected. Qualification never
 opens or rewrites the selector state. The default Testnet qualifier remains

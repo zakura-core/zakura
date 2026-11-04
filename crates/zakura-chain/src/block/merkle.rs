@@ -139,7 +139,8 @@ fn hash(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
     w.finish()
 }
 
-/// Merkle levels with at least this many nodes hash their pairs on the rayon pool.
+/// [`Root::from_hashes_in_parallel`] hashes Merkle levels with at least this many nodes on the
+/// rayon pool.
 ///
 /// Each pair costs about a microsecond without SHA instructions, so smaller levels stay serial.
 const PARALLEL_MERKLE_LEVEL_MIN: usize = 256;
@@ -150,6 +151,47 @@ fn hash_pair(chunk: &[[u8; 32]]) -> [u8; 32] {
         [h1, h2] => hash(h1, h2),
         [h1] => hash(h1, h1),
         _ => unreachable!("chunks(2)"),
+    }
+}
+
+/// Reduces Merkle leaves to their root, hashing levels with at least `parallel_min` nodes on the
+/// rayon pool.
+///
+/// # Panics
+///
+/// When `level` is empty.
+fn root_from_leaves(mut level: Vec<[u8; 32]>, parallel_min: usize) -> [u8; 32] {
+    use rayon::prelude::*;
+
+    while level.len() > 1 {
+        level = if level.len() >= parallel_min {
+            level
+                .par_chunks(2)
+                .with_min_len(PARALLEL_MERKLE_LEVEL_MIN / 8)
+                .map(hash_pair)
+                .collect()
+        } else {
+            level.chunks(2).map(hash_pair).collect()
+        };
+    }
+    level[0]
+}
+
+impl Root {
+    /// Builds the same root as collecting `hashes`, hashing levels with at least
+    /// [`PARALLEL_MERKLE_LEVEL_MIN`] nodes on the rayon pool.
+    ///
+    /// It blocks until the pool runs that work, so async code should call it from a blocking
+    /// thread.
+    ///
+    /// # Panics
+    ///
+    /// When `hashes` is empty. Every block has a coinbase transaction.
+    pub fn from_hashes_in_parallel(hashes: &[transaction::Hash]) -> Self {
+        Self(root_from_leaves(
+            hashes.iter().map(|hash| hash.0).collect(),
+            PARALLEL_MERKLE_LEVEL_MIN,
+        ))
     }
 }
 
@@ -226,21 +268,10 @@ impl std::iter::FromIterator<transaction::Hash> for Root {
     where
         I: IntoIterator<Item = transaction::Hash>,
     {
-        use rayon::prelude::*;
-
-        let mut hashes = hashes.into_iter().map(|hash| hash.0).collect::<Vec<_>>();
-        while hashes.len() > 1 {
-            hashes = if hashes.len() >= PARALLEL_MERKLE_LEVEL_MIN {
-                hashes
-                    .par_chunks(2)
-                    .with_min_len(PARALLEL_MERKLE_LEVEL_MIN / 8)
-                    .map(hash_pair)
-                    .collect()
-            } else {
-                hashes.chunks(2).map(hash_pair).collect()
-            };
-        }
-        Self(hashes[0])
+        Self(root_from_leaves(
+            hashes.into_iter().map(|hash| hash.0).collect(),
+            usize::MAX,
+        ))
     }
 }
 
@@ -443,31 +474,31 @@ mod tests {
         }
     }
 
-    /// Trees large enough to take the parallel level path get the same root as a serial build,
-    /// including odd-sized levels that pair their last node with itself.
+    /// Trees large enough to take the parallel level path get the same root as the serial
+    /// builder, including odd-sized levels that pair their last node with itself.
     #[test]
-    fn parallel_levels_match_serial_root() {
+    fn parallel_root_matches_serial_root() {
         for leaves in [
+            1,
             PARALLEL_MERKLE_LEVEL_MIN - 1,
             PARALLEL_MERKLE_LEVEL_MIN,
             PARALLEL_MERKLE_LEVEL_MIN + 1,
             2_301,
         ] {
-            let hashes: Vec<[u8; 32]> = (0..leaves)
+            let hashes: Vec<transaction::Hash> = (0..leaves)
                 .map(|i| {
                     let mut leaf = [0; 32];
                     leaf[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
-                    leaf
+                    transaction::Hash(leaf)
                 })
                 .collect();
 
-            let mut level = hashes.clone();
-            while level.len() > 1 {
-                level = level.chunks(2).map(hash_pair).collect();
-            }
-
-            let root: Root = hashes.into_iter().map(transaction::Hash).collect();
-            assert_eq!(root.0, level[0], "{leaves} leaves");
+            let serial: Root = hashes.iter().copied().collect();
+            assert_eq!(
+                Root::from_hashes_in_parallel(&hashes),
+                serial,
+                "{leaves} leaves"
+            );
         }
     }
 

@@ -51,7 +51,8 @@ const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Bounds the failure-path read that checks a body's authorizing data binding.
 const AUTH_DATA_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Blocks with at least this many transactions hash their transaction IDs on the rayon pool.
+/// Blocks with at least this many transactions hash their transaction IDs and Merkle tree on the
+/// rayon pool, from a blocking thread.
 ///
 /// Smaller blocks hash in well under a millisecond, so they stay on the calling thread rather than
 /// wait on a pool shared with proof verification.
@@ -569,20 +570,34 @@ where
                 // Precomputing this avoids duplicating transaction hash computations.
                 let transaction_hashes: Arc<[_]> =
                     if block.view().transactions().len() >= PARALLEL_TRANSACTION_HASH_MIN {
-                        use rayon::prelude::*;
+                        let block = block.clone();
+                        let network = network.clone();
+                        // Waiting on the shared rayon pool would otherwise hold this async worker.
+                        tokio::task::spawn_blocking(move || {
+                            use rayon::prelude::*;
 
-                        block
-                            .view()
-                            .parallel_transactions()
-                            .with_min_len(PARALLEL_TRANSACTION_HASH_MIN / 4)
-                            .map(|t| t.hash())
-                            .collect::<Vec<_>>()
-                            .into()
+                            let transaction_hashes: Arc<[_]> = block
+                                .view()
+                                .parallel_transactions()
+                                .with_min_len(PARALLEL_TRANSACTION_HASH_MIN / 4)
+                                .map(|t| t.hash())
+                                .collect::<Vec<_>>()
+                                .into();
+                            check::merkle_root_validity_in_parallel(
+                                &network,
+                                &block,
+                                &transaction_hashes,
+                            )
+                            .map(|()| transaction_hashes)
+                        })
+                        .await
+                        .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))?
                     } else {
-                        block.view().transactions().map(|t| t.hash()).collect()
+                        let transaction_hashes: Arc<[_]> =
+                            block.view().transactions().map(|t| t.hash()).collect();
+                        check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+                        transaction_hashes
                     };
-
-                check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 
                 // Since errors cause an early exit, try to do the
                 // quick checks first.

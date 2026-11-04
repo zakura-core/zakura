@@ -33,7 +33,11 @@ columns stay empty until the instrumented node runs, and the page says so.
   difficulty consensus required for it, recomputed from the stored headers by
   `nu7_daa.py`, a bit-exact Python copy of the node's adjustment rule. A block
   whose `bits` differ is a `daa_mismatch` event. The first start backfills
-  2016 blocks (about 42 h before NU7) as the miner baseline.
+  2016 blocks (about 42 h before NU7) as the miner baseline. The miners table
+  marks each miner `active` (a block within the last hour), `inactive` (a
+  block within 7 days but none for over an hour) or `gone` (nothing in 7
+  days), and separately checks its recent block count against its baseline
+  share.
 - After every new tip the collector estimates the hashrate (work over time,
   the same arithmetic as `getnetworksolps`), the next block's difficulty, the
   expected block time at the tip, and projects difficulty and block time 1500

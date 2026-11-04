@@ -14,6 +14,11 @@ from __future__ import annotations
 import math
 import re
 
+# A miner is active while its newest block is at most this old, and inactive
+# when it mined within SEEN_WITHIN_SECONDS but not within ACTIVE_WITHIN_SECONDS.
+ACTIVE_WITHIN_SECONDS = 3600
+SEEN_WITHIN_SECONDS = 7 * 86400
+
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{4,}")
 MINED_BY = re.compile(r"mined by ([A-Za-z0-9_.-]+)", re.IGNORECASE)
 
@@ -123,34 +128,67 @@ def miner_status(baseline_share, recent_blocks, recent_total):
     return "ok"
 
 
-def miner_table(baseline, recent, now):
-    """Rows for the miners table, baseline miners first by share, then new miners."""
+def miner_activity(last_seen_seconds):
+    """active, inactive or gone from the age of a miner's newest block.
+
+    `active`: a block within the last hour. `inactive`: a block within the
+    last week but none for over an hour. `gone`: nothing in a week, or never
+    seen. A small miner can go an hour without a block by chance; the share
+    check (`miner_status`) says whether a gap is statistically unusual.
+    """
+    if last_seen_seconds is None or last_seen_seconds > SEEN_WITHIN_SECONDS:
+        return "gone"
+    if last_seen_seconds > ACTIVE_WITHIN_SECONDS:
+        return "inactive"
+    return "active"
+
+
+def _latest(*entries):
+    """The (lastHeight, lastTime) of the newest block among share entries."""
+    best = (None, None)
+    for entry in entries:
+        if entry and entry.get("lastHeight") is not None and (best[0] is None or entry["lastHeight"] > best[0]):
+            best = (entry["lastHeight"], entry.get("lastTime"))
+    return best
+
+
+def miner_table(baseline, recent, week, now):
+    """Rows for the miners table: baseline miners first by share, then the rest by blocks this week.
+
+    `week` holds the shares over the last SEEN_WITHIN_SECONDS, so every miner
+    seen in that time has a row and an activity.
+    """
+    empty = {"blocks": 0, "share": 0.0, "lastHeight": None, "lastTime": None}
     rows = []
     seen = set()
-    for miner, entry in sorted(baseline["miners"].items(), key=lambda item: -item[1]["blocks"]):
-        seen.add(miner)
-        current = recent["miners"].get(miner, {"blocks": 0, "share": 0.0, "lastHeight": None, "lastTime": None})
-        last_time = current.get("lastTime") or entry.get("lastTime")
-        rows.append({
+
+    def row(miner, base, current, weekly, status):
+        last_height, last_time = _latest(weekly, current, base)
+        last_seen = (now - last_time) if last_time else None
+        return {
             "miner": miner,
-            "baselineShare": entry["share"],
-            "baselineBlocks": entry["blocks"],
+            "baselineShare": base["share"] if base else None,
+            "baselineBlocks": base["blocks"] if base else 0,
             "recentShare": current.get("share") or 0.0,
             "recentBlocks": current["blocks"],
-            "lastHeight": current.get("lastHeight") or entry.get("lastHeight"),
-            "lastSeenSeconds": (now - last_time) if last_time else None,
-            "status": miner_status(entry["share"], current["blocks"], recent["blocks"]),
-        })
-    for miner, entry in sorted(recent["miners"].items(), key=lambda item: -item[1]["blocks"]):
+            "weekBlocks": weekly["blocks"],
+            "lastHeight": last_height,
+            "lastSeenSeconds": last_seen,
+            "activity": miner_activity(last_seen),
+            "status": status,
+        }
+
+    for miner, entry in sorted(baseline["miners"].items(), key=lambda item: -item[1]["blocks"]):
+        seen.add(miner)
+        current = recent["miners"].get(miner, empty)
+        rows.append(row(miner, entry, current, week["miners"].get(miner, empty),
+                        miner_status(entry["share"], current["blocks"], recent["blocks"])))
+    others = {**week["miners"], **{m: e for m, e in recent["miners"].items() if m not in week["miners"]}}
+    for miner, weekly in sorted(others.items(), key=lambda item: -item[1]["blocks"]):
         if miner in seen:
             continue
-        rows.append({
-            "miner": miner, "baselineShare": None, "baselineBlocks": 0,
-            "recentShare": entry["share"], "recentBlocks": entry["blocks"],
-            "lastHeight": entry["lastHeight"],
-            "lastSeenSeconds": (now - entry["lastTime"]) if entry.get("lastTime") else None,
-            "status": "new",
-        })
+        current = recent["miners"].get(miner, empty)
+        rows.append(row(miner, None, current, week["miners"].get(miner, empty), "new"))
     return rows
 
 

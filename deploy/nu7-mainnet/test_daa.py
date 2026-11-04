@@ -156,13 +156,31 @@ class MinerTests(unittest.TestCase):
         recent = miners.miner_shares(rows[20:] + [{"height": 31, "time": 1800, "miner_id": "Newcomer"}])
         self.assertEqual(baseline["blocks"], 20)
         self.assertAlmostEqual(baseline["miners"]["Luxor"]["share"], 14 / 20)
-        table = miners.miner_table(baseline, recent, now=2000)
-        self.assertEqual([row["miner"] for row in table], ["Luxor", "2Miners", "Newcomer"])
+        week = miners.miner_shares(rows + [{"height": 31, "time": 1800, "miner_id": "Newcomer"},
+                                           {"height": 0, "time": 900, "miner_id": "Oldtimer"}])
+        table = miners.miner_table(baseline, recent, week, now=2000)
+        self.assertEqual([row["miner"] for row in table], ["Luxor", "2Miners", "Newcomer", "Oldtimer"])
         self.assertEqual(table[2]["status"], "new")
         self.assertEqual(table[0]["lastHeight"], 29)
+        self.assertEqual(table[0]["weekBlocks"], 20)
+        self.assertEqual([row["activity"] for row in table], ["active", "active", "active", "active"],
+                         "every block here is under an hour old")
+        self.assertEqual(table[3]["status"], "new", "a miner seen this week but not in the baseline or recent window")
         buckets = miners.miner_buckets(rows, 250, top=1)
         self.assertEqual(buckets["miners"], ["Luxor", "other"])
         self.assertEqual(sum(buckets["counts"]["Luxor"]) + sum(buckets["counts"]["other"]), 30)
+
+    def test_activity_from_age_of_newest_block(self):
+        self.assertEqual(miners.miner_activity(0), "active")
+        self.assertEqual(miners.miner_activity(3600), "active", "exactly an hour is still active")
+        self.assertEqual(miners.miner_activity(3601), "inactive")
+        self.assertEqual(miners.miner_activity(7 * 86400), "inactive")
+        self.assertEqual(miners.miner_activity(7 * 86400 + 1), "gone")
+        self.assertEqual(miners.miner_activity(None), "gone")
+        stale = miners.miner_shares([{"height": 5, "time": 1000, "miner_id": "Luxor"}])
+        fresh = miners.miner_shares([{"height": 6, "time": 1000 + 2 * 3600, "miner_id": "2Miners"}])
+        table = miners.miner_table(stale, fresh, miners.miner_shares([]), now=1000 + 2 * 3600 + 60)
+        self.assertEqual({row["miner"]: row["activity"] for row in table}, {"Luxor": "inactive", "2Miners": "active"})
 
 
 if __name__ == "__main__":

@@ -657,8 +657,10 @@ class Collector:
         baseline_end = self.activation_height if active else max(1, (height or 0) - MINER_RECENT_BLOCKS)
         baseline_rows = store.miner_rows(since_height=baseline_end - MINER_BASELINE_BLOCKS, until_height=baseline_end)
         recent_rows = store.miner_rows(since_height=max(1, (height or 0) - MINER_RECENT_BLOCKS + 1))
+        week_rows = store.miner_rows(since_time=int(now) - miners.SEEN_WITHIN_SECONDS)
         baseline = miners.miner_shares(baseline_rows)
         recent = miners.miner_shares(recent_rows)
+        week = miners.miner_shares(week_rows)
         return {
             "schemaVersion": 1,
             "generatedAt": now,
@@ -716,7 +718,9 @@ class Collector:
                 "baseline": {"fromHeight": baseline_end - MINER_BASELINE_BLOCKS, "untilHeight": baseline_end,
                              "blocks": baseline["blocks"]},
                 "recent": {"blocks": recent["blocks"], "lastBlocks": MINER_RECENT_BLOCKS},
-                "table": miners.miner_table(baseline, recent, now),
+                "week": {"blocks": week["blocks"], "seconds": miners.SEEN_WITHIN_SECONDS,
+                         "activeSeconds": miners.ACTIVE_WITHIN_SECONDS},
+                "table": miners.miner_table(baseline, recent, week, now),
             },
             "nsm": {
                 "balanceZat": nsm_balance,

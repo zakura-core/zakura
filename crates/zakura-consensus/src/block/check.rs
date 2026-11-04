@@ -548,7 +548,13 @@ pub fn merkle_root_validity(
 ) -> Result<(), BlockError> {
     // Check the header commitments first. The network upgrade check trusts the coinbase height,
     // which a peer can rewrite without changing a V5 block's hash.
+    let merkle_start = std::time::Instant::now();
     let merkle_root = transaction_hashes.iter().cloned().collect();
+    let merkle_seconds = merkle_start.elapsed().as_secs_f64();
+    metrics::histogram!("consensus.block.tx_merkle_root.duration_seconds").record(merkle_seconds);
+    tracing::info!(target: "mainnet_hash_measurement", block_hash = ?block.hash(),
+        transactions = transaction_hashes.len(), merkle_seconds,
+        "mainnet transaction Merkle root timing");
 
     if block.header().merkle_root != merkle_root {
         return Err(BlockError::BadMerkleRoot {

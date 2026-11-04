@@ -446,6 +446,8 @@ where
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
+            let verification_start = std::time::Instant::now();
+            let measurement_height = block.coinbase_height();
             let result: Result<block::Hash, VerifyBlockError> = async {
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let _receipt = receipt;
@@ -561,8 +563,15 @@ where
                 // the header binds to the transactions in the blocks.
 
                 // Precomputing this avoids duplicating transaction hash computations.
+                let txid_start = std::time::Instant::now();
                 let transaction_hashes: Arc<[_]> =
                     block.view().transactions().map(|t| t.hash()).collect();
+                let txid_seconds = txid_start.elapsed().as_secs_f64();
+                metrics::histogram!("consensus.block.txid.duration_seconds").record(txid_seconds);
+                tracing::info!(target: "mainnet_hash_measurement", block_hash = ?hash,
+                    ?height, transactions = transaction_hashes.len(),
+                    workers = rayon::current_num_threads(), txid_seconds,
+                    "mainnet transaction ID timing");
 
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 
@@ -864,6 +873,15 @@ where
                 commit_prepared_block(&mut state_service, prepared_block, mined).await
             }
             .await;
+
+            if !request.is_proposal() && result.is_ok() {
+                let verify_commit_seconds = verification_start.elapsed().as_secs_f64();
+                metrics::histogram!("consensus.block.verify_commit.duration_seconds")
+                    .record(verify_commit_seconds);
+                tracing::info!(target: "mainnet_hash_measurement", block_hash = ?hash,
+                    height = ?measurement_height, verify_commit_seconds,
+                    "mainnet verification and commit timing");
+            }
 
             match result {
                 // Proposals never become body evidence, so they keep the first failure.

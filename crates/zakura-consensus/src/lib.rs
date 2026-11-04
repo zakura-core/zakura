@@ -38,6 +38,7 @@
 #![allow(clippy::type_complexity)]
 
 mod block;
+mod block_perf;
 mod checkpoint;
 mod primitives;
 mod script;

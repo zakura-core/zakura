@@ -78,6 +78,9 @@ impl From<Transaction> for Hash {
 
 impl From<&Transaction> for Hash {
     fn from(transaction: &Transaction) -> Self {
+        let _perf = crate::diagnostic::block_perf::Timer::operation(
+            crate::diagnostic::block_perf::Operation::Id,
+        );
         let hasher = TxIdBuilder::new(transaction);
         hasher
             .txid()

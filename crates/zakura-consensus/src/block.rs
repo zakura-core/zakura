@@ -60,17 +60,20 @@ const PARALLEL_TRANSACTION_HASHES_MIN: usize = 64;
 
 /// Compute transaction IDs in block order, avoiding worker coordination for small blocks.
 fn transaction_hashes(block: &block::BlockRef) -> Arc<[transaction::Hash]> {
+    use zakura_chain::diagnostic::block_perf::{Context, Stage};
+    let context = Context::current();
+    let digest = |transaction: &transaction::Transaction| {
+        let _scope = Context::enter(context.clone(), Stage::Initial);
+        transaction.hash()
+    };
     if block.transactions().len() < PARALLEL_TRANSACTION_HASHES_MIN
         || rayon::current_num_threads() == 1
     {
-        block
-            .transactions()
-            .map(|transaction| transaction.hash())
-            .collect()
+        block.transactions().map(digest).collect()
     } else {
         block
             .parallel_transactions()
-            .map(|transaction| transaction.hash())
+            .map(digest)
             .collect::<Vec<_>>()
             .into()
     }
@@ -457,6 +460,15 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
+        use zakura_chain::diagnostic::block_perf::{Context, Session, Stage};
+        let route = match &request {
+            Request::Commit(_) => "ordinary",
+            Request::CommitMined { .. } => "mined",
+            Request::Prepare { .. } => "prepare",
+            Request::CheckProposal(_) => "proposal",
+        };
+        let mut perf = Session::new(hash, block.view(), route);
+        let perf_context = perf.context();
         let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
@@ -467,7 +479,7 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
-        async move {
+        crate::block_perf::observe(Some(perf_context.clone()), Stage::Parent, async move {
             let result: Result<block::Hash, VerifyBlockError> = async {
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let _receipt = receipt;
@@ -500,12 +512,14 @@ where
                             location @ (zs::KnownBlock::WriteChannel | zs::KnownBlock::Queue),
                         )) => {
                             if tokio::time::Instant::now() >= pending_commit_deadline {
+                                perf.route("duplicate");
                                 return Err(BlockError::AlreadyInChain(hash, location).into());
                             }
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
                         zs::Response::KnownBlock(Some(location)) => {
-                            return Err(BlockError::AlreadyInChain(hash, location).into())
+                            perf.route("duplicate");
+                            return Err(BlockError::AlreadyInChain(hash, location).into());
                         }
                         zs::Response::KnownBlock(None) => break,
                         _ => unreachable!("wrong response to Request::KnownBlock"),
@@ -576,16 +590,25 @@ where
                 if prepared_source == Some(PreparedCandidateSource::ServerTemplate)
                     && prepared_candidates.reuse_server_candidate(&block, &network)
                 {
+                    perf.route("proposal_reuse");
                     return Ok(hash);
                 }
 
                 // Next, check the Merkle root validity, to ensure that
                 // the header binds to the transactions in the blocks.
 
-                // Precomputing this avoids duplicating transaction hash computations.
-                let transaction_hashes = transaction_hashes(block.view());
+                // The baseline computes mined IDs here; auth digests are computed downstream.
+                let initial_timer = perf_context.stage(Stage::Initial);
+                let transaction_hashes = {
+                    let _scope = Context::enter(Some(perf_context.clone()), Stage::Initial);
+                    transaction_hashes(block.view())
+                };
+                drop(initial_timer);
 
-                check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+                {
+                    let _timer = perf_context.stage(Stage::Merkle);
+                    check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+                }
 
                 // Since errors cause an early exit, try to do the
                 // quick checks first.
@@ -680,6 +703,7 @@ where
                 // and carries the in-block ordering of each output.
                 let mut parent_utxos = Arc::new(HashMap::new());
                 if !external_inputs.is_empty() {
+                    let _parent_timer = perf_context.stage(Stage::Parent);
                     match check_parent_inputs(
                         state_service.clone(),
                         parent,
@@ -700,6 +724,9 @@ where
 
                 let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                     Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+
+                let _perf_requests = perf_context.bind(&known_outpoint_hashes);
+                let transaction_timer = perf_context.stage(Stage::Transactions);
 
                 // Dispatch shielded transactions first: their proof batches are the longest
                 // checks, so starting them before the transparent checks shortens the block's
@@ -776,6 +803,7 @@ where
                                 TransactionError::TransparentInputNotFound
                                     if !external_inputs.is_empty() =>
                                 {
+                                    let _parent_timer = perf_context.stage(Stage::Parent);
                                     match check_parent_inputs(
                                         state_service.clone(),
                                         parent,
@@ -847,6 +875,7 @@ where
                     }
                 })?;
 
+                drop(transaction_timer);
                 check::miner_fees_are_valid(
                     coinbase_tx,
                     height,
@@ -856,6 +885,9 @@ where
                     &network,
                 )?;
 
+                perf.semantic_done();
+                metrics::histogram!("zcash.chain.block_verification.semantic.duration_seconds")
+                    .record(preparation_start.elapsed().as_secs_f64());
                 // Finally, submit the block for contextual verification.
                 let prepared_block = zs::SemanticallyVerifiedBlock {
                     block,
@@ -882,21 +914,23 @@ where
                     .await;
                 }
 
+                let _handoff_timer = perf_context.stage(Stage::Handoff);
                 commit_prepared_block(&mut state_service, prepared_block, mined).await
             }
             .await;
 
+            perf.finish(result.is_ok());
             match result {
                 // Proposals never become body evidence, so they keep the first failure.
-                Err(error) if !request.is_proposal() => {
-                    Err(
-                        confirm_auth_data_binding(state_service, &network, request.block(), error)
-                            .await,
-                    )
-                }
+                Err(error) if !request.is_proposal() => Err(crate::block_perf::observe(
+                    Some(perf_context.clone()),
+                    Stage::Error,
+                    confirm_auth_data_binding(state_service, &network, request.block(), error),
+                )
+                .await),
                 result => result,
             }
-        }
+        })
         .instrument(span)
         .boxed()
     }
@@ -1045,6 +1079,12 @@ where
         .ready()
         .await
         .map_err(|source| VerifyBlockError::StateService { source, hash })?;
+    zakura_chain::diagnostic::block_perf::Context::contextual(
+        "state.semantic_commit.all_ready_wait.duration_seconds",
+        ready_start.elapsed(),
+    );
+    metrics::histogram!("state.semantic_commit.all_ready_wait.duration_seconds")
+        .record(ready_start.elapsed().as_secs_f64());
     if is_mined_commit {
         metrics::histogram!("state.semantic_commit.ready_wait.duration_seconds")
             .record(ready_start.elapsed().as_secs_f64());
@@ -1059,6 +1099,8 @@ where
         None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
     };
     let response = ready_state_service.call(request).await;
+    metrics::histogram!("state.semantic_commit.all_request_response.duration_seconds")
+        .record(commit_start.elapsed().as_secs_f64());
     if is_mined_commit {
         metrics::histogram!("mining.contextual_commit.duration_seconds")
             .record(commit_start.elapsed().as_secs_f64());

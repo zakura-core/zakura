@@ -390,8 +390,24 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
                     "the history tree of the previous block must exist \
                  since the current block has a ChainHistoryBlockTxAuthCommitment",
                 );
-            let auth_data_root =
-                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
+            use zakura_chain::diagnostic::block_perf::{Context, Operation, Stage, Timer};
+            let context = Context::current().or_else(|| Context::for_hash(block.hash()));
+            let stage = match Context::current_stage() {
+                Some(Stage::Error) => Stage::Error,
+                _ => Stage::Commitment,
+            };
+            let _scope = Context::enter(context, stage);
+            let _commitment = Context::current().map(|context| context.stage(stage));
+            let auth_data_root = match precomputed_auth_data_root {
+                Some(root) => {
+                    let _reuse = Timer::operation(Operation::RootReuse);
+                    root
+                }
+                None => {
+                    let _recompute = Timer::operation(Operation::RootRecompute);
+                    block.auth_data_root()
+                }
+            };
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
                 &auth_data_root,

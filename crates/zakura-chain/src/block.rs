@@ -494,14 +494,20 @@ impl BlockRef {
     ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244
     pub fn auth_data_root(&self) -> AuthDataRoot {
+        use crate::diagnostic::block_perf::{Context, Stage};
         use rayon::prelude::*;
+        let context = Context::current();
+        let stage = Context::current_stage().unwrap_or(Stage::Commitment);
 
         // Compute each transaction's auth digest in parallel, and collect into a
         // Vec with the same ordering.
         self.0
             .transactions
             .par_iter()
-            .map(|tx| auth_digest_or_placeholder(tx))
+            .map(|tx| {
+                let _scope = Context::enter(context.clone(), stage);
+                auth_digest_or_placeholder(tx)
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<AuthDataRoot>()

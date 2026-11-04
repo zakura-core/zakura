@@ -1632,6 +1632,12 @@ fn validate_and_commit_non_finalized_with_metrics(
     prepared: SemanticallyVerifiedBlock,
     contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
+    use zakura_chain::diagnostic::block_perf::{Context, Stage};
+    let perf_context = Context::for_hash(prepared.hash);
+    let _scope = Context::enter(perf_context.clone(), Stage::Commit);
+    let _perf_commit = perf_context
+        .as_ref()
+        .map(|context| context.stage(Stage::Commit));
     let total_start = Instant::now();
     let block = prepared.block.clone();
     let auth_data_root = prepared.auth_data_root;
@@ -3235,6 +3241,16 @@ impl WriteBlockWorkerTask {
                 continue;
             };
 
+            use zakura_chain::diagnostic::block_perf::{Context, Stage};
+            let perf_context = Context::for_hash(queued_child.hash);
+            let _perf_writer = perf_context
+                .as_ref()
+                .map(|context| context.stage(Stage::Writer));
+            let _perf_scope = Context::enter(perf_context.clone(), Stage::Commit);
+            Context::contextual(
+                "state.block_writer.queue.duration_seconds",
+                queued_at.elapsed(),
+            );
             let writer_queue_duration = queued_at.elapsed().as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
@@ -3418,6 +3434,9 @@ impl WriteBlockWorkerTask {
                 .expect("just successfully inserted a non-finalized block above")
                 > MAX_BLOCK_REORG_HEIGHT
             {
+                let _perf_finalized = perf_context
+                    .as_ref()
+                    .map(|context| context.stage(Stage::Finalized));
                 tracing::trace!("finalizing block past the reorg limit");
                 let commit_result = if let Some(writer) = header_chain.as_ref() {
                     commit_contextual_finalization(

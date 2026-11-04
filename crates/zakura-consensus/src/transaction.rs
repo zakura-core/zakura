@@ -489,8 +489,19 @@ where
         let state = self.state.clone();
         let mempool = self.mempool.clone();
 
+        use zakura_chain::diagnostic::block_perf::{Context, Stage};
+        let perf_context = match &req {
+            Request::Block {
+                known_outpoint_hashes,
+                ..
+            } => Context::for_request(known_outpoint_hashes),
+            Request::Mempool { .. } => None,
+        };
         let tx = req.transaction();
-        let tx_id = req.tx_id();
+        let tx_id = {
+            let _scope = Context::enter(perf_context.clone(), Stage::Transactions);
+            req.tx_id()
+        };
         let wtx_id = match tx_id {
             UnminedTxId::Witnessed(wtx_id) => Some(wtx_id),
             UnminedTxId::Legacy(_) => None,
@@ -507,7 +518,7 @@ where
             Request::Block { .. } | Request::Mempool { .. } => None,
         };
 
-        async move {
+        let perf_future = async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
@@ -770,8 +781,8 @@ where
                 // Hide the transaction data to avoid filling the logs
                 tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
             })
-            .instrument(span)
-            .boxed()
+            .instrument(span);
+        crate::block_perf::observe(perf_context, Stage::Transactions, perf_future).boxed()
     }
 }
 

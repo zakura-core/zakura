@@ -256,6 +256,9 @@ impl PrecomputedTxData {
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
+        let _perf = crate::diagnostic::block_perf::Timer::operation(
+            crate::diagnostic::block_perf::Operation::Sighash,
+        );
         let tx = tx.to_librustzcash_data(nu)?;
 
         let txid_parts = match tx.version() {
@@ -541,6 +544,9 @@ fn v4_signature_hash(
 ///
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
+    let _perf = crate::diagnostic::block_perf::Timer::operation(
+        crate::diagnostic::block_perf::Operation::Auth,
+    );
     // Compute the v5/v6 ZIP-244 authorizing-data digest natively, avoiding the
     // `librustzcash` reparse (see `crate::transaction::zip244`). Unsupported
     // versions fall back to `librustzcash`.
@@ -568,6 +574,9 @@ pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
 ///
 /// If passed a pre-v5 transaction.
 pub(crate) fn txid_and_auth_digest(tx: &Transaction) -> (Hash, AuthDigest) {
+    let _perf = crate::diagnostic::block_perf::Timer::operation(
+        crate::diagnostic::block_perf::Operation::Combined,
+    );
     // Compute the v5/v6 ZIP-244 txid and authorizing-data digest natively,
     // avoiding the `librustzcash` reparse (see `crate::transaction::zip244`).
     // Unsupported versions fall back to `librustzcash`.

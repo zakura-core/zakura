@@ -376,6 +376,9 @@ impl std::iter::FromIterator<transaction::AuthDigest> for AuthDataRoot {
     where
         I: IntoIterator<Item = transaction::AuthDigest>,
     {
+        let _perf = crate::diagnostic::block_perf::Timer::operation(
+            crate::diagnostic::block_perf::Operation::Root,
+        );
         let mut hashes = hashes.into_iter().map(|hash| hash.0).collect::<Vec<_>>();
         // > This new commitment is named hashAuthDataRoot and is the root of a
         // > binary Merkle tree of transaction authorizing data commitments [...]

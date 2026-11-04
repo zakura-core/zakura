@@ -77,6 +77,7 @@ impl ContextualMetrics {
             return;
         }
 
+        zakura_chain::diagnostic::block_perf::Context::contextual(metric_name, duration);
         let duration = duration.as_secs_f64();
         metrics::histogram!(metric_name).record(duration);
         if self == Self::Mined {

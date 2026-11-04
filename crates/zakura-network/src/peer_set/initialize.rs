@@ -182,6 +182,21 @@ where
     (peer_set, address_book, misbehavior_tx)
 }
 
+/// The block advertisement service of each peer-to-peer protocol this node runs.
+///
+/// Each protocol advertises on its own: a protocol with no peers never delays the other, and a
+/// protocol that is turned off is `None` rather than a service that can never send anything.
+#[derive(Clone)]
+pub struct BlockAdvertisementServices {
+    /// Advertises to legacy Zcash protocol peers, when legacy P2P is enabled.
+    ///
+    /// Ready once a connected peer can receive an advertisement, which may be a busy peer.
+    pub legacy: Option<BoxCloneService<Request, Response, BoxError>>,
+
+    /// Advertises to Zakura protocol peers, when the Zakura endpoint is running.
+    pub native: Option<BoxCloneService<Request, Response, BoxError>>,
+}
+
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
 #[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_with_zakura_header_sync<S, C>(
@@ -239,7 +254,7 @@ pub async fn init_with_zakura<S, C>(
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,
-        BoxCloneService<Request, Response, BoxError>,
+        BlockAdvertisementServices,
     ),
     BoxError,
 >
@@ -528,9 +543,7 @@ where
     // candidate set and crawler keep using the unwrapped legacy peer set above;
     // only the service handed to the syncer/mempool/inbound becomes dual-stack.
     //
-    // Block advertisements get their own service, so they reach busy peers without waiting for an
-    // idle one, while every other request keeps the peer set's readiness backpressure.
-    let (peer_set, block_adverts) = match zakura_supervisor_and_trace {
+    let peer_set = match &zakura_supervisor_and_trace {
         Some((supervisor, trace)) => {
             let dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
                 peer_set,
@@ -539,22 +552,26 @@ where
                 trace.clone(),
                 config.zakura.stream_open_rate_per_second,
             );
-            let advert_dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
-                block_advertiser,
-                supervisor,
-                config.legacy_p2p(),
-                trace,
-                config.zakura.stream_open_rate_per_second,
-            );
-            (
-                BoxCloneSyncService::new(spawn_buffer(
-                    BoxService::new(dual_stack),
-                    constants::PEERSET_BUFFER_SIZE,
-                )),
-                BoxCloneService::new(advert_dual_stack),
-            )
+            BoxCloneSyncService::new(spawn_buffer(
+                BoxService::new(dual_stack),
+                constants::PEERSET_BUFFER_SIZE,
+            ))
         }
-        None => (peer_set, BoxCloneService::new(block_advertiser)),
+        None => peer_set,
+    };
+
+    // Block advertisements get their own service per protocol, so they reach busy peers without
+    // waiting for an idle one, while every other request keeps the peer set's readiness
+    // backpressure. The advertisers are never buffered: a buffer's worker holds inner readiness
+    // for its whole queue, so one protocol without peers would hold up every queued
+    // advertisement.
+    let block_adverts = BlockAdvertisementServices {
+        legacy: config
+            .legacy_p2p()
+            .then(|| BoxCloneService::new(block_advertiser)),
+        native: zakura_supervisor_and_trace.map(|(supervisor, _trace)| {
+            BoxCloneService::new(crate::zakura::LegacyGossipAdapter::new(supervisor))
+        }),
     };
 
     if let Some(shutdown) = zakura_startup_shutdown {

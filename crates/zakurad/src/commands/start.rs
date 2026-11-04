@@ -835,7 +835,8 @@ impl StartCmd {
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change.clone(),
-                block_adverts,
+                block_adverts.legacy,
+                block_adverts.native,
                 read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
             )

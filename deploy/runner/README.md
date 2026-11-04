@@ -515,3 +515,29 @@ The acceptance tool also runs directly from an installed release, for example:
 python3 /opt/zakura-fleet-watchdog/current/zakura-monitoring-acceptance.py synthetic
 python3 /opt/zakura-fleet-watchdog/current/zakura-monitoring-acceptance.py soak --duration 1800
 ```
+
+### Temporary transaction-digest comparison
+
+`digest_compare.py` collects bounded performance summaries from `us-west-0`
+and `canada-0` through the existing runner's SSH identity. It never deploys a
+binary. `digest_probe.py` reads node health and the rotating observation sink,
+and captures capped, equivalent software CPU profiles. Its backup and restore
+operations require the recorded original executable checksum.
+
+Install the collector service as `zakura-digest-compare-pr2022.service` on the
+existing runner. Runtime files belong under
+`/var/lib/zakura-digest-compare/pr2022`; the service's installed source and SSH
+helpers belong under `/opt/zakura-digest-compare/pr2022`. Keep the manifest's
+`approved` field false until the exact Mainnet revision and node assignment
+has been confirmed. The `activate` command qualifies running checksums,
+advancing heights, matching tips and complete observations before starting a
+phase. Mark `swapping` before restarting either node for the crossover.
+
+The collector pairs identical block hashes within a phase and excludes
+profile, restart, incomplete, ambiguous and lossy observations. Late
+finalization counters are cumulative snapshots and are reported separately.
+The first report is written after 30 minutes; collection continues afterward.
+`status.json` exposes failures and stalled progress to the owning desktop
+watch process. Stop collection with
+`systemctl stop zakura-digest-compare-pr2022.service` on the runner; stopping
+collection does not restore either measured node's executable.

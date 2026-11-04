@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only Mainnet digest comparison for PR 2022
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/zakura-digest-compare/pr2022/current
+ExecStart=/usr/bin/python3 /opt/zakura-digest-compare/pr2022/current/digest_compare.py collect --manifest /var/lib/zakura-digest-compare/pr2022/manifest.json --output /var/lib/zakura-digest-compare/pr2022 --ssh-helper /opt/zakura-digest-compare/pr2022/helpers/ssh-check
+Restart=no
+Nice=10
+MemoryMax=512M
+TasksMax=32
+TimeoutStopSec=150
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

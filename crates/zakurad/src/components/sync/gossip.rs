@@ -398,8 +398,9 @@ where
     /// Puts a dispatched announcement back, if it is still an announcement this protocol wants.
     ///
     /// One that ran out of time, one that failed verification, a tip that is no longer the tip,
-    /// and a mined block that a newer committed one has buried are all dropped instead. A mined
-    /// block goes back ahead of the blocks accepted after it.
+    /// and a mined block that a newer committed one has buried are all dropped instead, except
+    /// that a mined block which is the best tip is still wanted: its tip event was consumed when
+    /// it was sent. A mined block goes back ahead of the blocks accepted after it.
     fn restore(&mut self, announcement: Announcement, best_tip: Option<block::Hash>) {
         if self.stopped || !announcement.is_current(Instant::now()) {
             return;
@@ -411,7 +412,8 @@ where
                 }
             }
             Slot::Mined => {
-                if self.is_buried(&announcement)
+                let buried = self.is_buried(&announcement) && best_tip != Some(announcement.hash);
+                if buried
                     || self.is_waiting_mined(&announcement.hash)
                     || self.mined.len() >= MAX_WAITING_MINED
                 {
@@ -1006,12 +1008,13 @@ struct MinedDeliveries {
 }
 
 impl MinedDeliveries {
-    /// Records that `protocol` announced `hash`, returning whether all `protocols` have
-    /// announced it.
+    /// Records that the protocol at index `protocol` announced `hash`, returning whether at
+    /// least `protocols` distinct protocols have announced it. A protocol that stopped is not
+    /// counted in `protocols`, so its index can be past that count.
     fn delivered(&mut self, hash: block::Hash, protocol: usize, protocols: usize) -> bool {
         assert!(
-            protocol < protocols && protocols <= u64::BITS as usize,
-            "protocol {protocol} of {protocols} fits the announced-protocol bits"
+            protocol < u64::BITS as usize,
+            "protocol index {protocol} fits the announced-protocol bits"
         );
         let index = match self.recent.iter().position(|(recent, _)| *recent == hash) {
             Some(index) => index,
@@ -1025,8 +1028,8 @@ impl MinedDeliveries {
         };
         let (_, announced) = &mut self.recent[index];
         *announced |= 1 << protocol;
-        let every_protocol = u64::MAX >> (u64::BITS as usize - protocols);
-        *announced == every_protocol
+        // At most 64 set bits, so the count fits a usize.
+        announced.count_ones() as usize >= protocols
     }
 }
 
@@ -1301,6 +1304,18 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_protocol_does_not_hold_up_the_suppression() {
+        let hash = block::Hash([6; 32]);
+        let mut deliveries = MinedDeliveries::default();
+
+        // The first protocol stopped, so only the second one counts, at its own index.
+        assert!(
+            deliveries.delivered(hash, 1, 1),
+            "the one live protocol announcing the block completes the record",
+        );
+    }
+
+    #[test]
     fn a_protocol_announcing_a_block_twice_does_not_stand_in_for_the_other() {
         let hash = block::Hash([5; 32]);
         let mut deliveries = MinedDeliveries::default();
@@ -1432,6 +1447,26 @@ mod tests {
         protocol.restore(first_sent, None);
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(first));
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(second));
+    }
+
+    #[test]
+    fn a_buried_mined_block_that_is_the_tip_is_put_back() {
+        let tip = block::Hash([30; 32]);
+        let side = block::Hash([31; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(tip, block::Height(2), 1_000, None));
+        let tip_sent = protocol.take_next().expect("the block is waiting");
+        // A higher own block committed on a side chain, so the sent block is still the tip.
+        protocol.accept_mined(Announcement::mined(side, block::Height(3), 1_000, None));
+
+        protocol.restore(tip_sent, Some(tip));
+        assert_eq!(
+            protocol.take_next().map(|next| next.hash),
+            Some(tip),
+            "the best tip is still wanted, since its tip event was consumed when it was sent",
+        );
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(side));
     }
 
     #[test]

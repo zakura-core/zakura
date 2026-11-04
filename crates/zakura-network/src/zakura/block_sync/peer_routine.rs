@@ -758,11 +758,13 @@ impl PeerRoutine {
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
         // `reset_above`) and release their reservations exactly once.
         self.return_unreceived_requests("view_reset");
-        // `return_unreceived_requests` cleared our registry claims.
-        self.publish_slot_diagnostics();
         // A destructive reset pulled this peer's outstanding on our initiative, so
         // neither its retry bias nor its no-progress probe streak may stay charged.
         self.state.note_locally_returned_requests();
+        // Publish after the streak clears: a peer that sat at its no-progress
+        // cap may take work again. `return_unreceived_requests` cleared our
+        // registry claims.
+        self.publish_slot_diagnostics();
         // Ping the producer immediately: `reset_above` emptied `pending`, and the
         // reactor's post-reset query may have run while our (now cleared) outstanding
         // still inflated the low-water gate. Without this ping a routine that then
@@ -1266,6 +1268,9 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.state
             .record_late_body(Instant::now(), self.config.effective_liveness_timeout());
+        // The progress clears any no-progress cap, so other routines may defer
+        // the floor to this peer again.
+        self.publish_slot_diagnostics();
 
         self.io.send_under_receipt(
             body,

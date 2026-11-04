@@ -57,7 +57,6 @@ code { font-family: var(--mono); font-size: .92em; }
 .status-pill--retired { color: var(--muted); }
 .nu7-notice { border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); padding: 10px 14px; border-radius: 10px; font-size: .92rem; }
 .nu7-notice[hidden] { display: none; }
-.chart--wide { grid-column: 1 / -1; }
 .nu7-miners .num { text-align: right; font-variant-numeric: tabular-nums; }
 .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; background: var(--surface-2); color: var(--muted); }
 .chip--absent { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
@@ -73,12 +72,12 @@ code { font-family: var(--mono); font-size: .92em; }
 .nu7-stats .hint { color: var(--muted); font-size: .82rem; margin-top: 4px; }
 .nu7-stats .hash code { font-size: .8rem; }
 .value.good { color: var(--nsm); } .value.warn { color: var(--warn); } .value.bad { color: var(--bad); }
-.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
-@media (max-width: 520px) { .charts { grid-template-columns: minmax(0, 1fr); } }
+.charts { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .chart { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px 10px; min-width: 0; }
 .chart h3 { margin: 0 0 2px; font-size: .95rem; }
 .chart p { margin: 0 0 8px; color: var(--muted); font-size: .8rem; }
-.chart canvas { width: 100% !important; height: 220px !important; }
+.chart canvas { width: 100% !important; height: 300px !important; }
+@media (max-width: 520px) { .chart canvas { height: 240px !important; } }
 .windows { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .windows button { background: var(--surface); color: var(--text); border: 0; padding: 6px 12px; cursor: pointer; font: inherit; font-size: .85rem; }
 .windows button[aria-pressed="true"] { background: var(--accent); color: #fff; }
@@ -155,8 +154,8 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
       <div class="charts">
         <div class="chart"><h3>Block interval</h3><p>Seconds between header times, with the rolling 102-block median and the target spacing.</p><canvas id="c-interval"></canvas></div>
         <div class="chart"><h3>Difficulty</h3><p>Difficulty (log) and its per-block change. The rule clamps the timespan it adjusts by, not the step itself, so single steps stay within about −24% / +19%.</p><canvas id="c-difficulty"></canvas></div>
-        <div class="chart chart--wide"><h3>Difficulty: live vs expected</h3><p>Live difficulty against what the rule requires from the stored headers (should overlay exactly), the projection frozen before activation at a constant hashrate (expected = Monte Carlo median, with its 10–90% band) and the projection re-run from the current chain and hashrate. The dashed level is where difficulty settles at today's hashrate.</p><canvas id="c-expected"></canvas></div>
-        <div class="chart chart--wide"><h3>Block time: observed vs expected</h3><p>Rolling 102-block mean and median of the observed intervals, the time each block was expected to take at its difficulty and the hashrate of the previous 120 blocks, and the projections' expected block time ahead of the tip.</p><canvas id="c-blocktime"></canvas></div>
+        <div class="chart"><h3>Difficulty: live vs expected</h3><p>Live difficulty against what the rule requires from the stored headers (should overlay exactly), the projection frozen before activation at a constant hashrate (expected = Monte Carlo median, with its 10–90% band) and the projection re-run from the current chain and hashrate. The dashed level is where difficulty settles at today's hashrate.</p><canvas id="c-expected"></canvas></div>
+        <div class="chart"><h3>Block time: observed vs expected</h3><p>Rolling 102-block mean and median of the observed intervals, the time each block was expected to take at its difficulty and the hashrate of the previous 120 blocks, and the projections' expected block time ahead of the tip.</p><canvas id="c-blocktime"></canvas></div>
         <div class="chart"><h3>Recent block times</h3><p>Each block's interval at its header time, with the block time the model expected for it.</p><canvas id="c-recent"></canvas></div>
         <div class="chart"><h3>Miners</h3><p>Blocks per miner per bucket, from coinbase tags and payout addresses. Shielded payouts without a tag share one bucket.</p><canvas id="c-miners"></canvas></div>
         <div class="chart"><h3>NSM balance</h3><p>Balance after each block and its per-block change next to the fee share plus reissuance the block should add.</p><canvas id="c-nsm"></canvas></div>

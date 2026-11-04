@@ -24,7 +24,9 @@
 //! the harness stopped it on purpose. A [`TapShutdown`] tells the tap so
 //! before the stop begins. The drain that finds the observer gone is then the
 //! tap's final read: it logs the reactor's last events and runs the teardown
-//! checks above. A reactor that unwound still fails as `ReactorGone`.
+//! checks above. A reactor that unwound still fails as `ReactorGone`, and a
+//! run that ends idle or at its budget before that read fails as
+//! `ShutdownIncomplete`.
 //!
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands
@@ -194,6 +196,15 @@ impl LiveEvidence for TapState {
         } else {
             None
         }
+    }
+
+    /// `ShutdownIncomplete` once the harness began stopping the reactor and
+    /// it still holds its observer, so its last events and the teardown
+    /// checks haven't happened.
+    fn unfinished(&self) -> Option<&'static str> {
+        (self.shutdown.load(Ordering::Relaxed) && self.observer.strong_count() > 0).then_some(
+            "ShutdownIncomplete: the run ended before the stopped reactor dropped its observer",
+        )
     }
 }
 

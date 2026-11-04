@@ -426,6 +426,29 @@ fn an_announced_stop_still_fails_open_work() {
     assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
 }
 
+/// A run that ends at its budget while an announced stop is still under way
+/// fails as `ShutdownIncomplete`, since the reactor's last events and the
+/// teardown checks never came.
+#[test]
+fn a_run_that_ends_mid_stop_fails() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
 /// A reactor that unwinds during an announced stop crashed rather than
 /// stopped, so the run still fails as `ReactorGone`.
 #[test]

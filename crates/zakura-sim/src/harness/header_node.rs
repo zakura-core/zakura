@@ -714,8 +714,9 @@ pub enum ControlAction {
     },
     /// Stop the node under test, which the step must name: close every link
     /// to it and cancel its reactor. Its tap expects the reactor to go, and
-    /// checks it left no call or ownership open. A later relink, or a second
-    /// shutdown, fails the run.
+    /// checks it left no call or ownership open. A later relink, a second
+    /// shutdown, or a run that ends idle or at its budget before the reactor
+    /// is gone fails the run.
     Shutdown,
 }
 

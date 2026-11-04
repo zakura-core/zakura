@@ -462,8 +462,9 @@ where
     /// One that ran out of time, one that failed verification, a tip that is no longer the tip,
     /// and a mined block that a newer committed one has buried are all dropped instead. A mined
     /// block goes back ahead of the blocks accepted after it, whichever order dispatched blocks
-    /// come back in, and the newest of them makes room when the queue is full. A committed block takes the place of its own submission that is
-    /// still waiting; otherwise a block that is already waiting is not put back twice.
+    /// come back in, and the newest of them makes room when the queue is full. A committed block
+    /// takes the place of its own submission that is still waiting; otherwise a block that is
+    /// already waiting is not put back twice.
     fn restore(&mut self, mut announcement: Announcement, best_tip: Option<block::Hash>) {
         let now = Instant::now();
         if self.stopped || !announcement.is_current(now) {

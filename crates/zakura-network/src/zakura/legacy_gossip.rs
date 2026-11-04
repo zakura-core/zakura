@@ -8248,6 +8248,45 @@ mod tests {
         Ok(())
     }
 
+    /// The node-wide gossip queue's 256 slots, filled with 25,000-ID advertisements,
+    /// retain no more decoded bytes than the compatibility inbound budget. The budget
+    /// refuses an advertisement before the queue fills.
+    #[tokio::test]
+    async fn full_transaction_advertisements_stay_within_the_inbound_budget() -> Result<(), BoxError>
+    {
+        let ids: Vec<UnminedTxId> = (0..u32::try_from(MAX_TX_INV_IN_SENT_MESSAGE)?)
+            .map(|n| {
+                let mut hash = [0; 32];
+                hash[..4].copy_from_slice(&n.to_le_bytes());
+                UnminedTxId::from_legacy_id(transaction::Hash(hash))
+            })
+            .collect();
+        let frame = LegacyGossipFrame::AdvertiseTransactionIds(ids).encode_frame()?;
+        let item_bytes = LegacyGossipFrame::decode_frame(frame.clone())?.retained_bytes();
+        let (inbound_tx, mut queue) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
+        let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
+
+        for _ in 0..LEGACY_GOSSIP_INBOUND_QUEUE {
+            sink.deliver(inbound_peer(), ZAKURA_STREAM_GOSSIP, frame.clone())
+                .map_err(|_| "a refused advertisement drops without faulting the peer")?;
+        }
+        let used = sink.inbound_budget.used();
+        assert!(used <= LEGACY_INBOUND_RETAINED_BYTES);
+        let mut queued = Vec::new();
+        while let Ok(work) = queue.try_recv() {
+            queued.push(work);
+        }
+        // Widening usize to u64 is lossless on supported targets.
+        assert_eq!(used, queued.len() as u64 * item_bytes);
+        assert!(
+            queued.len() < LEGACY_GOSSIP_INBOUND_QUEUE,
+            "the budget refuses before the queue fills"
+        );
+        drop(queued);
+        assert_eq!(sink.inbound_budget.used(), 0);
+        Ok(())
+    }
+
     /// The compatibility budgets have their derived values at the default caps.
     #[test]
     fn compatibility_budgets_have_their_derived_values() {

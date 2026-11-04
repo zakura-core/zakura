@@ -67,9 +67,8 @@ impl Tracing {
     // This method should only print to stderr, because stdout is for tracing logs.
     #[allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
     pub fn new(network: &Network, config: Config, uses_intro: bool) -> Result<Self, Report> {
-        // Only use color if tracing output is being sent to a terminal or if it was explicitly
-        // forced to.
-        let use_color = config.use_color_stdout();
+        // Only use terminal escapes for the banner if stderr is a terminal or if it was
+        // explicitly forced to.
         let use_color_stderr = config.use_color_stderr();
 
         let filter = config.filter.clone().unwrap_or_default();
@@ -81,9 +80,7 @@ impl Tracing {
         // Only show the intro for user-focused node server commands like `start`
         // Also skip the intro for regtest, since it pollutes the QA test logs
         if uses_intro && !network.is_regtest() {
-            // If it's a terminal and color escaping is enabled: clear screen and
-            // print Zakura logo (here `use_color` is being interpreted as
-            // "use escape codes")
+            // If it's a terminal and escapes are enabled: clear screen and print Zakura logo
             if use_color_stderr {
                 // Clear screen
                 eprint!("\x1B[2J");
@@ -150,9 +147,7 @@ impl Tracing {
         // Construct a format subscriber with the supplied global logging filter.
         // The filter is not a per-layer filter, so it applies to every layer.
         let subscriber = {
-            let logger = tracing_subscriber::fmt::layer()
-                .with_ansi(use_color)
-                .with_writer(non_blocking);
+            let logger = tracing_subscriber::fmt::layer().with_writer(non_blocking);
 
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),

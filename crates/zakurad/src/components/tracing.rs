@@ -62,19 +62,16 @@ impl From<Config> for InnerConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct InnerConfig {
-    /// Whether to use colored terminal output, if available.
+    /// Whether to clear the screen and print the Zakura logo at startup, if standard error is a
+    /// terminal.
     ///
-    /// Colored terminal output is automatically disabled if an output stream
-    /// is connected to a file. (Or another non-terminal device.)
+    /// Log lines are always plain text: `zakurad` does not color them.
     ///
-    /// Defaults to `true`, which automatically enables colored output to
-    /// terminals.
+    /// Defaults to `true`.
     pub use_color: bool,
 
-    /// Whether to force the use of colored terminal output, even if it's not available.
-    ///
-    /// Will force Zebra to use colored terminal output even if it does not detect that the output
-    /// is a terminal that supports colors.
+    /// Whether to clear the screen and print the Zakura logo at startup, even if standard error
+    /// is not a terminal.
     ///
     /// Defaults to `false`, which keeps the behavior of `use_color`.
     pub force_use_color: bool,
@@ -171,13 +168,7 @@ pub enum ProgressConfig {
 }
 
 impl Config {
-    /// Returns `true` if standard output should use color escapes.
-    /// Automatically checks if Zebra is running in a terminal.
-    pub fn use_color_stdout(&self) -> bool {
-        self.force_use_color || (self.use_color && std::io::stdout().is_terminal())
-    }
-
-    /// Returns `true` if standard error should use color escapes.
+    /// Returns `true` if the startup banner on standard error should use terminal escapes.
     /// Automatically checks if Zebra is running in a terminal.
     pub fn use_color_stderr(&self) -> bool {
         self.force_use_color || (self.use_color && std::io::stderr().is_terminal())

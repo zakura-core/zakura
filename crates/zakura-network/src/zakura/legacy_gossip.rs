@@ -205,6 +205,11 @@ pub(crate) fn legacy_gossip_streams() -> &'static [Stream] {
     &LEGACY_GOSSIP_SERVICE_STREAMS
 }
 
+/// How long a session whose queue is full gets to make room for a block advertisement, the
+/// same as a busy legacy peer's advert queue gets. The replay to a session that just opened and
+/// the catch-up of a session that opened during a fan-out wait the same.
+const BLOCK_QUEUE_WAIT: Duration = Duration::from_secs(3);
+
 /// The frame cap of the legacy gossip stream, kind [`ZAKURA_STREAM_GOSSIP`].
 // Widening u32 to u64 is lossless.
 const LEGACY_GOSSIP_FRAME_BYTES: u64 = LEGACY_GOSSIP_SERVICE_STREAMS[0].frame_cap as u64;
@@ -1742,9 +1747,23 @@ impl LegacyGossipOutbound {
         }
     }
 
+    /// Returns whether a later-issued advertisement's block has been remembered since
+    /// `advertisement` was issued, so its block is older than what a session that opened
+    /// meanwhile was replayed.
+    fn is_superseded(&self, advertisement: u64) -> bool {
+        self.latest_block
+            .lock()
+            .expect("legacy gossip latest-block mutex is never poisoned")
+            .remembered
+            > advertisement
+    }
+
+    /// Sends the remembered block to a session that just opened, giving a full queue up to
+    /// `wait` to make room.
     async fn replay_latest_block_to_peer(
         &self,
         session: LegacyGossipPeerSession,
+        wait: Duration,
     ) -> Result<(), BoxError> {
         let Some(hash) = self
             .latest_block
@@ -1755,7 +1774,10 @@ impl LegacyGossipOutbound {
             return Ok(());
         };
 
-        session.try_send_advertise_block(hash).map_err(Into::into)
+        session
+            .send_advertise_block_within(hash, wait)
+            .await
+            .map_err(Into::into)
     }
 
     /// Returns a watch of the session count that changes whenever the session set does.
@@ -1810,27 +1832,20 @@ impl LegacyGossipOutbound {
     /// `wait` to make room, and report what it reached and which sessions it was offered to.
     async fn fan_out_block_within(&self, hash: block::Hash, wait: Duration) -> BlockFanout {
         let offered = self.sessions_except(None);
-        let results = futures::future::join_all(
-            offered
-                .iter()
-                .map(|session| session.send_advertise_block_within(hash, wait)),
-        )
-        .await;
-        let mut reached = Fanout::default();
-        for (session, result) in offered.iter().zip(results) {
-            reached.record(session, result);
-        }
+        let reached = fan_out_block(&offered, hash, wait).await;
         BlockFanout { reached, offered }
     }
 
-    /// Offer a block advertisement, without waiting, to every session that is not among
-    /// `offered`: the sessions added while an earlier offer was waiting for a full queue.
-    fn send_block_to_sessions_added_since(
+    /// Offer a block advertisement to every session that is not among `offered`, the sessions
+    /// added while an earlier offer was waiting for a full queue, each full queue getting up to
+    /// `wait` to make room.
+    async fn send_block_to_sessions_added_since(
         &self,
         offered: &[LegacyGossipPeerSession],
         hash: block::Hash,
+        wait: Duration,
     ) -> Fanout {
-        let added = self
+        let added: Vec<_> = self
             .sessions_except(None)
             .into_iter()
             .filter(|session| {
@@ -1839,7 +1854,7 @@ impl LegacyGossipOutbound {
                     .any(|earlier| earlier.is_same_session(session))
             })
             .collect();
-        fan_out(added, &LegacyGossipFrame::AdvertiseBlock(hash))
+        fan_out_block(&added, hash, wait).await
     }
 
     /// The sessions to offer a frame to: every one but `exclude`'s.
@@ -1890,9 +1905,10 @@ pub struct LegacyGossipPeerSession {
     conn_id: ZakuraConnId,
     session_id: u64,
     send: FramedSend,
-    /// The block this session was last queued, shared by every handle to the session, so the
-    /// replay on joining and a catch-up offer of the same block do not both queue it.
-    last_block: Arc<StdMutex<Option<block::Hash>>>,
+    /// The block this session was last queued, shared by every handle to the session and held
+    /// across a block send, so the replay on joining and a catch-up offer of the same block do
+    /// not both queue it.
+    last_block: Arc<tokio::sync::Mutex<Option<block::Hash>>>,
 }
 
 impl LegacyGossipPeerSession {
@@ -1907,25 +1923,8 @@ impl LegacyGossipPeerSession {
             conn_id,
             session_id,
             send,
-            last_block: Arc::new(StdMutex::new(None)),
+            last_block: Arc::new(tokio::sync::Mutex::new(None)),
         }
-    }
-
-    /// Returns whether `hash` is the block this session was last queued.
-    fn was_last_queued(&self, hash: block::Hash) -> bool {
-        *self
-            .last_block
-            .lock()
-            .expect("legacy gossip session last-block mutex is never poisoned")
-            == Some(hash)
-    }
-
-    /// Records that `hash` was queued to this session.
-    fn queued_block(&self, hash: block::Hash) {
-        *self
-            .last_block
-            .lock()
-            .expect("legacy gossip session last-block mutex is never poisoned") = Some(hash);
     }
 
     /// Authenticated peer identity for this legacy gossip stream.
@@ -1949,15 +1948,9 @@ impl LegacyGossipPeerSession {
             && self.session_id == other.session_id
     }
 
-    /// Send an explicit block advertisement. A block this session was queued last is not
-    /// queued again.
+    /// Send an explicit block advertisement.
     pub fn try_send_advertise_block(&self, hash: block::Hash) -> Result<(), OrderedSendError> {
-        if self.was_last_queued(hash) {
-            return Ok(());
-        }
-        self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))?;
-        self.queued_block(hash);
-        Ok(())
+        self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))
     }
 
     /// Send an explicit block advertisement, giving a full queue up to `wait` to make room.
@@ -1969,7 +1962,10 @@ impl LegacyGossipPeerSession {
         hash: block::Hash,
         wait: Duration,
     ) -> Result<(), OrderedSendError> {
-        if self.was_last_queued(hash) {
+        // Held across the send: the check, the send and the record are one step, so two
+        // handles sending the same block queue it once.
+        let mut last_block = self.last_block.lock().await;
+        if *last_block == Some(hash) {
             return Ok(());
         }
         let frame = LegacyGossipFrame::AdvertiseBlock(hash)
@@ -1977,7 +1973,7 @@ impl LegacyGossipPeerSession {
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         let frame = match self.send.try_send(frame) {
             Ok(()) => {
-                self.queued_block(hash);
+                *last_block = Some(hash);
                 return Ok(());
             }
             Err(mpsc::error::TrySendError::Closed(_frame)) => return Err(OrderedSendError::Closed),
@@ -1985,7 +1981,7 @@ impl LegacyGossipPeerSession {
         };
         match timeout(wait, self.send.send(frame)).await {
             Ok(Ok(())) => {
-                self.queued_block(hash);
+                *last_block = Some(hash);
                 Ok(())
             }
             Ok(Err(_closed)) => Err(OrderedSendError::Closed),
@@ -2093,6 +2089,26 @@ struct BlockFanout {
 }
 
 /// Offer `frame` to every session, continuing past the ones that refuse it.
+/// Offers a block advertisement to every one of `sessions` at once, each full queue getting up
+/// to `wait` to make room, and counts the answers.
+async fn fan_out_block(
+    sessions: &[LegacyGossipPeerSession],
+    hash: block::Hash,
+    wait: Duration,
+) -> Fanout {
+    let results = futures::future::join_all(
+        sessions
+            .iter()
+            .map(|session| session.send_advertise_block_within(hash, wait)),
+    )
+    .await;
+    let mut fanout = Fanout::default();
+    for (session, result) in sessions.iter().zip(results) {
+        fanout.record(session, result);
+    }
+    fanout
+}
+
 fn fan_out(sessions: Vec<LegacyGossipPeerSession>, frame: &LegacyGossipFrame) -> Fanout {
     let mut fanout = Fanout::default();
     for session in sessions {
@@ -3167,7 +3183,10 @@ impl ZakuraService for LegacyGossipSink {
                 let outbound = outbound.clone();
                 let session = session.clone();
                 async move {
-                    if let Err(error) = outbound.replay_latest_block_to_peer(session).await {
+                    if let Err(error) = outbound
+                        .replay_latest_block_to_peer(session, BLOCK_QUEUE_WAIT)
+                        .await
+                    {
                         debug!(?error, "latest Zakura block gossip replay failed");
                     }
                 }
@@ -6582,7 +6601,7 @@ mod tests {
         broadcast.outbound.insert(session.clone());
         broadcast
             .outbound
-            .replay_latest_block_to_peer(session)
+            .replay_latest_block_to_peer(session, BLOCK_QUEUE_WAIT)
             .await?;
 
         let replayed = tokio::time::timeout(Duration::from_secs(1), receiver.recv())

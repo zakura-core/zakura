@@ -195,11 +195,14 @@ def nsm_fee_share(fees_zat):
     return fees_zat * NSM_FEE_PERCENT // 100
 
 
-def fee_split_ok(fees_zat, nsm_fee_zat):
-    """Whether a block's reported NSM share matches the consensus rounding."""
-    if fees_zat is None or nsm_fee_zat is None:
+def fee_split_ok(fees_zat, nsm_fee_zat, nu7_active=True):
+    """Whether a block's reported NSM share matches consensus: floor(60%) of the
+    fees once NU7 is active, nothing before. None when a value is missing or the
+    activation state is unknown."""
+    if fees_zat is None or nsm_fee_zat is None or nu7_active is None:
         return None
-    return nsm_fee_zat == nsm_fee_share(fees_zat)
+    expected = nsm_fee_share(fees_zat) if nu7_active else 0
+    return nsm_fee_zat == expected
 
 
 def attribute_counters(previous, current):

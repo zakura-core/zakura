@@ -75,6 +75,11 @@ class ChainArithmeticTests(unittest.TestCase):
         self.assertFalse(chain.fee_split_ok(1001, 601))
         self.assertIsNone(chain.fee_split_ok(None, 600))
 
+    def test_fee_split_expects_no_nsm_share_before_activation(self):
+        self.assertTrue(chain.fee_split_ok(1001, 0, nu7_active=False))
+        self.assertFalse(chain.fee_split_ok(1001, 600, nu7_active=False))
+        self.assertIsNone(chain.fee_split_ok(1001, 600, nu7_active=None))
+
     def test_attribute_one_new_block_is_exact(self):
         previous = {"height": 10, "totals": {"fees_zat": 100}, "latest": {"fees_zat": 40}}
         current = {"height": 11, "totals": {"fees_zat": 150}, "latest": {"fees_zat": 50}}
@@ -229,7 +234,7 @@ class CollectorTests(unittest.TestCase):
         self.collector.ingest_once(self.store)
         row = self.store.block(height)
         self.assertEqual((row["fees_zat"], row["nsm_fee_zat"], row["orchard_actions"]), (2001, 1200, 33))
-        self.assertEqual(row["fee_split_ok"], 1)
+        self.assertEqual(row["fee_split_ok"], 0, "a 60% NSM share before activation fails the split check")
 
     def test_counter_reset_is_an_event(self):
         self.collector.ingest_once(self.store)

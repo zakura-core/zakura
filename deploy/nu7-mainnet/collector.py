@@ -176,7 +176,9 @@ class Collector:
             rows = []
         for height, values, merged_from in rows:
             values = dict(values)
-            values["fee_split_ok"] = chain.fee_split_ok(values.get("fees_zat"), values.get("nsm_fee_zat"))
+            values["fee_split_ok"] = chain.fee_split_ok(
+                values.get("fees_zat"), values.get("nsm_fee_zat"), self.nu7_active_for(height, merged_from)
+            )
             if merged_from is not None:
                 values["merged_from"] = merged_from
             if store.block(height) is None:
@@ -185,6 +187,15 @@ class Collector:
             else:
                 store.update_block(height, values)
         store.set_meta("counter_snapshot", current)
+
+    def nu7_active_for(self, height, merged_from):
+        """Whether NU7 rules applied to every block a row covers; None for a merged row that straddles activation."""
+        first = height if merged_from is None else merged_from
+        if first >= self.activation_height:
+            return True
+        if height < self.activation_height:
+            return False
+        return None
 
     def metrics_loop(self, base_interval):
         store = Store(self.db_path)

@@ -293,22 +293,17 @@ impl AdoptionEvidence {
     }
 
     /// The tip rule: every adoption that changes the selected tip publishes
-    /// it on the tip watch before the next adoption and before virtual time
-    /// moves on, and every publication names the latest adopted tip and
-    /// reaches a receiver. The reactor sends in the same synchronous call
-    /// that adopts, and the simulator advances time only once no task is
-    /// ready, so a later timestamp means the reactor finished that call. The
-    /// harness holds the watch's receiver for the whole run, so a send with
-    /// none is a break. A run that ends at the adoption's instant is
-    /// inconclusive.
+    /// it on the tip watch before the next adoption, and every publication
+    /// names the latest adopted tip and reaches a receiver. The harness holds
+    /// the watch's receiver for the whole run, so a send with none is a break.
+    /// A run that ends with a tip still owed is inconclusive. Virtual time
+    /// isn't a deadline here, since a harness may hold the reactor's task
+    /// (`Sim::hold_tasks`) while time moves.
     pub fn tip(&self) -> Acceptance {
         let store = self.store();
         let mut adopted: Option<Frontier> = None;
         let mut owed: Option<(Frontier, Duration)> = None;
         for stamped in &store.facts {
-            if let Some((tip, at)) = owed.filter(|(_, at)| stamped.at > *at) {
-                return unpublished(tip, at);
-            }
             match &stamped.fact {
                 AdoptionFact::Adopted(adoption) => {
                     if let Some((tip, at)) = owed {
@@ -336,9 +331,8 @@ impl AdoptionEvidence {
             }
         }
         match owed {
-            Some((tip, at)) if store.horizon > at => unpublished(tip, at),
             Some((tip, at)) => Acceptance::Inconclusive(format!(
-                "the run ended at the instant {at:?} that adopted {tip:?}"
+                "the run ended with {tip:?}, adopted at {at:?}, not yet published"
             )),
             None => Acceptance::Holds,
         }
@@ -355,20 +349,24 @@ impl AdoptionEvidence {
     /// - after a deferral, another status fact within [`STATUS_RETRY_BOUND`].
     ///
     /// A later adoption that changes the status replaces what's owed, since
-    /// the publisher only ever sends its latest desired status. One that
-    /// doesn't change it keeps the deadline. A deadline at or after the
-    /// session's end is owed nothing. A run that ends before a deadline is
+    /// the publisher only ever sends its latest desired status, and resets the
+    /// deadline even when the session already holds that status, since the
+    /// publisher then sends it again. One that doesn't change the status keeps
+    /// the deadline. An adoption before a session starts owes it nothing
+    /// beyond its first status, and a deadline at or after its end is owed
+    /// nothing. The bounds assume the harness doesn't hold the reactor's task
+    /// (`Sim::hold_tasks`), as the header harnesses don't. A run that ends before a deadline is
     /// inconclusive. Status facts for a session not in `sessions` are checked
     /// only for what they advertise.
     pub fn status(&self, sessions: &[SessionLife]) -> Acceptance {
         let store = self.store();
         let mut latest: Option<&Adoption> = None;
-        let mut owed: BTreeMap<u64, Owed<'_>> = sessions
+        let mut owed: BTreeMap<u64, Owed> = sessions
             .iter()
             .map(|life| {
                 let owed = Owed {
-                    queued: None,
                     due: Some(life.from + STATUS_CHANGE_BOUND),
+                    from: life.from,
                     until: life.until,
                 };
                 (life.session_id, owed)
@@ -385,13 +383,8 @@ impl AdoptionEvidence {
                     if !changed {
                         continue;
                     }
-                    for session in owed.values_mut() {
-                        if !session
-                            .queued
-                            .is_some_and(|status| adoption.advertised_by(status))
-                        {
-                            session.due = Some(stamped.at + STATUS_CHANGE_BOUND);
-                        }
+                    for session in owed.values_mut().filter(|owed| owed.from <= stamped.at) {
+                        session.due = Some(stamped.at + STATUS_CHANGE_BOUND);
                     }
                 }
                 AdoptionFact::StatusQueued {
@@ -409,7 +402,6 @@ impl AdoptionEvidence {
                         ));
                     }
                     if let Some(session) = owed.get_mut(session_id) {
-                        session.queued = Some(status);
                         session.due = None;
                     }
                 }
@@ -449,16 +441,16 @@ pub struct SessionLife {
 }
 
 /// What the status rule says one session is owed.
-struct Owed<'s> {
-    /// The last status queued on it.
-    queued: Option<&'s Status>,
+struct Owed {
     /// When its next status fact is due, if one is owed.
     due: Option<Duration>,
+    /// When it started.
+    from: Duration,
     /// When it ended, if it did.
     until: Option<Duration>,
 }
 
-impl Owed<'_> {
+impl Owed {
     /// The deadline still owed: one before the session's end, if any.
     fn pending(&self) -> Option<Duration> {
         self.due
@@ -467,7 +459,7 @@ impl Owed<'_> {
 }
 
 /// The first session whose owed deadline is before `now`, and that deadline.
-fn overdue(owed: &BTreeMap<u64, Owed<'_>>, now: Duration) -> Option<(u64, Duration)> {
+fn overdue(owed: &BTreeMap<u64, Owed>, now: Duration) -> Option<(u64, Duration)> {
     owed.iter().find_map(|(session, owed)| {
         owed.pending()
             .filter(|due| now > *due)
@@ -612,11 +604,11 @@ mod tests {
         }
     }
 
-    /// A changed tip is owed at its adoption's instant: published there it holds,
+    /// A changed tip is owed before the next adoption: published by then it holds,
     /// unpublished when time or the next adoption moves on it breaks, and a run
     /// ending at that instant is inconclusive. A stale or lost publication breaks.
     #[test]
-    fn the_tip_is_owed_at_its_adoptions_instant() {
+    fn a_changed_tip_is_owed_before_the_next_adoption() {
         let (first, second) = (adoption(1, 1), adoption(2, 2));
         let held = evidence(
             vec![
@@ -643,10 +635,9 @@ mod tests {
         );
         assert_eq!(unchanged.tip(), Acceptance::Holds);
 
-        let cut = evidence(vec![(0, adopted(&first))], 0);
+        // Time alone owes nothing: only the next adoption does.
+        let cut = evidence(vec![(0, adopted(&first))], 60_000);
         assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
-        let late = evidence(vec![(0, adopted(&first))], 1);
-        assert!(violates(&late.tip(), "UnpublishedTip"));
         let skipped = evidence(vec![(0, adopted(&first)), (0, adopted(&second))], 0);
         assert!(violates(&skipped.tip(), "UnpublishedTip"));
         let stale = evidence(
@@ -755,6 +746,35 @@ mod tests {
             &evidence(postponed, 3_000).status(&live),
             "StatusOverdue"
         ));
+
+        // A session that starts after an adoption owes its first status from
+        // its own start.
+        let late = [SessionLife {
+            session_id: 1,
+            from: Duration::from_secs(10),
+            until: None,
+        }];
+        let joined = evidence(
+            vec![(0, adopted(&first)), (10_000, queued(status(&first)))],
+            60_000,
+        );
+        assert_eq!(joined.status(&late), Acceptance::Holds);
+
+        // Returning to the queued status still owes a status in time, which the
+        // publisher sends again.
+        let back = vec![
+            (0, adopted(&first)),
+            (0, queued(status(&first))),
+            (1_000, adopted(&second)),
+            (2_900, adopted(&first)),
+        ];
+        assert!(matches!(
+            evidence(back.clone(), 3_100).status(&live),
+            Acceptance::Inconclusive(_)
+        ));
+        let mut resent = back;
+        resent.push((3_000, queued(status(&first))));
+        assert_eq!(evidence(resent, 60_000).status(&live), Acceptance::Holds);
 
         let retry = vec![
             (0, adopted(&first)),

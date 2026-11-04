@@ -136,7 +136,7 @@ fn tip_with_transaction(height: u32, hash_byte: u8, parent_byte: u8) -> ChainTip
         .expect("test vector block deserializes");
 
     ChainTipBlock {
-        transactions: block.transactions.clone(),
+        transactions: block.transactions.iter().cloned().map(Into::into).collect(),
         transaction_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
         ..tip(height, hash_byte, parent_byte)
     }

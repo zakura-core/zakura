@@ -57,10 +57,11 @@ use super::peer_memory::{
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
-    frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
-    ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, NodeResources,
-    OrderedStreamFailure, OrderedStreamFailureCause, OwnerGuard, OwnerPhase, ReactorBudget,
-    ReactorShares, ResourceEnvelope, SessionLayout, StreamResources, TransportLimits,
+    check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
+    worker_framed_channel, AdmittedFrame, ConnectionResources, FrameGate, FrameGrant,
+    FramedWorkerRecv, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause, OwnerGuard,
+    OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout, StreamResources,
+    TransportLimits,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -422,22 +423,18 @@ impl ZakuraConfig {
     /// frame, a block-sync frame of `MAX_BS_FRAME_BYTES`.
     ///
     /// Each native stream kind's receive share is the stream window
-    /// ([`ReactorShares::from_quic`]). A frame above its share would take the
-    /// whole share and be charged less than it holds, so the endpoint would
-    /// refuse to start.
+    /// ([`ReactorShares::from_quic`]), so this applies endpoint startup's share
+    /// check to block sync's stream. Startup checks every registered kind again.
     pub fn validate_stream_receive_window(&self) -> Result<(), zakura_quic::ConfigError> {
-        let largest = super::block_sync::MAX_BS_FRAME_BYTES.min(super::LOCAL_MAX_MESSAGE_BYTES);
-        let window = self.quic.stream_receive_window_bytes;
-        if window < largest {
-            return Err(zakura_quic::ConfigError {
-                key: "stream_receive_window_bytes",
-                reason: format!(
-                    "{window} can't hold the largest native frame of {largest} bytes; \
-                     each native stream kind receives at most one stream window"
-                ),
-            });
-        }
-        Ok(())
+        check_reactor_shares(
+            &ReactorShares::from_quic(&self.quic),
+            super::block_sync::BLOCK_SYNC_SERVICE_STREAMS,
+            super::LOCAL_MAX_MESSAGE_BYTES,
+        )
+        .map_err(|error| zakura_quic::ConfigError {
+            key: "stream_receive_window_bytes",
+            reason: format!("{error}; each native stream kind receives one stream window"),
+        })
     }
 
     /// Return the effective per-IP admission cap, preserving a non-zero limit.
@@ -2494,6 +2491,14 @@ pub(crate) fn service_registry(
     ))
 }
 
+/// Every stream that `registry`'s services serve.
+fn registry_streams(registry: &ServiceRegistry) -> impl Iterator<Item = Stream> + '_ {
+    registry
+        .services()
+        .iter()
+        .flat_map(|service| service.streams().iter().copied())
+}
+
 /// zakura-quic acceptor for the Zakura `p2p-v2/3` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
@@ -2597,10 +2602,7 @@ impl ZakuraProtocolHandler {
         let envelope = limits.resource_envelope(&registry);
         let resources = NodeResources::new(
             limits.reactor_shares(),
-            registry
-                .services()
-                .iter()
-                .flat_map(|service| service.streams().iter().copied()),
+            registry_streams(&registry),
             limits.max_frame_bytes,
         );
         debug!(
@@ -4433,14 +4435,6 @@ async fn spawn_zakura_endpoint_inner(
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
     let discovery_secret_key = secret_key.clone();
-    // Bind a fixed address when configured so this node has a stable, advertisable
-    // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
-    // case does not expose the native P2P_V2_ALPN surface on all interfaces.
-    let quic = QuicEndpoint::bind(
-        secret_key,
-        &limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr)),
-        &limits.quic,
-    )?;
     let supervisor = match peer_registry {
         Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
             config.zakura.max_connections_per_ip(),
@@ -4565,8 +4559,27 @@ async fn spawn_zakura_endpoint_inner(
         service_demand.clone(),
         custom_services,
     );
-    let registry = match registry {
-        Ok(registry) => registry,
+    // Refuse shares that can't hold a registered frame before binding, so the
+    // handler's assertion of the same rule (`NodeResources::new`) can't stop
+    // startup. Bind a fixed
+    // address when configured so this node has a stable, advertisable Zakura
+    // endpoint; otherwise bind loopback-only so the unset (dial-out-only) case
+    // does not expose the native P2P_V2_ALPN surface on all interfaces.
+    let bound = registry.and_then(|registry| {
+        check_reactor_shares(
+            &limits.reactor_shares(),
+            registry_streams(&registry),
+            limits.max_frame_bytes,
+        )?;
+        let quic = QuicEndpoint::bind(
+            secret_key,
+            &limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr)),
+            &limits.quic,
+        )?;
+        Ok((registry, quic))
+    });
+    let (registry, quic) = match bound {
+        Ok(bound) => bound,
         Err(error) => {
             header_sync_shutdown.cancel();
             return Err(error);
@@ -8392,6 +8405,67 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid zakura.block_sync config"),
+            "unexpected error: {error}",
+        );
+    }
+
+    /// A `Config` built in code skips config-load validation, so startup
+    /// must refuse a window below a block-sync frame instead of panicking.
+    #[tokio::test]
+    async fn a_programmatic_stream_window_below_a_frame_fails_startup() {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.quic.stream_receive_window_bytes = 64 * 1024;
+
+        let error = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await
+        .expect_err("a stream window below a block-sync frame must not start the endpoint");
+        assert!(
+            error.to_string().contains("receive share of 65536 bytes"),
+            "unexpected error: {error}",
+        );
+    }
+
+    /// Config load checks only native kinds, so startup must refuse a custom
+    /// kind whose frame exceeds its share.
+    #[tokio::test]
+    async fn a_custom_frame_above_its_share_fails_startup_and_names_the_kind() {
+        const CUSTOM_STREAM: Stream = Stream {
+            kind: 64,
+            version: 1,
+            frame_cap: LOCAL_MAX_MESSAGE_BYTES,
+            capability: 1 << 16,
+            ..Stream::PERSISTENT
+        };
+
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.quic.stream_receive_window_bytes = MAX_BS_FRAME_BYTES;
+        config
+            .zakura
+            .validate_stream_receive_window()
+            .expect("the window holds every native frame");
+        let (sessions, _session_rx) = mpsc::unbounded_channel();
+
+        let error = spawn_zakura_endpoint_with_services(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopService),
+            None,
+            vec![CustomService {
+                service: Arc::new(OrderedStreamService {
+                    stream: CUSTOM_STREAM,
+                    sessions,
+                }),
+                provides: Vec::new(),
+                seeks: Vec::new(),
+            }],
+        )
+        .await
+        .expect_err("a custom frame above its share must not start the endpoint");
+        assert!(
+            error.to_string().contains("stream kind 64's receive share"),
             "unexpected error: {error}",
         );
     }

@@ -39,8 +39,8 @@ pub(crate) use io::{
 #[cfg(test)]
 pub(crate) use lifetime::OwnerCounts;
 pub(crate) use lifetime::{
-    frame_wire_bytes, ConnectionResources, FrameGate, FrameGrant, NodeResources, OwnerGuard,
-    OwnerPhase, ResourceEnvelope, StreamResources, TransportLimits,
+    check_reactor_shares, frame_wire_bytes, ConnectionResources, FrameGate, FrameGrant,
+    NodeResources, OwnerGuard, OwnerPhase, ResourceEnvelope, StreamResources, TransportLimits,
 };
 pub use lifetime::{ReactorShares, DEFAULT_REACTOR_OUTPUT_BYTES};
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};

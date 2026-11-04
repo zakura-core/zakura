@@ -1592,14 +1592,13 @@ where
     where
         C: Clone,
     {
-        crate::peer::block_gossip::BlockAdvertiser {
-            peers: self.block_gossip_peers_tx.subscribe(),
-            slots: self.block_gossip_slots.clone(),
-            fanout: self.block_gossip_fanout,
-            minimum_peer_version: self.minimum_peer_version.clone(),
-            bans: self.bans.clone(),
-            refresh: None,
-        }
+        crate::peer::block_gossip::BlockAdvertiser::new(
+            self.block_gossip_peers_tx.subscribe(),
+            self.block_gossip_slots.clone(),
+            self.block_gossip_fanout,
+            self.minimum_peer_version.clone(),
+            self.bans.clone(),
+        )
     }
 
     /// Given a number of ready peers calculate to how many of them Zebra will

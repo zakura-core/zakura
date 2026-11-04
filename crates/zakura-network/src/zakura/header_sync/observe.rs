@@ -151,8 +151,10 @@ pub enum ReactorEvent {
         cause: WaitCause,
     },
     /// The reactor reserved header capacity for one wire request to `peer`:
-    /// a round's first request, a granted continuation, or a VCT repair
-    /// request.
+    /// a round's first request, a continuation, or a VCT repair request.
+    /// Reported once the reservation succeeds, before the request is sent, so
+    /// it doesn't show that the request went out: a failed send or grant
+    /// cancels the reservation, and a scheduling point can come in between.
     ReservationOpened {
         /// The peer the request goes to.
         peer: ZakuraPeerId,

@@ -157,8 +157,9 @@ pub enum Trigger<K> {
     Prepared(String),
     /// The header node under test reserved header capacity for a request to
     /// this peer, as its tap reports: once per reservation, for a round's
-    /// first request, each granted continuation and each repair request.
-    /// Never holds without a tap.
+    /// first request, each continuation and each repair request. It counts
+    /// the reservation, not the request, which a failed send or grant
+    /// cancels. Never holds without a tap.
     ReservationOpened(String),
     /// The header node under test's reactor admitted a session from this
     /// peer, as its tap reports: once per admission, the setup link's

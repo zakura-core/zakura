@@ -238,8 +238,10 @@ fn a_shutdown_rejects_a_mirror_and_a_later_relink() {
 /// peer: `mirror-0`'s close comes only after the node's first call, its
 /// locator read, ends, since the node reserves while it handles that reply.
 /// The reactor can reach a scheduling point between the reservation and the
-/// request it sends, so the close may land in between. A mirror with nothing
-/// to offer gets no reservation, so its close is never offered.
+/// request it sends, so the close may land in between, and some plans close
+/// the link before any request starts: the trigger counts the reservation,
+/// not a sent request. A mirror with nothing to offer gets no reservation,
+/// so its close is never offered.
 #[test]
 fn a_control_step_waits_for_a_reservation() {
     let close = || {
@@ -250,6 +252,7 @@ fn a_control_step_waits_for_a_reservation() {
         )]
     };
     let scenario = scenario(Vec::new(), close());
+    let mut unsent = 0;
     for input in inputs(16, 256) {
         let report = run(&scenario, input);
         let closed = picked(&report, "peer:mirror-0:close").expect("the node reserves");
@@ -257,7 +260,14 @@ fn a_control_step_waits_for_a_reservation() {
             .find_map(|(at, event)| matches!(event, ReactorFact::CallEnded { .. }).then_some(at))
             .expect("the node's locator read ends");
         assert!(closed > located, "closed at {closed}, located at {located}");
+        if !reactor(&report).any(|(_, event)| matches!(event, ReactorFact::Started { .. })) {
+            unsent += 1;
+        }
     }
+    assert!(
+        unsent > 0,
+        "no plan closed the link between the reservation and its request"
+    );
 
     let idle = StorageScenario {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {

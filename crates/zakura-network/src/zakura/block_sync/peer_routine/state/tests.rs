@@ -768,3 +768,69 @@ fn a_late_body_matches_only_the_replacement_request() {
     assert!(model.requests.is_empty());
     assert_eq!(model.next_sequence, 3);
 }
+
+/// A peer that briefly drains its outbound queue cannot renew the congestion
+/// grace. Block progress and disarm each start a new episode with a fresh grace.
+#[test]
+fn liveness_grace_is_granted_once_per_no_progress_episode() {
+    let request_timeout = Duration::from_secs(2);
+    let start = Instant::now();
+    let far = start + Duration::from_secs(3_600);
+    let mut harness = Harness::new();
+    harness.issue(1, 1, 1, start, far);
+
+    // Congestion at the deadline earns the episode's one grace.
+    let deadline = start + LIVENESS_TIMEOUT;
+    harness.state.note_outbound_capacity(false, deadline);
+    assert_eq!(
+        harness
+            .state
+            .check_block_liveness(deadline, true, request_timeout),
+        super::LivenessDecision::Continue,
+    );
+
+    // A brief free slot starts a fresh full interval but no fresh grace.
+    let drained = deadline + Duration::from_millis(1);
+    harness.state.note_outbound_capacity(true, drained);
+    harness.state.note_outbound_capacity(false, drained);
+    let extended = deadline + request_timeout;
+    assert_eq!(
+        harness
+            .state
+            .check_block_liveness(extended, true, request_timeout),
+        super::LivenessDecision::Stall,
+        "a renewed full interval must not grant a second grace",
+    );
+
+    // Block progress with work still outstanding starts a new episode.
+    harness
+        .state
+        .window
+        .note_block_progress(extended, LIVENESS_TIMEOUT);
+    let next_deadline = extended + LIVENESS_TIMEOUT;
+    harness.state.note_outbound_capacity(true, next_deadline);
+    harness.state.note_outbound_capacity(false, next_deadline);
+    assert_eq!(
+        harness
+            .state
+            .check_block_liveness(next_deadline, true, request_timeout),
+        super::LivenessDecision::Continue,
+        "block progress restores the grace",
+    );
+
+    // Disarming an idle window also starts a new episode.
+    harness.state.window.outstanding.drain();
+    harness.state.window.clear_liveness_if_idle();
+    let reissued = next_deadline + Duration::from_millis(1);
+    harness.issue(2, 2, 1, reissued, far);
+    let last_deadline = reissued + LIVENESS_TIMEOUT;
+    harness.state.note_outbound_capacity(true, last_deadline);
+    harness.state.note_outbound_capacity(false, last_deadline);
+    assert_eq!(
+        harness
+            .state
+            .check_block_liveness(last_deadline, true, request_timeout),
+        super::LivenessDecision::Continue,
+        "disarm restores the grace",
+    );
+}

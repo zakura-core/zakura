@@ -94,7 +94,7 @@ jobs:
           versions="$(cargo xtask sim-versions --sim "${HARNESS}")"
           echo "key=$(printf '%s' "${versions}" | sha256sum | cut -c1-16)" >> "${GITHUB_OUTPUT}"
       - name: Restore the target's corpus
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 #v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: qa/fuzz/${{ inputs.package }}/corpus/${{ matrix.target }}
           # Bytes mean something only to their decoder, so a new decoder starts a new

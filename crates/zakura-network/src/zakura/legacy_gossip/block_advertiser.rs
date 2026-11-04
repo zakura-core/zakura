@@ -27,9 +27,7 @@ use crate::{
 
 use super::{BlockFanout, LegacyGossipFrame, ZakuraGossipBroadcast, ZakuraSupervisorHandle};
 
-/// How long a session whose queue is full gets to make room for a block advertisement, the
-/// same as a busy legacy peer's advert queue gets.
-const QUEUE_WAIT: Duration = Duration::from_secs(3);
+use super::BLOCK_QUEUE_WAIT as QUEUE_WAIT;
 
 /// Tower service that announces blocks to the Zakura peers with open gossip sessions.
 ///
@@ -41,7 +39,8 @@ const QUEUE_WAIT: Duration = Duration::from_secs(3);
 /// replay, since the chain can still reject it; once it commits, its announcement keeps it for
 /// replay even though it is not sent again. A session added while a full queue was making room
 /// is offered the block once it is delivered, since its replay on joining came too early for
-/// it. Requests other than block advertisements fail.
+/// it, unless a later block has been remembered since. Requests other than block
+/// advertisements fail.
 pub(crate) struct ZakuraBlockAdvertiser {
     broadcast: ZakuraGossipBroadcast,
     readiness: Readiness,
@@ -115,9 +114,14 @@ impl ZakuraBlockAdvertiser {
             }
             // A session added while a full queue was making room was replayed the block before
             // this one, or nothing, and a later advertisement of this block is not sent again.
-            broadcast
-                .outbound
-                .send_block_to_sessions_added_since(&offered, hash);
+            // Unless a later advertisement's block has been remembered since: then that is what
+            // the session was replayed, and this block is older than what it has.
+            if !broadcast.outbound.is_superseded(advertisement) {
+                broadcast
+                    .outbound
+                    .send_block_to_sessions_added_since(&offered, hash, queue_wait)
+                    .await;
+            }
             return Ok(Response::Nil);
         }
         if reached.attempted == 0
@@ -461,7 +465,7 @@ mod tests {
         let (later, mut later_receiver) = insert_session(&broadcast.outbound, 6, 1);
         broadcast
             .outbound
-            .replay_latest_block_to_peer(later)
+            .replay_latest_block_to_peer(later, TEST_QUEUE_WAIT)
             .await?;
         assert_eq!(
             recv_advert(&mut later_receiver).await?,
@@ -558,7 +562,7 @@ mod tests {
         let (later, mut later_receiver) = insert_session(&broadcast.outbound, 11, 1);
         broadcast
             .outbound
-            .replay_latest_block_to_peer(later)
+            .replay_latest_block_to_peer(later, TEST_QUEUE_WAIT)
             .await?;
         assert!(
             later_receiver.try_recv().is_err(),
@@ -602,7 +606,7 @@ mod tests {
         let (later, mut later_receiver) = insert_session(&broadcast.outbound, 13, 1);
         broadcast
             .outbound
-            .replay_latest_block_to_peer(later)
+            .replay_latest_block_to_peer(later, TEST_QUEUE_WAIT)
             .await?;
         assert_eq!(
             recv_advert(&mut later_receiver).await?,
@@ -653,7 +657,7 @@ mod tests {
         // The replay on joining runs after the block was remembered, and finds it queued.
         broadcast
             .outbound
-            .replay_latest_block_to_peer(joined)
+            .replay_latest_block_to_peer(joined, TEST_QUEUE_WAIT)
             .await?;
         assert!(
             joined_receiver.try_recv().is_err(),
@@ -750,6 +754,90 @@ mod tests {
             Some(newer),
             "the block advertised later stays the one replayed to later peers"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_does_not_catch_a_joined_session_up_with_an_older_block(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_busy, mut busy_receiver) = insert_session(&broadcast.outbound, 20, 1);
+        let earlier = block_hash(200);
+        let older = block_hash(20);
+        let newer = block_hash(21);
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(earlier.into()))
+            .await?;
+
+        // While the older block waits for the full queue: a newer, already relayed block is
+        // remembered, a session joins and is replayed it, then the queue drains.
+        let mut later_advertiser = advertiser.clone();
+        let newer_then_join_then_drain = async {
+            tokio::time::sleep(TEST_QUEUE_WAIT / 4).await;
+            broadcast
+                .mark_seen(&LegacyGossipFrame::AdvertiseBlock(newer))
+                .await;
+            timeout(RECEIVE_TIMEOUT, later_advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(newer.into()))
+                .await?;
+            let (joined, mut joined_receiver) = insert_session(&broadcast.outbound, 22, 2);
+            broadcast
+                .outbound
+                .replay_latest_block_to_peer(joined, TEST_QUEUE_WAIT)
+                .await?;
+            assert_eq!(recv_advert(&mut joined_receiver).await?, newer);
+            let drained = recv_advert(&mut busy_receiver).await?;
+            Ok::<_, BoxError>((joined_receiver, drained))
+        };
+        let advertise_older = async {
+            timeout(RECEIVE_TIMEOUT, advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(older.into()))
+                .await
+        };
+        let (joined, advertised) = tokio::join!(newer_then_join_then_drain, advertise_older);
+        let (mut joined_receiver, drained) = joined?;
+        assert_eq!(drained, earlier);
+        advertised?;
+
+        assert_eq!(recv_advert(&mut busy_receiver).await?, older);
+        assert!(
+            joined_receiver.try_recv().is_err(),
+            "a session that has the newer block is not sent the older one"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_replay_waits_for_a_full_session_to_make_room(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_session, mut receiver) = insert_session(&broadcast.outbound, 23, 1);
+        let hash = block_hash(23);
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(hash.into()))
+            .await?;
+
+        // A session that joins with a full queue of its own is replayed the block once it
+        // drains.
+        let (joined, mut joined_receiver) = insert_session(&broadcast.outbound, 24, 1);
+        let filler = block_hash(240);
+        joined.try_send_advertise_block(filler)?;
+        let drain = async {
+            tokio::time::sleep(TEST_QUEUE_WAIT / 4).await;
+            recv_advert(&mut joined_receiver).await
+        };
+        let replay = broadcast
+            .outbound
+            .replay_latest_block_to_peer(joined.clone(), TEST_QUEUE_WAIT);
+        let (drained, replayed) = tokio::join!(drain, replay);
+        assert_eq!(drained?, filler);
+        replayed?;
+        assert_eq!(recv_advert(&mut joined_receiver).await?, hash);
+        assert_eq!(recv_advert(&mut receiver).await?, hash);
         Ok(())
     }
 }

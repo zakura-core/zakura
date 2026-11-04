@@ -47,7 +47,9 @@ pub(super) struct ReactorState {
     /// The deadline is one readmission cooldown after the disconnect, so a peer
     /// that stays away that long has served the penalty its strikes lead to.
     /// Each entry represents one identity that held a strike when its session
-    /// ended. The reactor prunes expired entries with the cooldowns.
+    /// ended. The reactor prunes expired entries with the cooldowns, and the
+    /// admitted peer limits bound the count, so cycling fresh identities only
+    /// ends the earliest holds.
     pub(super) departed_strikes: HashMap<ZakuraPeerId, (u32, Instant)>,
     pub(super) request_deadlines: HashMap<ZakuraPeerId, Instant>,
     /// Sessions whose subscription this node closed, with the deadline for
@@ -138,15 +140,33 @@ impl ReactorState {
         replaced
     }
 
-    /// Remove `peer`'s session facts and its pending `Close`.
-    /// Forget `peer`'s session, and hold its unproductive-request strikes for
-    /// `hold` after `now` so a reconnect resumes them. A zero `hold` holds nothing.
-    pub(super) fn remove_session(&mut self, peer: &ZakuraPeerId, now: Instant, hold: Duration) {
+    /// Remove `peer`'s session facts and its pending `Close`, and hold its
+    /// unproductive-request strikes for `hold` after `now` so a reconnect
+    /// resumes them.
+    ///
+    /// At most `max_departed` peers keep held strikes; past that, the hold that
+    /// ends first ends now. A zero `hold` holds nothing.
+    pub(super) fn remove_session(
+        &mut self,
+        peer: &ZakuraPeerId,
+        now: Instant,
+        hold: Duration,
+        max_departed: usize,
+    ) {
         if let Some(schedule) = self.peers.remove(peer) {
             self.bump_scheduling_revision();
             if schedule.unproductive_requests > 0 && !hold.is_zero() {
                 self.departed_strikes
                     .insert(peer.clone(), (schedule.unproductive_requests, now + hold));
+                while self.departed_strikes.len() > max_departed {
+                    let earliest = self
+                        .departed_strikes
+                        .iter()
+                        .min_by_key(|(_, (_, until))| *until)
+                        .map(|(peer, _)| peer.clone())
+                        .expect("an over-limit map has an entry");
+                    self.departed_strikes.remove(&earliest);
+                }
             }
         }
         self.close_deadlines.remove(peer);

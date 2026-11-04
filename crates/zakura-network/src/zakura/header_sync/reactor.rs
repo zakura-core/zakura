@@ -850,10 +850,14 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
         self.sessions.remove(peer);
+        let limits = self.startup.config.peer_limits;
         self.state.remove_session(
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
+            limits
+                .max_inbound_peers
+                .saturating_add(limits.max_outbound_peers),
         );
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(

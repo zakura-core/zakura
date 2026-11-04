@@ -413,3 +413,31 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
         "a readmitted peer starts from a clean count"
     );
 }
+
+/// Fresh identities that each leave with a strike end the earliest holds
+/// instead of growing the held set past its limit.
+#[tokio::test(start_paused = true)]
+async fn the_departed_limit_bounds_held_strikes() {
+    let mut fixture = eviction_fixture(3, 7);
+    let hold = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let max_departed = 2;
+    let peers: Vec<_> = (0_u8..4)
+        .map(|index| {
+            ZakuraPeerId::new(vec![0x80 + index; 32]).expect("the test peer ID has 32 bytes")
+        })
+        .collect();
+    for peer in &peers {
+        let state = &mut fixture.reactor.state;
+        state.admit_session(peer, Instant::now());
+        state.charge_unproductive_request(peer, 3);
+        state.remove_session(peer, Instant::now(), hold, max_departed);
+        time::advance(std::time::Duration::from_secs(1)).await;
+    }
+
+    let held = &fixture.reactor.state.departed_strikes;
+    assert_eq!(held.len(), max_departed);
+    assert!(
+        peers[2..].iter().all(|peer| held.contains_key(peer)),
+        "the latest holds stay"
+    );
+}

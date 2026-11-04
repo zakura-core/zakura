@@ -490,7 +490,7 @@ impl Harness {
             }
             Op::Disconnect { peer } => {
                 self.state
-                    .remove_session(&peer_id(peer), Instant::now(), Duration::ZERO);
+                    .remove_session(&peer_id(peer), Instant::now(), Duration::ZERO, 0);
                 if self.model.sessions.remove(&peer).is_some() {
                     self.model.revision += 1;
                 }

@@ -27,10 +27,10 @@ pub(crate) struct ResponseCap {
 
 impl ResponseCap {
     /// Encoded bytes of the largest response, frame headers included.
-    pub(crate) fn output_bytes(self) -> u64 {
-        // Widening usize to u64 is lossless on supported targets.
+    pub(crate) const fn output_bytes(self) -> u64 {
+        // Widening usize and u32 to u64 is lossless on supported targets.
         let header = FRAME_HEADER_BYTES as u64;
-        let frames = u64::from(self.frames).saturating_add(1);
+        let frames = (self.frames as u64).saturating_add(1);
         self.bytes.saturating_add(frames.saturating_mul(header))
     }
 }

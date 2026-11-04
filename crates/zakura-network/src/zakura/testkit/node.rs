@@ -811,7 +811,9 @@ mod tests {
     async fn outbound_dial_reports_the_admitted_ip_before_registration() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        use crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip;
+        use crate::zakura::handler::{
+            serve_reported_native_dial_connection, DialRegistration, DialReport,
+        };
 
         let peer = ZakuraTestNode::builder(9205)
             .spawn()
@@ -842,14 +844,19 @@ mod tests {
                 .expect("dialer spawns");
             let mut peer_set_rx = node.supervisor().subscribe();
             let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
+            let (registration_tx, registration_rx) = tokio::sync::oneshot::channel();
+            let report = DialReport {
+                admitted_ip: admitted_ip_tx,
+                registration: registration_tx,
+            };
             let endpoint = node.endpoint();
             let limits = node.limits().clone();
             let dial = tokio::spawn(async move {
-                serve_native_dial_connection_reporting_admitted_ip(
+                serve_reported_native_dial_connection(
                     &endpoint,
                     peer_addr,
                     &limits,
-                    Some(admitted_ip_tx),
+                    Some(report),
                     crate::zakura::handler::NativeDialKind::Maintained,
                 )
                 .await
@@ -866,6 +873,14 @@ mod tests {
                 admitted_ip_rx.try_recv().ok(),
                 Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 "dialer {seed} reports the loopback path its handshake won, before registration",
+            );
+            assert_eq!(
+                tokio::time::timeout(TEST_NET_TIMEOUT, registration_rx)
+                    .await
+                    .expect("the dial reports its registration before the timeout")
+                    .ok(),
+                Some(DialRegistration::Registered),
+                "dialer {seed} reports its own registration",
             );
 
             dial.abort();

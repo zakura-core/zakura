@@ -1598,6 +1598,29 @@ impl ZakuraDiscoveryHandle {
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
         source: Option<NodeId>,
     ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
+        self.import_relayed_batch(records, source, None).await
+    }
+
+    /// Imports a `Peers` answer that `session` received, as
+    /// [`Self::import_peer_records`] does. The lock hold installs nothing once
+    /// `session` is replaced, and rejects the batch's records instead: the
+    /// answer's verification can outlive its session.
+    pub(super) async fn import_session_peer_records(
+        &self,
+        session: &DiscoverySessionKey,
+        records: impl IntoIterator<Item = ZakuraNodeRecord>,
+        source: NodeId,
+    ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
+        self.import_relayed_batch(records, Some(source), Some(session))
+            .await
+    }
+
+    async fn import_relayed_batch(
+        &self,
+        records: impl IntoIterator<Item = ZakuraNodeRecord>,
+        source: Option<NodeId>,
+        session: Option<&DiscoverySessionKey>,
+    ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
         let mut outcome = ImportBatchOutcome::default();
         let batch: Vec<_> = records.into_iter().collect();
         if batch.is_empty() {
@@ -1634,10 +1657,14 @@ impl ZakuraDiscoveryHandle {
 
         let now = current_unix_secs();
         let mut changes = Vec::new();
-        self.inner
-            .lock()
-            .await
-            .install_relayed(authentic, source, now, &mut outcome, &mut changes);
+        {
+            let mut state = self.inner.lock().await;
+            if session.is_none_or(|session| state.is_current_session(session)) {
+                state.install_relayed(authentic, source, now, &mut outcome, &mut changes);
+            } else {
+                outcome.rejected += authentic.len();
+            }
+        }
         drop(verification_slot);
         log_book_changes(&changes);
         Ok(outcome)
@@ -1904,11 +1931,20 @@ impl ZakuraDiscoveryHandle {
         in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
         let connected = self.connected.borrow().clone();
-        let limit = self
-            .inner
-            .lock()
-            .await
-            .dial_slot_limit(connected.len(), in_flight_node_ids.len());
+        // An attempt stays in flight after its peer registers, until the
+        // attempt settles. Such a peer counts once, as in flight.
+        let registered_in_flight = in_flight_node_ids
+            .iter()
+            .filter(|node_id| {
+                connected
+                    .iter()
+                    .any(|peer_id| peer_id.as_bytes() == node_id.as_bytes())
+            })
+            .count();
+        let limit = self.inner.lock().await.dial_slot_limit(
+            connected.len().saturating_sub(registered_in_flight),
+            in_flight_node_ids.len(),
+        );
         if limit == 0 {
             return Vec::new();
         }
@@ -3208,6 +3244,12 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
         .collect()
 }
 
+/// Returns how many discovery dials may start.
+///
+/// Connected peers and in-flight dials both take slots under the soft cap,
+/// `max_connections - connection_headroom`. The headroom stays free for
+/// maintained peers. `connected_count` excludes peers that an in-flight dial
+/// already registered, so no connection counts twice.
 pub(crate) fn discovery_dial_slot_limit(
     connected_count: usize,
     in_flight_count: usize,
@@ -3216,7 +3258,8 @@ pub(crate) fn discovery_dial_slot_limit(
     max_concurrent_dials: usize,
 ) -> usize {
     let soft_cap = max_connections.saturating_sub(connection_headroom);
-    let available_connection_slots = soft_cap.saturating_sub(connected_count);
+    let available_connection_slots =
+        soft_cap.saturating_sub(connected_count.saturating_add(in_flight_count));
     let available_dial_slots = max_concurrent_dials.saturating_sub(in_flight_count);
     available_connection_slots.min(available_dial_slots)
 }
@@ -8376,9 +8419,73 @@ mod tests {
     fn discovery_dial_slot_limit_reserves_headroom_and_concurrent_cap() {
         assert_eq!(discovery_dial_slot_limit(0, 0, 8, 2, 4), 4);
         assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(4, 1, 8, 2, 4), 1);
         assert_eq!(discovery_dial_slot_limit(2, 4, 8, 2, 4), 0);
         assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 4), 0);
+    }
+
+    proptest::proptest! {
+        /// New dials never take connected peers and in-flight dials past the
+        /// soft cap, nor in-flight dials past the concurrent-dial cap.
+        #[test]
+        fn discovery_dial_slot_limit_keeps_the_headroom_free(
+            connected in 0usize..64,
+            in_flight in 0usize..16,
+            max_connections in 0usize..64,
+            headroom in 0usize..16,
+            max_concurrent in 0usize..16,
+        ) {
+            let limit =
+                discovery_dial_slot_limit(connected, in_flight, max_connections, headroom, max_concurrent);
+            let soft_cap = max_connections.saturating_sub(headroom);
+            let occupied = connected + in_flight;
+            proptest::prop_assert!(occupied + limit <= soft_cap.max(occupied));
+            proptest::prop_assert!(in_flight + limit <= max_concurrent.max(in_flight));
+            proptest::prop_assert_eq!(
+                limit,
+                soft_cap.saturating_sub(occupied).min(max_concurrent.saturating_sub(in_flight)),
+                "the limit uses every free slot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_candidates_count_in_flight_dials_against_the_soft_cap() {
+        let local = secret_key();
+        let candidate_secret = NodeSecretKey::from_bytes(&[91; 32]);
+        let candidate = runtime_record_with_secret(&candidate_secret, 1, service(1), test_addr(1));
+        let candidate_id = candidate.body.node_id;
+        let [connected_id, in_flight_a, in_flight_b] =
+            [92, 93, 94].map(|byte| NodeSecretKey::from_bytes(&[byte; 32]).public());
+        let (connected_tx, connected_rx) = watch::channel(vec![peer_id_for(connected_id)]);
+        // A soft cap of three slots.
+        let handle = discovery_handle_at(
+            local_config_with(local, vec![test_addr(49)], vec![service(1)]),
+            ZakuraDiscoveryConfig {
+                max_zakura_connections: 4,
+                discovery_connection_headroom: 1,
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx,
+            NOW,
+        );
+        import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
+
+        assert!(
+            handle
+                .dial_candidates(&[service(1)], &[in_flight_a, in_flight_b])
+                .await
+                .is_empty(),
+            "one connection and two unregistered dials fill the soft cap"
+        );
+
+        connected_tx.send_replace(vec![peer_id_for(connected_id), peer_id_for(in_flight_a)]);
+        assert_eq!(
+            handle.dial_candidates(&[service(1)], &[in_flight_a]).await,
+            vec![candidate_for(&candidate, false)],
+            "a registered in-flight dial counts once"
+        );
     }
 
     #[tokio::test]

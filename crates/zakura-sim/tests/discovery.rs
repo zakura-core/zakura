@@ -21,26 +21,12 @@ use zakura_sim::{
     domain::discovery::{
         is_source, wait_complete_wakes, WaitState, WAIT_COMPLETE_WAKES as PROPERTY,
     },
-    harness::{
-        discovery::{run_config, spawn, Spawned, WaitComplete},
-        run_harness, HarnessError,
-    },
+    harness::discovery::{run_config, spawn, Spawned, WaitComplete},
     property::{Assumptions, Registry, RegistryChecker, Source, Sources, Tee},
     record::DrawRecord,
     record::Record,
-    MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
+    Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
-
-/// Runs the harness under `plan`.
-fn run_wait_complete(plan: PlanInput) -> RunReport {
-    match run_harness::<WaitComplete>(&Default::default(), plan, &mut MemorySink::default(), None) {
-        Ok(report) => report,
-        Err(HarnessError::Run { failure, .. }) => {
-            panic!("the run hit a harness failure: {failure}")
-        }
-        Err(error) => panic!("{error}"),
-    }
-}
 
 /// The registry's check of [`PROPERTY`] alone, for runs outside the
 /// harness.
@@ -63,11 +49,11 @@ fn task_of(identity: &str) -> Option<&str> {
     Some(&rest[..rest.rfind(':')?])
 }
 
-/// An enabled action other than the source, when the source's next point is
-/// its `notified` in the waiting code and a mark is still to come.
+/// An enabled action other than the source, when the source stands between
+/// its check and its `notified` and a mark is still to come.
 fn hold_source(state: &WaitState, enabled: &[String]) -> Option<usize> {
     let source_enabled = enabled.iter().filter_map(|e| task_of(e)).any(is_source);
-    if !source_enabled || !state.source_at_notified() || state.all_marked() {
+    if !source_enabled || !state.source_between_check_and_notified() || state.all_marked() {
         return None;
     }
     enabled
@@ -174,14 +160,14 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
 }
 
 /// The committed input that holds the source back, from
-/// [`hold_source_back`] on the code before the fix. `tests/witness.rs`
-/// runs it as S4.7's witness test.
+/// [`hold_source_back`] on the fixed code. `tests/witness.rs` runs it as S4.7's
+/// witness test, and the lost-wakeup planted case runs it on the reverted code.
 const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
 
 #[test]
-#[ignore = "rewrites the committed input; needs qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch applied"]
+#[ignore = "rewrites the committed input"]
 fn regenerate_wait_complete_input() {
-    let bytes = hold_source_back().expect("the reverted code misses the wakeup");
+    let bytes = hold_source_back().expect_err("the fix wakes the source");
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/discovery-wait-complete.bin"
@@ -251,10 +237,24 @@ fn the_peer_record_enters_the_book() {
     );
 }
 
+/// The sweep covers the worker counts that change how the source and the sink
+/// interleave.
 #[test]
 fn seed_sweep_wakes() {
-    for plan in inputs(200, 64) {
-        assert_wakes(&run_wait_complete(plan));
+    for workers in [1, 2, 4] {
+        for plan in inputs(200, 64) {
+            let mut config = run_config();
+            config.scheduler.workers = workers;
+            let (report, _) = recorded(
+                config,
+                plan,
+                |sim| {
+                    spawn(sim);
+                },
+                &mut wakes_checker(),
+            );
+            assert_wakes(&report);
+        }
     }
 }
 

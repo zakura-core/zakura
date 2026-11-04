@@ -336,6 +336,10 @@ pub mod discovery_trace {
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
     /// The discovery reader rejected a peer's frame and closed the connection.
     pub const DISCOVERY_VIOLATION: &str = "discovery_violation";
+    /// Phase of one claimed query answer.
+    pub const DISCOVERY_ANSWER: &str = "discovery_answer";
+    /// Phase of one candidate dial attempt.
+    pub const DISCOVERY_DIAL_PHASE: &str = "discovery_dial_phase";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

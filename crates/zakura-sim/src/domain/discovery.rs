@@ -103,8 +103,8 @@ fn check_verification_capacity<S: HasView<View = VerificationView>>(
 pub const WAIT_COMPLETE_WAKES: &str = "discovery/wait-complete-wakes";
 
 /// [`WAIT_COMPLETE_WAKES`]: at each step that leaves no task running after
-/// the sink has run all three `mark_*` notifies, the source must not be
-/// waiting after a point in `complete` or `wait_complete`.
+/// the sink has run the `Hello` notify and both answer notifies, the source
+/// must not be waiting after a point in `wait_complete`.
 ///
 /// It reads only the step loop's task observations, so any harness that
 /// runs discovery's service can register it.
@@ -126,7 +126,7 @@ pub fn wait_complete_wakes<S: HasView>() -> Property<S> {
 /// operations the fix reorders. With the bug, the check comes first, and
 /// the mark lands before the `Notified` exists to catch it. With the fix,
 /// the `Notified` comes first, and the mark lands while the check is still
-/// loading flags. A run where the final mark lands before the source has
+/// reading the state. A run where the final mark lands before the source has
 /// done either, or after it has done both, never reaches the bug.
 fn final_mark_raced_the_wait(log: &ObservationLog) -> bool {
     let mut state = WaitState::new();
@@ -157,7 +157,7 @@ fn check_wait_complete_wakes<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     Verdict::Violated(Violation {
         property: WAIT_COMPLETE_WAKES.to_owned(),
         step: cx.step,
-        witness: [state.last_load, Some(final_notify), state.last_notified]
+        witness: [state.last_check, Some(final_notify), state.last_notified]
             .into_iter()
             .flatten()
             .collect(),
@@ -176,8 +176,8 @@ pub struct WaitState {
     next: BTreeMap<String, (String, Option<u32>)>,
     /// The step that ran each mark's notify.
     marked: Vec<Option<u64>>,
-    /// The source's last load and `notified` steps in the waiting code.
-    last_load: Option<u64>,
+    /// The source's last check and `notified` steps in the waiting code.
+    last_check: Option<u64>,
     last_notified: Option<u64>,
     /// True once the source has created its `Notified` in the waiting code
     /// and hasn't checked for completion since, so it can only go on when
@@ -190,9 +190,9 @@ pub struct WaitState {
     /// through the waiting code.
     created_notified: bool,
     /// True once the source's check has failed in the current pass through
-    /// the waiting code: it ran a load and then parked or stopped at its
-    /// `notified`. A pass ends when the source parks, leaves the waiting
-    /// code, or runs its `notified` or check again.
+    /// the waiting code: it took the state's lock before the final mark. A
+    /// pass ends when the source parks, leaves the waiting code, or runs its
+    /// `notified` or check again.
     check_failed: bool,
 }
 
@@ -213,7 +213,7 @@ impl WaitState {
         WaitState {
             next: BTreeMap::new(),
             marked: vec![None; sites().marks.len()],
-            last_load: None,
+            last_check: None,
             last_notified: None,
             in_wait: false,
             source_parked: false,
@@ -238,7 +238,11 @@ impl WaitState {
         let from = |kind: &str| {
             source_ran && !self.source_parked && self.source_waits_at(|at| at.starts_with(kind))
         };
-        let (created, loaded) = (from("notified"), from("load"));
+        let (created, checked) = (from("notified"), from("lock"));
+        // A check that takes the lock before the final mark finds the exchange
+        // incomplete. The sink records its last answer before its notify, so a
+        // check between the two passes and leaves the waiting code next.
+        let failed = checked && !self.all_marked();
         if let Some(task) = task {
             self.ran(sites, task, step[0].step);
         }
@@ -263,12 +267,12 @@ impl WaitState {
             // A source that repeats an operation of its pass without parking
             // went through a `notified.await` that was already woken, so it
             // starts a new pass.
-            if (created && self.created_notified) || (loaded && self.check_failed) {
+            if (created && self.created_notified) || (checked && self.check_failed) {
                 self.created_notified = false;
                 self.check_failed = false;
             }
             self.created_notified |= created;
-            self.check_failed |= loaded && (self.source_parked || self.source_at_notified());
+            self.check_failed |= failed;
             if self.source_parked || !self.source_waits_at(|_| true) {
                 self.created_notified = false;
                 self.check_failed = false;
@@ -281,12 +285,19 @@ impl WaitState {
         let Some((at, Some(line))) = self.next.get(task) else {
             return;
         };
-        if let Some(i) = sites.marks.iter().position(|m| m == line) {
+        // Both answers share one notify, so each run fills the next open mark
+        // at its line.
+        let open = sites
+            .marks
+            .iter()
+            .zip(&self.marked)
+            .position(|(mark, marked)| mark == line && marked.is_none());
+        if let Some(i) = open {
             self.marked[i] = Some(step);
         }
         if is_source(task) && sites.waiting.contains(line) {
-            if at.starts_with("load") {
-                self.last_load = Some(step);
+            if at.starts_with("release") {
+                self.last_check = Some(step);
                 self.in_wait = false;
             } else if at.starts_with("notified") {
                 self.last_notified = Some(step);
@@ -316,6 +327,14 @@ impl WaitState {
         self.source_waits_at(|at| at.starts_with("notified"))
     }
 
+    /// True if the source finished the first of the two operations
+    /// [`final_mark_raced_the_wait`] names and the second is its next point:
+    /// the `notified` after a failed check, or the check after a `notified`.
+    pub fn source_between_check_and_notified(&self) -> bool {
+        (self.check_failed && self.source_at_notified())
+            || (self.created_notified && self.source_waits_at(|at| at.starts_with("lock")))
+    }
+
     /// True if the source's next point is in the waiting code, at a point
     /// whose kind `at` accepts.
     fn source_waits_at(&self, at: impl Fn(&str) -> bool) -> bool {
@@ -332,61 +351,61 @@ pub fn is_source(task: &str) -> bool {
     task.ends_with("/discovery_source.1")
 }
 
-/// Where `DiscoveryExchangeProgress` lives, and the lines of its
-/// `complete` and `wait_complete` bodies and of the three `mark_*` notifies.
+/// Where `SharedPeerState` lives, and the lines of its `wait_complete` body
+/// and of the `Hello` and answer notifies.
 #[derive(Debug, PartialEq, Eq)]
 struct Sites {
     file: &'static str,
-    /// `complete` through the end of `wait_complete`, the code a waiter runs
-    /// between checking for completion and waiting.
+    /// The body of `wait_complete`, the code a waiter runs between checking
+    /// for completion and waiting.
     waiting: RangeInclusive<u32>,
+    /// The `Hello` notify, then the answer notify once per answer.
     marks: Vec<u32>,
 }
 
-/// The discovery service's source, as the binary was built from it. The
+/// The discovery peer's source, as the binary was built from it. The
 /// observations carry the line numbers compiled into the binary, so the
 /// sites must come from the same text, never from the checkout at run time.
-const SERVICE_RS: &str = include_str!("../../../zakura-network/src/zakura/discovery/service.rs");
+const PEER_RS: &str = include_str!("../../../zakura-network/src/zakura/discovery/peer.rs");
 
-/// The sites in [`SERVICE_RS`], parsed once.
+/// The sites in [`PEER_RS`], parsed once.
 fn sites() -> &'static Sites {
     static SITES: OnceLock<Sites> = OnceLock::new();
-    SITES.get_or_init(|| Sites::parse(SERVICE_RS))
+    SITES.get_or_init(|| Sites::parse(PEER_RS))
 }
 
 impl Sites {
-    /// The sites in `source`, the text of the discovery service's file.
+    /// The sites in `source`, the text of the discovery peer's file.
     fn parse(source: &str) -> Sites {
-        let file = "crates/zakura-network/src/zakura/discovery/service.rs";
+        let file = "crates/zakura-network/src/zakura/discovery/peer.rs";
         let lines: Vec<&str> = source.lines().collect();
         let find = |from: usize, needle: &str| {
             from + lines[from..]
                 .iter()
                 .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("service.rs has `{needle}`"))
+                .unwrap_or_else(|| panic!("peer.rs has `{needle}`"))
         };
         // Lines are 1-based, and the file has far fewer than 2^32 of them.
         let line = |i: usize| (i + 1) as u32;
-        let progress = find(0, "impl DiscoveryExchangeProgress");
-        let complete = find(progress, "fn complete(&self)");
-        let wait_complete = find(complete, "async fn wait_complete(&self)");
+        let progress = find(0, "impl SharedPeerState");
+        let wait_complete = find(progress, "async fn wait_complete(&self)");
         let end = wait_complete
             + lines[wait_complete..]
                 .iter()
                 .position(|l| *l == "    }")
                 .expect("wait_complete's body closes");
-        let marks = ["fn mark_hello", "fn mark_peers", "fn mark_services"]
+        let marks = ["fn record_hello", "fn record_answer", "fn record_answer"]
             .iter()
             .map(|mark| line(find(find(progress, mark), "notify_waiters()")))
             .collect();
         Sites {
             file,
-            waiting: line(complete)..=line(end),
+            waiting: line(wait_complete)..=line(end),
             marks,
         }
     }
 
-    /// The line of `site` if it's in the discovery service's file.
+    /// The line of `site` if it's in the discovery peer's file.
     fn line(&self, site: &Option<String>) -> Option<u32> {
         let (file, line) = site.as_deref()?.rsplit_once(':')?;
         if file.ends_with(self.file) {
@@ -407,11 +426,11 @@ mod tests {
     #[test]
     fn sites_come_from_the_embedded_source() {
         let built = sites();
-        assert_eq!(*built, Sites::parse(SERVICE_RS));
+        assert_eq!(*built, Sites::parse(PEER_RS));
         assert!(built.waiting.start() < built.waiting.end());
         assert_eq!(built.marks.len(), 3);
 
-        let shifted = Sites::parse(&format!("{}{SERVICE_RS}", "\n".repeat(100)));
+        let shifted = Sites::parse(&format!("{}{PEER_RS}", "\n".repeat(100)));
         assert_eq!(
             shifted.waiting,
             built.waiting.start() + 100..=built.waiting.end() + 100
@@ -424,7 +443,7 @@ mod tests {
                 .map(|line| line + 100)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(*sites(), Sites::parse(SERVICE_RS));
+        assert_eq!(*sites(), Sites::parse(PEER_RS));
     }
 
     const SINK: &str = "discovery_admission.1/discovery_pipe.1";
@@ -445,7 +464,7 @@ mod tests {
         }
 
         /// One step that runs `task` to point `at` on `line` of the
-        /// service's file, or parks it for `None`.
+        /// peer's file, or parks it for `None`.
         fn run(&mut self, task: &str, to: Option<(&str, u32)>) -> &mut History {
             self.step += 1;
             self.log.begin(self.step);
@@ -462,11 +481,11 @@ mod tests {
             self
         }
 
-        /// The sink stores flag `i` and runs its notify, stopping before
-        /// the next mark's store.
+        /// The sink records part `i` and runs its notify, stopping before
+        /// the next mark's lock.
         fn mark(&mut self, i: usize) -> &mut History {
             let notify = sites().marks[i];
-            self.run(SINK, Some(("store#1", notify - 1)))
+            self.run(SINK, Some(("lock#1", notify - 1)))
                 .run(SINK, Some(("notify#1", notify)))
                 .run(SINK, Some(("send#1", 1)))
         }
@@ -476,69 +495,80 @@ mod tests {
         }
     }
 
-    /// The line of the service's first line that contains `needle`.
+    /// The line of the peer file's first line that contains `needle`.
     fn line_of(needle: &str) -> u32 {
-        let index = SERVICE_RS
+        let index = PEER_RS
             .lines()
             .position(|l| l.contains(needle))
-            .unwrap_or_else(|| panic!("service.rs has `{needle}`"));
+            .unwrap_or_else(|| panic!("peer.rs has `{needle}`"));
         // The file has far fewer than 2^32 lines.
         index as u32 + 1
     }
 
-    /// The point before flag `i`'s load in `complete`.
-    fn load(i: usize) -> Option<(&'static str, u32)> {
-        let flag = ["hello", "peers", "services"][i];
-        Some(("load#1", line_of(&format!("self.{flag}.load("))))
+    /// The point before `wait_complete`'s check takes the lock.
+    fn check() -> Option<(&'static str, u32)> {
+        Some(("lock#1", line_of("self.lock().is_complete()")))
+    }
+
+    /// The point right after that check releases the lock.
+    fn checked() -> Option<(&'static str, u32)> {
+        Some(("release#1", line_of("self.lock().is_complete()")))
     }
 
     /// The point before `wait_complete`'s `notified()`.
     fn notified() -> Option<(&'static str, u32)> {
-        Some(("notified#1", line_of("self.notify.notified()")))
+        Some(("notified#1", line_of("self.0.progressed.notified()")))
     }
 
-    /// The bug's order: the check fails on Hello, and every mark lands
-    /// while the source sits at its `notified`.
+    /// The bug's order: the check fails, and every mark lands while the source
+    /// sits at its `notified`.
     #[test]
     fn marks_after_a_failed_check_race_the_wait() {
         let mut bug = History::new();
-        bug.run(SOURCE, load(0)).run(SOURCE, notified());
+        bug.run(SOURCE, check())
+            .run(SOURCE, checked())
+            .run(SOURCE, notified());
+        bug.mark(0).mark(1).mark(2);
+        assert!(bug.raced());
+    }
+
+    /// The bug's order, with the source held right after its failed check.
+    #[test]
+    fn marks_right_after_the_failed_check_race_the_wait() {
+        let mut bug = History::new();
+        bug.run(SOURCE, check()).run(SOURCE, checked());
         bug.mark(0).mark(1).mark(2);
         assert!(bug.raced());
     }
 
     /// The fix's order: the source created its `Notified`, and the final
-    /// mark lands while its check still has the Services load to run.
+    /// mark lands before its check takes the lock.
     #[test]
     fn marks_after_the_notified_race_the_check() {
         let mut fix = History::new();
-        fix.run(SOURCE, notified()).run(SOURCE, load(0));
-        fix.mark(0).mark(1);
-        fix.run(SOURCE, load(1)).run(SOURCE, load(2));
-        fix.mark(2);
+        fix.run(SOURCE, notified()).run(SOURCE, check());
+        fix.mark(0).mark(1).mark(2);
         assert!(fix.raced());
     }
 
-    /// The same order without the `Notified`: with the bug, the final mark
-    /// lands while the check still has the Services load to run, which
-    /// sees the mark. The source never waits.
+    /// With the bug, a mark that lands before the check takes the lock is one
+    /// the check sees. The source never waits.
     #[test]
-    fn a_mark_during_the_bugs_check_misses_the_race() {
+    fn marks_before_the_bugs_check_miss_the_race() {
         let mut bug = History::new();
-        bug.run(SOURCE, load(0));
-        bug.mark(0).mark(1);
-        bug.run(SOURCE, load(1)).run(SOURCE, load(2));
-        bug.mark(2);
+        bug.run(SOURCE, check());
+        bug.mark(0).mark(1).mark(2);
         assert!(!bug.raced());
     }
 
     /// A source that has done both, or neither, misses the race: parked
     /// after creating its `Notified` and failing its check, under either
-    /// order, or back at its `notified` after a wake.
+    /// order, or back at its check after a wake.
     #[test]
     fn a_source_outside_the_window_misses_the_race() {
         let mut bug = History::new();
-        bug.run(SOURCE, load(0))
+        bug.run(SOURCE, check())
+            .run(SOURCE, checked())
             .run(SOURCE, notified())
             .run(SOURCE, None);
         bug.mark(0).mark(1).mark(2);
@@ -546,37 +576,52 @@ mod tests {
 
         let mut fix = History::new();
         fix.run(SOURCE, notified())
-            .run(SOURCE, load(0))
+            .run(SOURCE, check())
+            .run(SOURCE, checked())
             .run(SOURCE, None);
         fix.mark(0).mark(1).mark(2);
         assert!(!fix.raced());
 
-        // Woken by Peers, the bug's source runs its check again, and Services
-        // lands mid-check.
+        // Woken by the first answer, the bug's source runs its check again, and
+        // the final mark lands before that check takes the lock.
         let mut woken = History::new();
         woken
-            .run(SOURCE, load(0))
+            .run(SOURCE, check())
+            .run(SOURCE, checked())
             .run(SOURCE, notified())
             .run(SOURCE, None);
         woken.mark(0).mark(1);
-        woken.run(SOURCE, load(0)).run(SOURCE, load(1));
+        woken.run(SOURCE, check());
         woken.mark(2);
         assert!(!woken.raced());
     }
 
-    /// Peers lands between the fix's `notified()` and its failed check, so
-    /// the source's `notified.await` returns without parking. The next
-    /// pass starts over: the final mark lands during that pass's check, as
-    /// in [`marks_after_the_notified_race_the_check`].
+    /// The first answer lands between the fix's `notified()` and its failed
+    /// check, so the source's `notified.await` returns without parking. The
+    /// next pass starts over: the final mark lands before that pass's check,
+    /// as in [`marks_after_the_notified_race_the_check`].
     #[test]
     fn a_wait_that_was_already_woken_starts_a_new_pass() {
         let mut fix = History::new();
-        fix.run(SOURCE, notified()).run(SOURCE, load(0));
+        fix.run(SOURCE, notified())
+            .run(SOURCE, check())
+            .run(SOURCE, checked());
         fix.mark(1);
-        fix.run(SOURCE, notified()).run(SOURCE, load(0));
-        fix.mark(0);
-        fix.run(SOURCE, load(1)).run(SOURCE, load(2));
-        fix.mark(2);
+        fix.run(SOURCE, notified()).run(SOURCE, check());
+        fix.mark(0).mark(2);
         assert!(fix.raced());
+    }
+
+    /// Both answers run one notify, and each run fills the next open mark.
+    #[test]
+    fn each_answer_fills_its_own_mark() {
+        let mut history = History::new();
+        history.mark(1);
+        let state = WaitState::of(history.log.entries());
+        assert_eq!(state.marked.iter().flatten().count(), 1);
+        history.mark(2);
+        let state = WaitState::of(history.log.entries());
+        assert_eq!(state.marked.iter().flatten().count(), 2);
+        assert!(!state.all_marked());
     }
 }

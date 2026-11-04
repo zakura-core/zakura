@@ -1724,8 +1724,7 @@ fn update_latest_chain_channels(
         non_finalized_state.write_to_backup(backup_dir_path);
     }
 
-    // If the final receiver was just dropped, ignore the error.
-    let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+    non_finalized_state.publish(non_finalized_state_sender);
 
     chain_tip_sender.set_best_non_finalized_tip(tip_block);
 
@@ -1743,7 +1742,7 @@ fn update_channels_after_operator_change(
         if let Some(backup_dir_path) = backup_dir_path {
             non_finalized_state.write_to_backup(backup_dir_path);
         }
-        let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+        non_finalized_state.publish(non_finalized_state_sender);
         chain_tip_sender.clear_best_non_finalized_tip(
             finalized_state
                 .db
@@ -3135,8 +3134,7 @@ impl WriteBlockWorkerTask {
                                 // Only the order of other tips changed, so the header chain's
                                 // verified path and the chain tip channel stay the same.
                                 *non_finalized_state = staged;
-                                let _ =
-                                    non_finalized_state_sender.send(non_finalized_state.clone());
+                                non_finalized_state.publish(non_finalized_state_sender);
                                 return Ok(());
                             }
                             let (height, tip_hash) = new_tip.expect(

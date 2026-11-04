@@ -84,9 +84,10 @@ enum Line {
     Refresh,
     /// The select over cancellation, written answers, and the deadline.
     Answers,
-    ClosingOwners,
     /// `mark_short_lived_exchange`.
     ShortLived,
+    /// The last owner check, right before the close.
+    ClosingOwners,
     Done,
 }
 
@@ -128,7 +129,6 @@ impl Model {
             }),
             Line::Refresh => PeerInput::Refreshed {
                 sent: !choice.is_multiple_of(4),
-                unsettled: (choice / 4).is_multiple_of(2),
             },
             Line::Answers => PeerInput::AnswersSettled,
             Line::ShortLived => PeerInput::ShortLivedMarked,
@@ -181,36 +181,32 @@ impl Model {
                     (Line::Done, self.settle_open())
                 }
             }
-            (Line::Refresh, PeerInput::Refreshed { sent, unsettled }) => {
-                // A timed-out exchange gets one refresh interval to complete,
-                // and any delivered part gets its local processing.
-                let stalled = self.continued == Some(true) && !unsettled && !self.complete();
-                if sent && !stalled {
+            (Line::Refresh, PeerInput::Refreshed { sent }) => {
+                if sent {
                     (Line::Owners, then(PeerOutput::CheckSoleOwner))
                 } else {
                     (Line::Done, self.settle_open())
                 }
             }
             (Line::Answers, PeerInput::AnswersSettled) => {
+                (Line::ShortLived, then(PeerOutput::MarkShortLived))
+            }
+            (Line::ShortLived, PeerInput::ShortLivedMarked) => {
                 (Line::ClosingOwners, then(PeerOutput::CheckSoleOwner))
             }
             (Line::ClosingOwners, PeerInput::Owners(owners)) => match owners {
                 Ownership::Shared => (Line::Refresh, then(REFRESH)),
                 Ownership::Superseded => (Line::Done, self.settle_open()),
-                Ownership::Sole => (Line::ShortLived, then(PeerOutput::MarkShortLived)),
+                Ownership::Sole => {
+                    let reason = if self.complete() {
+                        CloseReason::ExchangeComplete
+                    } else {
+                        CloseReason::ExchangeTimedOut
+                    };
+                    let close = Close { reason };
+                    (Line::Done, then(PeerOutput::End { close: Some(close) }))
+                }
             },
-            (Line::ShortLived, PeerInput::ShortLivedMarked) => {
-                let reason = if self.complete() {
-                    CloseReason::ExchangeComplete
-                } else {
-                    CloseReason::ExchangeTimedOut
-                };
-                let close = Close {
-                    reason,
-                    if_kept: self.settle_open().charge,
-                };
-                (Line::Done, then(PeerOutput::End { close: Some(close) }))
-            }
             (line, input) => unreachable!("the model answered {line:?} with {input:?}"),
         };
         self.line = line;
@@ -318,23 +314,20 @@ pub(super) fn run(
                     }
                     None => {}
                 }
-                if let PeerOutput::End {
-                    close: Some(Close { if_kept, .. }),
-                } = step.next
-                {
+                if let PeerOutput::End { close: Some(_) } = step.next {
                     assert!(
                         sole_then_settled,
                         "{PROPERTY}: answers settled before close"
                     );
+                    // IO closes with no wait after this check, so a sibling
+                    // that gains the connection is never closed out.
+                    assert_eq!(
+                        input,
+                        PeerInput::Owners(Ownership::Sole),
+                        "{PROPERTY}: the owner check directly precedes a close"
+                    );
                     assert!(!replaced, "{PROPERTY}: replacement forbids close");
                     assert_eq!(step.charge, None, "{PROPERTY}: a close charges at IO's end");
-                    assert_ne!(
-                        if_kept,
-                        Some(SessionCharge::Retire),
-                        "{PROPERTY}: a kept connection keeps its record"
-                    );
-                    // A kept connection's charge is this session's one charge.
-                    summary.charges += usize::from(if_kept.is_some());
                     summary.closes += 1;
                 }
                 assert!(summary.charges <= 1, "{PROPERTY}: one session charge");

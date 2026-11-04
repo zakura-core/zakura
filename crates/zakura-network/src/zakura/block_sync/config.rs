@@ -459,7 +459,9 @@ impl ZakuraBlockSyncConfig {
     /// Fund decoded allocations through the pipeline and the caller's backend allowance.
     /// Four submission windows cover input, applying, driver overlap, and replacement
     /// headroom. Peer slots cover synchronous handoffs outside those collections.
-    /// Retiring holders keep their slots. The count covers all holders, and
+    /// Retiring holders keep their slots. The count funds the pipeline, peer
+    /// handoffs and `backend_blocks` current backend blocks. It does not fund
+    /// prior backend generations that state readers still hold.
     /// [`Self::decoded_pipeline_byte_bound`] limits the bytes before backend retention.
     pub fn decoded_block_pool(
         &self,

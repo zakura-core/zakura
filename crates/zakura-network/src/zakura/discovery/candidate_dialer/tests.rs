@@ -410,7 +410,9 @@ fn registrations_credit_only_the_attempt_that_registered() {
     use PeerRegistration::{Absent, Ended, Live};
     let dial = DialObservation::DialEnded;
     let rows = [
-        (dial(Served, Live), true, Some(R::ConnectedElsewhere)),
+        (dial(Served, Live), true, Some(R::ShortLivedRegistered)),
+        (dial(Served, Live), false, Some(R::ConnectedElsewhere)),
+        (dial(Failed, Live), true, Some(R::ShortLivedRegistered)),
         (dial(Failed, Live), false, Some(R::ConnectedElsewhere)),
         (dial(LocalLimit, Live), false, Some(R::ConnectedElsewhere)),
         (dial(Served, Ended), true, Some(R::ShortLivedRegistered)),
@@ -483,6 +485,62 @@ fn a_dial_refused_before_registration_is_not_served() {
     let result = classify_dial(refused, false).expect("a finished dial classifies");
     state.complete(second, result, Some(ip), now);
     assert!(state.is_backed_off(node_id(5), ip, now));
+}
+
+/// Another connection's registration confirms nothing: the record this
+/// attempt dialed stays unconfirmed, so this node never samples it to others.
+/// The attempt's own registration confirms it.
+#[tokio::test]
+async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate::BoxError> {
+    use crate::zakura::{ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig};
+    use zakura_chain::parameters::Network;
+
+    let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+    let local = |seed: u8, direct_addrs| ZakuraDiscoveryLocalConfig {
+        secret_key: zakura_quic::NodeSecretKey::from_bytes(&[seed; 32]),
+        direct_addrs,
+        services: vec![ZakuraServiceId::discovery()],
+        zakura_protocol_min: handshake.zakura_protocol_min,
+        zakura_protocol_max: handshake.zakura_protocol_max,
+        network_id: handshake.network_id,
+        chain_id: handshake.chain_id,
+        last_authored_sequence: None,
+    };
+    let (_connected_tx, connected) = watch::channel(Vec::new());
+    let handle = ZakuraDiscoveryHandle::new(
+        local(80, Vec::new()),
+        ZakuraDiscoveryConfig::default(),
+        connected.clone(),
+    )?;
+    let candidate = ZakuraDiscoveryHandle::new(
+        local(81, vec![SocketAddr::from(([93, 184, 216, 34], 8233))]),
+        ZakuraDiscoveryConfig::default(),
+        connected,
+    )?;
+    let record = (*candidate.current_self_record()).clone();
+    let node = record.body.node_id;
+    handle
+        .import_peer_records([record], Some(node_id(82)))
+        .await?;
+    let sampled = || handle.sample_peers(node_id(83), 10, &[], &[]);
+    let trace = ZakuraTrace::default();
+
+    apply_discovery_dial_result(
+        &handle,
+        &node,
+        DiscoveryDialResult::ConnectedElsewhere,
+        &trace,
+    )
+    .await;
+    assert!(sampled().await.is_empty(), "the record stays unconfirmed");
+
+    apply_discovery_dial_result(&handle, &node, DiscoveryDialResult::Registered, &trace).await;
+    assert_eq!(
+        sampled().await.len(),
+        1,
+        "the attempt's own registration confirms it"
+    );
+    Ok(())
 }
 
 fn peer_id(byte: u8) -> ZakuraPeerId {

@@ -146,13 +146,9 @@ impl PeerIO {
                     current: self.handle.is_current_session(&self.slot.key).await,
                 },
                 PeerOutput::CheckSoleOwner => PeerInput::Owners(self.owners().await),
-                PeerOutput::Refresh { interval } => {
-                    let sent = self.refresh_after(interval).await;
-                    PeerInput::Refreshed {
-                        sent,
-                        unsettled: self.queries.holds_unsettled(),
-                    }
-                }
+                PeerOutput::Refresh { interval } => PeerInput::Refreshed {
+                    sent: self.refresh_after(interval).await,
+                },
                 PeerOutput::WaitForAnswers { deadline } => {
                     self.wait_for_answers(deadline).await;
                     PeerInput::AnswersSettled
@@ -187,13 +183,15 @@ impl PeerIO {
         }
     }
 
-    /// Consults the connection's admitted service owners, then whether this
-    /// session is still current. Advertised service names never count.
+    /// Checks whether this session is still current, then consults the
+    /// connection's admitted service owners. Advertised service names never
+    /// count. The owners are read last, after the only wait, so no wait
+    /// separates that read from a close that follows.
     async fn owners(&self) -> Ownership {
+        let current = self.handle.is_current_session(&self.slot.key).await;
         if self.other_service_owns_connection() {
-            return Ownership::Shared;
-        }
-        if self.handle.is_current_session(&self.slot.key).await {
+            Ownership::Shared
+        } else if current {
             Ownership::Sole
         } else {
             Ownership::Superseded
@@ -242,37 +240,25 @@ impl PeerIO {
         }
     }
 
-    /// Ends the session's serving and queries and releases its admission,
-    /// then closes the connection if `close` asks to.
+    /// Ends the session's serving and queries, closes the connection if
+    /// `close` asks to, then releases the session's admission.
     ///
-    /// A service can gain the connection while the session's removal waits for
-    /// the discovery lock, so the owners are read again right before the
-    /// cancel, with no wait between the two. Only that close retires the
-    /// session's record. A connection that stays open is charged as `close`
-    /// says, and its record stays open to later sessions.
+    /// The state asks to close only right after the owner check. Retiring the
+    /// queries can close the connection too, so nothing here waits before the
+    /// close: a service that gained the connection after the check would
+    /// otherwise lose it. Only that close retires the session's record.
     async fn end(self, close: Option<Close>) {
-        let sole = match close {
-            Some(_) => self.owners().await == Ownership::Sole,
-            None => false,
-        };
         self.session.cancel_token().cancel();
         self.queries.retire();
-        self.handle.remove_session(&self.slot.key).await;
-        let Some(Close { reason, if_kept }) = close else {
-            return;
-        };
-        if !sole || self.other_service_owns_connection() {
-            if let Some(charge) = if_kept {
-                self.charge(charge);
-            }
-            return;
+        if let Some(Close { reason }) = close {
+            self.charge(SessionCharge::Retire);
+            self.close_cause.record(match reason {
+                CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
+                CloseReason::ExchangeComplete => "discovery_exchange_complete",
+            });
+            self.connection_cancel.cancel();
         }
-        self.charge(SessionCharge::Retire);
-        self.close_cause.record(match reason {
-            CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
-            CloseReason::ExchangeComplete => "discovery_exchange_complete",
-        });
-        self.connection_cancel.cancel();
+        self.handle.remove_session(&self.slot.key).await;
     }
 
     /// Gossips the current self-record and asks the peer for records and services.

@@ -137,6 +137,82 @@ async fn a_reset_before_writer_start_skips_the_published_request() {
     assert!(routine.state.window.requests_without_block_progress < streak);
 }
 
+/// A reset clears an unproven peer's probe streak. The routine publishes its
+/// slots after the streak clears, so the peer at its probe cap shows free
+/// slots again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reset_that_clears_the_probe_cap_republishes_free_slots() {
+    let budget = ByteBudget::new(1_000_000);
+    let work = Arc::new(WorkQueue::new(block::Height(0), budget));
+    work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Advertised(1_000),
+        )],
+    );
+    let registry = Arc::new(PeerRegistry::new());
+    let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+    let (mut routine, _outbound) = shared_floor_routine(7, &work, &registry, view_rx);
+    assert_eq!(routine.try_fill().sent, 1);
+    assert!(
+        !routine.state.published_free_slots,
+        "the probe reached the cap"
+    );
+
+    view_tx.send_modify(|view| view.reset_epoch += 1);
+    routine.on_view_changed();
+
+    assert_eq!(routine.state.window.requests_without_block_progress, 0);
+    assert!(
+        routine.state.published_free_slots,
+        "the reset cleared the cap, so the publication shows free slots"
+    );
+}
+
+/// A late body proves progress and clears an unproven peer's probe streak. The
+/// routine publishes its slots after the receipt, so the peer at its probe cap
+/// shows free slots again.
+#[tokio::test(start_paused = true)]
+async fn a_late_body_that_clears_the_probe_cap_republishes_free_slots() {
+    let Probe {
+        budget: _,
+        mut routine,
+        mut outbound,
+        blocks,
+        mut bodies,
+        inbound: _inbound,
+        _events,
+    } = probe(1);
+    routine.handle_status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(1),
+        max_blocks_per_response: 1,
+        max_inflight_requests: 3,
+        ..BlockSyncStatus::default()
+    });
+    assert_eq!(routine.try_fill().sent, 1);
+    outbound.recv().await.unwrap();
+    assert!(
+        !routine.state.published_free_slots,
+        "the probe reached the cap"
+    );
+    forget_request(&mut routine, block::Height(1));
+
+    deliver(&mut routine, BlockSyncMessage::Block(blocks[0].clone())).await;
+
+    assert!(
+        bodies.try_recv().is_ok(),
+        "the late body reached the sequencer"
+    );
+    assert_eq!(routine.state.window.requests_without_block_progress, 0);
+    assert!(
+        routine.state.published_free_slots,
+        "the late body cleared the cap, so the publication shows free slots"
+    );
+}
+
 /// How a body waiting for its sequencer slot stops waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitEnd {

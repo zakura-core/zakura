@@ -125,10 +125,10 @@ fn the_default_node_config_composes() {
             .expect("the default allowance fits")
             .get()
     );
-    // Block sync and header sync each fund 512 sessions × 64 MiB; discovery adds its
+    // Block sync and header sync each fund 92 sessions × 64 MiB; discovery adds its
     // answers.
-    assert!(envelope.serve_output_bytes >= 2 * 512 * (64 << 20));
-    assert!(envelope.serve_output_bytes < 2 * 512 * (64 << 20) + (1 << 30));
+    assert!(envelope.serve_output_bytes >= 2 * 92 * (64 << 20));
+    assert!(envelope.serve_output_bytes < 2 * 92 * (64 << 20) + (1 << 30));
     // The QUIC term is the derived one, within the peer memory budget.
     assert_eq!(
         envelope.quic_bytes,
@@ -142,6 +142,7 @@ fn the_default_node_config_composes() {
         envelope.transport_bytes
             + envelope.quic_bytes
             + u128::from(config.tcp_ingress_bound_bytes())
+            + envelope.serve_output_bytes
     );
 }
 
@@ -265,7 +266,7 @@ fn the_byte_bound_adds_each_owner_once() {
     assert_eq!(envelope.serve_output_bytes, 1 << 40);
     assert_eq!(
         envelope.retained_bytes_bound(),
-        retained_bound() + (1 << 20) + u128::from(TCP_INGRESS_BYTES)
+        retained_bound() + (1 << 20) + u128::from(TCP_INGRESS_BYTES) + (1 << 40)
     );
 }
 
@@ -282,7 +283,71 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
     let configured = NodeEnvelope::for_node(&config, &limits, &[], 16)
         .expect("the configured budgets fit")
         .serve_output_bytes;
-    assert_eq!(derived - configured, 2 * (512 * (64 << 20) - (1 << 30)));
+    assert_eq!(derived - configured, 2 * (92 * (64 << 20) - (1 << 30)));
+}
+
+/// Each serving family funds one session per connection that can serve at once: the
+/// inbound plus outbound session slots, clamped to the admitted connections. The
+/// retained bound counts that output, because guarded serving frames skip the
+/// transport output gate.
+#[test]
+fn serving_output_counts_admitted_sessions() {
+    const SESSION: u64 = 64 << 20;
+    let mut config = Config::default();
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let connections = limits.max_connections;
+    // Widening usize to u64 and u128 is lossless on supported targets.
+    let (sessions, discovery) = (
+        connections as u64,
+        u128::from(discovery_serving_output_bytes(connections)),
+    );
+    assert!(config.zakura.block_sync.peer_limits.max_inbound_peers > connections);
+
+    // The reactors build their pools from the node's configs.
+    let block_sync = config
+        .zakura
+        .block_sync
+        .clone()
+        .for_node_connections(connections);
+    assert_eq!(
+        getblocks_serving_limits(&block_sync).node_output_bytes,
+        sessions * SESSION
+    );
+    let headers = config
+        .zakura
+        .header_sync
+        .clone()
+        .for_node_connections(connections);
+    assert_eq!(headers.node_serve_output_bytes, Some(sessions * SESSION));
+
+    let envelope =
+        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
+    assert_eq!(
+        envelope.serve_output_bytes,
+        2 * u128::from(sessions * SESSION) + discovery
+    );
+    assert_eq!(
+        envelope.retained_bytes_bound(),
+        envelope.transport_bytes
+            + envelope.quic_bytes
+            + u128::from(envelope.tcp_ingress_bytes)
+            + envelope.serve_output_bytes
+    );
+
+    // Fewer session slots than connections bound the pools instead.
+    for peer_limits in [
+        &mut config.zakura.block_sync.peer_limits,
+        &mut config.zakura.header_sync.peer_limits,
+    ] {
+        peer_limits.max_inbound_peers = 3;
+        peer_limits.max_outbound_peers = 2;
+    }
+    let envelope =
+        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the smaller pools fit");
+    assert_eq!(
+        envelope.serve_output_bytes,
+        2 * u128::from(5 * SESSION) + discovery
+    );
 }
 
 /// A reconnect gets fresh connection gates, but it finds the old generation's

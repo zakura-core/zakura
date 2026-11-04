@@ -21,10 +21,11 @@
 //! blocks stay a separate allowance: a count across every holder, and a byte limit
 //! only on what the block pipeline still holds.
 //!
-//! Serving output is a separate bound too. Block sync, header sync and discovery
-//! reserve a response's whole cap before producing it, and hold it until the last
-//! frame is written. Queued frames can also hold transport output grants, so adding
-//! the serving bound to the retained bound would count them twice.
+//! Block sync, header sync and discovery reserve a serving response's whole cap
+//! before producing it, and hold it until the last frame is written. Their frames
+//! are guarded, so they skip the transport output gate, and the retained bound adds
+//! the serving bound once. Each family's budget funds one session per connection
+//! that can serve at once, not per configured session slot.
 
 use std::num::NonZeroU64;
 
@@ -158,19 +159,32 @@ impl NodeEnvelope {
 
     /// The most bytes that this envelope's byte owners retain together.
     pub(crate) fn retained_bytes_bound(&self) -> u128 {
-        self.transport_bytes + self.quic_bytes + u128::from(self.tcp_ingress_bytes)
+        self.transport_bytes
+            + self.quic_bytes
+            + u128::from(self.tcp_ingress_bytes)
+            + self.serve_output_bytes
     }
 }
 
 /// The node output budgets of every serving family on a node with this
-/// configuration, summed.
+/// configuration and `limits`' admitted connections, summed.
 fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
-    let headers = &config.zakura.header_sync;
+    let connections = limits.max_connections;
+    let block_sync = config
+        .zakura
+        .block_sync
+        .clone()
+        .for_node_connections(connections);
+    let headers = config
+        .zakura
+        .header_sync
+        .clone()
+        .for_node_connections(connections);
     [
-        getblocks_serving_limits(&config.zakura.block_sync).node_output_bytes,
+        getblocks_serving_limits(&block_sync).node_output_bytes,
         header_sync::v9::serving_limits(
             header_sync::v9::SERVE_PEER_OUTPUT_BYTES,
-            headers.serving_sessions(),
+            headers.serving_sessions(connections),
             headers.node_serve_output_bytes,
         )
         .node_output_bytes,

@@ -4703,7 +4703,11 @@ async fn spawn_zakura_endpoint_inner(
         anchor,
         frontiers,
         best_header_tip,
-        config.zakura.header_sync.clone(),
+        config
+            .zakura
+            .header_sync
+            .clone()
+            .for_node_connections(limits.max_connections),
         limits.max_frame_bytes,
     );
     let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();

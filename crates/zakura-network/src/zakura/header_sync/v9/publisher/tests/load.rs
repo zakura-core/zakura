@@ -83,19 +83,20 @@ async fn a_full_window_of_one_header_pages_fits_the_cursor_ring() {
 }
 
 /// The production serving limits keep the toolkit's defaults, 64 MiB of
-/// output per peer and that much for each of 512 sessions among them, and
-/// [`v9::serving_limits`] changes only the per-peer output.
+/// output per peer and that much for each of the 92 default connections'
+/// sessions, and [`v9::serving_limits`] changes only the per-peer output.
 #[test]
 fn serving_limits_keep_the_production_default() {
-    let peers = crate::zakura::ZakuraHeaderSyncConfig::default().serving_sessions();
-    assert_eq!(peers, 512);
+    let peers = crate::zakura::ZakuraHeaderSyncConfig::default()
+        .serving_sessions(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
+    assert_eq!(peers, 92);
     let production = ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
         peer_output_responses: 16_384,
-        node_output_responses: 512 * 16_384,
+        node_output_responses: 92 * 16_384,
         peer_output_bytes: 64 * 1024 * 1024,
-        node_output_bytes: 32 << 30,
+        node_output_bytes: 92 * (64 << 20),
     };
     assert_eq!(
         v9::serving_limits(v9::SERVE_PEER_OUTPUT_BYTES, peers, None),

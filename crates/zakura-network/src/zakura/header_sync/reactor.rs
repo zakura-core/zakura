@@ -202,7 +202,9 @@ fn build_header_sync_reactor(
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
         serving: v9::serving_capacity(
-            startup.config.serving_sessions(),
+            startup
+                .config
+                .serving_sessions(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS),
             startup.config.node_serve_output_bytes,
         ),
         page_limits,

@@ -464,7 +464,7 @@ fn the_largest_served_response_is_one_advertised_block() {
 
 /// One-block sizing leaves every default limit as the 128-block sizing set it:
 /// both responses fit the 64 MiB peer output floor (twice the send window), and
-/// the node funds that floor on each of its 512 sessions.
+/// the node funds that floor on each of its 92 default connections' sessions.
 #[test]
 fn one_block_sizing_keeps_the_default_serving_limits() {
     use crate::zakura::block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES};
@@ -480,11 +480,15 @@ fn one_block_sizing_keeps_the_default_serving_limits() {
         ServeLimits {
             node_execution: NODE_EXECUTION,
             peer_execution: PEER_EXECUTION,
-            ..sizing::serve_limits(old_largest, sizing::TARGET_RTT, serving_sessions(&config))
+            ..sizing::serve_limits(
+                old_largest,
+                sizing::TARGET_RTT,
+                config.block_sync_connections(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
+            )
         }
     );
     assert_eq!(limits.peer_output_bytes, 64 * 1024 * 1024);
-    assert_eq!(limits.node_output_bytes, 32 << 30);
+    assert_eq!(limits.node_output_bytes, 92 * (64 << 20));
     assert_eq!((limits.node_execution, limits.peer_execution), (24, 12));
 }
 
@@ -707,18 +711,23 @@ async fn serving_bounds_commitments_workers_and_outputs() {
     .expect("finished reads of a cancelled session return their workers and output grants");
 }
 
-/// Every configured session can hold a whole peer budget of unsent responses, so the
-/// node's output budget never pauses a conformant peer for another's reservations.
+/// Every session that can serve at once can hold a whole peer budget of unsent
+/// responses, so the node's output budget never pauses a conformant peer for another's
+/// reservations.
 #[test]
 fn getblocks_node_output_funds_every_session() {
     let config = ZakuraBlockSyncConfig::default();
     let limits = serving_limits(&config);
-    let sessions = config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers;
+    let sessions = config.block_sync_connections(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
     assert_eq!(
         limits.node_output_bytes,
         u64::try_from(sessions).unwrap() * limits.peer_output_bytes
     );
-    assert_eq!(limits.node_output_bytes, 32 << 30, "512 sessions × 64 MiB");
+    assert_eq!(
+        limits.node_output_bytes,
+        92 * (64 << 20),
+        "92 sessions × 64 MiB"
+    );
 
     let configured = ZakuraBlockSyncConfig {
         node_serve_output_bytes: Some(1 << 30),

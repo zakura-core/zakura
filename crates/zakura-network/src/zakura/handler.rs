@@ -5534,12 +5534,20 @@ async fn request_stream_worker(
     // Fund the whole response before the service runs, so a full output gate stops
     // the request here and no result waits unfunded. The stream's permit and
     // the raw frame's grant stay held during this wait.
-    let bound = response_bound(
+    let Some(bound) = response_bound(
         prelude.stream_kind,
         &frame,
         context.limits,
         response_frame_cap,
-    );
+        context.resources.output.capacity(),
+    ) else {
+        debug!(
+            response_frame_cap,
+            "Zakura request needs more output than its kind's gate holds"
+        );
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+        return;
+    };
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
@@ -5586,10 +5594,10 @@ async fn request_stream_worker(
     // The result is the worker's own retained memory, and `output` funds it through
     // the write from its kind's output gate. A result above its bound has no
     // funding, so it never reaches the write. The bytes the service did not use
-    // return to the gate now. A bound above the gate takes the whole gate, so one
-    // stalled response strands at most its kind's output share.
+    // return to the gate now. No bound exceeds the gate, so one stalled response
+    // strands at most its kind's output share.
     let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
-        bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
+        bytes.saturating_add(response_frame_bytes(frame.payload.len()))
     });
     if result_bytes > bound.bytes {
         debug!(
@@ -6235,16 +6243,13 @@ impl LegacyResponseBudget {
     /// The output the local responder can need for this request.
     ///
     /// This differs from the budget's own byte limit, which checks a peer's
-    /// response. A peer negotiates the caps here, so this limit charges every chunk's
-    /// headers and never trusts a small message cap to make a response small.
+    /// response. A peer negotiates the caps here, so this limit charges every
+    /// frame's overhead and never trusts a small cap to make a response small. A
+    /// one-frame response's encoder builds its whole payload before any write
+    /// checks the frame cap, so its bound ignores that cap.
     fn response_bound(&self, max_frame_bytes: u32) -> ResponseBound {
-        // Widening u32 to usize is lossless on supported targets.
-        let frame_payload_bytes = (max_frame_bytes as usize).saturating_sub(FRAME_HEADER_BYTES);
         let one_frame = |payload_bytes: usize| ResponseBound {
-            // Widening usize to u64 is lossless on supported targets.
-            bytes: payload_bytes
-                .min(frame_payload_bytes)
-                .saturating_add(FRAME_HEADER_BYTES) as u64,
+            bytes: response_frame_bytes(payload_bytes),
         };
         match self.kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
@@ -6275,6 +6280,8 @@ impl LegacyResponseBudget {
     /// entry that is smaller than that. All missing entries share one more frame.
     /// The encoder refuses a response above the aggregate cap, and each frame it
     /// emits within that cap carries at least one object byte after its chunk header.
+    /// An object's last frame can be partial, so the objects within the cap fill at
+    /// most one frame per `chunk_bytes`, plus one partial frame per item.
     fn inventory_bound(&self, chunk_bytes: usize) -> ResponseBound {
         let chunks_per_item = MAX_PROTOCOL_MESSAGE_LEN.div_ceil(chunk_bytes);
         let item_payload_bytes = MAX_PROTOCOL_MESSAGE_LEN
@@ -6287,14 +6294,19 @@ impl LegacyResponseBudget {
             .min(COMPAT_RESPONSE_MAX_AGGREGATE_BYTES);
         let most_frames = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES
             / LEGACY_RESPONSE_CHUNK_HEADER_BYTES.saturating_add(1);
+        let filled_frames =
+            (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / chunk_bytes).saturating_add(self.max_items);
         let frames = self
             .max_items
             .saturating_mul(chunks_per_item)
+            .min(filled_frames)
             .min(most_frames)
             .saturating_add(1);
         ResponseBound {
             // Widening usize to u64 is lossless on supported targets.
-            bytes: payload_bytes.saturating_add(frames.saturating_mul(FRAME_HEADER_BYTES)) as u64,
+            bytes: payload_bytes
+                .saturating_add(frames.saturating_mul(RESPONSE_FRAME_OVERHEAD_BYTES))
+                as u64,
         }
     }
 
@@ -6316,10 +6328,24 @@ impl LegacyResponseBudget {
     }
 }
 
+/// The memory one queued response frame holds beyond its payload: its wire header,
+/// plus two slots in the response's `Vec<Frame>`, each of which owns a payload's
+/// vector. A growing vector can hold as many spare slots as filled ones.
+///
+/// A small frame cap splits a response into many frames, and each frame's slot
+/// exists before the first write, so a response bound counts it per frame.
+const RESPONSE_FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 2 * std::mem::size_of::<Frame>();
+
+/// The output one queued response frame with `payload_len` payload bytes needs.
+fn response_frame_bytes(payload_len: usize) -> u64 {
+    // Widening usize to u64 is lossless on supported targets.
+    payload_len.saturating_add(RESPONSE_FRAME_OVERHEAD_BYTES) as u64
+}
+
 /// The most output one response to a request can need.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ResponseBound {
-    /// Wire bytes, including each frame's header.
+    /// Payload bytes, plus each frame's [`RESPONSE_FRAME_OVERHEAD_BYTES`].
     bytes: u64,
 }
 
@@ -6332,23 +6358,31 @@ impl ResponseBound {
     };
 }
 
-/// The most output this service's response to `frame` can need under these caps.
+/// The most output this service's response to `frame` can need under these caps,
+/// or `None` if that exceeds its kind's output gate of `gate_bytes`.
 ///
-/// A request that the legacy budget cannot parse gets [`ResponseBound::MAX`], so the
-/// service stays the one owner that rejects it.
+/// A response with no derivable limit gets [`ResponseBound::MAX`], or the whole gate
+/// if that is smaller, so the worker refuses a larger result instead of charging it
+/// less than it holds. A request that the legacy budget cannot parse gets that bound
+/// too, so the service stays the one owner that rejects it.
 fn response_bound(
     stream_kind: u16,
     frame: &Frame,
     limits: ZakuraConnectionLimits,
     max_frame_bytes: u32,
-) -> ResponseBound {
+    gate_bytes: u64,
+) -> Option<ResponseBound> {
+    let underived = ResponseBound {
+        bytes: ResponseBound::MAX.bytes.min(gate_bytes),
+    };
     if stream_kind != LEGACY_REQUEST_STREAM_KIND {
-        return ResponseBound::MAX;
+        return Some(underived);
     }
-    LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
-        .map_or(ResponseBound::MAX, |budget| {
-            budget.response_bound(max_frame_bytes)
-        })
+    let Ok(budget) = LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
+    else {
+        return Some(underived);
+    };
+    Some(budget.response_bound(max_frame_bytes)).filter(|bound| bound.bytes <= gate_bytes)
 }
 
 #[derive(Debug)]

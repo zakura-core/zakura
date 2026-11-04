@@ -232,9 +232,10 @@ pub const LEGACY_GOSSIP_BUDGET: ReactorBudget = ReactorBudget {
 ///   `COMPAT_RESPONSE_MAX_AGGREGATE_BYTES`. The exchange's frames and decode copies
 ///   are funded separately by [`super::COMPAT_EXCHANGE_BUDGET`].
 /// - Output: [`DEFAULT_REACTOR_OUTPUT_BYTES`], today's share. A request reserves its
-///   whole response bound, up to the aggregate cap plus frame headers, before its
-///   service runs. This share keeps today's three maximal reservations, so a peer's
-///   retry after its own timeout does not wait on a service that is still running.
+///   whole response bound, up to the aggregate cap plus each frame's overhead, before
+///   its service runs, and a bound above this share refuses the request. This share
+///   keeps today's three maximal reservations, so a peer's retry after its own
+///   timeout does not wait on a service that is still running.
 pub const LEGACY_REQUESTS_BUDGET: ReactorBudget = ReactorBudget {
     // Widening usize to u64 is lossless on supported targets.
     receive: LEGACY_REQUEST_FRAME_BYTES + COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
@@ -1177,14 +1178,14 @@ fn push_chunked_response(
         .ok_or(LegacyGossipError::OversizedResponse(bytes.len()))?;
 
     debug_assert!(!bytes.is_empty());
-    let chunks = bytes.chunks(chunk_bytes).collect::<Vec<_>>();
+    let chunk_count = bytes.len().div_ceil(chunk_bytes);
 
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in bytes.chunks(chunk_bytes).enumerate() {
         let mut payload = Vec::with_capacity(RESPONSE_CHUNK_HEADER_BYTES + chunk.len());
         // The stream prelude already has this id, but each response frame repeats it so
         // malformed peers are rejected at the frame boundary before decoding payload bytes.
         payload.extend_from_slice(&request_id.to_le_bytes());
-        payload.push(u8::from(index + 1 == chunks.len()));
+        payload.push(u8::from(index + 1 == chunk_count));
         payload.extend_from_slice(chunk);
         // Charge each chunk against the shared budget so a response that
         // aggregates many available items aborts mid-encode rather than after

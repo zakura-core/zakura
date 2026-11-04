@@ -458,6 +458,11 @@ impl FrameGate {
         }
     }
 
+    /// The bytes this gate can grant at once.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.budget.capacity()
+    }
+
     /// Admit a frame of `bytes` without waiting, if the gate has room.
     pub(crate) fn try_admit(&self, bytes: u64) -> Option<FrameGrant> {
         let charge = self.budget.clamp(bytes);

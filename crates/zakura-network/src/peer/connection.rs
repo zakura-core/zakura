@@ -636,7 +636,7 @@ where
     /// Receives block adverts independently of the current request's response.
     pub(super) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
 
-    /// When peer messages started to go ahead of a block advert waiting in its queue.
+    /// When the loop first saw the block advert now waiting in its queue.
     advert_waiting_since: Option<tokio::time::Instant>,
 
     /// Live authorization, rechecked immediately before advert writes.
@@ -852,7 +852,8 @@ where
             self.request_slot
                 .set_busy(!matches!(self.state, State::AwaitingRequest));
 
-            // A block advert that a run of peer messages has held back goes before the next one.
+            // A block advert that peer messages have kept waiting goes before the next one.
+            self.note_waiting_advert();
             let advert_due = self.block_advert_is_due();
             match self.state {
                 State::AwaitingRequest => {
@@ -919,7 +920,6 @@ where
                         }
                         Either::Left(Some(Err(e))) => self.fail_with(e).await,
                         Either::Left(Some(Ok(msg))) => {
-                            self.note_peer_message();
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -1039,7 +1039,6 @@ where
                         None => self.fail_with(PeerError::ConnectionClosed).await,
                         Some(Err(e)) => self.fail_with(e).await,
                         Some(Ok(peer_msg)) => {
-                            self.note_peer_message();
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
                             let payload_bytes = decoded_payload_bytes(&peer_msg);
 
@@ -1141,8 +1140,9 @@ where
         self.shutdown_async(error).await;
     }
 
-    /// Notes a peer message going ahead of a block advert, if one waits in its queue.
-    fn note_peer_message(&mut self) {
+    /// Notes a block advert waiting in its queue, from the first turn of the loop that could
+    /// have sent it, so a message handled meanwhile counts towards its wait.
+    fn note_waiting_advert(&mut self) {
         if self.block_advert_rx.is_empty() {
             self.advert_waiting_since = None;
         } else {
@@ -1151,8 +1151,8 @@ where
         }
     }
 
-    /// Returns whether a waiting block advert goes before the next peer message, because peer
-    /// messages have kept it waiting for [`WAITING_ADVERT_PRIORITY_DELAY`].
+    /// Returns whether a waiting block advert goes before the next peer message, because it has
+    /// waited for [`WAITING_ADVERT_PRIORITY_DELAY`] while peer messages went first.
     fn block_advert_is_due(&self) -> bool {
         self.advert_waiting_since
             .is_some_and(|since| since.elapsed() >= WAITING_ADVERT_PRIORITY_DELAY)

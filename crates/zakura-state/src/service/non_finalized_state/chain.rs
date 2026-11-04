@@ -1814,13 +1814,15 @@ impl Chain {
         // - sprout, sapling, orchard, and Ironwood tree updates and root calculations
         // - the rest of the Chain updates
         rayon::in_place_scope_fifo(|scope| {
-            // Spawns a separate rayon task for each note commitment tree
-            tree_result = Some(nct.update_trees_parallel(&contextually_valid.block.clone()));
-
+            // Spawn the other chain updates before updating the trees on this thread. The trees
+            // run to completion here, so spawning afterwards would run the two in sequence.
             scope.spawn_fifo(|_scope| {
                 partial_result =
                     Some(self.update_chain_tip_with_block_except_trees(contextually_valid));
             });
+
+            // Spawns a separate rayon task for each note commitment tree
+            tree_result = Some(nct.update_trees_parallel(&contextually_valid.block.clone()));
         });
 
         tree_result.expect("scope has already finished")?;

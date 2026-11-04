@@ -14,6 +14,20 @@ zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuz
 [workspace]
 
 [[bin]]
+name = "block_peer_registry"
+path = "fuzz_targets/block_peer_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_retry_authority"
+path = "fuzz_targets/block_retry_authority.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "discovery_redial"
 path = "fuzz_targets/discovery_redial.rs"
 test = false

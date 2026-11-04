@@ -1630,15 +1630,14 @@ fn work_queue_returned_height_is_contestable_by_any_peer() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
 
     // A peer takes the floor height (it leaves `pending` → `in_flight`).
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
+    let owner = queue.publish_fixture(1..=1);
     assert!(queue.in_flight_contains(block::Height(1)));
     assert!(!queue.pending_contains(block::Height(1)));
 
     // Its request times out: the height returns to `pending`, where any servable
     // peer (not just the original holder) can take it again. No bias toward or
     // away from any particular peer exists in WorkQueue.
-    queue.return_items([block::Height(1)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
     assert!(queue.pending_contains(block::Height(1)));
     assert_eq!(
         queue
@@ -1719,7 +1718,7 @@ fn work_queue_with(
     floor: u32,
     items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
 ) -> super::work_queue::WorkQueue {
-    let queue = super::work_queue::WorkQueue::new(block::Height(floor));
+    let queue = super::work_queue::WorkQueue::new(block::Height(floor), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     queue.extend(test_work_scope(), items);
     queue
@@ -2349,23 +2348,15 @@ fn work_queue_refreshes_queued_authority_and_preserves_registered_requests() {
         verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
         ..obsolete
     };
-    let queue = WorkQueue::new(block::Height(0));
+    let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     assert_eq!(
         queue.extend(obsolete, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.scope, obsolete);
-    let owner = obsolete.bind(
-        12,
-        std::num::NonZeroU64::new(13).expect("thirteen is nonzero"),
-    );
-    assert_eq!(
-        queue.mark_reserved_for_owner(owner, [block::Height(1)]),
-        100
-    );
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(owner.authority(), obsolete);
+    assert_eq!(queue.reserved_bytes(), 100);
     assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
 
     queue.refresh_authority(current);
@@ -2409,17 +2400,16 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
     assert_ne!(refreshed, scope);
     assert_eq!(refreshed.body_work_epoch, scope.body_work_epoch);
 
-    let owner = test_work_owner();
     let height = block::Height(1);
     let hash = block::Hash([1; 32]);
-    let queue = WorkQueue::new(block::Height(0));
+    let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     assert_eq!(
         queue.extend(scope, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
-    assert_eq!(queue.mark_reserved_for_owner(owner, [height]), 100);
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(queue.reserved_bytes(), 100);
 
     let config = ZakuraBlockSyncConfig::default();
     let registry = PeerRegistry::new();
@@ -2648,36 +2638,62 @@ fn work_queue_take_respects_servable_range_contiguity_and_max() {
     );
 }
 
+/// A provisional take with a byte cap, returned to `pending` when it drops.
+fn take_for_fixture(
+    queue: &Arc<WorkQueue>,
+    low: block::Height,
+    high: block::Height,
+    max_count: usize,
+    max_estimated_bytes: u64,
+) -> super::work_queue::TakenRequest {
+    queue.take_request(
+        low,
+        high,
+        max_count,
+        max_estimated_bytes,
+        1,
+        std::num::NonZeroU64::MIN,
+    )
+}
+
 #[test]
 fn work_queue_budgeted_take_respects_count_cap() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         (1..=4).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(4), 2, u64::MAX);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(4), 2, u64::MAX);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
 }
 
 #[test]
 fn work_queue_budgeted_take_respects_estimated_byte_cap() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(1, BlockSizeEstimate::Advertised(100)),
             needed(2, BlockSizeEstimate::Advertised(150)),
             needed(3, BlockSizeEstimate::Advertised(1)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(3), 3, 250);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(3), 3, 250);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
     assert!(queue.pending_contains(block::Height(3)));
@@ -2685,19 +2701,23 @@ fn work_queue_budgeted_take_respects_estimated_byte_cap() {
 
 #[test]
 fn work_queue_budgeted_take_stops_at_gaps() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(10, BlockSizeEstimate::Advertised(100)),
             needed(11, BlockSizeEstimate::Advertised(100)),
             needed(13, BlockSizeEstimate::Advertised(100)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(13), 3, u64::MAX);
+    let taken = take_for_fixture(&queue, block::Height(10), block::Height(13), 3, u64::MAX);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![10, 11]
     );
     assert!(queue.pending_contains(block::Height(13)));
@@ -2705,36 +2725,43 @@ fn work_queue_budgeted_take_stops_at_gaps() {
 
 #[test]
 fn work_queue_budgeted_take_takes_one_oversized_first_item_for_progress() {
-    let queue = work_queue_with(
+    let queue = Arc::new(work_queue_with(
         0,
         [
             needed(1, BlockSizeEstimate::Advertised(500)),
             needed(2, BlockSizeEstimate::Advertised(1)),
         ],
-    );
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(2), 2, 100);
+    let taken = take_for_fixture(&queue, block::Height(1), block::Height(2), 2, 100);
 
     assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        taken
+            .items()
+            .iter()
+            .map(|(height, _)| height.0)
+            .collect::<Vec<_>>(),
         vec![1]
     );
-    assert_eq!(taken[0].1.estimated_bytes, 500);
+    assert_eq!(taken.items()[0].1.estimated_bytes, 500);
     assert!(queue.pending_contains(block::Height(2)));
 }
 
 #[test]
 fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
-    let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(10, BlockSizeEstimate::Advertised(12_345))],
+    ));
 
-    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.estimated_bytes, 12_345);
+    let taken = take_for_fixture(&queue, block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(taken.items().len(), 1);
+    assert_eq!(taken.items()[0].1.estimated_bytes, 12_345);
 
-    queue.return_items([block::Height(10)]);
-    let retaken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
-    assert_eq!(retaken.len(), 1);
-    assert_eq!(retaken[0].1.estimated_bytes, 12_345);
+    drop(taken);
+    let retaken = take_for_fixture(&queue, block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(retaken.items().len(), 1);
+    assert_eq!(retaken.items()[0].1.estimated_bytes, 12_345);
 }
 
 /// Test shorthand: the grant for an admitted take, or `None` on any refusal.
@@ -3233,23 +3260,23 @@ fn commit_window_stays_fundable_at_exact_floor() {
 #[test]
 fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
-    assert_eq!(budget.reserved(), 100);
+    let owner = queue.publish_fixture(1..=1);
+    assert_eq!(queue.budget().reserved(), 100);
 
-    let watchdog_released = queue.release_and_return_items([block::Height(1)]);
-    budget.release(watchdog_released);
+    let watchdog_released = queue
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
+        .released_bytes;
+
     assert_eq!(watchdog_released, 100);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
-    let late_owner_released = queue.release_and_return_items([block::Height(1)]);
-    budget.release(late_owner_released);
+    let late_owner_released = queue
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)])
+        .released_bytes;
+
     assert_eq!(late_owner_released, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 }
 
@@ -3272,41 +3299,43 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     assert_eq!(queue.reserved_bytes(), 0);
     check("seed");
 
-    // take + mark_reserved: Released -> Reserved.
-    let taken = queue.take_in_range(block::Height(1), block::Height(6), 6);
-    assert_eq!(taken.len(), 6);
-    assert_eq!(queue.mark_reserved((1..=6).map(block::Height)), 600);
+    // publication: Released -> Reserved.
+    let owner = queue.publish_fixture(1..=6);
     assert_eq!(queue.reserved_bytes(), 600);
-    check("mark_reserved");
+    check("publish_fixture");
 
     // receipt: Reserved -> Released drops the reservation for height 1.
-    assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        Some(100),
-    );
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
     assert_eq!(queue.reserved_bytes(), 500);
-    check("release_active_reserved_height");
+    check("receive_fixture");
 
-    // claim_received: Reserved -> Released drops height 2's reservation.
-    assert_eq!(queue.claim_received(block::Height(2)), 100);
+    // claim_receipt_for_owner: Reserved -> Released drops height 2's reservation.
+    let claimed = queue
+        .claim_receipt_for_owner(owner, block::Height(2))
+        .expect("fixture funding matches the queue");
+    assert_eq!(claimed.bytes(), 100);
+    drop(claimed);
     assert_eq!(queue.reserved_bytes(), 400);
-    check("claim_received");
+    check("claim_receipt_for_owner");
 
-    // release_heights: Reserved -> Released for height 3.
-    queue.release_reserved_heights([block::Height(3)]);
+    // release_reserved_heights_for_owner: Reserved -> Released for height 3.
+    queue.release_reserved_heights_for_owner(owner, [block::Height(3)]);
     assert_eq!(queue.reserved_bytes(), 300);
-    check("release_heights");
+    check("release_reserved_heights_for_owner");
 
-    // release_reserved_and_return_items: only the still-reserved height 4 releases.
-    let released = queue.release_reserved_and_return_items([block::Height(4)]);
-    assert_eq!(released, 100);
+    // Return: only the still-reserved height 4 releases.
+    let returned =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(4)]);
+    assert_eq!(returned.released_bytes, 100);
     assert_eq!(queue.reserved_bytes(), 200);
-    check("release_reserved_and_return_items");
+    check("release_reserved_and_return_items_detailed_for_owner");
 
     // advance_floor drops the committed `<= floor` prefix. Heights 1 and 2
     // (received) and 3 (released) contribute no reservation. Only heights 5 and 6
     // remain reserved above the new floor.
-    let released = queue.advance_floor(block::Height(4));
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(4));
+    let released = before - queue.budget().reserved();
     assert_eq!(released, 0, "heights <= 4 owned no live reservation");
     assert!(!queue.pending_contains(block::Height(1)));
     assert!(!queue.in_flight_contains(block::Height(2)));
@@ -3315,7 +3344,9 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
 
     // reset_above drops the `> floor` suffix (heights 5 and 6), releasing their
     // reservations and zeroing the counter.
-    let released = queue.reset_above(block::Height(4));
+    let before = queue.budget().reserved();
+    queue.reset_above(block::Height(4));
+    let released = before - queue.budget().reserved();
     assert_eq!(released, 200);
     assert_eq!(queue.reserved_bytes(), 0);
     assert!(!queue.in_flight_contains(block::Height(5)));
@@ -3330,11 +3361,13 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
         (1..=10).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
     );
     // Reserve a contiguous run so we can see the reservation accounting on GC.
-    let _ = queue.take_in_range(block::Height(1), block::Height(10), 10);
-    assert_eq!(queue.mark_reserved((1..=10).map(block::Height)), 1000);
+    queue.publish_fixture(1..=10);
+    assert_eq!(queue.reserved_bytes(), 1000);
 
     // advance_floor to 4: drops heights 1..=4 (still reserved -> released), keeps 5..=10.
-    let released = queue.advance_floor(block::Height(4));
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(4));
+    let released = before - queue.budget().reserved();
     assert_eq!(released, 400, "reserved bytes for the dropped 1..=4 prefix");
     for h in 1..=4 {
         assert!(!queue.in_flight_contains(block::Height(h)));
@@ -3346,7 +3379,9 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
     assert_eq!(queue.reserved_bytes(), queue.reserved_bytes_scanned());
 
     // A lower floor is a no-op (floor only advances).
-    assert_eq!(queue.advance_floor(block::Height(2)), 0);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(2));
+    assert_eq!(queue.budget().reserved(), before);
     assert_eq!(queue.reserved_bytes(), 600);
 }
 
@@ -3355,20 +3390,13 @@ fn receipt_releases_wire_reservation_while_body_retained() {
     // Receipt ends the wire reservation: the estimate returns to the budget while
     // the caller still owns the body (the height stays claimed in `in_flight`).
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
     assert_eq!(queue.reserved_bytes(), 100);
 
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active reserved height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
-    budget.release(reserved_estimate);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
+
     assert_eq!(queue.reserved_bytes(), 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(
         queue.in_flight_contains(block::Height(1)),
         "the received height stays claimed; the body handoff owns it"
@@ -3380,21 +3408,16 @@ fn floor_watchdog_skips_received_heights() {
     // After receipt released the reservation, the watchdog must neither requeue
     // the height (the body handoff owns it) nor release a second time.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
 
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active reserved height releases at receipt");
-    budget.release(reserved_estimate);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
 
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    assert_eq!(queue.budget().reserved(), 0);
+
+    let outcome =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
     let watchdog_released = outcome.released_bytes;
-    budget.release(watchdog_released);
+
     assert_eq!(
         watchdog_released, 0,
         "watchdog must not release a received height owned by the sequencer handoff"
@@ -3407,13 +3430,14 @@ fn floor_watchdog_skips_received_heights() {
     assert_eq!(outcome.returned_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
-    assert_eq!(queue.advance_floor(block::Height(1)), 0);
+    assert_eq!(queue.budget().reserved(), 0);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(1));
+    assert_eq!(queue.budget().reserved(), before);
 }
 
 #[tokio::test]
 async fn floor_watchdog_only_avoids_requests_that_started_writing() {
-    use super::work_queue::RequestWrite;
     use crate::zakura::transport::FrameWriteClaim;
 
     #[derive(Clone, Copy, Debug)]
@@ -3457,7 +3481,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
                 BlockSizeEstimate::Confirmed(100),
             )],
         );
-        let items = wiring.work.take_for_request(
+        let taken = wiring.work.take_request(
             block::Height(1),
             block::Height(1),
             1,
@@ -3465,32 +3489,29 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
             generation,
             std::num::NonZeroU64::new(1).unwrap(),
         );
-        assert_eq!(items.len(), 1);
-        let owner = items[0].1.owner.unwrap();
-        assert!(wiring.budget.clone().try_reserve(100));
-        let write = RequestWrite::new(
-            owner,
-            items,
-            wiring.work.clone(),
-            wiring.budget.clone(),
-            CancellationToken::new(),
-        );
-        assert!(write.publish(|| {
-            wiring.registry.insert_outstanding(
-                &peer(1),
-                generation,
-                [(
-                    block::Height(1),
-                    OutstandingMeta {
-                        owner,
-                        hash: block::Hash([1; 32]),
-                        estimated_bytes: 100,
-                        queued_at: now,
-                        deadline: now,
-                    },
-                )],
-            );
-        }));
+        assert_eq!(taken.items().len(), 1);
+        let owner = taken.items()[0].1.owner.unwrap();
+        let write = taken
+            .admit(block::Height(0), CancellationToken::new())
+            .unwrap();
+        let write = write
+            .publish(|_| {
+                wiring.registry.insert_outstanding(
+                    &peer(1),
+                    generation,
+                    [(
+                        block::Height(1),
+                        OutstandingMeta {
+                            owner,
+                            hash: block::Hash([1; 32]),
+                            estimated_bytes: 100,
+                            queued_at: now,
+                            deadline: now,
+                        },
+                    )],
+                );
+            })
+            .unwrap();
         let started = matches!(write_state, WriteState::Started | WriteState::Written);
         if started {
             assert!(write.try_start());
@@ -3509,7 +3530,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         await_until(
             "watchdog settles the expired floor claim",
             Duration::from_secs(2),
-            || wiring.registry.total_unreceived() == 0 && wiring.budget.reserved() == 0,
+            || wiring.registry.total_unreceived() == 0 && wiring.work.budget().reserved() == 0,
         )
         .await
         .unwrap();
@@ -3531,56 +3552,95 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
 #[test]
 fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
 
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
-    let watchdog_released = outcome.released_bytes;
-    budget.release(watchdog_released);
+    let outcome =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+
     assert_eq!(outcome.returned_count, 1);
     assert_eq!(outcome.released_count, 0);
     assert_eq!(outcome.missing_count, 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
 
-    let duplicate =
-        queue.release_reserved_and_return_items_detailed([block::Height(1), block::Height(2)]);
+    let duplicate = queue.release_reserved_and_return_items_detailed_for_owner(
+        owner,
+        [block::Height(1), block::Height(2)],
+    );
     assert_eq!(duplicate.already_pending_count, 1);
     assert_eq!(duplicate.missing_count, 1);
     assert_eq!(duplicate.min_height, Some(block::Height(1)));
     assert_eq!(duplicate.max_height, Some(block::Height(2)));
 
     assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
+        queue.receive_fixture(owner, block::Height(1)),
         None,
         "a late body cannot release a claim the watchdog already released"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
+}
+
+#[test]
+fn an_unmatched_receipt_takes_only_the_charge_it_looked_up() {
+    // A routine with no request for height 1 receives its body while another
+    // routine publishes height 1. The lookup and the transfer share one queue
+    // lock, so the receipt sees either pending work, which it leaves alone, or
+    // the published request, whose charge it takes.
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    assert!(queue
+        .begin_unmatched_receipt(block::Height(1), block::Hash([1; 32]))
+        .expect("fixture funding matches the queue")
+        .is_none());
+    assert!(queue.pending_contains(block::Height(1)));
+    assert_eq!(queue.budget().reserved(), 0);
+
+    let owner = queue.publish_fixture(1..=1);
+    assert!(
+        queue
+            .begin_unmatched_receipt(block::Height(1), block::Hash([0xee; 32]))
+            .expect("fixture funding matches the queue")
+            .is_none(),
+        "a body for another hash can't take the published request's charge"
+    );
+    assert_eq!(queue.budget().reserved(), 100);
+    let (ended_owner, ended) = queue
+        .begin_unmatched_receipt(block::Height(1), block::Hash([1; 32]))
+        .expect("fixture funding matches the queue")
+        .expect("the published request reserves height 1");
+    assert_eq!(ended_owner, owner);
+    assert_eq!(ended.charge, 100);
+    assert_eq!(ended.funding.bytes(), 100);
+    assert_eq!(
+        queue.receive_fixture(owner, block::Height(1)),
+        None,
+        "the owner's own body can't release the charge again"
+    );
+    drop(ended);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
 fn claim_received_does_not_orphan_a_charge() {
-    // An unmatched queued body claims its height without a new reservation, but
-    // any stale request reservation it still owned is handed back exactly once.
+    // An unmatched body claims its height without a new reservation, but any stale
+    // request reservation it still owned is handed back exactly once.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
-    assert_eq!(taken.len(), 1);
-    assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    let owner = queue.publish_fixture(1..=1);
 
-    let old_charge = queue.claim_received(block::Height(1));
-    budget.release(old_charge);
-    assert_eq!(old_charge, 100);
-    assert_eq!(budget.reserved(), 0);
+    let old_charge = queue
+        .claim_receipt_for_owner(owner, block::Height(1))
+        .expect("fixture funding matches the queue");
 
-    let released = queue.release_reserved_heights([block::Height(1)]);
-    budget.release(released);
-    assert_eq!(released, 0, "a received height owns no further charge");
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(old_charge.bytes(), 100);
+    drop(old_charge);
+    assert_eq!(queue.budget().reserved(), 0);
+
+    queue.release_reserved_heights_for_owner(owner, [block::Height(1)]);
+
+    assert_eq!(
+        queue.budget().reserved(),
+        0,
+        "a received height owns no further charge"
+    );
 }
 
 #[test]
@@ -3592,38 +3652,31 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(taken.len(), 2);
-    assert!(budget.try_reserve(200));
-    assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
-        200
-    );
+    let owner = queue.publish_fixture(1..=2);
+    assert_eq!(queue.reserved_bytes(), 200);
 
     // Height 1 is received: its whole estimate returns to the budget.
-    let reserved_estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("active height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
-    budget.release(reserved_estimate);
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
+
+    assert_eq!(queue.budget().reserved(), 100);
 
     // Floor GC releases only the still-reserved (unreceived) height 2.
-    let released = queue.advance_floor(block::Height(2));
-    budget.release(released);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(2));
+    let released = before - queue.budget().reserved();
+
     assert_eq!(
         released, 100,
         "WorkQueue releases only the still-reserved height; received bodies hold no charge"
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
 fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
     // `stale_adjusted_disposition`, `finish_detached`) releases via
-    // `release_reserved_heights`. When a competing peer delivered a height late,
+    // `release_reserved_heights_for_owner`. When a competing peer delivered a height late,
     // its receipt ended that height's reservation in the shared queue; the owner
     // must release only the still-reserved estimates and leave the received body
     // to the winner (which releases the ended estimate after its forward) — never
@@ -3635,39 +3688,33 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
             needed(2, BlockSizeEstimate::Advertised(100)),
         ],
     );
-    let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(taken.len(), 2);
-    assert!(budget.try_reserve(200));
-    assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
-        200
-    );
+    let owner = queue.publish_fixture(1..=2);
+    assert_eq!(queue.reserved_bytes(), 200);
 
     // A competing peer's late body ends height 1's reservation; height 2 stays
     // reserved (never delivered). The winner releases the estimate after its
     // forward.
-    let estimate = queue
-        .release_active_reserved_height(block::Height(1))
-        .expect("height 1 is reserved");
-    assert_eq!(estimate, 100);
-    budget.release(estimate);
-    assert_eq!(budget.reserved(), 100);
+    assert_eq!(queue.receive_fixture(owner, block::Height(1)), Some(100));
+
+    assert_eq!(queue.budget().reserved(), 100);
 
     // GC both heights: only the still-reserved height 2 releases. The received
     // height 1 is skipped (its reservation already ended) and stays in `in_flight`.
-    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
-    budget.release(released);
+    queue.release_reserved_heights_for_owner(owner, [block::Height(1), block::Height(2)]);
+
     assert_eq!(
-        released, 100,
-        "release_reserved_heights frees only the still-reserved estimate, exactly once"
+        queue.reserved_bytes(),
+        0,
+        "release_reserved_heights_for_owner frees only the still-reserved estimate, exactly once"
     );
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.budget().reserved(), 0);
 
     // Floor GC clears the bookkeeping; nothing drifts.
-    assert_eq!(queue.advance_floor(block::Height(2)), 0);
-    assert_eq!(budget.reserved(), 0);
+    let before = queue.budget().reserved();
+    queue.advance_floor(block::Height(2));
+    assert_eq!(queue.budget().reserved(), before);
+    assert_eq!(queue.budget().reserved(), 0);
 }
 
 #[test]
@@ -3699,16 +3746,18 @@ fn work_queue_preserves_work_item_estimate_through_take_and_return() {
     // a height moves pending → in_flight → pending. Estimator overridden so the
     // clamp is wide enough to keep the hinted size.
     let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
-    let taken = queue.take_in_range(block::Height(10), block::Height(10), 1);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.estimated_bytes, 12_345);
-    assert_eq!(taken[0].1.hash, block::Hash([10; 32]));
+    let owner = queue.publish_fixture(10..=10);
+    let taken = queue
+        .item_for_height(block::Height(10))
+        .expect("the fixture keeps the height in flight");
+    assert_eq!(taken.estimated_bytes, 12_345);
+    assert_eq!(taken.hash, block::Hash([10; 32]));
 
-    queue.return_items([block::Height(10)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(10)]);
     let retaken = queue.take_in_range(block::Height(10), block::Height(10), 1);
     assert_eq!(
         retaken[0].1.estimated_bytes, 12_345,
-        "return_items must restore the stored WorkItem unchanged"
+        "a return must restore the stored WorkItem unchanged"
     );
 }
 
@@ -3750,9 +3799,9 @@ fn work_queue_height_is_in_exactly_one_set() {
     let h = block::Height(10);
 
     assert_eq!(in_one_set(h), 1, "pending only after extend");
-    queue.take_in_range(h, h, 1);
+    let owner = queue.publish_fixture(10..=10);
     assert_eq!(in_one_set(h), 1, "in_flight only after take");
-    queue.return_items([h]);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [h]);
     assert_eq!(in_one_set(h), 1, "pending only after return");
     queue.take_in_range(h, h, 1);
     queue.advance_floor(h);
@@ -4627,11 +4676,11 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
 
 #[test]
 fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
-    use super::work_queue::DEFAULT_BS_SIZE_FLOOR_BYTES;
+    use super::work_queue::state::DEFAULT_BS_SIZE_FLOOR_BYTES;
 
     // Default estimator: Unknown -> worst case; tiny hints clamp up to the floor;
     // huge hints clamp down to MAX_BLOCK_BYTES; ordinary hints pass through.
-    let queue = super::work_queue::WorkQueue::new(block::Height(0));
+    let queue = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.extend(
         test_work_scope(),
         [
@@ -4655,7 +4704,7 @@ fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
     assert_eq!(item(4), block::MAX_BLOCK_BYTES);
 
     // The test estimator override changes the floor clamp.
-    let tuned = super::work_queue::WorkQueue::new(block::Height(0));
+    let tuned = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     tuned.set_estimate_floor_for_tests(100);
     tuned.extend(
         test_work_scope(),
@@ -4723,7 +4772,7 @@ fn work_queue_diagnostics_report_runs_min_and_max() {
 fn work_queue_keeps_pending_ordered_by_height() {
     // A BTreeMap keeps the lowest needed height first regardless of extend order,
     // so a newly-needed lower height never sits behind later queued work.
-    let queue = super::work_queue::WorkQueue::new(block::Height(0));
+    let queue = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
     queue.extend(
         test_work_scope(),
         [needed(20, BlockSizeEstimate::Advertised(100))],
@@ -5253,10 +5302,10 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let budget = ByteBudget::new(1);
     let task = SequencerTask::new(
         Sequencer::new(block::Height(0), submission_limit),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
@@ -5477,11 +5526,11 @@ impl CappedSequencerTask {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(8);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions_tx,
             ThroughputMeter::new(Instant::now()),
@@ -5939,10 +5988,10 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let budget = ByteBudget::new(1);
     let task = SequencerTask::new(
         Sequencer::new(block::Height(0), submission_limit),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
@@ -6162,10 +6211,10 @@ impl DetachedWindow {
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), submission_limit),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
             actions_tx,
             ThroughputMeter::new(Instant::now()),
@@ -7037,7 +7086,7 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
 /// time. Per-height size-estimate reservation used by the budget-accounting tests.
 const THREE_BLOCK_ESTIMATE: u64 = 1_000;
 
-fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRange {
+fn outstanding_three_block_range() -> OutstandingBlockRange {
     let request = BlockRangeRequest {
         owner: test_work_owner(),
         start_height: block::Height(1),
@@ -7064,7 +7113,6 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
             },
         ],
     };
-    assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -7079,8 +7127,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
 
 #[test]
 fn outstanding_range_accumulates_delivered_bytes_for_bbr_sample() {
-    let mut budget = ByteBudget::new(THREE_BLOCK_ESTIMATE * 3);
-    let mut outstanding = outstanding_three_block_range(&mut budget);
+    let mut outstanding = outstanding_three_block_range();
 
     for (height, bytes) in [
         (block::Height(1), 700),
@@ -7111,70 +7158,48 @@ fn block_budget_ledger_releases_reserved_exactly_once() {
     assert_eq!(released.release_reserved(), 0);
 }
 
-#[test]
-fn budget_audit_catches_injected_drift() {
-    let mut budget = ByteBudget::new(1_000);
-    assert!(budget.try_reserve(400));
-    assert!(budget.audit(400, "test matching audit"));
-    // A budget excess is expected receipt-handoff skew (paired call sites drain
-    // the source ledger before releasing the budget), never drift.
-    assert!(budget.audit(300, "test transient handoff excess"));
-    // A budget shortfall cannot be produced by any healthy interleaving
-    // (a double release or lost charge): drift.
-    assert!(
-        !budget.audit(500, "test injected drift"),
-        "audit reports a budget shortfall as drift"
+#[tokio::test(start_paused = true)]
+async fn reactor_handle_observes_its_actual_request_budget_closing() {
+    let (_tip, handle, _actions, reactor) = spawn_genesis_reactor(ZakuraBlockSyncConfig::default());
+    let work = &handle.routine_wiring.as_ref().unwrap().work;
+    work.set_estimate_floor_for_tests(1);
+    work.extend(
+        test_work_scope(),
+        [(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Confirmed(100),
+        )],
     );
-    budget.release(400);
-    assert!(budget.audit(0, "test released audit"));
-}
-
-#[test]
-fn received_body_admission_ignores_request_budget() {
-    // A received body consumes no request budget, so a wire budget saturated by
-    // outstanding requests must not cause it to be dropped and re-downloaded:
-    // only the commit-window exemption and the resident gate apply.
-    let config = ZakuraBlockSyncConfig {
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(600),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
-        reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        // Outstanding requests have spent the entire in-flight budget.
-        budget_available: 0,
-    };
-    // In-window heights (<= verified_tip 10 + 401 = 411) stay exempt.
-    assert!(super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(411),
-        2_000_000,
-    ));
-    // Above the window the resident gate is the sole authority. The body is
-    // retained serialized, so one wire byte consumes one byte of headroom.
-    assert!(super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(602),
-        1_000,
-    ));
-    // A body larger than the remaining serialized headroom is refused.
-    assert!(!super::admission::admit_received_body(
-        &config,
-        &snapshot,
-        block::Height(602),
-        1_001,
-    ));
+    let claim = work
+        .take_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            100,
+            7,
+            std::num::NonZeroU64::new(1).unwrap(),
+        )
+        .admit(block::Height(0), CancellationToken::new())
+        .unwrap()
+        .publish(|_| {})
+        .unwrap();
+    let mut closed = Box::pin(handle.accounting_closed());
+    assert!(futures::poll!(&mut closed).is_pending());
+    let retained = work.retain_funding_for_test(1);
+    assert!(!work.audit_funding());
+    assert!(
+        futures::poll!(&mut closed).is_ready(),
+        "the real handle must read the queue's closed budget"
+    );
+    assert_eq!(
+        work.budget().reserved(),
+        100,
+        "signaling closure cannot erase held funding"
+    );
+    drop(claim);
+    drop(retained);
+    reactor.abort();
 }
 
 proptest::proptest! {
@@ -7295,19 +7320,19 @@ proptest::proptest! {
         // Whichever terminal path runs first (receipt, or a timeout/watchdog
         // release) drains the mirrored budget to zero; any later path is a no-op.
         let mut ledger = BlockBudgetLedger::reserved(estimate);
-        let mut budget = ByteBudget::new(u64::MAX);
-        prop_assert!(budget.try_reserve(estimate));
+        let budget = ByteBudget::new(u64::MAX);
+        let mut funding = budget.reserve_owned(estimate).unwrap();
 
         if release_before_receipt {
-            budget.release(ledger.release_reserved());
+            drop(funding.split(ledger.release_reserved()).unwrap());
             prop_assert_eq!(budget.reserved(), 0);
             prop_assert!(!ledger.is_reserved());
         }
-        budget.release(ledger.release_reserved());
+        drop(funding.split(ledger.release_reserved()).unwrap());
         prop_assert_eq!(budget.reserved(), 0);
         prop_assert_eq!(ledger.reserved_charge(), 0);
         // A third release still yields nothing.
-        budget.release(ledger.release_reserved());
+        drop(funding.split(ledger.release_reserved()).unwrap());
         prop_assert_eq!(budget.reserved(), 0);
     }
 }
@@ -7322,9 +7347,10 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
 
     // Happy path: download -> release-on-receipt -> buffer (uncharged) -> commit.
     {
-        let mut budget = ByteBudget::new(max);
+        let budget = ByteBudget::new(max);
         let mut reorder = ReorderBuffer::new();
-        let mut outstanding = outstanding_three_block_range(&mut budget);
+        let mut outstanding = outstanding_three_block_range();
+        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), max);
         assert!(budget.reserved() <= budget.max_bytes_for_test());
 
@@ -7336,7 +7362,7 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
             .into_iter()
             .enumerate()
         {
-            budget.release(estimate);
+            drop(funding.split(estimate).unwrap());
             outstanding.mark_received(height);
             assert_eq!(
                 reorder.insert(height, block.clone(), actuals[index], peer(0)),
@@ -7368,17 +7394,18 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
     // Timeout / short-response path: the received height released its estimate at
     // receipt; the unreceived heights release theirs exactly once on timeout.
     {
-        let mut budget = ByteBudget::new(max);
-        let mut outstanding = outstanding_three_block_range(&mut budget);
+        let budget = ByteBudget::new(max);
+        let mut outstanding = outstanding_three_block_range();
+        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), estimate * 3);
         // A short response delivers only height 1; its estimate is released.
-        budget.release(estimate);
+        drop(funding.split(estimate).unwrap());
         outstanding.mark_received(block::Height(1));
         // The remaining two unreceived heights still reserve their estimate each.
         assert_eq!(outstanding.reserved_bytes(), estimate * 2);
         assert_eq!(budget.reserved(), estimate * 2);
         // On timeout the outstanding range releases its still-reserved estimates.
-        budget.release(outstanding.reserved_bytes());
+        drop(funding.split(outstanding.reserved_bytes()).unwrap());
         assert_eq!(budget.reserved(), 0);
     }
 
@@ -7447,7 +7474,7 @@ fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
 fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let hint = 1_000u64;
     // Budget holds several hint-sized shares: enough to reserve this body's hint.
-    let mut budget = ByteBudget::new(hint * 4);
+    let budget = ByteBudget::new(hint * 4);
     let mut reorder = ReorderBuffer::new();
 
     let request = BlockRangeRequest {
@@ -7463,7 +7490,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
             estimated_bytes: hint,
         }],
     };
-    assert!(budget.try_reserve(request.estimated_bytes));
+    let funding = budget.reserve_owned(request.estimated_bytes).unwrap();
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -7485,7 +7512,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     // Receipt: release the reserved hint. The oversized body is retained at its
     // actual size by the reorder buffer, invisible to the request budget (the
     // resident look-ahead gate accounts for it instead).
-    budget.release(hint);
+    drop(funding);
     outstanding.mark_received(block::Height(1));
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     assert_eq!(
@@ -7497,7 +7524,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert_eq!(budget.reserved(), 0);
     assert_eq!(outstanding.reserved_bytes(), 0);
     assert!(
-        budget.try_reserve(hint),
+        budget.reserve_owned(hint).is_some(),
         "the freed reservation funds the next request immediately"
     );
     let dropped = reorder.drop_through(block::Height(1));
@@ -8007,6 +8034,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
+        accounting: ByteBudget::new(config.max_inflight_block_bytes).reader(),
         events,
         lifecycle,
         needed_query_failures,
@@ -14998,21 +15026,8 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
             needed(3, BlockSizeEstimate::Advertised(1_024)),
         ],
     );
-    let owner = queue.take_for_request(
-        block::Height(2),
-        block::Height(2),
-        1,
-        2_000_000,
-        1,
-        std::num::NonZeroU64::new(1).unwrap(),
-    )[0]
-    .1
-    .owner
-    .unwrap();
-    assert_eq!(
-        queue.mark_reserved_for_owner(owner, [block::Height(2)]),
-        2_000_000
-    );
+    let owner = queue.publish_fixture(2..=2);
+    assert_eq!(queue.reserved_bytes(), 2_000_000);
     queue.refresh_size_estimates(
         test_work_scope(),
         [
@@ -15036,19 +15051,9 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
         [3_146, 3_146]
     );
 
-    let owner = queue.take_for_request(
-        block::Height(3),
-        block::Height(3),
-        1,
-        1_024,
-        2,
-        std::num::NonZeroU64::new(1).unwrap(),
-    )[0]
-    .1
-    .owner
-    .unwrap();
-    queue.mark_reserved_for_owner(owner, [block::Height(3)]);
-    queue.release_active_reserved_height_for_owner(owner, block::Height(3));
+    let owner = queue.publish_fixture(3..=3);
+    drop(queue.begin_receipt_for_owner(owner, block::Height(3)));
+    assert_eq!(queue.budget().reserved(), 0);
     queue.refresh_size_estimates(
         test_work_scope(),
         [needed(3, BlockSizeEstimate::Advertised(7_000))],
@@ -15066,13 +15071,15 @@ fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
     );
     queue.refresh_size_estimates(test_work_scope(), [needed(3, BlockSizeEstimate::Unknown)]);
     queue.advance_floor(block::Height(1));
+    let retry = queue.publish_fixture(3..=3);
     assert_eq!(
-        queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
-            .1
+        queue
+            .item_for_height(block::Height(3))
+            .expect("the fixture keeps the height in flight")
             .estimated_bytes,
         5_000
     );
-    queue.return_items([block::Height(3)]);
+    queue.release_reserved_and_return_items_detailed_for_owner(retry, [block::Height(3)]);
     assert_eq!(
         queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
             .1
@@ -15212,11 +15219,7 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         ],
     );
     // A missed correction must also reach the next retry of an issued body.
-    assert_eq!(
-        work.take_in_range(block::Height(2), block::Height(2), 1)
-            .len(),
-        1
-    );
+    let owner = work.publish_fixture(2..=2);
     changed_view.snapshot.state_version = zakura_header_chain::StateVersion::new(21);
     changed_view.body_size_hint_revision = 20;
     changed_view.body_size_hint_batches = Some(
@@ -15261,10 +15264,66 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
     tokio::time::timeout(Duration::from_secs(1), changed)
         .await
         .unwrap();
-    work.return_items([block::Height(2)]);
+    work.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(2)]);
     assert!(work
         .take_in_range(block::Height(2), block::Height(3), 2)
         .iter()
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
+}
+
+#[tokio::test]
+async fn sequencer_panic_closes_the_reactor_action_channel() {
+    use super::block_sync_observe::{BlockEvent, BlockSyncObserver, ObserverSlot};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct PanicOnce(AtomicBool);
+    impl BlockSyncObserver for PanicOnce {
+        fn observe(&self, event: BlockEvent) {
+            if matches!(event, BlockEvent::Sequencer(_)) && !self.0.swap(true, Ordering::SeqCst) {
+                panic!("injected sequencer task failure");
+            }
+        }
+    }
+
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32]));
+    let snapshot = committed_snapshot(1, 1, 1, frontier, frontier, frontier);
+    let (snapshots, mut startup) =
+        committed_block_sync_startup(snapshot.clone(), ZakuraBlockSyncConfig::default());
+    let fault = Arc::new(PanicOnce::default());
+    startup.observer = ObserverSlot(Some(fault.clone()));
+    let (mut handle, mut actions, reactor) = spawn_block_sync_reactor(startup).unwrap();
+    // This sender exists only in unit-test wiring. Remove its keepalive for the
+    // real action channel so only the production reactor and sequencer own it.
+    let (fixture_actions, _) = mpsc::channel(1);
+    handle.routine_wiring.as_mut().unwrap().actions = fixture_actions;
+    let mut changed = snapshot;
+    changed.state_version = zakura_header_chain::StateVersion::new(2);
+    snapshots.send_replace(Some(committed_view(changed, 0)));
+
+    tokio::time::timeout(Duration::from_secs(2), reactor)
+        .await
+        .expect("sequencer closure must stop the reactor")
+        .expect("the reactor must exit without panicking");
+    assert!(
+        fault.0.load(Ordering::SeqCst),
+        "the sequencer reached the fault"
+    );
+    assert!(
+        !handle.is_accounting_closed(),
+        "exit must not depend on an accounting fault"
+    );
+    assert!(handle
+        .routine_wiring
+        .as_ref()
+        .unwrap()
+        .sequencer_input
+        .is_closed());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while actions.recv().await.is_some() {}
+    })
+    .await
+    .expect("sequencer and reactor exit must close the driver action channel");
+    drop(handle);
 }

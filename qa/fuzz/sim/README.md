@@ -47,6 +47,19 @@ handle under the scheduler and checks that unsettled verification results stay
 within the slots while a slow holder keeps the state lock. Run long campaigns
 manually or nightly; these targets add no blocking PR fuzz campaign.
 
+`block_work_ownership` and `block_work_funding` use the shared trace and replay
+pipeline without starting QUIC. Both consume at most 512 causal bytes. They have
+separate decoder-v1 identities; the same bytes represent different operations in
+each target. The funding target drives real queue reservations, unpublished
+requests, writer owners and receipts. It observes retained funding across reset
+and drains these owners before queue destruction. Its last record contains that
+drain. Operation 24 injects a funding discrepancy to test containment.
+
+The funding property compares actual retention with the independent model at
+completed operations. It does not establish asynchronous cancellation races,
+decoded-body retention, or backend-worker retention. Run long campaigns manually
+or nightly; this target adds no blocking PR fuzz campaign.
+
 ## Semantic feedback
 
 A target with a collector, `sim_target!(Harness, collector)`, adds abstract

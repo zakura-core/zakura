@@ -21,6 +21,12 @@
 //! proven tampered body disconnects (see `BlockSyncMisbehavior::proves_tampered_body`),
 //! so the registry keeps no per-peer misbehavior state.
 
+//!
+//! The pure [`PeerTable`] owns the per-peer summaries, and [`SupplierRetryState`]
+//! with [`BodyRetryAlarms`] owns body-retry avoidance (see [`state`]). This wrapper
+//! owns the locks, the floor-ranking notifier, the session parks, the generation
+//! counter, the clock reads, and the metrics.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -38,11 +44,19 @@ use zakura_rt::{
 };
 
 use super::{
-    config::{clamp_advertised_blocks, clamp_advertised_inflight, clamp_advertised_response_bytes},
-    state::EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER,
-    BlockSyncStatus, ServicePeerDirection, ZakuraPeerId,
+    state::EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER, BlockSyncStatus, ServicePeerDirection,
+    ZakuraPeerId,
 };
 use crate::zakura::ZakuraConnId;
+
+mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};
+
+use state::{BodyRetryAlarms, PeerTable, SupplierRetryState};
 
 /// Per-peer facts the reactor needs globally and the routine reads back.
 #[derive(Clone, Debug)]
@@ -66,10 +80,6 @@ pub(super) struct Entry {
     /// floor-bias decisions. Updated whenever the routine issues/finishes/times out
     /// a request.
     pub(super) slots: SlotDiagnostics,
-    /// Set by this generation's routine while it is blocked on its sequencer
-    /// handoff. The routine stores it without the registry lock, and other
-    /// routines skip the peer as a floor carrier while it is set.
-    pub(super) handoff_blocked: Arc<AtomicBool>,
     /// Heights this peer may not re-take after a floor-watchdog cancellation.
     pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
@@ -103,12 +113,24 @@ impl Entry {
             max_response_bytes: config.advertised_max_response_bytes(),
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
-            handoff_blocked: Arc::new(AtomicBool::new(false)),
             floor_watchdog_avoid: BTreeMap::new(),
             generation,
             conn_id: None,
             session_closed: false,
         }
+    }
+
+    fn can_serve_with_room(&self, height: block::Height) -> bool {
+        self.received_status
+            && self.servable_low <= height
+            && height <= self.servable_high
+            && self.slots.available_slots > 0
+    }
+
+    /// Only a session that could carry the floor can have made another routine
+    /// defer to it.
+    fn could_carry_floor(&self) -> bool {
+        self.received_status && self.slots.available_slots > 0
     }
 }
 
@@ -146,60 +168,12 @@ impl SessionAdmission {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-enum BodyRetryReason {
-    Unavailable,
-    Incompatible,
-}
-
-type SupplierRetryKey = (zakura_header_chain::SourceId, BodyRetryKey, BodyRetryReason);
-type SupplierRetries = HashMap<SupplierRetryKey, Instant>;
-
-/// Rekeying can merge snapshots of one cooldown. Keep its latest deadline.
-fn collect_supplier_retries(
-    entries: impl Iterator<Item = (SupplierRetryKey, Instant)>,
-) -> SupplierRetries {
-    entries.fold(SupplierRetries::new(), |mut merged, (key, deadline)| {
-        merged
-            .entry(key)
-            .and_modify(|until| *until = (*until).max(deadline))
-            .or_insert(deadline);
-        merged
-    })
-}
-
 /// Supplier-map size at which new retry deferrals stop being added: 64
 /// suppliers' worth of full 128-block responses. These deferrals outlive
 /// sessions, so peer limits do not bound them, and every lookup scans the map
 /// under the shared lock. Both reasons share the cap; skipping a deferral only
 /// allows an earlier retry.
 pub(super) const MAX_SUPPLIER_RETRIES: usize = 8_192;
-
-/// Authority and deadlines share a lock so stale routine snapshots cannot undo a refresh.
-#[derive(Debug, Default)]
-struct SupplierRetryState {
-    current: Option<zakura_header_chain::BodyWorkAuthority>,
-    entries: SupplierRetries,
-}
-
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-struct BodyRetryKey {
-    header_generation: zakura_header_chain::HeaderGeneration,
-    branch: zakura_header_chain::BranchId,
-    body_work_epoch: zakura_header_chain::BodyWorkEpoch,
-    hash: block::Hash,
-}
-
-impl BodyRetryKey {
-    fn new(scope: zakura_header_chain::BodyWorkAuthority, hash: block::Hash) -> Self {
-        Self {
-            header_generation: scope.header_generation,
-            branch: scope.branch,
-            body_work_epoch: scope.body_work_epoch,
-            hash,
-        }
-    }
-}
 
 /// The monotonic instant at which UTC `deadline` arrives by `clock`, or now if
 /// it has passed. `clock` must be the one that dated `deadline`.
@@ -246,15 +220,22 @@ pub(super) struct OutstandingClaim {
     pub(super) meta: OutstandingMeta,
 }
 
+/// Keeps pure peer facts and live handoff flags under the same registry lock.
+#[derive(Debug, Default)]
+struct PeerRegistryInner {
+    state: PeerTable,
+    handoffs: HashMap<ZakuraPeerId, Arc<AtomicBool>>,
+}
+
 /// The shared per-peer fact table. `Arc`-wrapped at the construction site so the
 /// reactor and every routine share one table.
 #[derive(Debug)]
 pub(super) struct PeerRegistry {
-    peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
+    peers: StdMutex<PeerRegistryInner>,
     floor_ranking_changed: Notify,
     session_parks: StdMutex<HashMap<ZakuraPeerId, SessionPark>>,
     body_retry_avoid: StdMutex<SupplierRetryState>,
-    body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
+    body_retry_all: StdMutex<BodyRetryAlarms>,
     /// Source of monotonically-increasing routine generations.
     next_generation: AtomicU64,
 }
@@ -268,11 +249,11 @@ impl Default for PeerRegistry {
 impl PeerRegistry {
     pub(super) fn new() -> Self {
         Self {
-            peers: StdMutex::new(HashMap::new()),
+            peers: StdMutex::new(PeerRegistryInner::default()),
             floor_ranking_changed: Notify::new(),
             session_parks: StdMutex::new(HashMap::new()),
             body_retry_avoid: StdMutex::new(SupplierRetryState::default()),
-            body_retry_all: StdMutex::new(HashMap::new()),
+            body_retry_all: StdMutex::new(BodyRetryAlarms::default()),
             next_generation: AtomicU64::new(1),
         }
     }
@@ -281,15 +262,7 @@ impl PeerRegistry {
         &self,
         height: block::Height,
     ) -> BTreeSet<zakura_header_chain::SourceId> {
-        self.lock()
-            .iter()
-            .filter(|(_, entry)| {
-                entry.received_status
-                    && entry.servable_low <= height
-                    && height <= entry.servable_high
-            })
-            .map(|(peer, _)| zakura_header_chain::SourceId::from_digest(peer.digest()))
-            .collect()
+        self.lock().state.eligible_sources(height)
     }
 
     /// Install the exact current set of supplier-specific retry deferrals for one body.
@@ -303,20 +276,12 @@ impl PeerRegistry {
         hash: block::Hash,
         until: Instant,
     ) {
-        let key = BodyRetryKey::new(scope, hash);
-        let sources: std::collections::BTreeSet<_> = sources.into_iter().collect();
-        let mut retries = self.body_retry_lock();
-        retries.entries.retain(|(source, candidate, reason), _| {
-            *reason != BodyRetryReason::Unavailable || *candidate != key || sources.contains(source)
-        });
-        for source in sources {
-            let entry = (source, key, BodyRetryReason::Unavailable);
-            if retries.entries.contains_key(&entry) || retries.entries.len() < MAX_SUPPLIER_RETRIES
-            {
-                retries.entries.insert(entry, until);
-            } else {
-                metrics::counter!("sync.block.body.unavailable_cooldown_skipped").increment(1);
-            }
+        let sources: BTreeSet<_> = sources.into_iter().collect();
+        let skipped = self
+            .body_retry_lock()
+            .defer_unavailable(sources, scope, hash, until);
+        if skipped > 0 {
+            metrics::counter!("sync.block.body.unavailable_cooldown_skipped").increment(skipped);
         }
     }
 
@@ -329,29 +294,13 @@ impl PeerRegistry {
     ) {
         // Consume caller work before locking. It may consult the work queue.
         let bodies: Vec<_> = bodies.into_iter().collect();
-        let mut retries = self.body_retry_lock();
-        let now = Instant::now();
-        retries.entries.retain(|_, deadline| *deadline > now);
-        for (scope, hash) in bodies {
-            let scope = match retries.current {
-                Some(current) if current.body_work_epoch == scope.body_work_epoch => current,
-                Some(current) if current.body_work_epoch > scope.body_work_epoch => continue,
-                // Fresh work can reach a routine before the sequencer handles its reset.
-                _ => scope,
-            };
-            let key = (
-                source,
-                BodyRetryKey::new(scope, hash),
-                BodyRetryReason::Incompatible,
-            );
-            if let Some(deadline) = retries.entries.get_mut(&key) {
-                *deadline = (*deadline).max(until);
-            } else if retries.entries.len() < MAX_SUPPLIER_RETRIES {
-                retries.entries.insert(key, until);
-            } else {
-                // The cooldown is advisory. Skipping it only allows an earlier retry.
-                metrics::counter!("sync.block.body.incompatible_cooldown_skipped").increment(1);
-            }
+        let skipped = {
+            let mut retries = self.body_retry_lock();
+            let now = Instant::now();
+            retries.defer_incompatible(source, bodies, until, now)
+        };
+        if skipped > 0 {
+            metrics::counter!("sync.block.body.incompatible_cooldown_skipped").increment(skipped);
         }
     }
 
@@ -359,11 +308,7 @@ impl PeerRegistry {
         &self,
         alarm: Option<(zakura_header_chain::BodyWorkAuthority, block::Hash, Instant)>,
     ) {
-        let mut retries = self.body_retry_all_lock();
-        retries.clear();
-        if let Some((scope, hash, until)) = alarm {
-            retries.insert(BodyRetryKey::new(scope, hash), until);
-        }
+        self.body_retry_all_lock().set(alarm);
     }
 
     pub(super) fn clear_body_retry(
@@ -371,11 +316,8 @@ impl PeerRegistry {
         scope: zakura_header_chain::BodyWorkAuthority,
         hash: block::Hash,
     ) {
-        let key = BodyRetryKey::new(scope, hash);
-        self.body_retry_lock()
-            .entries
-            .retain(|(_, candidate, _), _| *candidate != key);
-        self.body_retry_all_lock().remove(&key);
+        self.body_retry_lock().clear(scope, hash);
+        self.body_retry_all_lock().clear(scope, hash);
     }
 
     /// Retire old work while preserving alarms and incompatibility reports from newer work.
@@ -385,39 +327,7 @@ impl PeerRegistry {
     ) {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
-        retries.current = current;
-        retries.entries =
-            collect_supplier_retries(std::mem::take(&mut retries.entries).into_iter().filter_map(
-                |((source, mut key, reason), deadline)| {
-                    let scope = current?;
-                    if reason == BodyRetryReason::Incompatible {
-                        if key.body_work_epoch < scope.body_work_epoch {
-                            return None;
-                        }
-                        if key.body_work_epoch == scope.body_work_epoch {
-                            key = BodyRetryKey::new(scope, key.hash);
-                        }
-                        // A newer epoch may already have reported an incompatibility.
-                    } else if key != BodyRetryKey::new(scope, key.hash) {
-                        return None;
-                    }
-                    Some(((source, key, reason), deadline))
-                },
-            ));
-        *all_retries = std::mem::take(&mut *all_retries)
-            .into_iter()
-            .filter_map(|(mut key, deadline)| {
-                let scope = current?;
-                if key.body_work_epoch < scope.body_work_epoch {
-                    return None;
-                }
-                if key.body_work_epoch == scope.body_work_epoch {
-                    key = BodyRetryKey::new(scope, key.hash);
-                }
-                // The reactor can publish a newer alarm before this reset is processed.
-                Some((key, deadline))
-            })
-            .collect();
+        state::retain_body_retry_scope(&mut all_retries, &mut retries, current);
     }
 
     /// Carry suppression deadlines through a compatible authority refresh.
@@ -428,28 +338,7 @@ impl PeerRegistry {
     pub(super) fn refresh_body_retry_scope(&self, current: zakura_header_chain::BodyWorkAuthority) {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
-        retries.current = Some(current);
-        *all_retries = std::mem::take(&mut *all_retries)
-            .into_iter()
-            .map(|(mut key, deadline)| {
-                if key.body_work_epoch == current.body_work_epoch {
-                    key = BodyRetryKey::new(current, key.hash);
-                }
-                (key, deadline)
-            })
-            .collect();
-        retries.entries =
-            collect_supplier_retries(std::mem::take(&mut retries.entries).into_iter().map(
-                |((source, mut key, reason), deadline)| {
-                    // Compatible refreshes cannot adopt a cooldown from a future epoch.
-                    if reason != BodyRetryReason::Incompatible
-                        || key.body_work_epoch == current.body_work_epoch
-                    {
-                        key = BodyRetryKey::new(current, key.hash);
-                    }
-                    ((source, key, reason), deadline)
-                },
-            ));
+        state::refresh_body_retry_scope(&mut all_retries, &mut retries, current);
     }
 
     /// Match supplier cooldowns using the registry's authority while work snapshots refresh.
@@ -463,30 +352,7 @@ impl PeerRegistry {
         let source = zakura_header_chain::SourceId::from_digest(peer.digest());
         let all_retries = self.body_retry_all_lock();
         let retries = self.body_retry_lock();
-        // Check each deadline instead of sweeping: this runs once per scheduled
-        // body, and insertion and `next_body_retry_deadline` purge expired entries.
-        let current = retries
-            .current
-            .filter(|current| current.body_work_epoch == scope.body_work_epoch)
-            .unwrap_or(scope);
-        let keys = [
-            BodyRetryKey::new(current, hash),
-            BodyRetryKey::new(scope, hash),
-        ];
-        // There is at most one published alarm. Its exact body stays suppressed
-        // across compatible snapshots, including before either reader has refreshed.
-        all_retries.iter().any(|(key, until)| {
-            *until > now && key.hash == hash && key.body_work_epoch == scope.body_work_epoch
-        }) || keys.into_iter().any(|key| {
-            [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
-                .into_iter()
-                .any(|reason| {
-                    retries
-                        .entries
-                        .get(&(source, key, reason))
-                        .is_some_and(|until| *until > now)
-                })
-        })
+        state::is_body_retry_avoided(&all_retries, &retries, source, scope, hash, now)
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -495,22 +361,12 @@ impl PeerRegistry {
         now: Instant,
     ) -> Option<Instant> {
         let source = zakura_header_chain::SourceId::from_digest(peer.digest());
-        let all_deadline = {
-            let mut retries = self.body_retry_all_lock();
-            retries.retain(|_, until| *until > now);
-            retries.values().copied().min()
-        };
-        let mut retries = self.body_retry_lock();
-        retries.entries.retain(|_, until| *until > now);
-        let source_deadline = retries
-            .entries
-            .iter()
-            .filter_map(|((candidate, _, _), until)| (*candidate == source).then_some(*until))
-            .min();
+        let all_deadline = self.body_retry_all_lock().next_deadline(now);
+        let source_deadline = self.body_retry_lock().next_deadline(source, now);
         all_deadline.into_iter().chain(source_deadline).min()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
+    fn lock(&self) -> MutexGuard<'_, PeerRegistryInner> {
         self.peers
             .lock()
             .expect("peer registry mutex is never poisoned")
@@ -522,7 +378,7 @@ impl PeerRegistry {
             .expect("body retry registry mutex is never poisoned")
     }
 
-    fn body_retry_all_lock(&self) -> MutexGuard<'_, HashMap<BodyRetryKey, Instant>> {
+    fn body_retry_all_lock(&self) -> MutexGuard<'_, BodyRetryAlarms> {
         self.body_retry_all
             .lock()
             .expect("global body retry registry mutex is never poisoned")
@@ -546,10 +402,7 @@ impl PeerRegistry {
         deadline: Instant,
     ) -> bool {
         let peers = self.lock();
-        if peers
-            .get(peer)
-            .is_none_or(|entry| entry.generation != generation || entry.conn_id != Some(conn_id))
-        {
+        if !peers.state.owns_session(peer, conn_id, generation) {
             return false;
         }
         self.lock_session_parks().insert(
@@ -633,11 +486,7 @@ impl PeerRegistry {
         // Same lock order as `park_session`/`admit_session`: peers, then parks.
         let mut peers = self.lock();
         let mut session_parks = self.lock_session_parks();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.conn_id == Some(conn_id) {
-                entry.conn_id = None;
-            }
-        }
+        peers.state.release_connection(peer, conn_id);
         let Some(park) = session_parks.get_mut(peer) else {
             return;
         };
@@ -692,23 +541,25 @@ impl PeerRegistry {
         // Every entry field describes the session, so a replacement starts from
         // defaults. Keeping the old session's status, range, caps, or RTprop would
         // let other routines defer the floor to a routine that has no status yet.
-        let replaced = peers.insert(
-            peer.clone(),
+        let replaced = peers.state.admit(
+            peer,
             Entry {
                 conn_id: Some(conn_id),
                 ..Entry::new(direction, config, generation)
             },
         );
 
+        let replaced_handoff = peers
+            .handoffs
+            .insert(peer.clone(), Arc::new(AtomicBool::new(false)));
         let readmitted = session_parks
             .remove(peer)
             .is_some_and(|park| park.conn_id == Some(conn_id));
         drop(session_parks);
         drop(peers);
+        drop(replaced_handoff);
         if let Some(replaced) = replaced {
-            // Only a replaced session that could carry the floor can have made
-            // another routine defer to it.
-            let could_carry_floor = replaced.received_status && replaced.slots.available_slots > 0;
+            let could_carry_floor = replaced.could_carry_floor();
             // Drop the replaced entry's outstanding set after releasing the locks.
             drop(replaced);
             if could_carry_floor {
@@ -727,13 +578,7 @@ impl PeerRegistry {
     /// refuses an admission it already registered. A newer generation is left
     /// open.
     pub(super) fn close_session(&self, peer: &ZakuraPeerId, generation: u64) {
-        if let Some(entry) = self
-            .lock()
-            .get_mut(peer)
-            .filter(|entry| entry.generation == generation)
-        {
-            entry.session_closed = true;
-        }
+        self.lock().state.close_session(peer, generation);
     }
 
     /// Remove a peer's entry if its session is closed (see
@@ -741,14 +586,13 @@ impl PeerRegistry {
     /// close belongs to a live replacement and stays.
     pub(super) fn remove_closed_session(&self, peer: &ZakuraPeerId) {
         // Drop the removed entry after releasing the lock.
-        let removed = {
+        let (removed, handoff) = {
             let mut peers = self.lock();
-            if peers.get(peer).is_some_and(|entry| entry.session_closed) {
-                peers.remove(peer)
-            } else {
-                None
-            }
+            let removed = peers.state.remove_closed_session(peer);
+            let handoff = removed.as_ref().and_then(|_| peers.handoffs.remove(peer));
+            (removed, handoff)
         };
+        drop(handoff);
         if removed.is_some() {
             // A routine may have deferred the floor to the removed peer.
             self.floor_ranking_changed.notify_waiters();
@@ -758,7 +602,13 @@ impl PeerRegistry {
     /// Remove a peer's entry whether or not its session is closed.
     #[cfg(test)]
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
-        let removed = self.lock().remove(peer);
+        let (removed, handoff) = {
+            let mut peers = self.lock();
+            let removed = peers.state.remove(peer);
+            let handoff = removed.as_ref().and_then(|_| peers.handoffs.remove(peer));
+            (removed, handoff)
+        };
+        drop(handoff);
         if removed.is_some() {
             self.floor_ranking_changed.notify_waiters();
         }
@@ -774,25 +624,7 @@ impl PeerRegistry {
         generation: u64,
         status: BlockSyncStatus,
     ) {
-        let eligibility_changed = {
-            let mut peers = self.lock();
-            let Some(entry) = peers.get_mut(peer) else {
-                return;
-            };
-            if entry.generation != generation {
-                return;
-            }
-            let eligibility_changed = !entry.received_status
-                || entry.servable_low != status.servable_low
-                || entry.servable_high != status.servable_high;
-            entry.servable_low = status.servable_low;
-            entry.servable_high = status.servable_high;
-            entry.max_blocks_per_response = clamp_advertised_blocks(status.max_blocks_per_response);
-            entry.max_inflight_requests = clamp_advertised_inflight(status.max_inflight_requests);
-            entry.max_response_bytes = clamp_advertised_response_bytes(status.max_response_bytes);
-            entry.received_status = true;
-            eligibility_changed
-        };
+        let eligibility_changed = self.lock().state.upsert_status(peer, generation, status);
         if eligibility_changed {
             // A servable-range change can add or remove the preferred floor carrier.
             self.floor_ranking_changed.notify_waiters();
@@ -809,12 +641,9 @@ impl PeerRegistry {
         generation: u64,
         claims: impl IntoIterator<Item = (block::Height, OutstandingMeta)>,
     ) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.generation == generation {
-                entry.outstanding.extend(claims);
-            }
-        }
+        self.lock()
+            .state
+            .insert_outstanding(peer, generation, claims);
     }
 
     /// Remove `owner`'s claims at `heights`, generation-gated as in
@@ -827,30 +656,15 @@ impl PeerRegistry {
         owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) {
-        let mut peers = self.lock();
-        let Some(entry) = peers.get_mut(peer) else {
-            return;
-        };
-        if entry.generation != generation {
-            return;
-        }
-        for height in heights {
-            if entry.outstanding.get(&height).map(|meta| meta.owner) == Some(owner) {
-                entry.outstanding.remove(&height);
-            }
-        }
+        self.lock()
+            .state
+            .remove_outstanding_for_owner(peer, generation, owner, heights);
     }
 
     /// Clear the peer's outstanding set (it has no live requests), generation-gated
     /// as in [`insert_outstanding`](Self::insert_outstanding).
     pub(super) fn clear_outstanding(&self, peer: &ZakuraPeerId, generation: u64) {
-        let detached = {
-            let mut peers = self.lock();
-            peers
-                .get_mut(peer)
-                .filter(|entry| entry.generation == generation)
-                .map(|entry| std::mem::take(&mut entry.outstanding))
-        };
+        let detached = self.lock().state.take_outstanding(peer, generation);
         // Drop the detached claims after releasing the lock.
         drop(detached);
     }
@@ -863,19 +677,7 @@ impl PeerRegistry {
         generation: u64,
         slots: SlotDiagnostics,
     ) {
-        let ranking_changed = {
-            let mut peers = self.lock();
-            let Some(entry) = peers.get_mut(peer) else {
-                return;
-            };
-            if entry.generation != generation {
-                return;
-            }
-            let ranking_changed = entry.slots.bbr_rtprop_ms != slots.bbr_rtprop_ms
-                || (entry.slots.available_slots > 0) != (slots.available_slots > 0);
-            entry.slots = slots;
-            ranking_changed
-        };
+        let ranking_changed = self.lock().state.publish_slots(peer, generation, slots);
         if ranking_changed {
             // A previous deferrer may now be the preferred carrier. Updating the
             // table alone leaves its routine asleep until an unrelated wake.
@@ -897,10 +699,21 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         generation: u64,
     ) -> Arc<AtomicBool> {
-        self.lock()
+        let peers = self.lock();
+        if peers
+            .state
             .get(peer)
-            .filter(|entry| entry.generation == generation)
-            .map_or_else(Default::default, |entry| Arc::clone(&entry.handoff_blocked))
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            Arc::clone(
+                peers
+                    .handoffs
+                    .get(peer)
+                    .expect("every admitted peer has a handoff flag"),
+            )
+        } else {
+            Arc::new(AtomicBool::new(false))
+        }
     }
 
     /// Wake routines that may defer the floor to a routine that just blocked
@@ -911,39 +724,13 @@ impl PeerRegistry {
 
     /// Aggregate the routines' slot diagnostics for the periodic trace row.
     pub(super) fn slot_summary(&self) -> SlotSummary {
-        let peers = self.lock();
-        let mut summary = SlotSummary::default();
-        for entry in peers.values() {
-            summary.outstanding_requests = summary
-                .outstanding_requests
-                .saturating_add(entry.slots.outstanding_requests);
-            if !entry.received_status {
-                continue;
-            }
-            summary.capacity = summary.capacity.saturating_add(entry.slots.hard_capacity);
-            summary.effective_window = summary
-                .effective_window
-                .saturating_add(entry.slots.effective_window);
-            summary.available = summary
-                .available
-                .saturating_add(entry.slots.available_slots);
-            if entry.slots.available_slots == 0 {
-                summary.saturated_peers = summary.saturated_peers.saturating_add(1);
-            }
-        }
-        summary
+        self.lock().state.slot_summary()
     }
 
     /// Whether any connected peer has an outstanding request for `height`
     /// expecting `hash` (the producer's `!has_outstanding_request` filter).
     pub(super) fn has_outstanding_request(&self, height: block::Height, hash: block::Hash) -> bool {
-        let peers = self.lock();
-        peers.values().any(|entry| {
-            entry
-                .outstanding
-                .get(&height)
-                .is_some_and(|meta| meta.hash == hash)
-        })
+        self.lock().state.has_outstanding_request(height, hash)
     }
 
     /// Whether this exact peer still owns an outstanding claim for `height`.
@@ -952,31 +739,21 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         height: block::Height,
     ) -> bool {
-        let peers = self.lock();
-        peers
-            .get(peer)
-            .is_some_and(|entry| entry.outstanding.contains_key(&height))
+        self.lock().state.peer_has_outstanding_height(peer, height)
     }
 
     /// Total unreceived in-flight heights summed across peers — *per request*,
     /// never per body (an `outstanding` entry is one requested height). Feeds the
     /// producer's low-water refill gate.
     pub(super) fn total_unreceived(&self) -> usize {
-        let peers = self.lock();
-        peers.values().map(|entry| entry.outstanding.len()).sum()
+        self.lock().state.total_unreceived()
     }
 
     /// Whether any peer has an outstanding request reaching height `at_or_above`
     /// (the `peer_has_successor_after` half of the reset decision). Reads the
     /// registry's per-height outstanding set across peers.
     pub(super) fn any_outstanding_at_or_above(&self, at_or_above: block::Height) -> bool {
-        let peers = self.lock();
-        peers.values().any(|entry| {
-            entry
-                .outstanding
-                .keys()
-                .any(|height| *height >= at_or_above)
-        })
+        self.lock().state.any_outstanding_at_or_above(at_or_above)
     }
 
     /// Whether any peer has an outstanding request whose expected hash at `height`
@@ -987,27 +764,19 @@ impl PeerRegistry {
         height: block::Height,
         hash: block::Hash,
     ) -> bool {
-        let peers = self.lock();
-        peers.values().any(|entry| {
-            entry
-                .outstanding
-                .get(&height)
-                .is_some_and(|expected| expected.hash != hash)
-        })
+        self.lock().state.any_outstanding_conflicts_at(height, hash)
     }
 
     /// Whether the peer has sent a `Status` (the reactor's candidate and
     /// disconnect-trace read). The routine owns the rest of the serving caps
     /// locally now (inverted inbound flow); only `received_status` is read reactor-side.
     pub(super) fn has_received_status(&self, peer: &ZakuraPeerId) -> bool {
-        let peers = self.lock();
-        peers.get(peer).is_some_and(|entry| entry.received_status)
+        self.lock().state.has_received_status(peer)
     }
 
     /// Count of peers that have sent a status (low-water refill + trace).
     pub(super) fn peers_with_status(&self) -> usize {
-        let peers = self.lock();
-        peers.values().filter(|entry| entry.received_status).count()
+        self.lock().state.peers_with_status()
     }
 
     /// Candidate snapshot: node-id-servable hint per peer, used to publish the
@@ -1016,62 +785,19 @@ impl PeerRegistry {
     pub(super) fn candidate_snapshot(
         &self,
     ) -> Vec<(ZakuraPeerId, bool, block::Height, block::Height)> {
-        let peers = self.lock();
-        peers
-            .iter()
-            .map(|(peer, entry)| {
-                (
-                    peer.clone(),
-                    entry.received_status,
-                    entry.servable_low,
-                    entry.servable_high,
-                )
-            })
-            .collect()
+        self.lock().state.candidate_snapshot()
     }
 
     /// Per-direction peer / with-status counts for the periodic trace tick.
     pub(super) fn direction_status_counts(&self) -> DirectionStatusCounts {
-        let peers = self.lock();
-        let mut counts = DirectionStatusCounts::default();
-        for entry in peers.values() {
-            match entry.direction {
-                ServicePeerDirection::Inbound => {
-                    counts.inbound += 1;
-                    if entry.received_status {
-                        counts.inbound_with_status += 1;
-                    }
-                }
-                ServicePeerDirection::Outbound => {
-                    counts.outbound += 1;
-                    if entry.received_status {
-                        counts.outbound_with_status += 1;
-                    }
-                }
-            }
-        }
-        counts
+        self.lock().state.direction_status_counts()
     }
 
     /// Snapshot for the `floor_gap_diagnostics` trace: for a target `height`,
     /// how many peers are servable and how many of those have an outstanding
     /// request covering it.
     pub(super) fn floor_gap_servable(&self, height: block::Height) -> (usize, usize) {
-        let peers = self.lock();
-        let mut servable = 0usize;
-        let mut outstanding = 0usize;
-        for entry in peers.values() {
-            if entry.received_status
-                && entry.servable_low <= height
-                && height <= entry.servable_high
-            {
-                servable = servable.saturating_add(1);
-            }
-            if entry.outstanding.contains_key(&height) {
-                outstanding = outstanding.saturating_add(1);
-            }
-        }
-        (servable, outstanding)
+        self.lock().state.floor_gap_servable(height)
     }
 
     /// The soonest deadline among all peer claims for one height, if any. Lets the
@@ -1081,11 +807,7 @@ impl PeerRegistry {
         &self,
         height: block::Height,
     ) -> Option<Instant> {
-        let peers = self.lock();
-        peers
-            .values()
-            .filter_map(|entry| entry.outstanding.get(&height).map(|meta| meta.deadline))
-            .min()
+        self.lock().state.earliest_outstanding_deadline_at(height)
     }
 
     /// Whether some peer other than `self_peer` is a preferred floor server for
@@ -1113,25 +835,17 @@ impl PeerRegistry {
         allow_equal_score: bool,
     ) -> bool {
         let peers = self.lock();
-        // Rank registered peers from the same published snapshot. Mixing a fresh
-        // local expiry with other peers' cached scores can make every peer defer.
-        let self_score = peers
-            .get(self_peer)
-            .map(|entry| entry.slots.bbr_rtprop_ms)
-            .unwrap_or(self_rtprop_ms)
-            .unwrap_or(u64::MAX);
-        peers.iter().any(|(peer, entry)| {
-            if peer == self_peer || !entry.can_serve_with_room(height) {
-                return false;
-            }
-            let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
-            let preferred = if allow_equal_score {
-                other_score <= self_score
-            } else {
-                other_score < self_score
-            };
-            preferred && !entry.handoff_blocked.load(Ordering::Relaxed)
-        })
+        let preferred = peers
+            .state
+            .preferred_floor_candidates(height, self_peer, self_rtprop_ms, allow_equal_score)
+            .any(|peer| {
+                !peers
+                    .handoffs
+                    .get(peer)
+                    .expect("every admitted peer has a handoff flag")
+                    .load(Ordering::Relaxed)
+            });
+        preferred
     }
 
     /// `peer`'s published outstanding claims, by height, read from its entry.
@@ -1144,6 +858,7 @@ impl PeerRegistry {
         generation: u64,
     ) -> Vec<(block::Height, OutstandingMeta)> {
         self.lock()
+            .state
             .get(peer)
             .filter(|entry| entry.generation == generation)
             .map_or_else(Vec::new, |entry| {
@@ -1157,17 +872,7 @@ impl PeerRegistry {
 
     /// Snapshot all peer claims for one height.
     pub(super) fn outstanding_claims_at(&self, height: block::Height) -> Vec<OutstandingClaim> {
-        let peers = self.lock();
-        peers
-            .iter()
-            .filter_map(|(peer, entry)| {
-                entry.outstanding.get(&height).map(|meta| OutstandingClaim {
-                    peer: peer.clone(),
-                    height,
-                    meta: *meta,
-                })
-            })
-            .collect()
+        self.lock().state.outstanding_claims_at(height)
     }
 
     /// Remove a published outstanding claim only when its exact owner still matches.
@@ -1177,15 +882,9 @@ impl PeerRegistry {
         height: block::Height,
         owner: zakura_header_chain::BodyWorkOwner,
     ) -> bool {
-        let mut peers = self.lock();
-        let Some(entry) = peers.get_mut(peer) else {
-            return false;
-        };
-        if entry.outstanding.get(&height).map(|meta| meta.owner) != Some(owner) {
-            return false;
-        }
-        entry.outstanding.remove(&height);
-        true
+        self.lock()
+            .state
+            .clear_outstanding_height_for_owner(peer, height, owner)
     }
 
     /// Hard-exclude this peer from re-taking `height` until `until` after the
@@ -1196,10 +895,9 @@ impl PeerRegistry {
         height: block::Height,
         until: Instant,
     ) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            entry.floor_watchdog_avoid.insert(height, until);
-        }
+        self.lock()
+            .state
+            .avoid_floor_height_until(peer, height, until);
     }
 
     /// Whether the floor watchdog still hard-excludes this peer from `height`.
@@ -1209,15 +907,7 @@ impl PeerRegistry {
         height: block::Height,
         now: Instant,
     ) -> bool {
-        let mut peers = self.lock();
-        let Some(entry) = peers.get_mut(peer) else {
-            return false;
-        };
-        entry.floor_watchdog_avoid.retain(|_, until| *until > now);
-        entry
-            .floor_watchdog_avoid
-            .get(&height)
-            .is_some_and(|until| *until > now)
+        self.lock().state.is_floor_height_avoided(peer, height, now)
     }
 
     /// The next floor-watchdog hard-exclude expiry for this peer, if any. The
@@ -1227,19 +917,7 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         now: Instant,
     ) -> Option<Instant> {
-        let mut peers = self.lock();
-        let entry = peers.get_mut(peer)?;
-        entry.floor_watchdog_avoid.retain(|_, until| *until > now);
-        entry.floor_watchdog_avoid.values().min().copied()
-    }
-}
-
-impl Entry {
-    fn can_serve_with_room(&self, height: block::Height) -> bool {
-        self.received_status
-            && self.servable_low <= height
-            && height <= self.servable_high
-            && self.slots.available_slots > 0
+        self.lock().state.next_floor_avoid_deadline(peer, now)
     }
 }
 
@@ -1442,17 +1120,14 @@ mod floor_bias_tests {
         let hash = block::Hash([8; 32]);
         let now = Instant::now();
         let until = now + Duration::from_secs(60);
-        for reason in [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible] {
+        for unavailable in [true, false] {
             for (current, caller) in [(old, refreshed), (refreshed, old)] {
                 let registry = PeerRegistry::new();
                 registry.refresh_body_retry_scope(current);
-                match reason {
-                    BodyRetryReason::Unavailable => {
-                        registry.defer_body_retry([source], caller, hash, until);
-                    }
-                    BodyRetryReason::Incompatible => {
-                        registry.defer_incompatible_bodies(source, [(caller, hash)], until);
-                    }
+                if unavailable {
+                    registry.defer_body_retry([source], caller, hash, until);
+                } else {
+                    registry.defer_incompatible_bodies(source, [(caller, hash)], until);
                 }
                 assert!(registry.is_body_retry_avoided(&supplier, caller, hash, now));
                 assert!(!registry.is_body_retry_avoided(&peer(2), caller, hash, now));
@@ -1625,7 +1300,7 @@ mod floor_bias_tests {
         let later = now + Duration::from_secs(2);
         assert!(!registry.is_body_retry_avoided(&supplier, scope, hash, later));
         assert_eq!(
-            registry.body_retry_lock().entries.len(),
+            registry.body_retry_lock().len(),
             1,
             "expired entries wait for the next insertion or deadline scan"
         );
@@ -1657,10 +1332,7 @@ mod floor_bias_tests {
                 until,
             );
         }
-        assert_eq!(
-            registry.body_retry_lock().entries.len(),
-            MAX_SUPPLIER_RETRIES
-        );
+        assert_eq!(registry.body_retry_lock().len(), MAX_SUPPLIER_RETRIES);
         assert!(registry.is_body_retry_avoided(&first, scope, hash(0), now));
 
         // An existing cooldown can still be extended at capacity.
@@ -2140,6 +1812,7 @@ mod floor_bias_tests {
         // Refreshing either cached score must leave an eligible normal carrier.
         for expired_peer in [&fast, &slow] {
             reg.lock()
+                .state
                 .get_mut(expired_peer)
                 .expect("both test peers were registered")
                 .slots
@@ -2156,7 +1829,7 @@ mod floor_bias_tests {
         let reg = PeerRegistry::new();
         let provider = peer(1);
         register_with_rtprop(&reg, &config, &provider, 0, 1000, 3, Some(75));
-        let generation = reg.lock().get(&provider).unwrap().generation;
+        let generation = reg.lock().state.get(&provider).unwrap().generation;
         let slots = SlotDiagnostics {
             available_slots: 2,
             outstanding_requests: 1,
@@ -2207,7 +1880,7 @@ mod floor_bias_tests {
         let reg = PeerRegistry::new();
         let provider = peer(1);
         register_with_rtprop(&reg, &config, &provider, 0, 1000, 3, Some(75));
-        let generation = reg.lock().get(&provider).unwrap().generation;
+        let generation = reg.lock().state.get(&provider).unwrap().generation;
         let status = |high| BlockSyncStatus {
             servable_low: block::Height(0),
             servable_high: block::Height(high),

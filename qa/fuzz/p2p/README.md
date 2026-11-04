@@ -16,6 +16,14 @@ below. Decoders read at most 512 bytes. Empty inputs report zero applicability.
 | `discovery_query` | `discovery/answer-settlement` | 2 | `settlement_witness_exercises_holds_and_retirement` |
 | `discovery_candidate` | `discovery/dial-attempts` | 1 | `candidate_witness_exercises_identity_backoff_and_local_limits` |
 
+| Target | Property | Decoder |
+| --- | --- | --- |
+| `block_peer_registry` | `block/peer-registry` | 1 |
+| `block_retry_authority` | `block/retry-authority` | 1 |
+
+`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` model through
+trace and replay, so it needs no target here.
+
 The input decoding, the model and the checks live in `zakura-network` behind the
 `p2p-fuzz` feature, so the machine types stay private to the crate.
 

@@ -16,9 +16,17 @@ use tokio_util::sync::CancellationToken;
 /// When Zebra is shutting down, wait this long for tokio tasks to finish.
 const TOKIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Tokio's default blocking-thread limit. Blocking work other than state reads keeps it.
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
+
 /// Returns a new multi-threaded Tokio runtime with all drivers enabled.
-pub(crate) fn new_runtime() -> Runtime {
+///
+/// The blocking pool adds `read_workers` threads to Tokio's default, so admitted state
+/// reads cannot starve other blocking work. Tokio starts blocking threads on demand, so
+/// idle read threads cost nothing.
+pub(crate) fn new_runtime(read_workers: usize) -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(DEFAULT_MAX_BLOCKING_THREADS.saturating_add(read_workers))
         .enable_all()
         .build()
         .expect("runtime building should not fail")
@@ -117,6 +125,49 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    /// Admitted state reads leave Tokio's default blocking threads to other work.
+    #[test]
+    fn saturated_reads_leave_blocking_threads_for_other_work() {
+        let limit = Duration::from_secs(5);
+        // The largest limit that a 512-thread pool shared with other work admitted.
+        let state = zakura_state::Config {
+            read_concurrency_limit: std::num::NonZeroU16::new(508).expect("508 is nonzero"),
+            ..Default::default()
+        };
+        let read_workers = state.read_worker_count();
+        let runtime = new_runtime(read_workers);
+
+        runtime.block_on(async {
+            let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut releases = Vec::with_capacity(read_workers);
+            // Admitted reads run as `spawn_blocking` jobs, one per worker slot.
+            for _ in 0..read_workers {
+                let (release, released) = oneshot::channel::<()>();
+                releases.push(release);
+                let started = started.clone();
+                tokio::task::spawn_blocking(move || {
+                    started
+                        .send(())
+                        .expect("the test waits for every read to start");
+                    // Dropping the sender ends the read.
+                    let _ = released.blocking_recv();
+                });
+            }
+            for _ in 0..read_workers {
+                tokio::time::timeout(limit, started_rx.recv())
+                    .await
+                    .expect("every admitted read gets a blocking thread")
+                    .expect("read jobs hold a sender until they start");
+            }
+
+            tokio::time::timeout(limit, tokio::task::spawn_blocking(|| ()))
+                .await
+                .expect("other blocking work finishes while reads fill their slots")
+                .expect("the unrelated job does not panic");
+            drop(releases);
+        });
+    }
 
     #[tokio::test]
     async fn graceful_shutdown_waits_for_root_future_cleanup() {

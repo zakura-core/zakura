@@ -92,9 +92,9 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub state: RepairPolicyState,
     /// Failed or abandoned on-wire attempts, saturated only for diagnostics.
     pub attempts: u64,
-    /// Connected suppliers already tried in the current durable episode.
-    /// The configured inbound and outbound peer limits bound this set.
-    /// A supplier's entry survives session replacement and leaves on disconnect.
+    /// Suppliers already tried in the current durable episode.
+    /// A supplier's entry survives session replacement and holds after disconnect
+    /// as [`Self::departed_sources`] describes.
     pub tried_sources: HashSet<SourceId>,
     /// Connected suppliers that returned input excluded by this durable episode.
     pub excluded_input_sources: HashSet<SourceId>,
@@ -105,6 +105,13 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     /// `TargetNotSelected` answers per supplier in this episode, up to
     /// [`MAX_TARGET_REFUSALS_PER_SUPPLIER`]. Live peer admission limits bound this map.
     target_refusals: HashMap<SourceId, u8>,
+    /// Suppliers with history in this episode and no live session, with the
+    /// deadline until which a reconnect resumes that history.
+    ///
+    /// Holding history across a disconnect keeps a supplier from clearing its
+    /// failures and refusals by reopening its header stream. The hold and the
+    /// count limit passed to [`Self::retain_connected_sources`] bound this map.
+    departed_sources: HashMap<SourceId, Instant>,
 }
 
 impl RepairRequirement {
@@ -120,6 +127,7 @@ impl RepairRequirement {
             excluded_input_sources: HashSet::new(),
             busy_sources: HashMap::new(),
             target_refusals: HashMap::new(),
+            departed_sources: HashMap::new(),
         }
     }
 
@@ -287,27 +295,66 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Forget a supplier that no longer has a live session.
-    pub fn forget_source(&mut self, source: SourceId) {
+    /// Forget one supplier's history in this episode.
+    fn forget_source(&mut self, source: SourceId) {
         self.tried_sources.remove(&source);
         self.excluded_input_sources.remove(&source);
         self.busy_sources.remove(&source);
         self.target_refusals.remove(&source);
+        self.departed_sources.remove(&source);
     }
 
-    /// Forget supplier identities that no longer have a live session.
+    /// Hold the history of suppliers outside `connected_sources` for `hold`
+    /// after `now`, and forget it once the hold ends.
     ///
-    /// Durable state retains rejected and disputed semantic input. The reactor only needs the
-    /// identity sets to prevent repeated requests within a supplier's current session.
-    pub fn retain_connected_sources(&mut self, connected_sources: &HashSet<SourceId>) {
-        self.tried_sources
-            .retain(|source| connected_sources.contains(source));
-        self.excluded_input_sources
-            .retain(|source| connected_sources.contains(source));
-        self.busy_sources
-            .retain(|source, _| connected_sources.contains(source));
-        self.target_refusals
-            .retain(|source, _| connected_sources.contains(source));
+    /// A supplier that reconnects before its hold ends resumes its history. At
+    /// most `max_departed` departed suppliers keep history; past that, the
+    /// holds that end first end now. A zero `hold` forgets departed suppliers
+    /// at once. Durable state retains rejected and disputed semantic input, so
+    /// forgetting a supplier never forgets the input it sent.
+    pub fn retain_connected_sources(
+        &mut self,
+        connected_sources: &HashSet<SourceId>,
+        now: Instant,
+        hold: std::time::Duration,
+        max_departed: usize,
+    ) {
+        let departed: HashSet<SourceId> = self
+            .tried_sources
+            .iter()
+            .chain(&self.excluded_input_sources)
+            .chain(self.busy_sources.keys())
+            .chain(self.target_refusals.keys())
+            .filter(|source| !connected_sources.contains(*source))
+            .copied()
+            .collect();
+        for source in departed {
+            self.departed_sources.entry(source).or_insert(now + hold);
+        }
+        let mut ended: Vec<SourceId> = self
+            .departed_sources
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(source, _)| *source)
+            .collect();
+        for source in &ended {
+            self.departed_sources.remove(source);
+        }
+        if self.departed_sources.len() > max_departed {
+            let mut holds: Vec<_> = self
+                .departed_sources
+                .iter()
+                .map(|(source, until)| (*until, *source))
+                .collect();
+            holds.sort_unstable();
+            let excess = holds.len() - max_departed;
+            ended.extend(holds.into_iter().take(excess).map(|(_, source)| source));
+        }
+        for source in ended {
+            self.forget_source(source);
+        }
+        self.departed_sources
+            .retain(|source, _| !connected_sources.contains(source));
     }
 
     /// Back off ready or assigned repair work after a local failure.
@@ -642,7 +689,12 @@ mod tests {
             "the capped refusal charges the supplier for the episode"
         );
         assert!(!task.supplier_is_waiting_for_status(source));
-        task.retain_connected_sources(&[excluded].into_iter().collect());
+        task.retain_connected_sources(
+            &[excluded].into_iter().collect(),
+            Instant::now(),
+            std::time::Duration::ZERO,
+            0,
+        );
         assert!(task.busy_sources.is_empty());
         assert!(task.target_refusals.is_empty());
         assert!(task.excluded_input_sources.contains(&excluded));
@@ -726,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn supplier_history_releases_disconnected_sources_without_clearing_the_episode() {
+    fn departed_supplier_history_holds_until_its_hold_ends() {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
@@ -746,14 +798,39 @@ mod tests {
             task.record_failed_source(source(index))
                 .expect("ready work can record each supplier");
         }
-        let retained = source(previous_default_capacity - 1);
-        task.excluded_input_sources.insert(retained);
+        let connected = source(previous_default_capacity - 1);
+        task.excluded_input_sources.insert(connected);
+        let reopened = source(previous_default_capacity - 2);
+        let hold = std::time::Duration::from_secs(60);
+        let max_departed = 4;
+        let now = Instant::now();
+        let connected_sources: HashSet<_> = [connected].into_iter().collect();
 
-        let connected_sources = [retained].into_iter().collect();
-        task.retain_connected_sources(&connected_sources);
+        task.retain_connected_sources(&connected_sources, now, hold, max_departed);
+        assert_eq!(
+            task.tried_sources.len(),
+            1 + max_departed,
+            "the departed limit bounds held history"
+        );
+        assert!(task.tried_sources.contains(&connected));
+        assert!(
+            task.tried_sources.contains(&reopened),
+            "an equal hold keeps the highest sources"
+        );
 
+        let reconnected: HashSet<_> = [connected, reopened].into_iter().collect();
+        task.retain_connected_sources(&reconnected, now + hold / 2, hold, max_departed);
+        assert!(
+            task.tried_sources.contains(&reopened),
+            "a reconnect inside the hold resumes the supplier's history"
+        );
+
+        task.retain_connected_sources(&connected_sources, now + hold, hold, max_departed);
+        assert!(task.tried_sources.contains(&reopened), "a new hold starts");
+        task.retain_connected_sources(&connected_sources, now + hold * 2, hold, max_departed);
         assert_eq!(task.tried_sources, connected_sources);
         assert_eq!(task.excluded_input_sources, connected_sources);
+        assert!(task.departed_sources.is_empty());
         assert_eq!(task.state, RepairPolicyState::Ready { context });
     }
 

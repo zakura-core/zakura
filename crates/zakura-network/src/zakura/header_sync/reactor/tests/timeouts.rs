@@ -839,7 +839,7 @@ fn request_timeout_retires_owned_work_and_wakes_maintenance() {
 }
 
 #[test]
-fn vct_request_timeout_keeps_required_work_and_releases_a_disconnected_supplier() {
+fn vct_request_timeout_keeps_required_work_and_charges_a_disconnected_supplier() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -910,7 +910,10 @@ fn vct_request_timeout_keeps_required_work_and_releases_a_disconnected_supplier(
         RepairPolicyState::Ready { context: retained } if retained == &context
     ));
     assert_eq!(task.attempts, 1);
-    assert!(!task.tried_sources.contains(&source));
+    assert!(
+        task.tried_sources.contains(&source),
+        "a departed supplier's timeout holds for one cooldown"
+    );
     assert!(task.next_deadline().is_none());
 }
 
@@ -1125,9 +1128,9 @@ fn vct_admission_failures_preserve_retry_policy_state() {
             .expect("an admission failure cannot recreate the repair task");
         assert_eq!(task.attempts, 2);
         if supplier_attributed {
-            // No membership event removed this synthetic prior source.
+            // Departed suppliers' charges hold for one cooldown.
             assert!(task.tried_sources.contains(&prior));
-            assert!(!task.tried_sources.contains(&source));
+            assert!(task.tried_sources.contains(&source));
             assert!(matches!(
                 &task.state,
                 RepairPolicyState::Ready { context: retained } if retained == &context
@@ -1617,13 +1620,17 @@ fn status_releases_only_the_sending_unselected_supplier() {
     assert!(fixture.reactor.peer_work_queue.active(&peers[1]).is_none());
 }
 
+/// A supplier keeps its failure history across a disconnect for one readmission
+/// cooldown, so reopening its header stream cannot clear a refusal or failure.
+/// A reconnect after the cooldown starts clean.
 #[tokio::test(start_paused = true)]
-async fn vct_supplier_disconnect_clears_failure_history_before_reconnect() {
+async fn vct_supplier_history_holds_across_a_reconnect_until_the_cooldown_ends() {
     for outcome in [
         HeadersOutcomeCode::TargetNotSelected,
         HeadersOutcomeCode::TargetNotRetained,
     ] {
         let mut fixture = ReadyVctRepairFixture::new();
+        let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
         let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
         let peer = &peers[0];
         fixture.schedule();
@@ -1651,36 +1658,27 @@ async fn vct_supplier_disconnect_clears_failure_history_before_reconnect() {
         let (reconnected, _new_outbounds) = fixture.connect(&[0x71], 8);
         assert_eq!(reconnected, peers);
         fixture.advertise(&reconnected, 8);
+        assert!(
+            fixture.reactor.peer_work_queue.active(peer).is_none(),
+            "{outcome:?}: a reconnect inside the cooldown resumes the supplier's history"
+        );
 
+        fixture
+            .reactor
+            .handle_peer_disconnected(peer, 8, "test disconnect");
+        time::advance(cooldown).await;
+        let (reconnected, _later_outbounds) = fixture.connect(&[0x71], 9);
+        fixture.advertise(&reconnected, 9);
         let retry = fixture
             .reactor
             .peer_work_queue
             .active(peer)
-            .expect("the reconnected supplier is eligible before the old deadline")
-            .clone();
-        assert_eq!(retry.owner.session_id(), 8);
+            .expect("a reconnect after the cooldown starts clean");
+        assert_eq!(retry.owner.session_id(), 9);
         assert!(matches!(
             retry.purpose,
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
         ));
-
-        fixture.reactor.deliver_outcome(
-            peer.clone(),
-            8,
-            HeadersOutcome {
-                subscription_id: retry.request_id.get(),
-                initial_target_tip_hash: fixture.target.hash,
-                outcome: HeadersOutcomeCode::TargetNotSelected,
-            },
-        );
-        let task = fixture.reactor.state.vct_repair.current().unwrap();
-        assert!(task.tried_sources.is_empty());
-        assert_eq!(
-            task.next_deadline(),
-            None,
-            "TargetNotSelected in the new session waits for another status"
-        );
-        assert!(task.supplier_is_waiting_for_status(retry.source));
     }
 }
 
@@ -1806,14 +1804,17 @@ fn retained_old_session_repair_failure_charges_the_connected_supplier() {
             fixture
                 .reactor
                 .handle_peer_disconnected(peer, 8, "test disconnect");
-            assert!(fixture
-                .reactor
-                .state
-                .vct_repair
-                .current()
-                .unwrap()
-                .tried_sources
-                .is_empty());
+            assert!(
+                fixture
+                    .reactor
+                    .state
+                    .vct_repair
+                    .current()
+                    .unwrap()
+                    .tried_sources
+                    .contains(&old.source),
+                "the charge holds after the supplier disconnects"
+            );
         }
     }
 }
@@ -2250,9 +2251,12 @@ fn established_supplier_precedes_new_identities_after_adversarial_churn() {
         .vct_repair
         .current()
         .expect("the established supplier keeps the repair requirement");
-    assert!(established[..3]
-        .iter()
-        .all(|peer| !task.tried_sources.contains(&source_id_from_peer(peer))));
+    assert!(
+        established[..3]
+            .iter()
+            .all(|peer| task.tried_sources.contains(&source_id_from_peer(peer))),
+        "departed suppliers' failures hold for one cooldown"
+    );
 }
 
 #[test]
@@ -2297,7 +2301,12 @@ fn disconnected_supplier_history_cannot_block_a_new_supplier() {
         .vct_repair
         .current()
         .expect("the new supplier owns the repair requirement");
-    assert!(task.tried_sources.is_empty());
+    let limits = fixture.reactor.startup.config.peer_limits;
+    assert!(
+        task.tried_sources.len() <= limits.max_inbound_peers + limits.max_outbound_peers,
+        "the admitted peer limits bound departed suppliers' history"
+    );
+    assert!(!task.tried_sources.contains(&source));
 }
 
 #[test]
@@ -2391,7 +2400,7 @@ async fn replacement_session_keeps_busy_history_until_a_changed_status() {
 }
 
 #[test]
-fn replacement_keeps_a_supplier_failure_until_disconnect() {
+fn a_supplier_failure_holds_across_replacement_and_disconnect() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
     let peer = &peers[0];
@@ -2436,7 +2445,10 @@ fn replacement_keeps_a_supplier_failure_until_disconnect() {
     fixture
         .reactor
         .handle_peer_disconnected(peer, 8, "test disconnect");
-    assert!(!tried(&fixture));
+    assert!(
+        tried(&fixture),
+        "reopening the header stream cannot clear the failure"
+    );
 }
 
 #[test]

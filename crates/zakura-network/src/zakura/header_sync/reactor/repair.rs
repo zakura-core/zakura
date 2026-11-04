@@ -75,12 +75,6 @@ impl HeaderSyncReactor {
                     && source_id_from_peer(peer) == source
             })
             .map(|(peer, _)| peer.clone());
-        // A replacement session keeps the supplier connected under a new session id.
-        let supplier_connected = peer.is_some()
-            || self
-                .sessions
-                .keys()
-                .any(|peer| source_id_from_peer(peer) == source);
         if let Some(peer) = peer {
             self.state.clear_request_deadline(&peer);
         }
@@ -92,12 +86,12 @@ impl HeaderSyncReactor {
             return;
         }
         let now = Instant::now();
-        if !self
-            .state
-            .schedule_repair_retry(owner, retry, supplier_connected, now)
-        {
+        if !self.state.schedule_repair_retry(owner, retry, now) {
             return;
         }
+        // Retained local work can finish after its supplier disconnected, so
+        // the new charge may belong to a departed supplier.
+        self.prune_vct_supplier_history();
         if let Some(task) = self.state.vct_repair.current().cloned() {
             self.emit_vct_repair_state(&task, "retry", Some(retry.attribution.label()));
             if let Some(predecessor) = vct_repair_predecessor(&task) {
@@ -321,13 +315,24 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Hold departed suppliers' repair history for one readmission cooldown.
+    ///
+    /// Membership changes start and end holds. Status updates do not. The
+    /// admitted peer limits bound how many departed suppliers keep history.
     pub(super) fn prune_vct_supplier_history(&mut self) {
-        // Membership changes invalidate supplier history. Status updates do not.
         let Some(task) = self.state.vct_repair.current_mut() else {
             return;
         };
         let connected_sources: HashSet<_> = self.sessions.keys().map(source_id_from_peer).collect();
-        task.retain_connected_sources(&connected_sources);
+        let limits = self.startup.config.peer_limits;
+        task.retain_connected_sources(
+            &connected_sources,
+            Instant::now(),
+            self.startup.config.unproductive_peer_cooldown,
+            limits
+                .max_inbound_peers
+                .saturating_add(limits.max_outbound_peers),
+        );
     }
 
     pub(super) fn try_assign_vct_repair(&mut self) {

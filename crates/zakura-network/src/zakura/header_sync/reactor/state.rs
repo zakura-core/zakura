@@ -515,8 +515,8 @@ impl ReactorState {
     ///
     /// Supplier and excluded-input failures charge the supplier and rotate it to the back
     /// of the supplier order. A charge stays with the supplier's identity across session
-    /// replacement and leaves when it disconnects, so a failure that arrives while
-    /// `supplier_connected` is false leaves no history. A session that ended before its
+    /// replacement and disconnect, until the episode ends or
+    /// [`RepairRequirement::retain_connected_sources`] releases it. A session that ended before its
     /// supplier answered charges nothing. A `TargetNotSelected` answer waits for a status
     /// other than the one the request was built from. A local failure backs the repair off
     /// until [`VCT_REPAIR_RETRY_INTERVAL`] after `now`. A stale episode schedules nothing.
@@ -524,7 +524,6 @@ impl ReactorState {
         &mut self,
         owner: zakura_header_chain::BodyWorkOwner,
         retry: VctRepairRetry,
-        supplier_connected: bool,
         now: Instant,
     ) -> bool {
         let source = retry.source;
@@ -548,12 +547,6 @@ impl ReactorState {
                 });
         if !scheduled {
             return false;
-        }
-        if !supplier_connected {
-            // Retained local work can finish after its supplier disconnects.
-            if let Some(task) = self.vct_repair.get_mut(owner) {
-                task.forget_source(source);
-            }
         }
         if retry.attribution.charges_supplier() {
             self.rotate_supplier(source);

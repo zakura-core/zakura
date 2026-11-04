@@ -798,6 +798,8 @@ impl HeaderSyncReactor {
             }
             self.state.rotate_supplier(source_id_from_peer(&peer));
         }
+        // A reconnect resumes or ends the supplier's held repair history.
+        self.prune_vct_supplier_history();
         self.publish_peer_state();
         let admitted = self
             .sessions

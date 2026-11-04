@@ -413,19 +413,6 @@ impl Request {
     pub fn is_mempool(&self) -> bool {
         matches!(self, Request::Mempool { .. })
     }
-
-    /// Returns the block verifier batch flush key, if this is a block request.
-    fn block_verifier_batch_flush_key(&self) -> Option<primitives::BlockVerifierBatchFlushKey> {
-        match self {
-            Request::Block {
-                known_outpoint_hashes,
-                ..
-            } => Some(primitives::block_verifier_batch_flush_key(
-                known_outpoint_hashes,
-            )),
-            Request::Mempool { .. } => None,
-        }
-    }
 }
 
 impl Response {
@@ -508,11 +495,22 @@ where
             UnminedTxId::Legacy(_) => None,
         };
         let span = tracing::debug_span!("tx", ?tx_id);
+        // Taken before the future first runs, so a delayed poll still holds the block's flush.
+        let queueing = match &req {
+            Request::Block {
+                known_outpoint_hashes,
+                ..
+            } if tx.has_shielded_data() => {
+                primitives::flush::Queueing::for_transaction(known_outpoint_hashes)
+            }
+            Request::Block { .. } | Request::Mempool { .. } => None,
+        };
 
         async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
+            check::version_has_a_verifier(&tx)?;
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
             check::has_enough_ironwood_flags(&tx)?;
@@ -658,6 +656,19 @@ where
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
+
+                // Reject unknown anchors and already-spent nullifiers before dispatching
+                // cryptographic work to the verifiers shared with block verification.
+                let response = state
+                    .clone()
+                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
+                        unmined_tx.clone(),
+                    ))
+                    .await?;
+                assert!(
+                    response == zs::Response::ValidBestChainTipNullifiersAndAnchors,
+                    "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
+                );
             }
 
             let nu = req.upgrade(&network);
@@ -666,10 +677,10 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            // Built inside the block flush scope, so each batch request takes a flush guard.
+            let build_checks = || match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
-                    tracing::debug!(?tx, "got transaction with wrong version");
-                    return Err(TransactionError::WrongVersion);
+                    unreachable!("the version quick check rejects v1 to v3 transactions before any lookup")
                 }
                 Transaction::V4 {
                     joinsplit_data,
@@ -681,7 +692,7 @@ where
                     cached_ffi_transaction.clone(),
                     joinsplit_data.as_deref(),
                     tx_id,
-                )?,
+                ),
                 Transaction::V5 {
                     ..
                 } => Self::verify_v5_transaction(
@@ -690,7 +701,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
-                )?,
+                ),
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
@@ -699,32 +710,17 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
-                )?,
+                ),
             };
-
-            if let Some(unmined_tx) = mempool_transaction {
-                let check_anchors_and_revealed_nullifiers_query = state
-                    .clone()
-                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
-                        unmined_tx,
-                    ))
-                    .map(|res| {
-                        assert!(
-                            res? == zs::Response::ValidBestChainTipNullifiersAndAnchors,
-                            "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
-                        );
-                        Ok(())
-                    }
-                    );
-
-                async_checks.push(check_anchors_and_revealed_nullifiers_query);
-            }
-
-            let block_batch_flush_key = req.block_verifier_batch_flush_key();
+            let async_checks = match queueing.as_ref() {
+                Some(queueing) => queueing.scope(build_checks),
+                None => build_checks(),
+            }?;
+            drop(queueing);
 
             tracing::trace!(?tx_id, "awaiting async checks...");
 
-            async_checks.check(block_batch_flush_key).await?;
+            async_checks.check().await?;
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -1405,11 +1401,18 @@ where
             //
             // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
             // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-            let ed25519_verifier = primitives::ed25519::VERIFIER.clone();
+            let mut ed25519_verifier = primitives::ed25519::VERIFIER.clone();
             let ed25519_item =
                 (joinsplit_data.pub_key, joinsplit_data.sig, shielded_sighash).into();
 
-            checks.push(ed25519_verifier.oneshot(ed25519_item));
+            let queueing = primitives::flush::Queueing::for_request();
+            checks.push(async move {
+                let response = ed25519_verifier.ready().await?.call(ed25519_item);
+                if let Some(queueing) = queueing {
+                    queueing.enqueued(primitives::flush::Verifier::Ed25519);
+                }
+                response.await
+            });
         }
 
         Ok(checks)
@@ -1474,10 +1477,12 @@ where
         //
         // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
         if let Some(bundle) = bundle {
+            // Called now rather than through `oneshot`, so the cache takes its block flush guard
+            // while this transaction's checks are built. Its `poll_ready` is always ready.
             async_checks.push(
                 primitives::sapling::VERIFIER
                     .clone()
-                    .oneshot(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
+                    .call(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
             );
         }
 
@@ -1529,10 +1534,11 @@ where
             // bundles only under the fixed key, and NU6.3-onward bundles only
             // under the NU6.3 key (which enforces the Orchard cross-address
             // restriction even in v5 transactions).
+            // Called now rather than through `oneshot`. See `verify_sapling_bundle`.
             async_checks.push(
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()
-                    .oneshot(primitives::halo2::Item::new_with_wtx_id(
+                    .call(primitives::halo2::Item::new_with_wtx_id(
                         bundle, *sighash, wtx_id,
                     )),
             );
@@ -1573,49 +1579,18 @@ impl AsyncChecks {
     /// while that work is still running. A caller that bounds its compute on this response reads
     /// completion literally, and the wait costs nothing extra: the batches are already queued, and
     /// the batch verifiers flush them on their own latency bound at the latest.
-    async fn check(
-        mut self,
-        block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
-    ) -> Result<(), BoxError> {
-        let mut needs_block_batch_flush = block_batch_flush_key.is_some();
-        let mut block_batch_flush = match block_batch_flush_key {
-            Some(key) => async move {
-                tokio::task::yield_now().await;
-                primitives::start_block_transaction_async_checks(key);
-            }
-            .boxed(),
-            None => futures::future::pending().boxed(),
-        };
-
-        // Wait for all asynchronous checks to complete
-        // successfully, or fail verification if they error.
+    async fn check(mut self) -> Result<(), BoxError> {
         let mut first_error = None;
-        loop {
-            tokio::select! {
-                biased;
-
-                check = self.0.next() => {
-                    let Some(check) = check else {
-                        if needs_block_batch_flush {
-                            block_batch_flush.await;
-                        }
-
-                        return match first_error {
-                            Some(error) => Err(error),
-                            None => Ok(()),
-                        };
-                    };
-
-                    tracing::trace!(?check, remaining = self.0.len());
-                    if let Err(error) = check {
-                        first_error.get_or_insert(error);
-                    }
-                }
-
-                () = &mut block_batch_flush, if needs_block_batch_flush => {
-                    needs_block_batch_flush = false;
-                }
+        while let Some(check) = self.0.next().await {
+            tracing::trace!(?check, remaining = self.0.len());
+            if let Err(error) = check {
+                first_error.get_or_insert(error);
             }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }

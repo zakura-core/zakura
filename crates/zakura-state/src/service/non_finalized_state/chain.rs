@@ -382,6 +382,144 @@ impl Chain {
         Ok(self)
     }
 
+    /// Replaces this prepared chain's tip block with the solved block it was prepared for.
+    ///
+    /// A proposal and the block mined from it share a parent and a transaction list, so every
+    /// index this chain built from those transactions already describes `solved`. Only the four
+    /// records that read the block header are rebuilt: the stored block, the index from block
+    /// hash to height, the history tree entry, and the block info. The caller has checked that
+    /// the two blocks agree on their parent, their transactions, and their difficulty threshold,
+    /// so the cumulative work is unchanged as well.
+    ///
+    /// `parent_history_tree` is the history tree of this chain's parent, which the prepared tip's
+    /// entry was built from.
+    ///
+    /// # Panics
+    ///
+    /// If `solved` is not at this chain's tip height, does not extend the prepared tip's parent,
+    /// or claims a different difficulty threshold.
+    pub(crate) fn finish_prepared_tip(
+        mut self,
+        solved: ContextuallyVerifiedBlock,
+        parent_history_tree: &Arc<HistoryTree>,
+    ) -> Result<Chain, ValidateContextError> {
+        // Every field of `ChainInner` is named here, with no `..`, so adding a field is a
+        // compile error until its author decides whether a solved header changes it. The four
+        // rebuilt below come first; the rest are determined by the parent chain and the
+        // transactions, which `solved` shares with the prepared tip.
+        let ChainInner {
+            blocks: _,
+            height_by_hash: _,
+            history_trees_by_height: _,
+            block_info_by_height: _,
+
+            tx_loc_by_hash: _,
+            created_utxos: _,
+            spent_utxos: _,
+            sprout_trees_by_anchor: _,
+            sprout_trees_by_height: _,
+            sapling_trees_by_height: _,
+            orchard_trees_by_height: _,
+            ironwood_trees_by_height: _,
+            sprout_anchors: _,
+            sprout_anchors_by_height: _,
+            sapling_anchors: _,
+            sapling_anchors_by_height: _,
+            sapling_subtrees: _,
+            orchard_anchors: _,
+            orchard_anchors_by_height: _,
+            orchard_subtrees: _,
+            ironwood_subtrees: _,
+            ironwood_anchors: _,
+            ironwood_anchors_by_height: _,
+            sprout_nullifiers: _,
+            sapling_nullifiers: _,
+            orchard_nullifiers: _,
+            ironwood_nullifiers: _,
+            partial_transparent_transfers: _,
+            partial_cumulative_work: _,
+            chain_value_pools: _,
+        } = &self.inner;
+
+        let height = solved.height;
+        assert_eq!(
+            self.non_finalized_tip_height(),
+            height,
+            "a prepared chain is finished at its own tip, which the solved block replaces",
+        );
+
+        // The note commitment roots come from the transactions, so the prepared tip's roots are
+        // also the solved block's. Read them before the tip block is replaced.
+        let sapling_root = self.sapling_note_commitment_tree_for_tip().root();
+        let orchard_root = self.orchard_note_commitment_tree_for_tip().root();
+        let ironwood_root = self.ironwood_note_commitment_tree_for_tip().root();
+
+        let prepared = self
+            .blocks
+            .remove(&height)
+            .expect("the tip height indexes the prepared tip block");
+        assert_eq!(
+            solved.block.header.previous_block_hash, prepared.block.header.previous_block_hash,
+            "a solved block extends the same parent as the proposal it was mined from",
+        );
+        assert_eq!(
+            solved.block.header.difficulty_threshold, prepared.block.header.difficulty_threshold,
+            "this keeps the chain's cumulative work, so the solved block must claim the \
+             proposal's difficulty threshold",
+        );
+
+        let prepared_height = self.height_by_hash.remove(&prepared.hash);
+        assert_eq!(
+            prepared_height,
+            Some(height),
+            "a chain indexes the height of every block it holds",
+        );
+        let duplicate_height = self.height_by_hash.insert(solved.hash, height);
+        assert_eq!(
+            duplicate_height, None,
+            "block heights must be unique within a single chain",
+        );
+
+        // The history tree leaf reads the block hash, time, and difficulty threshold, so the
+        // prepared entry describes the proposal rather than the solved block. Rebuild it by
+        // appending the solved block to the parent's tree, exactly as the chain update does.
+        let mut history_tree = parent_history_tree.clone();
+        Arc::make_mut(&mut history_tree)
+            .push(
+                &self.network,
+                solved.block.clone(),
+                &sapling_root,
+                &orchard_root,
+                &ironwood_root,
+            )
+            .map_err(Arc::new)?;
+        self.history_trees_by_height
+            .insert(height, history_tree)
+            .expect("a chain holds a history tree for every block it holds");
+
+        // The block info is derived from the block, so it is derived again here from the solved
+        // one, as the ordinary chain update does. Its chain value pool balances come from the
+        // transactions, and its size comes out the same, because a proposal's placeholder
+        // solution has the same encoded length as the solution that replaces it. Deriving it
+        // again rather than carrying it over keeps that out of the reuse contract.
+        let size = solved.block.zcash_serialized_size();
+        // Cast is safe: a block that deserialized is far below the 2 MB block size limit, and a
+        // serialized size that did not fit in a `u32` could not have been read from the network.
+        let size = size as u32;
+        let chain_value_pools = self.chain_value_pools;
+        self.block_info_by_height
+            .insert(height, BlockInfo::new(chain_value_pools, size))
+            .expect("a chain holds the block info of every block it holds");
+
+        self.blocks.insert(height, Arc::new(solved));
+
+        // The preference belongs to a tip hash, and the tip hash has just changed.
+        // `NonFinalizedState` sets this again from its own preferences when it inserts the chain.
+        self.precious = None;
+
+        Ok(self)
+    }
+
     /// Pops the lowest height block of the non-finalized portion of a chain,
     /// and returns it with its associated treestate.
     #[instrument(level = "debug", skip(self))]

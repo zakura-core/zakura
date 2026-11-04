@@ -66,8 +66,12 @@ use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 /// `getdata` at about 1 MiB, so an honest peer never exceeds it.
 pub(crate) const COMPAT_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
 
-/// The most bytes one compatibility exchange may charge: its frames, plus the
-/// validator's and the decoder's reassembly copies of one object.
+/// The most bytes one compatibility exchange may charge: its serialized frames,
+/// plus the validator's and the decoder's reassembly copies of one object.
+///
+/// The charge lasts until the requester hands the decoded response to its caller.
+/// It counts serialized bytes, so a decoded object larger than its encoding is
+/// outside it.
 pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
     (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES + 2 * MAX_PROTOCOL_MESSAGE_LEN) as u64;
 

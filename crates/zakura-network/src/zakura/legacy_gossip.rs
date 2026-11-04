@@ -102,11 +102,13 @@ pub const MSG_RESPONSE_NIL: u16 = 18;
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
-/// Decoded compatibility work that the inbound queue and its handlers may retain.
+/// Decoded compatibility work that the inbound queue and its handlers may retain,
+/// until each handler hands its payload to the inbound service.
 ///
-/// Queue slots do not bound variable-size payloads. A queued transaction can be as
-/// large as a protocol message, so the in-flight limit binds first for wire-maximum
-/// requests, and the queue holds many more ordinary ones.
+/// Later owners, such as mempool verification, keep the decoded payload outside this
+/// budget. Queue slots do not bound variable-size payloads. A queued transaction can
+/// be as large as a protocol message, so the in-flight limit binds first for
+/// wire-maximum requests, and the queue holds many more ordinary ones.
 const LEGACY_INBOUND_RETAINED_BYTES: u64 =
     // Widening usize to u64 is lossless on supported targets.
     (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;

@@ -6314,8 +6314,11 @@ impl LegacyResponseBudget {
         }
     }
 
-    /// The bytes one exchange under this budget retains at its peak: its frames,
-    /// plus the validator's and the decoder's reassembly copies of one object.
+    /// The serialized bytes one exchange under this budget charges: its frames, plus
+    /// the validator's and the decoder's reassembly copies of one object.
+    ///
+    /// The charge lasts until the requester hands the decoded response to its caller.
+    /// A decoded object larger than its encoding is outside it.
     fn retained_bytes(&self) -> u64 {
         let copies = match self.kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {

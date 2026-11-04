@@ -43,8 +43,7 @@ fn settle_initial(state: &mut PeerState, wait: InitialWait) -> PeerStep {
 
 /// Without a `Hello` the exchange never completes, so the initial wait times
 /// out. The session is charged when it leaves the connection open. When it
-/// asks to close the connection, IO retires it at the close, or charges it
-/// the same failure if another service keeps the connection open.
+/// asks to close the connection, IO retires it at the close.
 #[test]
 fn a_missing_hello_times_out_the_initial_exchange() {
     for (owners, end) in [
@@ -57,7 +56,6 @@ fn a_missing_hello_times_out_the_initial_exchange() {
             then(PeerOutput::End {
                 close: Some(Close {
                     reason: CloseReason::ExchangeTimedOut,
-                    if_kept: Some(SessionCharge::Fail),
                 }),
             }),
         ),
@@ -76,13 +74,13 @@ fn a_missing_hello_times_out_the_initial_exchange() {
             assert_eq!(step, then(WAIT_FOR_ANSWERS));
             assert_eq!(
                 state.on_input(PeerInput::AnswersSettled),
-                then(PeerOutput::CheckSoleOwner)
-            );
-            assert_eq!(
-                state.on_input(PeerInput::Owners(Ownership::Sole)),
                 then(PeerOutput::MarkShortLived)
             );
-            assert_eq!(state.on_input(PeerInput::ShortLivedMarked), end);
+            assert_eq!(
+                state.on_input(PeerInput::ShortLivedMarked),
+                then(PeerOutput::CheckSoleOwner)
+            );
+            assert_eq!(state.on_input(PeerInput::Owners(Ownership::Sole)), end);
         } else {
             assert_eq!(step, end);
         }
@@ -134,10 +132,7 @@ fn another_admitted_service_keeps_the_connection_and_the_session_refreshes() {
             then(REFRESH)
         );
         assert_eq!(
-            state.on_input(PeerInput::Refreshed {
-                sent: true,
-                unsettled: false
-            }),
+            state.on_input(PeerInput::Refreshed { sent: true }),
             then(PeerOutput::CheckSoleOwner)
         );
     }
@@ -146,10 +141,7 @@ fn another_admitted_service_keeps_the_connection_and_the_session_refreshes() {
         then(REFRESH)
     );
     assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: false,
-            unsettled: false
-        }),
+        state.on_input(PeerInput::Refreshed { sent: false }),
         then(END_OPEN),
         "a completed session that ends with its stream leaves the connection open"
     );
@@ -170,77 +162,13 @@ fn a_late_completion_settles_a_timed_out_session_as_a_success() {
     );
     complete(&mut state);
     assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: false,
-            unsettled: false
-        }),
+        state.on_input(PeerInput::Refreshed { sent: false }),
         charged(SessionCharge::Succeed, END_OPEN)
     );
 }
 
-/// A timed-out exchange that is still incomplete one refresh interval later
-/// ends its session with a failure charge, even while another service keeps
-/// the connection.
-#[test]
-fn a_timed_out_exchange_still_incomplete_after_a_refresh_ends_charged() {
-    let mut state = waiting_session();
-    state.record_answer(&admitted(QueryKind::Peers));
-    assert_eq!(
-        settle_initial(&mut state, InitialWait::TimedOut),
-        then(PeerOutput::CheckSoleOwner)
-    );
-    assert_eq!(
-        state.on_input(PeerInput::Owners(Ownership::Shared)),
-        then(REFRESH)
-    );
-    assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: true,
-            unsettled: false
-        }),
-        charged(SessionCharge::Fail, END_OPEN)
-    );
-}
-
-/// A timed-out exchange whose delivered part still waits for local processing
-/// is not charged at the refresh: the delay is this node's. Once nothing
-/// delivered is left and the exchange is still incomplete, the next refresh
-/// ends it charged.
-#[test]
-fn a_delivered_part_in_local_verification_keeps_a_timed_out_session() {
-    let mut state = waiting_session();
-    assert_eq!(
-        settle_initial(&mut state, InitialWait::TimedOut),
-        then(PeerOutput::CheckSoleOwner)
-    );
-    for _ in 0..3 {
-        assert_eq!(
-            state.on_input(PeerInput::Owners(Ownership::Shared)),
-            then(REFRESH)
-        );
-        assert_eq!(
-            state.on_input(PeerInput::Refreshed {
-                sent: true,
-                unsettled: true
-            }),
-            then(PeerOutput::CheckSoleOwner)
-        );
-    }
-    assert_eq!(
-        state.on_input(PeerInput::Owners(Ownership::Shared)),
-        then(REFRESH)
-    );
-    assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: true,
-            unsettled: false
-        }),
-        charged(SessionCharge::Fail, END_OPEN)
-    );
-}
-
 /// An exchange that the close's answer wait finishes closes as complete, not
-/// as timed out. A connection another service keeps settles it as a success.
+/// as timed out.
 #[test]
 fn an_answer_that_settles_during_the_close_wait_completes_the_exchange() {
     let mut state = waiting_session();
@@ -255,18 +183,17 @@ fn an_answer_that_settles_during_the_close_wait_completes_the_exchange() {
     complete(&mut state);
     assert_eq!(
         state.on_input(PeerInput::AnswersSettled),
-        then(PeerOutput::CheckSoleOwner)
-    );
-    assert_eq!(
-        state.on_input(PeerInput::Owners(Ownership::Sole)),
         then(PeerOutput::MarkShortLived)
     );
     assert_eq!(
         state.on_input(PeerInput::ShortLivedMarked),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Sole)),
         then(PeerOutput::End {
             close: Some(Close {
                 reason: CloseReason::ExchangeComplete,
-                if_kept: Some(SessionCharge::Succeed),
             }),
         })
     );
@@ -287,18 +214,17 @@ fn a_pending_answer_holds_the_close_until_it_settles() {
     state.record_answer(&admitted(QueryKind::Services));
     assert_eq!(
         state.on_input(PeerInput::AnswersSettled),
-        then(PeerOutput::CheckSoleOwner)
-    );
-    assert_eq!(
-        state.on_input(PeerInput::Owners(Ownership::Sole)),
         then(PeerOutput::MarkShortLived)
     );
     assert_eq!(
         state.on_input(PeerInput::ShortLivedMarked),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Sole)),
         then(PeerOutput::End {
             close: Some(Close {
                 reason: CloseReason::ExchangeComplete,
-                if_kept: None,
             }),
         })
     );
@@ -371,7 +297,7 @@ proptest! {
     }
 }
 
-const WITNESS: &[u8] = &[0, 1, 2, 7, 11, 7, 11, 3, 11, 3];
+const WITNESS: &[u8] = &[0, 1, 2, 7, 11, 7, 11, 3, 3, 11];
 
 #[test]
 #[allow(
@@ -403,17 +329,46 @@ fn closing_events() -> impl Iterator<Item = Event> {
         Event::Answer(QueryKind::Services),
     ]
     .into_iter()
-    .chain([1, 2, 1, 2, 0, 2, 0].into_iter().map(Event::Outcome))
+    .chain([1, 2, 1, 2, 0, 0, 2].into_iter().map(Event::Outcome))
 }
 
 #[test]
 #[should_panic(expected = "discovery/session-policy")]
 fn discovery_session_witness_rejects_skipping_the_owner_recheck() {
     run(closing_events(), |input, step| {
-        if input == PeerInput::AnswersSettled {
-            step.next = PeerOutput::MarkShortLived;
+        if input == PeerInput::ShortLivedMarked {
+            step.next = PeerOutput::End {
+                close: Some(Close {
+                    reason: CloseReason::ExchangeComplete,
+                }),
+            };
         }
     });
+}
+
+/// A sibling that gains the connection during the close's answer wait keeps
+/// it: the last owner check finds it, and the session refreshes instead.
+#[test]
+fn a_sibling_found_at_the_last_owner_check_keeps_the_connection() {
+    let mut state = waiting_session();
+    complete(&mut state);
+    settle_initial(&mut state, InitialWait::Complete);
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Sole)),
+        then(WAIT_FOR_ANSWERS)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::AnswersSettled),
+        then(PeerOutput::MarkShortLived)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::ShortLivedMarked),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Shared)),
+        then(REFRESH)
+    );
 }
 
 #[test]

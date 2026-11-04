@@ -90,14 +90,13 @@ pub(super) enum CloseReason {
 
 /// A session's request to close its discovery-only connection.
 ///
-/// Another service can gain the connection before IO closes it. IO then keeps
-/// the connection open and charges `if_kept`, as a session that leaves its
-/// connection open is charged. When IO closes the connection, it retires the
-/// session's record instead, so the connection reopens no session.
+/// The state asks only right after IO found this current session the
+/// connection's only owner. IO closes the connection with no wait after that
+/// check, and retires the session's record, so the connection reopens no
+/// session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct Close {
     pub(super) reason: CloseReason,
-    pub(super) if_kept: Option<SessionCharge>,
 }
 
 /// The operation IO runs next.
@@ -138,10 +137,8 @@ pub(super) enum PeerInput {
     /// [`PeerOutput::CheckSoleOwner`] found this ownership.
     Owners(Ownership),
     /// [`PeerOutput::Refresh`] ended. `sent` is false once the session is
-    /// cancelled or gone. `unsettled` is true while the session holds an
-    /// answer or `Hello` that the peer delivered and this node has not
-    /// processed.
-    Refreshed { sent: bool, unsettled: bool },
+    /// cancelled or gone.
+    Refreshed { sent: bool },
     /// [`PeerOutput::WaitForAnswers`] ended.
     AnswersSettled,
     /// [`PeerOutput::MarkShortLived`] ran.
@@ -181,8 +178,8 @@ enum Phase {
     CheckingOwners,
     Refreshing,
     AwaitingAnswers,
-    CheckingClose,
     MarkingShortLived,
+    CheckingClose,
     Ended,
 }
 
@@ -256,8 +253,8 @@ impl PeerState {
                 self.phase = Phase::CheckingOwners;
                 // The answers can wait behind the peer's serving queue and
                 // this node's verification slots, so a slow exchange is not
-                // the peer's fault. It continues like a completed one for one
-                // refresh interval, and is settled when its session ends.
+                // the peer's fault. It continues like a completed one, and is
+                // settled when its session ends.
                 let charge = completed.then_some(SessionCharge::Succeed);
                 PeerStep::new(charge, PeerOutput::CheckSoleOwner)
             }
@@ -274,7 +271,7 @@ impl PeerState {
                 Phase::CheckingOwners | Phase::CheckingClose,
                 PeerInput::Owners(Ownership::Superseded),
             )
-            | (Phase::Refreshing, PeerInput::Refreshed { sent: false, .. }) => self.release(),
+            | (Phase::Refreshing, PeerInput::Refreshed { sent: false }) => self.release(),
             (Phase::CheckingOwners, PeerInput::Owners(Ownership::Sole)) => {
                 // Closing drops every unwritten answer, and the peer's
                 // exchange would end without it.
@@ -283,32 +280,22 @@ impl PeerState {
                     deadline: DISCOVERY_ANSWER_WRITE_DEADLINE,
                 })
             }
-            // A timed-out exchange that is still incomplete a full refresh
-            // interval later, with nothing delivered left to process, ends
-            // its session. The missing parts never reached this node, so a
-            // silent peer on a shared connection cannot hold a discovery
-            // slot. A delivered part that waits for local verification is
-            // never the peer's fault, and the session keeps refreshing.
-            (
-                Phase::Refreshing,
-                PeerInput::Refreshed {
-                    sent: true,
-                    unsettled: false,
-                },
-            ) if self.timed_out && !self.progress.complete() => self.release(),
-            (Phase::Refreshing, PeerInput::Refreshed { sent: true, .. }) => {
+            (Phase::Refreshing, PeerInput::Refreshed { sent: true }) => {
                 self.phase = Phase::CheckingOwners;
                 PeerStep::then(PeerOutput::CheckSoleOwner)
             }
             (Phase::AwaitingAnswers, PeerInput::AnswersSettled) => {
+                self.phase = Phase::MarkingShortLived;
+                PeerStep::then(PeerOutput::MarkShortLived)
+            }
+            // The owner check comes last, so IO closes the connection with no
+            // wait after it. A sibling that gained the connection meanwhile
+            // keeps it, and the session refreshes.
+            (Phase::MarkingShortLived, PeerInput::ShortLivedMarked) => {
                 self.phase = Phase::CheckingClose;
                 PeerStep::then(PeerOutput::CheckSoleOwner)
             }
             (Phase::CheckingClose, PeerInput::Owners(Ownership::Sole)) => {
-                self.phase = Phase::MarkingShortLived;
-                PeerStep::then(PeerOutput::MarkShortLived)
-            }
-            (Phase::MarkingShortLived, PeerInput::ShortLivedMarked) => {
                 self.phase = Phase::Ended;
                 // The close's answer wait can finish a timed-out exchange.
                 let reason = if self.progress.complete() {
@@ -318,11 +305,9 @@ impl PeerState {
                 };
                 // A retired session is never charged, so a timed-out exchange
                 // that closes its connection settles at the close.
-                let close = Close {
-                    reason,
-                    if_kept: self.open_charge(),
-                };
-                PeerStep::then(PeerOutput::End { close: Some(close) })
+                PeerStep::then(PeerOutput::End {
+                    close: Some(Close { reason }),
+                })
             }
             (phase, input) => {
                 unreachable!(

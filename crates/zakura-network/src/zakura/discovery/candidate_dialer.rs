@@ -581,8 +581,9 @@ async fn apply_discovery_dial_result(
             discovery.mark_dial_success(node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.succeeded").increment(1);
         }
+        // Another connection's registration proves none of this record's
+        // addresses, so it confirms nothing.
         DiscoveryDialResult::ConnectedElsewhere => {
-            discovery.mark_dial_success(node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.connected_elsewhere").increment(1);
         }
         DiscoveryDialResult::ShortLivedRegistered => {

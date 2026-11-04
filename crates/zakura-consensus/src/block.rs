@@ -19,6 +19,7 @@ use zakura_node_services::block_memory::BlockHandle;
 use chrono::Utc;
 use futures::stream::FuturesUnordered;
 use futures_util::FutureExt;
+use rayon::prelude::*;
 use thiserror::Error;
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
@@ -560,9 +561,14 @@ where
                 // Next, check the Merkle root validity, to ensure that
                 // the header binds to the transactions in the blocks.
 
-                // Precomputing this avoids duplicating transaction hash computations.
-                let transaction_hashes: Arc<[_]> =
-                    block.view().transactions().map(|t| t.hash()).collect();
+                // Precomputing this avoids duplicating transaction hash computations. Each hash
+                // is independent, so a large block's hashes are split across threads.
+                let transaction_hashes: Arc<[_]> = block
+                    .view()
+                    .parallel_transactions()
+                    .map(|t| t.hash())
+                    .collect::<Vec<_>>()
+                    .into();
 
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 

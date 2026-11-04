@@ -243,6 +243,55 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
     );
 }
 
+/// A replacement that changes direction needs a free slot in the destination
+/// pool. While that pool is full, the replacement is rejected and the old
+/// session stays admitted. A same-direction replacement keeps its slot.
+#[test]
+fn direction_change_replacement_respects_destination_cap() {
+    let mut state = discovery_state();
+    let admit = |state: &mut DiscoveryState, key: &DiscoverySessionKey, outbound| {
+        state.admit_session(key.clone(), direction(outbound))
+    };
+    for peer in 0..PEER_CAP {
+        assert_eq!(
+            admit(&mut state, &session(peer, 1, 1), true),
+            ServiceAdmissionDecision::Admit
+        );
+    }
+    let inbound = session(PEER_CAP, 1, 1);
+    assert_eq!(
+        admit(&mut state, &inbound, false),
+        ServiceAdmissionDecision::Admit
+    );
+
+    let to_outbound = session(PEER_CAP, 2, 1);
+    assert_eq!(
+        admit(&mut state, &to_outbound, true),
+        ServiceAdmissionDecision::RejectFull,
+        "the outbound pool is full"
+    );
+    assert!(state.is_current_session(&inbound), "the old session stays");
+    assert_eq!(state.peer_snapshot().inbound_peers, 1);
+    assert_eq!(state.peer_snapshot().outbound_peers, PEER_CAP);
+
+    let same_direction = session(0, 2, 1);
+    assert_eq!(
+        admit(&mut state, &same_direction, true),
+        ServiceAdmissionDecision::Admit,
+        "a same-direction replacement keeps its slot"
+    );
+    assert_eq!(state.peer_snapshot().outbound_peers, PEER_CAP);
+
+    state.remove_session(&same_direction);
+    assert_eq!(
+        admit(&mut state, &to_outbound, true),
+        ServiceAdmissionDecision::Admit,
+        "a free outbound slot admits the direction change"
+    );
+    assert_eq!(state.peer_snapshot().inbound_peers, 0);
+    assert_eq!(state.peer_snapshot().outbound_peers, PEER_CAP);
+}
+
 /// A peer's record hint ends at its signed expiry, and its live summaries end
 /// at their local TTL. Moving the time past the signed expiry while the local
 /// TTL has not passed drops the record hint and keeps the live summaries.

@@ -1031,13 +1031,18 @@ impl StateModel {
         session_id: u64,
         outbound: bool,
     ) -> ServiceAdmissionDecision {
-        if let Some((conn, session, _)) = self.peers[peer].admitted {
+        match self.peers[peer].admitted {
             // Only a later (connection, session) replaces an admitted session.
-            if (conn_id, session_id) <= (conn, session) {
+            Some((conn, session, _)) if (conn_id, session_id) <= (conn, session) => {
                 return ServiceAdmissionDecision::RejectNotUseful;
             }
-        } else if self.admitted_in(outbound) >= PEER_CAP {
-            return ServiceAdmissionDecision::RejectFull;
+            // A same-direction replacement keeps its slot.
+            Some((_, _, out)) if out == outbound => {}
+            // A new peer or a direction change needs a free destination slot.
+            _ if self.admitted_in(outbound) >= PEER_CAP => {
+                return ServiceAdmissionDecision::RejectFull;
+            }
+            _ => {}
         }
         self.peers[peer].admitted = Some((conn_id, session_id, outbound));
         ServiceAdmissionDecision::Admit
@@ -1240,6 +1245,12 @@ impl StateDriver {
     }
 
     fn check_sessions(&self) {
+        // The caps hold on the real state alone, whatever the model says.
+        let snapshot = self.state.peer_snapshot();
+        assert!(
+            snapshot.inbound_peers <= PEER_CAP && snapshot.outbound_peers <= PEER_CAP,
+            "{STATE_PROPERTY}: admitted sessions exceed a direction cap: {snapshot:?}"
+        );
         for (index, peer) in self.model.peers.iter().enumerate() {
             if let Some((conn_id, session_id, _)) = peer.admitted {
                 assert!(

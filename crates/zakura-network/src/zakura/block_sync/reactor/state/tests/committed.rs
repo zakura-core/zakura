@@ -170,6 +170,32 @@ fn authority_change_retires_the_pending_query_and_forces_refill() {
     assert!(update.forces_refill(false));
 }
 
+/// A new epoch with missed hint history starts no refresh: the Sequencer
+/// resets the queued work that IO would snapshot as the refresh bounds.
+#[test]
+fn epoch_change_with_missed_hints_starts_no_refresh() {
+    let mut state = reactor_state(0, 20);
+    let _ = observe(&mut state, &base_spec(), time::Instant::now());
+
+    let update = observe(
+        &mut state,
+        &Spec {
+            epoch: 1,
+            hint_revision: 3,
+            first_batch: Some(3),
+            ..base_spec()
+        },
+        time::Instant::now(),
+    );
+    assert!(matches!(
+        update.authority,
+        Some(AuthorityUpdate::EpochChanged { .. })
+    ));
+    assert_eq!(update.hints, HintUpdate::Unchanged);
+    assert_eq!(state.queries.hint_refresh(), None);
+    assert!(update.forces_refill(false));
+}
+
 #[test]
 fn unchanged_view_keeps_the_pending_query_and_needs_no_refill() {
     let now = Instant::now();
@@ -490,6 +516,7 @@ impl Model {
         let refreshed_pending = old_revision.is_some() && self.pending;
         let hints = match old_revision {
             None => HintUpdate::Unchanged,
+            Some(_) if epoch_changed => HintUpdate::Unchanged,
             Some(old) if spec.first_batch.is_some_and(|first| first <= old + 1) => {
                 HintUpdate::Apply {
                     after_revision: old,

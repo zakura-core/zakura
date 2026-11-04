@@ -606,6 +606,62 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
     assert_eq!(state.queries.hint_refresh(), None);
 }
 
+/// Both reset paths end the hint refresh. The Sequencer's reset drops the
+/// queued work the refresh covers, so the forced refill must read the new
+/// first unclaimed height instead of the old interval.
+#[test]
+fn resets_end_the_hint_refresh() {
+    let now = Instant::now();
+    let mut state = authorized_state(0, 20_000);
+    state
+        .queries
+        .start_hint_refresh(7, Some((block::Height(1), block::Height(5_000))));
+    assert!(matches!(
+        state.observe_view(view(0, 1, 1)),
+        ViewReaction::React { reset: true, .. }
+    ));
+    assert_eq!(state.queries.hint_refresh(), None);
+
+    state
+        .queries
+        .start_hint_refresh(8, Some((block::Height(1), block::Height(5_000))));
+    let _ = state.reset_queries(block::Height(0));
+    assert_eq!(state.queries.hint_refresh(), None);
+    let query = expect_accepted(refill(&mut state, true, work(Some(1), 0, 10), true, now));
+    assert_eq!((query.from, query.hint_revision), (block::Height(1), None));
+}
+
+/// An apply failure rolls the download floor back without a reset. The refresh
+/// ends, so the reopened gap is queried before any later height.
+#[test]
+fn floor_rollback_ends_the_hint_refresh() {
+    let now = Instant::now();
+    let mut state = authorized_state(0, 20_000);
+    let mut advanced = view(0, 0, 1);
+    advanced.download_floor = block::Height(5_000);
+    let _ = state.observe_view(advanced);
+    state
+        .queries
+        .start_hint_refresh(7, Some((block::Height(100), block::Height(9_000))));
+
+    let mut rolled_back = view(0, 0, 2);
+    rolled_back.download_floor = block::Height(149);
+    assert_eq!(
+        state.observe_view(rolled_back),
+        ViewReaction::React {
+            reset: false,
+            tip_advanced: false,
+        }
+    );
+    assert_eq!(state.queries.hint_refresh(), None);
+    assert_eq!(state.open_query(true).0, QueryOpening::NeedsWork);
+    let query = expect_accepted(refill(&mut state, false, work(Some(150), 0, 10), true, now));
+    assert_eq!(
+        (query.from, query.hint_revision),
+        (block::Height(150), None)
+    );
+}
+
 // ---- proptest ----
 
 /// Which query a completion names.

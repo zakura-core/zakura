@@ -2220,3 +2220,13 @@ impl Transaction {
         }
     }
 }
+
+/// Artifact-only full-DAG SIMD experiment.
+pub fn probe_batch_txids(txs: &[&Transaction], simd: bool) -> Vec<Hash> {
+    zip244::batch_probe::txids(txs, simd)
+}
+/// Artifact-only independent librustzcash oracle, outside timing.
+pub fn probe_oracle(tx: &Transaction) -> Hash {
+    let converted = tx.to_librustzcash(tx.network_upgrade().unwrap()).unwrap();
+    Hash(*converted.txid().as_ref())
+}

@@ -1094,3 +1094,5 @@ mod tests {
         }
     }
 }
+
+pub(crate) mod batch_probe;

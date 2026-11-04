@@ -504,6 +504,9 @@ where
             } if tx.has_shielded_data() => {
                 primitives::flush::Queueing::for_transaction(known_outpoint_hashes)
             }
+            Request::Mempool { .. } if tx.has_shielded_data() => {
+                Some(primitives::flush::Queueing::for_standalone_transaction())
+            }
             Request::Block { .. } | Request::Mempool { .. } => None,
         };
 

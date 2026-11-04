@@ -101,6 +101,26 @@ fn flush_waits_for_late_transactions_and_unqueued_requests() {
 }
 
 #[test]
+fn a_standalone_transaction_flushes_once_its_requests_are_queued() {
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let transaction = Queueing::for_standalone_transaction();
+        let pending = transaction.0.clone();
+        let request = transaction
+            .scope(Queueing::for_request)
+            .expect("built inside the transaction scope");
+
+        // Building the checks finished, but a request still waits for its queue.
+        drop(transaction);
+        assert_eq!(outstanding(&pending), 1, "the request");
+
+        // Its item reaches the queue, so the transaction flushes the real Ed25519 worker without
+        // any block registration.
+        request.enqueued(Verifier::Ed25519);
+        assert_eq!(outstanding(&pending), 0);
+    });
+}
+
+#[test]
 fn a_dropped_block_leaves_its_guards_releasable() {
     let context = Arc::new(());
     let registration = BlockFlush::register(&context, 2);

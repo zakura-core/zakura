@@ -3864,49 +3864,55 @@ mod tests {
         Ok(())
     }
 
-    /// A service admitted while the session's removal waits keeps the
-    /// connection: the last read of the owners comes right before the cancel.
-    /// The kept connection's record is charged as an open one, not retired,
-    /// so a later discovery session can still open on it.
+    /// A service admitted while the close marks the exchange short-lived keeps
+    /// the connection. The last owner check follows the mark, and no wait
+    /// separates it from the close. The peer reads this session's queries and
+    /// never answers them, so retiring the queries would close the connection
+    /// too.
     #[tokio::test(start_paused = true)]
-    async fn a_service_admitted_during_session_removal_keeps_the_connection(
+    async fn a_service_admitted_during_the_short_lived_mark_keeps_the_connection(
     ) -> Result<(), crate::BoxError> {
         let (handle, peer_id, _) = handle_with_session(66, 2).await?;
         let key = DiscoverySessionKey::new(peer_id.clone(), 2, 1);
-        let (send, _peer_recv) = framed_channel(16);
-        let (mut io, states) = test_peer_io(handle.clone(), peer_id.clone(), send);
-        // The first check after the timeout, the check after the answer wait,
-        // and the check that starts `end` find no owner. The fourth follows
-        // the session's removal.
-        let owner = ChangingOwner::new(4);
+        let (send, mut peer_recv) = framed_channel(16);
+        let (mut io, _states) = test_peer_io(handle.clone(), peer_id, send);
+        // The queries' fence closes the session's connection, as in production.
+        let (_unused, recv) = framed_channel(1);
+        io.queries = Queries::new(
+            reservation_pool(),
+            WriterFence::new(io.connection_cancel.clone(), io.close_cause.clone()),
+            &recv,
+            io.session.send.clone(),
+            io.session.cancel_token(),
+        );
+        let owner = ChangingOwner::new(usize::MAX);
         io.connection_owners = vec![owner.clone()];
         let connection = io.connection_cancel.clone();
+        // Reading a frame starts its exchange, as the transport's first write does.
+        let drain = tokio::spawn(async move { while peer_recv.recv().await.is_some() {} });
+        let hello = io.queries.verifying_hello();
+        let session = tokio::spawn(io.run());
 
-        tokio::spawn(io.run()).await?;
+        tokio::time::sleep(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+        )
+        .await;
+        let state = handle.lock_for_test().await;
+        drop(hello);
+        // The session blocks on the discovery lock after its answer wait.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        owner.owns.store(true, Ordering::SeqCst);
+        drop(state);
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(owner.calls.load(Ordering::SeqCst), 4);
-        assert!(!handle.is_current_session(&key).await, "the session ended");
         assert!(!connection.is_cancelled(), "the new owner keeps it open");
-        let mut states = states
-            .lock()
-            .expect("discovery session-state mutex is never poisoned");
+        assert!(handle.is_current_session(&key).await);
         assert!(
-            !states.is_retired(&peer_id, 2),
-            "a kept connection keeps its record open"
+            !session.is_finished(),
+            "the session refreshes for its owner"
         );
-        let record = states
-            .records
-            .get(&(peer_id.clone(), 2))
-            .copied()
-            .expect("the session's record outlives it");
-        assert_eq!(
-            record.failed_attempts, 1,
-            "the timed-out exchange is charged as a session that leaves its connection open"
-        );
-        assert!(
-            states.open(&DiscoverySessionKey::new(peer_id, 2, 2)),
-            "a later discovery session opens on the kept connection"
-        );
+        session.abort();
+        drain.abort();
         Ok(())
     }
 

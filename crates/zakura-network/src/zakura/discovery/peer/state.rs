@@ -90,14 +90,13 @@ pub(super) enum CloseReason {
 
 /// A session's request to close its discovery-only connection.
 ///
-/// Another service can gain the connection before IO closes it. IO then keeps
-/// the connection open and charges `if_kept`, as a session that leaves its
-/// connection open is charged. When IO closes the connection, it retires the
-/// session's record instead, so the connection reopens no session.
+/// The state asks only right after IO found this current session the
+/// connection's only owner. IO closes the connection with no wait after that
+/// check, and retires the session's record, so the connection reopens no
+/// session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct Close {
     pub(super) reason: CloseReason,
-    pub(super) if_kept: Option<SessionCharge>,
 }
 
 /// The operation IO runs next.
@@ -179,8 +178,8 @@ enum Phase {
     CheckingOwners,
     Refreshing,
     AwaitingAnswers,
-    CheckingClose,
     MarkingShortLived,
+    CheckingClose,
     Ended,
 }
 
@@ -286,14 +285,17 @@ impl PeerState {
                 PeerStep::then(PeerOutput::CheckSoleOwner)
             }
             (Phase::AwaitingAnswers, PeerInput::AnswersSettled) => {
+                self.phase = Phase::MarkingShortLived;
+                PeerStep::then(PeerOutput::MarkShortLived)
+            }
+            // The owner check comes last, so IO closes the connection with no
+            // wait after it. A sibling that gained the connection meanwhile
+            // keeps it, and the session refreshes.
+            (Phase::MarkingShortLived, PeerInput::ShortLivedMarked) => {
                 self.phase = Phase::CheckingClose;
                 PeerStep::then(PeerOutput::CheckSoleOwner)
             }
             (Phase::CheckingClose, PeerInput::Owners(Ownership::Sole)) => {
-                self.phase = Phase::MarkingShortLived;
-                PeerStep::then(PeerOutput::MarkShortLived)
-            }
-            (Phase::MarkingShortLived, PeerInput::ShortLivedMarked) => {
                 self.phase = Phase::Ended;
                 // The close's answer wait can finish a timed-out exchange.
                 let reason = if self.progress.complete() {
@@ -303,11 +305,9 @@ impl PeerState {
                 };
                 // A retired session is never charged, so a timed-out exchange
                 // that closes its connection settles at the close.
-                let close = Close {
-                    reason,
-                    if_kept: self.open_charge(),
-                };
-                PeerStep::then(PeerOutput::End { close: Some(close) })
+                PeerStep::then(PeerOutput::End {
+                    close: Some(Close { reason }),
+                })
             }
             (phase, input) => {
                 unreachable!(

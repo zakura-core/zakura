@@ -3,7 +3,7 @@
 //! Checkers read only the [`ObservationLog`]. Each entry carries the step
 //! that appended it. Step 0 is setup, before the first pick.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::Label;
 
@@ -663,7 +663,7 @@ pub enum StorageFact {
 }
 
 /// A work owner with every field of its typed form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkOwner {
     /// `header`, `body-repair`, or `body` for block sync's body work.
     pub kind: String,
@@ -714,7 +714,7 @@ pub struct BodyScope {
 }
 
 /// A header work scope: a generation and the branch it pursues.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkScope {
     /// The header generation.
     pub header_generation: u64,
@@ -723,7 +723,7 @@ pub struct WorkScope {
 }
 
 /// A branch, by its anchor and target hashes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageBranch {
     /// The anchor's hash.
     pub anchor: String,

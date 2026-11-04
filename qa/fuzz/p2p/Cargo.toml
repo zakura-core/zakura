@@ -26,8 +26,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "block_peer_registry"
+path = "fuzz_targets/block_peer_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cadence"
 path = "fuzz_targets/cadence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_retry_authority"
+path = "fuzz_targets/block_retry_authority.rs"
 test = false
 doc = false
 bench = false

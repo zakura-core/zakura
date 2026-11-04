@@ -39,7 +39,8 @@ use crate::{
 /// submission carries. Version 19 added the runtime object a task's point
 /// touches. Version 20 adds causal inputs and independent state views for
 /// machine steps, tagged by kind. Version 21 adds the transport's
-/// `session-lifecycle` event.
+/// `session-lifecycle` event. Another pure-reactor lane holds version 22, which
+/// adds block ownership and runtime queue funding evidence.
 pub const FORMAT_VERSION: u32 = 21;
 
 /// What records mean: the identity grammar, the default-pick and default-draw

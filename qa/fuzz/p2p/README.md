@@ -12,6 +12,11 @@ below.
 | --- | --- | --- |
 | `service_session` | `session/offer-assembly`, `session/one-active-generation`, `session/legal-reopen` | 1 |
 | `cadence` | `cadence/hold`, `cadence/settlement` | 1 |
+| `block_peer_registry` | `block/peer-registry` | 1 |
+| `block_retry_authority` | `block/retry-authority` | 1 |
+
+`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` model through
+trace and replay, so it needs no target here.
 
 The input decoding, the model and the checks live in `zakura-network` behind the
 `p2p-fuzz` feature, so the machine types stay private to the crate.

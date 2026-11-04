@@ -497,13 +497,17 @@ impl Subsystem for HeaderWire {
     type Prepared = WirePorts;
 
     /// [`wire_config`], with twice its budget for a scenario with status
-    /// bursts: emptying a `Status` bucket takes about 600 frames, and the
-    /// node about 40 steps to read each.
+    /// bursts or an over-credit objects page. Emptying a `Status` bucket
+    /// takes about 600 frames, and the node about 40 steps to read each. The
+    /// node must read the whole 45 KB page before it can count objects, so
+    /// with every datagram delivered at once, that run spends up to about
+    /// 3,500 steps at 0 ns, past the livelock limit of a tenth of the
+    /// budget.
     fn config(scenario: &WireScenario) -> RunConfig {
         let burst = scenario.peers.iter().any(|peer| {
-            peer.script.contains(&PeerAction::Act {
-                act: Act::StatusBurst,
-            })
+            [Act::StatusBurst, Act::OverCreditObjects]
+                .into_iter()
+                .any(|act| peer.script.contains(&PeerAction::Act { act }))
         });
         let config = wire_config();
         RunConfig {

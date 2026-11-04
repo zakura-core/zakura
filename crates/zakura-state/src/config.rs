@@ -52,7 +52,9 @@ pub struct Config {
     ///
     /// The default is 64. Cloned read services share this limit. Excess reads wait
     /// asynchronously before entering Tokio's blocking queue. Cancelling a caller
-    /// does not release a slot while its admitted job still runs.
+    /// does not release a slot while its admitted job still runs. `zakurad` adds
+    /// [`Self::read_worker_count`] blocking threads to Tokio's default pool, so
+    /// admitted reads never take threads from other blocking work.
     ///
     /// This limit covers read-service jobs, including owned block-range reads and
     /// retained header-path acquisition. A separate fixed pool admits bounded
@@ -505,10 +507,6 @@ pub(crate) const MAX_DECODED_BYTES_PER_WIRE_BYTE: u64 = 12;
 /// The decoded memory of one maximum-size block.
 const MAX_DECODED_BLOCK_BYTES: u64 = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
 
-/// The tokio default blocking thread limit, which the node runtime does not change.
-/// A larger worker allowance would queue jobs inside tokio, past their admission.
-const MAX_BLOCKING_READ_WORKERS: u64 = 512;
-
 /// Inbound peers that [`Config::read_result_byte_limit`] serves when no peer limit is known:
 /// `zakura-network`'s default inbound limit, 100 initial target peers × 3.
 pub const DEFAULT_READ_RESULT_PEERS: usize = 300;
@@ -525,12 +523,6 @@ pub const READ_RESULT_BLOCKS_PER_PEER: u64 = 16;
 /// Why a configuration cannot fund its read workers and one legal result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ReadCapacityError {
-    /// Tokio would queue admitted jobs behind its own thread limit.
-    #[error("{workers} read workers exceed the {MAX_BLOCKING_READ_WORKERS} blocking threads")]
-    TooManyWorkers {
-        /// Data and control workers.
-        workers: u64,
-    },
     /// The retained limit cannot hold one decoded maximum-size block.
     #[error("read_result_byte_limit {limit} is below the {required} bytes of one block")]
     ResultLimitTooSmall {
@@ -581,17 +573,20 @@ impl Config {
         })
     }
 
+    /// Blocking jobs one database admits at once: its data workers plus its control
+    /// workers. The runtime must reserve this many blocking threads beyond those that
+    /// other blocking work uses, or admitted jobs queue inside Tokio.
+    pub fn read_worker_count(&self) -> usize {
+        usize::from(self.read_concurrency_limit.get()) + crate::constants::CONTROL_READ_CONCURRENCY
+    }
+
     /// Check that the read limits fund their workers and one legal result, then
     /// return the bytes that bound read memory. Opening a database requires this check.
     ///
     /// Each partition in the sum has its own owner. Durable disk limits are not part of it.
     pub fn read_memory_bound(&self) -> Result<u64, ReadCapacityError> {
-        let workers = u64::from(self.read_concurrency_limit.get())
-            + u64::try_from(crate::constants::CONTROL_READ_CONCURRENCY)
-                .map_err(|_| ReadCapacityError::Overflow)?;
-        if workers > MAX_BLOCKING_READ_WORKERS {
-            return Err(ReadCapacityError::TooManyWorkers { workers });
-        }
+        let workers =
+            u64::try_from(self.read_worker_count()).map_err(|_| ReadCapacityError::Overflow)?;
 
         let result_bytes = self.read_result_byte_limit().get();
         if result_bytes < MAX_DECODED_BLOCK_BYTES {
@@ -701,13 +696,23 @@ mod tests {
 
     #[test]
     fn read_memory_bound_rejects_limits_that_cannot_fund_progress() {
+        // The runtime adds read threads to Tokio's pool, so the worker count has no
+        // thread ceiling: the largest limit only grows the parser term.
+        let decoded_block = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
         let workers = Config {
-            read_concurrency_limit: NonZeroU16::new(509).unwrap(),
+            read_concurrency_limit: NonZeroU16::MAX,
             ..Config::default()
         };
         assert_eq!(
+            workers.read_worker_count(),
+            usize::from(u16::MAX) + crate::constants::CONTROL_READ_CONCURRENCY
+        );
+        assert_eq!(
             workers.read_memory_bound(),
-            Err(ReadCapacityError::TooManyWorkers { workers: 513 })
+            Ok(DEFAULT_READ_RESULT_CEILING_BYTES
+                + (u64::from(u16::MAX) + 4) * (MAX_BLOCK_PARSER_BYTES + decoded_block)
+                + crate::constants::CHAIN_TIP_BLOCK_RETENTION
+                    * (decoded_block + MAX_BLOCK_PARSER_BYTES))
         );
         let result = Config {
             read_result_byte_limit: Some(NonZeroU64::MIN),
@@ -731,6 +736,7 @@ mod tests {
     fn read_limits_have_their_documented_defaults() {
         let config = toml::from_str::<Config>("").unwrap();
         assert_eq!(config.read_concurrency_limit.get(), 64);
+        assert_eq!(config.read_worker_count(), 68);
         assert_eq!(config.read_result_byte_limit, None);
         assert_eq!(
             config.read_result_byte_limit(),

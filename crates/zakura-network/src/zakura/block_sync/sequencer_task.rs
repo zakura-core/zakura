@@ -33,6 +33,7 @@ use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 use super::{
     events::*,
     peer_registry::{retry_deadline_instant, PeerRegistry},
+    reactor::ActionClass,
     reorder::BufferedBlockBody,
     sequencer::*,
     state::*,
@@ -425,6 +426,16 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 }
 
 impl state::SequencerEvidence {
+    /// The [`ActionClass`] of [`Self::into_action`]'s result.
+    fn class(&self) -> ActionClass {
+        match self {
+            Self::RecordBodyUnavailable { .. } | Self::RecordBodyInvalid { .. } => {
+                ActionClass::Required
+            }
+            Self::Misbehavior { .. } => ActionClass::Optional,
+        }
+    }
+
     fn metric_label(&self) -> &'static str {
         match self {
             Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
@@ -918,6 +929,8 @@ impl SequencerIO {
             verified_tip,
         } = acceptance
         {
+            // A refused deferral means a reset or the floor already removed this
+            // exact attempt, so the height has another path to a body.
             self.work
                 .defer_received_for_owner(owner, height, hash, bytes, verified_tip);
             metrics::counter!("sync.block.retention.deferred").increment(1);
@@ -962,8 +975,8 @@ impl SequencerIO {
                     );
                 }
                 SequencerOperation::DeliverEvidence => self.deliver_required_evidence().await,
-                SequencerOperation::SendAction(action) => {
-                    let _ = self.send_action(action.into_action()).await;
+                SequencerOperation::SendAction(evidence) => {
+                    self.send_replaceable_evidence(evidence).await;
                 }
                 SequencerOperation::SubmitPending => self.submit_pending_blocks().await,
             }
@@ -1116,32 +1129,56 @@ impl SequencerIO {
         }
     }
 
+    /// Send a replaceable peer report or record, giving up after the bounded
+    /// action-send timeout.
+    async fn send_replaceable_evidence(&self, evidence: state::SequencerEvidence) {
+        let action_label = evidence.metric_label();
+        let deadline = time::Instant::now() + self.action_send_timeout;
+        match reserve_action(
+            &self.actions,
+            evidence.class(),
+            action_label,
+            Some(deadline),
+        )
+        .await
+        {
+            Some(mut permits) => send_reserved(&mut permits, evidence),
+            None if !self.actions.is_closed() => {
+                metrics::counter!(
+                    "sync.block.action.send_timeout",
+                    "action" => action_label
+                )
+                .increment(1);
+            }
+            None => {}
+        }
+    }
+
     /// Deliver the oldest pending required action once the driver has capacity.
     ///
     /// A bounded timeout is correct for replaceable submissions and telemetry.
     /// It is not correct for deterministic invalidity or the latest retry state.
-    /// Waiting on the bounded channel gives this sender FIFO capacity ahead of
-    /// later peer-serving `try_send` calls. The state keeps the action pending
-    /// until a reserved permit guarantees delivery. A closed receiver leaves this
-    /// future fail-closed with the exact action still pending in the state until
-    /// subsystem supervision cancels the task.
+    /// The state keeps the action pending until a reserved permit guarantees
+    /// delivery. A closed receiver leaves this future fail-closed with the exact
+    /// action still pending in the state until subsystem supervision cancels the
+    /// task.
     async fn deliver_required_evidence(&mut self) {
-        let Some(action_label) = self
+        let Some((action_label, class)) = self
             .state
             .pending_evidence()
-            .map(state::SequencerEvidence::metric_label)
+            .map(|evidence| (evidence.metric_label(), evidence.class()))
         else {
             return;
         };
-        match self.actions.reserve().await {
-            Ok(permit) => {
-                let action = self
+        match reserve_action(&self.actions, class, action_label, None).await {
+            Some(mut permits) => {
+                let evidence = self
                     .state
                     .take_pending_evidence()
                     .expect("pending evidence exists because it was just observed");
-                permit.send(action.into_action());
+                send_reserved(&mut permits, evidence);
             }
-            Err(_) => {
+            None => {
                 metrics::counter!(
                     "sync.block.action.required_receiver_closed",
                     "action" => action_label
@@ -1285,6 +1322,64 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
     strip_rates(a) != strip_rates(b)
 }
 
+/// Reserve action-channel capacity under `class`'s rule. A required action
+/// waits in the channel's FIFO queue, ahead of later peer-serving `try_send`
+/// calls. An optional action polls every [`state::SUBMISSION_RETRY_DELAY`]
+/// instead: a queued reservation would hold the control reserve while it waited
+/// for its second permit. Each refused poll counts against `action_label`.
+/// Returns `None` once the driver closes the channel or `deadline` passes.
+async fn reserve_action<'a>(
+    actions: &'a mpsc::Sender<BlockSyncAction>,
+    class: ActionClass,
+    action_label: &'static str,
+    deadline: Option<time::Instant>,
+) -> Option<mpsc::PermitIterator<'a, BlockSyncAction>> {
+    if class == ActionClass::Required {
+        let reserve = actions.reserve_many(class.permits());
+        return match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(time::Instant::now());
+                time::timeout(remaining, reserve).await.ok()?.ok()
+            }
+            None => reserve.await.ok(),
+        };
+    }
+    loop {
+        match actions.try_reserve_many(class.permits()) {
+            Ok(permits) => return Some(permits),
+            Err(mpsc::error::TrySendError::Closed(())) => return None,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                metrics::counter!(
+                    "sync.block.action.control_capacity_reserved",
+                    "action" => action_label
+                )
+                .increment(1);
+            }
+        }
+        let retry_at = time::Instant::now() + state::SUBMISSION_RETRY_DELAY;
+        match deadline {
+            Some(deadline) if deadline <= time::Instant::now() => return None,
+            Some(deadline) => time::sleep_until(retry_at.min(deadline)).await,
+            None => time::sleep_until(retry_at).await,
+        }
+    }
+}
+
+/// Send `evidence` through one reserved permit. The other permits return to the
+/// channel when `permits` drops.
+fn send_reserved(
+    permits: &mut mpsc::PermitIterator<'_, BlockSyncAction>,
+    evidence: state::SequencerEvidence,
+) {
+    let class = evidence.class();
+    let action = evidence.into_action();
+    debug_assert_eq!(class, ActionClass::of(&action));
+    permits
+        .next()
+        .expect("a reservation holds at least one permit")
+        .send(action);
+}
+
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
@@ -1293,7 +1388,7 @@ mod tests {
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
-    use super::super::tests::genesis_frontiers;
+    use super::super::{reactor::BS_ACTION_CONTROL_RESERVE, tests::genesis_frontiers};
     use super::*;
 
     fn test_view() -> SequencerView {
@@ -1902,7 +1997,7 @@ mod tests {
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
-        let (actions, mut actions_rx) = mpsc::channel(1);
+        let (actions, mut actions_rx) = mpsc::channel(1 + BS_ACTION_CONTROL_RESERVE);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let budget = ByteBudget::new(123);
@@ -1949,14 +2044,16 @@ mod tests {
         };
         let outcome = BlockApplyOutcome::consensus_invalid(invalid.clone());
 
-        action_sender
-            .send(BlockSyncAction::Misbehavior {
-                peer: ZakuraPeerId::new(vec![0xee; 32])
-                    .expect("the filler peer ID has the required length"),
-                reason: BlockSyncMisbehavior::InvalidBlock,
-            })
-            .await
-            .expect("the filler occupies the action channel");
+        for _ in 0..action_sender.max_capacity() {
+            action_sender
+                .send(BlockSyncAction::Misbehavior {
+                    peer: ZakuraPeerId::new(vec![0xee; 32])
+                        .expect("the filler peer ID has the required length"),
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                })
+                .await
+                .expect("the filler occupies the action channel");
+        }
         let completion = tokio::spawn(async move {
             let result = finish_apply(
                 &mut task,
@@ -1980,13 +2077,15 @@ mod tests {
             !completion.is_finished(),
             "invalidity must remain pending after the ordinary action timeout",
         );
-        assert!(matches!(
-            actions_rx.recv().await,
-            Some(BlockSyncAction::Misbehavior {
-                reason: BlockSyncMisbehavior::InvalidBlock,
-                ..
-            })
-        ));
+        for _ in 0..action_sender.max_capacity() {
+            assert!(matches!(
+                actions_rx.recv().await,
+                Some(BlockSyncAction::Misbehavior {
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                    ..
+                })
+            ));
+        }
         assert!(matches!(
             actions_rx.recv().await,
             Some(BlockSyncAction::RecordBodyInvalid {
@@ -2423,26 +2522,30 @@ mod tests {
         }
     }
 
-    /// A tampered body's record waits for a busy driver instead of timing out.
-    /// The height is still reset so another supplier can serve it.
+    /// The reactor can deliver a payload mismatch before the
+    /// `WorkAuthorityRefreshed` of a newer committed view. It judges the
+    /// completion against the authority it last sent here, so the mismatch
+    /// clears the retry state this task holds, and the refresh carries no
+    /// supplier suppression forward.
     #[tokio::test]
-    async fn tampered_body_misbehavior_waits_for_a_busy_driver() {
+    async fn mismatch_before_authority_refresh_leaves_no_supplier_suppressed() {
         let frontiers = genesis_frontiers();
+        let old_authority = super::test_work_scope();
+        let registry = Arc::new(PeerRegistry::new());
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
-        let (actions, mut actions_rx) = mpsc::channel(1);
+        let (actions, mut actions_rx) = mpsc::channel(4);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
-            Arc::new(PeerRegistry::new()),
-            actions.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(123))),
+            registry.clone(),
+            actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
-            Some(super::test_work_scope()),
+            Some(old_authority),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
             std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
@@ -2450,11 +2553,10 @@ mod tests {
             input_bytes.clone(),
             input_decoded_bytes.clone(),
             view_tx,
-            Duration::from_millis(20),
+            Duration::from_secs(1),
             ZakuraTrace::noop(),
             super::test_decoded_pool(),
         );
-
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
         body.leave_queue();
         task.handle_accept_body(body);
@@ -2470,67 +2572,198 @@ mod tests {
         };
         let height = block.coinbase_height().expect("test block has height");
         let hash = block.hash();
-        let busy_peer = ZakuraPeerId::new(vec![7; 32]).expect("test peer ID is valid");
-        actions
-            .send(BlockSyncAction::Misbehavior {
-                peer: busy_peer,
-                reason: BlockSyncMisbehavior::StatusSpam,
-            })
-            .await
-            .expect("the filler action fills the channel");
+        // An earlier unavailable answer deferred another supplier under the old
+        // authority.
+        let deferred = ZakuraPeerId::new(vec![2; 32]).expect("test peer ID is valid");
+        let now = Instant::now();
+        registry.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest(
+                deferred.digest(),
+            )],
+            old_authority,
+            hash,
+            now + Duration::from_secs(60),
+        );
+        let mut refreshed = old_authority;
+        refreshed.header.header_generation = old_authority
+            .header
+            .header_generation
+            .checked_next()
+            .expect("the test generation has a successor");
+
         let mismatch = zakura_header_chain::BodyPayloadMismatch {
-            evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+            evidence: zakura_header_chain::EvidenceId::from_digest([0x82; 32]),
             requested: hash,
-            delivered: hash,
+            delivered: block::Hash([0x83; 32]),
             kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
             source,
         };
         let outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+        let _ = finish_apply(
+            &mut task,
+            owner,
+            source,
+            token,
+            height,
+            hash,
+            outcome,
+            BTreeSet::new(),
+            None,
+            Some((owner, zakura_header_chain::StateVersion::default())),
+            Some(owner.authority.body_work_epoch),
+        )
+        .await;
+        let _ = task
+            .handle_control_input(SequencerControlInput::WorkAuthorityRefreshed {
+                authority: refreshed,
+            })
+            .await;
 
-        let finished = {
-            let finish = finish_apply(
-                &mut task,
+        assert!(
+            !registry.is_body_retry_avoided(&deferred, refreshed, hash, now),
+            "the mismatch reopens the body to every supplier"
+        );
+    }
+
+    /// A Sequencer peer report leaves the control reserve to the reactor. With
+    /// only the reserve free, a tampered body's record waits for the driver and
+    /// a replaceable report times out. The height is still reset so another
+    /// supplier can serve it.
+    #[tokio::test]
+    async fn sequencer_misbehavior_leaves_the_control_reserve() {
+        for kind in [
+            zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+            zakura_header_chain::BodyCommitmentKind::HeaderHash,
+        ] {
+            let tampered = kind.proves_tampered_body();
+            let frontiers = genesis_frontiers();
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(2 + BS_ACTION_CONTROL_RESERVE);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let budget = ByteBudget::new(123);
+            let mut task = SequencerIO::new(
+                Sequencer::new(block::Height(0), 1),
+                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+                Arc::new(PeerRegistry::new()),
+                actions.clone(),
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_millis(20),
+                ZakuraTrace::noop(),
+                super::test_decoded_pool(),
+            );
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
                 owner,
                 source,
                 token,
-                height,
-                hash,
-                outcome,
-                BTreeSet::new(),
-                None,
-                Some((owner, zakura_header_chain::StateVersion::default())),
-                Some(owner.authority.body_work_epoch),
-            );
-            tokio::pin!(finish);
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            // Fill the channel up to the control reserve.
+            let busy_peer = ZakuraPeerId::new(vec![7; 32]).expect("test peer ID is valid");
+            for _ in 0..2 {
+                actions
+                    .try_send(BlockSyncAction::Misbehavior {
+                        peer: busy_peer.clone(),
+                        reason: BlockSyncMisbehavior::StatusSpam,
+                    })
+                    .expect("the filler fits outside the control reserve");
+            }
+            let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+                requested: hash,
+                delivered: hash,
+                kind,
+                source,
+            };
+            let outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+
+            let finished = {
+                let finish = finish_apply(
+                    &mut task,
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    outcome,
+                    BTreeSet::new(),
+                    None,
+                    Some((owner, zakura_header_chain::StateVersion::default())),
+                    Some(owner.authority.body_work_epoch),
+                );
+                tokio::pin!(finish);
+                let early = tokio::time::timeout(Duration::from_millis(100), &mut finish).await;
+                assert_eq!(
+                    early.is_err(),
+                    tampered,
+                    "{kind:?}: only the tampering record outlasts the 20ms send timeout"
+                );
+                assert_eq!(
+                    actions.capacity(),
+                    BS_ACTION_CONTROL_RESERVE,
+                    "{kind:?}: the report left the control reserve free"
+                );
+                drop(
+                    actions
+                        .try_reserve_many(ActionClass::Required.permits())
+                        .expect("a reactor control action still fits"),
+                );
+                for _ in 0..2 {
+                    assert!(matches!(
+                        actions_rx.recv().await,
+                        Some(BlockSyncAction::Misbehavior {
+                            reason: BlockSyncMisbehavior::StatusSpam,
+                            ..
+                        })
+                    ));
+                }
+                match early {
+                    Ok(finished) => finished,
+                    Err(_) => finish.await,
+                }
+            };
+            assert_eq!(finished, (true, true));
+            if tampered {
+                assert!(matches!(
+                    actions_rx.recv().await,
+                    Some(BlockSyncAction::Misbehavior {
+                        peer,
+                        reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+                    }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
+                        && actual == mismatch
+                ));
+            }
             assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut finish)
-                    .await
-                    .is_err(),
-                "the record must outlast the 20ms bounded send timeout"
+                actions_rx.try_recv().is_err(),
+                "{kind:?}: a timed-out replaceable report is dropped"
             );
-            assert!(matches!(
-                actions_rx.recv().await,
-                Some(BlockSyncAction::Misbehavior {
-                    reason: BlockSyncMisbehavior::StatusSpam,
-                    ..
-                })
-            ));
-            finish.await
-        };
-        assert_eq!(finished, (true, true));
-        assert!(matches!(
-            actions_rx.recv().await,
-            Some(BlockSyncAction::Misbehavior {
-                peer,
-                reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
-            }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
-                && actual == mismatch
-        ));
-        assert!(!task.state.sequencer().applying_contains(height));
-        assert!(
-            task.state.sequencer().floor() < height,
-            "the height is requestable again"
-        );
+            assert!(!task.state.sequencer().applying_contains(height));
+            assert!(
+                task.state.sequencer().floor() < height,
+                "the height is requestable again"
+            );
+        }
     }
 
     #[tokio::test]

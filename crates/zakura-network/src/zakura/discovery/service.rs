@@ -3292,6 +3292,79 @@ mod tests {
         Ok(())
     }
 
+    /// A peer that withholds `Hello`, `Peers` and `Services` on a connection
+    /// that another service keeps loses its discovery slot. The session ends
+    /// one refresh interval after the timeout, charged once, and the
+    /// connection stays open.
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_with_a_sibling_owner_loses_its_discovery_slot(
+    ) -> Result<(), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[58u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let peer_id = ZakuraPeerId::new(
+            NodeSecretKey::from_bytes(&[59u8; 32])
+                .public()
+                .as_bytes()
+                .to_vec(),
+        )?;
+        service.set_connection_owners(vec![Arc::new(TestConnectionOwner {
+            peer: peer_id.clone(),
+            conn_id: 0,
+        })]);
+        connected_tx.send_replace(vec![peer_id.clone()]);
+        let connection_cancel = CancellationToken::new();
+
+        // The peer keeps its stream open and never sends a frame.
+        let (_peer_send, service_recv) = framed_channel(16);
+        let (service_send, _peer_recv) = framed_channel(16);
+        service.add_peer(Peer::new(
+            peer_id.clone(),
+            None,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_LEGACY_GOSSIP,
+            HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]),
+            connection_cancel.clone(),
+        ));
+        wait_for_discovery_inbound_peers(&handle, 1).await;
+
+        tokio::time::sleep(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + SEND_INTERVAL + Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            handle.peer_snapshot().inbound_peers,
+            0,
+            "the silent session gives up its slot"
+        );
+        let failed_attempts = service
+            .session_states
+            .lock()
+            .expect("discovery session-state mutex is never poisoned")
+            .records
+            .get(&(peer_id.clone(), 0))
+            .map(|record| record.failed_attempts);
+        assert_eq!(failed_attempts, Some(1));
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "the sibling keeps the connection"
+        );
+        Ok(())
+    }
+
     /// A timed-out session on a shared connection is settled when it ends: it
     /// is charged if the exchange never completed, and resets the count if
     /// the exchange completed late.
@@ -3730,6 +3803,48 @@ mod tests {
         let (io, _states) = test_peer_io(handle, peer_id, send);
         let hello = io.queries.verifying_hello();
         assert_close_held_until_settled(io, hello).await
+    }
+
+    /// A `Hello` that waits for local verification is this node's delay, so a
+    /// timed-out session on a shared connection keeps refreshing, uncharged,
+    /// while it waits. Once the `Hello` settles and the exchange is still
+    /// incomplete, the next refresh ends the session, charged once.
+    #[tokio::test(start_paused = true)]
+    async fn a_hello_in_local_verification_keeps_a_shared_session_uncharged(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(78, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (mut io, states) = test_peer_io(handle.clone(), peer_id.clone(), send);
+        io.connection_owners = vec![Arc::new(TestConnectionOwner {
+            peer: peer_id.clone(),
+            conn_id: 2,
+        })];
+        let key = io.slot.key.clone();
+        let failed_attempts = || {
+            states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned")
+                .records
+                .get(&(peer_id.clone(), 2))
+                .map(|record| record.failed_attempts)
+        };
+        let hello = io.queries.verifying_hello();
+        let session = tokio::spawn(io.run());
+
+        tokio::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + 3 * SEND_INTERVAL).await;
+        assert!(
+            handle.is_current_session(&key).await,
+            "a delivered Hello in verification keeps the session"
+        );
+        assert_eq!(failed_attempts(), Some(0));
+
+        drop(hello);
+        tokio::time::timeout(SEND_INTERVAL + Duration::from_secs(1), session)
+            .await
+            .expect("the next refresh ends the stalled session")?;
+        assert!(!handle.is_current_session(&key).await);
+        assert_eq!(failed_attempts(), Some(1));
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

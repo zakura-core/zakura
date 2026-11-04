@@ -10,7 +10,7 @@ use crate::zakura::{
 use rand_10::Rng;
 use state::{
     admission_decision, block_sync_frontiers, body_completion_authority,
-    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
+    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired,
     AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply, QueryOpening,
     QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts, WorkReads,
 };
@@ -20,6 +20,7 @@ use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod state;
+pub(super) use state::ActionClass;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state::{
     replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
@@ -539,6 +540,7 @@ impl ReactorIO {
                     }
                 }
                 _ = metrics_ticks.tick() => {
+                    self.restart_body_alarm_for_new_supplier();
                     self.query_needed_blocks().await;
                     self.publish_metrics();
                     self.refresh_throughput();
@@ -1244,6 +1246,9 @@ impl ReactorIO {
                 self.handle_status_received(peer, send_reply);
             }
             RoutineToReactor::RequeryNeeded => {
+                // A full channel can drop `StatusReceived`, so the re-query
+                // also checks the alarm for a new supplier.
+                self.restart_body_alarm_for_new_supplier();
                 self.query_needed_blocks().await;
             }
             RoutineToReactor::Misbehavior { peer, reason } => {
@@ -1441,9 +1446,13 @@ impl ReactorIO {
         })
     }
 
-    /// Judges a body completion against the latest committed view, and returns
-    /// that view's body-work epoch. The epoch can be ahead of the last one this
-    /// reactor forwarded to the sequencer.
+    /// Judges a body completion against the committed view whose authority
+    /// this reactor last sent to the Sequencer, and returns that view's
+    /// body-work epoch.
+    ///
+    /// A newer view in the watch is not yet the Sequencer's: judging against it
+    /// would rebase the completion past retry state the Sequencer has not
+    /// rekeyed.
     fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
@@ -1455,15 +1464,10 @@ impl ReactorIO {
         )>,
         Option<zakura_header_chain::BodyWorkEpoch>,
     ) {
-        let current = self
-            .startup
-            .committed_views
-            .as_ref()
-            .and_then(|snapshots| snapshots.borrow().clone());
-        let Some(current) = current else {
+        let Some(current) = self.state.committed_view() else {
             return (None, None);
         };
-        let semantic_completion = body_completion_authority(&current, source, owner)
+        let semantic_completion = body_completion_authority(current, source, owner)
             .inspect_err(|reason| {
                 metrics::counter!(
                     "sync.header_chain.stale_completion.total",
@@ -1791,11 +1795,7 @@ impl ReactorIO {
         // control capacity in one semaphore operation. The Sequencer sends
         // concurrently, so a separate capacity check has a race.
         let class = ActionClass::of(&action);
-        let permits = match class {
-            ActionClass::Required => 1,
-            ActionClass::Optional => BS_ACTION_CONTROL_RESERVE + 1,
-        };
-        let mut permits = match self.actions.try_reserve_many(permits) {
+        let mut permits = match self.actions.try_reserve_many(class.permits()) {
             Ok(permits) => permits,
             Err(mpsc::error::TrySendError::Full(())) => {
                 return Err(match class {

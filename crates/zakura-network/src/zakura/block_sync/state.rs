@@ -535,6 +535,9 @@ pub(super) struct DownloadWindow {
     pub(super) startup_request_cap: usize,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
+    /// Whether the current no-progress episode already spent its one congestion
+    /// grace. Block progress and disarm start a new episode.
+    liveness_grace_used: bool,
     /// Last time this peer was sent a block-body request.
     pub(super) last_request_at: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
@@ -565,6 +568,7 @@ impl DownloadWindow {
                 .unwrap_or(usize::MAX)
                 .max(1),
             block_liveness_deadline: None,
+            liveness_grace_used: false,
             last_request_at: None,
             last_block_at: None,
             requests_without_block_progress: 0,
@@ -885,6 +889,7 @@ impl DownloadWindow {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
         self.outstanding.clear_liveness_charges();
+        self.liveness_grace_used = false;
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
@@ -899,14 +904,20 @@ impl DownloadWindow {
                 (Some(request_at), Some(block_at)) if block_at >= request_at
             )
         {
-            self.block_liveness_deadline = None;
+            self.disarm_liveness();
         }
     }
 
     pub(super) fn clear_liveness_if_idle(&mut self) {
         if self.outstanding.is_empty() {
-            self.block_liveness_deadline = None;
+            self.disarm_liveness();
         }
+    }
+
+    /// End the no-progress episode, so the next one may spend a fresh grace.
+    fn disarm_liveness(&mut self) {
+        self.block_liveness_deadline = None;
+        self.liveness_grace_used = false;
     }
 
     /// Clear the probe streak after we return requests on our own initiative,
@@ -937,9 +948,16 @@ impl DownloadWindow {
     }
 
     /// Give a briefly congested writer time to deliver our queued request before
-    /// parking the peer for not answering it. The caller bounds this grace.
+    /// parking the peer for not answering it. This spends the episode's one grace;
+    /// the caller bounds its length.
     pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
         self.block_liveness_deadline = Some(now + timeout);
+        self.liveness_grace_used = true;
+    }
+
+    /// Whether the current no-progress episode has not yet spent its grace.
+    pub(super) fn liveness_grace_available(&self) -> bool {
+        !self.liveness_grace_used
     }
 
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {

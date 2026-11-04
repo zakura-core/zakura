@@ -28,9 +28,9 @@ pub use tests::{
     SequencerReplaySummary,
 };
 
-/// Delay before retrying a verifier submission that could not enter the shared
-/// action channel.
-const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Delay before retrying a verifier submission or peer report that could not
+/// enter the shared action channel.
+pub(super) const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Payload-free evidence that sequencing policy asks IO to deliver.
 #[derive(Debug)]
@@ -79,7 +79,8 @@ pub(super) enum SequencerOperation {
     },
     /// Wait for action capacity, then deliver the oldest pending required evidence.
     DeliverEvidence,
-    /// Send a replaceable action under the bounded action-send timeout.
+    /// Send a replaceable action under the bounded action-send timeout and
+    /// the action channel's class rule.
     SendAction(SequencerEvidence),
     /// Run one verifier submission pass.
     SubmitPending,

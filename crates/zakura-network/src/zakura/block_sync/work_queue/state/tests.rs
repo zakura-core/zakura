@@ -165,13 +165,13 @@ fn a_competing_receipt_ends_only_a_published_reservation() {
     let mut state = new_state();
     extend(&mut state, authority(0), &[(1, 100)]);
     assert_eq!(
-        state.end_competing_reservation_at_receipt(height(1)),
+        state.end_competing_reservation_at_receipt(height(1), hash(1)),
         None,
         "pending work has no owner"
     );
     let a = take(&mut state, 1, 1, 1, 1);
     assert_eq!(
-        state.end_competing_reservation_at_receipt(height(1)),
+        state.end_competing_reservation_at_receipt(height(1), hash(1)),
         None,
         "a provisional take owns nothing yet"
     );
@@ -179,11 +179,11 @@ fn a_competing_receipt_ends_only_a_published_reservation() {
     assert_eq!(publish(&mut state, &a), 100);
 
     assert_eq!(
-        state.end_competing_reservation_at_receipt(height(1)),
+        state.end_competing_reservation_at_receipt(height(1), hash(1)),
         Some((owner, 100))
     );
     assert_eq!(
-        state.end_competing_reservation_at_receipt(height(1)),
+        state.end_competing_reservation_at_receipt(height(1), hash(1)),
         None,
         "the charge leaves the ledger once"
     );
@@ -194,6 +194,36 @@ fn a_competing_receipt_ends_only_a_published_reservation() {
     assert!(
         wake.revocation,
         "the owner learns that another attempt answered it"
+    );
+}
+
+#[test]
+fn an_old_hash_receipt_keeps_the_reissued_reservation() {
+    // A late body for the pre-reset hash must not end the funding of the
+    // request reissued for the new hash at the same height.
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100)]);
+    let a = take(&mut state, 1, 1, 1, 1);
+    assert_eq!(publish(&mut state, &a), 100);
+
+    let reset = state.reset_above(height(0));
+    assert_eq!(reset.released_bytes, 100);
+    let new_hash = block::Hash([0xee; 32]);
+    let (_, _) = state.extend(authority(1), [(height(1), new_hash, confirmed(100))]);
+    let b = take(&mut state, 1, 1, 2, 1);
+    assert_eq!(publish(&mut state, &b), 100);
+
+    assert_eq!(
+        state.end_competing_reservation_at_receipt(height(1), hash(1)),
+        None,
+        "the old hash names no published request"
+    );
+    assert!(state.is_published_claim(owner_of(&b), heights_of(&b)));
+    assert_eq!(state.reserved_bytes(), 100);
+    assert_eq!(
+        state.end_competing_reservation_at_receipt(height(1), new_hash),
+        Some((owner_of(&b), 100)),
+        "the reissued hash still settles through the competing path"
     );
 }
 

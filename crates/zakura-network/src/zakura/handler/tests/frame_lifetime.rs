@@ -3,7 +3,7 @@
 use super::read_close_cause::Link;
 use super::*;
 use crate::zakura::{
-    legacy_gossip::{LegacyResponseCodec, MSG_RESPONSE_PONG},
+    legacy_gossip::{LegacyResponseCodec, LEGACY_REQUESTS_BUDGET, MSG_RESPONSE_PONG},
     regulation::OutputByteBudget,
     RequestResponseService,
 };
@@ -468,14 +468,16 @@ async fn spawn_request(
 }
 
 /// A peer that stops reading a long response strands at most its kind's
-/// output share. The stalled response holds the whole gate, so the kind's
-/// next response waits, while another kind's response goes out. Ending the
-/// stalled stream returns the share. The test link carries two streams.
+/// output share. The stalled response holds its bytes of the gate, so the kind's
+/// next response, which reserves the whole share, waits, while another kind's
+/// response goes out. Ending the stalled stream returns the share. The test link
+/// carries two streams.
 #[tokio::test]
 async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(), BoxError> {
     const SLOW: Stream = test_stream(910, StreamMode::RequestResponse);
     const FAST: Stream = test_stream(911, StreamMode::RequestResponse);
-    const OUTPUT_SHARE: u64 = 4096;
+    const OUTPUT_SHARE: u64 = 512 * 1024;
+    const RESPONSE_FRAMES: usize = 400;
     // The peer's small stream window stalls a response of 400 frames.
     let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
         stream_receive_window_bytes: 64 * 1024,
@@ -486,8 +488,10 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
     let connection = connection_gates(&[SLOW, FAST], 1 << 20, OUTPUT_SHARE);
     let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(AnsweringRequests {
         streams: [SLOW, FAST],
-        frames: 400,
+        frames: RESPONSE_FRAMES,
     })])?);
+    let response_bytes = u64::try_from(RESPONSE_FRAMES)? * response_frame_bytes(1000);
+    assert!(response_bytes <= OUTPUT_SHARE);
     // The slow kind's gate, over a budget the test reads.
     let slow_output = OutputByteBudget::new(OUTPUT_SHARE)?;
     let slow_gate = FrameGate::over(slow_output.clone());
@@ -500,7 +504,7 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
     )
     .await?;
     timeout(TEST_TIMEOUT, async {
-        while slow_output.granted() == 0 {
+        while slow_output.granted() != response_bytes {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -510,10 +514,14 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
         !stalled.is_finished(),
         "the peer's window stalls the response"
     );
-    assert_eq!(slow_output.granted(), OUTPUT_SHARE, "it strands the share");
+    assert_eq!(
+        slow_output.granted(),
+        response_bytes,
+        "it strands its own bytes"
+    );
 
     assert!(
-        slow_gate.try_admit(1).is_none(),
+        slow_gate.try_admit(OUTPUT_SHARE).is_none(),
         "the kind's next response waits for its gate"
     );
     let (_fast_send, mut fast_recv, fast) = spawn_request(
@@ -525,13 +533,106 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
     )
     .await?;
     let answer = timeout(TEST_TIMEOUT, fast_recv.read_to_end(usize::MAX)).await??;
-    assert_eq!(answer.len(), 400 * 1008, "another kind answers in full");
+    assert_eq!(
+        answer.len(),
+        RESPONSE_FRAMES * 1008,
+        "another kind answers in full"
+    );
     timeout(TEST_TIMEOUT, fast).await??;
 
     stalled_recv.stop(0u32.into())?;
     timeout(TEST_TIMEOUT, stalled).await??;
     assert_eq!(slow_output.granted(), 0);
     assert!(slow_gate.try_admit(OUTPUT_SHARE).is_some());
+    link.close().await;
+    Ok(())
+}
+
+/// A custom kind's request has no derivable bound, so it reserves its whole output
+/// share. A result above the share resets the stream before any write, instead of
+/// going out under a charge of the share while it holds more.
+#[tokio::test]
+async fn an_oversize_custom_result_is_refused_not_charged_its_share() -> Result<(), BoxError> {
+    const CUSTOM: Stream = test_stream(912, StreamMode::RequestResponse);
+    const OTHER: Stream = test_stream(913, StreamMode::RequestResponse);
+    const OUTPUT_SHARE: u64 = 4096;
+    let mut link = Link::connect().await?;
+    let connection = connection_gates(&[CUSTOM, OTHER], 1 << 20, OUTPUT_SHARE);
+    let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(AnsweringRequests {
+        streams: [CUSTOM, OTHER],
+        frames: 400,
+    })])?);
+    let output = OutputByteBudget::new(OUTPUT_SHARE)?;
+    let (_peer_send, mut peer_recv, worker) = spawn_request(
+        &mut link,
+        &connection,
+        &registry,
+        prelude_of(CUSTOM.kind, Some(1)),
+        Some(FrameGate::over(output.clone())),
+    )
+    .await?;
+
+    timeout(TEST_TIMEOUT, worker).await??;
+    assert!(
+        timeout(TEST_TIMEOUT, peer_recv.read_to_end(usize::MAX))
+            .await?
+            .is_err(),
+        "the worker resets the stream instead of writing the result"
+    );
+    assert_eq!(output.granted(), 0);
+    link.close().await;
+    Ok(())
+}
+
+/// Cancelling the connection ends a response whose write waits on the peer's
+/// send credit, and returns its output grant, long before the write timeout.
+/// Teardown's drain then doesn't wait on the peer.
+#[tokio::test]
+async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(), BoxError> {
+    const SLOW: Stream = test_stream(912, StreamMode::RequestResponse);
+    const OTHER: Stream = test_stream(913, StreamMode::RequestResponse);
+    // The peer's small stream window stalls a response of 400 frames.
+    let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
+        stream_receive_window_bytes: 64 * 1024,
+        receive_window_bytes: 128 * 1024,
+        ..QuicConfig::default()
+    });
+    let mut link = Link::connect_with(peer).await?;
+    let connection = connection_gates(&[SLOW, OTHER], 1 << 20, 1 << 20);
+    let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(AnsweringRequests {
+        streams: [SLOW, OTHER],
+        frames: 400,
+    })])?);
+    let output = OutputByteBudget::new(1 << 20)?;
+    let mut context = tabled_context(None, 128);
+    context.resources = stream_of(&connection, SLOW.kind);
+    context.resources.output = FrameGate::over(output.clone());
+    let cancel = context.connection_token.clone();
+    let (_peer_send, _peer_recv, send, recv) = link.open(&frame_bytes(1, 16)).await?;
+    let worker = AbortOnDropHandle::new(tokio::spawn(request_stream_worker(
+        send,
+        recv,
+        prelude_of(SLOW.kind, Some(1)),
+        context,
+        registry,
+    )));
+    timeout(TEST_TIMEOUT, async {
+        while output.granted() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(HELD).await;
+    assert!(
+        !worker.is_finished(),
+        "the peer's window stalls the response"
+    );
+
+    cancel.cancel();
+    timeout(HELD, worker)
+        .await
+        .map_err(|_| "cancellation ends the stalled write")??;
+    assert_eq!(output.granted(), 0);
     link.close().await;
     Ok(())
 }
@@ -630,6 +731,17 @@ impl LegacyRequests {
         message_type: u16,
         payload: Vec<u8>,
     ) -> Result<(AbortOnDropHandle<()>, CancellationToken), BoxError> {
+        self.start_capped(message_type, payload, 1024).await
+    }
+
+    /// Start a worker for this request whose peer accepts response frames of at most
+    /// `frame_cap` bytes.
+    async fn start_capped(
+        &mut self,
+        message_type: u16,
+        payload: Vec<u8>,
+        frame_cap: u32,
+    ) -> Result<(AbortOnDropHandle<()>, CancellationToken), BoxError> {
         let frame = Frame {
             message_type,
             flags: 0,
@@ -640,6 +752,7 @@ impl LegacyRequests {
         let mut context = tabled_context(None, 128);
         context.resources.raw = self.raw.clone();
         context.resources.output = self.output_gate();
+        context.outbound_frame_cap = frame_cap;
         let cancel = context.connection_token.clone();
         let worker = AbortOnDropHandle::new(tokio::spawn(request_stream_worker(
             send,
@@ -699,7 +812,9 @@ fn one_block_bound() -> ResponseBound {
         &frame,
         test_connection_limits(),
         1024,
+        u64::MAX,
     )
+    .expect("an unlimited gate fits every bound")
 }
 
 fn pong() -> Vec<Frame> {
@@ -837,6 +952,120 @@ async fn cancelling_a_request_returns_its_reservation() -> Result<(), BoxError> 
     Ok(())
 }
 
+/// A peer's small frame cap does not shrink a request's reservation. The mempool
+/// encoder builds its whole one-frame answer before any write checks the cap, so
+/// the call runs under the request's full bound, and a gate that cannot hold that
+/// bound refuses the request before its service runs.
+#[tokio::test]
+async fn a_small_frame_cap_request_funds_its_full_bound_before_the_service() -> Result<(), BoxError>
+{
+    const SMALL_CAP: u32 = 64;
+    let request = Frame {
+        message_type: LEGACY_REQUEST_MEMPOOL_TRANSACTION_IDS,
+        flags: 0,
+        payload: Vec::new(),
+    };
+    let bound = response_bound(
+        LEGACY_REQUEST_STREAM_KIND,
+        &request,
+        test_connection_limits(),
+        SMALL_CAP,
+        u64::MAX,
+    )
+    .ok_or("an unlimited gate fits every bound")?;
+    assert!(
+        bound.bytes > u64::from(SMALL_CAP),
+        "the bound ignores the cap"
+    );
+
+    let mut requests = LegacyRequests::connect(8 << 20, Vec::new()).await?;
+    let (worker, _cancel) = requests
+        .start_capped(
+            LEGACY_REQUEST_MEMPOOL_TRANSACTION_IDS,
+            Vec::new(),
+            SMALL_CAP,
+        )
+        .await?;
+    requests.until_calls(1).await?;
+    assert_eq!(
+        requests.output.granted(),
+        bound.bytes,
+        "the call runs under the full bound"
+    );
+    requests.release.add_permits(1);
+    timeout(TEST_TIMEOUT, worker).await??;
+    assert_eq!(requests.output.granted(), 0);
+    requests.link.close().await;
+
+    let mut requests = LegacyRequests::connect(bound.bytes - 1, Vec::new()).await?;
+    let (worker, _cancel) = requests
+        .start_capped(
+            LEGACY_REQUEST_MEMPOOL_TRANSACTION_IDS,
+            Vec::new(),
+            SMALL_CAP,
+        )
+        .await?;
+    timeout(TEST_TIMEOUT, worker).await??;
+    assert_eq!(
+        requests.calls(),
+        0,
+        "a gate below the bound refuses the call"
+    );
+    assert_eq!(requests.output.granted(), 0);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    requests.link.close().await;
+    Ok(())
+}
+
+/// A peer's tiny frame cap would split one block into a frame per object byte. The
+/// bound counts each frame's overhead, so it exceeds the kind's output share, and
+/// the request is refused before its service runs.
+#[tokio::test]
+async fn a_tiny_frame_cap_block_request_is_refused_before_its_service() -> Result<(), BoxError> {
+    // A frame header, a response chunk header, and one object byte.
+    const TINY_CAP: u32 = 18;
+    let share = LEGACY_REQUESTS_BUDGET.output;
+    let request = Frame {
+        message_type: LEGACY_REQUEST_BLOCKS_BY_HASH,
+        flags: 0,
+        payload: one_block_request(),
+    };
+    let limits = test_connection_limits();
+    let unlimited = response_bound(
+        LEGACY_REQUEST_STREAM_KIND,
+        &request,
+        limits,
+        TINY_CAP,
+        u64::MAX,
+    )
+    .ok_or("an unlimited gate fits every bound")?;
+    assert!(
+        unlimited.bytes > share,
+        "the frames' overhead exceeds the share"
+    );
+    assert_eq!(
+        response_bound(
+            LEGACY_REQUEST_STREAM_KIND,
+            &request,
+            limits,
+            TINY_CAP,
+            share
+        ),
+        None
+    );
+
+    let mut requests = LegacyRequests::connect(share, Vec::new()).await?;
+    let (worker, _cancel) = requests
+        .start_capped(LEGACY_REQUEST_BLOCKS_BY_HASH, one_block_request(), TINY_CAP)
+        .await?;
+    timeout(TEST_TIMEOUT, worker).await??;
+    assert_eq!(requests.calls(), 0, "the service never runs");
+    assert_eq!(requests.output.granted(), 0);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    requests.link.close().await;
+    Ok(())
+}
+
 /// Each kind reserves from its own limit. Small kinds stay small, and a request with
 /// no derivable limit gets the compatibility response cap.
 #[test]
@@ -849,7 +1078,8 @@ fn each_request_kind_reserves_its_own_bound() {
             flags: 0,
             payload,
         };
-        response_bound(kind, &frame, limits, CAP)
+        response_bound(kind, &frame, limits, CAP, u64::MAX)
+            .expect("an unlimited gate fits every bound")
     };
     let legacy = |message_type, payload| bound(LEGACY_REQUEST_STREAM_KIND, message_type, payload);
     let hashes = |count: u8| {
@@ -860,16 +1090,25 @@ fn each_request_kind_reserves_its_own_bound() {
     let max = ResponseBound::MAX;
 
     for small in [LEGACY_REQUEST_PING, LEGACY_REQUEST_PUSH_TRANSACTION] {
-        assert_eq!(legacy(small, Vec::new()), ResponseBound { bytes: 16 });
+        assert_eq!(
+            legacy(small, Vec::new()),
+            ResponseBound {
+                bytes: response_frame_bytes(8)
+            }
+        );
     }
     let hashes_bound = legacy(LEGACY_REQUEST_FIND_BLOCKS, Vec::new());
-    assert!(hashes_bound.bytes <= 17 + 500 * 32 + 8);
+    assert!(hashes_bound.bytes <= response_frame_bytes(17 + 500 * 32));
     for one_frame in [
         LEGACY_REQUEST_FIND_HEADERS,
         LEGACY_REQUEST_MEMPOOL_TRANSACTION_IDS,
     ] {
         let bound = legacy(one_frame, Vec::new());
-        assert!(bound.bytes <= u64::from(CAP));
+        assert!(
+            bound.bytes > u64::from(CAP),
+            "a one-frame bound ignores the frame cap"
+        );
+        assert!(bound.bytes <= response_frame_bytes(8 + MAX_PROTOCOL_MESSAGE_LEN));
     }
 
     let one_block = legacy(LEGACY_REQUEST_BLOCKS_BY_HASH, hashes(1));
@@ -891,7 +1130,13 @@ fn the_bound_covers_an_encoded_response_under_small_caps() -> Result<(), BoxErro
     let block: Arc<Block> =
         Arc::new(zakura_test::vectors::BLOCK_TESTNET_141042_BYTES.zcash_deserialize_into()?);
     let transaction = UnminedTx::from(block.transactions[0].clone());
-    for (frame_cap, message_cap) in [(1 << 20, 4 << 20), (1 << 20, 64), (64, 1 << 20), (64, 64)] {
+    for (frame_cap, message_cap) in [
+        (1 << 20, 4 << 20),
+        (1 << 20, 64),
+        (64, 1 << 20),
+        (64, 64),
+        (32, 1 << 20),
+    ] {
         let mut limits = test_connection_limits();
         limits.max_message_bytes = message_cap;
         let mut transaction_request = vec![1];
@@ -921,11 +1166,18 @@ fn the_bound_covers_an_encoded_response_under_small_caps() -> Result<(), BoxErro
                 flags: 0,
                 payload,
             };
-            let bound = response_bound(LEGACY_REQUEST_STREAM_KIND, &frame, limits, frame_cap);
+            let bound = response_bound(
+                LEGACY_REQUEST_STREAM_KIND,
+                &frame,
+                limits,
+                frame_cap,
+                u64::MAX,
+            )
+            .ok_or("an unlimited gate fits every bound")?;
             let frames = LegacyResponseCodec::encode_response(7, response, frame_cap, message_cap)?;
             let bytes: u64 = frames
                 .iter()
-                .map(|frame| frame_wire_bytes(frame.payload.len()))
+                .map(|frame| response_frame_bytes(frame.payload.len()))
                 .sum();
             assert!(
                 bytes <= bound.bytes,

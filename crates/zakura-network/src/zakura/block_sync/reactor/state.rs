@@ -128,6 +128,7 @@ impl ReactorState {
     /// Retire the query state for a reset to the verified `tip`.
     pub(super) fn reset_queries(&mut self, tip: block::Height) -> ReactorTransition {
         self.queries.clear();
+        self.queries.end_hint_refresh();
         ReactorTransition::TipReset { tip }
     }
 
@@ -239,10 +240,15 @@ impl ReactorState {
     /// The mirrors change on every view. The expensive reaction runs only when
     /// `reaction_epoch` advances. A destructive reset also clears the pending
     /// query, whose bounds predate the reset, so the reaction must force a refill.
+    /// A reset or a retreating download floor ends the hint refresh: the
+    /// Sequencer dropped the queued work it covers.
     pub(super) fn observe_view(&mut self, view: SequencerView) -> ViewReaction {
         let reset = view.reset_epoch != self.progress.last_reset_epoch;
         let react = view.reaction_epoch != self.progress.last_reaction_epoch;
         let tip_advanced = view.verified_tip > self.progress.verified_block_tip;
+        if view.download_floor < self.progress.request_floor {
+            self.queries.end_hint_refresh();
+        }
 
         if view.verified_tip > block::Height(0) {
             self.bootstrap.start_body_sync();
@@ -256,6 +262,7 @@ impl ReactorState {
         if reset {
             self.progress.last_reset_epoch = view.reset_epoch;
             self.queries.clear();
+            self.queries.end_hint_refresh();
         }
         ViewReaction::React {
             reset,
@@ -1132,6 +1139,9 @@ impl ReactorState {
             old_hint_revision.is_some() && self.queries.pending().is_some();
         let hints = match old_hint_revision {
             None => HintUpdate::Unchanged,
+            // The Sequencer resets the queued work, and the forced refill reads
+            // current sizes, so a refresh would scan work about to be dropped.
+            Some(_) if body_work_epoch_changed => HintUpdate::Unchanged,
             Some(old_revision) => {
                 // An older query can carry sizes from before this correction.
                 self.queries.clear();
@@ -1444,9 +1454,10 @@ impl StatusSchedule {
 
 // ---- action classes ----
 
-/// How much action-channel capacity an action may use.
+/// How much action-channel capacity an action may use. The reactor and the
+/// Sequencer both send on the channel, so both apply this rule.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum ActionClass {
+pub(in crate::zakura::block_sync) enum ActionClass {
     /// Reactor control: needed-block queries and body-availability requests.
     /// It may use the protected control reserve.
     Required,
@@ -1455,11 +1466,21 @@ pub(super) enum ActionClass {
 }
 
 impl ActionClass {
-    pub(super) fn of(action: &BlockSyncAction) -> Self {
+    pub(in crate::zakura::block_sync) fn of(action: &BlockSyncAction) -> Self {
         if matches!(action, BlockSyncAction::Misbehavior { .. }) {
             Self::Optional
         } else {
             Self::Required
+        }
+    }
+
+    /// Permits to take in one semaphore operation. An optional action also
+    /// takes the control reserve, which returns to the channel when the unused
+    /// permits drop.
+    pub(in crate::zakura::block_sync) fn permits(self) -> usize {
+        match self {
+            Self::Required => 1,
+            Self::Optional => super::BS_ACTION_CONTROL_RESERVE + 1,
         }
     }
 }

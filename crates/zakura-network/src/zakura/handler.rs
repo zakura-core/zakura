@@ -59,11 +59,12 @@ use super::peer_memory::{
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
-    frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
-    CompatResponseGrant, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
-    NodeResources, OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerGuard,
-    OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout, StreamResources,
-    TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
+    worker_framed_channel, AdmittedFrame, CompatResponseGrant, ConnectionResources, FrameGate,
+    FrameGrant, FramedWorkerRecv, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause,
+    OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope,
+    SessionLayout, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
+    COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -418,22 +419,19 @@ impl ZakuraConfig {
     ///
     /// The five native reactors take their receive shares from their own
     /// budgets ([`Self::reactor_shares`]). Any other stream kind receives one
-    /// stream window ([`ReactorShares::from_quic`]). A frame above its share
-    /// would take the whole share and be charged less than it holds, so the
-    /// endpoint would refuse to start.
+    /// stream window ([`ReactorShares::from_quic`]). This applies endpoint
+    /// startup's share check, at one stream window, to block sync's stream.
+    /// Startup checks every registered kind again.
     pub fn validate_stream_receive_window(&self) -> Result<(), zakura_quic::ConfigError> {
-        let largest = super::block_sync::MAX_BS_FRAME_BYTES.min(super::LOCAL_MAX_MESSAGE_BYTES);
-        let window = self.quic.stream_receive_window_bytes;
-        if window < largest {
-            return Err(zakura_quic::ConfigError {
-                key: "stream_receive_window_bytes",
-                reason: format!(
-                    "{window} can't hold the largest native frame of {largest} bytes; \
-                     each native stream kind receives at most one stream window"
-                ),
-            });
-        }
-        Ok(())
+        check_reactor_shares(
+            &ReactorShares::from_quic(&self.quic),
+            super::block_sync::BLOCK_SYNC_SERVICE_STREAMS,
+            super::LOCAL_MAX_MESSAGE_BYTES,
+        )
+        .map_err(|error| zakura_quic::ConfigError {
+            key: "stream_receive_window_bytes",
+            reason: format!("{error}; a stream window must hold the largest native frame"),
+        })
     }
 
     /// Return the effective per-IP admission cap, preserving a non-zero limit.
@@ -782,7 +780,10 @@ impl ZakuraLocalLimits {
             }
         });
         let compat_exchange_bytes = if kinds.contains(&LEGACY_REQUEST_STREAM_KIND) {
-            COMPAT_EXCHANGE_BUDGET.receive
+            // Widening usize to u64 is lossless on supported targets.
+            COMPAT_EXCHANGE_BUDGET
+                .receive
+                .saturating_mul(super::legacy_gossip::LEGACY_CLIENT_REQUEST_SLOTS as u64)
         } else {
             0
         };
@@ -1536,7 +1537,8 @@ impl ZakuraPeerHandle {
     /// Open a request stream, write one frame, then return the response frames from the same stream.
     ///
     /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned value
-    /// funds its frames until it drops.
+    /// funds its frames until it drops. The node's resource envelope counts the
+    /// compatibility client's requests, so another caller bounds the values it keeps.
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -2660,6 +2662,14 @@ pub(crate) fn service_registry(
     ))
 }
 
+/// Every stream that `registry`'s services serve.
+fn registry_streams(registry: &ServiceRegistry) -> impl Iterator<Item = Stream> + '_ {
+    registry
+        .services()
+        .iter()
+        .flat_map(|service| service.streams().iter().copied())
+}
+
 /// zakura-quic acceptor for the Zakura `p2p-v2/3` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
@@ -2763,10 +2773,7 @@ impl ZakuraProtocolHandler {
         let envelope = limits.resource_envelope(&registry);
         let resources = NodeResources::new(
             limits.reactor_shares(),
-            registry
-                .services()
-                .iter()
-                .flat_map(|service| service.streams().iter().copied()),
+            registry_streams(&registry),
             limits.max_frame_bytes,
         );
         debug!(
@@ -3650,33 +3657,9 @@ impl ZakuraProtocolHandler {
         connection_token.cancel();
         drop(incoming_setup);
         drop(pending_sessions);
-        while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
-            .await
-            .ok()
-            .flatten()
-        {
-            if let Err(error) = joined {
-                debug!(?error, "Zakura stream worker failed during shutdown");
-            }
-        }
-        // The drain joined every worker only if it ended on an empty set
-        // rather than on its timeout.
-        #[cfg(any(test, zakura_sim))]
-        let drained = workers.is_empty();
-        workers.abort_all();
-        // An aborted worker keeps its owners until its task actually ends.
-        // Settle them before this connection returns its admission slot, so a
-        // replacement does not run beside the old generation's stream owners.
-        // The wait is bounded: a task that yields to no abort within the timeout
-        // cannot hold the slot, and the owner ledger keeps counting its owners.
-        while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
-            .await
-            .ok()
-            .flatten()
-        {
-            if let Err(error) = joined {
-                debug!(?error, "aborted Zakura stream worker ended");
-            }
+        let drained = drain_stream_workers(&mut workers).await;
+        if !drained {
+            debug!("aborted Zakura stream workers that outlasted the teardown drain");
         }
         self.resources.report_usage(limits_owner_bound);
         cleanup_guard.cleanup_registered_peer().await;
@@ -4640,14 +4623,6 @@ async fn spawn_zakura_endpoint_inner(
     );
     validate_idle_invariant(&limits)?;
     let discovery_secret_key = secret_key.clone();
-    // Bind a fixed address when configured so this node has a stable, advertisable
-    // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
-    // case does not expose the native P2P_V2_ALPN surface on all interfaces.
-    let quic = QuicEndpoint::bind(
-        secret_key,
-        &limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr)),
-        &limits.quic,
-    )?;
     let supervisor = match peer_registry {
         Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
             config.zakura.max_connections_per_ip(),
@@ -4788,8 +4763,27 @@ async fn spawn_zakura_endpoint_inner(
         service_demand.clone(),
         custom_services,
     );
-    let registry = match registry {
-        Ok(registry) => registry,
+    // Refuse shares that can't hold a registered frame before binding, so the
+    // handler's assertion of the same rule (`NodeResources::new`) can't stop
+    // startup. Bind a fixed
+    // address when configured so this node has a stable, advertisable Zakura
+    // endpoint; otherwise bind loopback-only so the unset (dial-out-only) case
+    // does not expose the native P2P_V2_ALPN surface on all interfaces.
+    let bound = registry.and_then(|registry| {
+        check_reactor_shares(
+            &limits.reactor_shares(),
+            registry_streams(&registry),
+            limits.max_frame_bytes,
+        )?;
+        let quic = QuicEndpoint::bind(
+            secret_key,
+            &limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr)),
+            &limits.quic,
+        )?;
+        Ok((registry, quic))
+    });
+    let (registry, quic) = match bound {
+        Ok(bound) => bound,
         Err(error) => {
             header_sync_shutdown.cancel();
             return Err(error);
@@ -5754,12 +5748,20 @@ async fn request_stream_worker(
     // Fund the whole response before the service runs, so a full output gate stops
     // the request here and no result waits unfunded. The stream's permit and
     // the raw frame's grant stay held during this wait.
-    let bound = response_bound(
+    let Some(bound) = response_bound(
         prelude.stream_kind,
         &frame,
         context.limits,
         response_frame_cap,
-    );
+        context.resources.output.capacity(),
+    ) else {
+        debug!(
+            response_frame_cap,
+            "Zakura request needs more output than its kind's gate holds"
+        );
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+        return;
+    };
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
@@ -5806,10 +5808,10 @@ async fn request_stream_worker(
     // The result is the worker's own retained memory, and `output` funds it through
     // the write from its kind's output gate. A result above its bound has no
     // funding, so it never reaches the write. The bytes the service did not use
-    // return to the gate now. A bound above the gate takes the whole gate, so one
-    // stalled response strands at most its kind's output share.
+    // return to the gate now. No bound exceeds the gate, so one stalled response
+    // strands at most its kind's output share.
     let result_bytes = response_frames.iter().fold(0, |bytes: u64, frame| {
-        bytes.saturating_add(frame_wire_bytes(frame.payload.len()))
+        bytes.saturating_add(response_frame_bytes(frame.payload.len()))
     });
     if result_bytes > bound.bytes {
         debug!(
@@ -5822,9 +5824,19 @@ async fn request_stream_worker(
     }
     output.shrink_to(result_bytes);
     for frame in response_frames {
-        if let Err(error) =
-            write_response_frame(&mut send, frame, context.limits, response_frame_cap).await
-        {
+        // Each write can wait on the peer's send credit, so it ends with the
+        // connection instead of holding teardown's drain.
+        let written = zakura_rt::select! {
+            biased;
+            _ = context.connection_token.cancelled() => return,
+            written = write_response_frame(
+                &mut send,
+                frame,
+                context.limits,
+                response_frame_cap,
+            ) => written,
+        };
+        if let Err(error) = written {
             debug!(?error, "failed to write Zakura request response frame");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
             return;
@@ -5832,6 +5844,42 @@ async fn request_stream_worker(
     }
 
     let _ = send.finish();
+}
+
+/// Waits for `workers` to end, then aborts the rest and waits for those to
+/// end. Returns whether every worker ended before the abort.
+///
+/// An aborted worker keeps its owners until its task actually ends. Teardown
+/// settles them before its connection returns its admission slot, so a
+/// replacement does not run beside the old generation's stream owners. Each
+/// wait has one deadline, [`STREAM_WORKER_DRAIN_TIMEOUT`] after it starts, so
+/// workers that end one after another can't extend it. A task that yields to
+/// no abort within the timeout cannot hold the slot, and the owner ledger
+/// keeps counting its owners.
+async fn drain_stream_workers(workers: &mut JoinSet<()>) -> bool {
+    join_stream_workers(workers, "Zakura stream worker failed during shutdown").await;
+    let drained = workers.is_empty();
+    workers.abort_all();
+    join_stream_workers(workers, "aborted Zakura stream worker ended").await;
+    drained
+}
+
+/// Joins `workers` until none is left or [`STREAM_WORKER_DRAIN_TIMEOUT`]
+/// passes, logging each failed worker with `failure`.
+async fn join_stream_workers(workers: &mut JoinSet<()>, failure: &'static str) {
+    let deadline = Instant::now() + STREAM_WORKER_DRAIN_TIMEOUT;
+    while let Some(joined) = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        workers.join_next(),
+    )
+    .await
+    .ok()
+    .flatten()
+    {
+        if let Err(error) = joined {
+            debug!(?error, "{failure}");
+        }
+    }
 }
 
 async fn freshness_reaper(mut freshness_rx: watch::Receiver<Instant>, idle_timeout: Duration) {
@@ -6455,16 +6503,13 @@ impl LegacyResponseBudget {
     /// The output the local responder can need for this request.
     ///
     /// This differs from the budget's own byte limit, which checks a peer's
-    /// response. A peer negotiates the caps here, so this limit charges every chunk's
-    /// headers and never trusts a small message cap to make a response small.
+    /// response. A peer negotiates the caps here, so this limit charges every
+    /// frame's overhead and never trusts a small cap to make a response small. A
+    /// one-frame response's encoder builds its whole payload before any write
+    /// checks the frame cap, so its bound ignores that cap.
     fn response_bound(&self, max_frame_bytes: u32) -> ResponseBound {
-        // Widening u32 to usize is lossless on supported targets.
-        let frame_payload_bytes = (max_frame_bytes as usize).saturating_sub(FRAME_HEADER_BYTES);
         let one_frame = |payload_bytes: usize| ResponseBound {
-            // Widening usize to u64 is lossless on supported targets.
-            bytes: payload_bytes
-                .min(frame_payload_bytes)
-                .saturating_add(FRAME_HEADER_BYTES) as u64,
+            bytes: response_frame_bytes(payload_bytes),
         };
         match self.kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
@@ -6495,6 +6540,8 @@ impl LegacyResponseBudget {
     /// entry that is smaller than that. All missing entries share one more frame.
     /// The encoder refuses a response above the aggregate cap, and each frame it
     /// emits within that cap carries at least one object byte after its chunk header.
+    /// An object's last frame can be partial, so the objects within the cap fill at
+    /// most one frame per `chunk_bytes`, plus one partial frame per item.
     fn inventory_bound(&self, chunk_bytes: usize) -> ResponseBound {
         let chunks_per_item = MAX_PROTOCOL_MESSAGE_LEN.div_ceil(chunk_bytes);
         let item_payload_bytes = MAX_PROTOCOL_MESSAGE_LEN
@@ -6507,19 +6554,27 @@ impl LegacyResponseBudget {
             .min(COMPAT_RESPONSE_MAX_AGGREGATE_BYTES);
         let most_frames = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES
             / LEGACY_RESPONSE_CHUNK_HEADER_BYTES.saturating_add(1);
+        let filled_frames =
+            (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / chunk_bytes).saturating_add(self.max_items);
         let frames = self
             .max_items
             .saturating_mul(chunks_per_item)
+            .min(filled_frames)
             .min(most_frames)
             .saturating_add(1);
         ResponseBound {
             // Widening usize to u64 is lossless on supported targets.
-            bytes: payload_bytes.saturating_add(frames.saturating_mul(FRAME_HEADER_BYTES)) as u64,
+            bytes: payload_bytes
+                .saturating_add(frames.saturating_mul(RESPONSE_FRAME_OVERHEAD_BYTES))
+                as u64,
         }
     }
 
-    /// The bytes one exchange under this budget retains at its peak: its frames,
-    /// plus the validator's and the decoder's reassembly copies of one object.
+    /// The serialized bytes one exchange under this budget charges: its frames, plus
+    /// the validator's and the decoder's reassembly copies of one object.
+    ///
+    /// The charge lasts until the requester hands the decoded response to its caller.
+    /// A decoded object larger than its encoding is outside it.
     fn retained_bytes(&self) -> u64 {
         let copies = match self.kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
@@ -6536,10 +6591,24 @@ impl LegacyResponseBudget {
     }
 }
 
+/// The memory one queued response frame holds beyond its payload: its wire header,
+/// plus two slots in the response's `Vec<Frame>`, each of which owns a payload's
+/// vector. A growing vector can hold as many spare slots as filled ones.
+///
+/// A small frame cap splits a response into many frames, and each frame's slot
+/// exists before the first write, so a response bound counts it per frame.
+const RESPONSE_FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 2 * std::mem::size_of::<Frame>();
+
+/// The output one queued response frame with `payload_len` payload bytes needs.
+fn response_frame_bytes(payload_len: usize) -> u64 {
+    // Widening usize to u64 is lossless on supported targets.
+    payload_len.saturating_add(RESPONSE_FRAME_OVERHEAD_BYTES) as u64
+}
+
 /// The most output one response to a request can need.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ResponseBound {
-    /// Wire bytes, including each frame's header.
+    /// Payload bytes, plus each frame's [`RESPONSE_FRAME_OVERHEAD_BYTES`].
     bytes: u64,
 }
 
@@ -6552,23 +6621,31 @@ impl ResponseBound {
     };
 }
 
-/// The most output this service's response to `frame` can need under these caps.
+/// The most output this service's response to `frame` can need under these caps,
+/// or `None` if that exceeds its kind's output gate of `gate_bytes`.
 ///
-/// A request that the legacy budget cannot parse gets [`ResponseBound::MAX`], so the
-/// service stays the one owner that rejects it.
+/// A response with no derivable limit gets [`ResponseBound::MAX`], or the whole gate
+/// if that is smaller, so the worker refuses a larger result instead of charging it
+/// less than it holds. A request that the legacy budget cannot parse gets that bound
+/// too, so the service stays the one owner that rejects it.
 fn response_bound(
     stream_kind: u16,
     frame: &Frame,
     limits: ZakuraConnectionLimits,
     max_frame_bytes: u32,
-) -> ResponseBound {
+    gate_bytes: u64,
+) -> Option<ResponseBound> {
+    let underived = ResponseBound {
+        bytes: ResponseBound::MAX.bytes.min(gate_bytes),
+    };
     if stream_kind != LEGACY_REQUEST_STREAM_KIND {
-        return ResponseBound::MAX;
+        return Some(underived);
     }
-    LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
-        .map_or(ResponseBound::MAX, |budget| {
-            budget.response_bound(max_frame_bytes)
-        })
+    let Ok(budget) = LegacyResponseBudget::from_request(frame.message_type, &frame.payload, limits)
+    else {
+        return Some(underived);
+    };
+    Some(budget.response_bound(max_frame_bytes)).filter(|bound| bound.bytes <= gate_bytes)
 }
 
 #[derive(Debug)]
@@ -8797,6 +8874,42 @@ mod tests {
         assert!(should_run_freshness_reaper(0, 0));
     }
 
+    /// Teardown's drain has one deadline for each wait. Workers that ignore
+    /// cancellation and end one after another, each before a fresh
+    /// per-worker timeout would fire, can't hold the connection's admission
+    /// permit past twice the drain timeout, however many there are.
+    #[tokio::test(start_paused = true)]
+    async fn trickling_workers_cannot_extend_the_teardown_drain() {
+        let step = STREAM_WORKER_DRAIN_TIMEOUT * 9 / 10;
+        for count in [4, 64] {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission
+                .clone()
+                .try_acquire_owned()
+                .expect("the test takes the only permit");
+            let mut workers = JoinSet::new();
+            for worker in 1..=count {
+                workers.spawn(zakura_rt::time::sleep(step * worker));
+            }
+            let cancelled = Instant::now();
+            let teardown = tokio::spawn(async move {
+                let drained = drain_stream_workers(&mut workers).await;
+                drop(permit);
+                (drained, workers.len())
+            });
+
+            let _returned = admission.acquire().await.expect("the test never closes it");
+            let held = cancelled.elapsed();
+            assert!(
+                held <= 2 * STREAM_WORKER_DRAIN_TIMEOUT,
+                "{count} trickling workers held the admission permit for {held:?}"
+            );
+            let (drained, left) = teardown.await.expect("the teardown task never panics");
+            assert!(!drained, "the later workers outlast the first wait");
+            assert_eq!(left, 0, "the abort ends every sleeping worker");
+        }
+    }
+
     #[tokio::test]
     async fn v2_p2p_false_leaves_header_sync_disabled() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -8827,6 +8940,71 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid zakura.block_sync config"),
+            "unexpected error: {error}",
+        );
+    }
+
+    /// A `Config` built in code skips config-load validation. The node's
+    /// limits replace its stream window with the largest reactor share, so a
+    /// window below a block-sync frame still starts the endpoint, and no
+    /// native frame exceeds its share.
+    #[tokio::test]
+    async fn a_programmatic_stream_window_takes_the_reactor_shares() {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.quic.stream_receive_window_bytes = 64 * 1024;
+
+        let limits = ZakuraLocalLimits::from_config(&config);
+        assert_eq!(
+            u64::from(limits.quic.stream_receive_window_bytes),
+            limits.reactor_shares().stream_receive_window()
+        );
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await
+        .expect("the reactor shares fund every native frame");
+        drop(endpoint);
+    }
+
+    /// Config load checks only native kinds, so startup must refuse a custom
+    /// kind whose frame exceeds its share.
+    #[tokio::test]
+    async fn a_custom_frame_above_its_share_fails_startup_and_names_the_kind() {
+        const CUSTOM_STREAM: Stream = Stream {
+            kind: 64,
+            version: 1,
+            frame_cap: LOCAL_MAX_MESSAGE_BYTES,
+            capability: 1 << 16,
+            ..Stream::PERSISTENT
+        };
+
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.quic.stream_receive_window_bytes = MAX_BS_FRAME_BYTES;
+        config
+            .zakura
+            .validate_stream_receive_window()
+            .expect("the window holds every native frame");
+        let (sessions, _session_rx) = mpsc::unbounded_channel();
+
+        let error = spawn_zakura_endpoint_with_services(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopService),
+            None,
+            vec![CustomService {
+                service: Arc::new(OrderedStreamService {
+                    stream: CUSTOM_STREAM,
+                    sessions,
+                }),
+                provides: Vec::new(),
+                seeks: Vec::new(),
+            }],
+        )
+        .await
+        .expect_err("a custom frame above its share must not start the endpoint");
+        assert!(
+            error.to_string().contains("stream kind 64's receive share"),
             "unexpected error: {error}",
         );
     }

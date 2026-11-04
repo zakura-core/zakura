@@ -155,12 +155,8 @@ impl PeerState {
         if !self.received_status {
             return Err(FillStop::NoStatus);
         }
-        if window.requests_without_block_progress >= window.no_progress_request_cap() {
-            return Err(if window.has_block_progress() {
-                FillStop::NoBlockProgressRequestCap
-            } else {
-                FillStop::InitialBlockProbeRequestCap
-            });
+        if let Some(stop) = self.no_progress_stop() {
+            return Err(stop);
         }
         // Floor bypass scaled by reliability: a healthy saturated carrier keeps the
         // full bypass so the floor keeps moving; a failing/sealed peer earns *no*
@@ -186,6 +182,20 @@ impl PeerState {
         })
     }
 
+    /// Why this peer may take no request until it makes block progress, if it
+    /// has reached its no-progress request cap.
+    fn no_progress_stop(&self) -> Option<FillStop> {
+        let window = &self.window;
+        if window.requests_without_block_progress < window.no_progress_request_cap() {
+            return None;
+        }
+        Some(if window.has_block_progress() {
+            FillStop::NoBlockProgressRequestCap
+        } else {
+            FillStop::InitialBlockProbeRequestCap
+        })
+    }
+
     /// Record whether the last capacity attempt found the requester pool empty,
     /// so the routine also waits for a pool entry.
     pub(super) fn note_request_pool(&mut self, waiting: bool) {
@@ -193,15 +203,15 @@ impl PeerState {
     }
 
     /// Record what a slot publication shows at `now`, and return it. A requester
-    /// that refuses new requests publishes no free slots, so no other routine
-    /// defers the floor to it.
+    /// that refuses new requests, or a peer at its no-progress request cap,
+    /// publishes no free slots, so no other routine defers the floor to it.
     pub(super) fn publish_slots(
         &mut self,
         requester_stopped: bool,
         now: Instant,
     ) -> SlotDiagnostics {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
-        let available_slots = if requester_stopped {
+        let available_slots = if requester_stopped || self.no_progress_stop().is_some() {
             0
         } else {
             self.window.available_slots_at(now)

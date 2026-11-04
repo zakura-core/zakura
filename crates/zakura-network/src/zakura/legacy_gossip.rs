@@ -102,11 +102,13 @@ pub const MSG_RESPONSE_NIL: u16 = 18;
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
-/// Decoded compatibility work that the inbound queue and its handlers may retain.
+/// Decoded compatibility work that the inbound queue and its handlers may retain,
+/// until each handler hands its payload to the inbound service.
 ///
-/// Queue slots do not bound variable-size payloads. A queued transaction can be as
-/// large as a protocol message, so the in-flight limit binds first for wire-maximum
-/// requests, and the queue holds many more ordinary ones.
+/// Later owners, such as mempool verification, keep the decoded payload outside this
+/// budget. Queue slots do not bound variable-size payloads. A queued transaction can
+/// be as large as a protocol message, so the in-flight limit binds first for
+/// wire-maximum requests, and the queue holds many more ordinary ones.
 const LEGACY_INBOUND_RETAINED_BYTES: u64 =
     // Widening usize to u64 is lossless on supported targets.
     (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;
@@ -115,6 +117,10 @@ const LEGACY_CLIENT_INVENTORY_SLOTS: usize = 256;
 /// Other requests that one request client runs at once. They have a partition of
 /// their own so saturated inventory fetches cannot delay chain discovery or Ping.
 const LEGACY_CLIENT_CONTROL_SLOTS: usize = 32;
+/// Requests that one request client runs at once. Each request holds at most one
+/// outbound compatibility exchange grant at a time.
+pub(super) const LEGACY_CLIENT_REQUEST_SLOTS: usize =
+    LEGACY_CLIENT_INVENTORY_SLOTS + LEGACY_CLIENT_CONTROL_SLOTS;
 const LEGACY_GOSSIP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_FIRST_SEEN_CAPACITY: usize = 50_000;
@@ -232,9 +238,10 @@ pub const LEGACY_GOSSIP_BUDGET: ReactorBudget = ReactorBudget {
 ///   `COMPAT_RESPONSE_MAX_AGGREGATE_BYTES`. The exchange's frames and decode copies
 ///   are funded separately by [`super::COMPAT_EXCHANGE_BUDGET`].
 /// - Output: [`DEFAULT_REACTOR_OUTPUT_BYTES`], today's share. A request reserves its
-///   whole response bound, up to the aggregate cap plus frame headers, before its
-///   service runs. This share keeps today's three maximal reservations, so a peer's
-///   retry after its own timeout does not wait on a service that is still running.
+///   whole response bound, up to the aggregate cap plus each frame's overhead, before
+///   its service runs, and a bound above this share refuses the request. This share
+///   keeps today's three maximal reservations, so a peer's retry after its own
+///   timeout does not wait on a service that is still running.
 pub const LEGACY_REQUESTS_BUDGET: ReactorBudget = ReactorBudget {
     // Widening usize to u64 is lossless on supported targets.
     receive: LEGACY_REQUEST_FRAME_BYTES + COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
@@ -1177,14 +1184,14 @@ fn push_chunked_response(
         .ok_or(LegacyGossipError::OversizedResponse(bytes.len()))?;
 
     debug_assert!(!bytes.is_empty());
-    let chunks = bytes.chunks(chunk_bytes).collect::<Vec<_>>();
+    let chunk_count = bytes.len().div_ceil(chunk_bytes);
 
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in bytes.chunks(chunk_bytes).enumerate() {
         let mut payload = Vec::with_capacity(RESPONSE_CHUNK_HEADER_BYTES + chunk.len());
         // The stream prelude already has this id, but each response frame repeats it so
         // malformed peers are rejected at the frame boundary before decoding payload bytes.
         payload.extend_from_slice(&request_id.to_le_bytes());
-        payload.push(u8::from(index + 1 == chunks.len()));
+        payload.push(u8::from(index + 1 == chunk_count));
         payload.extend_from_slice(chunk);
         // Charge each chunk against the shared budget so a response that
         // aggregates many available items aborts mid-encode rather than after
@@ -2473,7 +2480,8 @@ impl ZakuraRequestClient {
             }
         };
         // The grant funds the frames and the decoder's reassembly copy. It ends when
-        // the raw response does. The caller's pipeline owns the decoded payloads.
+        // the raw response does, within this request's client slot, even if its
+        // connection has closed. The caller's pipeline owns the decoded payloads.
         let (frames, _grant) = response.into_parts();
         let mut response = match LegacyResponseCodec::decode_response(
             request_id,
@@ -8150,6 +8158,134 @@ mod tests {
         }
 
         node.shutdown().await;
+        Ok(())
+    }
+
+    /// Reconnect churn holds at most one compatibility grant per client request,
+    /// which the node's envelope counts. Each exchange here runs on a fresh
+    /// connection, as after a reconnect, and keeps a full grant after that
+    /// connection's resources drop, until its requester gives up. The live grants
+    /// outnumber the admitted connections but stop at the client's slots.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_churn_keeps_compat_grants_within_the_envelope() -> Result<(), BoxError> {
+        let grant_bytes = crate::zakura::COMPAT_EXCHANGE_BUDGET.receive;
+        let node = crate::zakura::transport::NodeResources::new(
+            crate::zakura::ReactorShares::from_quic(&zakura_quic::QuicConfig::default()),
+            legacy_gossip_streams().iter().copied(),
+            u32::MAX,
+        );
+        let (sender, mut receiver) = mpsc::channel(8);
+        let churn = node.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = receiver.recv().await {
+                let crate::zakura::ZakuraOutboundFrame::Request { mut completion, .. } = frame;
+                let connection = churn.connection(ZAKURA_CAP_LEGACY_GOSSIP);
+                tokio::spawn(async move {
+                    let _grant = connection.admit_compat_response(grant_bytes).await;
+                    drop(connection);
+                    completion.closed().await;
+                });
+            }
+        });
+        let peer = ZakuraPeerId::new(vec![1; 32])?;
+        let supervisor = ZakuraSupervisorHandle::new(8);
+        supervisor
+            .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(peer, sender))
+            .await;
+        let client = ZakuraRequestClient::new_with_trace_and_stream_rate(
+            supervisor,
+            ZakuraTrace::noop(),
+            u32::MAX,
+        );
+        let requests: Vec<_> = (0..LEGACY_CLIENT_INVENTORY_SLOTS + 8)
+            .map(|_| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .request(
+                            LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+                            None,
+                            false,
+                        )
+                        .await
+                })
+            })
+            .collect();
+        let installed = || node.owners().counts().installed;
+        timeout(TEST_NET_TIMEOUT, async {
+            while installed() < LEGACY_CLIENT_INVENTORY_SLOTS {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            installed(),
+            LEGACY_CLIENT_INVENTORY_SLOTS,
+            "the extra requests wait for client slots"
+        );
+
+        let mut limits =
+            crate::zakura::ZakuraLocalLimits::from_config(&crate::config::Config::default());
+        limits.max_connections = 8;
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let registry = crate::zakura::transport::ServiceRegistry::new(vec![Arc::new(test_sink(
+            inbound_tx,
+            LegacyGossipOutbound::default(),
+        ))])?;
+        let envelope = limits.resource_envelope(&registry);
+        assert!(installed() > limits.max_connections);
+        // Widening usize to u64 is lossless on supported targets.
+        assert!(installed() as u64 * grant_bytes <= envelope.compat_response_bytes);
+
+        for request in &requests {
+            request.abort();
+        }
+        timeout(TEST_NET_TIMEOUT, async {
+            while installed() > 0 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The node-wide gossip queue's 256 slots, filled with 25,000-ID advertisements,
+    /// retain no more decoded bytes than the compatibility inbound budget. The budget
+    /// refuses an advertisement before the queue fills.
+    #[tokio::test]
+    async fn full_transaction_advertisements_stay_within_the_inbound_budget() -> Result<(), BoxError>
+    {
+        let ids: Vec<UnminedTxId> = (0..u32::try_from(MAX_TX_INV_IN_SENT_MESSAGE)?)
+            .map(|n| {
+                let mut hash = [0; 32];
+                hash[..4].copy_from_slice(&n.to_le_bytes());
+                UnminedTxId::from_legacy_id(transaction::Hash(hash))
+            })
+            .collect();
+        let frame = LegacyGossipFrame::AdvertiseTransactionIds(ids).encode_frame()?;
+        let item_bytes = LegacyGossipFrame::decode_frame(frame.clone())?.retained_bytes();
+        let (inbound_tx, mut queue) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
+        let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
+
+        for _ in 0..LEGACY_GOSSIP_INBOUND_QUEUE {
+            sink.deliver(inbound_peer(), ZAKURA_STREAM_GOSSIP, frame.clone())
+                .map_err(|_| "a refused advertisement drops without faulting the peer")?;
+        }
+        let used = sink.inbound_budget.used();
+        assert!(used <= LEGACY_INBOUND_RETAINED_BYTES);
+        let mut queued = Vec::new();
+        while let Ok(work) = queue.try_recv() {
+            queued.push(work);
+        }
+        // Widening usize to u64 is lossless on supported targets.
+        assert_eq!(used, queued.len() as u64 * item_bytes);
+        assert!(
+            queued.len() < LEGACY_GOSSIP_INBOUND_QUEUE,
+            "the budget refuses before the queue fills"
+        );
+        drop(queued);
+        assert_eq!(sink.inbound_budget.used(), 0);
         Ok(())
     }
 

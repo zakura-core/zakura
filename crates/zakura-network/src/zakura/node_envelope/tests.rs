@@ -180,10 +180,11 @@ fn the_default_envelope_sums_the_reactor_shares() {
     // Per connection: 74,828,489 B of receive shares and 180,303,803 B of output shares.
     assert_eq!(transport.connection_raw_bytes, 74_828_489);
     assert_eq!(transport.connection_output_bytes, 180_303_803);
-    assert_eq!(transport.compat_response_bytes, 92 * 20 * MIB);
+    // The shared compatibility client holds at most 288 exchanges at once.
+    assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
     assert_eq!(
         envelope.transport_bytes,
-        92 * u128::from(74_828_489_u64 + 180_303_803 + 20 * MIB)
+        92 * u128::from(74_828_489_u64 + 180_303_803) + u128::from(288 * 20 * MIB)
     );
     // 92 × 141,937,353 + 32 × 64 MiB + 256 MiB.
     assert_eq!(envelope.quic_bytes, 15_474_155_580);

@@ -422,8 +422,8 @@ impl Version for zakura_mmr_tree::V1 {
         let work = header
             .difficulty_threshold
             .to_work()
-            .expect("work must be valid during contextual verification");
-        let work = zakura_mmr_tree::U256::from_big_endian(&work.as_u256().to_big_endian());
+            .expect("work must be valid during contextual verification")
+            .as_u256();
 
         match network_upgrade {
             NetworkUpgrade::Genesis

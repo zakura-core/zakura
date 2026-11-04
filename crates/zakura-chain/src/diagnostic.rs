@@ -5,6 +5,9 @@
 
 pub mod task;
 
+/// Per-block observations for the temporary Mainnet digest comparison.
+pub mod block_perf;
+
 // Tracing the execution time of functions.
 //
 // TODO:

@@ -62,7 +62,7 @@ on:
       operation:
         description: "deploy builds and deploys nodes; monitoring only stages compatibility monitoring (node=zakura-compat, ref=full tested SHA)"
         type: choice
-        options: [deploy, monitoring]
+        options: [deploy, monitoring, build]
         default: deploy
       monitoring_stage:
         description: "fleet-deploy refreshes active monitoring; initial cutover uses install, validate, cutover, soak, finalize"
@@ -78,6 +78,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  digest-build:
+    if: inputs.operation == 'build'
+    name: Build instrumented Mainnet comparison binary
+    runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
+    timeout-minutes: 90
+    env:
+      ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /root/.cache/zakura-deployer-binaries
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: 1.98.1
+          cache: false
+      - name: Build without installing or restarting any node
+        env:
+          REVISION: ${{ inputs.ref }}
+          LANE: ${{ inputs.node }}
+        run: python3 deploy/runner/digest_build.py --revision "$REVISION" --lane "$LANE" --output "$RUNNER_TEMP/digest-build.json"
+      - name: Save binary identity and build settings
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-build-${{ inputs.node }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/digest-build.json
+          if-no-files-found: error
+          retention-days: 30
+
   mac-source:
     if: inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'deploy' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
     runs-on: ubuntu-24.04
@@ -257,7 +287,7 @@ jobs:
           retention-days: 90
 
   deploy:
-    if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'
+    if: inputs.node != 'zakura-mac-os' && inputs.operation == 'deploy'
     name: "Deploy Zakura mainnet ${{ inputs.ref }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
     timeout-minutes: 600

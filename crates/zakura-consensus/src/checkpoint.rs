@@ -1249,6 +1249,7 @@ where
 
     #[instrument(name = "checkpoint", skip(self, block))]
     fn call(&mut self, block: BlockHandle) -> Self::Future {
+        tracing::info!(target: "zakura_block_perf", hash = %block.hash(), "block_perf_checkpoint");
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();

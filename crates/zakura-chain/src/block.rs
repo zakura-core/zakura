@@ -521,14 +521,20 @@ impl BlockRef {
     ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244
     pub fn auth_data_root(&self) -> AuthDataRoot {
+        use crate::diagnostic::block_perf::{Context, Stage};
         use rayon::prelude::*;
+        let context = Context::current();
+        let stage = Context::current_stage().unwrap_or(Stage::Commitment);
 
         // Compute each transaction's auth digest in parallel, and collect into a
         // Vec with the same ordering.
         self.0
             .transactions
             .par_iter()
-            .map(|tx| auth_digest_or_placeholder(tx))
+            .map(|tx| {
+                let _scope = Context::enter(context.clone(), stage);
+                auth_digest_or_placeholder(tx)
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<AuthDataRoot>()
@@ -540,19 +546,22 @@ impl BlockRef {
     /// Blocks with fewer than 64 transactions, and single-worker Rayon pools, hash on
     /// the calling thread, where splitting costs more than it saves.
     pub fn transaction_digests(&self) -> TransactionDigests {
+        use crate::diagnostic::block_perf::{Context, Stage};
         use rayon::prelude::*;
+
+        let context = Context::current();
+        let digest = |tx: &Transaction| {
+            let _scope = Context::enter(context.clone(), Stage::Initial);
+            tx.txid_and_auth_digest()
+        };
 
         let (hashes, auth_digests): (Vec<_>, Vec<_>) = if self.0.transactions.len()
             < PARALLEL_TRANSACTION_HASHES_MIN
             || rayon::current_num_threads() == 1
         {
-            self.transactions()
-                .map(Transaction::txid_and_auth_digest)
-                .unzip()
+            self.transactions().map(digest).unzip()
         } else {
-            self.parallel_transactions()
-                .map(Transaction::txid_and_auth_digest)
-                .unzip()
+            self.parallel_transactions().map(digest).unzip()
         };
 
         let auth_data_root = auth_digests

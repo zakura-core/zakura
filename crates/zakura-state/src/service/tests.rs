@@ -3972,6 +3972,41 @@ async fn check(state: &mut StateService, block: Arc<Block>) -> crate::AuthDataCo
     }
 }
 
+/// Observations distinguish actual root reuse from recomputation through the state service.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_perf_records_root_reuse_and_fallback() {
+    use zakura_chain::diagnostic::block_perf::{Operation, Session, Stage};
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let block = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    let session = Session::new(block.hash(), &block, "test");
+    let context = session.context();
+    for root in [Some(block.auth_data_root()), None] {
+        let response = timeout(
+            Duration::from_secs(10),
+            (&mut state).oneshot(Request::CheckAuthDataCommitment(
+                crate::BlockCommitmentData {
+                    block: block.clone().into(),
+                    auth_data_root: root,
+                },
+            )),
+        )
+        .await
+        .expect("the check completes")
+        .expect("the check succeeds");
+        assert!(matches!(
+            response,
+            Response::AuthDataCommitment(crate::AuthDataCommitment::Bound)
+        ));
+    }
+    assert_eq!(context.count(Stage::Commitment, Operation::RootReuse), 1);
+    assert_eq!(
+        context.count(Stage::Commitment, Operation::RootRecompute),
+        1
+    );
+    assert_eq!(context.count(Stage::Commitment, Operation::Root), 1);
+}
+
 /// The authorizing data check finds a parent in the non-finalized state, not just at the
 /// finalized tip, and uses that parent's history tree.
 #[tokio::test(flavor = "multi_thread")]

@@ -1359,6 +1359,8 @@ impl StateService {
         span: Span,
     ) -> Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>> {
         let timer = CodeTimer::start();
+        let perf_queue_start = Instant::now();
+        let perf_context = zakura_chain::diagnostic::block_perf::Context::for_hash(block.hash);
         // These histograms measure how long a mined submission waits, so the sync path must not
         // mix its blocks into them. A mined submission is the only caller that supplies
         // `requested_at`, so that is what tells the two apart.
@@ -1395,6 +1397,16 @@ impl StateService {
                 .record(queue_send_start.elapsed().as_secs_f64());
         }
 
+        if let Some(context) = &perf_context {
+            let _scope = zakura_chain::diagnostic::block_perf::Context::enter(
+                Some(context.clone()),
+                zakura_chain::diagnostic::block_perf::Stage::Handoff,
+            );
+            zakura_chain::diagnostic::block_perf::Context::contextual(
+                "state.semantic_commit.prequeue_and_dispatch.duration_seconds",
+                perf_queue_start.elapsed(),
+            );
+        }
         // TODO:
         //   - check for panics in the block write task here,
         //     as well as in poll_ready()

@@ -55,6 +55,8 @@ use super::{check, Request, Verifier};
 #[cfg(test)]
 mod prop;
 
+mod mempool_precheck;
+
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.
 fn test_timeout() -> std::time::Duration {
@@ -1187,9 +1189,14 @@ async fn mempool_request_with_missing_input_is_rejected() {
         let verifier = Verifier::new_for_tests(&net, state.clone());
 
         let (height, tx) = transactions_from_blocks(net.block_iter())
-            .find(|(_, tx)| !(tx.is_coinbase() || tx.inputs().is_empty()))
+            .find(|(_, tx)| {
+                tx.version() >= 4
+                    && !tx.is_coinbase()
+                    && !tx.inputs().is_empty()
+                    && !tx.lock_time_is_time()
+            })
             .expect(
-                "At least one non-coinbase transaction with transparent inputs in test vectors",
+                "test vectors include a supported non-coinbase transaction with transparent inputs and no time lock",
             );
 
         let input_outpoint = match tx.inputs()[0] {
@@ -1197,8 +1204,7 @@ async fn mempool_request_with_missing_input_is_rejected() {
             transparent::Input::Coinbase { .. } => panic!("requires a non-coinbase transaction"),
         };
 
-        // The first non-coinbase transaction with transparent inputs in our test vectors
-        // does not use a lock time, so we don't see Request::BestChainNextMedianTimePast here
+        // The fixture needs no median-time lookup, so the missing input is the first query.
 
         let state_req = state
             .expect_request(zakura_state::Request::UnspentBestChainUtxo(input_outpoint))
@@ -3820,7 +3826,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
         let known_outpoint_hashes = Arc::new(HashSet::new());
         let _block_batch_flush =
-            crate::primitives::register_block_verifier_batch_flush(&known_outpoint_hashes, 1);
+            crate::primitives::flush::BlockFlush::register(&known_outpoint_hashes, 1);
         let transaction_hash = transaction.hash();
         let transaction_verifier = Verifier::new_for_tests(
             &network,
@@ -6917,17 +6923,8 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "this transaction's bundle must not have been verified before this test"
         );
 
-        // 1. The mempool verification is the only one that reaches the Halo2 verifier.
-        respond_to_nullifier_and_anchor_check(&state);
-        verify(
-            &mut verifier,
-            Request::Mempool {
-                transaction: tx.clone().into(),
-                height: expiry_height,
-            },
-        )
-        .await
-        .expect("a real mainnet Orchard transaction must verify at its expiry height");
+        // 1. Chain eligibility must succeed before the mempool can dispatch proof verification.
+        mempool_precheck::check_chain_gate(&mut verifier, &state, &tx, network_upgrade).await;
 
         assert_eq!(
             primitives::halo2::inner_calls_for(network_upgrade, &item),
@@ -6935,9 +6932,7 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "the mempool verification must reach the inner Halo2 verifier"
         );
 
-        verify(&mut verifier, block_request(&tx, expiry_height))
-            .await
-            .expect("the same transaction must verify in a block");
+        mempool_precheck::check_block_skips_chain_gate(&tx, expiry_height).await;
 
         assert_eq!(
             primitives::halo2::inner_calls_for(network_upgrade, &item),
@@ -6992,6 +6987,18 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
                 1,
                 "the {mutated_field} mutation must reach the inner Halo2 verifier"
             );
+
+            respond_to_nullifier_and_anchor_check(&state);
+            let error = verify(
+                &mut verifier,
+                Request::Mempool {
+                    transaction: mutated_tx.into(),
+                    height: expiry_height,
+                },
+            )
+            .await
+            .expect_err("passing chain checks must not accept invalid Orchard authorization");
+            assert_eq!(error, TransactionError::Halo2VerificationFailed);
         }
     });
 }
@@ -7221,17 +7228,8 @@ fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "this transaction's bundle must not have been verified before this test"
         );
 
-        // 1. The mempool verification is the only one that reaches the Sapling verifier.
-        respond_to_nullifier_and_anchor_check(&state);
-        verify(
-            &mut verifier,
-            Request::Mempool {
-                transaction: tx.clone().into(),
-                height: expiry_height,
-            },
-        )
-        .await
-        .expect("a real mainnet Sapling transaction must verify at its expiry height");
+        // 1. Chain eligibility must succeed before the mempool can dispatch proof verification.
+        mempool_precheck::check_chain_gate(&mut verifier, &state, &tx, network_upgrade).await;
 
         assert_eq!(
             primitives::sapling::inner_calls_for(&item),
@@ -7239,9 +7237,7 @@ fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "the mempool verification must reach the inner Sapling verifier"
         );
 
-        verify(&mut verifier, block_request(&tx, expiry_height))
-            .await
-            .expect("the same transaction must verify in a block");
+        mempool_precheck::check_block_skips_chain_gate(&tx, expiry_height).await;
 
         assert_eq!(
             primitives::sapling::inner_calls_for(&item),
@@ -7296,6 +7292,18 @@ fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
                 1,
                 "the {mutated_field} mutation must reach the inner Sapling verifier"
             );
+
+            respond_to_nullifier_and_anchor_check(&state);
+            let error = verify(
+                &mut verifier,
+                Request::Mempool {
+                    transaction: mutated_tx.into(),
+                    height: expiry_height,
+                },
+            )
+            .await
+            .expect_err("passing chain checks must not accept invalid Sapling authorization");
+            assert_eq!(error, TransactionError::SaplingVerificationFailed);
         }
     });
 }

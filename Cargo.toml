@@ -93,6 +93,7 @@ itertools = "0.14"
 jubjub = { version = "=5.1.0", package = "zakura-jubjub" }
 async-trait = "0.1.89"
 libc = "0.2"
+memchr = "2.8"
 metrics = "0.24"
 pin-project = "1.1.10"
 pin-project-lite = "0.2.17"

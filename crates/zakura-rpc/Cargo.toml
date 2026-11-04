@@ -59,6 +59,7 @@ bytes = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["server-auto", "service", "tokio"] }
 http-body-util = { workspace = true }
+memchr = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 indexmap = { workspace = true, features = ["serde"] }

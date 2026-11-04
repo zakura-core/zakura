@@ -11,8 +11,8 @@ use std::{
 use zakura_sim::{
     campaign::{
         self, build_fuzzer, Budget, CampaignError, Compaction, Digest, End, Evidence, Migration,
-        Prepared, ResumeOptions, RunState, StartOptions, Status, Store, WorkerPlan, FUZZ_PACKAGE,
-        SANITIZER_VARS,
+        Prepared, ResumeOptions, RunState, StartOptions, Status, Store, TargetsOptions, WorkerPlan,
+        FUZZ_PACKAGE, READINESS_FILE, SANITIZER_VARS,
     },
     explore::{stats::Counts, DEFAULT_ABANDON_LIMIT},
     harness,
@@ -36,6 +36,8 @@ pub const USAGE: &str = "\
   zakura-sim campaign status --store <dir>
   zakura-sim campaign evidence --store <dir> [--run <sha256>] [--out <file>]
   zakura-sim campaign verify --store <dir>
+  zakura-sim targets --out <dir> [--target <name>]... [--sanitizer address|none]
+      [--target-dir <dir>] [--fixtures <dir>]... [--child-secs <s>]
 ";
 
 /// What each subcommand does.
@@ -62,6 +64,12 @@ and assumption losses, and the features reached. It lists the properties no
 complete process saw apply, and every worker, process and stats file whose
 counts fall short. --out also writes it as JSON.
 `start` and `resume` exit 0 for a complete run and 1 otherwise.
+`targets` checks each simulator fuzz target qa/suite.toml declares, or each
+--target: it resolves the target's harness, runs the harness's admitted seeds,
+builds the target with the pinned nightly, and runs the target once on the
+seeds with --child-secs per input (default 60). It prints each target's status
+and the retained bypasses on its harness, writes readiness.json to --out, and
+exits 0 only if every target is ready.
 ";
 
 /// Runs `campaign <subcommand> <flags>`.
@@ -89,6 +97,75 @@ pub fn run(args: Vec<String>) -> Result<(), Error> {
         "verify" => verify(&store, &flags),
         other => Err(Error::Usage(format!(
             "unknown campaign subcommand `{other}`"
+        ))),
+    }
+}
+
+/// `targets`: checks each declared fuzz target's readiness, and writes the
+/// report.
+#[allow(clippy::print_stdout)]
+pub fn targets(args: Vec<String>) -> Result<(), Error> {
+    let flags = Flags::parse(args)?;
+    flags.only(&[
+        "--out",
+        "--target",
+        "--sanitizer",
+        "--target-dir",
+        "--fixtures",
+        "--child-secs",
+    ])?;
+    let repo = repo_root();
+    let sanitizer = flags.one("--sanitizer")?.unwrap_or("address");
+    if !matches!(sanitizer, "address" | "none") {
+        return Err(Error::Usage(format!(
+            "--sanitizer is address or none, not {sanitizer}"
+        )));
+    }
+    let child = flags.number::<u64>("--child-secs")?.unwrap_or(60);
+    if child == 0 {
+        return Err(Error::Usage("--child-secs must be at least 1".to_owned()));
+    }
+    let mut fixtures: Vec<PathBuf> = flags
+        .many("--fixtures")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    if fixtures.is_empty() {
+        fixtures.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
+    }
+    let options = TargetsOptions {
+        out: PathBuf::from(flags.required("--out")?),
+        targets: flags
+            .many("--target")
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        sanitizer: sanitizer.to_owned(),
+        target_dir: flags
+            .one("--target-dir")?
+            .map_or_else(|| repo.join("target").join("sim-fuzz"), PathBuf::from),
+        fixtures,
+        child: std::time::Duration::from_secs(child),
+        repo,
+    };
+    let report = campaign::check_targets(&options, |row| {
+        for line in row.lines() {
+            println!("{line}");
+        }
+    })
+    .map_err(failed)?;
+    println!("report in {}", options.out.join(READINESS_FILE).display());
+    let not_ready: Vec<String> = report
+        .not_ready()
+        .map(|row| format!("{} is {}", row.target, row.status.name()))
+        .collect();
+    match not_ready.as_slice() {
+        [] => Ok(()),
+        rows => Err(Error::Failed(format!(
+            "{} of {} targets aren't ready: {}",
+            rows.len(),
+            report.targets.len(),
+            rows.join(", ")
         ))),
     }
 }

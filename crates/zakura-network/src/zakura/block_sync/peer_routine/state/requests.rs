@@ -12,7 +12,7 @@ use super::{
         state::{DeliverySnapshot, OutstandingBlockRange, RequestKey, WriteOutcome},
         ZakuraBlockSyncConfig,
     },
-    PeerState,
+    PeerState, UncreditedTimeout,
 };
 
 /// Why a routine rejects a body whose hash isn't the one its outstanding
@@ -318,13 +318,63 @@ impl PeerState {
             .map(OutstandingBlockRange::is_complete)
     }
 
-    /// Record a wanted body that matches no outstanding request, typically one
-    /// that arrived just after its request timed out. It proves progress and
-    /// offsets that timeout's reliability charge. It feeds no delivery sample,
-    /// because its request's send time is gone.
-    pub(in super::super) fn record_late_body(&mut self, now: Instant, liveness_timeout: Duration) {
+    /// Record a wanted body `hash` at `height` that matches no outstanding
+    /// request, typically one that arrived just after its request timed out.
+    /// It proves progress. It offsets the reliability charge of the timed-out
+    /// request that asked this session for `hash` at `height`, and only once
+    /// per request, since each timed-out request charged one failure. It feeds
+    /// no delivery sample, because its request's send time is gone.
+    ///
+    /// Returns whether the body offset a timeout.
+    pub(in super::super) fn record_late_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        download_floor: block::Height,
+        now: Instant,
+        liveness_timeout: Duration,
+    ) -> bool {
         self.window.note_block_progress(now, liveness_timeout);
+        self.forget_timeouts_through(download_floor);
+        let Some(&UncreditedTimeout {
+            request,
+            span: (first, last),
+            ..
+        }) = self
+            .uncredited_timeouts
+            .get(&height)
+            .filter(|timeout| timeout.hash == hash)
+        else {
+            return false;
+        };
+        let credited: Vec<_> = self
+            .uncredited_timeouts
+            .range(first..=last)
+            .filter(|(_, timeout)| timeout.request == request)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in credited {
+            self.uncredited_timeouts.remove(&height);
+        }
         self.window.credit_late_delivery();
+        true
+    }
+
+    /// Drop uncredited timeouts at or below `download_floor`, whose bodies are no
+    /// longer wanted.
+    ///
+    /// The floor can roll back when a body above it fails verification, so a
+    /// dropped entry's body can become wanted again. That body then earns no
+    /// credit, which leaves the peer's timeout charged rather than over-crediting it.
+    fn forget_timeouts_through(&mut self, download_floor: block::Height) {
+        let kept_from = block::Height(download_floor.0.saturating_add(1));
+        if self
+            .uncredited_timeouts
+            .first_key_value()
+            .is_some_and(|(height, _)| *height < kept_from)
+        {
+            self.uncredited_timeouts = self.uncredited_timeouts.split_off(&kept_from);
+        }
     }
 
     /// Decide how an ending finishes the request that starts at its range's
@@ -407,9 +457,13 @@ impl PeerState {
 
     /// Retire due requests by how their write settled. Only a started write
     /// charges the peer with a timeout; a skipped write refunds its probe.
+    /// The first late body for an unreceived height of a timed-out request
+    /// above `download_floor` offsets that request's timeout, through
+    /// [`Self::record_late_body`].
     pub(in super::super) fn expire_requests(
         &mut self,
         due: Vec<(RequestKey, WriteOutcome)>,
+        download_floor: block::Height,
     ) -> ExpiredRequests {
         let (skipped, timed_out): (Vec<_>, Vec<_>) = due
             .into_iter()
@@ -422,11 +476,34 @@ impl PeerState {
             .collect();
         let timed_out: Vec<_> = timed_out
             .into_iter()
-            .filter_map(|(key, _)| self.window.outstanding.remove(key))
+            .filter_map(|(key, _)| Some((key, self.window.outstanding.remove(key)?)))
             .collect();
         if !timed_out.is_empty() {
             self.window.record_timeout(timed_out.len());
+            self.forget_timeouts_through(download_floor);
+            self.uncredited_timeouts
+                .extend(timed_out.iter().flat_map(|(key, range)| {
+                    let blocks = &range.request.expected_blocks;
+                    let span = (
+                        blocks.first().map_or(download_floor, |block| block.height),
+                        blocks.last().map_or(download_floor, |block| block.height),
+                    );
+                    blocks
+                        .iter()
+                        .filter(|expected| {
+                            expected.height > download_floor && !range.has_received(expected.height)
+                        })
+                        .map(move |expected| {
+                            let timeout = UncreditedTimeout {
+                                hash: expected.hash,
+                                request: *key,
+                                span,
+                            };
+                            (expected.height, timeout)
+                        })
+                }));
         }
+        let timed_out = timed_out.into_iter().map(|(_, range)| range).collect();
         ExpiredRequests { skipped, timed_out }
     }
 

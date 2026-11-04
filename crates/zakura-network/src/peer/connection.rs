@@ -7,7 +7,14 @@
 //! And it's unclear if these assumptions match the `zcashd` implementation.
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
-use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{future::Either, prelude::*};
@@ -31,7 +38,7 @@ use crate::{
     inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge},
     meta_addr::MetaAddr,
     peer::{
-        block_gossip::{BlockAdvert, BlockAdvertError},
+        block_gossip::{BlockAdvert, BlockAdvertError, BLOCK_REQUEST_WAIT},
         connection::peer_tx::PeerTx,
         error::AlreadyErrored,
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
@@ -567,6 +574,21 @@ impl From<Request> for InboundMessage {
     }
 }
 
+/// How long peer messages can keep a queued block advert waiting before the advert goes ahead of
+/// the next peer message.
+///
+/// Peer messages normally precede adverts, so a response to the peer's request goes out before an
+/// unsolicited `inv`. A peer that has a message ready at every turn, whether it floods or answers
+/// a large request of ours, would otherwise keep an advert queued past the advertiser's wait
+/// ([`BLOCK_REQUEST_WAIT`]). A third of that wait leaves the advert time to be written and the
+/// peer time to request the block.
+///
+/// The wait is checked between messages, so one message whose handling outlasts the
+/// advertiser's wait still expires the advert. The response to a `getdata` writes each block
+/// inline under [`REQUEST_TIMEOUT`](crate::constants::REQUEST_TIMEOUT) per block, so a peer that
+/// reads slowly can hold its connection's loop for minutes with one message.
+const WAITING_ADVERT_PRIORITY_DELAY: Duration = BLOCK_REQUEST_WAIT.checked_div(3).unwrap();
+
 /// Where a connection reads our requests from, and the authorization it rechecks before
 /// writing a block advert.
 pub(crate) struct ConnectionRequests<C> {
@@ -618,6 +640,12 @@ where
 
     /// Receives block adverts independently of the current request's response.
     pub(super) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
+
+    /// When the loop first saw a block advert waiting in a queue that has not drained since.
+    ///
+    /// Adverts queued behind one that became due are written in the turns right after it, so a
+    /// burst of adverts to one connection does not wait the delay once each.
+    advert_waiting_since: Option<tokio::time::Instant>,
 
     /// Live authorization, rechecked immediately before advert writes.
     minimum_peer_version: MinimumPeerVersion<C>,
@@ -765,6 +793,7 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             block_advert_rx,
+            advert_waiting_since: None,
             minimum_peer_version,
             bans,
             error_slot,
@@ -831,6 +860,12 @@ where
             self.request_slot
                 .set_busy(!matches!(self.state, State::AwaitingRequest));
 
+            // A block advert that peer messages have kept waiting goes before the next one.
+            self.note_waiting_advert();
+            // The turn's one decision: a due advert goes before the next peer message, and the
+            // write counts it as such with the wait decided on here.
+            let overdue_advert_wait = self.overdue_advert_wait();
+            let advert_due = overdue_advert_wait.is_some();
             match self.state {
                 State::AwaitingRequest => {
                     trace!("awaiting client request or peer message");
@@ -873,12 +908,19 @@ where
                     // Zebra services might be temporarily delayed until the peer times out, if a
                     // request to that peer is sent by the service, and the service blocks until
                     // the request completes (or times out).
+                    //
+                    // The one exception is a block advert that peer messages have kept waiting
+                    // for [`WAITING_ADVERT_PRIORITY_DELAY`]: it goes before the next peer message,
+                    // so a peer with a message ready at every turn cannot keep it queued. That
+                    // peer may then take our one-hash `inv` as the response to a `getblocks` it
+                    // has already sent, which is also possible when its `getblocks` is still on
+                    // the wire, and which costs it one unsolicited `inv` later.
                     let incoming = tokio::select! {
                         biased;
-                        msg = peer_rx.next() => Either::Left(msg),
+                        msg = peer_rx.next(), if !advert_due => Either::Left(msg),
                         // A closed advert channel disables only this branch.
                         Some(advert) = self.block_advert_rx.recv() => {
-                            self.send_block_advert(advert).await;
+                            self.send_block_advert(advert, overdue_advert_wait).await;
                             continue;
                         }
                         req = self.client_rx.next() => Either::Right(req),
@@ -954,7 +996,8 @@ where
                     // This makes sure a peer can't block disconnection or timeouts by sending too
                     // many messages. It also avoids doing work to process messages after a
                     // connection has failed.
-                    // Peer messages precede adverts to preserve response ordering, as above.
+                    // Peer messages precede adverts to preserve response ordering, as above,
+                    // except an advert that a run of peer messages has held back.
                     let peer_msg = tokio::select! {
                         biased;
                         _ = tx.cancellation() => {
@@ -997,9 +1040,9 @@ where
                             };
                             continue;
                         }
-                        msg = peer_rx.next().instrument(span.clone()) => msg,
+                        msg = peer_rx.next().instrument(span.clone()), if !advert_due => msg,
                         Some(advert) = self.block_advert_rx.recv() => {
-                            self.send_block_advert(advert).await;
+                            self.send_block_advert(advert, overdue_advert_wait).await;
                             continue;
                         }
                     };
@@ -1108,11 +1151,39 @@ where
         self.shutdown_async(error).await;
     }
 
+    /// Notes a block advert waiting in its queue, from the first turn of the loop that could
+    /// have sent it, so a message handled meanwhile counts towards its wait. The wait ends only
+    /// when the queue is empty: an advert written or skipped leaves the ones behind it as overdue
+    /// as it was.
+    fn note_waiting_advert(&mut self) {
+        if self.block_advert_rx.is_empty() {
+            self.advert_waiting_since = None;
+        } else {
+            self.advert_waiting_since
+                .get_or_insert_with(tokio::time::Instant::now);
+        }
+    }
+
+    /// Returns how long peer messages have kept the waiting block adverts queued, once that is
+    /// at least [`WAITING_ADVERT_PRIORITY_DELAY`]: the next advert then goes before the next
+    /// peer message. `None` while the queue is empty or its wait is shorter.
+    fn overdue_advert_wait(&self) -> Option<Duration> {
+        if self.block_advert_rx.is_empty() {
+            return None;
+        }
+        self.advert_waiting_since
+            .map(|since| since.elapsed())
+            .filter(|waited| *waited >= WAITING_ADVERT_PRIORITY_DELAY)
+    }
+
     /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
     /// acknowledges it once the local write completes.
     ///
+    /// `overdue_wait` is how long the queue had waited when this turn decided that the advert
+    /// goes before the next peer message, or `None` when it goes out in a gap between them.
+    ///
     /// Does not change the state of any request that is awaiting its response.
-    async fn send_block_advert(&mut self, advert: BlockAdvert) {
+    async fn send_block_advert(&mut self, advert: BlockAdvert, overdue_wait: Option<Duration>) {
         if advert.result.is_closed() {
             metrics::counter!("peer.canceled").increment(1);
             metrics::counter!(
@@ -1121,6 +1192,14 @@ where
             )
             .increment(1);
             return;
+        }
+
+        if let Some(queue_waited) = overdue_wait {
+            metrics::counter!("peer.block_gossip.advert_priority_writes").increment(1);
+            debug!(
+                ?queue_waited,
+                "writing a block advert ahead of the peer's messages"
+            );
         }
 
         metrics::counter!(

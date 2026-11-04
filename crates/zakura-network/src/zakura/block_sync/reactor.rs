@@ -29,6 +29,37 @@ const BS_ACTION_SPARE_POOL: usize = 128;
 /// serving and misbehavior-report floods that occupy the spare pool.
 pub(super) const BS_ACTION_CONTROL_RESERVE: usize = 1;
 
+/// How much action-channel capacity an action may use. The reactor and the
+/// Sequencer both send on the channel, so both apply this rule.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum ActionClass {
+    /// Reactor control and Sequencer data-plane actions. They may use the
+    /// control reserve.
+    Required,
+    /// Peer reports. They must leave the control reserve free.
+    Optional,
+}
+
+impl ActionClass {
+    pub(super) fn of(action: &BlockSyncAction) -> Self {
+        if matches!(action, BlockSyncAction::Misbehavior { .. }) {
+            Self::Optional
+        } else {
+            Self::Required
+        }
+    }
+
+    /// Permits to take in one semaphore operation. An optional action also
+    /// takes the control reserve, which returns to the channel when the unused
+    /// permits drop.
+    pub(super) fn permits(self) -> usize {
+        match self {
+            Self::Required => 1,
+            Self::Optional => BS_ACTION_CONTROL_RESERVE + 1,
+        }
+    }
+}
+
 /// Bound on the shared routine→reactor channel (status-advertise / serve /
 /// re-query / serving-misbehavior). Sized generously so a transient burst of
 /// per-peer events never makes a routine's `try_send` drop a serving/status
@@ -2168,11 +2199,12 @@ impl BlockSyncReactor {
             .actions
             .max_capacity()
             .saturating_sub(self.actions.capacity());
-        let peer_action_permits = if matches!(action, BlockSyncAction::Misbehavior { .. }) {
+        let class = ActionClass::of(&action);
+        let peer_action_permits = if class == ActionClass::Optional {
             // Acquire the peer-action slot and protected control capacity in one
             // semaphore operation. The Sequencer sends concurrently, so a
             // separate capacity check followed by `try_send` has a race.
-            match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
+            match self.actions.try_reserve_many(class.permits()) {
                 Ok(permits) => Some(permits),
                 Err(mpsc::error::TrySendError::Full(())) => {
                     metrics::counter!(

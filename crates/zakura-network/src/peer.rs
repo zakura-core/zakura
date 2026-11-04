@@ -25,6 +25,7 @@ use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientRespon
 
 pub(crate) use client::{CancelHeartbeatTask, ClientRequest};
 
+pub use block_gossip::NoEligibleBlockPeers;
 pub use client::Client;
 pub use connection::Connection;
 pub(crate) use connection::ConnectionRequests;

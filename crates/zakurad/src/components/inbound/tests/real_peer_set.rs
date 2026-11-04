@@ -1082,7 +1082,8 @@ async fn setup(
     let block_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
         sync_status.clone(),
         chain_tip_change,
-        peer_set.clone(),
+        Some(peer_set.clone()),
+        None,
         read_only_state_service,
         Some(submitblock_channel.receiver()),
     ));
@@ -1152,8 +1153,13 @@ mod submitblock_test {
 
     use super::*;
 
-    /// How long the test waits for the mined block broadcast log before failing.
+    /// How long the test waits for the mined block log before failing.
     const MINED_BLOCK_BROADCAST_DEADLINE: Duration = Duration::from_secs(7);
+
+    /// What the gossip task logs when it takes a mined block from the submit-block channel.
+    ///
+    /// The announcement itself waits for a peer that can receive it, which this test has none of.
+    const MINED_BLOCK_LOG: &str = "announcing this node's committed block";
 
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
@@ -1230,7 +1236,8 @@ mod submitblock_test {
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change,
-                peer_set.clone(),
+                Some(peer_set.clone()),
+                None,
                 read_only_state_service,
                 Some(submitblock_channel.receiver()),
             )
@@ -1243,8 +1250,7 @@ mod submitblock_test {
                 let next_log = log_written.notified();
                 let sent_mined_block = {
                     let captured_logs = logs.lock().unwrap();
-                    String::from_utf8_lossy(&captured_logs)
-                        .contains("sending committed mined block broadcast")
+                    String::from_utf8_lossy(&captured_logs).contains(MINED_BLOCK_LOG)
                 };
 
                 if sent_mined_block {
@@ -1264,7 +1270,7 @@ mod submitblock_test {
         };
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending committed mined block broadcast"));
+        assert!(log_output.contains(MINED_BLOCK_LOG));
 
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle

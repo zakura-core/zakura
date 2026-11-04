@@ -889,6 +889,62 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
     Ok(())
 }
 
+/// The SIMD lane path computes the same txids and auth digests as the scalar path for every
+/// v5/v6 transaction, whatever mix of bundles and action counts shares a lane group.
+#[test]
+fn zip244_lanes_match_scalar_digests() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let mut corpus = Vec::new();
+    for test in zip0244::TEST_VECTORS.iter() {
+        if let Some(transaction) = deserialize_canonical_zip244_test_vector(&test.tx)? {
+            corpus.push(transaction);
+        }
+    }
+    for test in ironwood_v6_tx_hash::TEST_VECTORS.iter() {
+        let mut tx_bytes = test.tx.to_vec();
+        tx_bytes[4..8].copy_from_slice(&crate::parameters::TX_V6_VERSION_GROUP_ID.to_le_bytes());
+        tx_bytes[8..12].copy_from_slice(
+            &u32::from(
+                NetworkUpgrade::Nu6_3
+                    .branch_id()
+                    .expect("NU6.3 has a consensus branch ID"),
+            )
+            .to_le_bytes(),
+        );
+        corpus.push(tx_bytes.zcash_deserialize_into()?);
+    }
+    for bytes in zakura_test::vectors::BLOCKS.iter() {
+        let block: Block = bytes.zcash_deserialize_into()?;
+        corpus.extend(block.transactions.iter().map(|tx| Transaction::clone(tx)));
+    }
+    assert!(corpus.iter().any(|tx| tx.version() < 5));
+    assert!(corpus.iter().any(|tx| tx.has_orchard_shielded_data()));
+    assert!(corpus.iter().any(|tx| tx.has_ironwood_shielded_data()));
+
+    let group = crate::transaction::zip244::LANE_GROUP;
+    for count in [0, 1, 3, 4, 5, group - 1, group, group + 1, 3 * group + 7] {
+        for start in [0, 1, 5, corpus.len() / 2] {
+            let transactions: Vec<_> = corpus.iter().cycle().skip(start).take(count).collect();
+            let mut lanes = vec![None; count];
+            crate::transaction::zip244::txids_and_auth_digests(
+                transactions.iter().copied(),
+                |i, digests| lanes[i] = Some(digests),
+            );
+            for (i, tx) in transactions.iter().enumerate() {
+                let scalar = crate::transaction::zip244::txid_and_auth_digest(tx);
+                assert_eq!(
+                    lanes[i],
+                    Some(scalar),
+                    "{count} transactions from {start}, index {i}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// V5 remains valid under the NU6.3 branch ID, even though NU6.3 also
 /// introduces V6 and changes Orchard bundle semantics. Keep the native
 /// ZIP-244 path pinned to the librustzcash oracle at that mixed boundary.

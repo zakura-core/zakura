@@ -110,6 +110,17 @@ impl AuthDataDigests {
     }
 }
 
+/// A block's transaction digests, in block order, from [`BlockRef::transaction_digests`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionDigests {
+    /// Each transaction's mined ID.
+    pub hashes: Arc<[transaction::Hash]>,
+    /// Each transaction's ZIP-244 authorizing-data digest, `None` before v5.
+    pub auth_digests: Vec<Option<AuthDigest>>,
+    /// The ZIP-244 authorizing-data root over `auth_digests`.
+    pub auth_data_root: AuthDataRoot,
+}
+
 /// Read-only block access that does not expose shared header or transaction handles.
 /// Runtime owners can lend this reference without letting a caller clone their raw Arcs.
 #[derive(Debug, RefCast)]
@@ -581,6 +592,100 @@ impl BlockRef {
             .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
             .collect();
         AuthDataDigests { digests, root }
+    }
+
+    /// Prototype combined SIMD hashing for the benchmark example.
+    ///
+    /// Computes every transaction ID, authorizing-data digest and authorization root.
+    /// Verification keeps the separate ID and authorization stages so a mismatched
+    /// transaction Merkle root is rejected before authorization data is hashed.
+    ///
+    /// Blocks with fewer than 64 transactions, and single-worker Rayon pools, hash on
+    /// the calling thread, where splitting costs more than it saves.
+    pub fn transaction_digests(&self) -> TransactionDigests {
+        use rayon::prelude::*;
+
+        let len = self.0.transactions.len();
+        let mut hashes = vec![transaction::Hash([0; 32]); len];
+        let mut auth_digests = vec![None; len];
+        // v5/v6 digests come from the SIMD lane path; earlier versions keep their own hashes.
+        let hash_group = |transactions: &[Arc<Transaction>],
+                          hashes: &mut [transaction::Hash],
+                          auth_digests: &mut [Option<AuthDigest>]| {
+            transaction::zip244::txids_and_auth_digests(
+                transactions.iter().map(Arc::as_ref),
+                |i, digests| {
+                    (hashes[i], auth_digests[i]) = match digests {
+                        Some((hash, auth_digest)) => (hash, Some(auth_digest)),
+                        None => transactions[i].txid_and_auth_digest(),
+                    }
+                },
+            )
+        };
+        if len < PARALLEL_TRANSACTION_HASHES_MIN || rayon::current_num_threads() == 1 {
+            hash_group(&self.0.transactions, &mut hashes, &mut auth_digests);
+        } else {
+            // Grouping transactions for lanes makes each group one task that Rayon can't split.
+            // Only transactions with Orchard-style bundles have inputs long enough to repay
+            // that. Every other transaction keeps Rayon's per-transaction splitting, which
+            // balances uneven work better near the end of the block.
+            let lane_indices: Vec<usize> = (0..len)
+                .filter(|&i| transaction::zip244::uses_simd_lanes(&self.0.transactions[i]))
+                .collect();
+            let ((), lane_digests) = rayon::join(
+                || {
+                    self.0
+                        .transactions
+                        .par_iter()
+                        .zip(hashes.par_iter_mut())
+                        .zip(auth_digests.par_iter_mut())
+                        .filter(|((transaction, _), _)| {
+                            !transaction::zip244::uses_simd_lanes(transaction)
+                        })
+                        .for_each(|((transaction, hash), auth_digest)| {
+                            (*hash, *auth_digest) = transaction.txid_and_auth_digest()
+                        })
+                },
+                || {
+                    // Aim for several tasks per worker, with at least one full set of 4 lanes
+                    // per task.
+                    let chunk = lane_indices
+                        .len()
+                        .div_ceil(rayon::current_num_threads() * 4)
+                        .clamp(4, transaction::zip244::LANE_GROUP);
+                    lane_indices
+                        .par_chunks(chunk)
+                        .flat_map_iter(|indices| {
+                            let mut group = [None; transaction::zip244::LANE_GROUP];
+                            transaction::zip244::txids_and_auth_digests(
+                                indices.iter().map(|&i| self.0.transactions[i].as_ref()),
+                                |i, digests| {
+                                    group[i] = Some(digests.expect(
+                                        "only v5 and v6 transactions have Orchard-style bundles",
+                                    ))
+                                },
+                            );
+                            group.into_iter().take(indices.len()).flatten()
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
+            for (i, (hash, auth_digest)) in lane_indices.into_iter().zip(lane_digests) {
+                hashes[i] = hash;
+                auth_digests[i] = Some(auth_digest);
+            }
+        }
+
+        let auth_data_root = auth_digests
+            .iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect();
+
+        TransactionDigests {
+            hashes: hashes.into(),
+            auth_digests,
+            auth_data_root,
+        }
     }
 }
 

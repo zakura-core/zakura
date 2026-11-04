@@ -318,6 +318,7 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) {
                     if !tampered {
                         harness.state.record_late_body(
                             block::Height(height),
+                            hash(height, false),
                             block::Height(0),
                             model.now,
                             LIVENESS_TIMEOUT,
@@ -864,15 +865,15 @@ fn publish_slots_shows_no_free_slot_at_the_no_progress_cap() {
     assert!(!harness.state.published_free_slots);
 }
 
-/// A late body offsets the timeout its own request charged, once. A repeated
-/// late body, a body for a height this session never timed out, and a body at
-/// or below the download floor earn no credit, though each still proves
-/// progress.
+/// A late body offsets the timeout its own request charged, once per request.
+/// A second body of the same request, a repeated body, a body with another
+/// hash, a body for a height this session never timed out, and a body at or
+/// below the download floor earn no credit, though each still proves progress.
 #[test]
 fn a_late_body_credits_only_its_own_timeout_once() {
     let mut harness = Harness::new();
     let start = Instant::now();
-    harness.issue(1, 3, 2, start, start + Duration::from_millis(10));
+    harness.issue(1, 3, 3, start, start + Duration::from_millis(10));
     harness.written.insert(1);
     let now = start + Duration::from_millis(10);
     let due: Vec<_> = harness
@@ -884,44 +885,52 @@ fn a_late_body_credits_only_its_own_timeout_once() {
     let expired = harness.state.expire_requests(due, block::Height(3));
     assert_eq!(expired.timed_out.len(), 1);
     assert_eq!(
-        harness.state.uncredited_timeouts,
-        [block::Height(4)].into_iter().collect(),
-        "only the unreceived height above the floor can offset the timeout"
+        harness
+            .state
+            .uncredited_timeouts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![block::Height(4), block::Height(5)],
+        "only the unreceived heights above the floor can offset the timeout"
     );
     let after_timeout = harness.state.window.reliability_factor();
+    let late = |harness: &mut Harness, height: u32, tampered: bool| {
+        harness.state.record_late_body(
+            block::Height(height),
+            hash(height, tampered),
+            block::Height(3),
+            now,
+            LIVENESS_TIMEOUT,
+        )
+    };
 
-    assert!(!harness.state.record_late_body(
-        block::Height(9),
-        block::Height(3),
-        now,
-        LIVENESS_TIMEOUT
-    ));
+    assert!(!late(&mut harness, 9, false));
+    assert!(
+        !late(&mut harness, 4, true),
+        "a body with another hash answers another request"
+    );
     assert_eq!(harness.state.window.reliability_factor(), after_timeout);
 
-    assert!(harness.state.record_late_body(
-        block::Height(4),
-        block::Height(3),
-        now,
-        LIVENESS_TIMEOUT
-    ));
+    assert!(late(&mut harness, 4, false));
     let credited = harness.state.window.reliability_factor();
     assert!(credited > after_timeout);
 
-    assert!(!harness.state.record_late_body(
-        block::Height(4),
-        block::Height(3),
-        now,
-        LIVENESS_TIMEOUT
-    ));
+    assert!(!late(&mut harness, 4, false));
+    assert!(
+        !late(&mut harness, 5, false),
+        "one timed-out request earns one credit"
+    );
     assert_eq!(
         harness.state.window.reliability_factor(),
         credited,
-        "a second late copy earns no second credit"
+        "later late bodies earn no second credit"
     );
+    assert!(harness.state.uncredited_timeouts.is_empty());
     assert!(harness.state.window.has_block_progress());
 }
 
-/// The download floor retires uncredited timeouts, so the set stays within
+/// The download floor retires uncredited timeouts, so the map stays within
 /// the window above the floor.
 #[test]
 fn the_download_floor_retires_uncredited_timeouts() {
@@ -941,12 +950,18 @@ fn the_download_floor_retires_uncredited_timeouts() {
 
     assert!(!harness.state.record_late_body(
         block::Height(4),
+        hash(4, false),
         block::Height(4),
         now,
         LIVENESS_TIMEOUT
     ));
     assert_eq!(
-        harness.state.uncredited_timeouts,
-        [block::Height(5)].into_iter().collect()
+        harness
+            .state
+            .uncredited_timeouts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![block::Height(5)]
     );
 }

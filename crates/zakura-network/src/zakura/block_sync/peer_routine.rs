@@ -1273,10 +1273,11 @@ impl PeerRoutine {
         // that merely slowed down (backlog draining past the per-request deadline but
         // every body still arriving) keeps a reduced-but-nonzero window instead of being
         // sealed to zero like a genuine dropper — which sends no late body to credit.
-        // This is the slow-vs-wedged distinction the seal relies on. A body for a height
-        // this session never timed out earns no credit.
+        // This is the slow-vs-wedged distinction the seal relies on. A body this session's
+        // timed-out requests never asked for earns no credit.
         self.state.record_late_body(
             height,
+            hash,
             self.io.download_floor(),
             Instant::now(),
             self.config.effective_liveness_timeout(),

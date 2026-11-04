@@ -526,3 +526,30 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
         "the reader rejects the page for its linkage, not another rule"
     );
 }
+
+/// A fault whose session already ended starts a cooldown that no disconnect
+/// publishes, so the fault publishes it and the service stops reopening the peer.
+#[test]
+fn a_cooldown_without_a_current_session_is_published() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    // The handle keeps the candidate-state receiver that the service reads.
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the fixture starts");
+    let peer = peer();
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 0);
+    assert!(!reactor.sessions.contains_key(&peer));
+
+    let failure = invalid_header_failure(source, owner);
+    reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
+
+    assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    let node_id = node_id_from_peer(&peer).expect("the test peer has a node identity");
+    assert_eq!(
+        reactor.candidates.borrow().backed_off_node_ids,
+        vec![node_id]
+    );
+}

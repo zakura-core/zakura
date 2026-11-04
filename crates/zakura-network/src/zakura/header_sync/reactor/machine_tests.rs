@@ -465,7 +465,7 @@ impl Harness {
         match op {
             Op::Connect { peer } => {
                 self.summary.admissions += 1;
-                let replaced = self.state.admit_session(&peer_id(peer));
+                let replaced = self.state.admit_session(&peer_id(peer), Instant::now());
                 if replaced {
                     self.state
                         .requeue_supplier(source_id_from_peer(&peer_id(peer)));
@@ -489,7 +489,8 @@ impl Harness {
                 assert_eq!(replaced, previous.is_some(), "{PROPERTY}");
             }
             Op::Disconnect { peer } => {
-                self.state.remove_session(&peer_id(peer));
+                self.state
+                    .remove_session(&peer_id(peer), Instant::now(), Duration::ZERO);
                 if self.model.sessions.remove(&peer).is_some() {
                     self.model.revision += 1;
                 }

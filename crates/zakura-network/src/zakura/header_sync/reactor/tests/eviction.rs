@@ -234,8 +234,46 @@ fn strikes_survive_session_replacement() {
     );
 }
 
-#[test]
-fn a_disconnect_clears_strikes() {
+impl EvictionFixture {
+    /// Disconnect session `old` and connect `new` for the same peer.
+    fn reconnect(&mut self, old: u64, new: u64) -> CancellationToken {
+        self.reactor
+            .handle_peer_disconnected(&self.peer.clone(), old, "test disconnect");
+        let cancel = CancellationToken::new();
+        let (send, outbound) = framed_channel(8);
+        self._outbound = outbound;
+        self.reactor.handle_event(Event::PeerConnected(
+            PeerSession::from_parts_with_session_id(self.peer.clone(), new, send, cancel.clone()),
+        ));
+        cancel
+    }
+}
+
+/// Covers a plain reconnect, and a replacement whose old session's disconnect
+/// reaches the reactor before the new session's connect.
+#[tokio::test(start_paused = true)]
+async fn strikes_survive_a_reconnect_within_the_cooldown() {
+    let mut fixture = eviction_fixture(3, 7);
+    for _ in 0..2 {
+        fixture.time_out_one_request(7);
+    }
+    time::advance(fixture.reactor.startup.config.unproductive_peer_cooldown / 2).await;
+    let reconnected = fixture.reconnect(7, 8);
+    assert_eq!(
+        fixture.unproductive_requests(),
+        Some(2),
+        "reconnecting cannot reset strikes"
+    );
+
+    fixture.time_out_one_request(8);
+    assert!(
+        !fixture.is_admitted() && reconnected.is_cancelled(),
+        "the reconnected session's first strike reaches the limit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn strikes_expire_after_a_cooldown_away() {
     let mut fixture = eviction_fixture(3, 7);
     for _ in 0..2 {
         fixture.time_out_one_request(7);
@@ -243,8 +281,12 @@ fn a_disconnect_clears_strikes() {
     fixture
         .reactor
         .handle_peer_disconnected(&fixture.peer.clone(), 7, "test disconnect");
+    time::advance(fixture.reactor.startup.config.unproductive_peer_cooldown).await;
+    fixture.reactor.refresh_statuses();
+    assert!(fixture.reactor.state.departed_strikes.is_empty());
 
-    let (send, _outbound) = framed_channel(8);
+    let (send, outbound) = framed_channel(8);
+    fixture._outbound = outbound;
     fixture.reactor.handle_event(Event::PeerConnected(
         PeerSession::from_parts_with_session_id(
             fixture.peer.clone(),

@@ -769,7 +769,7 @@ impl HeaderSyncReactor {
         if replaces_existing_peer && !owns_local_repair_operation {
             self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
         }
-        let replaced_schedule = self.state.admit_session(&peer);
+        let replaced_schedule = self.state.admit_session(&peer, Instant::now());
         let previous = self.sessions.insert(
             peer.clone(),
             SessionHandles {
@@ -850,7 +850,11 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
         self.sessions.remove(peer);
-        self.state.remove_session(peer);
+        self.state.remove_session(
+            peer,
+            Instant::now(),
+            self.startup.config.unproductive_peer_cooldown,
+        );
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
                 owner,
@@ -2973,6 +2977,11 @@ impl HeaderSyncReactor {
                 Instant::now(),
                 self.startup.config.unproductive_peer_cooldown,
             );
+            if faulted.is_none() {
+                // No disconnect follows to publish the cooldown, and the service
+                // would keep reopening a session the reactor refuses.
+                self.publish_peer_state();
+            }
         }
         let _ = self.dispatch_action(HeaderPortOperation::Misbehavior { peer, reason });
     }

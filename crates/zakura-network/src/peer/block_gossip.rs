@@ -575,7 +575,7 @@ pub(crate) struct BlockAdvertiser<C> {
 }
 
 /// One handle's progress towards a peer that can receive a block advertisement.
-enum Readiness {
+pub(crate) enum Readiness {
     /// Nothing is known about the connected peers yet.
     Idle,
     /// Waiting for the peer set to have a peer that can receive an advertisement.
@@ -586,7 +586,7 @@ enum Readiness {
 
 impl Readiness {
     /// Returns the state's name, for logs.
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Waiting(_) => "waiting for peers",

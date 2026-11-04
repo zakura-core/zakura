@@ -6,21 +6,27 @@
 
 mod support;
 
-use std::{io::Write, process::Command};
+use std::{cell::RefCell, io::Write, path::Path, process::Command};
 
+use serde_json::Value;
 use support::inputs;
+use tempfile::TempDir;
 use zakura_network::zakura::{ServicePeerDirection, SessionOrigin};
 use zakura_sim::{
     harness::{
+        self,
+        header_node::session::SessionEvidence,
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             session::SessionFact,
             ControlAction, ControlStep, Policy,
         },
         header_sync::{Storage, StorageScenario},
-        run_prepared, Subsystem,
+        record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
+    record::RecordSink,
+    trace::{replay_with, ReplayOptions, TraceReader},
     MemorySink, Observation, PlanInput, RunReport,
 };
 
@@ -270,38 +276,97 @@ fn the_session_witnesses_repeat_a_a_and_a_b_a() {
     }
 }
 
-/// Set in the child process that
-/// [`the_session_witnesses_repeat_in_a_fresh_process`] starts.
-const CHILD: &str = "ZAKURA_SIM_SESSION_FACTS_CHILD";
+/// Set, to a directory of recorded traces, in the child process that
+/// [`the_session_witnesses_replay_in_a_fresh_process`] starts.
+const CHILD: &str = "ZAKURA_SIM_SESSION_TRACES";
 
-/// Both witnesses' session facts under one plan, as text.
-fn witness_facts() -> String {
-    let input = inputs(1, 256).remove(0);
-    [close_witness(), relink_witness()]
-        .iter()
-        .map(|scenario| format!("{:?}\n", run(scenario, input.clone()).1))
-        .collect()
+thread_local! {
+    /// The session view of the run [`capture_run`] last prepared.
+    static CAPTURED: RefCell<Option<SessionEvidence>> = const { RefCell::new(None) };
 }
 
-/// A fresh process that runs both witnesses under the same plan gives the
-/// same session facts as this one.
+/// `header-sync/storage`'s own run, keeping its session view in
+/// [`CAPTURED`] for the replay to read.
+fn capture_run(
+    scenario: &Value,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+) -> Result<RunReport, HarnessError> {
+    let scenario: StorageScenario =
+        serde_json::from_value(scenario.clone()).map_err(HarnessError::Scenario)?;
+    let ports = Storage::prepare(&scenario);
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(ports.sessions.clone()));
+    run_prepared::<Storage>(&scenario, ports, input, sink, None)
+}
+
+/// `header-sync/storage`'s registry entry, with its run replaced by
+/// [`capture_run`].
+fn capturing() -> HarnessEntry {
+    HarnessEntry {
+        run: capture_run,
+        ..*harness::find(Storage::NAME).expect("the storage harness is registered")
+    }
+}
+
+/// The session view [`capture_run`] last kept, as text.
+fn captured() -> String {
+    let view = CAPTURED
+        .with(|captured| captured.borrow_mut().take())
+        .expect("the run prepared its ports");
+    format!("{:?}\n", view.facts())
+}
+
+/// The witnesses, by the name their traces are recorded under.
+fn witnesses() -> [(&'static str, StorageScenario); 2] {
+    [("close", close_witness()), ("relink", relink_witness())]
+}
+
+/// Each witness recorded under one plan in this process, then replayed
+/// exactly in a fresh process of the same test binary, gives the session
+/// facts its recorded run gave.
 #[test]
-fn the_session_witnesses_repeat_in_a_fresh_process() {
-    let facts = witness_facts();
-    if std::env::var_os(CHILD).is_some() {
+fn the_session_witnesses_replay_in_a_fresh_process() {
+    let entry = capturing();
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let facts: String = witnesses()
+            .into_iter()
+            .map(|(name, _)| {
+                let trace =
+                    TraceReader::open(&Path::new(&dir).join(name)).expect("the trace was recorded");
+                // A replay that leaves the trace's picks, draws or
+                // observations, or fails where the recording didn't, errs.
+                replay_with(&trace, &entry, ReplayOptions::default())
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                captured()
+            })
+            .collect();
         // The parent reads the facts from the child's stdout.
         writeln!(std::io::stdout(), "FACTS-BEGIN\n{facts}FACTS-END")
             .expect("the test harness captures stdout");
         return;
     }
+    let PlanInput::Bytes(plan) = inputs(1, 256).remove(0) else {
+        unreachable!("fuzz inputs are bytes");
+    };
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut recorded = String::new();
+    for (name, scenario) in witnesses() {
+        let scenario = serde_json::to_value(&scenario).expect("a scenario serializes");
+        let what = RecordInput::Plan {
+            scenario: &scenario,
+            plan: &plan,
+        };
+        record(&entry, what, &dir.path().join(name)).expect("the witness records");
+        recorded.push_str(&captured());
+    }
     let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
         .args([
             "--exact",
-            "the_session_witnesses_repeat_in_a_fresh_process",
+            "the_session_witnesses_replay_in_a_fresh_process",
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(CHILD, "1")
+        .env(CHILD, dir.path())
         .output()
         .expect("the test binary runs");
     let stdout = String::from_utf8_lossy(&child.stdout);
@@ -311,5 +376,5 @@ fn the_session_witnesses_repeat_in_a_fresh_process() {
         .and_then(|(_, rest)| rest.split_once("FACTS-END"))
         .map(|(facts, _)| facts)
         .unwrap_or_else(|| panic!("the child prints its facts: {stdout}"));
-    assert_eq!(replayed, facts);
+    assert_eq!(replayed, recorded);
 }

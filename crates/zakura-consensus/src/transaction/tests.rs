@@ -3826,7 +3826,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
         let known_outpoint_hashes = Arc::new(HashSet::new());
         let _block_batch_flush =
-            crate::primitives::register_block_verifier_batch_flush(&known_outpoint_hashes, 1);
+            crate::primitives::flush::BlockFlush::register(&known_outpoint_hashes, 1);
         let transaction_hash = transaction.hash();
         let transaction_verifier = Verifier::new_for_tests(
             &network,

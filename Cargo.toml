@@ -154,7 +154,8 @@ tower = "0.5.3"
 tracing = "0.1.41"
 # Without `tracing-log`: nothing in the node logs through the `log` crate, so
 # the `log`-to-`tracing` bridge would only add `tracing-log` and `log`.
-tracing-subscriber = { version = "0.3.19", default-features = false, features = ["ansi", "fmt", "smallvec", "std"] }
+# Without `ansi`: log lines are plain text, so `nu-ansi-term` is not needed.
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "smallvec", "std"] }
 uint = "0.10"
 zcash_note_encryption = { version = "=5.1.0", package = "zakura-note-encryption" }
 zcash_script = { version = "=0.0.1", package = "zakura-zcash-script" }

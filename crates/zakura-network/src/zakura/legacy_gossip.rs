@@ -18,7 +18,7 @@ use indexmap::IndexSet;
 use rand_10::{seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
     time::{sleep, timeout, Instant},
 };
 use tower::{Service, ServiceExt};
@@ -51,8 +51,10 @@ use super::{
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
+mod block_advertiser;
 mod trace;
 
+pub(crate) use block_advertiser::ZakuraBlockAdvertiser;
 use trace::{LegacyRequestError, LegacyRequestResponse, LegacyRequestStart};
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
@@ -1416,11 +1418,34 @@ struct GossipSessionChurn {
 
 /// Session and reopen-gap claim state, kept under one lock so a session removal
 /// and its gap claim are always observed together.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LegacyGossipOutboundState {
     sessions: HashMap<ZakuraPeerId, LegacyGossipPeerSession>,
     gap_claims: HashMap<ZakuraPeerId, GossipGapClaim>,
     churn: HashMap<ZakuraPeerId, GossipSessionChurn>,
+    /// The number of sessions, published on every change to the session set so a
+    /// block advertiser waiting for a peer wakes when one arrives. A session that
+    /// replaces another on the same peer is published too, since the new one may
+    /// be open where the old one was closed.
+    session_count: watch::Sender<usize>,
+}
+
+impl Default for LegacyGossipOutboundState {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            gap_claims: HashMap::new(),
+            churn: HashMap::new(),
+            session_count: watch::channel(0).0,
+        }
+    }
+}
+
+impl LegacyGossipOutboundState {
+    /// Tell session-count watchers that the session set changed.
+    fn publish_session_count(&self) {
+        self.session_count.send_replace(self.sessions.len());
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1454,6 +1479,7 @@ impl LegacyGossipOutbound {
         }
         state.gap_claims.remove(session.peer_id());
         state.sessions.insert(session.peer_id().clone(), session);
+        state.publish_session_count();
         true
     }
 
@@ -1486,6 +1512,7 @@ impl LegacyGossipOutbound {
             return;
         }
         state.sessions.remove(peer);
+        state.publish_session_count();
 
         let churn = state
             .churn
@@ -1554,6 +1581,7 @@ impl LegacyGossipOutbound {
             .is_some_and(|session| session.conn_id() == conn_id)
         {
             state.sessions.remove(peer);
+            state.publish_session_count();
         }
         if state
             .gap_claims
@@ -1619,11 +1647,51 @@ impl LegacyGossipOutbound {
         session.try_send_advertise_block(hash).map_err(Into::into)
     }
 
+    /// Returns a watch of the session count that changes whenever the session set does.
+    fn subscribe_session_count(&self) -> watch::Receiver<usize> {
+        self.state
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .session_count
+            .subscribe()
+    }
+
+    /// Returns whether a session can still take a frame: one whose transport
+    /// writer is alive. A session whose queue is full counts, like a busy legacy
+    /// peer; one whose writer has gone away does not, even while it is still in
+    /// the set waiting for its stream to report the close.
+    fn has_open_session(&self) -> bool {
+        self.state
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .sessions
+            .values()
+            .any(|session| !session.send.is_closed())
+    }
+
+    /// Number of sessions in the set, open or not.
+    fn session_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .sessions
+            .len()
+    }
+
     async fn send_to_peers(
         &self,
         frame: LegacyGossipFrame,
         exclude: Option<&ZakuraPeerId>,
     ) -> Result<(), BoxError> {
+        self.fan_out_to_peers(&frame, exclude).into_result()
+    }
+
+    /// Offer `frame` to every session but `exclude`'s, and report what it reached.
+    fn fan_out_to_peers(
+        &self,
+        frame: &LegacyGossipFrame,
+        exclude: Option<&ZakuraPeerId>,
+    ) -> Fanout {
         let sessions: Vec<_> = {
             let state = self
                 .state
@@ -1637,7 +1705,7 @@ impl LegacyGossipOutbound {
                 .collect()
         };
 
-        send_to_sessions(sessions, frame)
+        fan_out(sessions, frame)
     }
 }
 
@@ -1752,35 +1820,59 @@ fn first_seen_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> FirstSeenCa
         .clone()
 }
 
-fn send_to_sessions(
-    sessions: Vec<LegacyGossipPeerSession>,
-    frame: LegacyGossipFrame,
-) -> Result<(), BoxError> {
-    let mut first_error = None;
+/// What one fan-out of a gossip frame reached.
+#[derive(Debug)]
+struct Fanout {
+    /// Sessions the frame was offered to.
+    attempted: usize,
+    /// Sessions that queued the frame.
+    delivered: usize,
+    /// The first refusal, when a session refused the frame.
+    first_error: Option<OrderedSendError>,
+}
+
+impl Fanout {
+    /// The gossip result: an error when any session refused the frame, success
+    /// otherwise, including when there was no session to offer it to.
+    fn into_result(self) -> Result<(), BoxError> {
+        match self.first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Offer `frame` to every session, continuing past the ones that refuse it.
+fn fan_out(sessions: Vec<LegacyGossipPeerSession>, frame: &LegacyGossipFrame) -> Fanout {
+    let mut fanout = Fanout {
+        attempted: 0,
+        delivered: 0,
+        first_error: None,
+    };
     for session in sessions {
-        let result = match &frame {
+        fanout.attempted += 1;
+        let result = match frame {
             LegacyGossipFrame::AdvertiseBlock(hash) => session.try_send_advertise_block(*hash),
             LegacyGossipFrame::AdvertiseTransactionIds(ids) => {
                 session.try_send_advertise_transaction_ids(ids.clone())
             }
         };
 
-        if let Err(error) = result {
-            debug!(
-                peer = ?session.peer_id(),
-                ?error,
-                "failed to queue Zakura legacy gossip frame"
-            );
-            if first_error.is_none() {
-                first_error = Some(error.into());
+        match result {
+            Ok(()) => fanout.delivered += 1,
+            Err(error) => {
+                debug!(
+                    peer = ?session.peer_id(),
+                    ?error,
+                    "failed to queue Zakura legacy gossip frame"
+                );
+                if fanout.first_error.is_none() {
+                    fanout.first_error = Some(error);
+                }
             }
         }
     }
-
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    Ok(())
+    fanout
 }
 
 /// Tower service that adapts legacy Zebra gossip requests onto Zakura streams.
@@ -5373,6 +5465,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_block_adverts_wait_for_the_first_native_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let (node_a, _rx_a) = legacy_node(61).await?;
+        let mut advertiser = ZakuraBlockAdvertiser::new(node_a.supervisor());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), advertiser.ready())
+                .await
+                .is_err(),
+            "with no native peer the advertiser is not ready"
+        );
+
+        let (node_b, mut rx_b) = legacy_node(62).await?;
+        node_a.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+        let block_hash = block_hash(61);
+
+        tokio::time::timeout(TEST_NET_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(block_hash.into()))
+            .await?;
+        match recv_request(&mut rx_b).await? {
+            Request::AdvertiseBlock(
+                crate::AdvertisedBlock { hash, .. },
+                Some(PeerSource::Zakura(peer_id)),
+            ) => {
+                assert_eq!(hash, block_hash);
+                assert_eq!(peer_id, a_peer_id);
+            }
+            request => panic!("unexpected B request: {request:?}"),
+        }
+
+        tokio::time::timeout(TEST_NET_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(block_hash.into()))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx_b.try_recv().is_err(),
+            "a delivered block is not sent again"
+        );
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_origin_echo_is_dropped_by_shared_first_seen_cache() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let (node_a, mut rx_a) = legacy_node(51).await?;
@@ -5427,13 +5566,14 @@ mod tests {
         let (honest, mut honest_rx) = framed_channel(1);
         let block_hash = block_hash(7);
 
-        let result = send_to_sessions(
+        let result = fan_out(
             vec![
                 LegacyGossipPeerSession::new(saturated_peer, 0, 0, saturated),
                 LegacyGossipPeerSession::new(honest_peer, 0, 0, honest),
             ],
-            LegacyGossipFrame::AdvertiseBlock(block_hash),
-        );
+            &LegacyGossipFrame::AdvertiseBlock(block_hash),
+        )
+        .into_result();
         let outbound = tokio::time::timeout(Duration::from_secs(1), honest_rx.recv())
             .await?
             .expect("honest peer receives fanout");
@@ -5447,6 +5587,117 @@ mod tests {
             "saturated peer failure is reported after honest peer is attempted"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn fan_out_counts_delivered_sessions() -> Result<(), BoxError> {
+        let (saturated, _saturated_rx) = framed_channel(1);
+        saturated.try_send(Frame {
+            message_type: MSG_ADVERTISE_BLOCK,
+            flags: 0,
+            payload: vec![1],
+        })?;
+        let (honest, mut honest_rx) = framed_channel(1);
+        let (closed, closed_rx) = framed_channel(1);
+        drop(closed_rx);
+        let session = |byte: u8, send| {
+            let peer = ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds");
+            LegacyGossipPeerSession::new(peer, 0, 0, send)
+        };
+        let block_hash = block_hash(8);
+
+        let fanout = fan_out(
+            vec![
+                session(1, saturated),
+                session(2, honest),
+                session(3, closed),
+            ],
+            &LegacyGossipFrame::AdvertiseBlock(block_hash),
+        );
+
+        assert_eq!(fanout.attempted, 3);
+        assert_eq!(
+            fanout.delivered, 1,
+            "only the honest session queued the frame"
+        );
+        assert!(fanout.first_error.is_some());
+        let outbound = tokio::time::timeout(Duration::from_secs(1), honest_rx.recv())
+            .await?
+            .expect("honest peer receives fanout");
+        assert_eq!(
+            LegacyGossipFrame::decode_frame(outbound)?,
+            LegacyGossipFrame::AdvertiseBlock(block_hash)
+        );
+        assert!(
+            fanout.into_result().is_err(),
+            "gossip reports the refusal even though one session took the frame"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_count_follows_insert_finish_and_remove() -> Result<(), BoxError> {
+        let outbound = LegacyGossipOutbound::default();
+        let mut count = outbound.subscribe_session_count();
+        let peer = ZakuraPeerId::new(vec![4; 32]).expect("test peer id is within bounds");
+        let session = |conn_id, session_id| {
+            LegacyGossipPeerSession::new(peer.clone(), conn_id, session_id, framed_channel(1).0)
+        };
+
+        assert!(outbound.insert(session(1, 1)));
+        assert!(count.has_changed()?);
+        assert_eq!(*count.borrow_and_update(), 1);
+
+        assert!(
+            !outbound.insert(session(0, 1)),
+            "an older connection does not replace the session"
+        );
+        assert!(!count.has_changed()?, "a refused insert is no change");
+
+        outbound.finish_session(&peer, 1, 2, false);
+        assert!(!count.has_changed()?, "a stale session id is no change");
+
+        outbound.finish_session(&peer, 1, 1, false);
+        assert!(count.has_changed()?);
+        assert_eq!(*count.borrow_and_update(), 0);
+
+        assert!(outbound.insert(session(2, 1)));
+        assert_eq!(*count.borrow_and_update(), 1);
+        assert!(
+            outbound.insert(session(3, 1)),
+            "a newer connection replaces the session"
+        );
+        assert!(
+            count.has_changed()?,
+            "a replaced session is published even though the count is unchanged"
+        );
+        assert_eq!(*count.borrow_and_update(), 1);
+
+        outbound.remove(&peer, 3);
+        assert!(count.has_changed()?);
+        assert_eq!(*count.borrow_and_update(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_whose_writer_closed_is_not_open() {
+        let outbound = LegacyGossipOutbound::default();
+        let peer = ZakuraPeerId::new(vec![5; 32]).expect("test peer id is within bounds");
+        let (send, recv) = framed_channel(1);
+        assert!(outbound.insert(LegacyGossipPeerSession::new(peer, 0, 0, send)));
+        assert!(outbound.has_open_session());
+
+        drop(recv);
+
+        assert_eq!(
+            outbound.session_count(),
+            1,
+            "the session stays until its stream exits"
+        );
+        assert!(
+            !outbound.has_open_session(),
+            "a session whose writer is gone cannot take a frame"
+        );
     }
 
     #[tokio::test]
@@ -5818,10 +6069,11 @@ mod tests {
         let (disconnected, rx) = framed_channel(1);
         drop(rx);
 
-        let error = send_to_sessions(
+        let error = fan_out(
             vec![LegacyGossipPeerSession::new(peer_id, 0, 0, disconnected)],
-            LegacyGossipFrame::AdvertiseBlock(block_hash(8)),
+            &LegacyGossipFrame::AdvertiseBlock(block_hash(8)),
         )
+        .into_result()
         .expect_err("closed outbound queue reports an adapter error");
         assert!(
             error

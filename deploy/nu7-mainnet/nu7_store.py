@@ -10,17 +10,22 @@ Three tables, all written by the collector and read by the JSON API:
 - `samples`: one row per sample tick (mempool, peers, latency summaries and
   node health). Pruned after `SAMPLE_RETENTION_SECONDS`.
 - `events`: reorgs, counter resets and other things worth a marker on a chart.
-- `meta`: schema version and the last counter snapshot, so a collector restart
-  does not lose a block's attribution.
+- `meta`: schema version, the last counter snapshot (so a collector restart
+  does not lose a block's attribution) and the frozen difficulty projection.
+
+Opening a database created by an older collector adds the columns it lacks.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Every loop opens its own connection at start; only one of them may alter the table.
+MIGRATION_LOCK = threading.Lock()
 SAMPLE_RETENTION_SECONDS = 7 * 24 * 3600
 
 BLOCK_COLUMNS = [
@@ -33,7 +38,15 @@ BLOCK_COLUMNS = [
     "pool_transparent_zat", "pool_sprout_zat", "pool_sapling_zat",
     "pool_orchard_zat", "pool_ironwood_zat", "pool_lockbox_zat",
     "chain_supply_zat", "merged_from", "nu7_active", "source",
+    # Schema 2: who mined the block, and the difficulty model's verdict on it.
+    "miner_tag", "miner_address", "miner_id", "expected_bits", "daa_ok",
+    "hashrate_solps", "expected_interval_s",
 ]
+
+BLOCK_COLUMN_TYPES = {
+    "miner_tag": "TEXT", "miner_address": "TEXT", "miner_id": "TEXT", "expected_bits": "TEXT",
+    "expected_interval_s": "REAL",
+}
 
 SAMPLE_COLUMNS = [
     "t", "height", "mempool_tx", "mempool_bytes", "mempool_actions_paid",
@@ -59,7 +72,9 @@ CREATE TABLE IF NOT EXISTS blocks (
   transparent_outputs INTEGER, pool_transparent_zat INTEGER, pool_sprout_zat INTEGER,
   pool_sapling_zat INTEGER, pool_orchard_zat INTEGER, pool_ironwood_zat INTEGER,
   pool_lockbox_zat INTEGER, chain_supply_zat INTEGER, merged_from INTEGER,
-  nu7_active INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'live'
+  nu7_active INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'live',
+  miner_tag TEXT, miner_address TEXT, miner_id TEXT, expected_bits TEXT, daa_ok INTEGER,
+  hashrate_solps INTEGER, expected_interval_s REAL
 );
 CREATE TABLE IF NOT EXISTS samples (
   t REAL PRIMARY KEY, height INTEGER, mempool_tx INTEGER, mempool_bytes INTEGER,
@@ -88,10 +103,25 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(SCHEMA)
+        self.add_missing_block_columns()
         self.set_meta("schema_version", SCHEMA_VERSION)
 
     def close(self):
         self.connection.close()
+
+    def add_missing_block_columns(self):
+        """Bring a database from an older schema up to date: new block columns are nullable, so ADD COLUMN suffices."""
+        with MIGRATION_LOCK:
+            present = {row["name"] for row in self.connection.execute("PRAGMA table_info(blocks)")}
+            for column in BLOCK_COLUMNS:
+                if column in present:
+                    continue
+                try:
+                    self.connection.execute(f"ALTER TABLE blocks ADD COLUMN {column} {BLOCK_COLUMN_TYPES.get(column, 'INTEGER')}")
+                except sqlite3.OperationalError as error:
+                    # Another process added it between the PRAGMA and the ALTER.
+                    if "duplicate column" not in str(error):
+                        raise
 
     # -- meta ---------------------------------------------------------------
 
@@ -229,6 +259,49 @@ class Store:
             (count,),
         ).fetchall()
         return [(row["height"], row["interval_s"]) for row in reversed(rows)]
+
+    def headers_before(self, height, count):
+        """(bits, time) of up to `count` stored blocks below `height`, newest first: the difficulty rule's context."""
+        rows = self.connection.execute(
+            "SELECT bits, time FROM blocks WHERE height < ? AND bits IS NOT NULL ORDER BY height DESC LIMIT ?",
+            (height, count),
+        ).fetchall()
+        return [(row["bits"], row["time"]) for row in rows]
+
+    def blocks_without_annotation(self, limit):
+        """Heights of stored blocks that still lack a miner or a difficulty check, oldest first."""
+        rows = self.connection.execute(
+            "SELECT height FROM blocks WHERE miner_id IS NULL OR expected_interval_s IS NULL "
+            "ORDER BY height ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [row["height"] for row in rows]
+
+    def miner_rows(self, since_height=None, since_time=None, until_height=None):
+        """(height, time, miner_id) of attributed blocks in a height or time range, oldest first."""
+        clauses = ["miner_id IS NOT NULL"]
+        params = []
+        if since_height is not None:
+            clauses.append("height >= ?")
+            params.append(since_height)
+        if until_height is not None:
+            clauses.append("height < ?")
+            params.append(until_height)
+        if since_time is not None:
+            clauses.append("time >= ?")
+            params.append(since_time)
+        rows = self.connection.execute(
+            f"SELECT height, time, miner_id FROM blocks WHERE {' AND '.join(clauses)} ORDER BY height ASC",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def daa_check_counts(self):
+        """How many stored blocks the difficulty model judged, and how many it matched."""
+        row = self.connection.execute(
+            "SELECT COUNT(daa_ok) AS checked, COALESCE(SUM(daa_ok), 0) AS matched FROM blocks"
+        ).fetchone()
+        return row["checked"], row["matched"]
 
     def fee_totals_since(self, height):
         """Summed fees over the stored blocks at or above `height` that carry fee data."""

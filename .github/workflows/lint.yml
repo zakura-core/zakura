@@ -278,7 +278,7 @@ jobs:
 
       - name: NU7 mainnet dashboard tests
         if: ${{ !cancelled() }}
-        run: python3 deploy/nu7-mainnet/test_collector.py
+        run: python3 -m unittest discover -s deploy/nu7-mainnet -p 'test_*.py'
 
       - name: Compatibility monitoring tests
         if: ${{ !cancelled() }}

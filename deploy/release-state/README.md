@@ -203,8 +203,15 @@ steps above for the new ready-set path.
   retained`: the grid export ran against a pruned database. Point it at an
   archive one.
 - `Sprout note commitments were appended at ...`: a v4 JoinSplit landed just
-  below the state tip; the next day's export self-heals once the checkpoint
-  grid passes that block.
+  above the selected checkpoint and the exporter has no reviewed frontier at or
+  below that height. With a current Mainnet exporter, retained blocks extend the
+  embedded Sprout frontier through the selected checkpoint. Replay continues to
+  the finalized tip and must reproduce its stored Sprout root before publication.
+  Older exporters require waiting until the checkpoint grid passes that block.
+- `Sprout replay checkpoint ... does not match` or `Sprout replay does not match`:
+  the retained chain or replayed commitments disagree with the reviewed checkpoint
+  or stored tip frontier. Publication stops; investigate the database and exporter
+  before retrying.
 - `existing bundle at this height has different contents`: determinism broke
   (or the bucket was tampered with) — investigate before deleting anything.
 - `another release-state publisher is already running`: wait for the active

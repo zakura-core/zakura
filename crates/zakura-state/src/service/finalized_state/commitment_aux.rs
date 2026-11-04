@@ -118,10 +118,10 @@ pub enum FinalFrontiersGenerationError {
         tip: block::Height,
     },
 
-    /// A block body needed to prove the Sprout frontier is settled was not retained.
+    /// A block body needed to scan or replay the Sprout frontier was not retained.
     #[error(
         "cannot produce final frontiers at height {height:?}: block {missing:?} below finalized \
-         tip {tip:?} is not retained, so the settled-Sprout scan cannot run"
+         tip {tip:?} is not retained, so the Sprout frontier scan or replay cannot run"
     )]
     MissingBlockInSproutWindow {
         /// The unretained block height.
@@ -130,6 +130,27 @@ pub enum FinalFrontiersGenerationError {
         height: block::Height,
         /// The finalized database tip height.
         tip: block::Height,
+    },
+
+    /// The retained chain does not contain the reviewed replay checkpoint.
+    #[error("Sprout replay checkpoint {height:?} does not match the finalized database")]
+    SproutReplayCheckpointMismatch {
+        /// The reviewed checkpoint used to seed replay.
+        height: block::Height,
+    },
+
+    /// Replaying retained commitments could not reproduce the stored tip tree.
+    #[error("Sprout replay does not match the stored frontier at finalized tip {tip:?}")]
+    SproutReplayTipMismatch {
+        /// The finalized tip used to verify replay.
+        tip: block::Height,
+    },
+
+    /// Retained commitments exceed the Sprout tree capacity.
+    #[error("Sprout tree capacity exceeded while replaying block {height:?}")]
+    SproutReplayTreeFull {
+        /// The block whose commitment could not be appended.
+        height: block::Height,
     },
 }
 
@@ -609,9 +630,10 @@ fn produce_final_frontiers_with_post_read(
 ///
 /// Sprout stores only its current tip frontier, so this proves the tip frontier is also the
 /// frontier at `height` before pairing them: it scans every retained block body in
-/// `(height, tip]` and fails closed if any block appended Sprout note commitments
-/// ([`FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight`]) or is not retained
-/// ([`FinalFrontiersGenerationError::MissingBlockInSproutWindow`]). See
+/// `(height, tip]`. If that window changes Sprout, replay from the reviewed embedded
+/// checkpoint instead, and verify the replay against the stored tip frontier. Replay
+/// requires a checkpoint at or below `height` and all intervening block bodies.
+/// Missing bodies or mismatched roots fail closed. See
 /// [`produce_final_frontiers`] for the tip-only variant that needs no scan.
 pub(super) fn produce_settled_final_frontiers(
     db: &ZakuraDb,
@@ -638,17 +660,94 @@ pub(super) fn produce_settled_final_frontiers(
             last_change = Some(scan_height);
         }
     }
-    if let Some(last_change) = last_change {
+    let historical_sprout = if let Some(last_change) = last_change {
+        let network = db.network();
+        let checkpoint = super::vct::embedded_final_frontiers(&network)
+            .filter(|checkpoint| checkpoint.height <= height)
+            .ok_or(
+                FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight {
+                    last_change,
+                    height,
+                    tip,
+                },
+            )?;
+        let checkpoint_hash = network
+            .checkpoint_list()
+            .hash(checkpoint.height)
+            .expect("the embedded frontier is verified against its network checkpoint");
+        Some(replay_sprout_frontier(
+            db,
+            height,
+            tip,
+            (checkpoint.height, checkpoint_hash, checkpoint.sprout),
+        )?)
+    } else {
+        None
+    };
+
+    let mut frontiers = read_final_frontiers_at(db, height, before, || {})?;
+    if let Some(sprout) = historical_sprout {
+        frontiers.sprout = sprout;
+    }
+    Ok(frontiers)
+}
+
+/// Recover a historical Sprout frontier from a reviewed chain checkpoint.
+///
+/// Continue past the requested height to authenticate the replay against the stored
+/// tip frontier. This checks commitments on both sides of the requested height and
+/// prevents a wrong starting tree from silently becoming a release artifact.
+fn replay_sprout_frontier(
+    db: &ZakuraDb,
+    height: block::Height,
+    tip: block::Height,
+    checkpoint: (
+        block::Height,
+        block::Hash,
+        Arc<sprout::tree::NoteCommitmentTree>,
+    ),
+) -> Result<Arc<sprout::tree::NoteCommitmentTree>, FinalFrontiersGenerationError> {
+    let (checkpoint_height, checkpoint_hash, mut replayed) = checkpoint;
+    if db.hash(checkpoint_height) != Some(checkpoint_hash) {
         return Err(
-            FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight {
-                last_change,
-                height,
-                tip,
+            FinalFrontiersGenerationError::SproutReplayCheckpointMismatch {
+                height: checkpoint_height,
             },
         );
     }
 
-    read_final_frontiers_at(db, height, before, || {})
+    let mut historical = (checkpoint_height == height).then(|| replayed.clone());
+    for raw_height in checkpoint_height.0.saturating_add(1)..=tip.0 {
+        let replay_height = block::Height(raw_height);
+        let block = db.block(replay_height.into()).ok_or(
+            FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+                missing: replay_height,
+                height,
+                tip,
+            },
+        )?;
+        for commitment in block.sprout_note_commitments() {
+            Arc::make_mut(&mut replayed)
+                .append(*commitment)
+                .map_err(|_| FinalFrontiersGenerationError::SproutReplayTreeFull {
+                    height: replay_height,
+                })?;
+        }
+        if replay_height == height {
+            historical = Some(replayed.clone());
+        }
+    }
+
+    let stored_tip = db
+        .sprout_tree_for_tip()
+        .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;
+    if replayed.root() != stored_tip.root() {
+        return Err(FinalFrontiersGenerationError::SproutReplayTipMismatch { tip });
+    }
+    Ok(
+        historical
+            .expect("the requested height is between the replay checkpoint and finalized tip"),
+    )
 }
 
 /// Read the four frontiers for `height` and re-check that the tip identity `before` did not
@@ -1267,6 +1366,135 @@ mod tests {
         assert!(
             changed.sprout_note_commitments().next().is_some(),
             "block 396 appends the first Mainnet Sprout note commitments"
+        );
+    }
+
+    /// Block 396 contains Mainnet's first Sprout commitments. Its predecessor
+    /// therefore supplies a known empty frontier for historical replay tests.
+    fn sprout_replay_db(retain_change: bool) -> (ZakuraDb, block::Hash) {
+        let db = ephemeral_mainnet_db();
+        let blocks: [Option<&[u8]>; 2] = [
+            Some(zakura_test::vectors::BLOCK_MAINNET_395_BYTES.as_ref()),
+            retain_change.then_some(zakura_test::vectors::BLOCK_MAINNET_396_BYTES.as_ref()),
+        ];
+        for bytes in blocks.into_iter().flatten() {
+            let block: Arc<block::Block> = bytes
+                .zcash_deserialize_into()
+                .expect("Mainnet replay block deserializes");
+            let finalized = FinalizedBlock::from_checkpoint_verified(
+                CheckpointVerifiedBlock::from(block),
+                Treestate::default(),
+            );
+            let mut batch = DiskWriteBatch::new();
+            batch
+                .prepare_block_header_and_transaction_data_batch(&db, &finalized, true, None)
+                .expect("Mainnet replay block is retained");
+            db.write_batch(batch)
+                .expect("Mainnet replay block is stored");
+        }
+        let changed: block::Block = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
+            .zcash_deserialize_into()
+            .expect("Mainnet block 396 deserializes");
+        let mut tip_tree = sprout::tree::NoteCommitmentTree::default();
+        for commitment in changed.sprout_note_commitments() {
+            tip_tree
+                .append(*commitment)
+                .expect("the first Sprout tree is not full");
+        }
+        seed_sprout_tree(&db, &tip_tree);
+        let mut batch = DiskWriteBatch::new();
+        let hashes = db.db().cf_handle("hash_by_height").unwrap();
+        batch.zs_insert(&hashes, block::Height(396), changed.hash());
+        db.write_batch(batch).expect("the finalized tip is seeded");
+        let checkpoint_hash = db.hash(block::Height(395)).expect("block 395 is retained");
+        (db, checkpoint_hash)
+    }
+
+    #[test]
+    fn sprout_replay_preserves_frontier_before_later_joinsplit() {
+        let _init_guard = zakura_test::init();
+        let (db, hash) = sprout_replay_db(true);
+        let historical = replay_sprout_frontier(
+            &db,
+            block::Height(395),
+            block::Height(396),
+            (block::Height(395), hash, Arc::new(Default::default())),
+        )
+        .expect("retained blocks reproduce the stored tip frontier");
+        assert_eq!(historical.count(), 0, "later commitments are excluded");
+        assert_ne!(historical.root(), db.sprout_tree_for_tip().unwrap().root());
+        let at_tip = replay_sprout_frontier(
+            &db,
+            block::Height(396),
+            block::Height(396),
+            (block::Height(395), hash, Arc::new(Default::default())),
+        )
+        .expect("replay includes commitments at the requested height");
+        assert_eq!(at_tip.root(), db.sprout_tree_for_tip().unwrap().root());
+        assert_eq!(
+            at_tip.count(),
+            2,
+            "the first JoinSplit appends both output notes"
+        );
+    }
+
+    #[test]
+    fn sprout_replay_rejects_checkpoint_on_another_chain() {
+        let _init_guard = zakura_test::init();
+        let (db, _) = sprout_replay_db(true);
+        assert_eq!(
+            replay_sprout_frontier(
+                &db,
+                block::Height(395),
+                block::Height(396),
+                (
+                    block::Height(395),
+                    block::Hash([0; 32]),
+                    Arc::new(Default::default())
+                ),
+            )
+            .expect_err("a foreign checkpoint must not seed replay"),
+            FinalFrontiersGenerationError::SproutReplayCheckpointMismatch {
+                height: block::Height(395)
+            }
+        );
+    }
+
+    #[test]
+    fn sprout_replay_rejects_wrong_starting_tree() {
+        let _init_guard = zakura_test::init();
+        let (db, hash) = sprout_replay_db(true);
+        assert_eq!(
+            replay_sprout_frontier(
+                &db,
+                block::Height(395),
+                block::Height(396),
+                (block::Height(395), hash, Arc::new(sprout_tree_with_note(1))),
+            )
+            .expect_err("a wrong seed must fail the stored tip comparison"),
+            FinalFrontiersGenerationError::SproutReplayTipMismatch {
+                tip: block::Height(396)
+            }
+        );
+    }
+
+    #[test]
+    fn sprout_replay_rejects_missing_block_bodies() {
+        let _init_guard = zakura_test::init();
+        let (db, hash) = sprout_replay_db(false);
+        assert_eq!(
+            replay_sprout_frontier(
+                &db,
+                block::Height(395),
+                block::Height(396),
+                (block::Height(395), hash, Arc::new(Default::default())),
+            )
+            .expect_err("missing commitments must not be treated as an empty block"),
+            FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+                missing: block::Height(396),
+                height: block::Height(395),
+                tip: block::Height(396)
+            }
         );
     }
 

@@ -96,14 +96,15 @@ pub(super) fn classify_dial(
 ) -> Option<DiscoveryDialResult> {
     use DiscoveryDialResult as Result;
     Some(match observation {
-        DialObservation::DialEnded(_, PeerRegistration::Live) => Result::ConnectedElsewhere,
-        // The registration watch can lag a dial that already finished serving.
-        DialObservation::DialEnded(_, PeerRegistration::Ended)
+        // The registration watch can lag a dial that already finished
+        // serving, in either direction.
+        DialObservation::DialEnded(_, PeerRegistration::Live | PeerRegistration::Ended)
         | DialObservation::DialEnded(DialFinish::Served, PeerRegistration::Absent)
             if registered =>
         {
             Result::ShortLivedRegistered
         }
+        DialObservation::DialEnded(_, PeerRegistration::Live) => Result::ConnectedElsewhere,
         DialObservation::DialEnded(finish, _) => match finish {
             DialFinish::LocalLimit => Result::LocalResourceLimit,
             DialFinish::AlpnMismatch => Result::AlpnMismatch,

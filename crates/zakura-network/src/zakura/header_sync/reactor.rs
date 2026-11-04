@@ -782,7 +782,22 @@ impl HeaderSyncReactor {
             previous.is_some(),
             "sessions and schedules share their keys"
         );
-        observe!(self, ReactorEvent::SessionAdmitted { peer: peer.clone() });
+        observe!(self, {
+            let admitted = &self
+                .sessions
+                .get(&peer)
+                .expect("the admitted peer was just installed")
+                .session;
+            ReactorEvent::SessionAdmitted {
+                peer: peer.clone(),
+                session_id: admitted.session_id(),
+                direction,
+                replaced: previous
+                    .as_ref()
+                    .map(|previous| previous.session.session_id()),
+                origin: admitted.origin(),
+            }
+        });
         if let Some(previous) = previous {
             previous.session.cancel_token().cancel();
             if let Some((owner, source)) = replaced_repair.and_then(|(owner, source, phase)| {
@@ -851,6 +866,14 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
         self.sessions.remove(peer);
+        observe!(
+            self,
+            ReactorEvent::SessionEnded {
+                peer: peer.clone(),
+                session_id,
+                reason,
+            }
+        );
         let limits = self.startup.config.peer_limits;
         self.state.remove_session(
             peer,

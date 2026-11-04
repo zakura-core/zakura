@@ -294,6 +294,20 @@ impl CloseCauseReader {
     }
 }
 
+/// Where a service session came from: its connection, QUIC stream and
+/// service generation. It travels with the session apart from the session ID
+/// the service is handed, so a simulator check can compare the two.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionOrigin {
+    /// The connection that carries the session.
+    pub connection: ZakuraConnId,
+    /// The session's QUIC stream ID, or `None` on an in-memory link.
+    pub quic_stream: Option<u64>,
+    /// The service generation the transport installed for it.
+    pub generation: u64,
+}
+
 /// Per-peer transport state handed to a service when a peer connects.
 #[derive(Debug)]
 pub struct Peer {
@@ -311,6 +325,9 @@ pub struct Peer {
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
     close_cause: CloseCause,
+    /// Where the session came from, if whoever built the peer said.
+    #[cfg(any(test, zakura_sim))]
+    origin: Option<SessionOrigin>,
 }
 
 impl Peer {
@@ -504,7 +521,24 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            #[cfg(any(test, zakura_sim))]
+            origin: None,
         }
+    }
+
+    /// This peer, carrying `origin` to the service that admits its session.
+    #[cfg(any(test, zakura_sim))]
+    pub fn with_origin(self, origin: SessionOrigin) -> Self {
+        Self {
+            origin: Some(origin),
+            ..self
+        }
+    }
+
+    /// Where this peer's session came from, if its builder said.
+    #[cfg(any(test, zakura_sim))]
+    pub fn origin(&self) -> Option<SessionOrigin> {
+        self.origin
     }
 
     /// Take ownership of a stream's receive and send handles for `kind`.

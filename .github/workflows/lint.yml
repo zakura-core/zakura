@@ -274,7 +274,7 @@ jobs:
         run: |
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
-          python3 deploy/runner/test_nu7_activation.py
+          python3 -m unittest discover -s deploy/runner -p 'test_nu7_*.py'
 
       - name: Compatibility monitoring tests
         if: ${{ !cancelled() }}

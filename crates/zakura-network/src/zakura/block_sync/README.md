@@ -80,7 +80,7 @@ separate serving/read reservation contract.
 | Purpose | unblock the contiguous prefix so the committer keeps moving | fill the look-ahead buffer so the bursty committer never starves |
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
-| Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one body when `try_reserve` fails — reachable even at zero in-flight budget; liveness rule 3 bounds the total | non-blocking `try_reserve`; refused if the in-flight budget is spent |
+| Byte funding | `TakenRequest::admit` permits an owned overdraft for floor progress while accounting stays open; liveness rule 3 bounds the total | `TakenRequest::admit` refuses the request if the in-flight budget is spent |
 | Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
@@ -91,6 +91,33 @@ inside bypass an equal-RTprop peer is preferred too, so scarce bypass slots are 
 only when nobody better can move the floor. If every servable peer is saturated, nobody
 defers and the floor still moves.
 
+### Accounting closure
+
+The request budget permanently closes its generation when an accounting operation
+fails. The queue, unpublished requests, and writers consult the same closure flag.
+Closure rejects normal and floor admission, publication, and new writer starts.
+Existing owners retain their charges and can settle them. A frontier reset cannot
+reopen the budget or erase unmatched funding.
+
+The first closure emits an error with its cause, current charge, and budget limit.
+A funding audit also includes the logical and funded totals in that cause.
+A lock acquisition that finds a poisoned queue closes the same budget generation.
+Cleanup recovers the guard so request owners can settle during unwind. The queue
+notifies closure waiters after unlocking. Retained receipts and unrelated
+reservations remain charged until their own owners finish.
+
+The sequencer publishes `accounting_closed` in its view and block-state trace.
+Fill passes report `accounting_closed` separately from capacity exhaustion.
+Typed admission refusals also distinguish cancellation and stale claims.
+
+The queue guard notifies closure waiters after unlocking, including during unwind.
+Counter release also publishes closure if its arithmetic fails. The driver reads
+this signal independently of action-queue capacity and sequencer-view publication.
+It stops starting verification work, discards queued work, and drains its in-flight
+verification futures. Its exit triggers the existing critical-driver supervisor,
+which starts node shutdown. Recovery requires a new process. The old budget never
+reopens, and the node creates no replacement subsystem in the same process.
+
 ## Look-ahead rules: `admit()` and the commit window
 
 Request admission decisions go through one pure function, `admission::admit(config,
@@ -98,13 +125,6 @@ snapshot, start_height, servable_high, response_byte_cap)`. It is the single aut
 for the commit-window exemption, the resident-memory gate, and request sizing — the
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
 sizing.
-
-The one deliberate exception is `admission::admit_received_body`, the retention-only
-gate for a body that is already downloaded (the unmatched-fallthrough path). A received
-body consumes no request budget, so it applies the same commit-window exemption and
-resident gate but never consults `budget_available` — a wire budget saturated by
-outstanding requests must not force an already-paid-for body to be dropped and
-re-downloaded.
 
 ### The commit window
 
@@ -173,7 +193,7 @@ Two gates, checked together in `lookahead_over_budget`:
   config knob).
 
 This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
-default 6 GiB, tracked by `ByteBudget`): that bounds outstanding request
+derived as `x × C`, 2,944 MiB at the defaults, tracked by `ByteBudget`): that bounds outstanding request
 reservations — charged at issuance, released at receipt (or timeout/watchdog/
 reset/floor GC) — while the request look-ahead gate paces incoming work.
 
@@ -225,11 +245,11 @@ derives the whole-node bound. The plateau can still exceed the budget by:
 
 1. **Commit-window heights are always fundable**, on both lanes, regardless of the
    look-ahead gates — a pinned checkpoint range can always assemble.
-2. **Floor grants never size below one byte**, and `take_in_range_budgeted` always
+2. **Floor grants never size below one byte**, and `take_request` always
    takes its first item regardless of the byte cap — so the floor block is taken even
    when the in-flight budget is exactly full, reaching the floor reservation path…
 3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
-   `reserve_request_budget`'s Floor path charges the reservation past the max `M`,
+   `TakenRequest::admit`'s Floor path charges the reservation past the max `M`,
    repaid through the normal release discipline. The overshoot is bounded: only a
    request starting at the floor or the next height is floor-priority, and the
    WorkQueue gives each height one owner, so at most two overdrafts are live, each
@@ -292,7 +312,7 @@ so only a reader that sees no request in transition can compare them.
 | Knob | Default | Notes |
 | --- | --- | --- |
 | `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
-| `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
+| `max_inflight_block_bytes` | unset: `x × C` (92 × 32 MiB = 2,944 MiB) | outstanding-request wire budget, released at receipt (separate from the resident gate) |
 | `max_blocks_per_response` | 1 (fixed) | deprecated and ignored; requests always carry one block, and serving answers a larger request with a one-block prefix |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
 | `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |

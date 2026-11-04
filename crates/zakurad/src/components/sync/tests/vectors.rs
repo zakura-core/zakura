@@ -174,12 +174,12 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -255,14 +255,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -332,14 +332,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block3.clone(),
+            block3.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block4.clone(),
+            block4.clone().into(),
             None,
         ))]));
 
@@ -408,12 +408,12 @@ async fn sync_singleton_obtain_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -467,12 +467,12 @@ async fn sync_singleton_obtain_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
+            block1.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block1))
+        .expect_request(zakura_consensus::Request::Commit(block1.into()))
         .await
         .respond(block1_hash);
 
@@ -526,12 +526,12 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -597,14 +597,14 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -667,12 +667,12 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block3.clone(),
+            block3.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block3))
+        .expect_request(zakura_consensus::Request::Commit(block3.into()))
         .await
         .respond(block3_hash);
 
@@ -777,7 +777,10 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         peer_set
             .expect_request(zn::Request::BlocksByHash(iter::once(*hash).collect()))
             .await
-            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+            .respond(zn::Response::Blocks(vec![Available((
+                block.clone().into(),
+                None,
+            ))]));
     }
 
     // Hold blocks 1-2 in the verifier. A checkpoint verifier cannot verify a partial range, so these
@@ -823,7 +826,7 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         .expect_request(zn::Request::BlocksByHash(iter::once(hashes[3]).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            blocks[3].clone(),
+            blocks[3].clone().into(),
             None,
         ))]));
     pending_verifications.push(
@@ -889,7 +892,7 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         .expect_request(zn::Request::BlocksByHash(iter::once(hashes[4]).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            blocks[4].clone(),
+            blocks[4].clone().into(),
             None,
         ))]));
     pending_verifications.push(
@@ -975,7 +978,7 @@ async fn sync_block_lookahead_drop() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block982k.clone(),
+            block982k.clone().into(),
             None,
         ))]));
 
@@ -1046,12 +1049,12 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -1139,21 +1142,21 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block982k.clone(),
+            block982k.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -1232,12 +1235,12 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
+            block0.clone().into(),
             None,
         ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
+        .expect_request(zakura_consensus::Request::Commit(block0.into()))
         .await
         .respond(block0_hash);
 
@@ -1313,14 +1316,14 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
+            block1.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
+            block2.clone().into(),
             None,
         ))]));
 
@@ -1392,14 +1395,14 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block3.clone(),
+            block3.clone().into(),
             None,
         ))]));
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block4.clone(),
+            block4.clone().into(),
             None,
         ))]));
     peer_set
@@ -1408,7 +1411,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            block982k.clone(),
+            block982k.clone().into(),
             None,
         ))]));
 
@@ -1613,7 +1616,10 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
                 request,
                 zn::Request::BlocksByHash(iter::once(block0_hash).collect())
             );
-            Ok::<_, crate::BoxError>(zn::Response::Blocks(vec![Available((peer_block, None))]))
+            Ok::<_, crate::BoxError>(zn::Response::Blocks(vec![Available((
+                peer_block.into(),
+                None,
+            ))]))
         }
     });
 
@@ -1947,10 +1953,13 @@ async fn transient_download_failure_requeues_and_clears_on_success() -> Result<(
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+        .respond(zn::Response::Blocks(vec![Available((
+            block.clone().into(),
+            None,
+        ))]));
 
     block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block))
+        .expect_request(zakura_consensus::Request::Commit(block.into()))
         .await
         .respond(block_hash);
 
@@ -2038,7 +2047,7 @@ async fn transient_download_failure_has_eight_peer_request_ceiling() -> Result<(
             .expect_request(zn::Request::BlocksByHash(iter::once(prime_hash).collect()))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                prime_block.clone(),
+                prime_block.clone().into(),
                 None,
             ))]));
         block_verifier_router
@@ -2154,7 +2163,7 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
                 );
                 unrelated_response_sent = true;
                 response.respond(zn::Response::Blocks(vec![Available((
-                    unrelated_block.clone(),
+                    unrelated_block.clone().into(),
                     None,
                 ))]));
             }
@@ -2173,7 +2182,7 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
             ))
             .await
             .respond(zn::Response::Blocks(vec![Available((
-                retried_block.clone(),
+                retried_block.clone().into(),
                 None,
             ))]));
         block_verifier_router
@@ -2214,7 +2223,7 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
                     iter::once(block.hash()).collect(),
                 ))
                 .await
-                .respond(zn::Response::Blocks(vec![Available((block, None))]));
+                .respond(zn::Response::Blocks(vec![Available((block.into(), None))]));
         }
         // The two verifier calls can arrive in either order.
         let first = verifier.expect_request_that(|_| true).await;
@@ -2240,9 +2249,12 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
             .expect_request(zn::Request::BlocksByHash(iter::once(child_hash).collect()))
             .await;
         parent_commit.respond(parent_hash);
-        retry.respond(zn::Response::Blocks(vec![Available((child.clone(), None))]));
+        retry.respond(zn::Response::Blocks(vec![Available((
+            child.clone().into(),
+            None,
+        ))]));
         verifier
-            .expect_request(zakura_consensus::Request::Commit(child))
+            .expect_request(zakura_consensus::Request::Commit(child.into()))
             .await
             .respond(child_hash);
     };
@@ -2471,9 +2483,12 @@ async fn verification_timeout_requeues_and_recovers() -> Result<(), crate::BoxEr
         peers
             .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
             .await
-            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+            .respond(zn::Response::Blocks(vec![Available((
+                block.clone().into(),
+                None,
+            ))]));
         verifier
-            .expect_request(zakura_consensus::Request::Commit(block))
+            .expect_request(zakura_consensus::Request::Commit(block.into()))
             .await
             .respond(hash);
         let response = chain_sync
@@ -2526,9 +2541,12 @@ async fn verification_timeout_restarts_after_retry_limit() -> Result<(), crate::
             peers
                 .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
                 .await
-                .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+                .respond(zn::Response::Blocks(vec![Available((
+                    block.clone().into(),
+                    None,
+                ))]));
             verifier
-                .expect_request(zakura_consensus::Request::Commit(block.clone()))
+                .expect_request(zakura_consensus::Request::Commit(block.clone().into()))
                 .await
                 .respond_error(
                     RouterError::Block {
@@ -2618,9 +2636,12 @@ async fn short_verify_timeout_starts_after_final_checkpoint() -> Result<(), crat
         peers
             .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
             .await
-            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+            .respond(zn::Response::Blocks(vec![Available((
+                block.clone().into(),
+                None,
+            ))]));
         let commit = verifier
-            .expect_request(zakura_consensus::Request::Commit(block))
+            .expect_request(zakura_consensus::Request::Commit(block.into()))
             .await;
         tokio::time::advance(sync::FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT + Duration::from_secs(1))
             .await;
@@ -3792,7 +3813,7 @@ async fn tip_child_rejects_poisoned_coinbase_height() {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            poisoned,
+            poisoned.into(),
             Some(addr),
         ))]));
 
@@ -3853,7 +3874,7 @@ async fn tip_child_rejects_forged_high_coinbase_height() {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            poisoned,
+            poisoned.into(),
             Some(addr),
         ))]));
 
@@ -3934,15 +3955,18 @@ async fn unconfirmed_binding_reverifies_after_the_parent_commits() {
         peer_set
             .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
             .await
-            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+            .respond(zn::Response::Blocks(vec![Available((
+                block.clone().into(),
+                None,
+            ))]));
 
         verifier
-            .expect_request(zakura_consensus::Request::Commit(block.clone()))
+            .expect_request(zakura_consensus::Request::Commit(block.clone().into()))
             .await
             .respond(Err(unconfirmed_verifier_error(parent)));
         if parent_commits {
             verifier
-                .expect_request(zakura_consensus::Request::Commit(block.clone()))
+                .expect_request(zakura_consensus::Request::Commit(block.clone().into()))
                 .await
                 .respond(hash);
         }
@@ -4015,9 +4039,12 @@ async fn cancel_all_ends_a_parent_wait() {
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
         .await
-        .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+        .respond(zn::Response::Blocks(vec![Available((
+            block.clone().into(),
+            None,
+        ))]));
     verifier
-        .expect_request(zakura_consensus::Request::Commit(block))
+        .expect_request(zakura_consensus::Request::Commit(block.into()))
         .await
         .respond(Err(unconfirmed_verifier_error(parent)));
     wait_started.await.expect("the task waits for the parent");
@@ -4133,7 +4160,7 @@ async fn canonical_tip_child_reaches_the_verifier() {
         ))
         .await
         .respond(zn::Response::Blocks(vec![Available((
-            canonical.clone(),
+            canonical.clone().into(),
             None,
         ))]));
 
@@ -4184,7 +4211,7 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
-        .respond(zn::Response::Blocks(vec![Available((block1, None))]));
+        .respond(zn::Response::Blocks(vec![Available((block1.into(), None))]));
 
     let result = downloads
         .next()
@@ -4279,7 +4306,10 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
                     peer_set
                         .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
                         .await
-                        .respond(zn::Response::Blocks(vec![Available((candidate, None))]));
+                        .respond(zn::Response::Blocks(vec![Available((
+                            candidate.into(),
+                            None,
+                        ))]));
                     let error = downloads.next().await.unwrap().unwrap_err();
                     assert!(matches!(
                         error,
@@ -4554,7 +4584,7 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
         .await
-        .respond(zn::Response::Blocks(vec![Available((block1, None))]));
+        .respond(zn::Response::Blocks(vec![Available((block1.into(), None))]));
 
     let result = downloads
         .next()
@@ -4761,6 +4791,67 @@ fn scaled_lookahead_stays_below_the_drop_height() {
         assert!(
             Height(u32::try_from(LOOKAHEAD_LIMIT * multiplier).expect("fits")) <= genesis_drop,
             "multiplier {multiplier}"
+        );
+    }
+}
+
+#[test]
+fn backend_verification_total_sums_effective_limits_and_rejects_excess() {
+    use crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY;
+    use crate::components::sync::{
+        lookahead_limit_multiplier, BackendExecutionError, Config,
+        DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT, MAX_BACKEND_BLOCK_VERIFICATIONS,
+        MIN_CHECKPOINT_CONCURRENCY_LIMIT, MIN_CONCURRENCY_LIMIT,
+        VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
+    };
+
+    // Limits below their minimums count at the minimum the syncer raises them to.
+    let low = Config {
+        checkpoint_verify_concurrency_limit: 0,
+        full_verify_concurrency_limit: 0,
+        zakura_block_apply_concurrency_limit: 0,
+        ..Config::default()
+    };
+    for network in Network::iter() {
+        let multiplier = network
+            .activation_list()
+            .into_keys()
+            .map(|height| lookahead_limit_multiplier(&network, height))
+            .max()
+            .unwrap();
+        assert_eq!(
+            low.backend_verification_total(&network).unwrap(),
+            MIN_CHECKPOINT_CONCURRENCY_LIMIT
+                * multiplier
+                * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
+                + MIN_CONCURRENCY_LIMIT * multiplier
+                + 2 * MIN_CHECKPOINT_CONCURRENCY_LIMIT
+                + MAX_INBOUND_CONCURRENCY,
+            "{network}"
+        );
+
+        let default = Config::default();
+        let total = default.backend_verification_total(&network).unwrap();
+        assert!(total > default.full_verify_concurrency_limit * multiplier);
+        assert!(total > DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT);
+        assert!(total <= MAX_BACKEND_BLOCK_VERIFICATIONS);
+
+        let excess = Config {
+            full_verify_concurrency_limit: MAX_BACKEND_BLOCK_VERIFICATIONS,
+            ..Config::default()
+        };
+        assert!(matches!(
+            excess.backend_verification_total(&network),
+            Err(BackendExecutionError::AboveAllowance { .. })
+        ));
+
+        let overflow = Config {
+            checkpoint_verify_concurrency_limit: usize::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            overflow.backend_verification_total(&network),
+            Err(BackendExecutionError::Overflow)
         );
     }
 }

@@ -175,7 +175,10 @@ impl Harness {
                 }
 
                 match blocks.get(&hash) {
-                    Some(block) => Ok(zn::Response::Blocks(vec![Available((block.clone(), None))])),
+                    Some(block) => Ok(zn::Response::Blocks(vec![Available((
+                        block.clone().into(),
+                        None,
+                    ))])),
                     None => future::pending().await,
                 }
             }
@@ -195,7 +198,7 @@ impl Harness {
                         return Err("unexpected verifier request".into());
                     };
                     let hash = block.hash();
-                    let parent = block.header.previous_block_hash;
+                    let parent = block.header().previous_block_hash;
 
                     committed
                         .subscribe()

@@ -8,6 +8,7 @@
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
 use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
@@ -16,7 +17,7 @@ use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     chain_tip::{ChainTip, NoChainTip},
     serialization::SerializationError,
     transaction::{UnminedTx, UnminedTxId},
@@ -27,6 +28,7 @@ use crate::{
         self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
         OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
+    inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge},
     meta_addr::MetaAddr,
     peer::{
         block_gossip::{BlockAdvert, BlockAdvertError},
@@ -64,7 +66,7 @@ pub(super) enum Handler {
     FindHeaders,
     BlocksByHash {
         pending_hashes: HashSet<block::Hash>,
-        blocks: Vec<Arc<Block>>,
+        blocks: Vec<BlockHandle>,
     },
     TransactionsById {
         pending_ids: HashSet<UnminedTxId>,
@@ -428,7 +430,12 @@ impl Handler {
                 Handler::Finished(Ok(response))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
-                Handler::Finished(Ok(Response::BlockHeaders(headers)))
+                Handler::Finished(Ok(Response::BlockHeaders(
+                    headers
+                        .into_iter()
+                        .map(|counted| counted.header.into())
+                        .collect(),
+                )))
             }
 
             (Handler::MempoolTransactionIds, Message::Inv(items))
@@ -657,6 +664,12 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Funds decoded TCP payloads across this node's connections.
+    pub(super) inbound_budget: InboundBudget,
+
+    /// Funds the payloads of the current client request's response until its handoff.
+    response_charge: Option<InboundCharge>,
 }
 
 impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
@@ -675,6 +688,50 @@ where
             .field("last_metrics_state", &self.last_metrics_state)
             .field("last_overload_time", &self.last_overload_time)
             .finish()
+    }
+}
+
+/// Convert retained headers into their TCP wire form, and return the bytes this copies.
+///
+/// A shared header has no read admission to keep, so its wire form shares its
+/// allocation. A header with read admission keeps its slot for the original, and the
+/// returned bytes cover only the new allocations. No allocation is charged twice.
+fn wire_headers(
+    headers: &[zakura_node_services::block_memory::HeaderHandle],
+) -> (Vec<block::CountedHeader>, u64) {
+    use zakura_node_services::block_memory::HeaderHandle;
+
+    let mut copied_headers = 0u64;
+    let wire: Vec<_> = headers
+        .iter()
+        .map(|handle| {
+            let header = match handle {
+                HeaderHandle::Shared(header) => header.clone(),
+                HeaderHandle::Block(_) | HeaderHandle::Standalone(_) => {
+                    copied_headers = copied_headers.saturating_add(1);
+                    Arc::new(**handle)
+                }
+            };
+            block::CountedHeader { header }
+        })
+        .collect();
+    let copied_bytes = copied_headers
+        .saturating_mul(COPIED_HEADER_BYTES)
+        .saturating_add(vec_retained_bytes(&wire));
+    (wire, copied_bytes)
+}
+
+/// The bytes of one `Arc<Header>` allocation: the header and its two reference counts.
+// Widening usize to u64 is lossless on supported targets.
+const COPIED_HEADER_BYTES: u64 =
+    (std::mem::size_of::<block::Header>() + 2 * std::mem::size_of::<usize>()) as u64;
+
+/// The decoded bytes a `block` or `tx` message retains while a handler holds it.
+fn decoded_payload_bytes(message: &Message) -> u64 {
+    match message {
+        Message::Block(block) => block.decoded_bytes(),
+        Message::Tx(transaction) => transaction.transaction().retained_memory_size_bytes(),
+        _ => 0,
     }
 }
 
@@ -698,6 +755,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        inbound_budget: InboundBudget,
     ) -> Self {
         Connection {
             connection_info,
@@ -717,6 +775,8 @@ where
             addr_label,
             last_metrics_state: None,
             last_overload_time: None,
+            inbound_budget,
+            response_charge: None,
         }
     }
 }
@@ -759,6 +819,12 @@ where
         // TODO: turn this comment into a module-level comment, after splitting the module.
         loop {
             self.update_state_metrics(None);
+
+            // Each way out of a client request reaches this point before the next one
+            // starts, so one place ends the charge for its response's payloads.
+            if !matches!(self.state, State::AwaitingResponse { .. }) {
+                self.response_charge = None;
+            }
 
             // Every state change returns here before the next await, so the slot is current
             // whenever this task is waiting.
@@ -942,6 +1008,7 @@ where
                         Some(Err(e)) => self.fail_with(e).await,
                         Some(Ok(peer_msg)) => {
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
+                            let payload_bytes = decoded_payload_bytes(&peer_msg);
 
                             // Try to process the message using the handler.
                             // This extremely awkward construction avoids
@@ -963,6 +1030,11 @@ where
 
                             self.update_state_metrics(None);
 
+                            // The handler retains a consumed payload until its handoff.
+                            if request_msg.is_none() {
+                                self.charge_response_payload(payload_bytes);
+                            }
+
                             // A message can finish the response and still need inbound handling:
                             // a one-block inv can also be an announcement, and an unsolicited
                             // transaction ends the pending transaction batch. Deliver the reply
@@ -977,6 +1049,9 @@ where
                                 )
                             {
                                 self.deliver_finished_response();
+                                // The client now holds the payloads, so the inbound handling
+                                // below must not keep their charge.
+                                self.response_charge = None;
                             }
 
                             // If the handler returned the message, check whether it can also
@@ -1301,6 +1376,12 @@ where
 
         use InboundMessage::*;
 
+        let Some(_unsolicited_charge) = self.charge_unsolicited(&msg) else {
+            metrics::counter!("zcash.net.in.discarded", "reason" => "inbound_budget").increment(1);
+            debug!("TCP inbound bytes exhausted: dropping unsolicited transaction");
+            return None;
+        };
+
         let req = match msg {
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");
@@ -1509,6 +1590,34 @@ where
             Consumed => None,
             Unused => Some(msg),
         }
+    }
+
+    /// Charge a payload that the pending request's handler keeps until its handoff.
+    ///
+    /// A response to this node's own request never refuses, or the conformant peer
+    /// sending it would time out.
+    fn charge_response_payload(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let charge = self.inbound_budget.charge_committed(bytes);
+        match &mut self.response_charge {
+            Some(retained) => retained.merge(charge),
+            None => self.response_charge = Some(charge),
+        }
+    }
+
+    /// Charge an unsolicited message until its handler ends, or refuse it.
+    ///
+    /// Only a transaction carries a charge. An unsolicited block has no retained owner.
+    /// Nothing waits for unsolicited work, so a saturated budget refuses it, as a full
+    /// queue does.
+    fn charge_unsolicited(&self, msg: &Message) -> Option<InboundCharge> {
+        let bytes = match msg {
+            Message::Tx(_) => decoded_payload_bytes(msg),
+            _ => 0,
+        };
+        self.inbound_budget.try_charge(bytes)
     }
 
     /// Sends the finished response of the pending client request to the client, and makes the
@@ -1744,7 +1853,15 @@ where
                 }
             }
             Response::BlockHeaders(headers) => {
-                if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
+                // The handles keep their read admission until the send ends. The budget
+                // funds only the copies. This response answers a request the node
+                // already accepted, so its copies never refuse.
+                let (wire, copied_bytes) = wire_headers(&headers);
+                let copies = self.inbound_budget.charge_committed(copied_bytes);
+                let sent = self.peer_tx.send(Message::Headers(wire)).await;
+                drop(copies);
+                drop(headers);
+                if let Err(e) = sent {
                     self.fail_with(e).await
                 }
             }

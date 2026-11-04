@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
-    block::{Block, Header},
+    block::{BlockRef, Header},
     parameters::Network,
     serialization::ZcashSerialize,
     work::equihash::Solution,
@@ -116,8 +116,8 @@ impl PreparedCandidateCache {
     }
 
     /// Returns the prepared verification for `block`'s content, if some source prepared it.
-    pub(super) fn lookup(&self, block: &Block, network: &Network) -> Option<CacheHit> {
-        let key = CandidateKey::of(&block.header, network);
+    pub(super) fn lookup(&self, block: &BlockRef, network: &Network) -> Option<CacheHit> {
+        let key = CandidateKey::of(block.header(), network);
         let mut cache = self.lock();
         cache.iter_mut().for_each(Partition::prune_expired);
         let hit = cache.iter().find_map(|partition| {
@@ -137,8 +137,8 @@ impl PreparedCandidateCache {
     }
 
     /// Reuses and refreshes a server candidate with identical immutable content.
-    pub(super) fn reuse_server_candidate(&self, block: &Block, network: &Network) -> bool {
-        let key = CandidateKey::of(&block.header, network);
+    pub(super) fn reuse_server_candidate(&self, block: &BlockRef, network: &Network) -> bool {
+        let key = CandidateKey::of(block.header(), network);
         let mut cache = self.lock();
         let partition = &mut cache[PreparedCandidateSource::ServerTemplate.index()];
         partition.prune_expired();
@@ -162,7 +162,7 @@ impl PreparedCandidateCache {
         prepared: SemanticallyVerifiedBlock,
         network: &Network,
     ) -> InsertOutcome {
-        let key = CandidateKey::of(&prepared.block.header, network);
+        let key = CandidateKey::of(prepared.block.header(), network);
         let size = retained_size(&prepared);
         let mut cache = self.lock();
         let partition = &mut cache[source.index()];
@@ -209,13 +209,19 @@ impl Partition {
     ///
     /// Bodies are compared only for entries with an equal key, which a block shares with at
     /// most the candidates it was solved from.
-    fn position(&self, key: &CandidateKey, block: &Block) -> Option<usize> {
+    fn position(&self, key: &CandidateKey, block: &BlockRef) -> Option<usize> {
         self.entries.iter().position(|entry| {
-            entry.key == *key && entry.prepared.block.transactions == block.transactions
+            entry.key == *key
+                && entry
+                    .prepared
+                    .block
+                    .view()
+                    .transactions()
+                    .eq(block.transactions())
         })
     }
 
-    fn get(&self, key: &CandidateKey, block: &Block) -> Option<&Entry> {
+    fn get(&self, key: &CandidateKey, block: &BlockRef) -> Option<&Entry> {
         self.position(key, block).map(|index| &self.entries[index])
     }
 
@@ -301,7 +307,9 @@ fn retained_size(prepared: &SemanticallyVerifiedBlock) -> usize {
 mod tests {
     use super::*;
     use zakura_chain::{
-        block::Hash, serialization::ZcashDeserialize, work::difficulty::INVALID_COMPACT_DIFFICULTY,
+        block::{Block, Hash},
+        serialization::ZcashDeserialize,
+        work::difficulty::INVALID_COMPACT_DIFFICULTY,
     };
 
     fn test_block() -> Block {
@@ -326,6 +334,42 @@ mod tests {
             SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
             network,
         )
+    }
+
+    /// An owned block matches the candidate its shared copy prepared, and the lookup borrows it
+    /// without changing its decoded-memory charge.
+    #[test]
+    fn owned_blocks_match_their_shared_candidates() {
+        use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+
+        let network = Network::Mainnet;
+        for bytes in [
+            &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES[..],
+        ] {
+            let block = Block::zcash_deserialize(bytes).unwrap();
+            let cache = PreparedCandidateCache::default();
+            assert_eq!(
+                insert(
+                    &cache,
+                    &block,
+                    PreparedCandidateSource::ServerTemplate,
+                    &network
+                ),
+                InsertOutcome::Inserted
+            );
+
+            // Admission refuses payloads that share allocations, so decode an unshared copy.
+            let unshared = Block::zcash_deserialize(bytes).unwrap();
+            let charge = unshared.attributed_memory_size_bytes();
+            let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, charge);
+            let owned = pool.try_admit(unshared, Admission::WithinLimit).unwrap();
+            assert!(cache.lookup(&owned, &network).is_some());
+            assert_eq!(pool.reserved_bytes(), charge);
+            drop(owned);
+            assert_eq!(pool.reserved_bytes(), 0);
+        }
     }
 
     #[test]

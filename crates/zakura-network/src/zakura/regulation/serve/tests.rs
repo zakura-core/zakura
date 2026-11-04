@@ -1383,6 +1383,29 @@ async fn one_slot_serving_drains_before_control_uses_the_slot() {
     }
 }
 
+#[test]
+fn only_more_than_twice_the_limit_is_over_committed() {
+    for limit in [0u32, 1, 2, 7, u32::MAX / 2, u32::MAX] {
+        let margin = limit.saturating_mul(2);
+        for open in [0u32, 1, limit, limit.saturating_add(1), margin] {
+            if open > margin {
+                continue;
+            }
+            assert_eq!(
+                commitment_over_limit(open, limit),
+                Ok(open > limit),
+                "{open}/{limit}"
+            );
+        }
+        if let Some(open) = limit.checked_mul(2).and_then(|twice| twice.checked_add(1)) {
+            assert_eq!(
+                commitment_over_limit(open, limit),
+                Err(ServeViolation::OverCommitted { open, limit })
+            );
+        }
+    }
+}
+
 /// [`Scripted`], logging the node execution slots held at each lease report.
 #[derive(Debug)]
 struct Leased {
@@ -1517,4 +1540,58 @@ async fn a_leaked_lease_clone_delays_the_release_report() {
     .await
     .expect("the release reports once the blocking operation ends");
     assert_eq!(logged(), [("acquired", 1), ("released", 0)]);
+}
+
+/// A pushed frame's output stays with its unpolled future, and dropping that
+/// future returns the grants and takes no transport slot.
+#[tokio::test]
+async fn an_unpolled_push_send_returns_its_grants() {
+    let capacity = capacity(LIMITS);
+    let peer = peer(1);
+    let push = capacity.push(&peer);
+    let permit = push.acquire(8).await;
+    assert!(capacity.node_output.granted() > 0);
+    let (send, _output) = crate::zakura::transport::worker_framed_channel(1);
+    let unpolled = permit.reserve_send(&send);
+    assert!(
+        capacity.node_output.granted() > 0,
+        "the future owns the grants"
+    );
+    drop(unpolled);
+    assert_eq!(capacity.node_output.granted(), 0);
+    assert_eq!(send.capacity(), 1);
+}
+
+/// Every serving peer holds its whole output budget at once, as a fast reader does
+/// because a grant reserves a response's cap until its write. None of it waits for
+/// the node budget, so these peers can't pause each other.
+#[test]
+fn every_serving_peer_can_hold_its_output_budget_at_once() {
+    const PEERS: u8 = 128;
+    let limits = crate::zakura::regulation::sizing::serve_limits(
+        1 << 20,
+        Duration::from_millis(1),
+        usize::from(PEERS),
+    );
+    let capacity = capacity(limits);
+    let peer_bytes = u32::try_from(limits.peer_output_bytes).expect("64 MiB fits u32");
+    let budgets: Vec<_> = (0..PEERS).map(|n| capacity.peer(&peer(n))).collect();
+    let grants: Vec<_> = budgets
+        .iter()
+        .map(|budgets| {
+            (
+                budgets
+                    .output
+                    .try_grant(peer_bytes)
+                    .expect("the peer budget is free"),
+                capacity
+                    .node_output
+                    .try_grant(peer_bytes)
+                    .expect("the node budget holds every peer's budget"),
+            )
+        })
+        .collect();
+    assert_eq!(capacity.node_output_held(), limits.node_output_bytes);
+    drop(grants);
+    assert_eq!(capacity.node_output_held(), 0);
 }

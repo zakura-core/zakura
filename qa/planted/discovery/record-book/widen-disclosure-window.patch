@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index f80874e5f..cea08219f 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -2300,9 +2300,7 @@ impl ZakuraDiscoveryBook {
+     /// response's records, so a larger configured limit cannot widen what a
+     /// requester learns in an epoch.
+     fn sample_window(&self) -> usize {
+-        self.limits
+-            .max_imported_records_per_response
+-            .min(MAX_DISCOVERY_RECORDS_PER_RESPONSE)
++        self.limits.max_records
+     }
+ 
+     /// Whether `entry` may appear in a peer sample now.

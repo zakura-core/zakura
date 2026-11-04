@@ -1145,6 +1145,7 @@ mod tests {
             id,
             request: StorageRequest::ContinuationLocator,
             digest: String::new(),
+            call: None,
         }
     }
 

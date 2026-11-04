@@ -34,6 +34,84 @@ pub enum SessionOpening {
     EitherSide,
 }
 
+/// One step of a service's session lifecycle on a connection.
+///
+/// A service session has three identities. An attempt counts this endpoint's
+/// local opens of the service. A wire ID names the members of one inbound
+/// multi-stream offer. A generation is the local ID of one admitted session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SessionStep {
+    /// This endpoint started opening the service.
+    AttemptStarted {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A local open failed before the session started.
+    AttemptFailed {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A member of an inbound offer finished setup.
+    MemberArrived {
+        /// The offer's wire ID, zero for a single-stream session.
+        wire_id: u64,
+        /// The member's stream kind.
+        member: u16,
+    },
+    /// An incomplete inbound offer expired and released its members.
+    OfferExpired {
+        /// The offer's wire ID.
+        wire_id: u64,
+    },
+    /// A generation started all its workers.
+    GenerationInstalled {
+        /// The generation.
+        generation: u64,
+        /// The attempt that opened it, or `None` for a peer-opened session.
+        attempt: Option<u64>,
+    },
+    /// This endpoint refused a complete inbound generation and is retiring it.
+    GenerationParked {
+        /// The generation.
+        generation: u64,
+    },
+    /// Every worker of a generation finished.
+    GenerationExited {
+        /// The generation.
+        generation: u64,
+        /// Whether this endpoint opened it.
+        opened_locally: bool,
+        /// Whether the state still recorded it. A false value means a stale exit.
+        current: bool,
+    },
+}
+
+impl SessionStep {
+    /// The trace row's event name.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::AttemptStarted { .. } => "session.attempt_started",
+            Self::AttemptFailed { .. } => "session.attempt_failed",
+            Self::MemberArrived { .. } => "session.member_arrived",
+            Self::OfferExpired { .. } => "session.offer_expired",
+            Self::GenerationInstalled { .. } => "session.generation_installed",
+            Self::GenerationParked { .. } => "session.generation_parked",
+            Self::GenerationExited { .. } => "session.generation_exited",
+        }
+    }
+
+    /// The trace row's identity: the attempt, wire ID, or generation.
+    pub(crate) fn identity(self) -> u64 {
+        match self {
+            Self::AttemptStarted { attempt } | Self::AttemptFailed { attempt } => attempt,
+            Self::MemberArrived { wire_id, .. } | Self::OfferExpired { wire_id } => wire_id,
+            Self::GenerationInstalled { generation, .. }
+            | Self::GenerationParked { generation }
+            | Self::GenerationExited { generation, .. } => generation,
+        }
+    }
+}
+
 /// Static transport policy for one persistent service session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct SessionPolicy {

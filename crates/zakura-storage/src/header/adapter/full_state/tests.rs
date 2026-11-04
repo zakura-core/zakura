@@ -330,7 +330,7 @@ fn a_commit_past_the_non_finalized_window_panics() {
     );
     let mut full_state = crate::full_state::VerifiedChain::new(fixture.headers().genesis_block());
     for (receipt, block) in (1..).zip(&chain) {
-        full_state = full_state.with(Arc::clone(&block.block), block.height, receipt);
+        full_state = full_state.with(Arc::clone(&block.block).into(), block.height, receipt);
     }
 }
 
@@ -366,7 +366,7 @@ fn body_records_reach_the_engine() {
     let other = crate::full_state::verified_request(
         &crate::full_state::VerifiedChain::new(fixture.headers().genesis_block()),
         &crate::full_state::VerifiedChain::new(fixture.headers().genesis_block()).with(
-            block.block.clone(),
+            block.block.clone().into(),
             block.height,
             1,
         ),

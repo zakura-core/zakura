@@ -97,7 +97,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                 .build()
                 .unwrap();
             runtime.block_on(async { tokio::task::spawn_blocking(|| ()).await.unwrap() });
-            let limits = super::super::serving_limits();
+            let limits = super::super::serving_limits(&ZakuraBlockSyncConfig::default());
             let block = Arc::from(BLOCK_MAINNET_1_BYTES.as_slice());
             let gate = Arc::new(Semaphore::new(0));
             let source = LoadSource {

@@ -451,6 +451,9 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
     // its step, so only the absence of a read tells the stages apart.
     match stage(act) {
         Stage::Header => assert_eq!(read, None, "{act:?}: a header-stage fault was read whole"),
+        // A session that already handled the first ending has no subscription
+        // left, so its precheck refuses this one unread, as `ExtraEnding`.
+        Stage::Frame if matches!(act, Act::ExtraEndingAhead) && read.is_none() => {}
         Stage::Frame => assert!(
             read.is_some_and(|read| read < judged),
             "{act:?}: judged before its payload was read"

@@ -96,6 +96,11 @@ pub(super) struct Link {
 
 impl Link {
     pub(super) async fn connect() -> Result<Self, BoxError> {
+        Self::connect_with(LocalEndpointFactory::new()).await
+    }
+
+    /// [`Self::connect`] with `client` building the peer's endpoint.
+    pub(super) async fn connect_with(client: LocalEndpointFactory) -> Result<Self, BoxError> {
         let server = LocalEndpointFactory::new().endpoint(95101).await?;
         let (connection_tx, _connections) = mpsc::channel(1);
         let (stream_tx, streams) = mpsc::channel(2);
@@ -104,7 +109,7 @@ impl Link {
             connection_tx,
             stream_tx,
         })?;
-        let client = LocalEndpointFactory::new().endpoint(95102).await?;
+        let client = client.endpoint(95102).await?;
         let connection = timeout(
             TEST_TIMEOUT,
             client.connect(LocalEndpointFactory::node_addr(&server).await, &[ALPN]),

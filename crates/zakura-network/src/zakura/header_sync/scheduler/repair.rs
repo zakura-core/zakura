@@ -321,6 +321,14 @@ impl RepairRequirement {
         }
     }
 
+    /// The selected request context, while a shared active target owns this repair.
+    pub fn assigned_context(&self) -> Option<&VctRepairContext> {
+        match &self.state {
+            RepairPolicyState::Assigned { context } => Some(context),
+            _ => None,
+        }
+    }
+
     /// Return the next task-owned maintenance deadline.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.state {

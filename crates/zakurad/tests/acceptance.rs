@@ -116,6 +116,7 @@ use std::{
 };
 #[cfg(not(target_os = "windows"))]
 use std::{net::SocketAddr, path::Path};
+use zakura_node_services::block_memory::BlockHandle;
 
 use eyre::{eyre, WrapErr};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -2400,7 +2401,9 @@ async fn validate_regtest_genesis_block() {
         .await;
 
     let genesis_hash = block_verifier_router
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            regtest_genesis_block().into(),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -2919,7 +2922,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3045,7 +3048,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3170,7 +3173,9 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
 
     let genesis_hash = block_verifier_router
         .clone()
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            regtest_genesis_block().into(),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -3528,7 +3533,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
         let block = block.expect("should have block with latest_chain_tip hash");
 
-        let spends_with_spending_tx_hashes = block.transactions.iter().cloned().flat_map(|tx| {
+        let spends_with_spending_tx_hashes = block.view().transactions().flat_map(|tx| {
             let tx_hash = tx.hash();
             tx.inputs()
                 .iter()
@@ -3578,7 +3583,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
             );
         }
 
-        tip_hash = block.header.previous_block_hash;
+        tip_hash = block.view().header().previous_block_hash;
     }
 
     assert!(

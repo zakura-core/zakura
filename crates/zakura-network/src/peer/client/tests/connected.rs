@@ -105,6 +105,7 @@ impl ConnectedClient {
             connection_info.clone(),
             addr_label,
             Vec::new(),
+            crate::inbound_resources::InboundBudget::new(1 << 30),
         );
         let block_uploads = connection.block_uploads.clone();
         let request_slot = connection.request_slot.clone();

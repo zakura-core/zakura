@@ -26,18 +26,15 @@ pub struct RollbackStateCmd {
 
     /// Path to Zebra's cached state.
     ///
-    /// The `zakurad rollback-state` subcommand defaults to `state.cache_dir` from the loaded
-    /// `zakura.toml`, while the standalone `zakura-rollback-state` binary defaults to
-    /// `zakura_state::Config::default()`. Pass `--cache-dir` to be explicit and avoid rolling back
-    /// the wrong (or an empty) state directory.
+    /// Defaults to `state.cache_dir` from the loaded `zakura.toml`. Pass `--cache-dir` to be
+    /// explicit and avoid rolling back the wrong (or an empty) state directory.
     #[clap(long, short, help = "path to directory with the Zakura chain state")]
     cache_dir: Option<PathBuf>,
 
     /// Override the loaded state storage mode.
     ///
-    /// The standalone binary defaults to archive mode. Use `--storage-mode pruned` for a
-    /// database without transparent indexes. When omitted, `zakurad rollback-state` retains
-    /// the mode and pruning settings from the loaded configuration.
+    /// Use `--storage-mode pruned` for a database without transparent indexes. When omitted,
+    /// the mode and pruning settings from the loaded configuration are kept.
     #[clap(long, value_enum)]
     storage_mode: Option<RollbackStorageMode>,
 
@@ -62,8 +59,8 @@ pub struct RollbackStateCmd {
 impl RollbackStateCmd {
     /// `rollback-state` sub-command entrypoint.
     ///
-    /// Returns an error after logging it, so `zakurad` exits non-zero like the standalone
-    /// `zakura-rollback-state` binary, and scripts can detect the failure.
+    /// Returns an error after logging it, so `zakurad` exits non-zero and scripts can detect
+    /// the failure.
     pub(crate) fn run(&self, config: &ZakuradConfig) -> Result<()> {
         self.run_with_config(config.mirrored_state_config(), config.consensus.clone())
             .inspect_err(|error| tracing::error!("Failed to roll back finalized state: {error}"))

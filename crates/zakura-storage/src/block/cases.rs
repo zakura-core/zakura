@@ -403,7 +403,7 @@ impl Script {
                     owner: scope.bind(1, NonZeroU64::MIN),
                     source: SOURCE,
                     token,
-                    block: self.blocks[*index].block.clone(),
+                    block: self.blocks[*index].block.clone().into(),
                 }]
             }
             Step::RecordInvalid { block, version } => vec![BlockSyncAction::RecordBodyInvalid {

@@ -46,6 +46,17 @@ const HEADER_LEN: usize = 24usize;
 const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =
     [*b"filterload\0\0", *b"filteradd\0\0\0", *b"filterclear\0"];
 
+/// The most body bytes the decoder reserves before they arrive.
+///
+/// A peer names a body length in a 24-byte header. Reserving only this much keeps a
+/// hostile length from allocating a whole body. The buffer then grows with the bytes
+/// that actually arrive, and TCP flow control bounds those.
+const MAX_UNRECEIVED_BODY_RESERVATION: usize = 64 * 1024;
+
+/// The most bytes one connection's decoder can hold for an incomplete message: one
+/// header and one body of the protocol's maximum size.
+pub(crate) const MAX_INCOMPLETE_MESSAGE_BYTES: usize = HEADER_LEN + MAX_PROTOCOL_MESSAGE_LEN;
+
 /// The maximum body length allowed before the handshake completes.
 ///
 /// Version messages are ~344 bytes max (including a 256-byte user agent);
@@ -383,6 +394,11 @@ impl Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         use Error::Parse;
 
+        // Ignored Bloom and unknown commands continue to the next message in the same
+        // call. Returning `Ok(None)` with a complete message buffered would stall the
+        // reader until the peer sends more bytes. Each discarded body is within
+        // `max_len`, and one call only discards bytes already buffered, so the work
+        // per call stays bounded without a separate count.
         'messages: loop {
             match self.state {
                 DecodeState::Head => {
@@ -426,8 +442,8 @@ impl Decoder for Codec {
                     metrics::counter!("zcash.net.in.bytes.total")
                         .increment((body_len + HEADER_LEN) as u64);
 
-                    // Reserve buffer space for the expected body and the following header.
-                    src.reserve(body_len + HEADER_LEN);
+                    // Reserve buffer space for the next arriving bytes, not the claimed body.
+                    src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
                     self.state = DecodeState::Body {
                         body_len,
@@ -462,6 +478,8 @@ impl Decoder for Codec {
                     }
 
                     if BLOOM_FILTER_COMMANDS.contains(&command) {
+                        metrics::counter!("zcash.net.in.discarded", "reason" => "bloom")
+                            .increment(1);
                         debug!(
                             command = %escape_command(&command),
                             "ignored unsupported bloom filter message"
@@ -518,6 +536,8 @@ impl Decoder for Codec {
                                 // Since we can't verify their source, Zebra needs to ignore
                                 // unexpected messages, because closing the connection could
                                 // cause a denial of service or eclipse attack.
+                                metrics::counter!("zcash.net.in.discarded", "reason" => "unknown")
+                                    .increment(1);
                                 debug!(?command, %command_string, "unknown message command from peer");
                                 return Ok(None);
                             }
@@ -538,6 +558,8 @@ impl Decoder for Codec {
                     }));
 
                     match decode_result {
+                        // An unknown command decodes to nothing; continue to the next one.
+                        Ok(Ok(None)) => continue 'messages,
                         Ok(result) => return result,
                         Err(_panic_payload) => {
                             // Escaped for consistency with the other command logs:
@@ -742,12 +764,12 @@ impl Codec {
 
     fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
         let result = self.deserialize_block_spawning(reader);
-        let block = result?.into();
+        let block: std::sync::Arc<Block> = result?.into();
 
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(block))
+        Ok(Message::Block(block.into()))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {

@@ -225,6 +225,7 @@ impl Fact {
                 id,
                 request: StorageRequest::ContinuationLocator,
                 digest: String::new(),
+                call: None,
             },
             Fact::Completed(id) => StorageFact::Completed {
                 id,

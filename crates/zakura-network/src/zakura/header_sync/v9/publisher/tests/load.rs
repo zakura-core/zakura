@@ -20,7 +20,7 @@ use crate::zakura::{
         wire::{DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES},
     },
     regulation::{sizing, WriterFence},
-    CloseCause,
+    CloseCause, FRAME_HEADER_BYTES,
 };
 
 /// The production window: 4,000 headers and 8 MiB.
@@ -82,6 +82,164 @@ async fn a_full_window_of_one_header_pages_fits_the_cursor_ring() {
     harness.check_quiet().await;
 }
 
+/// The production serving limits keep the toolkit's defaults, 64 MiB of
+/// output per peer and that much for each of the 92 default connections'
+/// sessions, and [`v9::serving_limits`] changes only the per-peer output.
+#[test]
+fn serving_limits_keep_the_production_default() {
+    let peers = crate::zakura::ZakuraHeaderSyncConfig::default()
+        .serving_sessions(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
+    assert_eq!(peers, 92);
+    let production = ServeLimits {
+        node_execution: NODE_EXECUTION,
+        peer_execution: PEER_EXECUTION,
+        peer_output_responses: 16_384,
+        node_output_responses: 92 * 16_384,
+        peer_output_bytes: 64 * 1024 * 1024,
+        node_output_bytes: 92 * (64 << 20),
+    };
+    assert_eq!(
+        v9::serving_limits(v9::SERVE_PEER_OUTPUT_BYTES, peers, None),
+        production
+    );
+    let output = v9::CommonMessage::BUDGET.output;
+    assert_eq!(
+        v9::serving_limits(output, peers, None),
+        ServeLimits {
+            peer_output_bytes: output,
+            ..production
+        }
+    );
+}
+
+/// Output is keyed by peer ID, so a replacement session that overlaps its
+/// predecessor shares one peer budget. Under the 64 MiB default, both
+/// sessions queue a full byte window of the largest Mainnet pages with the
+/// writer stalled, and neither waits for output.
+#[test]
+fn the_peer_output_default_holds_two_overlapping_sessions() {
+    let share = v9::CommonMessage::BUDGET.output;
+    // Widening usize to u64 is lossless on supported targets.
+    assert!(v9::SERVE_PEER_OUTPUT_BYTES >= PEER_EXECUTION as u64 * share);
+    let largest = v9::largest_page(COMMON_HEADER_BYTES);
+    // Widening u32 to usize is lossless on supported targets.
+    let window = vec![largest; WINDOW.bytes as usize / largest];
+    let capacity = serving_capacity(1, None);
+    let mut queued = 0;
+    let mut queues = Vec::new();
+    for _session in 0..PEER_EXECUTION {
+        let push = capacity.push(&peer(9));
+        let (send, recv) = framed_channel(window.len() + 1);
+        for &len in &window {
+            push.acquire(len)
+                .now_or_never()
+                .expect("an overlapping session's full window never waits for output")
+                .reserve_send(&send)
+                .now_or_never()
+                .expect("the queue has room")
+                .expect("the queue is open")
+                .send(Frame {
+                    message_type: v9::message_type::HEADERS,
+                    flags: 0,
+                    payload: vec![0; len],
+                });
+            // Widening usize to u64 is lossless on supported targets.
+            queued += (len + FRAME_HEADER_BYTES) as u64;
+        }
+        queues.push((send, recv));
+    }
+    assert_eq!(capacity.peer_held(&peer(9)).1, queued);
+    assert!(queued <= PEER_EXECUTION as u64 * share, "{queued}");
+}
+
+/// The derived output share holds a full window with the writer stalled. A
+/// byte window of the largest Mainnet pages and a header window of the
+/// smallest each queue without waiting for output, and they hold at most the
+/// share.
+#[test]
+fn the_derived_output_share_holds_a_full_window() {
+    let output = v9::CommonMessage::BUDGET.output;
+    let largest = v9::largest_page(COMMON_HEADER_BYTES);
+    let smallest = smallest_page(COMMON_HEADER_BYTES, AuxSchema::None);
+    // Widening u32 to usize is lossless on supported targets.
+    let window = WINDOW.bytes as usize;
+    let mut bytes_bind = vec![largest; window / largest];
+    while bytes_bind.iter().sum::<usize>() + smallest <= window {
+        bytes_bind.push(smallest);
+    }
+    let headers_bind = vec![smallest; WINDOW.objects as usize];
+    for pages in [bytes_bind, headers_bind] {
+        let capacity = ServeCapacity::new(
+            "header-sync",
+            &SUBSCRIBE_HEADERS,
+            v9::serving_limits(output, 1, None),
+        )
+        .expect("the derived limits are positive");
+        let push = capacity.push(&peer(7));
+        // Room for every page and the control slot, and nobody reads.
+        let (send, _recv) = framed_channel(pages.len() + 1);
+        let mut queued = 0;
+        for &len in &pages {
+            let permit = push
+                .acquire(len)
+                .now_or_never()
+                .expect("a page within the window never waits for output");
+            let slot = permit
+                .reserve_send(&send)
+                .now_or_never()
+                .expect("the queue has room")
+                .expect("the queue is open");
+            slot.send(Frame {
+                message_type: v9::message_type::HEADERS,
+                flags: 0,
+                payload: vec![0; len],
+            });
+            // Widening usize to u64 is lossless on supported targets.
+            queued += (len + FRAME_HEADER_BYTES) as u64;
+        }
+        assert_eq!(capacity.peer_held(&peer(7)).1, queued);
+        assert!(queued <= output, "{queued} of {output}");
+    }
+}
+
+/// A publisher writing at full credit never waits on output. Under the
+/// derived output share, with a writer that never drains, the publisher
+/// commits a full window of one-header pages, the most frames one window
+/// allows.
+#[tokio::test(start_paused = true)]
+async fn a_publisher_at_full_credit_never_waits_on_output() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let tip = *port
+        .grow(WINDOW.objects + 1)
+        .last()
+        .expect("the chain grew");
+    let output = v9::RegtestMessage::BUDGET.output;
+    let capacity = ServeCapacity::new(
+        "header_sync_v9",
+        &SUBSCRIBE_HEADERS,
+        v9::serving_limits(output, 1, None),
+    )
+    .expect("the derived limits are positive");
+    let one_header = PageLimits {
+        max_headers: 1,
+        ..production_pages()
+    };
+    // Room for every page and the control slot, and nobody reads.
+    let queue = WINDOW.objects as usize + 1;
+    let (publisher, _recv, _cancel, _task) =
+        session_advertising(&port, &capacity, &peer(7), 1, queue, one_header);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(tip.hash, vec![port.genesis], WINDOW, AuxSchema::None);
+    assert_eq!(publisher.apply(&open).await, Ok(Applied::Live));
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(publisher.unacknowledged(open.subscription_id), Some(4_000));
+    // Widening usize to u64 is lossless on supported targets.
+    let page = (smallest_page(HB, AuxSchema::None) + FRAME_HEADER_BYTES) as u64;
+    let held = capacity.peer_held(&peer(7)).1;
+    assert_eq!(held, 4_000 * page);
+    assert!(held <= output, "{held} of {output}");
+}
+
 /// A subscriber that never acknowledges sends the most `Open` and `Grant`
 /// updates the window allows, each at the minimum, while page output is
 /// blocked. Every update applies, the publisher spends credit only on the
@@ -118,7 +276,7 @@ async fn minimum_grant_floods_apply_while_output_is_blocked() {
     let started = std::time::Instant::now();
     let ((), allocated) = zakura_test::allocations::measure(|| {
         for grant in &grants[1..] {
-            let applied = lock(&publisher.shared).apply(grant, limits());
+            let applied = lock(&publisher.shared).apply(grant);
             assert_eq!(applied, Ok(Applied::Live));
         }
     });
@@ -275,7 +433,7 @@ async fn run_load(peers: usize) {
     ];
     let port = FakePort::new(0);
     let tip = *port.grow(TIP).last().expect("the chain grew");
-    let capacity = serving_capacity();
+    let capacity = serving_capacity(peers, None);
     let (started, wall) = (tokio::time::Instant::now(), std::time::Instant::now());
     // Session `id` of peer `index`, after its `Open` applies.
     let connect = |index: usize, id: u64| {
@@ -388,7 +546,10 @@ async fn run_load(peers: usize) {
             }
         }
         assert!(capacity.node_execution_held() <= NODE_EXECUTION);
-        assert!(capacity.node_output_held() <= sizing::node_output_bytes());
+        assert!(
+            capacity.node_output_held()
+                <= sizing::node_output_bytes(peers, sizing::peer_output_bytes())
+        );
         let finished = sessions.iter().all(|session| match session.role {
             Role::Follower => session.headers == PUSHED,
             Role::FromEmpty => session.headers == TIP + PUSHED,

@@ -806,6 +806,8 @@ impl SequencerTask {
             body.bytes,
         ) && !self.sequencer.already_retains(body.height, body.hash)
         {
+            // A refused deferral means a reset or the floor already removed this
+            // exact attempt, so the height has another path to a body.
             self.work.defer_received_for_owner(
                 body.owner,
                 body.height,

@@ -3689,15 +3689,23 @@ fn an_unmatched_receipt_takes_only_the_charge_it_looked_up() {
     // the published request, whose charge it takes.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     assert!(queue
-        .begin_unmatched_receipt(block::Height(1))
+        .begin_unmatched_receipt(block::Height(1), block::Hash([1; 32]))
         .expect("fixture funding matches the queue")
         .is_none());
     assert!(queue.pending_contains(block::Height(1)));
     assert_eq!(queue.budget().reserved(), 0);
 
     let owner = queue.publish_fixture(1..=1);
+    assert!(
+        queue
+            .begin_unmatched_receipt(block::Height(1), block::Hash([0xee; 32]))
+            .expect("fixture funding matches the queue")
+            .is_none(),
+        "a body for another hash can't take the published request's charge"
+    );
+    assert_eq!(queue.budget().reserved(), 100);
     let (ended_owner, ended) = queue
-        .begin_unmatched_receipt(block::Height(1))
+        .begin_unmatched_receipt(block::Height(1), block::Hash([1; 32]))
         .expect("fixture funding matches the queue")
         .expect("the published request reserves height 1");
     assert_eq!(ended_owner, owner);

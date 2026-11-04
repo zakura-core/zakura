@@ -2473,8 +2473,10 @@ impl PeerRoutine {
         // discarding a valid body because another peer currently owns the
         // request slot. The ended reservation is released after the forward
         // below. Pending work has no request owner, and accepting its body would
-        // create an unowned completion, so the caller ignores it.
-        let (owner, settlement) = match self.work.begin_unmatched_receipt(height) {
+        // create an unowned completion, so the caller ignores it. The queue
+        // rechecks `hash` under the transfer's lock: a reset and reissue since
+        // the caller's lookup leaves the replacement funded.
+        let (owner, settlement) = match self.work.begin_unmatched_receipt(height, hash) {
             Ok(Some(ended)) => ended,
             Ok(None) => return false,
             Err(_) => {

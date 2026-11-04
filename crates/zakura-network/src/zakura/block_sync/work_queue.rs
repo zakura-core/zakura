@@ -367,16 +367,18 @@ impl WorkQueue {
     }
 
     /// Transfer the charge of whichever published request reserves `height`
-    /// when an attempt that holds no request for it receives its body. The
-    /// owner lookup and the transfer share one queue lock, so a request that
-    /// takes the height concurrently can't lose its charge unrevoked. Returns
-    /// `None` for pending work, which has no owner.
+    /// for `hash` when an attempt that holds no request for it receives its
+    /// body. The owner and hash checks and the transfer share one queue lock,
+    /// so neither a request that takes the height concurrently nor one reissued
+    /// for another hash loses its charge. Returns `None` for pending work,
+    /// which has no owner.
     pub(super) fn begin_unmatched_receipt(
         &self,
         height: block::Height,
+        hash: block::Hash,
     ) -> Result<Option<(zakura_header_chain::BodyWorkOwner, EndedReservation)>, ReservationError>
     {
-        self.begin_receipt(|state| state.end_competing_reservation_at_receipt(height))
+        self.begin_receipt(|state| state.end_competing_reservation_at_receipt(height, hash))
     }
 
     fn begin_receipt(

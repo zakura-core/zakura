@@ -12,10 +12,12 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::FutureExt;
 use tower::Service;
+use zakura_chain::block;
 
 use crate::{
     peer::{block_gossip::Readiness, NoEligibleBlockPeers},
@@ -25,28 +27,36 @@ use crate::{
 
 use super::{LegacyGossipFrame, ZakuraGossipBroadcast, ZakuraSupervisorHandle};
 
+/// How long a session whose queue is full gets to make room for a block advertisement, the
+/// same as a busy legacy peer's advert queue gets.
+const QUEUE_WAIT: Duration = Duration::from_secs(3);
+
 /// Tower service that announces blocks to the Zakura peers with open gossip sessions.
 ///
 /// Ready once a session can take a frame, which may be a session with a full queue, like a busy
-/// legacy peer. A block is recorded as seen, and kept for replay to later peers, only once a
-/// session queued it; a block already seen, sent earlier or relayed from a peer, is not sent
-/// again. A submitted block that the chain has not committed yet is never kept for replay, since
-/// the chain can still reject it. Requests other than block advertisements fail.
+/// legacy peer: a full queue gets [`QUEUE_WAIT`] to make room before the session counts as
+/// having refused the block. A block is recorded as seen, and kept for replay to later peers,
+/// only once a session queued it; a block already seen, sent earlier or relayed from a peer, is
+/// not sent again. A submitted block that the chain has not committed yet is never kept for
+/// replay, since the chain can still reject it. Requests other than block advertisements fail.
 pub(crate) struct ZakuraBlockAdvertiser {
     broadcast: ZakuraGossipBroadcast,
     readiness: Readiness,
+    /// How long a full session queue gets to make room.
+    queue_wait: Duration,
 }
 
 impl ZakuraBlockAdvertiser {
     /// Returns an advertiser for the gossip sessions of the given supervisor's peers.
     pub(crate) fn new(supervisor: ZakuraSupervisorHandle) -> Self {
-        Self::from_broadcast(ZakuraGossipBroadcast::new(supervisor))
+        Self::from_broadcast(ZakuraGossipBroadcast::new(supervisor), QUEUE_WAIT)
     }
 
-    fn from_broadcast(broadcast: ZakuraGossipBroadcast) -> Self {
+    fn from_broadcast(broadcast: ZakuraGossipBroadcast, queue_wait: Duration) -> Self {
         Self {
             broadcast,
             readiness: Readiness::Idle,
+            queue_wait,
         }
     }
 
@@ -69,17 +79,22 @@ impl ZakuraBlockAdvertiser {
         })
     }
 
-    /// Sends `frame` to the open sessions, keeping a committed block for replay to later peers.
+    /// Sends the block to the open sessions, keeping a committed block for replay to later peers.
     async fn advertise(
         broadcast: ZakuraGossipBroadcast,
-        frame: LegacyGossipFrame,
+        hash: block::Hash,
         committed: bool,
+        queue_wait: Duration,
     ) -> Result<Response, BoxError> {
+        let frame = LegacyGossipFrame::AdvertiseBlock(hash);
         if broadcast.unseen(&frame).await.is_none() {
             return Ok(Response::Nil);
         }
 
-        let fanout = broadcast.outbound.fan_out_to_peers(&frame, None);
+        let fanout = broadcast
+            .outbound
+            .fan_out_block_within(hash, queue_wait)
+            .await;
         if fanout.delivered > 0 {
             broadcast.mark_seen(&frame).await;
             if committed {
@@ -101,7 +116,7 @@ impl ZakuraBlockAdvertiser {
 impl Clone for ZakuraBlockAdvertiser {
     /// Clones the handle without its wait: each handle establishes its own readiness.
     fn clone(&self) -> Self {
-        Self::from_broadcast(self.broadcast.clone())
+        Self::from_broadcast(self.broadcast.clone(), self.queue_wait)
     }
 }
 
@@ -156,8 +171,9 @@ impl Service<Request> for ZakuraBlockAdvertiser {
         let broadcast = self.broadcast.clone();
         Box::pin(Self::advertise(
             broadcast,
-            LegacyGossipFrame::AdvertiseBlock(block.hash),
+            block.hash,
             !block.submitted,
+            self.queue_wait,
         ))
     }
 }
@@ -193,13 +209,16 @@ mod tests {
         block::Hash([byte; 32])
     }
 
+    /// How long a full queue gets to make room in these tests.
+    const TEST_QUEUE_WAIT: Duration = Duration::from_millis(200);
+
     fn advertiser() -> (ZakuraBlockAdvertiser, ZakuraGossipBroadcast) {
         let broadcast = ZakuraGossipBroadcast {
             first_seen: FirstSeenCache::new(DEFAULT_FIRST_SEEN_CAPACITY, DEFAULT_FIRST_SEEN_TTL),
             outbound: LegacyGossipOutbound::default(),
         };
         (
-            ZakuraBlockAdvertiser::from_broadcast(broadcast.clone()),
+            ZakuraBlockAdvertiser::from_broadcast(broadcast.clone(), TEST_QUEUE_WAIT),
             broadcast,
         )
     }
@@ -329,7 +348,8 @@ mod tests {
             .call(Request::AdvertiseBlockToAll(earlier.into()))
             .await?;
 
-        // The queue of one is full: the session is there but refuses the next frame.
+        // The queue of one stays full for longer than the wait: the session is there but
+        // refuses the next frame.
         let hash = block_hash(4);
         let error = timeout(RECEIVE_TIMEOUT, advertiser.ready())
             .await??
@@ -356,6 +376,43 @@ mod tests {
             hash,
             "the retry of a refused block is sent"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_waits_for_a_full_session_to_make_room() -> Result<(), BoxError>
+    {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_session, mut receiver) = insert_session(&broadcast.outbound, 12, 1);
+        let earlier = block_hash(120);
+        let hash = block_hash(12);
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(earlier.into()))
+            .await?;
+
+        // The queue of one is full, and drains while the advertisement is waiting for room.
+        let drain = async {
+            tokio::time::sleep(TEST_QUEUE_WAIT / 4).await;
+            recv_advert(&mut receiver).await
+        };
+        let advertise = async {
+            timeout(RECEIVE_TIMEOUT, advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(hash.into()))
+                .await
+        };
+        let (drained, advertised) = tokio::join!(drain, advertise);
+        assert_eq!(drained?, earlier);
+        advertised?;
+
+        assert_eq!(
+            recv_advert(&mut receiver).await?,
+            hash,
+            "the block is queued once the session made room"
+        );
+        assert!(!is_unseen(&broadcast, hash).await);
+        assert_eq!(latest_block(&broadcast.outbound), Some(hash));
         Ok(())
     }
 

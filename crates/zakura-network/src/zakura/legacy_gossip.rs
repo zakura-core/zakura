@@ -1772,20 +1772,42 @@ impl LegacyGossipOutbound {
         frame: &LegacyGossipFrame,
         exclude: Option<&ZakuraPeerId>,
     ) -> Fanout {
-        let sessions: Vec<_> = {
-            let state = self
-                .state
-                .lock()
-                .expect("legacy gossip outbound mutex is never poisoned");
-            state
-                .sessions
-                .iter()
-                .filter(|(peer_id, _)| !exclude.is_some_and(|exclude| exclude == *peer_id))
-                .map(|(_peer_id, session)| session.clone())
-                .collect()
-        };
+        fan_out(self.sessions_except(exclude), frame)
+    }
 
-        fan_out(sessions, frame)
+    /// Offer a block advertisement to every session at once, each full queue getting up to
+    /// `wait` to make room, and report what it reached.
+    async fn fan_out_block_within(&self, hash: block::Hash, wait: Duration) -> Fanout {
+        let sessions = self.sessions_except(None);
+        let results = futures::future::join_all(
+            sessions
+                .iter()
+                .map(|session| session.send_advertise_block_within(hash, wait)),
+        )
+        .await;
+        let mut fanout = Fanout {
+            attempted: 0,
+            delivered: 0,
+            first_error: None,
+        };
+        for (session, result) in sessions.iter().zip(results) {
+            fanout.record(session, result);
+        }
+        fanout
+    }
+
+    /// The sessions to offer a frame to: every one but `exclude`'s.
+    fn sessions_except(&self, exclude: Option<&ZakuraPeerId>) -> Vec<LegacyGossipPeerSession> {
+        let state = self
+            .state
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned");
+        state
+            .sessions
+            .iter()
+            .filter(|(peer_id, _)| !exclude.is_some_and(|exclude| exclude == *peer_id))
+            .map(|(_peer_id, session)| session.clone())
+            .collect()
     }
 }
 
@@ -1857,6 +1879,30 @@ impl LegacyGossipPeerSession {
         self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))
     }
 
+    /// Send an explicit block advertisement, giving a full queue up to `wait` to make room.
+    ///
+    /// A queue that is still full after `wait` reports [`OrderedSendError::Full`]; one whose
+    /// transport writer goes away meanwhile reports [`OrderedSendError::Closed`].
+    async fn send_advertise_block_within(
+        &self,
+        hash: block::Hash,
+        wait: Duration,
+    ) -> Result<(), OrderedSendError> {
+        let frame = LegacyGossipFrame::AdvertiseBlock(hash)
+            .encode_frame()
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        let frame = match self.send.try_send(frame) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_frame)) => return Err(OrderedSendError::Closed),
+            Err(mpsc::error::TrySendError::Full(frame)) => frame,
+        };
+        match timeout(wait, self.send.send(frame)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_closed)) => Err(OrderedSendError::Closed),
+            Err(_elapsed) => Err(OrderedSendError::Full),
+        }
+    }
+
     /// Send explicit transaction id advertisements.
     pub fn try_send_advertise_transaction_ids(
         &self,
@@ -1912,6 +1958,24 @@ struct Fanout {
 }
 
 impl Fanout {
+    /// Counts one session's answer to the frame.
+    fn record(&mut self, session: &LegacyGossipPeerSession, result: Result<(), OrderedSendError>) {
+        self.attempted += 1;
+        match result {
+            Ok(()) => self.delivered += 1,
+            Err(error) => {
+                debug!(
+                    peer = ?session.peer_id(),
+                    ?error,
+                    "failed to queue Zakura legacy gossip frame"
+                );
+                if self.first_error.is_none() {
+                    self.first_error = Some(error);
+                }
+            }
+        }
+    }
+
     /// The gossip result: an error when any session refused the frame, success
     /// otherwise, including when there was no session to offer it to.
     fn into_result(self) -> Result<(), BoxError> {
@@ -1930,27 +1994,13 @@ fn fan_out(sessions: Vec<LegacyGossipPeerSession>, frame: &LegacyGossipFrame) ->
         first_error: None,
     };
     for session in sessions {
-        fanout.attempted += 1;
         let result = match frame {
             LegacyGossipFrame::AdvertiseBlock(hash) => session.try_send_advertise_block(*hash),
             LegacyGossipFrame::AdvertiseTransactionIds(ids) => {
                 session.try_send_advertise_transaction_ids(ids.clone())
             }
         };
-
-        match result {
-            Ok(()) => fanout.delivered += 1,
-            Err(error) => {
-                debug!(
-                    peer = ?session.peer_id(),
-                    ?error,
-                    "failed to queue Zakura legacy gossip frame"
-                );
-                if fanout.first_error.is_none() {
-                    fanout.first_error = Some(error);
-                }
-            }
-        }
+        fanout.record(&session, result);
     }
     fanout
 }
@@ -6213,6 +6263,91 @@ mod tests {
         assert!(
             result.is_err(),
             "saturated peer failure is reported after honest peer is attempted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_session_takes_the_block_once_its_queue_drains_within_the_wait(
+    ) -> Result<(), BoxError> {
+        let (send, mut receiver) = framed_channel(1);
+        let filler = Frame {
+            message_type: MSG_ADVERTISE_BLOCK,
+            flags: 0,
+            payload: vec![1],
+        };
+        send.try_send(filler.clone())?;
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
+        let session = LegacyGossipPeerSession::new(peer, 0, 0, send);
+        let hash = block_hash(9);
+
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            receiver.recv().await
+        };
+        let (drained, sent) = tokio::join!(
+            drain,
+            session.send_advertise_block_within(hash, Duration::from_secs(1))
+        );
+        assert_eq!(drained, Some(filler));
+        sent?;
+
+        let queued = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await?
+            .expect("the block was queued once the filler left");
+        assert_eq!(
+            LegacyGossipFrame::decode_frame(queued)?,
+            LegacyGossipFrame::AdvertiseBlock(hash)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_that_stays_full_refuses_the_block_after_the_wait() -> Result<(), BoxError> {
+        let (send, _receiver) = framed_channel(1);
+        send.try_send(Frame {
+            message_type: MSG_ADVERTISE_BLOCK,
+            flags: 0,
+            payload: vec![1],
+        })?;
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
+        let session = LegacyGossipPeerSession::new(peer, 0, 0, send);
+
+        let result = session
+            .send_advertise_block_within(block_hash(9), Duration::from_millis(50))
+            .await;
+
+        assert!(
+            matches!(result, Err(OrderedSendError::Full)),
+            "a queue still full after the wait is a refusal: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_writer_leaves_during_the_wait_reports_closed() -> Result<(), BoxError>
+    {
+        let (send, receiver) = framed_channel(1);
+        send.try_send(Frame {
+            message_type: MSG_ADVERTISE_BLOCK,
+            flags: 0,
+            payload: vec![1],
+        })?;
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
+        let session = LegacyGossipPeerSession::new(peer, 0, 0, send);
+
+        let leave = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(receiver);
+        };
+        let ((), result) = tokio::join!(
+            leave,
+            session.send_advertise_block_within(block_hash(9), Duration::from_secs(1))
+        );
+
+        assert!(
+            matches!(result, Err(OrderedSendError::Closed)),
+            "a writer that left is a closed session: {result:?}"
         );
         Ok(())
     }

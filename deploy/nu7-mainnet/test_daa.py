@@ -182,6 +182,20 @@ class MinerTests(unittest.TestCase):
         table = miners.miner_table(stale, fresh, miners.miner_shares([]), now=1000 + 2 * 3600 + 60)
         self.assertEqual({row["miner"]: row["activity"] for row in table}, {"Luxor": "inactive", "2Miners": "active"})
 
+    def test_minor_miners_are_combined_into_one_row(self):
+        rows = [{"height": h, "time": 1000 + 25 * h, "miner_id": "Luxor"} for h in range(1, 201)]
+        rows += [{"height": 200 + i, "time": 1000 + 25 * (200 + i), "miner_id": f"solo:m{i}"} for i in range(1, 4)]
+        rows += [{"height": 204, "time": 1000 + 25 * 204, "miner_id": "KuPool"}]
+        shares = miners.miner_shares(rows)
+        table = miners.miner_table(shares, shares, shares, now=1000 + 25 * 204 + 3700)
+        self.assertEqual([row["miner"] for row in table], ["Luxor", "KuPool", "other"],
+                         "KuPool keeps a row by its tag at 0.5%; three solo miners at 0.5% each are combined")
+        other = table[2]
+        self.assertEqual((other["miners"], other["weekBlocks"], other["lastHeight"]), (3, 3, 203))
+        self.assertEqual(other["activity"], "inactive", "the newest solo block is 3725 s old")
+        self.assertAlmostEqual(other["baselineShare"], 3 / 204)
+        self.assertTrue(miners.is_major("addr:t1MKn3…hVn7", shares, {"miners": {"addr:t1MKn3…hVn7": {"share": 0.2}}}))
+
 
 if __name__ == "__main__":
     unittest.main()

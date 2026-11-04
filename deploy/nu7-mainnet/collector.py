@@ -720,6 +720,7 @@ class Collector:
                 "recent": {"blocks": recent["blocks"], "lastBlocks": MINER_RECENT_BLOCKS},
                 "week": {"blocks": week["blocks"], "seconds": miners.SEEN_WITHIN_SECONDS,
                          "activeSeconds": miners.ACTIVE_WITHIN_SECONDS},
+                "majorShare": miners.MAJOR_SHARE,
                 "table": miners.miner_table(baseline, recent, week, now),
             },
             "nsm": {

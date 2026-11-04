@@ -65,6 +65,7 @@ code { font-family: var(--mono); font-size: .92em; }
 .chip--active { background: color-mix(in srgb, var(--nsm) 18%, transparent); color: var(--nsm); }
 .chip--inactive { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .chip--gone { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+.nu7-miners tr.other { color: var(--muted); }
 .legend { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 6px; color: var(--muted); font-size: .82rem; }
 .legend li { display: flex; gap: 8px; align-items: baseline; }
 .legend .chip { flex: none; }
@@ -185,6 +186,7 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
         <li><span class="chip chip--low">low</span><span>Share check: more than 3σ below the block count the baseline share predicts (at least 9 expected).</span></li>
         <li><span class="chip chip--absent">absent</span><span>Share check: no recent block, where the baseline share makes that under 1% likely.</span></li>
         <li><span class="chip chip--new">new</span><span>Not in the baseline; first seen after it.</span></li>
+        <li><span class="chip">other</span><span>Every miner without a known pool tag and under 1% of the blocks (this week and in the baseline), added up: mostly solo miners.</span></li>
       </ul>
     </section>
 
@@ -327,14 +329,15 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
       var tr = document.createElement("tr");
       tr.innerHTML = '<th></th><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td><span class="chip"></span></td><td><span class="chip"></span></td>';
       var c = tr.children;
-      c[0].textContent = row.miner; c[1].textContent = pct(row.baselineShare); c[2].textContent = pct(row.recentShare);
+      if (row.miner === "other") { tr.className = "other"; }
+      c[0].textContent = row.miner === "other" ? "other (" + fmtInt(row.miners) + " miners)" : row.miner; c[1].textContent = pct(row.baselineShare); c[2].textContent = pct(row.recentShare);
       c[3].textContent = fmtInt(row.recentBlocks); c[4].textContent = fmtInt(row.weekBlocks || 0);
       c[5].textContent = row.lastHeight ? fmtInt(row.lastHeight) + " · " + fmtAge(row.lastSeenSeconds) + " ago" : "—";
       c[6].firstChild.textContent = row.activity || "gone"; c[6].firstChild.className = "chip chip--" + (row.activity || "gone");
       c[7].firstChild.textContent = row.status; c[7].firstChild.className = "chip chip--" + row.status;
       minersBody.appendChild(tr);
     });
-    setText("[data-miners-hint]", "Baseline: " + fmtInt(mi.baseline.blocks) + " blocks " + fmtInt(mi.baseline.fromHeight) + "–" + fmtInt(mi.baseline.untilHeight) + " · recent: last " + fmtInt(mi.recent.lastBlocks) + " blocks (" + fmtInt(mi.recent.blocks) + " attributed) · week: " + fmtInt((mi.week || {}).blocks || 0) + " attributed blocks");
+    setText("[data-miners-hint]", "Baseline: " + fmtInt(mi.baseline.blocks) + " blocks " + fmtInt(mi.baseline.fromHeight) + "–" + fmtInt(mi.baseline.untilHeight) + " · recent: last " + fmtInt(mi.recent.lastBlocks) + " blocks (" + fmtInt(mi.recent.blocks) + " attributed) · week: " + fmtInt((mi.week || {}).blocks || 0) + " attributed blocks · rows: known pools and miners with at least " + pct(mi.majorShare || 0.01) + " of the blocks");
     renderCharts(d);
   }
   function pct(v) { return v == null ? "—" : (v * 100).toFixed(1) + "%"; }

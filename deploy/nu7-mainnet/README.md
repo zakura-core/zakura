@@ -37,7 +37,8 @@ columns stay empty until the instrumented node runs, and the page says so.
   marks each miner `active` (a block within the last hour), `inactive` (a
   block within 7 days but none for over an hour) or `gone` (nothing in 7
   days), and separately checks its recent block count against its baseline
-  share.
+  share. It lists the known pools and any miner with at least 1% of the
+  blocks; the rest (mostly solo miners) are added up into one `other` row.
 - After every new tip the collector estimates the hashrate (work over time,
   the same arithmetic as `getnetworksolps`), the next block's difficulty, the
   expected block time at the tip, and projects difficulty and block time 1500

@@ -19,6 +19,12 @@ import re
 ACTIVE_WITHIN_SECONDS = 3600
 SEEN_WITHIN_SECONDS = 7 * 86400
 
+# A miner gets its own table row when it carries a known pool tag or mined at
+# least this share of the blocks (this week or in the baseline); the rest are
+# combined into one "other" row.
+MAJOR_SHARE = 0.01
+OTHER = "other"
+
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{4,}")
 MINED_BY = re.compile(r"mined by ([A-Za-z0-9_.-]+)", re.IGNORECASE)
 
@@ -152,12 +158,60 @@ def _latest(*entries):
     return best
 
 
-def miner_table(baseline, recent, week, now):
-    """Rows for the miners table: baseline miners first by share, then the rest by blocks this week.
+def is_pool(miner):
+    """Whether a miner id names a known pool (from POOL_TAGS) rather than a solo tag, an address or a shielded group."""
+    return miner in {name for _, name in POOL_TAGS}
 
-    `week` holds the shares over the last SEEN_WITHIN_SECONDS, so every miner
-    seen in that time has a row and an activity.
+
+def is_major(miner, baseline, week):
+    """Whether a miner is a known pool or mined at least MAJOR_SHARE of the baseline or this week's blocks."""
+    if is_pool(miner):
+        return True
+    for shares in (baseline, week):
+        entry = shares["miners"].get(miner)
+        if entry and entry["share"] >= MAJOR_SHARE:
+            return True
+    return False
+
+
+def combine_rows(rows, now):
+    """One table row standing for `rows`: counts and shares added up, the newest block of any of them."""
+    last_height, last_time = None, None
+    for row in rows:
+        if row["lastHeight"] is not None and (last_height is None or row["lastHeight"] > last_height):
+            last_height = row["lastHeight"]
+            last_time = now - row["lastSeenSeconds"]
+    last_seen = (now - last_time) if last_time is not None else None
+    return {
+        "miner": OTHER,
+        "miners": len(rows),
+        "baselineShare": sum(row["baselineShare"] or 0.0 for row in rows),
+        "baselineBlocks": sum(row["baselineBlocks"] for row in rows),
+        "recentShare": sum(row["recentShare"] for row in rows),
+        "recentBlocks": sum(row["recentBlocks"] for row in rows),
+        "weekBlocks": sum(row["weekBlocks"] for row in rows),
+        "lastHeight": last_height,
+        "lastSeenSeconds": last_seen,
+        "activity": miner_activity(last_seen),
+        "status": OTHER,
+    }
+
+
+def miner_table(baseline, recent, week, now):
+    """Rows for the miners table: the major miners, baseline ones first by share, then the rest combined.
+
+    `week` holds the shares over the last SEEN_WITHIN_SECONDS, so every major
+    miner seen in that time has a row and an activity; minor miners (see
+    `is_major`) are added up into one "other" row at the end.
     """
+    rows = all_miner_rows(baseline, recent, week, now)
+    major = [row for row in rows if is_major(row["miner"], baseline, week)]
+    minor = [row for row in rows if not is_major(row["miner"], baseline, week)]
+    return major + ([combine_rows(minor, now)] if minor else [])
+
+
+def all_miner_rows(baseline, recent, week, now):
+    """A row per miner: baseline miners first by share, then the rest by blocks this week."""
     empty = {"blocks": 0, "share": 0.0, "lastHeight": None, "lastTime": None}
     rows = []
     seen = set()

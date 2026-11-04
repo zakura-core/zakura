@@ -7,6 +7,8 @@
 //! de-duplicate-tree format check, which guards against rollback leaving a duplicate sapling or
 //! orchard tree entry (it would brick the node on the next startup).
 
+#[cfg(zcash_unstable = "nutachyon")]
+use std::collections::BTreeMap;
 use std::{env, path::Path, sync::Arc};
 
 use tempfile::TempDir;
@@ -637,6 +639,53 @@ pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwo
     )
 }
 
+/// A V7 transaction whose Tachyon bundle reveals `tachygram`; checkpoint commits do not
+/// validate bundles, so the rest is placeholder.
+#[cfg(zcash_unstable = "nutachyon")]
+fn tachyon_v7_tx(tachygram: zcash_tachyon::Tachygram) -> Arc<Transaction> {
+    use zakura_chain::transaction::TachyonShieldedData;
+    use zcash_tachyon::{
+        bundle, value, Anchor, Bundle, ProofStamp, TachygramSetPoly, TachyonBundle,
+    };
+
+    Arc::new(Transaction::V7 {
+        network_upgrade: NetworkUpgrade::NuTachyon,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        zip233_amount: Amount::zero(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        tachyon_shielded_data: Some(TachyonShieldedData(TachyonBundle::Proven(Bundle {
+            actions: Vec::new(),
+            value_balance: value::Balance::ZERO,
+            binding_sig: bundle::Signature::read(&[0x02; 64][..])
+                .expect("test signature bytes are canonical"),
+            memo: Vec::new(),
+            stamp: ProofStamp {
+                coverage: [0; 32],
+                tachygram_set: [tachygram]
+                    .into_iter()
+                    .collect::<TachygramSetPoly>()
+                    .commit(),
+                tachygrams: [tachygram].into_iter().collect(),
+                anchor: Anchor::read(&[0; 32][..]).expect("the zero anchor is canonical"),
+                proof: Box::new(ragu::Proof::trivial()),
+            },
+        }))),
+    })
+}
+
+/// The tachygram whose field element is `value`.
+#[cfg(zcash_unstable = "nutachyon")]
+fn tachygram(value: u8) -> zcash_tachyon::Tachygram {
+    let mut bytes = [0; 32];
+    bytes[0] = value;
+    zcash_tachyon::Tachygram::read(&bytes[..]).expect("small values are canonical")
+}
+
 pub(super) fn child_block_with_history_commitment(
     parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
@@ -952,6 +1001,67 @@ fn rollback_truncates_commitment_roots_above_the_target_tip() {
         after.commitment_roots(Height(1)).is_some(),
         "commitment roots at the target tip must remain"
     );
+}
+
+/// A regtest network that activates NU7 and Tachyon at `activation`.
+#[cfg(zcash_unstable = "nutachyon")]
+fn tachyon_regtest(activation: u32) -> Network {
+    use zakura_chain::parameters::testnet::RegtestParameters;
+
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(activation),
+            nu_tachyon: Some(activation),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+/// Commits a regtest chain up to `tip`, revealing `tachygram(reveals[&height])` where present.
+#[cfg(zcash_unstable = "nutachyon")]
+fn commit_tachyon_chain(config: &Config, network: &Network, tip: u32, reveals: &BTreeMap<u32, u8>) {
+    let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let mut state = reopen(config, network);
+    let mut parent: Arc<Block> = zakura_chain::block::genesis::regtest_genesis_block();
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(parent.clone()).into(),
+            None,
+            None,
+            "rollback test",
+        )
+        .expect("committing the genesis block succeeds");
+    // Each block commits to the history tree after its parent, so build the chain while
+    // syncing it.
+    for height in 1..=tip {
+        let mut transactions = vec![coinbase_tx(Height(height), dust, &address)];
+        if let Some(value) = reveals.get(&height) {
+            transactions.push(tachyon_v7_tx(tachygram(*value)));
+        }
+        let block = if height == 1 {
+            // The Heartwood activation block has the reserved all-zero commitment.
+            child_block(&parent, transactions)
+        } else {
+            child_block_with_history_commitment(
+                &parent,
+                transactions,
+                network,
+                &state.db.history_tree(),
+            )
+        };
+        state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block.clone()).into(),
+                None,
+                None,
+                "rollback test",
+            )
+            .expect("committing a generated block succeeds");
+        parent = block;
+    }
 }
 
 /// A configured testnet with early modern activation heights, so rollback tests can exercise
@@ -1410,6 +1520,220 @@ fn rollback_prunes_ironwood_nullifiers_above_target() {
         !open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
         "rollback prunes Ironwood nullifiers above the target"
     );
+}
+
+/// Rollback prunes the Tachyon indexes above the target, and empties them below activation.
+#[test]
+#[cfg(zcash_unstable = "nutachyon")]
+fn rollback_resets_tachyon_indexes_to_the_target() {
+    use zakura_chain::tachyon;
+
+    let _init_guard = zakura_test::init();
+
+    let activation = 2;
+    let network = tachyon_regtest(activation);
+    // One reveal per block from activation, so each end-of-block anchor is distinct.
+    let reveals: BTreeMap<u32, u8> = [(2, 0x0A), (3, 0x0B), (4, 0x0C)].into_iter().collect();
+    let revealed = |db: &ZakuraDb, value: u8| {
+        db.tachyon_tachygram_revealed_height(&tachyon::Tachygram::from(tachygram(value)))
+    };
+    let anchor_at = |db: &ZakuraDb, height: u32| {
+        db.tachyon_anchor_by_height(Height(height))
+            .expect("forward sync records the end-of-block anchor")
+    };
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    commit_tachyon_chain(&config, &network, 4, &reveals);
+
+    let synced = open_unchecked_db(&config, &network);
+    let anchors = [
+        anchor_at(&synced, 2),
+        anchor_at(&synced, 3),
+        anchor_at(&synced, 4),
+    ];
+    let epoch_anchor = synced.tachyon_epoch_anchor(0);
+    assert_eq!(
+        [0x0A, 0x0B, 0x0C].map(|value| revealed(&synced, value)),
+        [Some(Height(2)), Some(Height(3)), Some(Height(4))],
+        "forward sync indexes every revealed tachygram"
+    );
+    assert_eq!(
+        anchors.map(|anchor| synced.tachyon_anchor_height(&anchor)),
+        [Some(Height(2)), Some(Height(3)), Some(Height(4))],
+        "forward sync indexes every end-of-block anchor"
+    );
+    drop(synced);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(2),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback within the Tachyon pool succeeds");
+
+    let rolled = open_unchecked_db(&config, &network);
+    assert_eq!(
+        [0x0A, 0x0B, 0x0C].map(|value| revealed(&rolled, value)),
+        [Some(Height(2)), None, None],
+        "rollback prunes tachygrams above the target"
+    );
+    assert_eq!(
+        anchors.map(|anchor| rolled.tachyon_anchor_height(&anchor)),
+        [Some(Height(2)), None, None],
+        "rollback prunes anchors above the target"
+    );
+    assert_eq!(rolled.tachyon_anchor_for_tip(), anchors[0]);
+    assert_eq!(rolled.tachyon_anchor_by_height(Height(4)), Some(anchors[0]));
+    assert_eq!(rolled.tachyon_epoch_anchor(0), epoch_anchor);
+    assert_eq!(rolled.tachyon_current_epoch(), Some(0));
+    drop(rolled);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback below Tachyon activation succeeds");
+
+    let rolled = open_unchecked_db(&config, &network);
+    assert_eq!(
+        [0x0A, 0x0B, 0x0C].map(|value| revealed(&rolled, value)),
+        [None; 3]
+    );
+    assert_eq!(
+        anchors.map(|anchor| rolled.tachyon_anchor_height(&anchor)),
+        [None; 3]
+    );
+    assert_eq!(rolled.tachyon_anchor_for_tip(), tachyon::Anchor::default());
+    assert_eq!(rolled.tachyon_anchor_by_height(Height(4)), None);
+    assert_eq!(rolled.tachyon_current_epoch(), None);
+}
+
+/// Rollback restores the tachygrams and anchors that an epoch start or a repeated reveal
+/// above the target removed, and a second rollback still finds them.
+#[test]
+#[cfg(zcash_unstable = "nutachyon")]
+fn rollback_rebuilds_the_tachyon_scan_window_across_epoch_starts() {
+    use zakura_chain::tachyon::{self, EPOCH_LENGTH};
+
+    let _init_guard = zakura_test::init();
+
+    let activation = 2;
+    let network = tachyon_regtest(activation);
+    // The first tachygram is revealed again in epoch 2, outside the scan window of its first
+    // reveal, which the duplicate check allows.
+    let first_reveal = activation + 8;
+    let last_of_epoch_0 = activation + EPOCH_LENGTH - 1;
+    let first_of_epoch_1 = activation + EPOCH_LENGTH;
+    let last_of_epoch_1 = activation + 2 * EPOCH_LENGTH - 1;
+    let first_of_epoch_2 = activation + 2 * EPOCH_LENGTH;
+    let repeat = first_of_epoch_2 + 3;
+    let reveals: BTreeMap<u32, u8> = [
+        (first_reveal, 0x0A),
+        (last_of_epoch_0, 0x0B),
+        (first_of_epoch_1, 0x0C),
+        (last_of_epoch_1, 0x0D),
+        (first_of_epoch_2, 0x0E),
+        (repeat, 0x0A),
+    ]
+    .into_iter()
+    .collect();
+    let revealed = |db: &ZakuraDb, value: u8| {
+        db.tachyon_tachygram_revealed_height(&tachyon::Tachygram::from(tachygram(value)))
+    };
+    let anchor_at = |db: &ZakuraDb, height: u32| {
+        db.tachyon_anchor_by_height(Height(height))
+            .expect("forward sync records the end-of-block anchor")
+    };
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    commit_tachyon_chain(&config, &network, repeat + 2, &reveals);
+
+    let synced = open_unchecked_db(&config, &network);
+    let first_anchor = anchor_at(&synced, first_reveal);
+    let epoch_1_anchor = anchor_at(&synced, first_of_epoch_1);
+    let last_of_epoch_1_anchor = anchor_at(&synced, last_of_epoch_1);
+    let epoch_2_anchor = anchor_at(&synced, first_of_epoch_2);
+    assert_eq!(revealed(&synced, 0x0A), Some(Height(repeat)));
+    assert_eq!(revealed(&synced, 0x0B), None);
+    assert_eq!(revealed(&synced, 0x0C), Some(Height(first_of_epoch_1)));
+    assert_eq!(synced.tachyon_anchor_height(&first_anchor), None);
+    assert_eq!(synced.tachyon_current_epoch(), Some(2));
+    drop(synced);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(last_of_epoch_1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback across the epoch-2 start succeeds");
+
+    let rolled = open_unchecked_db(&config, &network);
+    assert_eq!(
+        [0x0A, 0x0B, 0x0C, 0x0D, 0x0E].map(|value| revealed(&rolled, value)),
+        [
+            Some(Height(first_reveal)),
+            Some(Height(last_of_epoch_0)),
+            Some(Height(first_of_epoch_1)),
+            Some(Height(last_of_epoch_1)),
+            None,
+        ],
+        "rollback restores the pruned and overwritten reveals inside the window"
+    );
+    assert_eq!(
+        rolled.tachyon_anchor_height(&first_anchor),
+        Some(Height(first_reveal))
+    );
+    assert_eq!(
+        rolled.tachyon_anchor_height(&epoch_1_anchor),
+        Some(Height(first_of_epoch_1))
+    );
+    assert_eq!(rolled.tachyon_anchor_height(&epoch_2_anchor), None);
+    assert_eq!(rolled.tachyon_anchor_for_tip(), last_of_epoch_1_anchor);
+    assert_eq!(rolled.tachyon_current_epoch(), Some(1));
+    drop(rolled);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(last_of_epoch_0),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("a second rollback across the epoch-1 start succeeds");
+
+    let rolled = open_unchecked_db(&config, &network);
+    assert_eq!(
+        [0x0A, 0x0B, 0x0C].map(|value| revealed(&rolled, value)),
+        [
+            Some(Height(first_reveal)),
+            Some(Height(last_of_epoch_0)),
+            None
+        ],
+        "a repeated rollback keeps the window at its own target"
+    );
+    assert_eq!(
+        rolled.tachyon_anchor_height(&first_anchor),
+        Some(Height(first_reveal))
+    );
+    assert_eq!(rolled.tachyon_anchor_height(&epoch_1_anchor), None);
+    assert_eq!(rolled.tachyon_current_epoch(), Some(0));
 }
 
 #[test]

@@ -922,12 +922,15 @@ where
             perf.finish(result.is_ok());
             match result {
                 // Proposals never become body evidence, so they keep the first failure.
-                Err(error) if !request.is_proposal() => Err(crate::block_perf::observe(
-                    Some(perf_context.clone()),
-                    Stage::Error,
-                    confirm_auth_data_binding(state_service, &network, request.block(), error),
-                )
-                .await),
+                Err(error) if !request.is_proposal() => {
+                    perf_context.mark_error_binding();
+                    Err(crate::block_perf::observe(
+                        Some(perf_context.clone()),
+                        Stage::Error,
+                        confirm_auth_data_binding(state_service, &network, request.block(), error),
+                    )
+                    .await)
+                }
                 result => result,
             }
         })

@@ -256,9 +256,6 @@ impl PrecomputedTxData {
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
-        let _perf = crate::diagnostic::block_perf::Timer::operation(
-            crate::diagnostic::block_perf::Operation::Sighash,
-        );
         let tx = tx.to_librustzcash_data(nu)?;
 
         let txid_parts = match tx.version() {

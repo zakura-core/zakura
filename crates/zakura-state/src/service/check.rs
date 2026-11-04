@@ -394,6 +394,7 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
             let context = Context::current().or_else(|| Context::for_hash(block.hash()));
             let stage = match Context::current_stage() {
                 Some(Stage::Error) => Stage::Error,
+                _ if context.as_ref().is_some_and(Context::is_error_binding) => Stage::Error,
                 _ => Stage::Commitment,
             };
             let _scope = Context::enter(context, stage);

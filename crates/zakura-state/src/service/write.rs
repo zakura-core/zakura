@@ -3434,6 +3434,7 @@ impl WriteBlockWorkerTask {
                 .expect("just successfully inserted a non-finalized block above")
                 > MAX_BLOCK_REORG_HEIGHT
             {
+                let _finalized_scope = Context::enter(perf_context.clone(), Stage::Finalized);
                 let _perf_finalized = perf_context
                     .as_ref()
                     .map(|context| context.stage(Stage::Finalized));

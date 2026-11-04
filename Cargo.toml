@@ -336,7 +336,39 @@ debug = false
 # Dependencies rarely rebuild and compile in parallel with each other, so one
 # codegen unit each costs little build time. It removes the extra per-unit
 # copies of the generic code they use, shrinking zakurad's .text by about 2%.
-# Workspace crates keep 4 units so edit-and-rebuild stays parallel.
+# The workspace crates below zakura-state also use one unit: their dependents
+# start from their metadata, so their codegen finishes long before the final
+# link, and one unit shrinks zakurad's .text by another 0.8% without slowing
+# clean or edit-and-rebuild builds. zakura-state and the crates above it keep
+# 4 units: they are on the build's critical path, where one unit each slows a
+# clean release build by over 20%.
+codegen-units = 1
+
+[profile.release.package.zakura-mmr-tree]
+codegen-units = 1
+
+[profile.release.package.zakura-rt]
+codegen-units = 1
+
+[profile.release.package.zakura-jsonl-trace]
+codegen-units = 1
+
+[profile.release.package.zakura-test]
+codegen-units = 1
+
+[profile.release.package.zakura-chain]
+codegen-units = 1
+
+[profile.release.package.zakura-quic]
+codegen-units = 1
+
+[profile.release.package.zakura-header-chain]
+codegen-units = 1
+
+[profile.release.package.zakura-script]
+codegen-units = 1
+
+[profile.release.package.zakura-node-services]
 codegen-units = 1
 
 [profile.ci-tests]

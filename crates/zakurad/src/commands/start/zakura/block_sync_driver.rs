@@ -1124,8 +1124,13 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 tokio::select! {
                     biased;
                     completed = &mut apply => {
-                        // Holders that remain belong to the backend, whatever the outcome.
-                        transfer_block.leave_pipeline();
+                        // Only a committed block's remaining holders belong to the
+                        // backend. After any other result, detached verifier work such
+                        // as a queued script check can still hold the block, so its last
+                        // holder ends the pipeline share when it drops.
+                        if completed.result == BlockApplyResult::Committed {
+                            transfer_block.leave_pipeline();
+                        }
                         accepted
                             .take()
                             .expect("accepted operation has one terminal result")
@@ -1161,9 +1166,10 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                         BlockApplyCompletion { class, result }
                     }
                     () = abandon.cancelled() => {
-                        // Shutdown outwaited its drain bound. Dropping the
-                        // verifier future releases the body.
-                        transfer_block.leave_pipeline();
+                        // Shutdown outwaited its drain bound. Dropping the verifier
+                        // future releases its holders, but detached verifier work can
+                        // still hold the body, so its last holder ends the pipeline
+                        // share when it drops.
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,
@@ -2214,6 +2220,103 @@ mod tests {
             "the last downstream holder settles the charge"
         );
         drop(lease);
+    }
+
+    /// Apply an owned block through a verifier that keeps a transaction handle,
+    /// as a detached script check or the backend does, and returns `reply`.
+    /// Returns once the driver has dropped its own holders.
+    async fn apply_with_retained_transaction(
+        reply: fn(block::Hash) -> Result<block::Hash, zakura_consensus::BoxError>,
+    ) -> (
+        zakura_node_services::block_memory::DecodedBlockPool,
+        zakura_node_services::block_memory::TransactionHandle,
+        u64,
+        TestDriver,
+    ) {
+        use zakura_node_services::block_memory::{model::Probe, Admission, DecodedBlockPool};
+
+        let block: block::Block = BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("block vector parses");
+        let bytes = block.attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+        let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&block);
+        let (retained_tx, mut retained_rx) = mpsc::unbounded_channel();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let retained_tx = retained_tx.clone();
+            async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    panic!("unexpected request: {request:?}");
+                };
+                retained_tx.send(block.transaction(0).unwrap()).unwrap();
+                reply(block.hash())
+            }
+        });
+        let driver = spawn_checkpoint_driver(verifier, SyncCoordinator::new(), ZakuraTrace::noop());
+        driver
+            .actions
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_owner(),
+                source: test_source(),
+                token: 3,
+                block: block.into(),
+            })
+            .await
+            .unwrap();
+        let transaction = tokio::time::timeout(Duration::from_secs(1), retained_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probe.read(1, std::slice::from_ref(&pool)).unwrap().holders > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver drops its holders after the apply");
+        (pool, transaction, bytes, driver)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_apply_keeps_pipeline_share_until_detached_holder_drops() {
+        let (pool, transaction, bytes, driver) = apply_with_retained_transaction(|_| {
+            Err(zakura_consensus::VerifyBlockError::Block {
+                source: zakura_consensus::BlockError::NoTransactions,
+            }
+            .into())
+        })
+        .await;
+        assert_eq!(
+            pool.pipeline_bytes(),
+            bytes,
+            "a detached holder of a rejected block keeps its pipeline share"
+        );
+        let version = pool.capacity_version();
+
+        drop(transaction);
+        assert_eq!(pool.pipeline_bytes(), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(
+            pool.capacity_version() > version,
+            "the last holder's release wakes admission"
+        );
+        driver.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_apply_leaves_pipeline_while_backend_holds_block() {
+        let (pool, transaction, bytes, driver) = apply_with_retained_transaction(Ok).await;
+        assert_eq!(
+            pool.pipeline_bytes(),
+            0,
+            "a committed block's backend holder is past the pipeline"
+        );
+        assert_eq!(pool.reserved_bytes(), bytes);
+
+        drop(transaction);
+        assert_eq!(pool.reserved_bytes(), 0);
+        driver.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

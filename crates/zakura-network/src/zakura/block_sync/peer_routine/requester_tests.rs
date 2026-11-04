@@ -1,4 +1,4 @@
-use super::super::regulated::live_requester::MAX_PENDING_ENDINGS;
+use super::super::regulated::{live_requester::MAX_PENDING_ENDINGS, status_sender::StatusSender};
 use super::super::{request::BlockSizeEstimate, BlockSyncMessage, MSG_BS_BLOCK};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
@@ -77,14 +77,19 @@ fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
 #[tokio::test]
 async fn replacement_requests_from_cached_status_without_waiting_for_an_announcement() {
     let (mut routine, mut outbound, _events) = super::tests::status_test_routine();
+    let connection = Arc::new(StatusSender::new(u32::MAX, Duration::ZERO));
+    connection.record_received(
+        Some(BlockSyncStatus {
+            servable_high: block::Height(10),
+            ..Default::default()
+        }),
+        routine.state.status_pacing.clone(),
+    );
     routine.io.session = routine
         .io
         .session
         .clone()
-        .with_status_for_test(BlockSyncStatus {
-            servable_high: block::Height(10),
-            ..Default::default()
-        });
+        .with_status_sender_for_test(connection);
     let (_input, recv) = crate::zakura::framed_channel(4);
     routine.io.recv = recv;
     let (_view, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
@@ -1508,7 +1513,7 @@ async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
     ranking.as_mut().enable();
     fast.handle_status(inflight_limit(1));
     assert!(
-        fast.state.pending_status.is_some(),
+        fast.state.status_pacing.pending.is_some(),
         "the status was rate-limited"
     );
     assert!(futures::poll!(ranking.as_mut()).is_ready());
@@ -1535,7 +1540,7 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
         ranking.as_mut().enable();
         fast.handle_status(inflight_limit(if round % 2 == 0 { 1 } else { 2 }));
         assert!(
-            fast.state.pending_status.is_some(),
+            fast.state.status_pacing.pending.is_some(),
             "every status is rate-limited"
         );
         if futures::poll!(ranking.as_mut()).is_ready() {
@@ -1551,7 +1556,7 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     ranking.as_mut().enable();
     time::advance(Duration::from_secs(1)).await;
     fast.flush_pending_status();
-    assert!(fast.state.pending_status.is_none());
+    assert!(fast.state.status_pacing.pending.is_none());
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.io.peer, None, false));
 }

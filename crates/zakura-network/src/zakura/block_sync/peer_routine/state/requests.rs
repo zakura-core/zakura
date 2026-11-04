@@ -468,8 +468,9 @@ impl PeerState {
             shared.floor_watchdog_avoid,
             shared.body_retry_avoid,
             shared.retry_filter,
-            self.pending_status
-                .map(|_| self.inbound_status_meter.next_allowed),
+            self.status_pacing
+                .pending
+                .map(|_| self.status_pacing.apply_meter.next_allowed),
         ]
         .into_iter()
         .flatten()

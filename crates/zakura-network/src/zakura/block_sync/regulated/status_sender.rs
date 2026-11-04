@@ -7,7 +7,7 @@ use zakura_rt::{
 
 use super::wire::Message;
 use crate::zakura::{
-    block_sync::{BlockSyncStatus, MSG_BS_STATUS},
+    block_sync::{state::RateMeter, BlockSyncStatus, MSG_BS_STATUS},
     regulation::{CadenceSendError, CadenceSender, RowSend},
     FramedSend, OrderedSendError,
 };
@@ -26,10 +26,34 @@ pub(crate) enum StatusSend {
     QueueFull,
 }
 
+/// How a connection paces the Status frames it receives. A stream-6
+/// replacement resumes this pacing, so a reopened stream gets no fresh
+/// Status allowance.
+#[derive(Clone, Debug)]
+pub(in crate::zakura::block_sync) struct InboundStatusPacing {
+    /// Paces Status application, with one extra range change per window.
+    pub(in crate::zakura::block_sync) apply_meter: RateMeter,
+    /// Paces our Status replies.
+    pub(in crate::zakura::block_sync) reply_meter: RateMeter,
+    /// Whether the current window still allows one immediate range change.
+    pub(in crate::zakura::block_sync) range_bypass_available: bool,
+    /// The latest received Status that the apply meter deferred.
+    pub(in crate::zakura::block_sync) pending: Option<BlockSyncStatus>,
+}
+
+/// The inbound Status state that outlives one stream-6 session.
+#[derive(Clone, Debug)]
+pub(in crate::zakura::block_sync) struct ReceivedStatus {
+    /// The last Status that a routine applied. It was paced when it arrived,
+    /// so a replacement routine applies it again without spending a meter.
+    pub(in crate::zakura::block_sync) applied: BlockSyncStatus,
+    pub(in crate::zakura::block_sync) pacing: InboundStatusPacing,
+}
+
 #[derive(Debug)]
 pub(crate) struct StatusSender {
     sender: Mutex<CadenceSender<Message>>,
-    received: Mutex<Option<BlockSyncStatus>>,
+    received: Mutex<Option<ReceivedStatus>>,
     max_inflight_requests: u32,
 }
 
@@ -56,12 +80,28 @@ impl StatusSender {
         }
     }
 
-    pub(crate) fn record_received(&self, status: BlockSyncStatus) {
-        *self.received.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
+    /// Store this connection's inbound Status pacing for a later stream-6
+    /// session, with the Status just applied, if any. Pacing without an
+    /// applied Status has nothing to resume, so it is not kept.
+    pub(in crate::zakura::block_sync) fn record_received(
+        &self,
+        applied: Option<BlockSyncStatus>,
+        pacing: InboundStatusPacing,
+    ) {
+        let mut received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        match (applied, received.as_mut()) {
+            (Some(applied), _) => *received = Some(ReceivedStatus { applied, pacing }),
+            (None, Some(received)) => received.pacing = pacing,
+            (None, None) => {}
+        }
     }
 
-    pub(crate) fn received(&self) -> Option<BlockSyncStatus> {
-        *self.received.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The inbound Status state that an earlier stream-6 session stored.
+    pub(in crate::zakura::block_sync) fn received(&self) -> Option<ReceivedStatus> {
+        self.received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Replace the pending Status and queue it if the cadence allows.

@@ -854,7 +854,20 @@ fn publish_slots_shows_no_free_slot_at_the_no_progress_cap() {
         harness.state.fill_limits(&config, now).err(),
         Some(super::FillStop::InitialBlockProbeRequestCap),
     );
-    let slots = harness.state.publish_slots(false, now);
+    let slots = harness.state.publish_slots(false, false, now);
     assert_eq!(slots.available_slots, 0);
     assert!(!harness.state.published_free_slots);
+}
+
+/// A full outbound queue takes no request, so the slot publication shows no
+/// free slot, whatever the window allows.
+#[test]
+fn publish_slots_shows_no_free_slot_while_the_outbound_queue_is_full() {
+    let now = Instant::now();
+    let mut harness = Harness::new();
+    assert!(harness.state.window.available_slots_at(now) > 0);
+    let slots = harness.state.publish_slots(false, true, now);
+    assert_eq!(slots.available_slots, 0);
+    assert!(!harness.state.published_free_slots);
+    assert!(harness.state.published_outbound_full);
 }

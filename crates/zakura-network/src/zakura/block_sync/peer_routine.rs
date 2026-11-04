@@ -35,7 +35,7 @@ use super::{
     peer_registry::PeerRegistry,
     pipe::block_sync_guard,
     reactor::tolerated_bytes,
-    regulated::{wire::Outcome, CompletedRange},
+    regulated::{status_sender::ReceivedStatus, wire::Outcome, CompletedRange},
     sequencer_task::{SequencedBody, SequencerView},
     state::{DownloadWindow, OutstandingBlockRange, RequestKey, ThroughputMeter, WriteOutcome},
     work_queue::{WorkQueue, WorkReturnOutcome},
@@ -365,8 +365,8 @@ impl PeerRoutine {
         let mut guard = block_sync_guard();
         // A stream replacement keeps the same connection advertisement. Waiting
         // for a fresh one would stall requests until the next cadence interval.
-        if let Some(status) = self.io.session.received_status() {
-            self.handle_status(status);
+        if let Some(received) = self.io.session.received_status() {
+            self.resume_status(received);
         }
         let result = self.run_inner(&mut guard).await;
         // Traced here rather than in the liveness check, which runs on every
@@ -445,6 +445,7 @@ impl PeerRoutine {
                 None
             };
             let outbound_queue_has_capacity = self.io.session.outbound_capacity() > 0;
+            self.follow_outbound_capacity(outbound_queue_has_capacity);
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
@@ -704,7 +705,6 @@ impl PeerRoutine {
     /// meter allows publication, write it to the registry and ping the reactor
     /// to advertise our reply and republish the candidate.
     fn handle_status(&mut self, status: BlockSyncStatus) {
-        self.io.session.record_received_status(status);
         let update = self.state.on_status(status, Instant::now());
         if self
             .state
@@ -712,9 +712,28 @@ impl PeerRoutine {
         {
             self.publish_slot_diagnostics();
         }
+        // The connection keeps the pacing, so a stream-6 replacement resumes it.
+        let applied = matches!(update, StatusUpdate::Publish { .. }).then_some(status);
+        self.io
+            .session
+            .record_received_status(applied, self.state.status_pacing.clone());
         let StatusUpdate::Publish { send_reply } = update else {
             return;
         };
+        self.publish_status(status, send_reply);
+    }
+
+    /// Resume the Status state an earlier stream-6 session of this connection
+    /// left behind, and publish its applied Status for this generation without
+    /// a reply.
+    fn resume_status(&mut self, received: ReceivedStatus) {
+        let applied = received.applied;
+        self.state.resume_status(received);
+        self.publish_status(applied, false);
+    }
+
+    /// Write `status` to the registry and ask the reactor to republish the candidate.
+    fn publish_status(&mut self, status: BlockSyncStatus, send_reply: bool) {
         // Publish the servable range / clamped caps / received_status to the
         // registry so the reactor's candidate reads see them; generation-gated.
         self.io
@@ -1467,14 +1486,27 @@ impl PeerRoutine {
         self.state.requester_stop(self.io.requester.occupancy())
     }
 
+    /// Republish the slots when the outbound queue filled or drained since the
+    /// last publication. Fill cannot send while the queue is full, so the
+    /// published slots follow the queue; publishing on the edge alone bounds
+    /// the churn.
+    fn follow_outbound_capacity(&mut self, has_capacity: bool) {
+        if self.state.published_outbound_full == has_capacity {
+            self.publish_slot_diagnostics();
+        }
+    }
+
     /// Publish the window diagnostics for the reactor's periodic trace row and
-    /// for other routines' cross-peer floor-bias decisions. A routine whose
-    /// requester refuses new requests publishes no free slots, so no other
+    /// for other routines' cross-peer floor-bias decisions. A routine that
+    /// cannot send a request, because its requester refuses new requests or
+    /// its outbound queue is full, publishes no free slots, so no other
     /// routine defers the floor to it.
     fn publish_slot_diagnostics(&mut self) {
-        let diagnostics = self
-            .state
-            .publish_slots(self.requester_stop().is_some(), Instant::now());
+        let diagnostics = self.state.publish_slots(
+            self.requester_stop().is_some(),
+            self.io.session.outbound_capacity() == 0,
+            Instant::now(),
+        );
         self.io
             .registry
             .publish_slots(&self.io.peer, self.io.generation, diagnostics);
@@ -1936,8 +1968,8 @@ mod tests {
             .try_recv()
             .expect("initial status is published");
         let next_allowed = Instant::now() + Duration::from_secs(60);
-        routine.state.inbound_status_meter.next_allowed = next_allowed;
-        routine.state.status_reply_meter.next_allowed = next_allowed;
+        routine.state.status_pacing.apply_meter.next_allowed = next_allowed;
+        routine.state.status_pacing.reply_meter.next_allowed = next_allowed;
 
         status.servable_low = block::Height(2);
         routine.handle_status(status);
@@ -1970,7 +2002,7 @@ mod tests {
         routine.flush_pending_status();
         assert!(reactor_events.try_recv().is_err());
 
-        routine.state.inbound_status_meter.next_allowed = Instant::now();
+        routine.state.status_pacing.apply_meter.next_allowed = Instant::now();
         routine.flush_pending_status();
         assert_eq!(
             (routine.state.servable_low, routine.state.servable_high),
@@ -1987,7 +2019,7 @@ mod tests {
         ));
 
         // A newer return to the applied range must cancel an older deferred change.
-        routine.state.inbound_status_meter.next_allowed = next_allowed;
+        routine.state.status_pacing.apply_meter.next_allowed = next_allowed;
         status.servable_low = block::Height(1);
         routine.handle_status(status);
         let _ = reactor_events
@@ -1997,7 +2029,7 @@ mod tests {
         routine.handle_status(status);
         status.servable_low = block::Height(1);
         routine.handle_status(status);
-        routine.state.inbound_status_meter.next_allowed = Instant::now();
+        routine.state.status_pacing.apply_meter.next_allowed = Instant::now();
         routine.flush_pending_status();
         assert!(reactor_events.try_recv().is_err());
         assert_eq!(routine.state.servable_low, block::Height(1));
@@ -2021,7 +2053,8 @@ mod tests {
         assert_eq!(routine.state.window.max_inflight_requests, 8);
 
         // A second Status, buffered behind a read pause, only lowers the limit.
-        routine.state.inbound_status_meter.next_allowed = Instant::now() + Duration::from_secs(60);
+        routine.state.status_pacing.apply_meter.next_allowed =
+            Instant::now() + Duration::from_secs(60);
         status.max_inflight_requests = 1;
         routine.handle_status(status);
         assert_eq!(
@@ -2059,7 +2092,7 @@ mod tests {
         // A repeat must not cancel the unpublished change.
         routine.handle_status(status);
 
-        routine.state.inbound_status_meter.next_allowed = Instant::now();
+        routine.state.status_pacing.apply_meter.next_allowed = Instant::now();
         routine.flush_pending_status();
         assert_eq!(
             routine.state.published_limits.2, 1,
@@ -2069,6 +2102,123 @@ mod tests {
             reactor_events.try_recv(),
             Ok(RoutineToReactor::StatusReceived { .. })
         ));
+    }
+
+    /// A stream-6 replacement resumes its connection's Status pacing, so a
+    /// reopened stream gets no fresh Status allowance and no fresh reply.
+    #[tokio::test]
+    async fn a_stream_replacement_resumes_the_connections_status_pacing() {
+        let connection = Arc::new(super::super::regulated::status_sender::StatusSender::new(
+            u32::MAX,
+            Duration::ZERO,
+        ));
+        let (mut first, _first_outbound, mut first_events) = status_test_routine();
+        first.io.session = first
+            .io
+            .session
+            .clone()
+            .with_status_sender_for_test(Arc::clone(&connection));
+        let mut status = BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(3),
+            tip_hash: block::Hash([3; 32]),
+            max_blocks_per_response: first.config.advertised_max_blocks_per_response(),
+            max_inflight_requests: first.config.advertised_max_inflight_requests(),
+            max_response_bytes: first.config.advertised_max_response_bytes(),
+        };
+        first.handle_status(status);
+        assert!(matches!(
+            first_events.try_recv(),
+            Ok(RoutineToReactor::StatusReceived {
+                send_reply: true,
+                ..
+            })
+        ));
+        // Close the apply window, then send a limits-only change it defers.
+        let closed_until = Instant::now() + Duration::from_secs(60);
+        first.state.status_pacing.apply_meter.next_allowed = closed_until;
+        first.state.status_pacing.reply_meter.next_allowed = closed_until;
+        let lowered = BlockSyncStatus {
+            max_inflight_requests: 1,
+            ..status
+        };
+        first.handle_status(lowered);
+        assert!(first_events.try_recv().is_err(), "the meter defers it");
+
+        let (mut replacement, _outbound, mut events) = status_test_routine();
+        replacement.io.session = replacement
+            .io
+            .session
+            .clone()
+            .with_status_sender_for_test(connection);
+        let received = replacement
+            .io
+            .session
+            .received_status()
+            .expect("the first stream stored its Status state");
+        replacement.resume_status(received);
+        assert!(replacement.state.received_status);
+        assert_eq!(replacement.state.servable_high, block::Height(3));
+        assert_eq!(
+            replacement.state.window.max_inflight_requests, 1,
+            "requests obey the deferred limit at once"
+        );
+        assert_eq!(replacement.state.status_pacing.pending, Some(lowered));
+        assert!(
+            matches!(
+                events.try_recv(),
+                Ok(RoutineToReactor::StatusReceived {
+                    send_reply: false,
+                    ..
+                })
+            ),
+            "the replacement publishes the applied Status without a reply"
+        );
+
+        // The replacement shares the closed window: a limits change waits.
+        status.max_response_bytes /= 2;
+        replacement.handle_status(status);
+        assert!(
+            events.try_recv().is_err(),
+            "a reopened stream gets no fresh Status allowance"
+        );
+        // Once the apply window opens, the reply window is still the connection's.
+        replacement.state.status_pacing.apply_meter.next_allowed = Instant::now();
+        replacement.flush_pending_status();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(RoutineToReactor::StatusReceived {
+                send_reply: false,
+                ..
+            })
+        ));
+    }
+
+    /// A full outbound queue publishes no free slots, and the routine
+    /// republishes free slots once the queue drains.
+    #[tokio::test]
+    async fn slot_publication_follows_the_outbound_queue() {
+        let (mut routine, mut outbound, _events) = status_test_routine();
+        routine.follow_outbound_capacity(true);
+        routine.publish_slot_diagnostics();
+        assert!(routine.state.published_free_slots);
+
+        let sender = routine.io.session.request_sender();
+        let frame = BlockSyncMessage::Status(BlockSyncStatus::default())
+            .encode_frame()
+            .unwrap();
+        while routine.io.session.outbound_capacity() > 0 {
+            sender.try_send(frame.clone()).unwrap();
+        }
+        routine.follow_outbound_capacity(false);
+        assert!(
+            !routine.state.published_free_slots,
+            "fill cannot send, so no routine may defer the floor to this one"
+        );
+
+        outbound.recv().await.unwrap();
+        routine.follow_outbound_capacity(true);
+        assert!(routine.state.published_free_slots);
     }
 
     #[tokio::test]
@@ -2097,19 +2247,19 @@ mod tests {
 
         // Keep both windows closed without depending on the test's runtime speed.
         let next_allowed = Instant::now() + Duration::from_secs(60);
-        routine.state.inbound_status_meter.next_allowed = next_allowed;
-        routine.state.status_reply_meter.next_allowed = next_allowed;
+        routine.state.status_pacing.apply_meter.next_allowed = next_allowed;
+        routine.state.status_pacing.reply_meter.next_allowed = next_allowed;
         for (index, (low, high)) in [(2, 3), (1, 3), (1, 2), (1, 3), (0, 3), (0, 0), (2, 3)]
             .into_iter()
             .enumerate()
         {
             if index > 0 {
-                routine.state.inbound_status_meter.next_allowed = Instant::now();
+                routine.state.status_pacing.apply_meter.next_allowed = Instant::now();
                 routine.handle_status(status);
                 let _ = routine_to_reactor_rx
                     .try_recv()
                     .expect("new status window opens");
-                routine.state.inbound_status_meter.next_allowed = next_allowed;
+                routine.state.status_pacing.apply_meter.next_allowed = next_allowed;
             }
             status.servable_low = block::Height(low);
             status.servable_high = block::Height(high);

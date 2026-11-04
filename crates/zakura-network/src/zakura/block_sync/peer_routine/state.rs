@@ -8,10 +8,11 @@ use zakura_rt::time::Instant;
 use super::{
     super::{
         peer_registry::{hard_outbound_capacity, SlotDiagnostics},
+        regulated::status_sender::InboundStatusPacing,
         state::RateMeter,
     },
     fill::{FillLimits, FillStop},
-    BlockSyncStatus, DownloadWindow, ZakuraBlockSyncConfig,
+    DownloadWindow, ZakuraBlockSyncConfig,
 };
 
 mod liveness;
@@ -54,14 +55,12 @@ pub(super) struct PeerState {
     /// repeated stall is connection-fatal so it cannot reclaim download slots
     /// indefinitely without paying the redial cost.
     pub(super) allow_no_progress_park: bool,
-    /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
-    /// The reply decision is routine-local; the actual send stays reactor-side via
+    /// How this connection paces the peer's inbound `Status`: application,
+    /// our replies, the range bypass, and the deferred Status. The routine
+    /// stores it with the connection after each `Status`, so a stream-6
+    /// replacement resumes it. The reply itself stays reactor-side via
     /// `RoutineToReactor::StatusReceived`.
-    pub(super) status_reply_meter: RateMeter,
-    /// Rate meter for status application, with one extra range change per window.
-    pub(super) inbound_status_meter: RateMeter,
-    /// Allows one immediate range change without permitting an unbounded bypass.
-    status_range_bypass_available: bool,
+    pub(super) status_pacing: InboundStatusPacing,
     /// Clamped limits last published to the registry. Request issuance uses the
     /// latest limits immediately; only publication waits for the meter.
     pub(super) published_limits: (u32, u32, u32),
@@ -70,8 +69,8 @@ pub(super) struct PeerState {
     /// Whether the last slot publication showed a free slot, so other
     /// routines may defer the floor to this one.
     pub(super) published_free_slots: bool,
-    /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
-    pub(super) pending_status: Option<BlockSyncStatus>,
+    /// Whether the last slot publication saw a full outbound queue.
+    pub(super) published_outbound_full: bool,
     /// Last `reset_epoch` that this routine processed.
     /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
     last_reset_epoch: u64,
@@ -118,14 +117,17 @@ impl PeerState {
             retry_avoid: BTreeMap::new(),
             request_pool_waiting: false,
             allow_no_progress_park,
-            status_reply_meter: RateMeter::new(config.status_refresh_interval),
-            inbound_status_meter: RateMeter::new(
-                config.status_refresh_interval.min(Duration::from_secs(1)),
-            ),
-            status_range_bypass_available: false,
+            status_pacing: InboundStatusPacing {
+                apply_meter: RateMeter::new(
+                    config.status_refresh_interval.min(Duration::from_secs(1)),
+                ),
+                reply_meter: RateMeter::new(config.status_refresh_interval),
+                range_bypass_available: false,
+                pending: None,
+            },
             published_requester_stopped: false,
             published_free_slots: false,
-            pending_status: None,
+            published_outbound_full: false,
             last_reset_epoch: reset_epoch,
             checked_revocations: revocations,
             outbound_full_since: None,
@@ -203,20 +205,24 @@ impl PeerState {
     }
 
     /// Record what a slot publication shows at `now`, and return it. A requester
-    /// that refuses new requests, or a peer at its no-progress request cap,
-    /// publishes no free slots, so no other routine defers the floor to it.
+    /// that refuses new requests, a full outbound queue, or a peer at its
+    /// no-progress request cap publishes no free slots, so no other routine
+    /// defers the floor to it.
     pub(super) fn publish_slots(
         &mut self,
         requester_stopped: bool,
+        outbound_full: bool,
         now: Instant,
     ) -> SlotDiagnostics {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
-        let available_slots = if requester_stopped || self.no_progress_stop().is_some() {
-            0
-        } else {
-            self.window.available_slots_at(now)
-        };
+        let available_slots =
+            if requester_stopped || outbound_full || self.no_progress_stop().is_some() {
+                0
+            } else {
+                self.window.available_slots_at(now)
+            };
         self.published_requester_stopped = requester_stopped;
+        self.published_outbound_full = outbound_full;
         self.published_free_slots = available_slots > 0;
         SlotDiagnostics {
             hard_capacity,

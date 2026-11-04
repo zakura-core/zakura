@@ -211,6 +211,14 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "block/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_query_identities",
+        ),
+        bypass: Bypass::Planted("refusal-consumes-query-id"),
+    },
+    Coverage {
         property: "block/work-funding",
         passing: passes(
             "tests/replay_exact.rs",
@@ -573,5 +581,16 @@ pub static COVERAGE: &[Coverage] = &[
             "the_decoded_input_stall_input_holds_input_decoded_bound",
         )),
         bypass: Bypass::Planted("no-room-check"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_reset_mid_flight_input_holds_reactor_query_lifecycle",
+        ),
+        bypass: Bypass::Pending(
+            "no committed input is known to fill or close the action channel, so no planted \
+             refusal bug can reach this check yet; checker tests cover crafted refusals",
+        ),
     },
 ];

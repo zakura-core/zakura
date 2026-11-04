@@ -613,6 +613,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 BlockSyncFact::WorkQueue { .. } => "work-queue",
                 BlockSyncFact::Sequencer { .. } => "sequencer",
                 BlockSyncFact::SequencerClosed => "sequencer-closed",
+                BlockSyncFact::Reactor { .. } => "reactor",
             }),
             _ => None,
         })

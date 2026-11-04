@@ -2657,6 +2657,108 @@ mod tests {
         }
     }
 
+    /// The reactor can deliver a payload mismatch before the
+    /// `WorkAuthorityRefreshed` of a newer committed view. It judges the
+    /// completion against the authority it last sent here, so the mismatch
+    /// clears the retry state this task holds, and the refresh carries no
+    /// supplier suppression forward.
+    #[tokio::test]
+    async fn mismatch_before_authority_refresh_leaves_no_supplier_suppressed() {
+        let frontiers = genesis_frontiers();
+        let old_authority = super::test_work_scope();
+        let registry = Arc::new(PeerRegistry::new());
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(123))),
+            registry.clone(),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(old_authority),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        // An earlier unavailable answer deferred another supplier under the old
+        // authority.
+        let deferred = ZakuraPeerId::new(vec![2; 32]).expect("test peer ID is valid");
+        let now = Instant::now();
+        registry.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest(
+                deferred.digest(),
+            )],
+            old_authority,
+            hash,
+            now + Duration::from_secs(60),
+        );
+        let mut refreshed = old_authority;
+        refreshed.header.header_generation = old_authority
+            .header
+            .header_generation
+            .checked_next()
+            .expect("the test generation has a successor");
+
+        let mismatch = zakura_header_chain::BodyPayloadMismatch {
+            evidence: zakura_header_chain::EvidenceId::from_digest([0x82; 32]),
+            requested: hash,
+            delivered: block::Hash([0x83; 32]),
+            kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+            source,
+        };
+        let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+        let _ = task
+            .handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::default())),
+                Some(owner.authority.body_work_epoch),
+            )
+            .await;
+        let _ = task
+            .handle_control_input(SequencerControlInput::WorkAuthorityRefreshed {
+                authority: refreshed,
+            })
+            .await;
+
+        assert!(
+            !registry.is_body_retry_avoided(&deferred, refreshed, hash, now),
+            "the mismatch reopens the body to every supplier"
+        );
+    }
+
     /// A tampered body's record waits for a busy driver instead of timing out.
     /// The height is still reset so another supplier can serve it.
     #[tokio::test]

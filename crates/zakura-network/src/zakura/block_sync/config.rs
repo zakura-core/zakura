@@ -468,11 +468,10 @@ impl ZakuraBlockSyncConfig {
             .clamp(Duration::from_millis(1), self.request_timeout)
     }
 
-    /// Return the largest byte reservation a single floor request can need.
+    /// Return the largest byte reservation a single floor request can need:
+    /// its estimate, at most `k·B`.
     pub fn floor_request_byte_reservation(&self) -> u64 {
-        let worst_case_blocks = u64::from(self.advertised_max_blocks_per_response())
-            .saturating_mul(BS_PER_BLOCK_WORST_CASE_BYTES);
-        u64::from(self.advertised_max_response_bytes()).max(worst_case_blocks)
+        self.request_byte_ceiling()
     }
 
     /// The largest estimate one request reserves: `k·B`, with `k` blocks per

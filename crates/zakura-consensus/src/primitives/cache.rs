@@ -34,6 +34,8 @@ use zakura_chain::transaction::UnminedTxId;
 
 use crate::BoxError;
 
+use super::flush;
+
 #[cfg(test)]
 mod tests;
 
@@ -312,6 +314,9 @@ pub struct Cached<S> {
     /// The value this cache reports in the `verifier` label of its metrics.
     verifier_name: &'static str,
 
+    /// The batch worker a block flushes once its misses are queued, if any.
+    flush_verifier: Option<flush::Verifier>,
+
     /// The keys of the items that reached the inner service, in call order.
     ///
     /// Test-only. See [`Self::inner_calls_for`].
@@ -325,6 +330,7 @@ impl<S: Clone> Clone for Cached<S> {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
             verifier_name: self.verifier_name,
+            flush_verifier: self.flush_verifier,
             #[cfg(test)]
             inner_calls: self.inner_calls.clone(),
         }
@@ -339,9 +345,17 @@ impl<S> Cached<S> {
             inner,
             verified: Arc::new(Mutex::new(VerifiedBundles::new(capacity))),
             verifier_name,
+            flush_verifier: None,
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Makes a block flush `verifier`, the batch worker behind this cache, once the block's
+    /// misses are in its queue. See [`flush`].
+    pub(super) fn with_flush(mut self, verifier: flush::Verifier) -> Self {
+        self.flush_verifier = Some(verifier);
+        self
     }
 
     /// Returns the wrapped verification service.
@@ -396,6 +410,7 @@ impl<S> Cached<S> {
             inner,
             verified: self.verified.clone(),
             verifier_name: self.verifier_name,
+            flush_verifier: self.flush_verifier,
             inner_calls: self.inner_calls.clone(),
         }
     }
@@ -453,6 +468,9 @@ where
         let verified = self.verified.clone();
         let verifier_name = self.verifier_name;
         let mut inner = self.inner.clone();
+        let queueing = self
+            .flush_verifier
+            .and_then(|verifier| Some((flush::Queueing::for_request()?, verifier)));
 
         #[cfg(test)]
         let inner_calls = self.inner_calls.clone();
@@ -470,7 +488,11 @@ where
                             .push(key);
                     }
 
-                    inner.call(item).await
+                    let response = inner.call(item);
+                    if let Some((queueing, verifier)) = queueing {
+                        queueing.enqueued(verifier);
+                    }
+                    response.await
                 }
                 Err(error) => Err(error),
             };

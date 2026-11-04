@@ -276,6 +276,10 @@ jobs:
           python3 deploy/runner/test_zakura_cluster_watchdog.py
           python3 -m unittest discover -s deploy/runner -p 'test_nu7_*.py'
 
+      - name: NU7 mainnet dashboard tests
+        if: ${{ !cancelled() }}
+        run: python3 deploy/nu7-mainnet/test_collector.py
+
       - name: Compatibility monitoring tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/runner -p 'test_*monitoring*.py'

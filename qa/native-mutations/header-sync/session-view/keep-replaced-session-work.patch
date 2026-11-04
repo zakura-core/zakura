@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -766,9 +766,7 @@ impl HeaderSyncReactor {
+             )
+         });
+         let replaces_existing_peer = self.sessions.contains_key(&peer);
+-        if replaces_existing_peer && !owns_local_repair_operation {
+-            self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
+-        }
++        let _ = (replaces_existing_peer, owns_local_repair_operation);
+         let replaced_schedule = self.state.admit_session(&peer, Instant::now());
+         let previous = self.sessions.insert(
+             peer.clone(),

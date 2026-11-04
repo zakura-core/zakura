@@ -10,10 +10,12 @@
 //! operations, and gates `Control` steps, until chosen events happen. A
 //! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
 //! A `Shutdown` step stops the node under test on purpose, which its tap
-//! expects.
+//! expects. The tap and the topology's links keep the node's
+//! [`session`] view.
 
 mod pair;
 pub mod policy;
+pub mod session;
 pub mod tap;
 
 use std::{
@@ -33,8 +35,8 @@ use zakura_header_chain::{Frontier, VctRootRepairStatus};
 use zakura_network::zakura::{
     framed_channel, observe::HeaderSyncObserver, spawn_header_sync_reactor, FullStateFrontiers,
     HeaderSyncHandle, HeaderSyncService, HeaderSyncStartup, Peer, Service, ServicePeerDirection,
-    ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    SessionOrigin, ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
+    ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_quic::NodeSecretKey;
@@ -46,6 +48,7 @@ use zakura_storage::header::{
 
 use self::{
     policy::{Hold, LinkEffect, Predicates, Trigger},
+    session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
@@ -492,12 +495,17 @@ pub struct Link {
     pub session_id: u64,
     /// Each side's connection token, dialer first.
     tokens: [CancellationToken; 2],
+    /// The node under test's session view, which learns of the close.
+    sessions: Option<SessionEvidence>,
 }
 
 impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.link_closed(self.conn_id);
+        }
         for token in &self.tokens {
             token.cancel();
         }
@@ -523,6 +531,8 @@ pub struct Topology {
     last_id: Cell<u64>,
     /// The node under test's tap, told of its shutdown.
     tap: Option<TapShutdown>,
+    /// The node under test's session view, told of each link.
+    sessions: Option<SessionEvidence>,
 }
 
 impl Topology {
@@ -539,6 +549,7 @@ impl Topology {
             effects,
             last_id: Cell::new(0),
             tap: None,
+            sessions: None,
         }
     }
 
@@ -546,6 +557,17 @@ impl Topology {
     pub fn with_tap(self, tap: TapShutdown) -> Self {
         Topology {
             tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// This topology, reporting each link it opens and closes to
+    /// `sessions`, the node under test's session view, which then joins
+    /// each admission to its link.
+    pub fn with_sessions(self, sessions: SessionEvidence) -> Self {
+        sessions.expect_links();
+        Topology {
+            sessions: Some(sessions),
             ..self
         }
     }
@@ -633,12 +655,34 @@ impl Topology {
 
     /// Connects `dialer` to `listener` with a new connection and session,
     /// each side's stream 5 at version 9 over a pair of in-memory channels.
+    /// Each side's peer carries the link's counter as its origin's
+    /// connection and generation. The session view hears of the link first.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
+        let peer = if dialer == 0 { listener } else { dialer };
+        if let Some(sessions) = &self.sessions {
+            sessions.link_opened(
+                &self.nodes[peer].id,
+                &self.nodes[peer].name,
+                id,
+                id,
+                &self.nodes[dialer].name,
+                if dialer == 0 {
+                    ServicePeerDirection::Outbound
+                } else {
+                    ServicePeerDirection::Inbound
+                },
+            );
+        }
+        let origin = SessionOrigin {
+            connection: id,
+            quic_stream: None,
+            generation: id,
+        };
         let sides = [
             (
                 dialer,
@@ -654,19 +698,21 @@ impl Topology {
             ),
         ];
         for ((local, remote, direction, streams), token) in sides.into_iter().zip(&tokens) {
-            self.nodes[local].service.add_peer(Peer::new_versioned(
-                id,
-                self.nodes[remote].id.clone(),
-                ZAKURA_CAP_HEADER_SYNC,
-                direction,
-                ZAKURA_STREAM_HEADER_SYNC,
-                ZAKURA_HEADER_SYNC_STREAM_VERSION,
-                id,
-                streams,
-                token.clone(),
-            ));
+            self.nodes[local].service.add_peer(
+                Peer::new_versioned(
+                    id,
+                    self.nodes[remote].id.clone(),
+                    ZAKURA_CAP_HEADER_SYNC,
+                    direction,
+                    ZAKURA_STREAM_HEADER_SYNC,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                    id,
+                    streams,
+                    token.clone(),
+                )
+                .with_origin(origin),
+            );
         }
-        let peer = if dialer == 0 { listener } else { dialer };
         let link = Link {
             peer: self.nodes[peer].name.clone(),
             dialer,
@@ -674,6 +720,7 @@ impl Topology {
             conn_id: id,
             session_id: id,
             tokens,
+            sessions: self.sessions.clone(),
         };
         self.effects.links.borrow_mut().push(link.clone());
         link

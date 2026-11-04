@@ -60,7 +60,8 @@ pub(super) const MAX_WAITING_MINED: usize = 16;
 ///
 /// With a peer connected, every block is sent as soon as it arrives, so this only matters for a
 /// run of submissions faster than their announcements finish: later ones wait their turn instead
-/// of each starting a task. The committed tip is not held back by them.
+/// of each starting a task. The committed tip is neither held back nor counted: there is at most
+/// one of its announcements per tip change.
 pub(super) const MAX_ACTIVE_BROADCASTS: usize = 16;
 
 /// Which waiting announcement a block replaces.
@@ -250,7 +251,7 @@ struct Protocol<ZN> {
     /// The wait for a peer, while this protocol has an announcement to send.
     ready: Option<BoxFuture<'static, Result<ZN, BoxError>>>,
 
-    /// Announcements dispatched and not reported back yet.
+    /// This node's own blocks dispatched and not reported back yet.
     active: usize,
 
     /// Committed mined-block announcements, so the committed-tip path does not duplicate them.
@@ -407,6 +408,20 @@ where
                 protocol = self.name,
                 "dropping a waiting mined block announcement: too many are waiting",
             );
+        }
+    }
+
+    /// Counts an announcement that is being dispatched towards [`MAX_ACTIVE_BROADCASTS`].
+    fn start_sending(&mut self, announcement: &Announcement) {
+        if announcement.slot == Slot::Mined {
+            self.active += 1;
+        }
+    }
+
+    /// Releases the count of a dispatched announcement that reported back.
+    fn finish_sending(&mut self, announcement: &Announcement) {
+        if announcement.slot == Slot::Mined {
+            self.active = self.active.saturating_sub(1);
         }
     }
 
@@ -774,7 +789,7 @@ where
                             if announcement.tracked {
                                 protocol.broadcasts.start(announcement.hash);
                             }
-                            protocol.active += 1;
+                            protocol.start_sending(&announcement);
                             dispatch(
                                 index,
                                 protocol.name,
@@ -975,7 +990,7 @@ fn finish_broadcast<ZN>(
         announcement.tracked,
     );
     let protocol = &mut protocols[protocol_index];
-    protocol.active = protocol.active.saturating_sub(1);
+    protocol.finish_sending(&announcement);
 
     if outcome == Outcome::NoPeers {
         // Nothing was sent, so this is not a failed delivery and does not use up the one retry.
@@ -1760,6 +1775,27 @@ mod tests {
 
         protocol.active -= 1;
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(mined));
+    }
+
+    #[test]
+    fn tip_announcements_do_not_count_towards_the_active_bound() {
+        let mined = Announcement::mined(block::Hash([41; 32]), block::Height(2), 1_000, None);
+        let tip = Announcement::tip(block::Hash([42; 32]), block::Height(3));
+        let retry = Announcement::retry(block::Hash([43; 32]), block::Height(3), None);
+
+        let mut protocol = protocol();
+        protocol.start_sending(&tip);
+        protocol.start_sending(&retry);
+        assert_eq!(
+            protocol.active, 0,
+            "a run of tip changes starts no own-block count"
+        );
+        protocol.start_sending(&mined);
+        assert_eq!(protocol.active, 1);
+        protocol.finish_sending(&tip);
+        assert_eq!(protocol.active, 1, "a tip completion releases nothing");
+        protocol.finish_sending(&mined);
+        assert_eq!(protocol.active, 0);
     }
 
     #[test]
